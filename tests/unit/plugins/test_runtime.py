@@ -25,6 +25,8 @@ from agent_hub.plugins.contracts import (
 from agent_hub.plugins.runtime import (
     HttpJsonPluginAdapter,
     PluginInvocationContext,
+    PluginPackageAdapter,
+    PluginPackageExecutionTarget,
     _plugin_package_execution_target,
     build_runtime_plugin_service,
 )
@@ -122,6 +124,40 @@ class RecordingPluginAdapter:
             "resource_schema": {"type": "object", "additionalProperties": True},
             "capability_schema": {"type": "object", "additionalProperties": True},
             "argument_schema": {"type": "object", "additionalProperties": True},
+        }
+
+
+@dataclass
+class RecordingPluginPackageRunner:
+    calls: list[
+        tuple[
+            PluginPackageExecutionTarget,
+            str,
+            str,
+            Mapping[str, JsonValue],
+            PluginInvocationContext,
+        ]
+    ]
+    result: object | None = None
+    failure: Exception | None = None
+
+    async def invoke(
+        self,
+        *,
+        target: PluginPackageExecutionTarget,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]:
+        if self.failure is not None:
+            raise self.failure
+        self.calls.append((target, plugin.id, capability.id, arguments, context))
+        if self.result is not None:
+            return cast(Mapping[str, JsonValue], self.result)
+        return {
+            "ok": True,
+            "entrypoint": str(target.entrypoint),
         }
 
 
@@ -526,6 +562,37 @@ def test_plugin_package_execution_target_rejects_entrypoint_escaping_artifact_ro
         )
 
 
+def test_plugin_package_execution_target_rejects_symlinked_entrypoint_outside_artifact_root(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    outside_entrypoint = tmp_path / "outside.py"
+    outside_entrypoint.write_text("def invoke():\n    return {}\n")
+    try:
+        (artifact_root / "adapter" / "main.py").symlink_to(outside_entrypoint)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package path is invalid"):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
 @pytest.mark.parametrize(
     ("package_update", "error"),
     [
@@ -588,6 +655,436 @@ def test_plugin_package_execution_target_rejects_non_executable_package_state(
             ),
             tenant_id=TENANT_ID,
             package_store_dir=tmp_path,
+        )
+
+
+async def test_plugin_package_adapter_invokes_runner_with_execution_target(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[], result={"ok": True, "source": "package"})
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+    context = PluginInvocationContext(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="tester",
+        idempotency_key="invoke-1",
+    )
+
+    result = await adapter.invoke(
+        plugin=plugin(
+            "calendar",
+            adapter="calendar_python",
+            sandbox_profile="in_process",
+            package_metadata=package_metadata,
+            content_sha256=content_sha256,
+        ),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="in_process",
+        ),
+        arguments={"title": "review"},
+        context=context,
+    )
+
+    assert result == {"ok": True, "source": "package"}
+    assert runner.calls[0][0].root == artifact_root
+    assert runner.calls[0][0].entrypoint == artifact_root / "adapter" / "main.py"
+    assert runner.calls[0][1:] == (
+        "calendar",
+        "calendar.create_event",
+        {"title": "review"},
+        context,
+    )
+
+
+async def test_plugin_package_adapter_fails_closed_before_runner_when_target_invalid(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package artifact is unavailable"):
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert runner.calls == []
+
+
+async def test_plugin_package_adapter_rejects_capability_adapter_mismatch_before_runner(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package adapter mismatch"):
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="other_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert runner.calls == []
+
+
+async def test_plugin_package_adapter_rejects_package_adapter_id_mismatch_before_runner(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    ).model_copy(update={"adapter_id": "other_python"})
+    runner = RecordingPluginPackageRunner(calls=[])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package adapter mismatch"):
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert runner.calls == []
+
+
+async def test_plugin_package_adapter_uses_context_tenant_to_resolve_target(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package artifact storage key is invalid"):
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=OTHER_TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert runner.calls == []
+
+
+async def test_plugin_package_adapter_rejects_runner_non_mapping_result(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[], result=["not", "mapping"])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin result is invalid"):
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert len(runner.calls) == 1
+
+
+async def test_plugin_package_adapter_wraps_runner_failure_without_leaking_details(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(
+        calls=[],
+        failure=ValueError("secret detail from package runner"),
+    )
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=tmp_path,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as error:
+        await adapter.invoke(
+            plugin=plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert str(error.value) == "Plugin tool failed"
+
+
+async def test_runtime_plugin_service_can_invoke_registered_package_adapter_runner(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="in_process",
+                    package_metadata=package_metadata,
+                    content_sha256=content_sha256,
+                ),
+            )
+        ),
+        adapters={
+            "calendar_python": PluginPackageAdapter(
+                adapter_id="calendar_python",
+                package_store_dir=tmp_path,
+                runner=runner,
+            )
+        },
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="tester",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="invoke-1",
+    )
+
+    assert result["ok"] is True
+    assert runner.calls[0][0].root == artifact_root
+
+
+async def test_runtime_plugin_service_rejects_package_adapter_result_that_violates_output_schema(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[], result={"ok": "yes"})
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="in_process",
+                    package_metadata=package_metadata,
+                    content_sha256=content_sha256,
+                    output_schema={
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ("ok",),
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+        ),
+        adapters={
+            "calendar_python": PluginPackageAdapter(
+                adapter_id="calendar_python",
+                package_store_dir=tmp_path,
+                runner=runner,
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin result does not match output schema"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="invoke-1",
         )
 
 

@@ -88,6 +88,18 @@ type HttpJsonPost = Callable[
 type PluginSecretResolver = Callable[[str], Awaitable[str]]
 
 
+class PluginPackageRunner(Protocol):
+    async def invoke(
+        self,
+        *,
+        target: PluginPackageExecutionTarget,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]: ...
+
+
 class HttpJsonPluginAdapter:
     def __init__(
         self,
@@ -157,6 +169,58 @@ class HttpJsonPluginAdapter:
 
     def descriptor(self) -> Mapping[str, JsonValue]:
         return adapter_descriptor_with_contract(http_json_adapter_descriptor())
+
+
+class PluginPackageAdapter:
+    def __init__(
+        self,
+        *,
+        adapter_id: str,
+        package_store_dir: Path,
+        runner: PluginPackageRunner,
+    ) -> None:
+        self._adapter_id = adapter_id
+        self._package_store_dir = package_store_dir
+        self._runner = runner
+
+    async def invoke(
+        self,
+        *,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]:
+        package = plugin.package_metadata
+        if (
+            capability.adapter != self._adapter_id
+            or package is None
+            or package.adapter_id != self._adapter_id
+        ):
+            raise RuntimeCapabilityError("Plugin package adapter mismatch")
+        target = _plugin_package_execution_target(
+            plugin,
+            tenant_id=context.tenant_id,
+            package_store_dir=self._package_store_dir,
+        )
+        try:
+            result = await self._runner.invoke(
+                target=target,
+                plugin=plugin,
+                capability=capability,
+                arguments=arguments,
+                context=context,
+            )
+        except RuntimeCapabilityError:
+            raise
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin tool failed") from error
+        if not isinstance(result, Mapping):
+            raise RuntimeCapabilityError("Plugin result is invalid")
+        return result
+
+    def descriptor(self) -> Mapping[str, JsonValue]:
+        return adapter_descriptor_with_contract(_package_adapter_descriptor(self._adapter_id))
 
 
 class RuntimePluginService:
@@ -711,6 +775,23 @@ def _endpoint_domain_allowed(url: str, domain_allowlist: Sequence[str]) -> bool:
     return normalized_host in allowed
 
 
+def _package_adapter_descriptor(adapter_id: str) -> Mapping[str, JsonValue]:
+    return {
+        "id": adapter_id,
+        "name": "Package Adapter",
+        "description": "Invokes a verified local plugin package through the package runner.",
+        "resource_schema": {"type": "object", "additionalProperties": True},
+        "capability_schema": {
+            "type": "object",
+            "properties": {
+                "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+            },
+            "additionalProperties": True,
+        },
+        "argument_schema": {"type": "object", "additionalProperties": True},
+    }
+
+
 def _plugin_schema_validator(
     *,
     schema: Mapping[str, JsonValue] | None,
@@ -809,7 +890,9 @@ __all__ = [
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",
+    "PluginPackageAdapter",
     "PluginPackageExecutionTarget",
+    "PluginPackageRunner",
     "PluginSecretResolver",
     "RuntimePluginService",
     "_plugin_package_execution_target",
