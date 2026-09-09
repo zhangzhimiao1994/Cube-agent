@@ -120,6 +120,15 @@ function formatResourceConfig(config: PluginResource["resource_config"]) {
   );
 }
 
+function formatPluginPackageDependencies(plugin: PluginResource) {
+  if (!plugin.package_metadata) return "未配置";
+  const dependencies = plugin.package_metadata?.dependencies ?? [];
+  if (dependencies.length === 0) return "未声明；运行时不会自动安装依赖";
+  return `${dependencies
+    .map((dependency) => `${dependency.kind}:${dependency.source}:${dependency.name}@${dependency.version}`)
+    .join(", ")}；运行时不会自动安装依赖`;
+}
+
 function parseSchemaText(value: string, label: string): PluginCapability["input_schema"] {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -1448,6 +1457,7 @@ export function McpPage() {
                     </p>
                     <p>包入口：<span>{plugin.package_metadata?.entrypoint ?? "未配置"}</span></p>
                     <p>安装模式：<span>{plugin.package_metadata?.install_mode ?? "未配置"}</span></p>
+                    <p>声明依赖：<span>{formatPluginPackageDependencies(plugin)}</span></p>
                     <p>适配器 ID：<span>{plugin.package_metadata?.adapter_id ?? "未配置"}</span></p>
                     <p>SDK API：<span>{plugin.package_metadata?.sdk_api_version ?? "未配置"}</span></p>
                     <p>包版本：<span>{plugin.package_metadata?.package_version ?? "未配置"}</span></p>

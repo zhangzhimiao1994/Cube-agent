@@ -469,6 +469,7 @@ const calendarPlugin: PluginResource = {
     entrypoint: "adapter/main.py",
     isolation: "local_process",
     install_mode: "scan_only",
+    dependencies: [],
     artifact: null,
   },
   capabilities: [
@@ -6651,6 +6652,8 @@ describe("operational management pages", () => {
     expect(screen.getByText("adapter/main.py")).not.toBeNull();
     expect(screen.getByText("安装模式：")).not.toBeNull();
     expect(screen.getByText("scan_only")).not.toBeNull();
+    expect(screen.getByText("声明依赖：")).not.toBeNull();
+    expect(screen.getByText("未声明；运行时不会自动安装依赖")).not.toBeNull();
 
     await user.upload(
       screen.getByLabelText("插件归档"),

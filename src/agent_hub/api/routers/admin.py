@@ -714,6 +714,23 @@ class PluginPackageArtifactMetadata(BaseModel):
     quarantine_state: Literal["stored"] = "stored"
 
 
+class PluginPackageDependency(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["python"] = "python"
+    source: Literal["pypi"] = "pypi"
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+    )
+    version: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9!+.,<=>~_-]{0,127}$",
+    )
+
+
 class PluginPackageMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -775,6 +792,7 @@ class PluginPackageMetadata(BaseModel):
         "mcp_remote",
     ] = "none"
     install_mode: PluginPackageInstallMode = "scan_only"
+    dependencies: tuple[PluginPackageDependency, ...] = Field(default_factory=tuple, max_length=32)
     artifact: PluginPackageArtifactMetadata | None = None
 
     @model_validator(mode="after")
@@ -3448,6 +3466,9 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package verified public key is server-controlled")
     if "artifact" in package:
         raise InvalidSkillPackage("plugin package artifact is server-controlled")
+    dependencies = package.get("dependencies")
+    if dependencies not in (None, []):
+        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
     if package.get("kind") == "manifest_only" and set(package) & {
         "package_version",
         "adapter_id",
@@ -3476,6 +3497,8 @@ def _validate_plugin_package_contract(
 ) -> None:
     if package is None:
         return
+    if package.dependencies:
+        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
     if package.kind == "manifest_only":
         if (
             package.package_version is not None

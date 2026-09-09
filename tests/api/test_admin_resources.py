@@ -3886,11 +3886,178 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
         "install_mode": "scan_only",
+        "dependencies": [],
         "artifact": None,
     }
     assert api.get("/api/v1/admin/plugins", headers=headers()).json()[0]["package_metadata"] == body[
         "plugin"
     ]["package_metadata"]
+
+
+def test_plugin_archive_install_persists_empty_package_dependencies() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                    "dependencies": [],
+                },
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["plugin"]["package_metadata"]["dependencies"] == []
+
+
+def test_plugin_archive_install_rejects_package_dependencies() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                    "dependencies": [
+                        {
+                            "kind": "python",
+                            "source": "pypi",
+                            "name": "requests",
+                            "version": "2.31.0",
+                        }
+                    ],
+                },
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == (
+        "plugin package dependencies are not supported by this runtime"
+    )
+
+
+def test_plugin_archive_install_rejects_malformed_package_dependencies_with_stable_reason() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                    "dependencies": [{"kind": "python", "source": "pypi", "name": "requests"}],
+                },
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == (
+        "plugin package dependencies are not supported by this runtime"
+    )
 
 
 def test_plugin_archive_install_stores_verified_adapter_package_artifact(

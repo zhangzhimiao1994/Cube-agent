@@ -1003,6 +1003,16 @@ const PluginPackageMetadataSchema = z.object({
     .enum(["none", "remote_connector", "in_process", "local_process", "container", "mcp_remote"])
     .default("none"),
   install_mode: z.enum(["scan_only", "runtime_registered"]).default("scan_only"),
+  dependencies: z
+    .array(
+      z.object({
+        kind: z.literal("python").default("python"),
+        source: z.literal("pypi").default("pypi"),
+        name: z.string(),
+        version: z.string(),
+      }),
+    )
+    .default([]),
   artifact: z
     .object({
       storage_key: z.string(),

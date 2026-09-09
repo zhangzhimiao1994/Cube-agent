@@ -599,6 +599,7 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "local_process",
         install_mode: "scan_only",
+        dependencies: [],
         artifact: {
           storage_key:
             "00000000-0000-4000-8000-000000000001/calendar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -679,6 +680,7 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "local_process",
         install_mode: "scan_only",
+        dependencies: [],
         artifact: null,
       },
       status: "stopped",
@@ -748,6 +750,14 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "in_process",
         install_mode: "runtime_registered",
+        dependencies: [
+          {
+            kind: "python",
+            source: "pypi",
+            name: "requests",
+            version: "2.31.0",
+          },
+        ],
         artifact: {
           storage_key:
             "00000000-0000-4000-8000-000000000001/calendar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -774,6 +784,14 @@ describe("api client transport", () => {
 
     expect(result[0]?.package_metadata?.install_mode).toBe("runtime_registered");
     expect(result[0]?.package_metadata?.activation_state).toBe("eligible");
+    expect(result[0]?.package_metadata?.dependencies).toEqual([
+      {
+        kind: "python",
+        source: "pypi",
+        name: "requests",
+        version: "2.31.0",
+      },
+    ]);
     expect(result[0]?.package_metadata?.artifact?.quarantine_state).toBe("stored");
   });
 
