@@ -745,6 +745,33 @@ function refreshedDetailProcessCard(currentCard: DetailProcessCard, candidates: 
   return matchedByStableSource.at(-1) ?? candidates.find((card) => card.id === currentCard.id) ?? currentCard;
 }
 
+function detailWorkbenchCardIdentity(card: DetailProcessCard) {
+  return card.sourceActor?.trim() || card.id;
+}
+
+function detailWorkbenchAgentCount(cards: DetailProcessCard[]) {
+  const actors = new Set<string>();
+  cards.forEach((card) => {
+    actors.add(detailWorkbenchCardIdentity(card));
+  });
+  return actors.size;
+}
+
+function detailWorkbenchCompletedCount(cards: DetailProcessCard[]) {
+  const completedAgents = new Set<string>();
+  cards.forEach((card) => {
+    if (
+      card.sourceKind !== "artifact.created" &&
+      card.sourceKind !== "message.created" &&
+      card.sourceKind !== "runtime.completed"
+    ) {
+      return;
+    }
+    completedAgents.add(detailWorkbenchCardIdentity(card));
+  });
+  return completedAgents.size;
+}
+
 function isGenericEventMessage(event: RunEvent) {
   return event.message === event.kind || /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message);
 }
@@ -1456,38 +1483,80 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
   );
 }
 
-function DetailProcessDrawer({ card, dialogId, onClose }: { card: DetailProcessCard; dialogId: string; onClose: () => void }) {
+function DetailProcessCardBody({ card }: { card: DetailProcessCard }) {
+  return (
+    <article>
+      <p>{card.detail}</p>
+      {card.artifact ? (
+        <div className="artifact-download-list" aria-label="中间产物">
+          <ArtifactFileCard artifact={card.artifact} compact />
+        </div>
+      ) : null}
+      <DetailProcessCards card={card} />
+      {card.createdAt ? <small>{runEventTimestamp(card.createdAt)}</small> : null}
+    </article>
+  );
+}
+
+function DetailProcessDrawer({
+  cards,
+  selectedCard,
+  dialogId,
+  onClose,
+  onSelectCard,
+}: {
+  cards: DetailProcessCard[];
+  selectedCard: DetailProcessCard;
+  dialogId: string;
+  onClose: () => void;
+  onSelectCard: (card: DetailProcessCard) => void;
+}) {
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
         id={dialogId}
         className="process-drawer"
         role="dialog"
-        aria-label="Agent 动作详情"
+        aria-label="Agent 工作席详情"
         aria-modal="true"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="process-drawer-handle" aria-hidden="true" />
         <div className="process-drawer-header">
           <div>
-            <span className="eyebrow">{card.label}</span>
-            <h3>{card.title}</h3>
+            <span className="eyebrow">Agent workbench</span>
+            <h3>Agent 工作席</h3>
           </div>
           <button type="button" className="secondary-action" onClick={onClose}>
             关闭
           </button>
         </div>
+        <div className="agent-workbench-detail">
+          <div className="agent-workbench-actions">
+            <div className="agent-workbench-actions-header">
+              <strong>调度动作</strong>
+              <small>{cards.length} 条</small>
+            </div>
+            <div className="agent-cluster-actions" aria-label="Agent 工作席动作">
+              {cards.map((card) => (
+                <button
+                  key={card.id}
+                  type="button"
+                  className="run-process-toggle process-intermediate-card"
+                  aria-current={selectedCard.id === card.id ? "true" : undefined}
+                  onClick={() => onSelectCard(card)}
+                >
+                  <span aria-hidden="true">›</span>
+                  <small className="process-card-badge">{card.label}</small>
+                  <strong>{card.title}</strong>
+                  {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
         <div className="run-process-detail">
-          <article>
-            <p>{card.detail}</p>
-            {card.artifact ? (
-              <div className="artifact-download-list" aria-label="中间产物">
-                <ArtifactFileCard artifact={card.artifact} compact />
-              </div>
-            ) : null}
-            <DetailProcessCards card={card} />
-            {card.createdAt ? <small>{runEventTimestamp(card.createdAt)}</small> : null}
-          </article>
+          <DetailProcessCardBody card={selectedCard} />
         </div>
       </section>
     </div>,
@@ -1497,9 +1566,9 @@ function DetailProcessDrawer({ card, dialogId, onClose }: { card: DetailProcessC
 
 function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
   const [selectedCard, setSelectedCard] = useState<DetailProcessCard | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const previouslyFocused = useRef<HTMLElement | null>(null);
-  const selected = selectedCard ? refreshedDetailProcessCard(selectedCard, cards) : null;
-  const drawerOpen = Boolean(selectedCard);
+  const selected = selectedCard ? refreshedDetailProcessCard(selectedCard, cards) : (cards.at(-1) ?? null);
   useEffect(() => {
     if (!drawerOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1510,7 +1579,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
     document.body.style.touchAction = "none";
     document.documentElement.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSelectedCard(null);
+      if (event.key === "Escape") setDrawerOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -1522,6 +1591,9 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
     };
   }, [drawerOpen]);
   if (cards.length === 0) return null;
+  const workbenchId = "run-detail-agent-workbench";
+  const agentCount = detailWorkbenchAgentCount(cards);
+  const completedCount = detailWorkbenchCompletedCount(cards);
   return (
     <section className="run-detail-process-summary" aria-label="Agent 集群动作">
       <div className="run-failure-diagnostics-header">
@@ -1529,28 +1601,31 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
         <strong>Agent 集群动作</strong>
         <small>{cards.length} 条</small>
       </div>
-      <div className="agent-cluster-actions">
-        {cards.map((card) => (
-          <button
-            key={card.id}
-            type="button"
-            className="run-process-toggle process-intermediate-card"
-            aria-controls={`run-detail-process-${card.id}`}
-            aria-expanded={selected?.id === card.id}
-            onClick={() => setSelectedCard(card)}
-          >
-            <span aria-hidden="true">›</span>
-            <small className="process-card-badge">{card.label}</small>
-            <strong>{card.title}</strong>
-            {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
-          </button>
-        ))}
+      <div className="agent-workbench">
+        <button
+          type="button"
+          className="agent-workbench-trigger"
+          aria-controls={workbenchId}
+          aria-expanded={drawerOpen}
+          onClick={() => {
+            setSelectedCard(cards.at(-1) ?? null);
+            setDrawerOpen(true);
+          }}
+        >
+          <span aria-hidden="true">⌘</span>
+          <strong>Agent 工作席</strong>
+          <small className="agent-workbench-meta">
+            {agentCount} 个 Agent · {completedCount} 已下班
+          </small>
+        </button>
       </div>
-      {selected ? (
+      {drawerOpen && selected ? (
         <DetailProcessDrawer
-          card={selected}
-          dialogId={`run-detail-process-${selected.id}`}
-          onClose={() => setSelectedCard(null)}
+          cards={cards}
+          selectedCard={selected}
+          dialogId={workbenchId}
+          onClose={() => setDrawerOpen(false)}
+          onSelectCard={setSelectedCard}
         />
       ) : null}
     </section>

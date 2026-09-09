@@ -140,12 +140,12 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("artifact_id")).toBeNull();
 
     const processSummary = screen.getByLabelText("Agent 集群动作");
-    const processCard = within(processSummary).getByRole("button", { name: /SUMMARY_SHOULD_BE_COMPACTED/ });
+    const processCard = within(processSummary).getByRole("button", { name: /Agent 工作席/ });
     const controlsId = processCard.getAttribute("aria-controls");
     expect(controlsId).toBeTruthy();
     await user.click(processCard);
 
-    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     const backdrop = document.querySelector(".process-drawer-backdrop");
     expect(backdrop?.parentElement).toBe(document.body);
     expect(controlsId ? document.getElementById(controlsId) : null).toBe(drawer);
@@ -174,18 +174,114 @@ describe("RunDetailPage", () => {
     await user.click(document.querySelector(".process-detail-modal-backdrop") as HTMLElement);
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "证据详情" })).toBeNull());
     await user.keyboard("{Escape}");
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 动作详情" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull());
     expect(document.body.style.overflow).toBe("");
     expect(document.body.style.touchAction).toBe("");
     expect(document.documentElement.style.overflow).toBe("");
 
     await user.click(processCard);
-    expect(await screen.findByRole("dialog", { name: "Agent 动作详情" })).not.toBeNull();
+    expect(await screen.findByRole("dialog", { name: "Agent 工作席详情" })).not.toBeNull();
     await user.click(document.querySelector(".process-drawer-backdrop") as HTMLElement);
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 动作详情" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull());
     expect(document.body.style.overflow).toBe("");
     expect(document.body.style.touchAction).toBe("");
     expect(document.documentElement.style.overflow).toBe("");
+  });
+
+  it("keeps the agent workbench as one entry point and opens dispatch details on click", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          summary: "主 Agent 初始判断",
+          actor: "main_agent",
+          step_id: "main-agent-plan",
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 2,
+          kind: "step.started",
+          message: "reviewer scheduled",
+          summary: "reviewer 子 Agent 调度",
+          actor: "reviewer",
+          step_id: "reviewer-dispatch",
+          artifact: null,
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 3,
+          kind: "runtime.completed",
+          message: "critic completed",
+          summary: "critic 子 Agent 已下班",
+          actor: "critic",
+          step_id: "critic-complete",
+          artifact: null,
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 4,
+          kind: "message.created",
+          message: "critic final note",
+          summary: "critic 子 Agent 追加收尾",
+          actor: "critic",
+          step_id: "critic-final-note",
+          artifact: null,
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 5,
+          kind: "runtime.completed",
+          message: "unassigned cleanup completed",
+          summary: "未标记 actor 的收尾",
+          actor: null,
+          step_id: "unassigned-cleanup",
+          artifact: null,
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    const workbenchButton = within(processSummary).getByRole("button", { name: /Agent 工作席/ });
+    expect(within(processSummary).getAllByRole("button")).toHaveLength(1);
+    expect(workbenchButton.textContent).toContain("4 个 Agent");
+    expect(workbenchButton.textContent).toContain("3 已下班");
+    expect(workbenchButton.textContent).not.toContain("critic 子 Agent 已下班");
+    expect(within(processSummary).queryByText("reviewer 子 Agent 调度")).toBeNull();
+    expect(within(processSummary).queryByText("critic 子 Agent 已下班")).toBeNull();
+
+    await user.click(workbenchButton);
+
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(drawer).getByText("主 Agent 初始判断")).not.toBeNull();
+    expect(within(drawer).getByText("reviewer 子 Agent 调度")).not.toBeNull();
+    expect(within(drawer).getAllByText("critic 子 Agent 已下班").length).toBeGreaterThan(0);
+    await user.click(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ }));
+    expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).toContain("reviewer 子 Agent 调度");
+    expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
   });
 
   it("renders run detail events in sequence order when backend payload arrives out of order", async () => {
@@ -307,8 +403,9 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("tenant-private-quota")).toBeNull();
 
     const processSummary = await screen.findByLabelText("Agent 集群动作");
-    await user.click(within(processSummary).getByRole("button", { name: /模型过程/ }));
-    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: /模型过程/ }));
     expect(within(drawer).queryByText("lease-private")).toBeNull();
     expect(within(drawer).queryByText("tenant-private-quota")).toBeNull();
   });
@@ -395,8 +492,9 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("internal.example.invalid")).toBeNull();
 
     const processSummary = await screen.findByLabelText("Agent 集群动作");
-    await user.click(within(processSummary).getByRole("button", { name: /执行步骤/ }));
-    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: /执行步骤/ }));
     expect(within(drawer).queryByText("lease-private")).toBeNull();
     expect(within(drawer).queryByText("internal.example.invalid")).toBeNull();
   });
@@ -707,10 +805,10 @@ describe("RunDetailPage", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     const processSummary = await screen.findByLabelText("Agent 集群动作");
-    const processCard = within(processSummary).getByRole("button", { name: /初始动作摘要/ });
+    const processCard = within(processSummary).getByRole("button", { name: /Agent 工作席/ });
     await user.click(processCard);
 
-    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     expect(within(drawer).getAllByText(initialSummary).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("2026-08-20T00:00:01Z").length).toBeGreaterThan(0);
 
@@ -773,8 +871,10 @@ describe("RunDetailPage", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     const processSummary = await screen.findByLabelText("Agent 集群动作");
-    await user.click(within(processSummary).getByRole("button", { name: /writer 初始动作/ }));
-    expect(await screen.findByRole("dialog", { name: "Agent 动作详情" })).not.toBeNull();
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(workbenchActions).getByRole("button", { name: /writer 初始动作/ })).not.toBeNull();
 
     currentDetail = {
       ...currentDetail,
@@ -793,10 +893,11 @@ describe("RunDetailPage", () => {
 
     await waitFor(
       () => {
-        expect(within(processSummary).getByRole("button", { name: /reviewer 新加入动作/ })).not.toBeNull();
+        expect(within(processSummary).queryByText("reviewer 新加入动作")).toBeNull();
+        expect(within(workbenchActions).getByRole("button", { name: /reviewer 新加入动作/ })).not.toBeNull();
       },
       { timeout: 2500 },
     );
-    expect(screen.getByRole("dialog", { name: "Agent 动作详情" })).not.toBeNull();
+    expect(screen.getByRole("dialog", { name: "Agent 工作席详情" })).not.toBeNull();
   });
 });
