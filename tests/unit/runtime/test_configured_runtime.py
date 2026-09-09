@@ -1773,6 +1773,140 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
 
 
 @pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_fails_closed_when_tool_roles_have_no_eligible_model() -> None:
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "anthropic",
+                                "model": "claude-sonnet-4-5",
+                                "api_base": "https://api.anthropic.com/v1/messages",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "anthropic_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling", "structured_output"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="生成一个最简单的 hello world Python 项目，必须运行测试。",
+                routing_decision={"main_agent_model": "main"},
+            )
+        )
+    ]
+
+    assert [event.kind for event in events] == [EventKind.RUNTIME_FAILED]
+    assert events[0].reason == "harness_model_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_routes_inventory_skill_tools_to_capable_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "main_account",
+                                "max_concurrency": 20,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            }
+                        ]
+                    },
+                    "qwen_tools": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen3-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling", "structured_output"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "scheduler",
+                        "role": "Scheduler",
+                        "prompt": "Schedule events through the calendar plugin.",
+                        "model": "main",
+                        "skills": ["calendar_create"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=AvailablePluginManifestCapabilityGateway(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Create a calendar event.",
+                routing_decision={
+                    "selected_agent_ids": ("scheduler",),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    role_plan = events[0].payload["roles"]
+    assert role_plan[0]["id"] == "scheduler"
+    assert role_plan[0]["logical_model"] == "qwen_tools"
+    assert role_plan[0]["tools"] == ("calendar.create_event",)
+
+
+@pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_constraint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2104,7 +2238,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_execution_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     },
@@ -2198,7 +2332,7 @@ async def test_config_backed_dispatch_runtime_treats_uncertain_capabilities_as_p
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     },
@@ -2277,7 +2411,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     },
@@ -2685,7 +2819,7 @@ async def test_config_backed_dispatch_runtime_injects_harness_tool_gateway(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     }
@@ -2738,7 +2872,7 @@ async def test_config_backed_discussion_runtime_injects_harness_tool_gateway(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     }
@@ -2795,7 +2929,7 @@ async def test_config_backed_hybrid_runtime_injects_harness_tool_gateway_into_ch
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     }
@@ -3082,7 +3216,7 @@ async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     },
@@ -3837,7 +3971,7 @@ async def test_config_backed_dispatch_runtime_prepares_tenant_before_inventory_p
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "tool_calling", "structured_output"],
                             }
                         ]
                     },
@@ -4730,6 +4864,70 @@ def test_role_model_assignment_avoids_messages_endpoint_for_tool_roles() -> None
     )
 
     assert assigned[0].model == "qwen"
+
+
+def test_role_model_assignment_fails_closed_when_tool_role_has_no_eligible_model() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "sonnet": {
+                    "deployments": [
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4-5",
+                            "api_base": "https://api.anthropic.com/v1/messages",
+                            "credential_ref": "secret://sonnet",
+                            "quota_scope_id": "sonnet",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "plain": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://plain",
+                            "quota_scope_id": "plain",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="planner",
+        role="Planner",
+        purpose=RolePurpose.EXECUTE,
+        mission="拆解任务并调用工具读取上下文。",
+        must_answer=("步骤是什么？",),
+        allowed_tools=("read_context",),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={},
+        model="sonnet",
+    )
+
+    with pytest.raises(
+        defaults_module.HarnessModelSelectionError,
+        match="model capability unavailable",
+    ):
+        _assign_models_to_roles(
+            (role,),
+            config,
+            default_model="sonnet",
+            task="读取上下文后生成计划。",
+        )
+
 
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(

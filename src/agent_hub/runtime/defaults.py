@@ -349,7 +349,10 @@ class ConfigBackedDirectRuntime:
         self._active: dict[UUID, ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
-        runtime = await self._runtime_for(context)
+        try:
+            runtime = await self._runtime_for(context)
+        except HarnessModelSelectionError:
+            runtime = UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -419,7 +422,10 @@ class ConfigBackedDispatchRuntime:
         self._active: dict[UUID, ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
-        runtime = await self._runtime_for(context)
+        try:
+            runtime = await self._runtime_for(context)
+        except HarnessModelSelectionError:
+            runtime = UnavailableRuntime(TaskMode.DISPATCH, reason="harness_model_unavailable")
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -480,11 +486,17 @@ class ConfigBackedDispatchRuntime:
                 )
             ).roles
         role_sources = (*planned_roles, *_temporary_role_assignments(context, logical_model))
+        role_tools_by_id = _role_tools_by_id(
+            role_sources,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
         roles = _assign_models_to_roles(
             role_sources,
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=role_tools_by_id,
         )
         model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
             role_sources,
@@ -492,6 +504,7 @@ class ConfigBackedDispatchRuntime:
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=role_tools_by_id,
         )
         plan = _dispatch_plan(
             roles,
@@ -554,7 +567,10 @@ class ConfigBackedDiscussionRuntime:
         self._active: dict[UUID, ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
-        runtime = await self._runtime_for(context)
+        try:
+            runtime = await self._runtime_for(context)
+        except HarnessModelSelectionError:
+            runtime = UnavailableRuntime(TaskMode.DISCUSS, reason="harness_model_unavailable")
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -614,11 +630,17 @@ class ConfigBackedDiscussionRuntime:
                     default_model=logical_model,
                 )
             ).roles
+        role_tools_by_id = _role_tools_by_id(
+            planned_roles,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
         roles = _assign_models_to_roles(
             planned_roles,
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=role_tools_by_id,
         )
         model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
             planned_roles,
@@ -626,6 +648,7 @@ class ConfigBackedDiscussionRuntime:
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=role_tools_by_id,
         )
         plan = _discussion_plan(
             roles,
@@ -688,7 +711,10 @@ class ConfigBackedHybridRuntime:
         self._active: dict[UUID, ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
-        runtime = await self._runtime_for(context)
+        try:
+            runtime = await self._runtime_for(context)
+        except HarnessModelSelectionError:
+            runtime = UnavailableRuntime(TaskMode.HYBRID, reason="harness_model_unavailable")
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -786,17 +812,29 @@ class ConfigBackedHybridRuntime:
             *_temporary_role_assignments(context, logical_model),
         )
         discussion_role_sources = discussion_roles
+        dispatch_role_tools_by_id = _role_tools_by_id(
+            dispatch_role_sources,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
+        discussion_role_tools_by_id = _role_tools_by_id(
+            discussion_role_sources,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
         dispatch_roles = _assign_models_to_roles(
             dispatch_role_sources,
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=dispatch_role_tools_by_id,
         )
         discussion_roles = _assign_models_to_roles(
             discussion_role_sources,
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=discussion_role_tools_by_id,
         )
         dispatch_matrix, dispatch_matrix_truncated = _role_model_routing_matrix_payload(
             dispatch_role_sources,
@@ -804,6 +842,7 @@ class ConfigBackedHybridRuntime:
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=dispatch_role_tools_by_id,
         )
         discussion_matrix, discussion_matrix_truncated = _role_model_routing_matrix_payload(
             discussion_role_sources,
@@ -811,6 +850,7 @@ class ConfigBackedHybridRuntime:
             config,
             default_model=logical_model,
             task=context.request,
+            role_tools_by_id=discussion_role_tools_by_id,
         )
         model_routing_matrix = (*dispatch_matrix, *discussion_matrix)
         model_routing_matrix_truncated = dispatch_matrix_truncated or discussion_matrix_truncated
@@ -1327,6 +1367,24 @@ def _plan_allowed_tools(
     return tuple(dict.fromkeys(tools))
 
 
+def _role_tools_by_id(
+    roles: tuple[RoleAssignment, ...],
+    context: TaskContext,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> dict[str, tuple[str, ...]]:
+    if capability_gateway is None:
+        return {role.id: role.allowed_tools for role in roles}
+    return {
+        role.id: _role_allowed_tools(
+            role,
+            context,
+            capability_gateway=capability_gateway,
+        )
+        for role in roles
+    }
+
+
 async def _prepare_capability_gateway_for_tenant(
     tenant_id: UUID,
     *,
@@ -1464,6 +1522,7 @@ def _assign_models_to_roles(
     *,
     default_model: str,
     task: object,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[RoleAssignment, ...]:
     assigned_counts: dict[str, int] = {}
     capacities = {
@@ -1477,6 +1536,7 @@ def _assign_models_to_roles(
             config,
             default_model=default_model,
             task=task,
+            allowed_tools=_routing_tools_for_role(role, role_tools_by_id),
         )
         selected = default_model
         if ranked:
@@ -1507,6 +1567,15 @@ def _capacity_adjusted_model_score(
     if used >= capacity:
         adjusted -= (used - capacity + 1) * 24
     return adjusted, -used, length_tiebreaker, logical_model
+
+
+def _routing_tools_for_role(
+    role: RoleAssignment,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None,
+) -> tuple[str, ...]:
+    if role_tools_by_id is None:
+        return role.allowed_tools
+    return role_tools_by_id.get(role.id, role.allowed_tools)
 
 
 def _logical_model_capacity(config: PlatformConfig, logical_model: str) -> int:
@@ -2112,6 +2181,7 @@ def _role_model_routing_matrix_payload(
     *,
     default_model: str,
     task: object,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[tuple[Mapping[str, JsonValue], ...], bool]:
     payload: list[Mapping[str, JsonValue]] = []
     truncated = len(source_roles) > _MAX_MODEL_ROUTING_MATRIX_ROLES
@@ -2130,7 +2200,7 @@ def _role_model_routing_matrix_payload(
                 mission=role.mission,
                 skills=role.skills,
                 must_answer=role.must_answer,
-                allowed_tools=role.allowed_tools,
+                allowed_tools=_routing_tools_for_role(role, role_tools_by_id),
                 preferred_model=role.model,
                 default_model=default_model,
             ),
@@ -2375,12 +2445,14 @@ def _select_logical_model_for_role(
     *,
     default_model: str,
     task: object,
+    allowed_tools: tuple[str, ...] | None = None,
 ) -> str:
     ranked = _rank_logical_models_for_role(
         role,
         config,
         default_model=default_model,
         task=task,
+        allowed_tools=allowed_tools,
     )
     return ranked[0][2] if ranked else default_model
 
@@ -2391,6 +2463,7 @@ def _rank_logical_models_for_role(
     *,
     default_model: str,
     task: object,
+    allowed_tools: tuple[str, ...] | None = None,
 ) -> list[tuple[int, int, str]]:
     ranked = rank_role_models(
         RoleModelRoutingRequest(
@@ -2401,15 +2474,18 @@ def _rank_logical_models_for_role(
             mission=role.mission,
             skills=role.skills,
             must_answer=role.must_answer,
-            allowed_tools=role.allowed_tools,
+            allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
             preferred_model=role.model,
             default_model=default_model,
         ),
         config,
     )
+    eligible = [candidate for candidate in ranked if candidate.eligible]
+    if ranked and not eligible:
+        raise HarnessModelSelectionError("model capability unavailable")
     return [
         (candidate.score, -len(candidate.logical_model), candidate.logical_model)
-        for candidate in ranked
+        for candidate in eligible
     ]
 
 
