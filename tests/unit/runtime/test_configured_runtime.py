@@ -994,6 +994,186 @@ def test_model_execution_plan_reports_disabled_harness_fallback_policy() -> None
     )
 
 
+def test_model_execution_plan_separates_scheduler_selection_from_gateway_policy() -> None:
+    constraint = DeploymentRoutingConstraint(
+        logical_model="main",
+        provider="deepseek",
+        model="deepseek-chat",
+    )
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+            routing_decision={
+                "harness_decision": {
+                    "selected_provider": "deepseek",
+                    "selected_model": "deepseek-chat",
+                    "selected_logical_model": "main",
+                    "requires_approval": False,
+                }
+            },
+        ),
+        main_agent_model="main",
+        roles=(),
+        deployment_constraint=constraint,
+        fallback_policy="configured",
+    )
+
+    assert plan["scheduler_selection"] == {
+        "schema_version": 1,
+        "source": "harness_decision",
+        "selected_logical_model": "main",
+        "selected_provider": "deepseek",
+        "selected_model": "deepseek-chat",
+        "applies_to_main_agent": True,
+        "requires_approval": False,
+    }
+    assert plan["gateway_execution_policy"] == {
+        "schema_version": 1,
+        "capacity_boundary": "model_gateway",
+        "deployment_constraint_applied": True,
+        "constrained_logical_model": "main",
+        "fallback_policy": "disabled_for_harness_selection",
+        "fallback_mappings_enabled": False,
+    }
+
+
+def test_model_execution_plan_reports_gateway_policy_without_scheduler_selection() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+        ),
+        main_agent_model="main",
+        roles=(),
+        deployment_constraint=None,
+        fallback_policy="configured",
+    )
+
+    assert plan["scheduler_selection"] == {
+        "schema_version": 1,
+        "source": "runtime_default",
+        "selected_logical_model": None,
+        "selected_provider": None,
+        "selected_model": None,
+        "applies_to_main_agent": False,
+        "requires_approval": False,
+    }
+    assert plan["gateway_execution_policy"] == {
+        "schema_version": 1,
+        "capacity_boundary": "model_gateway",
+        "deployment_constraint_applied": False,
+        "constrained_logical_model": None,
+        "fallback_policy": "configured",
+        "fallback_mappings_enabled": True,
+    }
+
+
+def test_model_execution_plan_reports_harness_policy_without_scheduler_selection() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+            routing_decision={"harness_policy": {"fallback_policy": "disabled"}},
+        ),
+        main_agent_model="main",
+        roles=(),
+        deployment_constraint=None,
+        fallback_policy="disabled",
+    )
+
+    assert plan["scheduler_selection"] == {
+        "schema_version": 1,
+        "source": "runtime_default",
+        "selected_logical_model": None,
+        "selected_provider": None,
+        "selected_model": None,
+        "applies_to_main_agent": False,
+        "requires_approval": False,
+    }
+    assert plan["gateway_execution_policy"] == {
+        "schema_version": 1,
+        "capacity_boundary": "model_gateway",
+        "deployment_constraint_applied": False,
+        "constrained_logical_model": None,
+        "fallback_policy": "disabled_by_harness_policy",
+        "fallback_mappings_enabled": False,
+    }
+
+
+def test_model_execution_plan_reports_explicit_main_agent_selection_source() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+            routing_decision={"main_agent_model": "creative"},
+        ),
+        main_agent_model="creative",
+        roles=(),
+        deployment_constraint=None,
+        fallback_policy="configured",
+    )
+
+    assert plan["scheduler_selection"] == {
+        "schema_version": 1,
+        "source": "main_agent_model",
+        "selected_logical_model": "creative",
+        "selected_provider": None,
+        "selected_model": None,
+        "applies_to_main_agent": True,
+        "requires_approval": False,
+    }
+    assert plan["gateway_execution_policy"] == {
+        "schema_version": 1,
+        "capacity_boundary": "model_gateway",
+        "deployment_constraint_applied": False,
+        "constrained_logical_model": None,
+        "fallback_policy": "configured",
+        "fallback_mappings_enabled": True,
+    }
+
+
+def test_model_execution_plan_sanitizes_scheduler_selection_fields() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+            routing_decision={
+                "harness_decision": {
+                    "selected_provider": "sk-secret-token",
+                    "selected_model": "authorization bearer token",
+                    "selected_logical_model": "main",
+                    "requires_approval": True,
+                }
+            },
+        ),
+        main_agent_model="main",
+        roles=(),
+        deployment_constraint=None,
+        fallback_policy="configured",
+    )
+
+    assert plan["scheduler_selection"] == {
+        "schema_version": 1,
+        "source": "harness_decision",
+        "selected_logical_model": "main",
+        "selected_provider": None,
+        "selected_model": None,
+        "applies_to_main_agent": True,
+        "requires_approval": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
@@ -1317,6 +1497,23 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             },
         ),
         "deployment_constraints": model_execution_plan["deployment_constraints"],
+        "scheduler_selection": {
+            "schema_version": 1,
+            "source": "harness_decision",
+            "selected_logical_model": "main",
+            "selected_provider": "deepseek",
+            "selected_model": "deepseek-chat",
+            "applies_to_main_agent": True,
+            "requires_approval": False,
+        },
+        "gateway_execution_policy": {
+            "schema_version": 1,
+            "capacity_boundary": "model_gateway",
+            "deployment_constraint_applied": True,
+            "constrained_logical_model": "main",
+            "fallback_policy": "disabled_for_harness_selection",
+            "fallback_mappings_enabled": False,
+        },
         "role_model_routing_matrix": model_execution_plan["role_model_routing_matrix"],
         "role_model_routing_matrix_truncated": False,
     }

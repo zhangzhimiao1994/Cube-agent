@@ -116,6 +116,7 @@ _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+_SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
     {
         "api_key",
@@ -1505,6 +1506,90 @@ def _fallback_policy_label(
     return "configured"
 
 
+def _scheduler_selection_payload(
+    context: TaskContext,
+    *,
+    main_agent_model: str,
+) -> Mapping[str, JsonValue]:
+    explicit_main = context.routing_decision.get("main_agent_model")
+    harness_decision = context.routing_decision.get("harness_decision")
+    source = (
+        "harness_decision"
+        if isinstance(harness_decision, Mapping)
+        else "main_agent_model"
+        if isinstance(explicit_main, str) and explicit_main
+        else "runtime_default"
+    )
+    selected_logical_model: str | None = None
+    selected_provider: str | None = None
+    selected_model: str | None = None
+    requires_approval = False
+    if isinstance(harness_decision, Mapping):
+        selected_logical_model = _optional_selection_id(
+            harness_decision.get("selected_logical_model")
+        )
+        selected_provider = _optional_selection_id(harness_decision.get("selected_provider"))
+        selected_model = _optional_model_selection_text(harness_decision.get("selected_model"))
+        requires_approval = harness_decision.get("requires_approval") is True
+    elif isinstance(explicit_main, str) and explicit_main:
+        selected_logical_model = _optional_selection_id(explicit_main)
+    return {
+        "schema_version": 1,
+        "source": source,
+        "selected_logical_model": selected_logical_model,
+        "selected_provider": selected_provider,
+        "selected_model": selected_model,
+        "applies_to_main_agent": selected_logical_model == main_agent_model,
+        "requires_approval": requires_approval,
+    }
+
+
+def _gateway_execution_policy_payload(
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None,
+    fallback_policy: FallbackExecutionPolicy,
+) -> Mapping[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "capacity_boundary": "model_gateway",
+        "deployment_constraint_applied": deployment_constraint is not None,
+        "constrained_logical_model": (
+            deployment_constraint.logical_model
+            if deployment_constraint is not None
+            else None
+        ),
+        "fallback_policy": _fallback_policy_label(deployment_constraint, fallback_policy),
+        "fallback_mappings_enabled": (
+            deployment_constraint is None and fallback_policy == "configured"
+        ),
+    }
+
+
+def _optional_selection_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.casefold()
+    if not _is_safe_inventory_token(normalized, max_length=128):
+        return None
+    return normalized
+
+
+def _optional_model_selection_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > 128
+        or _SAFE_MODEL_SELECTION_TEXT.fullmatch(text) is None
+    ):
+        return None
+    normalized = text.casefold()
+    if any(part in normalized for part in _SENSITIVE_CAPABILITY_INVENTORY_TEXT):
+        return None
+    return text
+
+
 def _deployment_constraints_payload(
     config: PlatformConfig,
     *,
@@ -1630,6 +1715,14 @@ def _model_execution_plan_payload(
             "selected_model": selected_model,
             "fallback_policy": _fallback_policy_label(deployment_constraint, fallback_policy),
         },
+        "scheduler_selection": _scheduler_selection_payload(
+            context,
+            main_agent_model=main_agent_model,
+        ),
+        "gateway_execution_policy": _gateway_execution_policy_payload(
+            deployment_constraint=deployment_constraint,
+            fallback_policy=fallback_policy,
+        ),
         "role_model_assignments": tuple(
             {
                 "role_id": str(role["id"]),
