@@ -73,16 +73,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
-            if sudo DEBIAN_FRONTEND=noninteractive apt-get update && \
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck bats; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 100
-            fi
-            sleep $((attempt * 10))
-          done
+          shellcheck --version
+          npm install -g bats
+          bats -v
       - run: bash -n install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
       - run: shellcheck install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
       - run: bats tests/install
