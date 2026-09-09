@@ -240,6 +240,57 @@ describe("api client transport", () => {
     });
   });
 
+  it("preserves safe recovery metadata on self-repair proposals", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_1",
+          status: "failed",
+          mode: "dispatch",
+          version: 1,
+          request: "Recover run.",
+          created_at: "2026-09-06T13:50:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+          repair_proposal: {
+            kind: "self_repair",
+            title: "受控自修复建议",
+            summary: "运行失败已分类，可在审批后创建一次受控修复重试。",
+            repair_action: "draft_repair_proposal",
+            failure_kind: "capacity_pressure",
+            source_run_id: "run_1",
+            source_event_sequence: 2,
+            attempt: 1,
+            max_attempts: 1,
+            instruction: "只执行一次受控修复。",
+            requires_approval: true,
+            replay_safe: false,
+            automatic_execution: false,
+            fingerprint: "a".repeat(64),
+            recovery_strategy: "switch_to_available_model_and_retry",
+            orchestration_recovery_hint: "retry_blocked_contract_chain",
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const run = await api.run("run_1");
+
+    expect(run.repair_proposal?.recovery_strategy).toBe("switch_to_available_model_and_retry");
+    expect(run.repair_proposal?.orchestration_recovery_hint).toBe("retry_blocked_contract_chain");
+  });
+
   it("defaults missing model outcome summaries on legacy run details", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

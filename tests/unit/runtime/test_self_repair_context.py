@@ -15,6 +15,8 @@ def test_self_repair_context_formats_bounded_approved_guidance() -> None:
                 "attempt": 1,
                 "max_attempts": 1,
                 "instruction": "只执行一次受控修复。",
+                "recovery_strategy": "switch_to_available_model_and_retry",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
                 "command": "cat secret.txt",
                 "stdout": "private output",
             }
@@ -23,6 +25,8 @@ def test_self_repair_context_formats_bounded_approved_guidance() -> None:
 
     assert "<SELF_REPAIR_CONTEXT>" in text
     assert "只执行一次受控修复" in text
+    assert "switch_to_available_model_and_retry" in text
+    assert "retry_blocked_contract_chain" in text
     assert "cat secret" not in text
     assert "private output" not in text
     assert len(text.encode("utf-8")) <= 900 + 256

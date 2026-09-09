@@ -42,6 +42,46 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
         "empty model response",
     }
 )
+_RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = {
+    "capacity_pressure": "switch_to_available_model_and_retry",
+    "empty_model_response": "retry_with_fallback_or_reassign_model",
+    "runtime_failure": "preserve_outputs_and_retry_scope",
+    "step_failure": "retry_failed_step_after_context_compaction",
+    "tool_failure": "repair_tool_invocation_after_permission_check",
+    "missing_failure_event": "manual_review_missing_failure_event",
+}
+_SAFE_RECOVERY_STRATEGIES = frozenset(_RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.values())
+_SAFE_OBSERVER_RECOMMENDATIONS = frozenset(
+    {
+        "switch_to_available_model_and_retry",
+        "retry_with_fallback_or_reassign_model",
+        "pause_for_scheduler_review",
+        "preserve_outputs_and_retry_scope",
+        "watch_retry_budget_before_requeue",
+        "compact_context_before_next_model_call",
+    }
+)
+_SAFE_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
+_REPAIR_PROPOSAL_FIELDS = frozenset(
+    {
+        "kind",
+        "title",
+        "summary",
+        "repair_action",
+        "failure_kind",
+        "source_run_id",
+        "source_event_sequence",
+        "attempt",
+        "max_attempts",
+        "instruction",
+        "requires_approval",
+        "replay_safe",
+        "automatic_execution",
+        "fingerprint",
+        "recovery_strategy",
+        "orchestration_recovery_hint",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +115,8 @@ class SelfRepairDecision:
     attempt: int
     max_attempts: int
     skip_reason: str | None = None
+    recovery_strategy: str | None = None
+    orchestration_recovery_hint: str | None = None
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
         return SelfRepairDecision(
@@ -93,6 +135,8 @@ class SelfRepairDecision:
             attempt=self.attempt,
             max_attempts=self.max_attempts,
             skip_reason=self.skip_reason,
+            recovery_strategy=self.recovery_strategy,
+            orchestration_recovery_hint=self.orchestration_recovery_hint,
         )
 
     def to_event(self, *, run_id: UUID, sequence: int) -> RunEvent:
@@ -115,12 +159,16 @@ class SelfRepairDecision:
             payload["mode"] = self.mode.value
         if self.skip_reason is not None:
             payload["skip_reason"] = self.skip_reason
+        if self.recovery_strategy is not None:
+            payload["recovery_strategy"] = self.recovery_strategy
+        if self.orchestration_recovery_hint is not None:
+            payload["orchestration_recovery_hint"] = self.orchestration_recovery_hint
         return RunEvent(kind=self.kind, sequence=sequence, run_id=run_id, payload=payload)
 
     def to_proposal(self, *, run_id: UUID) -> dict[str, object] | None:
         if self.kind != "repair.classified":
             return None
-        return {
+        proposal: dict[str, object] = {
             "kind": "self_repair",
             "title": "受控自修复建议",
             "summary": "运行失败已分类，可在审批后创建一次受控修复重试。",
@@ -136,6 +184,11 @@ class SelfRepairDecision:
             "automatic_execution": False,
             "fingerprint": self.fingerprint,
         }
+        if self.recovery_strategy is not None:
+            proposal["recovery_strategy"] = self.recovery_strategy
+        if self.orchestration_recovery_hint is not None:
+            proposal["orchestration_recovery_hint"] = self.orchestration_recovery_hint
+        return proposal
 
 
 def classify_terminal_run(
@@ -152,6 +205,8 @@ def classify_terminal_run(
     source_kind = "run.failed" if failure is None else _kind_text(failure.kind)
     source_sequence = 0 if failure is None else failure.sequence
     failure_category = "missing_failure_event" if failure is None else _failure_category(failure)
+    recovery_strategy = _recovery_strategy(failure_category=failure_category, events=events)
+    orchestration_recovery_hint = _orchestration_recovery_hint(events)
     fingerprint = _fingerprint(
         status=status,
         mode=mode,
@@ -171,6 +226,8 @@ def classify_terminal_run(
             attempt=1,
             max_attempts=policy.max_attempts,
             skip_reason="recursive_self_repair",
+            recovery_strategy=recovery_strategy,
+            orchestration_recovery_hint=orchestration_recovery_hint,
         )
     if failure_category == "outcome_uncertain":
         return _skipped_decision(
@@ -185,6 +242,8 @@ def classify_terminal_run(
             max_attempts=policy.max_attempts,
             skip_reason="side_effect_outcome_uncertain",
             severity="warning",
+            recovery_strategy=recovery_strategy,
+            orchestration_recovery_hint=orchestration_recovery_hint,
         )
     return SelfRepairDecision(
         kind="repair.classified",
@@ -201,6 +260,8 @@ def classify_terminal_run(
         automatic_execution=False,
         attempt=1,
         max_attempts=policy.max_attempts,
+        recovery_strategy=recovery_strategy,
+        orchestration_recovery_hint=orchestration_recovery_hint,
     )
 
 
@@ -217,6 +278,8 @@ def _skipped_decision(
     max_attempts: int,
     skip_reason: str,
     severity: str = "info",
+    recovery_strategy: str | None = None,
+    orchestration_recovery_hint: str | None = None,
 ) -> SelfRepairDecision:
     return SelfRepairDecision(
         kind="repair.skipped",
@@ -234,6 +297,8 @@ def _skipped_decision(
         attempt=attempt,
         max_attempts=max_attempts,
         skip_reason=skip_reason,
+        recovery_strategy=recovery_strategy,
+        orchestration_recovery_hint=orchestration_recovery_hint,
     )
 
 
@@ -248,7 +313,7 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         minimum=attempt,
         maximum=3,
     )
-    return {
+    context: dict[str, object] = {
         "schema_version": 1,
         "source": "self_repair",
         "source_run_id": _safe_text(proposal.get("source_run_id"), default="unknown"),
@@ -274,6 +339,34 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         "requires_approval": True,
         "automatic_execution": False,
     }
+    recovery_strategy = _safe_optional_text(
+        proposal.get("recovery_strategy"),
+        allowed=_SAFE_RECOVERY_STRATEGIES | _SAFE_OBSERVER_RECOMMENDATIONS,
+    )
+    orchestration_recovery_hint = _safe_optional_text(
+        proposal.get("orchestration_recovery_hint"),
+        allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS,
+    )
+    if recovery_strategy is not None:
+        context["recovery_strategy"] = recovery_strategy
+    if orchestration_recovery_hint is not None:
+        context["orchestration_recovery_hint"] = orchestration_recovery_hint
+    return context
+
+
+def repair_proposal_projection(proposal: Mapping[str, object] | None) -> dict[str, JsonValue] | None:
+    """Project only safe, UI-facing self-repair proposal metadata."""
+
+    if not proposal:
+        return None
+    safe: dict[str, JsonValue] = {}
+    for key, value in proposal.items():
+        if key not in _REPAIR_PROPOSAL_FIELDS:
+            continue
+        converted = _repair_proposal_projection_value(key, value)
+        if converted is not None:
+            safe[key] = converted
+    return safe or None
 
 
 def _repair_instruction(failure_category: str) -> str:
@@ -308,6 +401,57 @@ def _safe_int(
     if type(value) is int:
         return min(max(value, minimum), maximum)
     return default
+
+
+def _safe_optional_text(value: object, *, allowed: frozenset[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())[:128]
+    return text if text in allowed else None
+
+
+def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | None:
+    if key == "recovery_strategy":
+        return _safe_optional_text(
+            value,
+            allowed=_SAFE_RECOVERY_STRATEGIES | _SAFE_OBSERVER_RECOMMENDATIONS,
+        )
+    if key == "orchestration_recovery_hint":
+        return _safe_optional_text(value, allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS)
+    if isinstance(value, str | int | float | bool):
+        return value
+    return None
+
+
+def _recovery_strategy(*, failure_category: str, events: Sequence[RunEvent]) -> str | None:
+    for event in reversed(events):
+        if _kind_text(event.kind) != "observer.notice":
+            continue
+        recommendation = _safe_optional_text(
+            event.payload.get("recommendation"),
+            allowed=_SAFE_OBSERVER_RECOMMENDATIONS,
+        )
+        if recommendation is not None:
+            return recommendation
+    return _RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.get(failure_category)
+
+
+def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
+    for event in reversed(events):
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        protocol = plan.get("orchestration_protocol")
+        if not isinstance(protocol, Mapping):
+            continue
+        hints = protocol.get("recovery_hints")
+        if not isinstance(hints, Sequence) or isinstance(hints, str | bytes):
+            continue
+        for hint in hints:
+            safe_hint = _safe_optional_text(hint, allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS)
+            if safe_hint is not None:
+                return safe_hint
+    return None
 
 
 def _already_classified(events: Sequence[RunEvent]) -> bool:

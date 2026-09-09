@@ -596,6 +596,8 @@ const RepairProposalSchema = z.object({
   replay_safe: z.boolean(),
   automatic_execution: z.boolean(),
   fingerprint: z.string(),
+  recovery_strategy: z.string().optional(),
+  orchestration_recovery_hint: z.string().optional(),
 });
 const SubmittedRunSchema = z.object({
   id: z.string(),

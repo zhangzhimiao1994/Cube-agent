@@ -1426,6 +1426,7 @@ class RunService:
                         run_id=run_id,
                         event=observer_event,
                     )
+                    observed_events.append(observer_event)
                     scheduler_notice_payloads.append(dict(observer_event.payload))
                     sequence += 1
         if (
@@ -2063,7 +2064,7 @@ def _self_repair_execution_payload(
         attempt,
         3,
     )
-    return {
+    payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "source": "self_repair",
         "status": status.value,
@@ -2090,6 +2091,16 @@ def _self_repair_execution_payload(
         "requires_approval": True,
         "automatic_execution": False,
     }
+    recovery_strategy = _bounded_optional_text(repair.get("recovery_strategy"), 128)
+    orchestration_recovery_hint = _bounded_optional_text(
+        repair.get("orchestration_recovery_hint"),
+        128,
+    )
+    if recovery_strategy is not None:
+        payload["recovery_strategy"] = recovery_strategy
+    if orchestration_recovery_hint is not None:
+        payload["orchestration_recovery_hint"] = orchestration_recovery_hint
+    return payload
 
 
 def _bounded_text(value: object, default: str, max_chars: int) -> str:
@@ -2097,6 +2108,13 @@ def _bounded_text(value: object, default: str, max_chars: int) -> str:
         return default
     text = " ".join(value.split())[:max_chars]
     return text or default
+
+
+def _bounded_optional_text(value: object, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())[:max_chars]
+    return text or None
 
 
 def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:

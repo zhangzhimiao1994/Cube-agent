@@ -2140,6 +2140,8 @@ def test_repair_proposal_projects_allowlisted_safe_metadata_only() -> None:
                 "attempt": 1,
                 "max_attempts": 1,
                 "instruction": "只执行一次受控修复。",
+                "recovery_strategy": "switch_to_available_model_and_retry",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
                 "requires_approval": True,
                 "replay_safe": False,
                 "automatic_execution": False,
@@ -2163,6 +2165,8 @@ def test_repair_proposal_projects_allowlisted_safe_metadata_only() -> None:
         "attempt": 1,
         "max_attempts": 1,
         "instruction": "只执行一次受控修复。",
+        "recovery_strategy": "switch_to_available_model_and_retry",
+        "orchestration_recovery_hint": "retry_blocked_contract_chain",
         "requires_approval": True,
         "replay_safe": False,
         "automatic_execution": False,
@@ -2171,6 +2175,38 @@ def test_repair_proposal_projects_allowlisted_safe_metadata_only() -> None:
     assert "private-token" not in serialized
     assert "private output" not in serialized
     assert "hidden prompt" not in serialized
+
+
+def test_repair_proposal_drops_unknown_recovery_metadata_values() -> None:
+    proposal = _repair_proposal(
+        {
+            "repair_proposal": {
+                "kind": "self_repair",
+                "title": "controlled repair",
+                "summary": "failed run was classified",
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "runtime_failure",
+                "source_run_id": "run_1",
+                "source_event_sequence": 2,
+                "attempt": 1,
+                "max_attempts": 1,
+                "instruction": "只执行一次受控修复。",
+                "recovery_strategy": "secret://model-provider-token",
+                "orchestration_recovery_hint": "dump_private_context",
+                "requires_approval": True,
+                "replay_safe": False,
+                "automatic_execution": False,
+                "fingerprint": "a" * 64,
+            }
+        }
+    )
+
+    serialized = json.dumps(proposal, ensure_ascii=False)
+    assert proposal is not None
+    assert "recovery_strategy" not in proposal
+    assert "orchestration_recovery_hint" not in proposal
+    assert "secret://model-provider-token" not in serialized
+    assert "dump_private_context" not in serialized
 
 
 def test_run_detail_response_exposes_tool_lifecycle_without_raw_payloads() -> None:

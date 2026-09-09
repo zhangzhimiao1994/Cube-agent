@@ -11,7 +11,11 @@ import pytest
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.self_repair import SelfRepairPolicy, repair_context_from_proposal
+from agent_hub.runs.self_repair import (
+    SelfRepairPolicy,
+    classify_terminal_run,
+    repair_context_from_proposal,
+)
 from agent_hub.runs.service import HermesRunOutcome, RunService
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -920,6 +924,7 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
     assert repair.payload["source_kind"] == "runtime.failed"
     assert repair.payload["source_sequence"] == 2
     assert repair.payload["failure_category"] == "capacity_pressure"
+    assert repair.payload["recovery_strategy"] == "switch_to_available_model_and_retry"
     assert repair.payload["requires_approval"] is True
     assert repair.payload["automatic_execution"] is False
     assert len(str(repair.payload["fingerprint"])) == 64
@@ -938,6 +943,7 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
         "attempt": 1,
         "max_attempts": 1,
         "instruction": "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。",
+        "recovery_strategy": "switch_to_available_model_and_retry",
         "requires_approval": True,
         "replay_safe": False,
         "automatic_execution": False,
@@ -993,6 +999,60 @@ async def test_execute_classifies_empty_model_response_for_controlled_retry() ->
     assert "hybrid dispatch failed" not in closure_text
     assert "secret" not in closure_text
     assert repository.artifacts == [closure_artifact]
+
+
+def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_STARTED,
+                sequence=1,
+                run_id=run_id,
+                actor="main_agent",
+                step_id="main_agent_plan",
+                payload={
+                    "model_execution_plan": {
+                        "orchestration_protocol": {
+                            "protocol": "role_handoff_contract_v1",
+                            "status": "blocked",
+                            "role_count": 3,
+                            "handoff_count": 2,
+                            "contract_count": 2,
+                            "blocked_contract_count": 1,
+                            "recovery_hints": (
+                                "retry_blocked_contract_chain",
+                                "read secret://token",
+                            ),
+                            "truncated": False,
+                        }
+                    }
+                },
+            ),
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=2,
+                run_id=run_id,
+                actor="final_synthesizer",
+                step_id="final_response_step",
+                reason="role handoff failed",
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    repair_event = decision.to_event(run_id=run_id, sequence=3)
+    proposal = decision.to_proposal(run_id=run_id)
+    assert repair_event.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert "secret" not in repr(repair_event.payload)
+    assert proposal is not None
+    assert proposal["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert "secret" not in repr(proposal)
 
 
 @pytest.mark.asyncio
@@ -1253,6 +1313,10 @@ async def test_accept_self_repair_requeues_failed_run_with_recursion_guard() -> 
     assert repository.row.routing_decision["self_repair_max_attempts"] == 1
     assert isinstance(repository.row.routing_decision["self_repair_context"], dict)
     assert repository.row.routing_decision["self_repair_context"]["source"] == "self_repair"
+    assert (
+        repository.row.routing_decision["self_repair_context"]["recovery_strategy"]
+        == "switch_to_available_model_and_retry"
+    )
 
 
 @pytest.mark.asyncio
@@ -1300,6 +1364,7 @@ async def test_accepted_self_repair_run_records_bounded_execution_audit() -> Non
     assert isinstance(repair_context, dict)
     assert repair_context["source"] == "self_repair"
     assert repair_context["automatic_execution"] is False
+    assert repair_context["recovery_strategy"] == "switch_to_available_model_and_retry"
 
 
 @pytest.mark.asyncio

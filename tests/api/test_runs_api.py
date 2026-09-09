@@ -382,6 +382,8 @@ class StubRunService:
                 "kind": "self_repair",
                 "repair_action": "draft_repair_proposal",
                 "failure_kind": "runtime_failure",
+                "recovery_strategy": "switch_to_available_model_and_retry",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
                 "automatic_execution": False,
             },
         )
@@ -1190,6 +1192,8 @@ def test_accept_self_repair_queues_failed_run_safely() -> None:
     assert body["mode"] == "dispatch"
     assert body["repair_proposal"]["kind"] == "self_repair"
     assert body["repair_proposal"]["automatic_execution"] is False
+    assert body["repair_proposal"]["recovery_strategy"] == "switch_to_available_model_and_retry"
+    assert body["repair_proposal"]["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
 
 
 def test_approve_capability_queues_waiting_run_safely() -> None:
@@ -1271,6 +1275,8 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
                 "attempt": 1,
                 "max_attempts": 1,
                 "instruction": "只执行一次受控修复。",
+                "recovery_strategy": "switch_to_available_model_and_retry",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
                 "requires_approval": True,
                 "replay_safe": False,
                 "automatic_execution": False,
@@ -1286,10 +1292,52 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
     assert payload["repair_proposal"]["attempt"] == 1
     assert payload["repair_proposal"]["max_attempts"] == 1
     assert payload["repair_proposal"]["instruction"] == "只执行一次受控修复。"
+    assert payload["repair_proposal"]["recovery_strategy"] == "switch_to_available_model_and_retry"
+    assert payload["repair_proposal"]["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert "command" not in payload["repair_proposal"]
     assert "stdout" not in payload["repair_proposal"]
     assert "private-token" not in json.dumps(payload, ensure_ascii=False)
     assert "private output" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_submitted_run_response_drops_unknown_self_repair_recovery_metadata() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+
+    response = SubmittedRunResponse.from_submitted(
+        SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=5,
+            repair_proposal={
+                "kind": "self_repair",
+                "title": "受控自修复建议",
+                "summary": "运行失败已分类，可在审批后创建一次受控修复重试。",
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "runtime_failure",
+                "source_run_id": str(run_id),
+                "source_event_sequence": 2,
+                "attempt": 1,
+                "max_attempts": 1,
+                "instruction": "只执行一次受控修复。",
+                "recovery_strategy": "secret://model-provider-token",
+                "orchestration_recovery_hint": "dump_private_context",
+                "requires_approval": True,
+                "replay_safe": False,
+                "automatic_execution": False,
+                "fingerprint": "a" * 64,
+            },
+        )
+    )
+
+    payload = response.model_dump(mode="json")
+    assert "recovery_strategy" not in payload["repair_proposal"]
+    assert "orchestration_recovery_hint" not in payload["repair_proposal"]
+    assert "secret://model-provider-token" not in json.dumps(payload, ensure_ascii=False)
+    assert "dump_private_context" not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_viewer_can_read_but_cannot_create_or_control_runs() -> None:

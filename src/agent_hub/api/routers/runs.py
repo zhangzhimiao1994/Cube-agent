@@ -26,6 +26,7 @@ from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound
+from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 from agent_hub.runs.workspace import REQUESTED_PERMISSIONS, SANDBOX_PROFILES, workspace_selection
 
@@ -372,25 +373,8 @@ class RunEventsResponse(BaseModel):
 
 
 def _repair_proposal_response(proposal: dict[str, object] | None) -> dict[str, object] | None:
-    if not proposal:
-        return None
-    allowed = {
-        "kind",
-        "title",
-        "summary",
-        "repair_action",
-        "failure_kind",
-        "source_run_id",
-        "source_event_sequence",
-        "attempt",
-        "max_attempts",
-        "instruction",
-        "requires_approval",
-        "replay_safe",
-        "automatic_execution",
-        "fingerprint",
-    }
-    return {key: value for key, value in proposal.items() if key in allowed}
+    projected = repair_proposal_projection(proposal)
+    return None if projected is None else dict(projected)
 
 
 class AttachmentUploadResponse(BaseModel):

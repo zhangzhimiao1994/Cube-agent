@@ -36,6 +36,12 @@ def self_repair_context_text(
             "Run one bounded repair attempt, then stop.",
             _MAX_INSTRUCTION_CHARS,
         ),
+        "recovery_strategy": _safe_text(repair.get("recovery_strategy"), "", 128),
+        "orchestration_recovery_hint": _safe_text(
+            repair.get("orchestration_recovery_hint"),
+            "",
+            128,
+        ),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > _MAX_TOTAL_BYTES:

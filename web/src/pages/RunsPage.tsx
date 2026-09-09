@@ -1550,6 +1550,8 @@ function repairProposalBody(proposal: RepairProposal) {
     `修复动作：${proposal.repair_action}`,
     `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
     proposal.instruction ? `受控指令：${proposal.instruction}` : "",
+    proposal.recovery_strategy ? `恢复策略：${proposal.recovery_strategy}` : "",
+    proposal.orchestration_recovery_hint ? `角色交接恢复：${proposal.orchestration_recovery_hint}` : "",
     proposal.automatic_execution
       ? "该修复提案标记为自动执行。"
       : "不会自动执行；只有确认后才会重新排队一次。",

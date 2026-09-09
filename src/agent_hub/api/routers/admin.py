@@ -96,6 +96,7 @@ from agent_hub.plugins.contracts import (
 )
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
+from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import (
     is_legacy_generic_failure_reason,
@@ -11003,26 +11004,7 @@ def _repair_proposal(
     proposal = routing_decision.get("repair_proposal")
     if not isinstance(proposal, dict):
         return None
-    allowed = {
-        "kind",
-        "title",
-        "summary",
-        "repair_action",
-        "failure_kind",
-        "source_run_id",
-        "source_event_sequence",
-        "attempt",
-        "max_attempts",
-        "instruction",
-        "requires_approval",
-        "replay_safe",
-        "automatic_execution",
-        "fingerprint",
-    }
-    safe = _safe_proposal_json_mapping(
-        {key: value for key, value in proposal.items() if key in allowed}
-    )
-    return safe or None
+    return repair_proposal_projection(proposal)
 
 
 def _schedule_proposal(

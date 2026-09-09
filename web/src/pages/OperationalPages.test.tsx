@@ -778,6 +778,8 @@ describe("operational management pages", () => {
                 attempt: 1,
                 max_attempts: 1,
                 instruction: "只执行一次受控修复。",
+                recovery_strategy: "switch_to_available_model_and_retry",
+                orchestration_recovery_hint: "retry_blocked_contract_chain",
                 requires_approval: true,
                 replay_safe: false,
                 automatic_execution: false,
@@ -2950,6 +2952,8 @@ describe("operational management pages", () => {
     expect(within(card).getByText(/runtime_failure/)).not.toBeNull();
     expect(within(card).getByText(/第 1\/1 次/)).not.toBeNull();
     expect(within(card).getByText(/只执行一次受控修复/)).not.toBeNull();
+    expect(within(card).getByText(/switch_to_available_model_and_retry/)).not.toBeNull();
+    expect(within(card).getByText(/retry_blocked_contract_chain/)).not.toBeNull();
     expect(within(card).getByText(/不会自动执行/)).not.toBeNull();
   });
   it("accepts a self-repair proposal with the run decision token", async () => {
