@@ -76,6 +76,7 @@ type ObserverNotice = {
   trigger: string;
   action: string;
   severity: string;
+  recommendation: string | null;
   sourceKind: string | null;
   sourceSequence: number | null;
   actor: string | null;
@@ -187,6 +188,15 @@ const OBSERVER_SEVERITY_LABELS: Record<string, string> = {
   info: "提示",
   warning: "警告",
   error: "错误",
+};
+
+const OBSERVER_RECOMMENDATION_LABELS: Record<string, string> = {
+  switch_to_available_model_and_retry: "恢复建议：切换到有容量的同类模型，保留已有产物后重试。",
+  retry_with_fallback_or_reassign_model: "恢复建议：重试空响应步骤，必要时切换备用模型或改派角色。",
+  pause_for_scheduler_review: "恢复建议：暂停自动重试，先复核调度策略和失败集中点。",
+  preserve_outputs_and_retry_scope: "恢复建议：保留已有产物，只缩小重试失败阶段。",
+  watch_retry_budget_before_requeue: "恢复建议：继续观察重试预算，超出后再改派或暂停。",
+  compact_context_before_next_model_call: "恢复建议：下次模型调用前压缩上下文，避免长上下文继续放大失败。",
 };
 
 const RUN_STATUS_LABELS: Record<string, string> = {
@@ -402,9 +412,10 @@ function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
         trigger,
         action,
         severity,
+        recommendation: observerRecommendationLabel(payloadString(event.payload, "recommendation")),
         sourceKind: payloadString(event.payload, "source_kind"),
         sourceSequence: payloadNumber(event.payload, "source_sequence"),
-        actor: event.actor ?? null,
+        actor: displayDetailActor(payloadString(event.payload, "actor") ?? event.actor),
         failureEvents: payloadNumber(event.payload, "failure_events"),
         retryEvents: payloadNumber(event.payload, "retry_events"),
         messageEvents: payloadNumber(event.payload, "message_events"),
@@ -424,6 +435,11 @@ function observerActionLabel(action: string) {
 
 function observerSeverityLabel(severity: string) {
   return OBSERVER_SEVERITY_LABELS[severity] ?? severity;
+}
+
+function observerRecommendationLabel(recommendation: string | null) {
+  if (!recommendation) return null;
+  return OBSERVER_RECOMMENDATION_LABELS[recommendation] ?? null;
 }
 
 function displayDetailEventKind(kind: string) {
@@ -2072,6 +2088,7 @@ export function RunDetailPage() {
                   <small>来源：{observerSourceLabel(notice.sourceKind)} #{notice.sourceSequence}</small>
                 ) : null}
                 {notice.actor ? <small>角色：{notice.actor}</small> : null}
+                {notice.recommendation ? <small>{notice.recommendation}</small> : null}
                 <small>
                   运行信号：失败 {notice.failureEvents ?? 0} / 重试 {notice.retryEvents ?? 0} / 消息 {notice.messageEvents ?? 0} / 产物 {notice.artifactEvents ?? 0}
                 </small>

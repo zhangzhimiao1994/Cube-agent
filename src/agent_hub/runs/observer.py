@@ -28,6 +28,14 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
         "empty model response",
     }
 )
+_RECOMMENDATIONS = {
+    "model_capacity_pressure": "switch_to_available_model_and_retry",
+    "empty_model_response": "retry_with_fallback_or_reassign_model",
+    "repeated_failure": "pause_for_scheduler_review",
+    "runtime_failure": "preserve_outputs_and_retry_scope",
+    "step_retrying": "watch_retry_budget_before_requeue",
+    "context_compaction_recommended": "compact_context_before_next_model_call",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +66,7 @@ class ObserverDecision:
     trigger: str
     action: str
     severity: str
+    recommendation: str
     source_kind: str
     source_sequence: int
     counters: Mapping[str, int]
@@ -69,6 +78,7 @@ class ObserverDecision:
             "trigger": self.trigger,
             "action": self.action,
             "severity": self.severity,
+            "recommendation": self.recommendation,
             "source_kind": self.source_kind,
             "source_sequence": self.source_sequence,
             "event_count": self.counters.get("events", 0),
@@ -158,6 +168,7 @@ class RunMonitor:
             trigger=trigger,
             action=action,
             severity=severity,
+            recommendation=_RECOMMENDATIONS[trigger],
             source_kind=_event_kind_text(event.kind),
             source_sequence=event.sequence,
             counters=self._counters(),

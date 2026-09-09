@@ -2033,6 +2033,7 @@ describe("operational management pages", () => {
           payload: {
             trigger: "model_capacity_pressure",
             action: "reschedule_or_reassign_model",
+            recommendation: "switch_to_available_model_and_retry",
             severity: "warning",
             source_kind: "step.failed",
             source_sequence: 4,
@@ -2051,6 +2052,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "调度观察" })).not.toBeNull();
     expect(screen.getByText("模型容量拥堵")).not.toBeNull();
     expect(screen.getByText("建议改派模型或重新调度")).not.toBeNull();
+    expect(screen.getByText("恢复建议：切换到有容量的同类模型，保留已有产物后重试。")).not.toBeNull();
     expect(screen.getByText(/来源：执行步骤 #4/)).not.toBeNull();
     expect(screen.queryByText("null")).toBeNull();
   });

@@ -339,6 +339,85 @@ describe("RunDetailPage", () => {
     ]);
   });
 
+  it("shows safe observer recommendations from payload metadata", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "observer.notice",
+          message: "observer.notice",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: null,
+          participants: [],
+          step_id: null,
+          payload: {
+            trigger: "model_capacity_pressure",
+            action: "reschedule_or_reassign_model",
+            severity: "warning",
+            recommendation: "switch_to_available_model_and_retry",
+            source_kind: "step.failed",
+            source_sequence: 4,
+            failure_events: 1,
+            retry_events: 0,
+            message_events: 3,
+            artifact_events: 1,
+            actor: "planner",
+          },
+        },
+        {
+          sequence: 9,
+          kind: "observer.notice",
+          message: "observer.notice",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: null,
+          participants: [],
+          step_id: null,
+          payload: {
+            trigger: "runtime_failure",
+            action: "preserve_partial_outputs",
+            severity: "info",
+            recommendation: "raw_unknown_recommendation_should_not_render",
+            source_kind: "runtime.failed",
+            source_sequence: 5,
+            failure_events: 2,
+            retry_events: 0,
+            message_events: 3,
+            artifact_events: 1,
+            actor: "main_agent",
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const observerHeading = await screen.findByRole("heading", { name: "调度观察" });
+    const observerArticle = observerHeading.closest("article") as HTMLElement;
+    expect(within(observerArticle).getByText("恢复建议：切换到有容量的同类模型，保留已有产物后重试。")).not.toBeNull();
+    expect(within(observerArticle).getByText("角色：planner")).not.toBeNull();
+    expect(within(observerArticle).getByText("角色：主 Agent")).not.toBeNull();
+    expect(screen.queryByText(/raw_unknown_recommendation_should_not_render/)).toBeNull();
+  });
+
   it("renders model outcome summary without capacity internals", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {

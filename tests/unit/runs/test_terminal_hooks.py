@@ -884,6 +884,7 @@ async def test_execute_persists_observer_notice_for_capacity_pressure() -> None:
     assert notice.sequence == 3
     assert notice.payload["trigger"] == "model_capacity_pressure"
     assert notice.payload["action"] == "reschedule_or_reassign_model"
+    assert notice.payload["recommendation"] == "switch_to_available_model_and_retry"
     assert notice.payload["source_sequence"] == 1
     assert "message" not in notice.payload
     assert "prompt" not in notice.payload
@@ -1379,6 +1380,7 @@ async def test_execute_records_observer_notices_in_hermes_scheduler_outcome() ->
             "trigger": "model_capacity_pressure",
             "action": "reschedule_or_reassign_model",
             "severity": "warning",
+            "recommendation": "switch_to_available_model_and_retry",
             "source_kind": "step.failed",
             "source_sequence": 1,
             "event_count": 1,
