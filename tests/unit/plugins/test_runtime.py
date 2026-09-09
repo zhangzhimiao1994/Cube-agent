@@ -1040,6 +1040,101 @@ async def test_runtime_plugin_service_can_invoke_registered_package_adapter_runn
     assert runner.calls[0][0].root == artifact_root
 
 
+async def test_runtime_plugin_service_invokes_allowlisted_package_adapter_through_subprocess(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    entrypoint = artifact_root / "adapter" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text(
+        "import json\n"
+        "import sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "json.dump({\n"
+        "    'remote_id': 'evt_' + payload['arguments']['title'],\n"
+        "    'actor': payload['context']['actor'],\n"
+        "    'zone': payload['resource_config']['zone'],\n"
+        "    'mode': payload['capability_config']['mode'],\n"
+        "}, sys.stdout)\n"
+    )
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+                resource_config={"zone": "utc"},
+                capability_config={"mode": "smoke"},
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "remote_id": {"type": "string"},
+                        "actor": {"type": "string"},
+                        "zone": {"type": "string"},
+                        "mode": {"type": "string"},
+                    },
+                    "required": ("remote_id", "actor", "zone", "mode"),
+                    "additionalProperties": False,
+                },
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters=build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            python_executable=sys.executable,
+            timeout_seconds=2,
+        ),
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result == {
+        "remote_id": "evt_review",
+        "actor": "scheduler",
+        "zone": "utc",
+        "mode": "smoke",
+    }
+    assert admin_service.audit_events == [
+        {
+            "actor": "scheduler",
+            "action": "plugin.invoke.succeeded",
+            "resource": "plugin:calendar:calendar.create_event",
+            "details": {
+                "plugin_id": "calendar",
+                "capability_id": "calendar.create_event",
+                "adapter": "calendar_python",
+                "permission_class": "calendar.write",
+                "sandbox_profile": "in_process",
+                "replay_safe": False,
+                "run_id": str(TENANT_ID),
+                "user_id": str(TENANT_ID),
+                "idempotency_key": "plugin_1",
+            },
+        }
+    ]
+    assert "review" not in repr(admin_service.audit_events)
+
+
 async def test_runtime_plugin_service_rejects_package_adapter_result_that_violates_output_schema(
     tmp_path: Path,
 ) -> None:
