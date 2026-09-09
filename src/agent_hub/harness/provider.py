@@ -46,7 +46,7 @@ class ProviderStreamDelta:
 
 @dataclass(frozen=True, slots=True)
 class NormalizedProviderEvent:
-    kind: Literal["model.reasoning_delta", "model.text_delta", "tool.requested"]
+    kind: Literal["model.reasoning_delta", "model.text_delta", "model.fallback", "tool.requested"]
     payload: Mapping[str, JsonValue] = field(repr=False)
 
     def __post_init__(self) -> None:

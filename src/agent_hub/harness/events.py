@@ -9,7 +9,7 @@ from uuid import UUID
 from agent_hub.harness.provider import NormalizedProviderEvent
 from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ToolCall
+from agent_hub.models.types import ToolCall, _require_safe_identifier
 from agent_hub.runtime.contracts import RunEvent
 
 _SENSITIVE_TEXT = re.compile(
@@ -19,6 +19,14 @@ _SENSITIVE_TEXT = re.compile(
 _MAX_PROFILE_ITEMS = 6
 _MAX_PROFILE_TEXT = 160
 _PUBLIC_DELTA_PHASES = frozenset({"analysis", "draft", "final"})
+_PUBLIC_FALLBACK_REASONS = frozenset(
+    {
+        "capacity_unavailable",
+        "empty_response",
+        "gateway_retryable",
+        "transport_retryable",
+    }
+)
 
 
 def provider_events_to_run_events(
@@ -33,11 +41,14 @@ def provider_events_to_run_events(
     for event in events:
         if not isinstance(event, NormalizedProviderEvent):
             raise TypeError("provider events must be NormalizedProviderEvent values")
+        payload = _provider_event_payload(event)
+        if event.kind == "model.fallback" and not payload:
+            continue
         yield RunEvent(
             kind=event.kind,
             sequence=sequence,
             run_id=run_id,
-            payload=_provider_event_payload(event),
+            payload=payload,
         )
         sequence += 1
 
@@ -164,6 +175,8 @@ def _safe_fallback_candidates(value: object) -> tuple[Mapping[str, str], ...]:
 def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:
     if event.kind in {"model.text_delta", "model.reasoning_delta"}:
         return _provider_delta_payload(event)
+    if event.kind == "model.fallback":
+        return _provider_fallback_payload(event)
     if event.kind != "tool.requested":
         return event.payload
     identifier = _safe_text(event.payload.get("id"))
@@ -188,6 +201,56 @@ def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, Json
         "redacted_argument_key_count": len(argument_keys) - len(safe_argument_keys),
         "argument_bytes": len(canonical_arguments),
     }
+
+
+def _provider_fallback_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:
+    from_logical_model = _safe_identifier(event.payload.get("from_logical_model"))
+    to_logical_model = _safe_identifier(event.payload.get("to_logical_model"))
+    reason = _safe_identifier(event.payload.get("reason"))
+    attempted_logical_models = _safe_identifier_tuple(
+        event.payload.get("attempted_logical_models")
+    )
+    if (
+        from_logical_model is None
+        or to_logical_model is None
+        or reason not in _PUBLIC_FALLBACK_REASONS
+        or not attempted_logical_models
+    ):
+        return {}
+    return {
+        "schema_version": 1,
+        "phase": "attempted",
+        "from_logical_model": from_logical_model,
+        "to_logical_model": to_logical_model,
+        "reason": reason,
+        "attempted_logical_models": attempted_logical_models,
+    }
+
+
+def _safe_identifier(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    if _SENSITIVE_TEXT.search(value):
+        return None
+    try:
+        _require_safe_identifier("provider event field", value)
+    except ValueError:
+        return None
+    return value
+
+
+def _safe_identifier_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    result: list[str] = []
+    for item in value:
+        identifier = _safe_identifier(item)
+        if identifier is None:
+            continue
+        result.append(identifier)
+        if len(result) >= _MAX_PROFILE_ITEMS:
+            break
+    return tuple(result)
 
 
 def _provider_delta_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:

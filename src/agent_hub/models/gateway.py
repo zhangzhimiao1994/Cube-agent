@@ -429,7 +429,22 @@ class ModelGateway:
         )
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
-        for _logical_model, candidates in candidate_groups:
+        attempted_logical_models: list[str] = []
+        fallback_from_logical_model: str | None = None
+        fallback_reason: str | None = None
+        for logical_model, candidates in candidate_groups:
+            attempted_logical_models.append(logical_model)
+            if (
+                fallback_from_logical_model is not None
+                and fallback_reason is not None
+                and logical_model != request.logical_model
+            ):
+                yield self._stream_fallback_event(
+                    from_logical_model=fallback_from_logical_model,
+                    to_logical_model=logical_model,
+                    reason=fallback_reason,
+                    attempted_logical_models=attempted_logical_models,
+                )
             try:
                 await capacity.initialize()
                 lease = await capacity.acquire(
@@ -438,6 +453,8 @@ class ModelGateway:
                     estimated_tokens=estimated_tokens,
                 )
             except (CapacityWaitTimeout, CapacityQueueFull):
+                fallback_from_logical_model = logical_model
+                fallback_reason = "capacity_unavailable"
                 continue
             selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
@@ -465,11 +482,15 @@ class ModelGateway:
                     yield event
                 if not yielded:
                     last_retryable_error = ModelGatewayError("model response is empty")
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = _fallback_reason(last_retryable_error)
                     continue
             except (ModelTransportError, ModelGatewayError) as error:
                 if yielded or not _retryable_model_failure(error):
                     raise
                 last_retryable_error = error
+                fallback_from_logical_model = logical_model
+                fallback_reason = _fallback_reason(error)
                 continue
             finally:
                 await cast(Any, events).aclose()
@@ -477,6 +498,28 @@ class ModelGateway:
         if last_retryable_error is not None:
             raise last_retryable_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
+
+    def _stream_fallback_event(
+        self,
+        *,
+        from_logical_model: str,
+        to_logical_model: str,
+        reason: str,
+        attempted_logical_models: Sequence[str],
+    ) -> NormalizedProviderEvent:
+        from agent_hub.harness.provider import NormalizedProviderEvent
+
+        return NormalizedProviderEvent(
+            kind="model.fallback",
+            payload={
+                "schema_version": 1,
+                "phase": "attempted",
+                "from_logical_model": from_logical_model,
+                "to_logical_model": to_logical_model,
+                "reason": reason,
+                "attempted_logical_models": tuple(dict.fromkeys(attempted_logical_models)),
+            },
+        )
 
     def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)

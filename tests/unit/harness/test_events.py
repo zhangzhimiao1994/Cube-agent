@@ -104,6 +104,99 @@ def test_provider_events_project_to_runtime_extension_events_with_sequences() ->
     assert events[0].message is None
 
 
+def test_provider_fallback_event_projection_keeps_only_safe_metadata() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "primary",
+                        "to_logical_model": "backup",
+                        "reason": "transport_retryable",
+                        "attempted_logical_models": ("primary", "backup", "sk-secret"),
+                        "provider_error": "sk-secret should never be projected",
+                    },
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=9,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "sk-secret" not in serialized
+    assert event.kind == "model.fallback"
+    assert event.payload == {
+        "schema_version": 1,
+        "phase": "attempted",
+        "from_logical_model": "primary",
+        "to_logical_model": "backup",
+        "reason": "transport_retryable",
+        "attempted_logical_models": ("primary", "backup"),
+    }
+
+
+def test_provider_fallback_event_projection_rejects_incomplete_or_sensitive_metadata() -> None:
+    events = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "primary",
+                        "to_logical_model": "backup",
+                    },
+                ),
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "primary",
+                        "to_logical_model": "sk-secret",
+                        "reason": "transport_retryable",
+                    },
+                ),
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "user asked about private roadmap",
+                        "to_logical_model": "backup",
+                        "reason": "transport_retryable",
+                        "attempted_logical_models": ("primary", "backup"),
+                    },
+                ),
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "primary",
+                        "to_logical_model": "backup",
+                        "reason": "provider said backup answer",
+                        "attempted_logical_models": ("primary", "backup"),
+                    },
+                ),
+                NormalizedProviderEvent(
+                    kind="model.fallback",
+                    payload={
+                        "schema_version": 1,
+                        "from_logical_model": "primary",
+                        "to_logical_model": "backup",
+                        "reason": "transport_retryable",
+                    },
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=10,
+        )
+    )
+
+    assert events == ()
+
+
 def test_provider_text_delta_projection_does_not_expose_stream_text() -> None:
     (event,) = tuple(
         provider_events_to_run_events(
