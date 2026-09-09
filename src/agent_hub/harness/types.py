@@ -265,6 +265,7 @@ class HarnessPolicy:
     allowed_providers: frozenset[str] = field(default_factory=frozenset)
     denied_providers: frozenset[str] = field(default_factory=frozenset)
     preferred_providers: tuple[str, ...] = ()
+    fallback_policy: Literal["configured", "disabled"] = "configured"
     prefer_low_cost: bool = False
     require_approval_for_sensitive: bool = True
 
@@ -274,6 +275,8 @@ class HarnessPolicy:
         preferred = _safe_provider_tuple("preferred provider", self.preferred_providers)
         if allowed & denied:
             raise ValueError("provider policy is contradictory")
+        if self.fallback_policy not in {"configured", "disabled"}:
+            raise ValueError("fallback_policy must be configured or disabled")
         if type(self.prefer_low_cost) is not bool:
             raise ValueError("prefer_low_cost must be a boolean")
         if type(self.require_approval_for_sensitive) is not bool:

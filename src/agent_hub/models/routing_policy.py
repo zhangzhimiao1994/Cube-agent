@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal, cast
 
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.models.types import Deployment
 
+FallbackExecutionPolicy = Literal["configured", "disabled"]
+
 
 class DeploymentRoutingConstraintError(RuntimeError):
     """Stable failure for unavailable harness deployment constraints."""
+
+
+class FallbackExecutionPolicyError(RuntimeError):
+    """Stable failure for invalid harness fallback execution policy."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +101,30 @@ def constrain_deployments_for_routing(
     return tuple(constrained)
 
 
+def fallback_execution_policy_from_decision(
+    routing_decision: object | None,
+) -> FallbackExecutionPolicy:
+    if not isinstance(routing_decision, Mapping):
+        return "configured"
+    raw_policy = routing_decision.get("harness_policy")
+    if raw_policy is None:
+        return "configured"
+    if not isinstance(raw_policy, Mapping):
+        raise FallbackExecutionPolicyError("invalid fallback execution policy")
+    value = raw_policy.get("fallback_policy")
+    if value is None:
+        return "configured"
+    if isinstance(value, str) and value in {"configured", "disabled"}:
+        return cast(FallbackExecutionPolicy, value)
+    raise FallbackExecutionPolicyError("invalid fallback execution policy")
+
+
 __all__ = [
     "DeploymentRoutingConstraint",
     "DeploymentRoutingConstraintError",
+    "FallbackExecutionPolicy",
+    "FallbackExecutionPolicyError",
     "constrain_deployments_for_routing",
     "deployment_routing_constraint_from_decision",
+    "fallback_execution_policy_from_decision",
 ]

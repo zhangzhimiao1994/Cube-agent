@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
@@ -2306,6 +2306,7 @@ def _harness_policy(routing_decision: Mapping[str, object]) -> HarnessPolicy:
             allowed_providers=_provider_policy_set(raw_policy.get("allowed_providers")),
             denied_providers=_provider_policy_set(raw_policy.get("denied_providers")),
             preferred_providers=_provider_policy_tuple(raw_policy.get("preferred_providers")),
+            fallback_policy=_provider_fallback_policy(raw_policy.get("fallback_policy")),
             prefer_low_cost=_provider_policy_bool(raw_policy.get("prefer_low_cost"), default=False),
             require_approval_for_sensitive=_provider_policy_bool(
                 raw_policy.get("require_approval_for_sensitive"),
@@ -2339,6 +2340,14 @@ def _provider_policy_bool(value: object, *, default: bool) -> bool:
     if type(value) is not bool:
         raise ValueError("provider policy flags must be booleans")
     return value
+
+
+def _provider_fallback_policy(value: object) -> Literal["configured", "disabled"]:
+    if value is None:
+        return "configured"
+    if isinstance(value, str) and value in {"configured", "disabled"}:
+        return cast(Literal["configured", "disabled"], value)
+    raise ValueError("fallback_policy must be configured or disabled")
 
 
 def _routing_requests_vibe_coding(routing_decision: Mapping[str, object]) -> bool:

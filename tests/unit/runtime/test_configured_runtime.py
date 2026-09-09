@@ -33,9 +33,11 @@ from agent_hub.runtime.defaults import (
     UnavailableRuntime,
     _assign_models_to_roles,
     _capability_inventory_payload,
+    _deployment_constraints_payload,
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _model_execution_plan_payload,
     _role_model_routing_matrix_payload,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
@@ -713,6 +715,283 @@ async def test_config_backed_direct_runtime_does_not_fallback_past_harness_selec
 
     assert capacities[0].events == [("deepseek/deepseek-chat",)]
     assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_disables_fallback_from_harness_policy() -> None:
+    transport = FakeTransport()
+    capacities: list[TimeoutCapacity] = []
+
+    async def capacity_factory(
+        tenant_id: UUID,
+        deployments: tuple[Deployment, ...],
+    ) -> TimeoutCapacity:
+        assert tenant_id == TENANT_ID
+        capacity = TimeoutCapacity(deployments)
+        capacities.append(capacity)
+        return capacity
+
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "fallback_model": "backup",
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ],
+                    },
+                    "backup": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=capacity_factory,
+        transport=transport,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="model capacity unavailable"):
+        _ = [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.DIRECT,
+                    request="use explicit harness fallback policy",
+                    routing_decision={
+                        "harness_policy": {
+                            "fallback_policy": "disabled",
+                        }
+                    },
+                )
+            )
+        ]
+
+    assert capacities[0].events == [("deepseek/deepseek-chat",)]
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "routing_decision",
+    (
+        {},
+        {"harness_policy": {"fallback_policy": "configured"}},
+    ),
+)
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_uses_configured_fallback(
+    routing_decision: Mapping[str, JsonValue],
+) -> None:
+    class FailFirstCapacity(ImmediateCapacity):
+        def __init__(self, deployments: tuple[Deployment, ...]) -> None:
+            super().__init__(deployments)
+            self.events: list[tuple[str, ...]] = []
+
+        async def acquire(
+            self,
+            candidates: Sequence[Deployment],
+            wait_timeout: float,
+            *,
+            estimated_tokens: int,
+        ) -> CapacityLease:
+            self.wait_timeouts.append(wait_timeout)
+            self.events.append(tuple(deployment.provider_model for deployment in candidates))
+            assert estimated_tokens > 0
+            if len(self.events) == 1:
+                raise CapacityWaitTimeout("busy")
+            candidate = next(iter(candidates))
+            return CapacityLease(
+                id=str(uuid4()),
+                deployment_id=candidate.id,
+                quota_scope_id=candidate.quota_scope_id,
+                expires_at=datetime.now(UTC) + timedelta(seconds=30),
+                renew_after_seconds=30,
+            )
+
+    transport = FakeTransport()
+    capacities: list[FailFirstCapacity] = []
+
+    async def capacity_factory(
+        tenant_id: UUID,
+        deployments: tuple[Deployment, ...],
+    ) -> FailFirstCapacity:
+        assert tenant_id == TENANT_ID
+        capacity = FailFirstCapacity(deployments)
+        capacities.append(capacity)
+        return capacity
+
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "fallback_model": "backup",
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ],
+                    },
+                    "backup": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=capacity_factory,
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="use configured fallback policy",
+                routing_decision=routing_decision,
+            )
+        )
+    ]
+
+    assert capacities[0].events == [
+        ("deepseek/deepseek-chat",),
+        ("openai/gpt-5.6-sol",),
+    ]
+    assert len(transport.calls) == 1
+    assert transport.calls[0][0].logical_model == "backup"
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.payload["logical_model"] == "backup"
+    assert artifact_event.payload["provider"] == "openai"
+    assert artifact_event.payload["upstream_model"] == "openai/gpt-5.6-sol"
+
+
+def test_model_execution_plan_reports_disabled_harness_fallback_policy() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "main": {
+                    "fallback_model": "backup",
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek_account",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ],
+                },
+                "backup": {
+                    "deployments": [
+                        {
+                            "provider": "openai",
+                            "model": "gpt-5.6-sol",
+                            "api_base": "https://api.openai.com/v1",
+                            "credential_ref": "secret://openai",
+                            "quota_scope_id": "openai_account",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="use explicit harness fallback policy",
+        routing_decision={"harness_policy": {"fallback_policy": "disabled"}},
+    )
+
+    deployment_constraints = _deployment_constraints_payload(
+        config,
+        main_agent_model="main",
+        roles=(),
+        constraint=None,
+        fallback_policy="disabled",
+    )
+    plan = _model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=(),
+        deployment_constraints=deployment_constraints,
+        deployment_constraint=None,
+        fallback_policy="disabled",
+    )
+
+    main_agent = plan["main_agent"]
+    assert isinstance(main_agent, Mapping)
+    assert main_agent["fallback_policy"] == "disabled_by_harness_policy"
+    assert deployment_constraints["items"] == (
+        {
+            "logical_model": "main",
+            "total_deployments": 1,
+            "eligible_deployments": 1,
+            "harness_constrained": False,
+            "selected_provider": None,
+            "selected_model": None,
+            "fallback_policy": "disabled_by_harness_policy",
+        },
+    )
 
 
 @pytest.mark.asyncio

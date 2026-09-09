@@ -7,7 +7,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -34,8 +34,11 @@ from agent_hub.models.routing_matrix import (
 from agent_hub.models.routing_policy import (
     DeploymentRoutingConstraint,
     DeploymentRoutingConstraintError,
+    FallbackExecutionPolicy,
+    FallbackExecutionPolicyError,
     constrain_deployments_for_routing,
     deployment_routing_constraint_from_decision,
+    fallback_execution_policy_from_decision,
 )
 from agent_hub.models.types import Deployment
 from agent_hub.runtime.autogen.adapter import (
@@ -225,6 +228,7 @@ class _PlannedRuntime:
         model_routing_matrix_truncated: bool = False,
         deployment_constraints: Mapping[str, JsonValue] | None = None,
         deployment_constraint: DeploymentRoutingConstraint | None = None,
+        fallback_policy: FallbackExecutionPolicy = "configured",
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self.mode = mode
@@ -236,6 +240,7 @@ class _PlannedRuntime:
         self._model_routing_matrix_truncated = model_routing_matrix_truncated
         self._deployment_constraints = deployment_constraints
         self._deployment_constraint = deployment_constraint
+        self._fallback_policy = fallback_policy
         self._capability_gateway = capability_gateway
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
@@ -263,6 +268,7 @@ class _PlannedRuntime:
                         model_routing_matrix_truncated=self._model_routing_matrix_truncated,
                         deployment_constraints=self._deployment_constraints,
                         deployment_constraint=self._deployment_constraint,
+                        fallback_policy=self._fallback_policy,
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
@@ -339,7 +345,7 @@ class ConfigBackedDirectRuntime:
         if not config.models:
             return UnavailableRuntime(TaskMode.DIRECT)
         try:
-            gateway, logical_model = await _gateway_for_config(
+            gateway, logical_model, _fallback_policy = await _gateway_for_config(
                 config,
                 tenant_id=context.tenant_id,
                 secret_service=self._secret_service,
@@ -405,7 +411,7 @@ class ConfigBackedDispatchRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.DISPATCH)
         try:
-            gateway, logical_model = await _gateway_for_config(
+            gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
                 tenant_id=context.tenant_id,
                 secret_service=self._secret_service,
@@ -479,8 +485,10 @@ class ConfigBackedDispatchRuntime:
                 main_agent_model=logical_model,
                 roles=role_payload,
                 constraint=deployment_constraint,
+                fallback_policy=fallback_policy,
             ),
             deployment_constraint=deployment_constraint,
+            fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
         )
 
@@ -538,7 +546,7 @@ class ConfigBackedDiscussionRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.DISCUSS)
         try:
-            gateway, logical_model = await _gateway_for_config(
+            gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
                 tenant_id=context.tenant_id,
                 secret_service=self._secret_service,
@@ -611,8 +619,10 @@ class ConfigBackedDiscussionRuntime:
                 main_agent_model=logical_model,
                 roles=role_payload,
                 constraint=deployment_constraint,
+                fallback_policy=fallback_policy,
             ),
             deployment_constraint=deployment_constraint,
+            fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
         )
 
@@ -670,7 +680,7 @@ class ConfigBackedHybridRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.HYBRID)
         try:
-            gateway, logical_model = await _gateway_for_config(
+            gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
                 tenant_id=context.tenant_id,
                 secret_service=self._secret_service,
@@ -821,8 +831,10 @@ class ConfigBackedHybridRuntime:
                 main_agent_model=logical_model,
                 roles=role_payload,
                 constraint=deployment_constraint,
+                fallback_policy=fallback_policy,
             ),
             deployment_constraint=deployment_constraint,
+            fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
         )
 
@@ -848,9 +860,13 @@ async def _gateway_for_config(
     capacity_factory: CapacityFactory,
     transport: ModelTransport,
     routing_decision: object | None = None,
-) -> tuple[ModelGateway, str]:
+) -> tuple[ModelGateway, str, FallbackExecutionPolicy]:
     logical_model = _direct_logical_model(config, routing_decision)
     deployments = _deployments(config)
+    try:
+        fallback_policy = fallback_execution_policy_from_decision(routing_decision)
+    except FallbackExecutionPolicyError as error:
+        raise HarnessModelSelectionError(str(error)) from error
     deployment_constraint = _deployment_routing_constraint(config, routing_decision)
     deployments = _constrained_deployments_for_harness_decision(
         deployments,
@@ -861,10 +877,14 @@ async def _gateway_for_config(
         await capacity_factory(tenant_id, deployments),
         TenantSecretResolver(secret_service, tenant_id),
         transport,
-        fallbacks={} if deployment_constraint is not None else _fallbacks(config),
+        fallbacks=(
+            {}
+            if deployment_constraint is not None or fallback_policy == "disabled"
+            else _fallbacks(config)
+        ),
         capacity_wait_timeout=60,
     )
-    return gateway, logical_model
+    return gateway, logical_model, fallback_policy
 
 
 def _constrained_deployments_for_harness_decision(
@@ -1474,12 +1494,24 @@ def _string_or_default(value: object, default: str) -> str:
     return value if isinstance(value, str) and value else default
 
 
+def _fallback_policy_label(
+    constraint: DeploymentRoutingConstraint | None,
+    fallback_policy: FallbackExecutionPolicy,
+) -> Literal["configured", "disabled_by_harness_policy", "disabled_for_harness_selection"]:
+    if constraint is not None:
+        return "disabled_for_harness_selection"
+    if fallback_policy == "disabled":
+        return "disabled_by_harness_policy"
+    return "configured"
+
+
 def _deployment_constraints_payload(
     config: PlatformConfig,
     *,
     main_agent_model: str,
     roles: tuple[Mapping[str, JsonValue], ...],
     constraint: DeploymentRoutingConstraint | None,
+    fallback_policy: FallbackExecutionPolicy = "configured",
 ) -> Mapping[str, JsonValue]:
     logical_models = _logical_models_for_deployment_constraints(
         main_agent_model=main_agent_model,
@@ -1519,11 +1551,7 @@ def _deployment_constraints_payload(
                 "selected_model": (
                     constraint.model if harness_constrained and constraint else None
                 ),
-                "fallback_policy": (
-                    "disabled_for_harness_selection"
-                    if constraint is not None
-                    else "configured"
-                ),
+                "fallback_policy": _fallback_policy_label(constraint, fallback_policy),
             }
         )
     return {
@@ -1571,6 +1599,7 @@ def _model_execution_plan_payload(
     model_routing_matrix_truncated: bool = False,
     deployment_constraints: Mapping[str, JsonValue] | None = None,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
+    fallback_policy: FallbackExecutionPolicy = "configured",
 ) -> Mapping[str, JsonValue]:
     explicit_main = context.routing_decision.get("main_agent_model")
     main_agent_constraint = (
@@ -1599,11 +1628,7 @@ def _model_execution_plan_payload(
             "harness_constrained": main_agent_constraint is not None,
             "selected_provider": selected_provider,
             "selected_model": selected_model,
-            "fallback_policy": (
-                "disabled_for_harness_selection"
-                if deployment_constraint is not None
-                else "configured"
-            ),
+            "fallback_policy": _fallback_policy_label(deployment_constraint, fallback_policy),
         },
         "role_model_assignments": tuple(
             {

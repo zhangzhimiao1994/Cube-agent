@@ -277,6 +277,7 @@ def test_harness_decision_uses_provider_policy_from_routing_payload() -> None:
                 "allowed_providers": ["DeepSeek", "OpenAI"],
                 "denied_providers": ["Local"],
                 "preferred_providers": ["OpenAI", "DeepSeek"],
+                "fallback_policy": "disabled",
                 "prefer_low_cost": True,
                 "require_approval_for_sensitive": False,
             }
@@ -288,6 +289,7 @@ def test_harness_decision_uses_provider_policy_from_routing_payload() -> None:
     assert policy.allowed_providers == frozenset({"deepseek", "openai"})
     assert policy.denied_providers == frozenset({"local"})
     assert policy.preferred_providers == ("openai", "deepseek")
+    assert policy.fallback_policy == "disabled"
     assert policy.prefer_low_cost is True
     assert policy.require_approval_for_sensitive is False
 
@@ -325,6 +327,7 @@ def test_invalid_harness_provider_policy_degrades_to_unavailable_payload() -> No
         "openai",
         None,
         {"preferred_providers": {"openai"}},
+        {"fallback_policy": "fallback_to_anything"},
     ],
 )
 def test_malformed_harness_provider_policy_degrades_to_unavailable_payload(
