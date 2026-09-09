@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from agent_hub.plugins.contracts import (
 from agent_hub.plugins.runtime import (
     HttpJsonPluginAdapter,
     PluginInvocationContext,
+    _plugin_package_execution_target,
     build_runtime_plugin_service,
 )
 from agent_hub.runtime.contracts import JsonValue
@@ -146,6 +148,7 @@ def plugin(
     input_schema: Mapping[str, JsonValue] | None = None,
     output_schema: Mapping[str, JsonValue] | None = None,
     package_metadata: PluginPackageMetadata | None = None,
+    content_sha256: str | None = None,
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
@@ -180,6 +183,7 @@ def plugin(
         health=health,
         last_error_type=None,
         package_metadata=package_metadata,
+        content_sha256=content_sha256,
     )
 
 
@@ -321,6 +325,270 @@ async def test_runtime_plugin_service_invokes_runtime_registered_adapter_package
     assert result["ok"] is True
     assert adapter.calls[0][0] == "calendar"
     assert adapter.calls[0][1] == "calendar.create_event"
+
+
+def verified_package_with_artifact(
+    *,
+    content_sha256: str,
+    storage_key: str,
+    entrypoint: str = "adapter/main.py",
+) -> PluginPackageMetadata:
+    return PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": entrypoint,
+            "isolation": "in_process",
+            "install_mode": "runtime_registered",
+            "artifact": {
+                "storage_key": storage_key,
+                "content_sha256": content_sha256,
+                "file_count": 2,
+                "total_size_bytes": 64,
+                "stored_at": "2026-09-09T04:00:00Z",
+                "quarantine_state": "stored",
+            },
+        }
+    )
+
+
+def test_plugin_package_execution_target_resolves_artifact_entrypoint(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+
+    target = _plugin_package_execution_target(
+        plugin(
+            "calendar",
+            adapter="calendar_python",
+            sandbox_profile="in_process",
+            package_metadata=package_metadata,
+            content_sha256=content_sha256,
+        ),
+        tenant_id=TENANT_ID,
+        package_store_dir=tmp_path,
+    )
+
+    assert target.root == artifact_root
+    assert target.entrypoint == artifact_root / "adapter" / "main.py"
+
+
+@pytest.mark.parametrize(
+    ("content_sha256", "storage_key", "error"),
+    [
+        (
+            "a" * 64,
+            f"{OTHER_TENANT_ID}/calendar/{'a' * 64}",
+            "Plugin package artifact storage key is invalid",
+        ),
+        (
+            "b" * 64,
+            f"{TENANT_ID}/calendar/{'a' * 64}",
+            "Plugin package artifact digest does not match plugin content",
+        ),
+    ],
+)
+def test_plugin_package_execution_target_rejects_mismatched_artifact_metadata(
+    tmp_path: Path,
+    content_sha256: str,
+    storage_key: str,
+    error: str,
+) -> None:
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=storage_key,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match=error):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256="a" * 64,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+def test_plugin_package_execution_target_rejects_missing_entrypoint(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    artifact_root.mkdir(parents=True)
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package entrypoint is unavailable"):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+def test_plugin_package_execution_target_rejects_missing_artifact_metadata(
+    tmp_path: Path,
+) -> None:
+    package_metadata = verified_package_with_artifact(
+        content_sha256="a" * 64,
+        storage_key=f"{TENANT_ID}/calendar/{'a' * 64}",
+    ).model_copy(update={"artifact": None})
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package artifact is unavailable"):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256="a" * 64,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+def test_plugin_package_execution_target_rejects_missing_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package artifact is unavailable"):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+def test_plugin_package_execution_target_rejects_entrypoint_escaping_artifact_root(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    artifact_root.mkdir(parents=True)
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+        entrypoint="../main.py",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package entrypoint is unavailable"):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("package_update", "error"),
+    [
+        (
+            {
+                "kind": "manifest_only",
+                "activation_state": "not_applicable",
+                "activation_reason": "manifest-only package has no executable activation target",
+            },
+            "Plugin package artifact is unavailable",
+        ),
+        (
+            {
+                "install_mode": "scan_only",
+                "activation_state": "verified_scan_only",
+                "activation_reason": (
+                    "package signature is verified, but install_mode=scan_only prevents activation"
+                ),
+            },
+            "Plugin package is not eligible for executable activation",
+        ),
+        (
+            {
+                "signature_verification": "not_verified",
+                "activation_state": "blocked_unverified_signature",
+                "activation_reason": "package signature has not been verified by the server",
+            },
+            "Plugin package is not eligible for executable activation",
+        ),
+        (
+            {
+                "approval_state": "pending",
+                "approval_reason": "adapter package requires plugin approval before activation",
+                "activation_state": "blocked_pending_approval",
+                "activation_reason": "adapter package requires plugin approval before activation",
+            },
+            "Plugin package is not eligible for executable activation",
+        ),
+    ],
+)
+def test_plugin_package_execution_target_rejects_non_executable_package_state(
+    tmp_path: Path,
+    package_update: Mapping[str, object],
+    error: str,
+) -> None:
+    content_sha256 = "a" * 64
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    ).model_copy(update=package_update)
+
+    with pytest.raises(RuntimeCapabilityError, match=error):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
 
 
 async def test_runtime_plugin_service_rechecks_runtime_registered_package_metadata() -> None:

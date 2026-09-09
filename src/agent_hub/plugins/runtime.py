@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
@@ -61,6 +62,12 @@ class PluginInvocationContext:
     run_id: UUID
     actor: str
     idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class PluginPackageExecutionTarget:
+    root: Path
+    entrypoint: Path
 
 
 class PluginAdapter(Protocol):
@@ -518,6 +525,63 @@ def _runtime_package_activation_block_reason(
     return None
 
 
+def _plugin_package_execution_target(
+    plugin: PluginResourceResponse,
+    *,
+    tenant_id: UUID,
+    package_store_dir: Path,
+) -> PluginPackageExecutionTarget:
+    package = plugin.package_metadata
+    if package is None or package.kind != "adapter_package":
+        raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    if (
+        package.activation_state != "eligible"
+        or package.install_mode != "runtime_registered"
+        or package.signature_verification != "verified"
+        or package.approval_state != "approved"
+        or package.sdk_api_version not in SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS
+        or package.runtime not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES
+        or package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS
+    ):
+        raise RuntimeCapabilityError("Plugin package is not eligible for executable activation")
+    artifact = package.artifact
+    if artifact is None:
+        raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    if plugin.content_sha256 is None or artifact.content_sha256 != plugin.content_sha256:
+        raise RuntimeCapabilityError("Plugin package artifact digest does not match plugin content")
+    expected_storage_key = f"{tenant_id}/{plugin.id}/{artifact.content_sha256}"
+    if artifact.storage_key != expected_storage_key:
+        raise RuntimeCapabilityError("Plugin package artifact storage key is invalid")
+    if package.entrypoint is None:
+        raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
+    root = package_store_dir.joinpath(*artifact.storage_key.split("/"))
+    _ensure_runtime_path_inside(package_store_dir, root)
+    if not root.is_dir():
+        raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    entrypoint_path = PurePosixPath(package.entrypoint)
+    entrypoint_parts = entrypoint_path.parts
+    if (
+        not entrypoint_parts
+        or any(part in {"", ".", ".."} for part in entrypoint_parts)
+        or entrypoint_path.is_absolute()
+    ):
+        raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
+    entrypoint = root.joinpath(*entrypoint_parts)
+    _ensure_runtime_path_inside(root, entrypoint)
+    if not entrypoint.is_file():
+        raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
+    return PluginPackageExecutionTarget(root=root, entrypoint=entrypoint)
+
+
+def _ensure_runtime_path_inside(root: Path, path: Path) -> None:
+    root_resolved = root.resolve()
+    path_resolved = path.resolve()
+    try:
+        path_resolved.relative_to(root_resolved)
+    except ValueError:
+        raise RuntimeCapabilityError("Plugin package path is invalid") from None
+
+
 def _permission_class_parts(permission_class: str) -> tuple[str, str] | None:
     separator = "." if "." in permission_class else ":"
     parts = permission_class.split(separator, 1)
@@ -745,7 +809,9 @@ __all__ = [
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",
+    "PluginPackageExecutionTarget",
     "PluginSecretResolver",
     "RuntimePluginService",
+    "_plugin_package_execution_target",
     "build_runtime_plugin_service",
 ]
