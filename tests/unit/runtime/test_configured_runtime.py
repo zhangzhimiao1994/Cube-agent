@@ -1900,7 +1900,7 @@ async def test_config_backed_dispatch_runtime_routes_inventory_skill_tools_to_ca
     ]
 
     assert events[0].kind is EventKind.STEP_STARTED
-    role_plan = events[0].payload["roles"]
+    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
     assert role_plan[0]["id"] == "scheduler"
     assert role_plan[0]["logical_model"] == "qwen_tools"
     assert role_plan[0]["tools"] == ("calendar.create_event",)
