@@ -69,9 +69,21 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck bats
+      - name: Install shell test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get update && \
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck bats; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 100
+            fi
+            sleep $((attempt * 10))
+          done
       - run: bash -n install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
       - run: shellcheck install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
       - run: bats tests/install
       - run: docker compose -f deploy/compose/docker-compose.yml config --quiet
-
