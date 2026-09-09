@@ -24,6 +24,13 @@ from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTran
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.profiles import infer_model_traits
 from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.routing_matrix import (
+    RoleModelRoutingRequest,
+    rank_role_models,
+)
+from agent_hub.models.routing_matrix import (
+    task_characteristics as routing_task_characteristics,
+)
 from agent_hub.models.types import Deployment
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
@@ -150,6 +157,9 @@ _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
     "questions_for_user": "string[]",
     "verification_needed": "string[]",
 }
+_MAX_MODEL_ROUTING_MATRIX_ROLES = 24
+_MAX_MODEL_ROUTING_MATRIX_REASONS = 16
+_MAX_MODEL_ROUTING_MATRIX_TRAITS = 16
 
 
 class UnavailableRuntime:
@@ -205,6 +215,8 @@ class _PlannedRuntime:
         main_agent_model: str,
         roles: tuple[Mapping[str, JsonValue], ...],
         steps: tuple[Mapping[str, JsonValue], ...],
+        model_routing_matrix: tuple[Mapping[str, JsonValue], ...] = (),
+        model_routing_matrix_truncated: bool = False,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self.mode = mode
@@ -212,6 +224,8 @@ class _PlannedRuntime:
         self._main_agent_model = main_agent_model
         self._roles = roles
         self._steps = steps
+        self._model_routing_matrix = model_routing_matrix
+        self._model_routing_matrix_truncated = model_routing_matrix_truncated
         self._capability_gateway = capability_gateway
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
@@ -235,6 +249,8 @@ class _PlannedRuntime:
                         context,
                         main_agent_model=self._main_agent_model,
                         roles=self._roles,
+                        model_routing_matrix=self._model_routing_matrix,
+                        model_routing_matrix_truncated=self._model_routing_matrix_truncated,
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
@@ -411,8 +427,16 @@ class ConfigBackedDispatchRuntime:
                     default_model=logical_model,
                 )
             ).roles
+        role_sources = (*planned_roles, *_temporary_role_assignments(context, logical_model))
         roles = _assign_models_to_roles(
-            (*planned_roles, *_temporary_role_assignments(context, logical_model)),
+            role_sources,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
+        model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
+            role_sources,
+            roles,
             config,
             default_model=logical_model,
             task=context.request,
@@ -434,6 +458,8 @@ class ConfigBackedDispatchRuntime:
             main_agent_model=logical_model,
             roles=_dispatch_role_payload(plan),
             steps=_dispatch_step_payload(plan),
+            model_routing_matrix=model_routing_matrix,
+            model_routing_matrix_truncated=model_routing_matrix_truncated,
             capability_gateway=self._capability_gateway,
         )
 
@@ -531,6 +557,13 @@ class ConfigBackedDiscussionRuntime:
             default_model=logical_model,
             task=context.request,
         )
+        model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
+            planned_roles,
+            roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
         plan = _discussion_plan(
             roles,
             logical_model,
@@ -548,6 +581,8 @@ class ConfigBackedDiscussionRuntime:
             main_agent_model=logical_model,
             roles=_discussion_role_payload(plan),
             steps=_discussion_step_payload(plan),
+            model_routing_matrix=model_routing_matrix,
+            model_routing_matrix_truncated=model_routing_matrix_truncated,
             capability_gateway=self._capability_gateway,
         )
 
@@ -672,18 +707,39 @@ class ConfigBackedHybridRuntime:
                     default_model=logical_model,
                 )
             ).roles
+        dispatch_role_sources = (
+            *dispatch_roles,
+            *_temporary_role_assignments(context, logical_model),
+        )
+        discussion_role_sources = discussion_roles
         dispatch_roles = _assign_models_to_roles(
-            (*dispatch_roles, *_temporary_role_assignments(context, logical_model)),
+            dispatch_role_sources,
             config,
             default_model=logical_model,
             task=context.request,
         )
         discussion_roles = _assign_models_to_roles(
+            discussion_role_sources,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
+        dispatch_matrix, dispatch_matrix_truncated = _role_model_routing_matrix_payload(
+            dispatch_role_sources,
+            dispatch_roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
+        discussion_matrix, discussion_matrix_truncated = _role_model_routing_matrix_payload(
+            discussion_role_sources,
             discussion_roles,
             config,
             default_model=logical_model,
             task=context.request,
         )
+        model_routing_matrix = (*dispatch_matrix, *discussion_matrix)
+        model_routing_matrix_truncated = dispatch_matrix_truncated or discussion_matrix_truncated
         dispatch_plan = _dispatch_plan(
             dispatch_roles,
             context,
@@ -726,6 +782,8 @@ class ConfigBackedHybridRuntime:
                     "tools": (),
                 },
             ),
+            model_routing_matrix=model_routing_matrix,
+            model_routing_matrix_truncated=model_routing_matrix_truncated,
             capability_gateway=self._capability_gateway,
         )
 
@@ -1443,6 +1501,8 @@ def _model_execution_plan_payload(
     *,
     main_agent_model: str,
     roles: tuple[Mapping[str, JsonValue], ...],
+    model_routing_matrix: tuple[Mapping[str, JsonValue], ...] = (),
+    model_routing_matrix_truncated: bool = False,
 ) -> Mapping[str, JsonValue]:
     selection = _harness_deployment_selection_payload(context.routing_decision)
     explicit_main = context.routing_decision.get("main_agent_model")
@@ -1478,7 +1538,90 @@ def _model_execution_plan_payload(
             for role in roles
             if "id" in role and "purpose" in role and "logical_model" in role
         ),
+        "role_model_routing_matrix": model_routing_matrix,
+        "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
+
+
+def _role_model_routing_matrix_payload(
+    source_roles: tuple[RoleAssignment, ...],
+    assigned_roles: tuple[RoleAssignment, ...],
+    config: PlatformConfig,
+    *,
+    default_model: str,
+    task: object,
+) -> tuple[tuple[Mapping[str, JsonValue], ...], bool]:
+    payload: list[Mapping[str, JsonValue]] = []
+    truncated = len(source_roles) > _MAX_MODEL_ROUTING_MATRIX_ROLES
+    capacities = {
+        logical_model: _logical_model_capacity(config, logical_model)
+        for logical_model in config.models
+    }
+    assigned_counts: dict[str, int] = {}
+    for index, role in enumerate(source_roles[:_MAX_MODEL_ROUTING_MATRIX_ROLES]):
+        ranked = rank_role_models(
+            RoleModelRoutingRequest(
+                task=task,
+                role_id=role.id,
+                role=role.role,
+                purpose=role.purpose.value,
+                mission=role.mission,
+                skills=role.skills,
+                must_answer=role.must_answer,
+                allowed_tools=role.allowed_tools,
+                preferred_model=role.model,
+                default_model=default_model,
+            ),
+            config,
+        )
+        assigned_role = assigned_roles[index] if index < len(assigned_roles) else None
+        selected = assigned_role.model if assigned_role is not None else default_model
+        selected_candidate = next(
+            (candidate for candidate in ranked if candidate.logical_model == selected),
+            None,
+        )
+        adjusted_score: int | None = None
+        if selected_candidate is not None:
+            adjusted_score = _capacity_adjusted_model_score(
+                (
+                    selected_candidate.score,
+                    -len(selected_candidate.logical_model),
+                    selected_candidate.logical_model,
+                ),
+                assigned_counts=assigned_counts,
+                capacities=capacities,
+            )[0]
+        candidate_count = len(ranked)
+        ranked_top = ranked[0].logical_model if ranked else ""
+        reasons = (
+            selected_candidate.reasons
+            if selected_candidate is not None
+            else ("fallback:default_model",)
+        )
+        if selected_candidate is not None and ranked_top and ranked_top != selected:
+            reasons = (*reasons, "capacity_adjustment:selected_after_balance")
+        traits = selected_candidate.traits if selected_candidate is not None else frozenset()
+        selected_payload: Mapping[str, JsonValue] = {
+            "logical_model": selected,
+            "score": selected_candidate.score if selected_candidate is not None else 0,
+            "adjusted_score": adjusted_score if adjusted_score is not None else 0,
+            "eligible": selected_candidate.eligible if selected_candidate is not None else False,
+            "selected": True,
+            "traits": tuple(sorted(traits))[:_MAX_MODEL_ROUTING_MATRIX_TRAITS],
+            "reasons": reasons[:_MAX_MODEL_ROUTING_MATRIX_REASONS],
+        }
+        payload.append(
+            {
+                "role_id": role.id,
+                "purpose": role.purpose.value,
+                "selected_logical_model": selected,
+                "candidate_count": candidate_count,
+                "truncated_candidates": candidate_count > 1,
+                "candidates": (selected_payload,),
+            }
+        )
+        assigned_counts[selected] = assigned_counts.get(selected, 0) + 1
+    return tuple(payload), truncated
 
 
 def _capability_execution_plan_payload(
@@ -1687,72 +1830,25 @@ def _rank_logical_models_for_role(
     default_model: str,
     task: object,
 ) -> list[tuple[int, int, str]]:
-    if not config.models:
-        return []
-    text = " ".join(
-        (
-            str(task),
-            role.id,
-            role.role,
-            role.mission,
-            " ".join(role.skills),
-            " ".join(role.must_answer),
-        )
-    ).lower()
-    preferred = role.model if role.model in config.models and role.model != default_model else ""
-    scored: list[tuple[int, int, str]] = []
-    for logical_model, definition in config.models.items():
-        haystack = " ".join(
-            (
-                logical_model,
-                " ".join(
-                    " ".join(
-                        (
-                            deployment.provider,
-                            deployment.model,
-                            " ".join(sorted(deployment.capabilities)),
-                        )
-                    )
-                    for deployment in definition.deployments
-                ),
-            )
-        ).lower()
-        score = 0
-        if logical_model == preferred:
-            score += 12
-        if logical_model == default_model:
-            score += 1
-        score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
-        if role.allowed_tools and not _logical_model_supports_tool_roles(definition):
-            score -= 1000
-        characteristics = _model_characteristics(logical_model, definition)
-        score += _task_characteristic_score(text, characteristics)
-        if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
-            if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
-                score += 30
-            if "tool_calling" in haystack:
-                score += 4
-        if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
-            if any(keyword in haystack for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")):
-                score += 24
-            if any(keyword in haystack for keyword in ("creative", "kimi", "story")):
-                score += 10
-            if any(keyword in haystack for keyword in ("coder", "code")):
-                score -= 4
-        if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险", "review", "audit")):
-            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek", "qwen", "glm")):
-                score += 22
-            if "structured_output" in haystack:
-                score += 6
-        if any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision")) and "vision" in haystack:
-            score += 28
-        if any(
-            keyword in text for keyword in ("合规", "法律", "隐私", "版权", "资质", "compliance")
-        ) and any(keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")):
-            score += 18
-        scored.append((score, -len(logical_model), logical_model))
-    scored.sort(reverse=True)
-    return scored
+    ranked = rank_role_models(
+        RoleModelRoutingRequest(
+            task=task,
+            role_id=role.id,
+            role=role.role,
+            purpose=role.purpose.value,
+            mission=role.mission,
+            skills=role.skills,
+            must_answer=role.must_answer,
+            allowed_tools=role.allowed_tools,
+            preferred_model=role.model,
+            default_model=default_model,
+        ),
+        config,
+    )
+    return [
+        (candidate.score, -len(candidate.logical_model), candidate.logical_model)
+        for candidate in ranked
+    ]
 
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
@@ -1782,24 +1878,7 @@ def _model_characteristics(
 
 
 def _task_characteristics(text: str) -> frozenset[str]:
-    characteristics: set[str] = set()
-    if any(keyword in text for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")):
-        characteristics.add("audio")
-    if any(keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")):
-        characteristics.add("vision")
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
-        characteristics.add("code")
-    if any(keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")):
-        characteristics.add("review")
-    if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")):
-        characteristics.add("analysis")
-    if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
-        characteristics.add("creative")
-    if any("\u4e00" <= char <= "\u9fff" for char in text):
-        characteristics.add("chinese")
-    if not characteristics:
-        characteristics.add("general")
-    return frozenset(characteristics)
+    return routing_task_characteristics(text)
 
 
 def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> int:

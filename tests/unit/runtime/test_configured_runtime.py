@@ -1,5 +1,6 @@
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar, cast
@@ -34,6 +35,7 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _role_model_routing_matrix_payload,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
     configured_runtime_registry,
@@ -940,7 +942,56 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         "deepseek/deepseek-chat",
         "kimi/kimi-k2-latest",
     }
-    assert events[0].payload["model_execution_plan"] == {
+    model_execution_plan_raw = events[0].payload["model_execution_plan"]
+    assert isinstance(model_execution_plan_raw, Mapping)
+    model_execution_plan = model_execution_plan_raw
+    assert model_execution_plan["schema_version"] == 1
+    assert model_execution_plan["main_agent"] == {
+        "logical_model": "main",
+        "selection_source": "harness_decision",
+        "harness_constrained": True,
+        "selected_provider": "deepseek",
+        "selected_model": "deepseek-chat",
+        "fallback_policy": "disabled_for_harness_selection",
+    }
+    assert model_execution_plan["role_model_assignments"] == (
+        {
+            "role_id": "copywriter",
+            "purpose": "execute",
+            "logical_model": "creative",
+        },
+        {
+            "role_id": "final_synthesizer",
+            "purpose": "synthesize",
+            "logical_model": "main",
+        },
+    )
+    routing_matrix = model_execution_plan["role_model_routing_matrix"]
+    assert isinstance(routing_matrix, tuple)
+    assert len(routing_matrix) == 1
+    assert isinstance(routing_matrix[0], Mapping)
+    copywriter_matrix = routing_matrix[0]
+    assert copywriter_matrix["role_id"] == "copywriter"
+    assert copywriter_matrix["purpose"] == "execute"
+    assert copywriter_matrix["selected_logical_model"] == "creative"
+    candidates = copywriter_matrix["candidates"]
+    assert copywriter_matrix["candidate_count"] == 2
+    assert copywriter_matrix["truncated_candidates"] is True
+    assert isinstance(candidates, tuple)
+    candidate_mappings: list[Mapping[str, JsonValue]] = []
+    for candidate in candidates:
+        assert isinstance(candidate, Mapping)
+        candidate_mappings.append(candidate)
+    selected_candidates = tuple(
+        candidate for candidate in candidate_mappings if candidate["selected"] is True
+    )
+    assert len(selected_candidates) == 1
+    assert selected_candidates[0]["logical_model"] == "creative"
+    selected_reasons = selected_candidates[0]["reasons"]
+    assert isinstance(selected_reasons, tuple)
+    assert "preference:role_model" in selected_reasons
+    assert {candidate["logical_model"] for candidate in candidate_mappings} == {"creative"}
+    assert model_execution_plan == {
         "schema_version": 1,
         "main_agent": {
             "logical_model": "main",
@@ -962,6 +1013,8 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                 "logical_model": "main",
             },
         ),
+        "role_model_routing_matrix": model_execution_plan["role_model_routing_matrix"],
+        "role_model_routing_matrix_truncated": False,
     }
 
 
@@ -3349,6 +3402,146 @@ def test_general_role_model_assignment_uses_more_configured_text_models() -> Non
     )
 
     assert len({role.model for role in assigned}) == 4
+
+
+def test_role_model_routing_matrix_explains_capacity_balanced_selection() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    roles = tuple(
+        RoleAssignment(
+            id=f"planner_{index}",
+            role="规划助手",
+            purpose=RolePurpose.EXECUTE,
+            mission="规划代码实现、测试和交付步骤。",
+            must_answer=("计划是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={},
+            model="deepseek",
+        )
+        for index in range(2)
+    )
+
+    assigned = _assign_models_to_roles(
+        roles,
+        config,
+        default_model="deepseek",
+        task="规划代码实现、测试和交付步骤。",
+    )
+    matrix, truncated = _role_model_routing_matrix_payload(
+        roles,
+        assigned,
+        config,
+        default_model="deepseek",
+        task="规划代码实现、测试和交付步骤。",
+    )
+
+    assert truncated is False
+    assert assigned[0].model == "qwen"
+    assert assigned[1].model == "deepseek"
+    second = matrix[1]
+    assert second["selected_logical_model"] == "deepseek"
+    candidates = second["candidates"]
+    assert isinstance(candidates, tuple)
+    assert len(candidates) == 1
+    assert isinstance(candidates[0], Mapping)
+    reasons = candidates[0]["reasons"]
+    assert isinstance(reasons, tuple)
+    assert "capacity_adjustment:selected_after_balance" in reasons
+
+
+def test_role_model_routing_matrix_caps_event_payload_and_hides_unselected_models() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://main",
+                            "quota_scope_id": "main",
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "private_reviewer": {
+                    "deployments": [
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4-5",
+                            "api_base": "https://api.anthropic.com/v1/messages",
+                            "credential_ref": "secret://private",
+                            "quota_scope_id": "private",
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    roles = tuple(
+        RoleAssignment(
+            id=f"agent_{index}",
+            role="通用助手",
+            purpose=RolePurpose.EXECUTE,
+            mission="整理信息并给出建议。",
+            must_answer=("建议是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={},
+            model="main",
+        )
+        for index in range(25)
+    )
+    assigned = tuple(replace(role, model="main") for role in roles)
+
+    matrix, truncated = _role_model_routing_matrix_payload(
+        roles,
+        assigned,
+        config,
+        default_model="main",
+        task="整理普通问题。",
+    )
+
+    assert truncated is True
+    assert len(matrix) == 24
+    assert all(entry["candidate_count"] == 2 for entry in matrix)
+    assert all(entry["truncated_candidates"] is True for entry in matrix)
+    assert "private_reviewer" not in repr(matrix)
 
 
 def test_role_model_assignment_uses_inferred_mainstream_model_traits() -> None:
