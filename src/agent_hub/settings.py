@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     runtime_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
+    plugin_package_store_dir: Path = Path("/var/lib/agent-hub/plugin-packages")
     attachment_store_dir: Path = Path("/var/lib/agent-hub/attachments")
     generated_artifact_dir: Path = Path("/var/lib/agent-hub/generated")
     project_workspace_dir: Path = Path("/var/lib/agent-hub/workspaces")

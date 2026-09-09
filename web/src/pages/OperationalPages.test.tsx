@@ -469,6 +469,7 @@ const calendarPlugin: PluginResource = {
     entrypoint: "adapter/main.py",
     isolation: "local_process",
     install_mode: "scan_only",
+    artifact: null,
   },
   capabilities: [
     {

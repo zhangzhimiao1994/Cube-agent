@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import tarfile
+import tempfile
 import threading
 import zipfile
 from collections.abc import Mapping
@@ -88,6 +89,7 @@ from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
+from agent_hub.settings import Settings
 
 
 class FakeConfigService:
@@ -2381,6 +2383,21 @@ def client() -> TestClient:
         rate_limiter=object(),
     )
     app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.settings = Settings.model_construct(
+        plugin_package_store_dir=Path(tempfile.gettempdir())
+        / f"agent-hub-test-plugin-packages-{uuid4()}"
+    )
+    return TestClient(app)
+
+
+def client_with_settings(settings: Settings) -> TestClient:
+    app = create_app(
+        settings=settings,
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.settings = settings
     return TestClient(app)
 
 
@@ -3869,10 +3886,140 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
         "install_mode": "scan_only",
+        "artifact": None,
     }
     assert api.get("/api/v1/admin/plugins", headers=headers()).json()[0]["package_metadata"] == body[
         "plugin"
     ]["package_metadata"]
+
+
+def test_plugin_archive_install_stores_verified_adapter_package_artifact(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(
+        private_key,
+        files={"adapter/main.py": "def invoke():\n    return {'ok': True}\n"},
+    )
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=archive_bytes,
+    )
+
+    assert response.status_code == 200
+    metadata = response.json()["plugin"]["package_metadata"]
+    artifact = metadata["artifact"]
+    assert artifact["storage_key"] == f"{TENANT_ID}/calendar/{content_sha256}"
+    assert artifact["content_sha256"] == content_sha256
+    assert artifact["file_count"] == 2
+    assert artifact["total_size_bytes"] == len(
+        "Plugin package.\n" + "def invoke():\n    return {'ok': True}\n"
+    )
+    assert artifact["quarantine_state"] == "stored"
+    assert datetime.fromisoformat(artifact["stored_at"]).tzinfo is not None
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    assert (artifact_root / "adapter" / "main.py").read_text() == (
+        "def invoke():\n    return {'ok': True}\n"
+    )
+    assert (artifact_root / "README.md").read_text() == "Plugin package.\n"
+    assert not (artifact_root / "plugin.json").exists()
+
+
+def test_plugin_archive_install_does_not_store_untrusted_adapter_package_artifact(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["plugin"]["package_metadata"]["artifact"] is None
+    assert not tmp_path.exists() or not any(tmp_path.rglob("*"))
+
+
+def test_plugin_delete_removes_verified_adapter_package_artifact(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(private_key)
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=archive_bytes,
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    assert install.status_code == 200
+    assert artifact_root.exists()
+
+    delete_response = api.delete("/api/v1/admin/plugins/calendar", headers=headers())
+
+    assert delete_response.status_code == 200
+    assert not artifact_root.exists()
 
 
 def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
@@ -4290,6 +4437,56 @@ def test_plugin_archive_install_rejects_forged_verified_public_key() -> None:
     assert (
         response.json()["error"]["details"]["reason"]
         == "plugin package verified public key is server-controlled"
+    )
+
+
+def test_plugin_archive_install_rejects_forged_package_artifact() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "artifact": {
+                        "storage_key": f"{TENANT_ID}/calendar/{'a' * 64}",
+                        "content_sha256": "a" * 64,
+                        "file_count": 1,
+                        "total_size_bytes": 10,
+                        "stored_at": "2026-09-09T04:00:00Z",
+                        "quarantine_state": "stored",
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package artifact is server-controlled"
     )
 
 

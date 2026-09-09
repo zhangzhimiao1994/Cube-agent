@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import inspect
 import io
@@ -10,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import stat
 import tarfile
 import zipfile
@@ -693,6 +695,25 @@ SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES = frozenset(("python",))
 SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS = frozenset(("in_process",))
 
 
+class PluginPackageArtifactMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    storage_key: str = Field(
+        min_length=103,
+        max_length=512,
+        pattern=r"^[0-9a-f-]{36}/[a-z0-9][a-z0-9_.-]{0,127}/[a-f0-9]{64}$",
+    )
+    content_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    file_count: int = Field(ge=1, le=512)
+    total_size_bytes: int = Field(ge=0, le=2_000_000)
+    stored_at: datetime
+    quarantine_state: Literal["stored"] = "stored"
+
+
 class PluginPackageMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -754,6 +775,7 @@ class PluginPackageMetadata(BaseModel):
         "mcp_remote",
     ] = "none"
     install_mode: PluginPackageInstallMode = "scan_only"
+    artifact: PluginPackageArtifactMetadata | None = None
 
     @model_validator(mode="after")
     def derive_server_controlled_state(self) -> PluginPackageMetadata:
@@ -2686,6 +2708,7 @@ _TAR_METADATA_TYPES = frozenset(
 )
 _MAX_SKILL_BUNDLE_ITEMS = 4096
 _MAX_PLUGIN_ARCHIVE_BYTES = 2_000_000
+_MAX_PLUGIN_PACKAGE_FILE_COUNT = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -3423,6 +3446,8 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package signature verification is server-controlled")
     if "verified_public_key_sha256" in package:
         raise InvalidSkillPackage("plugin package verified public key is server-controlled")
+    if "artifact" in package:
+        raise InvalidSkillPackage("plugin package artifact is server-controlled")
     if package.get("kind") == "manifest_only" and set(package) & {
         "package_version",
         "adapter_id",
@@ -3746,6 +3771,7 @@ def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: by
             "approval_reason",
             "approved_by",
             "approved_at",
+            "artifact",
         ):
             package.pop(field, None)
         signature = package.get("signature")
@@ -3771,6 +3797,115 @@ def _plugin_archive_signature_files(archive_bytes: bytes) -> tuple[tuple[str, by
     if zipfile.is_zipfile(archive_buffer):
         return _plugin_archive_signature_files_from_zip(archive_bytes)
     return _plugin_archive_signature_files_from_tar(archive_bytes)
+
+
+def _plugin_package_store_root(request: Request) -> Path:
+    settings = getattr(request.app.state, "settings", None)
+    configured = getattr(
+        settings,
+        "plugin_package_store_dir",
+        Path("/var/lib/agent-hub/plugin-packages"),
+    )
+    return Path(configured)
+
+
+def _ensure_path_inside(root: Path, path: Path) -> None:
+    root_resolved = root.resolve()
+    path_resolved = path.resolve()
+    try:
+        path_resolved.relative_to(root_resolved)
+    except ValueError:
+        raise InvalidSkillPackage("plugin archive contains unsafe paths") from None
+
+
+def _stored_plugin_package_metadata(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+    package: PluginPackageMetadata | None,
+    archive_bytes: bytes,
+    content_sha256: str,
+) -> PluginPackageMetadata | None:
+    if (
+        package is None
+        or package.kind != "adapter_package"
+        or package.signature_verification != "verified"
+    ):
+        return package
+    files = _plugin_archive_signature_files(archive_bytes)
+    if len(files) > _MAX_PLUGIN_PACKAGE_FILE_COUNT:
+        raise InvalidSkillPackage("plugin archive contains too many package files")
+    total_size_bytes = sum(len(content) for _path, content in files)
+    if total_size_bytes > _MAX_PLUGIN_ARCHIVE_BYTES:
+        raise InvalidSkillPackage("plugin archive uncompressed package files exceed size limit")
+    store_root = _plugin_package_store_root(request)
+    storage_key = f"{tenant_id}/{plugin_id}/{content_sha256}"
+    artifact_root = store_root / str(tenant_id) / plugin_id / content_sha256
+    temp_root = artifact_root.parent / f"tmp-{uuid4().hex}"
+    try:
+        artifact_root.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_path_inside(store_root, artifact_root)
+        _ensure_path_inside(store_root, temp_root)
+        for path, content in files:
+            target = temp_root.joinpath(*PurePosixPath(path).parts)
+            _ensure_path_inside(temp_root, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        if artifact_root.exists():
+            shutil.rmtree(artifact_root)
+        temp_root.replace(artifact_root)
+    except OSError as error:
+        with contextlib.suppress(OSError):
+            if temp_root.exists():
+                shutil.rmtree(temp_root)
+        raise PublicAPIError(
+            503,
+            "plugin_package_store_unavailable",
+            "plugin package store is unavailable",
+        ) from error
+    return package.model_copy(
+        update={
+            "artifact": PluginPackageArtifactMetadata(
+                storage_key=storage_key,
+                content_sha256=content_sha256,
+                file_count=len(files),
+                total_size_bytes=total_size_bytes,
+                stored_at=datetime.now(UTC),
+                quarantine_state="stored",
+            )
+        }
+    )
+
+
+def _cleanup_plugin_package_artifact(
+    request: Request,
+    plugin: PluginResourceResponse,
+    *,
+    tenant_id: UUID,
+) -> None:
+    artifact = plugin.package_metadata.artifact if plugin.package_metadata is not None else None
+    if artifact is None:
+        return
+    expected_storage_key = f"{tenant_id}/{plugin.id}/{artifact.content_sha256}"
+    if artifact.storage_key != expected_storage_key:
+        _LOGGER.warning(
+            "skipping plugin package artifact cleanup with mismatched storage key",
+            extra={"plugin_id": plugin.id},
+        )
+        return
+    try:
+        store_root = _plugin_package_store_root(request)
+        artifact_root = store_root.joinpath(*artifact.storage_key.split("/"))
+        _ensure_path_inside(store_root, artifact_root)
+        if artifact_root.exists():
+            shutil.rmtree(artifact_root)
+    except (InvalidSkillPackage, OSError):
+        _LOGGER.warning(
+            "failed to cleanup plugin package artifact",
+            extra={"plugin_id": plugin.id},
+            exc_info=True,
+        )
 
 
 def _plugin_archive_signature_files_from_zip(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
@@ -12032,7 +12167,7 @@ async def list_plugin_adapters(
 @router.post(
     "/plugins/install",
     response_model=PluginArchiveInstallResponse,
-    responses=error_responses(401, 403, 413, 422),
+    responses=error_responses(401, 403, 413, 422, 503),
 )
 async def install_plugin_archive(
     request: Request,
@@ -12071,6 +12206,14 @@ async def install_plugin_archive(
     _validate_plugin_capability_configs(request, plugin_request)
     try:
         _validate_runtime_registered_plugin_package(request, plugin_request, package_metadata)
+        package_metadata = _stored_plugin_package_metadata(
+            request,
+            tenant_id=principal.tenant_id,
+            plugin_id=plugin_request.id,
+            package=package_metadata,
+            archive_bytes=archive_bytes,
+            content_sha256=content_sha256,
+        )
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -12327,6 +12470,11 @@ async def uninstall_plugin(
 ) -> OperationStatusResponse:
     _require(principal, "plugin:write")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
         await service.uninstall_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
@@ -12334,6 +12482,7 @@ async def uninstall_plugin(
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    _cleanup_plugin_package_artifact(request, current, tenant_id=principal.tenant_id)
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return OperationStatusResponse(status="uninstalled")
 
@@ -12351,6 +12500,11 @@ async def delete_plugin(
 ) -> OperationStatusResponse:
     _require(principal, "plugin:write")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
         await service.delete_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
@@ -12358,6 +12512,7 @@ async def delete_plugin(
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    _cleanup_plugin_package_artifact(request, current, tenant_id=principal.tenant_id)
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return OperationStatusResponse(status="deleted")
 

@@ -599,6 +599,15 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "local_process",
         install_mode: "scan_only",
+        artifact: {
+          storage_key:
+            "00000000-0000-4000-8000-000000000001/calendar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          content_sha256: "a".repeat(64),
+          file_count: 2,
+          total_size_bytes: 56,
+          stored_at: "2026-09-09T04:00:00Z",
+          quarantine_state: "stored",
+        },
       },
       status: "stopped",
       health: "stopped",
@@ -670,6 +679,7 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "local_process",
         install_mode: "scan_only",
+        artifact: null,
       },
       status: "stopped",
       health: "stopped",
@@ -738,6 +748,15 @@ describe("api client transport", () => {
         entrypoint: "adapter/main.py",
         isolation: "in_process",
         install_mode: "runtime_registered",
+        artifact: {
+          storage_key:
+            "00000000-0000-4000-8000-000000000001/calendar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          content_sha256: "a".repeat(64),
+          file_count: 2,
+          total_size_bytes: 56,
+          stored_at: "2026-09-09T04:00:00Z",
+          quarantine_state: "stored",
+        },
       },
       status: "running",
       health: "healthy",
@@ -755,6 +774,7 @@ describe("api client transport", () => {
 
     expect(result[0]?.package_metadata?.install_mode).toBe("runtime_registered");
     expect(result[0]?.package_metadata?.activation_state).toBe("eligible");
+    expect(result[0]?.package_metadata?.artifact?.quarantine_state).toBe("stored");
   });
 
   it("manages trusted plugin signing keys", async () => {

@@ -1003,6 +1003,17 @@ const PluginPackageMetadataSchema = z.object({
     .enum(["none", "remote_connector", "in_process", "local_process", "container", "mcp_remote"])
     .default("none"),
   install_mode: z.enum(["scan_only", "runtime_registered"]).default("scan_only"),
+  artifact: z
+    .object({
+      storage_key: z.string(),
+      content_sha256: z.string(),
+      file_count: z.number(),
+      total_size_bytes: z.number(),
+      stored_at: z.string(),
+      quarantine_state: z.literal("stored").default("stored"),
+    })
+    .nullable()
+    .default(null),
 });
 
 const PluginResourceSchema = z.object({
