@@ -10,6 +10,7 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
 from agent_hub.harness.types import (
     HarnessDecision,
+    HarnessFallbackCandidate,
     HarnessPolicy,
     HarnessTaskRequirements,
     HermesContextHint,
@@ -110,6 +111,14 @@ class RecordingHarnessScheduler:
             policy_reasons=("provider_allowed:deepseek",),
             context_reasons=("hermes_context_match",),
             fallbacks_considered=("openai",),
+            fallback_candidates=(
+                HarnessFallbackCandidate(
+                    provider="openai",
+                    model="gpt-5",
+                    logical_model="main",
+                    reason="provider_blocked",
+                ),
+            ),
         )
 
 
@@ -205,6 +214,14 @@ async def test_direct_submit_stamps_harness_decision_in_routing_payload() -> Non
         "policy_reasons": ["provider_allowed:deepseek"],
         "context_reasons": ["hermes_context_match"],
         "fallbacks_considered": ["openai"],
+        "fallback_candidates": [
+            {
+                "provider": "openai",
+                "model": "gpt-5",
+                "logical_model": "main",
+                "reason": "provider_blocked",
+            }
+        ],
     }
 
 
@@ -512,6 +529,14 @@ async def test_auto_local_resolution_stamps_harness_decision_after_mode_selectio
         "policy_reasons": ["provider_allowed:deepseek"],
         "context_reasons": ["hermes_context_match"],
         "fallbacks_considered": ["openai"],
+        "fallback_candidates": [
+            {
+                "provider": "openai",
+                "model": "gpt-5",
+                "logical_model": "main",
+                "reason": "provider_blocked",
+            }
+        ],
     }
 
 
@@ -553,6 +578,14 @@ async def test_auto_direct_fallback_after_hermes_check_stamps_harness_decision()
         "policy_reasons": ["provider_allowed:deepseek"],
         "context_reasons": ["hermes_context_match"],
         "fallbacks_considered": ["openai"],
+        "fallback_candidates": [
+            {
+                "provider": "openai",
+                "model": "gpt-5",
+                "logical_model": "main",
+                "reason": "provider_blocked",
+            }
+        ],
     }
 
 

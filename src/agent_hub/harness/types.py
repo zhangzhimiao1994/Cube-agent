@@ -305,6 +305,34 @@ class HermesContextHint:
 
 
 @dataclass(frozen=True, slots=True)
+class HarnessFallbackCandidate:
+    provider: str
+    model: str
+    logical_model: str
+    reason: str
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_safe_id("provider", self.provider)
+        _require_unpadded_model("model", self.model)
+        _require_safe_id("logical_model", self.logical_model)
+        _require_safe_id("reason", self.reason)
+        if self.detail is not None:
+            _require_safe_text("detail", self.detail, max_length=256)
+
+    def to_payload(self) -> Mapping[str, object]:
+        payload: dict[str, object] = {
+            "provider": self.provider,
+            "model": self.model,
+            "logical_model": self.logical_model,
+            "reason": self.reason,
+        }
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        return MappingProxyType(payload)
+
+
+@dataclass(frozen=True, slots=True)
 class HarnessDecision:
     tenant_id: UUID
     mode: str
@@ -316,6 +344,7 @@ class HarnessDecision:
     policy_reasons: tuple[str, ...]
     context_reasons: tuple[str, ...] = ()
     fallbacks_considered: tuple[str, ...] = ()
+    fallback_candidates: tuple[HarnessFallbackCandidate, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.tenant_id) is not UUID:
@@ -333,6 +362,11 @@ class HarnessDecision:
             "fallbacks_considered",
         ):
             object.__setattr__(self, name, _safe_reason_tuple(name, getattr(self, name)))
+        fallback_candidates = tuple(self.fallback_candidates)
+        for candidate in fallback_candidates:
+            if not isinstance(candidate, HarnessFallbackCandidate):
+                raise TypeError("fallback_candidates must contain HarnessFallbackCandidate values")
+        object.__setattr__(self, "fallback_candidates", fallback_candidates)
 
     def to_payload(self) -> Mapping[str, object]:
         return MappingProxyType(
@@ -347,6 +381,9 @@ class HarnessDecision:
                 "policy_reasons": list(self.policy_reasons),
                 "context_reasons": list(self.context_reasons),
                 "fallbacks_considered": list(self.fallbacks_considered),
+                "fallback_candidates": [
+                    dict(candidate.to_payload()) for candidate in self.fallback_candidates
+                ],
             }
         )
 

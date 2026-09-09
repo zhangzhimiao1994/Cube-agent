@@ -6,6 +6,7 @@ from uuid import UUID
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import (
     HarnessDecision,
+    HarnessFallbackCandidate,
     HarnessPolicy,
     HarnessTaskRequirements,
     HermesContextHint,
@@ -49,37 +50,57 @@ class CapabilityAwareHarnessScheduler:
         if mode is TaskMode.AUTO:
             raise HarnessSchedulingError("harness mode must be executable")
         fallbacks: list[str] = []
+        fallback_candidates: list[HarnessFallbackCandidate] = []
         candidates: list[_CandidateScore] = []
         for profile in self._profiles:
             if profile.provider in policy.denied_providers:
-                fallbacks.append(f"provider_blocked:{profile.provider}")
+                _record_fallback(fallbacks, fallback_candidates, profile, "provider_blocked")
                 continue
             if policy.allowed_providers and profile.provider not in policy.allowed_providers:
-                fallbacks.append(f"provider_blocked:{profile.provider}")
+                _record_fallback(fallbacks, fallback_candidates, profile, "provider_blocked")
                 continue
             if (
                 requirements.required_logical_model is not None
                 and profile.logical_model != requirements.required_logical_model
             ):
-                fallbacks.append(
-                    f"logical_model_blocked:{profile.provider}:{profile.logical_model}"
+                _record_fallback(
+                    fallbacks,
+                    fallback_candidates,
+                    profile,
+                    "logical_model_blocked",
+                    detail=profile.logical_model,
                 )
                 continue
             missing = requirements.required_capabilities - profile.capabilities
             if missing:
                 for capability in sorted(missing):
-                    fallbacks.append(f"missing_capability:{profile.provider}:{capability}")
+                    _record_fallback(
+                        fallbacks,
+                        fallback_candidates,
+                        profile,
+                        "missing_capability",
+                        detail=capability,
+                    )
                 continue
             context_window = assess_context_window(profile, requirements)
             if not context_window.fits:
-                fallbacks.append(f"context_window_exceeded:{profile.provider}")
+                _record_fallback(
+                    fallbacks,
+                    fallback_candidates,
+                    profile,
+                    "context_window_exceeded",
+                )
                 continue
             if (
                 requirements.required_sandbox_mode is not None
                 and requirements.required_sandbox_mode not in profile.sandbox_modes
             ):
-                fallbacks.append(
-                    f"sandbox_mode_blocked:{profile.provider}:{requirements.required_sandbox_mode}"
+                _record_fallback(
+                    fallbacks,
+                    fallback_candidates,
+                    profile,
+                    "sandbox_mode_blocked",
+                    detail=requirements.required_sandbox_mode,
                 )
                 continue
             candidates.append(
@@ -90,6 +111,7 @@ class CapabilityAwareHarnessScheduler:
                     policy=policy,
                     hermes_hint=hermes_hint,
                     fallbacks=fallbacks,
+                    fallback_candidates=fallback_candidates,
                 )
             )
         if not candidates:
@@ -120,6 +142,7 @@ class CapabilityAwareHarnessScheduler:
             policy_reasons=tuple(policy_reasons),
             context_reasons=selected.context_reasons,
             fallbacks_considered=tuple(dict.fromkeys(fallbacks)),
+            fallback_candidates=tuple(dict.fromkeys(fallback_candidates)),
         )
 
     def _score(
@@ -131,6 +154,7 @@ class CapabilityAwareHarnessScheduler:
         policy: HarnessPolicy,
         hermes_hint: HermesContextHint | None,
         fallbacks: list[str],
+        fallback_candidates: list[HarnessFallbackCandidate],
     ) -> _CandidateScore:
         del mode
         score = 0.0
@@ -164,7 +188,12 @@ class CapabilityAwareHarnessScheduler:
         if requirements.estimated_input_tokens:
             context_window = assess_context_window(profile, requirements)
             if context_window.risk_level == "near_limit":
-                fallbacks.append(f"context_window_near_limit:{profile.provider}")
+                _record_fallback(
+                    fallbacks,
+                    fallback_candidates,
+                    profile,
+                    "context_window_near_limit",
+                )
                 capability_reasons.append("context_window_near_limit")
             else:
                 score += 1
@@ -196,7 +225,12 @@ class CapabilityAwareHarnessScheduler:
                 )
         if profile.runtime_health.degraded:
             score -= 20
-            fallbacks.append(f"provider_health_degraded:{profile.provider}")
+            _record_fallback(
+                fallbacks,
+                fallback_candidates,
+                profile,
+                "provider_health_degraded",
+            )
         return _CandidateScore(
             profile=profile,
             score=score,
@@ -204,6 +238,27 @@ class CapabilityAwareHarnessScheduler:
             policy_reasons=tuple(dict.fromkeys(policy_reasons)),
             context_reasons=tuple(dict.fromkeys(context_reasons)),
         )
+
+
+def _record_fallback(
+    legacy: list[str],
+    structured: list[HarnessFallbackCandidate],
+    profile: ProviderCapabilityProfile,
+    reason: str,
+    *,
+    detail: str | None = None,
+) -> None:
+    suffix = f":{detail}" if detail is not None else ""
+    legacy.append(f"{reason}:{profile.provider}{suffix}")
+    structured.append(
+        HarnessFallbackCandidate(
+            provider=profile.provider,
+            model=profile.model,
+            logical_model=profile.logical_model,
+            reason=reason,
+            detail=detail,
+        )
+    )
 
 
 def _policy_allows(profile: ProviderCapabilityProfile, policy: HarnessPolicy) -> bool:

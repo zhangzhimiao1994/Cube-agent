@@ -741,6 +741,7 @@ async def test_execute_persists_harness_started_event_before_vibe_runtime_events
         "policy": ("policy_allows_restricted_sandbox",),
         "context": ("context_window_fits",),
         "fallbacks": ("deepseek",),
+        "fallback_candidates": (),
     }
 
 

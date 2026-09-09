@@ -194,6 +194,15 @@ def test_scheduler_treats_required_sandbox_mode_as_hard_capability() -> None:
     assert decision.selected_provider == "openai"
     assert "sandbox_mode:workspace_write" in decision.capability_reasons
     assert "sandbox_mode_blocked:deepseek:workspace_write" in decision.fallbacks_considered
+    assert decision.to_payload()["fallback_candidates"] == [
+        {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "logical_model": "main",
+            "reason": "sandbox_mode_blocked",
+            "detail": "workspace_write",
+        }
+    ]
 
 
 def test_scheduler_rejects_profiles_that_cannot_satisfy_hard_capabilities() -> None:
@@ -244,6 +253,14 @@ def test_runtime_health_can_demote_an_otherwise_good_provider() -> None:
 
     assert decision.selected_provider == "openai"
     assert "provider_health_degraded:deepseek" in decision.fallbacks_considered
+    fallback_candidates = decision.to_payload()["fallback_candidates"]
+    assert isinstance(fallback_candidates, list)
+    assert {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "logical_model": "main",
+        "reason": "provider_health_degraded",
+    } in fallback_candidates
 
 
 def test_context_window_assessment_reports_near_limit_and_overflow() -> None:
@@ -316,6 +333,14 @@ def test_scheduler_filters_context_window_overflow_before_scoring() -> None:
 
     assert decision.selected_provider == "openai"
     assert "context_window_exceeded:deepseek" in decision.fallbacks_considered
+    fallback_candidates = decision.to_payload()["fallback_candidates"]
+    assert isinstance(fallback_candidates, list)
+    assert {
+        "provider": "deepseek",
+        "model": "deepseek-chat",
+        "logical_model": "main",
+        "reason": "context_window_exceeded",
+    } in fallback_candidates
 
 
 def test_scheduler_never_lets_context_overflow_win_from_hints_or_cost() -> None:

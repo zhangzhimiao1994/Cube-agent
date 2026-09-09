@@ -82,6 +82,9 @@ def harness_started_event(
             "policy": _safe_text_tuple(decision.get("policy_reasons")),
             "context": _safe_text_tuple(decision.get("context_reasons")),
             "fallbacks": _safe_text_tuple(decision.get("fallbacks_considered")),
+            "fallback_candidates": _safe_fallback_candidates(
+                decision.get("fallback_candidates")
+            ),
         },
     )
 
@@ -125,6 +128,34 @@ def _safe_text_tuple(value: object) -> tuple[str, ...]:
         if text is None:
             continue
         result.append(text)
+        if len(result) >= _MAX_PROFILE_ITEMS:
+            break
+    return tuple(result)
+
+
+def _safe_fallback_candidates(value: object) -> tuple[Mapping[str, str], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    result: list[Mapping[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        provider = _safe_text(item.get("provider"))
+        model = _safe_text(item.get("model"))
+        logical_model = _safe_text(item.get("logical_model"))
+        reason = _safe_text(item.get("reason"))
+        if provider is None or model is None or logical_model is None or reason is None:
+            continue
+        candidate = {
+            "provider": provider,
+            "model": model,
+            "logical_model": logical_model,
+            "reason": reason,
+        }
+        detail = _safe_text(item.get("detail"))
+        if detail is not None:
+            candidate["detail"] = detail
+        result.append(candidate)
         if len(result) >= _MAX_PROFILE_ITEMS:
             break
     return tuple(result)

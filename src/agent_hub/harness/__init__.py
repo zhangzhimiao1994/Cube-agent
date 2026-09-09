@@ -27,6 +27,7 @@ from agent_hub.harness.tool_gateway import (
 from agent_hub.harness.types import (
     ContextWindowAssessment,
     HarnessDecision,
+    HarnessFallbackCandidate,
     HarnessPolicy,
     HarnessTaskRequirements,
     HarnessToolCallRequest,
@@ -42,6 +43,7 @@ __all__ = [
     "ContextWindowAssessment",
     "HarnessCapabilityPolicyGateway",
     "HarnessDecision",
+    "HarnessFallbackCandidate",
     "HarnessPolicy",
     "HarnessSchedulingError",
     "HarnessTaskRequirements",

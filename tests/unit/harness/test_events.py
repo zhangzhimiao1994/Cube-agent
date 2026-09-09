@@ -6,6 +6,7 @@ import pytest
 
 from agent_hub.harness.events import (
     gateway_completion_events,
+    harness_started_event,
     provider_events_to_run_events,
     safe_tool_event_payload,
 )
@@ -15,6 +16,53 @@ from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.contracts import EventKind
 
 RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
+
+
+def test_harness_started_event_projects_structured_fallback_candidates_safely() -> None:
+    event = harness_started_event(
+        routing_decision={
+            "harness_decision": {
+                "mode": "dispatch",
+                "selected_provider": "openai",
+                "selected_model": "gpt-5",
+                "selected_logical_model": "main",
+                "requires_approval": False,
+                "capability_reasons": ["sandbox_mode:workspace_write"],
+                "policy_reasons": ["provider_allowed:openai"],
+                "context_reasons": [],
+                "fallbacks_considered": ["sandbox_mode_blocked:deepseek:workspace_write"],
+                "fallback_candidates": [
+                    {
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "logical_model": "main",
+                        "reason": "sandbox_mode_blocked",
+                        "detail": "workspace_write",
+                    },
+                    {
+                        "provider": "bad-provider",
+                        "model": "sk-secret",
+                        "logical_model": "main",
+                        "reason": "provider_blocked",
+                    },
+                ],
+            }
+        },
+        run_id=RUN_ID,
+        start_sequence=7,
+    )
+
+    assert event is not None
+    assert event.payload["fallbacks"] == ("sandbox_mode_blocked:deepseek:workspace_write",)
+    assert event.payload["fallback_candidates"] == (
+        {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "logical_model": "main",
+            "reason": "sandbox_mode_blocked",
+            "detail": "workspace_write",
+        },
+    )
 
 
 def test_provider_events_project_to_runtime_extension_events_with_sequences() -> None:
