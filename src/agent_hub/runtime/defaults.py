@@ -31,6 +31,12 @@ from agent_hub.models.routing_matrix import (
 from agent_hub.models.routing_matrix import (
     task_characteristics as routing_task_characteristics,
 )
+from agent_hub.models.routing_policy import (
+    DeploymentRoutingConstraint,
+    DeploymentRoutingConstraintError,
+    constrain_deployments_for_routing,
+    deployment_routing_constraint_from_decision,
+)
 from agent_hub.models.types import Deployment
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
@@ -217,6 +223,8 @@ class _PlannedRuntime:
         steps: tuple[Mapping[str, JsonValue], ...],
         model_routing_matrix: tuple[Mapping[str, JsonValue], ...] = (),
         model_routing_matrix_truncated: bool = False,
+        deployment_constraints: Mapping[str, JsonValue] | None = None,
+        deployment_constraint: DeploymentRoutingConstraint | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self.mode = mode
@@ -226,6 +234,8 @@ class _PlannedRuntime:
         self._steps = steps
         self._model_routing_matrix = model_routing_matrix
         self._model_routing_matrix_truncated = model_routing_matrix_truncated
+        self._deployment_constraints = deployment_constraints
+        self._deployment_constraint = deployment_constraint
         self._capability_gateway = capability_gateway
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
@@ -251,6 +261,8 @@ class _PlannedRuntime:
                         roles=self._roles,
                         model_routing_matrix=self._model_routing_matrix,
                         model_routing_matrix_truncated=self._model_routing_matrix_truncated,
+                        deployment_constraints=self._deployment_constraints,
+                        deployment_constraint=self._deployment_constraint,
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
@@ -447,6 +459,8 @@ class ConfigBackedDispatchRuntime:
             max_parallelism=_dispatch_parallelism(config, logical_model, roles),
             capability_gateway=self._capability_gateway,
         )
+        role_payload = _dispatch_role_payload(plan)
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             CrewDispatchRuntime(
                 gateway,
@@ -456,10 +470,17 @@ class ConfigBackedDispatchRuntime:
             ),
             mode=TaskMode.DISPATCH,
             main_agent_model=logical_model,
-            roles=_dispatch_role_payload(plan),
+            roles=role_payload,
             steps=_dispatch_step_payload(plan),
             model_routing_matrix=model_routing_matrix,
             model_routing_matrix_truncated=model_routing_matrix_truncated,
+            deployment_constraints=_deployment_constraints_payload(
+                config,
+                main_agent_model=logical_model,
+                roles=role_payload,
+                constraint=deployment_constraint,
+            ),
+            deployment_constraint=deployment_constraint,
             capability_gateway=self._capability_gateway,
         )
 
@@ -570,6 +591,8 @@ class ConfigBackedDiscussionRuntime:
             context,
             capability_gateway=self._capability_gateway,
         )
+        role_payload = _discussion_role_payload(plan)
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             AutoGenDiscussionRuntime(
                 gateway,
@@ -579,10 +602,17 @@ class ConfigBackedDiscussionRuntime:
             ),
             mode=TaskMode.DISCUSS,
             main_agent_model=logical_model,
-            roles=_discussion_role_payload(plan),
+            roles=role_payload,
             steps=_discussion_step_payload(plan),
             model_routing_matrix=model_routing_matrix,
             model_routing_matrix_truncated=model_routing_matrix_truncated,
+            deployment_constraints=_deployment_constraints_payload(
+                config,
+                main_agent_model=logical_model,
+                roles=role_payload,
+                constraint=deployment_constraint,
+            ),
+            deployment_constraint=deployment_constraint,
             capability_gateway=self._capability_gateway,
         )
 
@@ -752,6 +782,8 @@ class ConfigBackedHybridRuntime:
             context,
             capability_gateway=self._capability_gateway,
         )
+        role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             HybridRuntime(
                 CrewDispatchRuntime(
@@ -770,7 +802,7 @@ class ConfigBackedHybridRuntime:
             ),
             mode=TaskMode.HYBRID,
             main_agent_model=logical_model,
-            roles=_hybrid_role_payload(dispatch_plan, discussion_plan),
+            roles=role_payload,
             steps=(
                 *_dispatch_step_payload(dispatch_plan),
                 *_discussion_step_payload(discussion_plan),
@@ -784,6 +816,13 @@ class ConfigBackedHybridRuntime:
             ),
             model_routing_matrix=model_routing_matrix,
             model_routing_matrix_truncated=model_routing_matrix_truncated,
+            deployment_constraints=_deployment_constraints_payload(
+                config,
+                main_agent_model=logical_model,
+                roles=role_payload,
+                constraint=deployment_constraint,
+            ),
+            deployment_constraint=deployment_constraint,
             capability_gateway=self._capability_gateway,
         )
 
@@ -812,14 +851,17 @@ async def _gateway_for_config(
 ) -> tuple[ModelGateway, str]:
     logical_model = _direct_logical_model(config, routing_decision)
     deployments = _deployments(config)
-    harness_selection = _harness_deployment_selection(config, routing_decision)
-    deployments = _constrained_deployments_for_harness_decision(deployments, harness_selection)
+    deployment_constraint = _deployment_routing_constraint(config, routing_decision)
+    deployments = _constrained_deployments_for_harness_decision(
+        deployments,
+        deployment_constraint,
+    )
     gateway = ModelGateway(
         ModelRegistry(deployments),
         await capacity_factory(tenant_id, deployments),
         TenantSecretResolver(secret_service, tenant_id),
         transport,
-        fallbacks={} if harness_selection is not None else _fallbacks(config),
+        fallbacks={} if deployment_constraint is not None else _fallbacks(config),
         capacity_wait_timeout=60,
     )
     return gateway, logical_model
@@ -827,86 +869,22 @@ async def _gateway_for_config(
 
 def _constrained_deployments_for_harness_decision(
     deployments: tuple[Deployment, ...],
-    selection: tuple[str, str, str] | None,
+    constraint: DeploymentRoutingConstraint | None,
 ) -> tuple[Deployment, ...]:
-    if selection is None:
-        return deployments
-    logical_model, provider, model = selection
-    constrained: list[Deployment] = []
-    matched = False
-    for deployment in deployments:
-        if deployment.logical_model != logical_model:
-            constrained.append(deployment)
-            continue
-        if _deployment_matches_harness_selection(deployment, provider=provider, model=model):
-            constrained.append(deployment)
-            matched = True
-    if not matched:
-        raise HarnessModelSelectionError("harness model selection is unavailable")
-    return tuple(constrained)
+    try:
+        return constrain_deployments_for_routing(deployments, constraint)
+    except DeploymentRoutingConstraintError as error:
+        raise HarnessModelSelectionError(str(error)) from error
 
 
-def _harness_deployment_selection(
+def _deployment_routing_constraint(
     config: PlatformConfig,
     routing_decision: object | None,
-) -> tuple[str, str, str] | None:
-    if not isinstance(routing_decision, Mapping):
-        return None
-    harness_decision = routing_decision.get("harness_decision")
-    if not isinstance(harness_decision, Mapping):
-        return None
-    logical_model = harness_decision.get("selected_logical_model")
-    provider = harness_decision.get("selected_provider")
-    model = harness_decision.get("selected_model")
-    if not (
-        isinstance(logical_model, str)
-        and isinstance(provider, str)
-        and isinstance(model, str)
-        and logical_model
-        and provider
-        and model
-    ):
-        return None
-    if logical_model not in config.models:
-        raise HarnessModelSelectionError("harness logical model is unavailable")
-    return logical_model, provider.casefold(), model
-
-
-def _harness_deployment_selection_payload(
-    routing_decision: object | None,
-) -> tuple[str, str, str] | None:
-    if not isinstance(routing_decision, Mapping):
-        return None
-    harness_decision = routing_decision.get("harness_decision")
-    if not isinstance(harness_decision, Mapping):
-        return None
-    logical_model = harness_decision.get("selected_logical_model")
-    provider = harness_decision.get("selected_provider")
-    model = harness_decision.get("selected_model")
-    if not (
-        isinstance(logical_model, str)
-        and isinstance(provider, str)
-        and isinstance(model, str)
-        and logical_model
-        and provider
-        and model
-    ):
-        return None
-    return logical_model, provider, model
-
-
-def _deployment_matches_harness_selection(
-    deployment: Deployment,
-    *,
-    provider: str,
-    model: str,
-) -> bool:
-    deployment_provider, _, provider_model = deployment.provider_model.partition("/")
-    return deployment_provider.casefold() == provider and model in {
-        deployment.request_model,
-        provider_model,
-        deployment.provider_model,
-    }
+) -> DeploymentRoutingConstraint | None:
+    try:
+        return deployment_routing_constraint_from_decision(config, routing_decision)
+    except DeploymentRoutingConstraintError as error:
+        raise HarnessModelSelectionError(str(error)) from error
 
 
 def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
@@ -1496,6 +1474,94 @@ def _string_or_default(value: object, default: str) -> str:
     return value if isinstance(value, str) and value else default
 
 
+def _deployment_constraints_payload(
+    config: PlatformConfig,
+    *,
+    main_agent_model: str,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    constraint: DeploymentRoutingConstraint | None,
+) -> Mapping[str, JsonValue]:
+    logical_models = _logical_models_for_deployment_constraints(
+        main_agent_model=main_agent_model,
+        roles=roles,
+    )
+    items: list[Mapping[str, JsonValue]] = []
+    for logical_model in logical_models:
+        definition = config.models.get(logical_model)
+        if definition is None:
+            continue
+        harness_constrained = (
+            constraint is not None and constraint.logical_model == logical_model
+        )
+        total_deployments = len(definition.deployments)
+        eligible_deployments = sum(
+            1
+            for deployment in definition.deployments
+            if not harness_constrained
+            or (
+                constraint is not None
+                and _deployment_definition_matches_constraint(
+                    logical_model,
+                    deployment,
+                    constraint,
+                )
+            )
+        )
+        items.append(
+            {
+                "logical_model": logical_model,
+                "total_deployments": total_deployments,
+                "eligible_deployments": eligible_deployments,
+                "harness_constrained": harness_constrained,
+                "selected_provider": (
+                    constraint.provider if harness_constrained and constraint else None
+                ),
+                "selected_model": (
+                    constraint.model if harness_constrained and constraint else None
+                ),
+                "fallback_policy": (
+                    "disabled_for_harness_selection"
+                    if constraint is not None
+                    else "configured"
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+    }
+
+
+def _logical_models_for_deployment_constraints(
+    *,
+    main_agent_model: str,
+    roles: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    logical_models: list[str] = []
+    for role in roles:
+        logical_model = role.get("logical_model")
+        if isinstance(logical_model, str) and logical_model:
+            logical_models.append(logical_model)
+    logical_models.append(main_agent_model)
+    return tuple(dict.fromkeys(logical_models))
+
+
+def _deployment_definition_matches_constraint(
+    logical_model: str,
+    deployment: object,
+    constraint: DeploymentRoutingConstraint,
+) -> bool:
+    provider = getattr(deployment, "provider", None)
+    model = getattr(deployment, "model", None)
+    if not isinstance(provider, str) or not isinstance(model, str):
+        return False
+    return constraint.matches_provider_model(
+        logical_model=logical_model,
+        provider=provider,
+        model=model,
+    )
+
+
 def _model_execution_plan_payload(
     context: TaskContext,
     *,
@@ -1503,30 +1569,40 @@ def _model_execution_plan_payload(
     roles: tuple[Mapping[str, JsonValue], ...],
     model_routing_matrix: tuple[Mapping[str, JsonValue], ...] = (),
     model_routing_matrix_truncated: bool = False,
+    deployment_constraints: Mapping[str, JsonValue] | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> Mapping[str, JsonValue]:
-    selection = _harness_deployment_selection_payload(context.routing_decision)
     explicit_main = context.routing_decision.get("main_agent_model")
+    main_agent_constraint = (
+        deployment_constraint
+        if deployment_constraint is not None
+        and deployment_constraint.logical_model == main_agent_model
+        else None
+    )
     selection_source = (
         "main_agent_model"
         if isinstance(explicit_main, str) and explicit_main
         else "harness_decision"
-        if selection is not None
+        if main_agent_constraint is not None
         else "runtime_default"
     )
     selected_provider: str | None = None
     selected_model: str | None = None
-    if selection is not None:
-        _, selected_provider, selected_model = selection
-    return {
+    if main_agent_constraint is not None:
+        selected_provider = main_agent_constraint.provider
+        selected_model = main_agent_constraint.model
+    payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "main_agent": {
             "logical_model": main_agent_model,
             "selection_source": selection_source,
-            "harness_constrained": selection is not None,
+            "harness_constrained": main_agent_constraint is not None,
             "selected_provider": selected_provider,
             "selected_model": selected_model,
             "fallback_policy": (
-                "disabled_for_harness_selection" if selection is not None else "configured"
+                "disabled_for_harness_selection"
+                if deployment_constraint is not None
+                else "configured"
             ),
         },
         "role_model_assignments": tuple(
@@ -1541,6 +1617,9 @@ def _model_execution_plan_payload(
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
+    if deployment_constraints is not None:
+        payload["deployment_constraints"] = deployment_constraints
+    return payload
 
 
 def _role_model_routing_matrix_payload(

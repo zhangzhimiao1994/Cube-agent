@@ -16,6 +16,7 @@ from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease, CapacityWaitTimeout
 from agent_hub.models.gateway import CapacityController
+from agent_hub.models.routing_policy import DeploymentRoutingConstraint
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import (
     EventKind,
@@ -912,7 +913,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                 routing_decision={
                     "selected_agent_ids": ("copywriter",),
                     "harness_decision": {
-                        "selected_provider": "deepseek",
+                        "selected_provider": "DeepSeek",
                         "selected_model": "deepseek-chat",
                         "selected_logical_model": "main",
                     },
@@ -966,6 +967,29 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             "logical_model": "main",
         },
     )
+    assert model_execution_plan["deployment_constraints"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "logical_model": "creative",
+                "total_deployments": 1,
+                "eligible_deployments": 1,
+                "harness_constrained": False,
+                "selected_provider": None,
+                "selected_model": None,
+                "fallback_policy": "disabled_for_harness_selection",
+            },
+            {
+                "logical_model": "main",
+                "total_deployments": 2,
+                "eligible_deployments": 1,
+                "harness_constrained": True,
+                "selected_provider": "deepseek",
+                "selected_model": "deepseek-chat",
+                "fallback_policy": "disabled_for_harness_selection",
+            },
+        ),
+    }
     routing_matrix = model_execution_plan["role_model_routing_matrix"]
     assert isinstance(routing_matrix, tuple)
     assert len(routing_matrix) == 1
@@ -1013,8 +1037,42 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                 "logical_model": "main",
             },
         ),
+        "deployment_constraints": model_execution_plan["deployment_constraints"],
         "role_model_routing_matrix": model_execution_plan["role_model_routing_matrix"],
         "role_model_routing_matrix_truncated": False,
+    }
+
+
+def test_model_execution_plan_does_not_report_unrelated_constraint_as_main_agent() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "copywriter",
+                "purpose": "execute",
+                "logical_model": "creative",
+            },
+        ),
+        deployment_constraint=DeploymentRoutingConstraint(
+            logical_model="creative",
+            provider="kimi",
+            model="kimi-k2-latest",
+        ),
+    )
+
+    assert plan["main_agent"] == {
+        "logical_model": "main",
+        "selection_source": "runtime_default",
+        "harness_constrained": False,
+        "selected_provider": None,
+        "selected_model": None,
+        "fallback_policy": "disabled_for_harness_selection",
     }
 
 
