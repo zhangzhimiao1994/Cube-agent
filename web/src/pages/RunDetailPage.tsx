@@ -36,6 +36,11 @@ type OrchestrationHandoffSummary = {
   handoffKinds: string[];
 };
 
+type OrchestrationContractSummary = {
+  count: number;
+  truncated: boolean;
+};
+
 function detailTimestampValue(value: string | null | undefined) {
   if (!value) return 0;
   const timestamp = new Date(value).getTime();
@@ -924,6 +929,23 @@ function orchestrationHandoffSummary(events: RunEvent[]): OrchestrationHandoffSu
   };
 }
 
+function orchestrationContractSummary(events: RunEvent[]): OrchestrationContractSummary | null {
+  let count = 0;
+  let truncated = false;
+  events.forEach((event) => {
+    const plan = objectPayload(event.payload.model_execution_plan);
+    const contracts = objectPayload(plan?.orchestration_contracts);
+    if (!contracts) return;
+    truncated = truncated || contracts.truncated === true;
+    const rawItems = Array.isArray(contracts.items) ? contracts.items : [];
+    rawItems.forEach((item) => {
+      if (orchestrationContractFromPayload(item)) count += 1;
+    });
+  });
+  if (count === 0) return null;
+  return { count, truncated };
+}
+
 function objectPayload(value: unknown): Record<string, unknown> | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
@@ -940,6 +962,18 @@ function orchestrationHandoffFromPayload(value: unknown): OrchestrationHandoff |
     handoffKind: safeOrchestrationToken(item.handoff_kind),
   };
   return Object.values(handoff).every(Boolean) ? handoff : null;
+}
+
+function orchestrationContractFromPayload(value: unknown) {
+  const item = objectPayload(value);
+  if (!item) return null;
+  const contract = {
+    sourceRoleId: safeOrchestrationToken(item.source_role_id),
+    targetRoleId: safeOrchestrationToken(item.target_role_id),
+    handoffKind: safeOrchestrationToken(item.handoff_kind),
+    status: safeOrchestrationToken(item.status),
+  };
+  return Object.values(contract).every(Boolean) ? contract : null;
 }
 
 function safeOrchestrationToken(value: unknown) {
@@ -1726,6 +1760,7 @@ export function RunDetailPage() {
   const modelOutcomeSummary = orderedRunData.model_outcome_summary;
   const hasOutcomeSummary = hasModelOutcomeSummary(modelOutcomeSummary);
   const handoffSummary = orchestrationHandoffSummary(orderedRunData.events);
+  const contractSummary = orchestrationContractSummary(orderedRunData.events);
 
   return (
     <section>
@@ -1768,7 +1803,7 @@ export function RunDetailPage() {
         </ul>
       </div>
 
-      {hasOutcomeSummary || handoffSummary ? (
+      {hasOutcomeSummary || handoffSummary || contractSummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
@@ -1778,7 +1813,9 @@ export function RunDetailPage() {
                 ? modelOutcomeSummary.fallback_used
                   ? "已发生回退"
                   : "未发生回退"
-                : "已记录交接"}
+                : handoffSummary
+                  ? "已记录交接"
+                  : "已记录契约"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -1831,6 +1868,14 @@ export function RunDetailPage() {
                   <strong>{orchestrationList(handoffSummary.handoffKinds)}</strong>
                 </li>
               </>
+            ) : null}
+            {contractSummary ? (
+              <li>
+                <span>契约</span>
+                <strong>
+                  {contractSummary.count} 个契约{contractSummary.truncated ? "，已截断" : ""}
+                </strong>
+              </li>
             ) : null}
           </ul>
         </div>

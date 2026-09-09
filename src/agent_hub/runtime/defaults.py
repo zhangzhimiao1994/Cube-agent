@@ -116,6 +116,8 @@ _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
 _MAX_ORCHESTRATION_HANDOFFS = 12
+_ORCHESTRATION_CONTRACT_READY_STATUS = "done"
+_ORCHESTRATION_CONTRACT_BLOCKING_STATUSES = ("blocked", "needs_user")
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
@@ -1749,6 +1751,10 @@ def _model_execution_plan_payload(
             roles=roles,
             steps=steps,
         ),
+        "orchestration_contracts": _orchestration_contracts_payload(
+            roles=roles,
+            steps=steps,
+        ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
@@ -1762,6 +1768,47 @@ def _orchestration_handoffs_payload(
     roles: tuple[Mapping[str, JsonValue], ...],
     steps: tuple[Mapping[str, JsonValue], ...],
 ) -> Mapping[str, JsonValue]:
+    items, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+        "truncated": truncated,
+    }
+
+
+def _orchestration_contracts_payload(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    handoffs, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    items: list[Mapping[str, JsonValue]] = [
+        {
+            "contract_id": f"{handoff['source_step_id']}-to-{handoff['target_step_id']}",
+            "source_step_id": handoff["source_step_id"],
+            "target_step_id": handoff["target_step_id"],
+            "source_role_id": handoff["source_role_id"],
+            "target_role_id": handoff["target_role_id"],
+            "handoff_kind": handoff["handoff_kind"],
+            "status": "planned",
+            "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
+            "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
+            "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
+        }
+        for handoff in handoffs
+    ]
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+        "truncated": truncated,
+    }
+
+
+def _orchestration_handoff_items(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[list[Mapping[str, JsonValue]], bool]:
     safe_roles = {
         role_id: role
         for role in roles
@@ -1833,11 +1880,7 @@ def _orchestration_handoffs_payload(
                 continue
             if len(items) >= _MAX_ORCHESTRATION_HANDOFFS:
                 truncated = True
-                return {
-                    "schema_version": 1,
-                    "items": tuple(items),
-                    "truncated": truncated,
-                }
+                return items, truncated
             items.append(
                 {
                     "source_step_id": source_step_id,
@@ -1851,11 +1894,7 @@ def _orchestration_handoffs_payload(
                     "handoff_kind": "step_dependency",
                 }
             )
-    return {
-        "schema_version": 1,
-        "items": tuple(items),
-        "truncated": truncated,
-    }
+    return items, truncated
 
 
 def _optional_orchestration_handoff_token(value: object, *, max_length: int) -> str | None:

@@ -545,6 +545,30 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                 ),
                                 "truncated": False,
                             },
+                            "orchestration_contracts": {
+                                "schema_version": 1,
+                                "items": (
+                                    {
+                                        "contract_id": "copywriter_step-to-final_response_step",
+                                        "source_step_id": "copywriter_step",
+                                        "target_step_id": "final_response_step",
+                                        "source_role_id": "copywriter",
+                                        "target_role_id": "final_synthesizer",
+                                        "handoff_kind": "step_dependency",
+                                        "status": "planned",
+                                        "required_output_fields": (
+                                            "status",
+                                            "summary",
+                                            "evidence",
+                                        ),
+                                        "ready_status": "done",
+                                        "blocking_statuses": ("blocked", "needs_user"),
+                                        "api_base": "https://contract-internal.example.invalid",
+                                        "quota_scope_id": "contract-private-quota",
+                                    },
+                                ),
+                                "truncated": False,
+                            },
                             "quota_scope_id": "tenant-private-quota",
                             "credential_ref": "credential-private",
                             "api_base": "https://internal.example.invalid",
@@ -580,9 +604,31 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         ],
         "truncated": False,
     }
+    assert model_execution_plan["orchestration_contracts"] == {
+        "schema_version": 1,
+        "items": [
+            {
+                "contract_id": "copywriter_step-to-final_response_step",
+                "source_step_id": "copywriter_step",
+                "target_step_id": "final_response_step",
+                "source_role_id": "copywriter",
+                "target_role_id": "final_synthesizer",
+                "handoff_kind": "step_dependency",
+                "status": "planned",
+                "required_output_fields": ["status", "summary", "evidence"],
+                "ready_status": "done",
+                "blocking_statuses": ["blocked", "needs_user"],
+                "api_base": "[redacted]",
+                "quota_scope_id": "[redacted]",
+            }
+        ],
+        "truncated": False,
+    }
     serialized = json.dumps(body, ensure_ascii=False)
     assert "lease-private" not in serialized
     assert "tenant-private-quota" not in serialized
+    assert "contract-private-quota" not in serialized
+    assert "contract-internal.example.invalid" not in serialized
     assert "credential-private" not in serialized
     assert "internal.example.invalid" not in serialized
 

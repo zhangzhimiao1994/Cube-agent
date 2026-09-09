@@ -454,6 +454,25 @@ describe("RunDetailPage", () => {
                 ],
                 truncated: false,
               },
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "copywriter_step-to-final_response_step",
+                    source_step_id: "copywriter_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "copywriter",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "planned",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                    quota_scope_id: "tenant-private-quota",
+                  },
+                ],
+                truncated: false,
+              },
             },
           },
         },
@@ -483,12 +502,15 @@ describe("RunDetailPage", () => {
     expect(summary.classList.contains("run-model-outcome-summary")).toBe(true);
     expect(within(summary).getByText("已记录交接")).not.toBeNull();
     expect(within(summary).getByText("1 次交接")).not.toBeNull();
+    expect(within(summary).getByText("1 个契约")).not.toBeNull();
     expect(within(summary).getByText("copywriter -> final_synthesizer")).not.toBeNull();
     expect(within(summary).getByText("creative -> main")).not.toBeNull();
     expect(within(summary).getByText("step_dependency")).not.toBeNull();
     expect(screen.queryByText("copywriter_step")).toBeNull();
     expect(screen.queryByText("final_response_step")).toBeNull();
+    expect(screen.queryByText("copywriter_step-to-final_response_step")).toBeNull();
     expect(screen.queryByText("lease-private")).toBeNull();
+    expect(screen.queryByText("tenant-private-quota")).toBeNull();
     expect(screen.queryByText("internal.example.invalid")).toBeNull();
 
     const processSummary = await screen.findByLabelText("Agent 集群动作");
@@ -537,6 +559,22 @@ describe("RunDetailPage", () => {
                 ],
                 truncated: false,
               },
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "copywriter_step-to-final_response_step",
+                    source_role_id: "copywriter",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "planned",
+                    required_output_fields: ["status", "summary"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                  },
+                ],
+                truncated: false,
+              },
             },
           },
         },
@@ -566,6 +604,7 @@ describe("RunDetailPage", () => {
     expect(within(summary).getByText("未发生回退")).not.toBeNull();
     expect(within(summary).getByText("1 次完成")).not.toBeNull();
     expect(within(summary).getByText("1 次交接")).not.toBeNull();
+    expect(within(summary).getByText("1 个契约")).not.toBeNull();
     expect(within(summary).queryByText("已记录交接")).toBeNull();
   });
 
