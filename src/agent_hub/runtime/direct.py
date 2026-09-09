@@ -313,6 +313,19 @@ class DirectRuntime:
             completion_deployment_id = completion.deployment_id
             completion_provider_id = completion.provider_id
             completion_provider_model = completion.provider_model
+            completion_attempted_logical_models = completion.attempted_logical_models
+            completion_requested_logical_model = (
+                completion_attempted_logical_models[0]
+                if completion_attempted_logical_models
+                else completion_logical_model
+            )
+            completion_fallback_attempt_count = max(
+                0,
+                len(completion_attempted_logical_models) - 1,
+            )
+            completion_fallback_used = completion.fallback_used
+            completion_fallback_from_logical_model = completion.fallback_from_logical_model
+            completion_fallback_reason = completion.fallback_reason
             artifact_text_preview = _event_text_preview(artifact.content.get("text"))
             await self._consume_task_terminal(gateway_task)
             self._active_task = None
@@ -325,11 +338,17 @@ class DirectRuntime:
                 actor="main_agent",
                 message="模型已返回直连回答。",
                 payload={
+                    "requested_logical_model": completion_requested_logical_model,
                     "logical_model": completion_logical_model,
                     "model": completion_logical_model,
                     "deployment": completion_deployment_id,
                     "provider": completion_provider_id,
                     "upstream_model": completion_provider_model,
+                    "fallback_used": completion_fallback_used,
+                    "fallback_from_logical_model": completion_fallback_from_logical_model,
+                    "fallback_reason": completion_fallback_reason,
+                    "attempted_logical_models": completion_attempted_logical_models,
+                    "fallback_attempt_count": completion_fallback_attempt_count,
                     "artifact_id": str(artifact.id),
                     "output": artifact_text_preview,
                     "result": artifact_text_preview,
@@ -364,8 +383,14 @@ class DirectRuntime:
                 actor="main_agent",
                 message="本次直连对话已完成。",
                 payload={
+                    "requested_logical_model": completion_requested_logical_model,
                     "logical_model": completion_logical_model,
                     "model": completion_logical_model,
+                    "fallback_used": completion_fallback_used,
+                    "fallback_from_logical_model": completion_fallback_from_logical_model,
+                    "fallback_reason": completion_fallback_reason,
+                    "attempted_logical_models": completion_attempted_logical_models,
+                    "fallback_attempt_count": completion_fallback_attempt_count,
                     "artifact_id": str(artifact.id),
                     "summary": artifact_text_preview,
                 },

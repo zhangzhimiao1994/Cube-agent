@@ -440,6 +440,19 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
         (TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")
     ]
     assert capacities[0].recorded == [True]
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.payload["requested_logical_model"] == "main"
+    assert artifact_event.payload["logical_model"] == "main"
+    assert artifact_event.payload["fallback_used"] is False
+    assert artifact_event.payload["fallback_from_logical_model"] is None
+    assert artifact_event.payload["fallback_reason"] is None
+    assert artifact_event.payload["attempted_logical_models"] == ("main",)
+    assert artifact_event.payload["fallback_attempt_count"] == 0
+    completed_event = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    assert completed_event.payload["requested_logical_model"] == "main"
+    assert completed_event.payload["logical_model"] == "main"
+    assert completed_event.payload["fallback_used"] is False
+    assert completed_event.payload["fallback_attempt_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -910,9 +923,20 @@ async def test_config_backed_direct_runtime_uses_configured_fallback(
     assert len(transport.calls) == 1
     assert transport.calls[0][0].logical_model == "backup"
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.payload["requested_logical_model"] == "main"
     assert artifact_event.payload["logical_model"] == "backup"
     assert artifact_event.payload["provider"] == "openai"
     assert artifact_event.payload["upstream_model"] == "openai/gpt-5.6-sol"
+    assert artifact_event.payload["fallback_used"] is True
+    assert artifact_event.payload["fallback_from_logical_model"] == "main"
+    assert artifact_event.payload["fallback_reason"] == "capacity_unavailable"
+    assert artifact_event.payload["attempted_logical_models"] == ("main", "backup")
+    assert artifact_event.payload["fallback_attempt_count"] == 1
+    completed_event = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    assert completed_event.payload["requested_logical_model"] == "main"
+    assert completed_event.payload["logical_model"] == "backup"
+    assert completed_event.payload["fallback_used"] is True
+    assert completed_event.payload["fallback_attempt_count"] == 1
 
 
 def test_model_execution_plan_reports_disabled_harness_fallback_policy() -> None:

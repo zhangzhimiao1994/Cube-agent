@@ -389,6 +389,7 @@ def test_gateway_completion_projects_safe_model_completed_event() -> None:
     assert event.sequence == 9
     assert event.payload == {
         "actor": "main_agent",
+        "requested_logical_model": "main",
         "logical_model": "main",
         "deployment_id": "deepseek-main",
         "provider_id": "deepseek",
@@ -401,10 +402,37 @@ def test_gateway_completion_projects_safe_model_completed_event() -> None:
         "fallback_from_logical_model": None,
         "fallback_reason": None,
         "attempted_logical_models": ("main",),
+        "fallback_attempt_count": 0,
         "text_bytes": len(b"final answer"),
         "tool_calls": (),
         "metadata": {"request_id": "req_123", "finish_reason": "stop"},
     }
+
+
+def test_gateway_completion_projects_execution_correlation_fields_for_fallback() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(text="fallback answer"),
+        deployment_id="openai-backup",
+        logical_model="backup",
+        provider_id="openai",
+        provider_model="openai/gpt-5.6-sol",
+        fallback_used=True,
+        fallback_from_logical_model="main",
+        fallback_reason="capacity_unavailable",
+        attempted_logical_models=("main", "backup"),
+    )
+
+    (event,) = gateway_completion_events(
+        completion,
+        run_id=RUN_ID,
+        start_sequence=1,
+        actor="main_agent",
+    )
+
+    assert event.payload["requested_logical_model"] == "main"
+    assert event.payload["logical_model"] == "backup"
+    assert event.payload["fallback_attempt_count"] == 1
+    assert event.payload["attempted_logical_models"] == ("main", "backup")
 
 
 def test_gateway_completion_projection_rejects_sensitive_tool_arguments() -> None:

@@ -383,8 +383,13 @@ def _completion_payload(
     actor: str,
 ) -> Mapping[str, JsonValue]:
     response = completion.response
+    attempted_logical_models = completion.attempted_logical_models
+    requested_logical_model = (
+        attempted_logical_models[0] if attempted_logical_models else completion.logical_model
+    )
     payload: dict[str, JsonValue] = {
         "actor": actor,
+        "requested_logical_model": requested_logical_model,
         "logical_model": completion.logical_model,
         "deployment_id": completion.deployment_id,
         "provider_id": completion.provider_id,
@@ -393,7 +398,8 @@ def _completion_payload(
         "fallback_used": completion.fallback_used,
         "fallback_from_logical_model": completion.fallback_from_logical_model,
         "fallback_reason": completion.fallback_reason,
-        "attempted_logical_models": completion.attempted_logical_models,
+        "attempted_logical_models": attempted_logical_models,
+        "fallback_attempt_count": max(0, len(attempted_logical_models) - 1),
         "text_bytes": 0 if response.text is None else len(response.text.encode("utf-8")),
         "tool_calls": tuple(_tool_call_payload(call) for call in response.tool_calls),
         "metadata": _safe_provider_metadata(response.provider_metadata),
