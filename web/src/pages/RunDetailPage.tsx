@@ -18,6 +18,23 @@ type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
+type OrchestrationHandoff = {
+  sourceRoleId: string;
+  targetRoleId: string;
+  sourceLogicalModel: string;
+  targetLogicalModel: string;
+  handoffKind: string;
+};
+
+type OrchestrationHandoffSummary = {
+  count: number;
+  truncated: boolean;
+  sourceRoles: string[];
+  targetRoles: string[];
+  sourceModels: string[];
+  targetModels: string[];
+  handoffKinds: string[];
+};
 
 function detailTimestampValue(value: string | null | undefined) {
   if (!value) return 0;
@@ -495,7 +512,9 @@ function detailPayloadLabel(key: string) {
 
 function isSensitivePayloadKey(key: string) {
   const normalized = key.trim().toLowerCase();
-  if (["lease_id", "quota_scope_id", "capacity_scope_id", "reservation_id"].includes(normalized)) return true;
+  if (["api_base", "lease_id", "quota_scope_id", "capacity_scope_id", "model_execution_plan", "reservation_id"].includes(normalized)) {
+    return true;
+  }
   return /api[_-]?key|secret|token|password|credential/i.test(key);
 }
 
@@ -850,6 +869,77 @@ function modelOutcomeHandoff(summary: ModelOutcomeSummary) {
   const actual = summary.last_logical_model;
   if (requested && actual && requested !== actual) return `${requested} -> ${actual}`;
   return actual || requested || "未记录";
+}
+
+function orchestrationHandoffSummary(events: RunEvent[]): OrchestrationHandoffSummary | null {
+  const items: OrchestrationHandoff[] = [];
+  let truncated = false;
+  events.forEach((event) => {
+    const plan = objectPayload(event.payload.model_execution_plan);
+    const handoffs = objectPayload(plan?.orchestration_handoffs);
+    if (!handoffs) return;
+    truncated = truncated || handoffs.truncated === true;
+    const rawItems = Array.isArray(handoffs.items) ? handoffs.items : [];
+    rawItems.forEach((item) => {
+      const handoff = orchestrationHandoffFromPayload(item);
+      if (handoff) items.push(handoff);
+    });
+  });
+  if (items.length === 0) return null;
+  return {
+    count: items.length,
+    truncated,
+    sourceRoles: uniqueHandoffValues(items.map((item) => item.sourceRoleId)),
+    targetRoles: uniqueHandoffValues(items.map((item) => item.targetRoleId)),
+    sourceModels: uniqueHandoffValues(items.map((item) => item.sourceLogicalModel)),
+    targetModels: uniqueHandoffValues(items.map((item) => item.targetLogicalModel)),
+    handoffKinds: uniqueHandoffValues(items.map((item) => item.handoffKind)),
+  };
+}
+
+function objectPayload(value: unknown): Record<string, unknown> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function orchestrationHandoffFromPayload(value: unknown): OrchestrationHandoff | null {
+  const item = objectPayload(value);
+  if (!item) return null;
+  const handoff = {
+    sourceRoleId: safeOrchestrationToken(item.source_role_id),
+    targetRoleId: safeOrchestrationToken(item.target_role_id),
+    sourceLogicalModel: safeOrchestrationToken(item.source_logical_model),
+    targetLogicalModel: safeOrchestrationToken(item.target_logical_model),
+    handoffKind: safeOrchestrationToken(item.handoff_kind),
+  };
+  return Object.values(handoff).every(Boolean) ? handoff : null;
+}
+
+function safeOrchestrationToken(value: unknown) {
+  const text = safeDiagnosticIdentifier(value, "");
+  if (!text) return "";
+  if (
+    /api[_-]?key|api[_-]?base|apikey|authorization|bearer|capacity|credential|lease|password|quota|secret|token/i.test(
+      text,
+    )
+  ) {
+    return "";
+  }
+  return text;
+}
+
+function uniqueHandoffValues(values: string[]) {
+  return [...new Set(values)].slice(0, 4);
+}
+
+function orchestrationList(values: string[]) {
+  return values.length > 0 ? values.join(", ") : "未记录";
+}
+
+function orchestrationPair(left: string[], right: string[]) {
+  const leftText = orchestrationList(left);
+  const rightText = orchestrationList(right);
+  return leftText === rightText ? leftText : `${leftText} -> ${rightText}`;
 }
 
 function replaySafetyLabel(value: unknown) {
@@ -1559,6 +1649,8 @@ export function RunDetailPage() {
   const executionIntents = executionIntentsForDetail(orderedRunData);
   const failureDiagnostics = failureDiagnosticsForDetail(orderedRunData);
   const modelOutcomeSummary = orderedRunData.model_outcome_summary;
+  const hasOutcomeSummary = hasModelOutcomeSummary(modelOutcomeSummary);
+  const handoffSummary = orchestrationHandoffSummary(orderedRunData.events);
 
   return (
     <section>
@@ -1601,38 +1693,70 @@ export function RunDetailPage() {
         </ul>
       </div>
 
-      {hasModelOutcomeSummary(modelOutcomeSummary) ? (
+      {hasOutcomeSummary || handoffSummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
             <strong>模型结果</strong>
-            <small>{modelOutcomeSummary.fallback_used ? "已发生回退" : "未发生回退"}</small>
+            <small>
+              {hasOutcomeSummary
+                ? modelOutcomeSummary.fallback_used
+                  ? "已发生回退"
+                  : "未发生回退"
+                : "已记录交接"}
+            </small>
           </div>
           <ul aria-label="模型结果指标">
-            <li>
-              <span>完成</span>
-              <strong>{modelOutcomeSummary.completion_count} 次完成</strong>
-            </li>
-            <li>
-              <span>回退</span>
-              <strong>{modelOutcomeSummary.fallback_attempt_count} 次回退</strong>
-            </li>
-            <li>
-              <span>请求模型</span>
-              <strong>{modelOutcomeList(modelOutcomeSummary.requested_logical_models)}</strong>
-            </li>
-            <li>
-              <span>实际模型</span>
-              <strong>{modelOutcomeList(modelOutcomeSummary.actual_logical_models)}</strong>
-            </li>
-            <li>
-              <span>Provider</span>
-              <strong>{modelOutcomeList(modelOutcomeSummary.provider_ids)}</strong>
-            </li>
-            <li>
-              <span>最后结果</span>
-              <strong>{modelOutcomeHandoff(modelOutcomeSummary)}</strong>
-            </li>
+            {hasOutcomeSummary ? (
+              <>
+                <li>
+                  <span>完成</span>
+                  <strong>{modelOutcomeSummary.completion_count} 次完成</strong>
+                </li>
+                <li>
+                  <span>回退</span>
+                  <strong>{modelOutcomeSummary.fallback_attempt_count} 次回退</strong>
+                </li>
+                <li>
+                  <span>请求模型</span>
+                  <strong>{modelOutcomeList(modelOutcomeSummary.requested_logical_models)}</strong>
+                </li>
+                <li>
+                  <span>实际模型</span>
+                  <strong>{modelOutcomeList(modelOutcomeSummary.actual_logical_models)}</strong>
+                </li>
+                <li>
+                  <span>Provider</span>
+                  <strong>{modelOutcomeList(modelOutcomeSummary.provider_ids)}</strong>
+                </li>
+                <li>
+                  <span>最后结果</span>
+                  <strong>{modelOutcomeHandoff(modelOutcomeSummary)}</strong>
+                </li>
+              </>
+            ) : null}
+            {handoffSummary ? (
+              <>
+                <li>
+                  <span>交接</span>
+                  <strong>
+                    {handoffSummary.count} 次交接{handoffSummary.truncated ? "，已截断" : ""}
+                  </strong>
+                </li>
+                <li>
+                  <span>角色路径</span>
+                  <strong>{orchestrationPair(handoffSummary.sourceRoles, handoffSummary.targetRoles)}</strong>
+                </li>
+                <li>
+                  <span>模型路径</span>
+                  <strong>{orchestrationPair(handoffSummary.sourceModels, handoffSummary.targetModels)}</strong>
+                </li>
+                <li>
+                  <span>类型</span>
+                  <strong>{orchestrationList(handoffSummary.handoffKinds)}</strong>
+                </li>
+              </>
+            ) : null}
           </ul>
         </div>
       ) : null}
