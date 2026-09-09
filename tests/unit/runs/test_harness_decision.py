@@ -240,6 +240,99 @@ async def test_direct_submit_constrains_harness_decision_to_direct_model() -> No
     assert harness["selected_logical_model"] == "main"
 
 
+def test_harness_decision_uses_provider_policy_from_routing_payload() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=scheduler,
+    )
+
+    service._with_harness_decision(
+        tenant_id=TENANT_ID,
+        message="普通问题",
+        mode=TaskMode.DIRECT,
+        routing_decision={
+            "harness_policy": {
+                "allowed_providers": ["DeepSeek", "OpenAI"],
+                "denied_providers": ["Local"],
+                "preferred_providers": ["OpenAI", "DeepSeek"],
+                "prefer_low_cost": True,
+                "require_approval_for_sensitive": False,
+            }
+        },
+    )
+
+    policy = scheduler.calls[0]["policy"]
+    assert isinstance(policy, HarnessPolicy)
+    assert policy.allowed_providers == frozenset({"deepseek", "openai"})
+    assert policy.denied_providers == frozenset({"local"})
+    assert policy.preferred_providers == ("openai", "deepseek")
+    assert policy.prefer_low_cost is True
+    assert policy.require_approval_for_sensitive is False
+
+
+def test_invalid_harness_provider_policy_degrades_to_unavailable_payload() -> None:
+    repository = RecordingRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=RecordingHarnessScheduler(),
+    )
+
+    routing = service._with_harness_decision(
+        tenant_id=TENANT_ID,
+        message="普通问题",
+        mode=TaskMode.DIRECT,
+        routing_decision={
+            "harness_policy": {
+                "allowed_providers": ["openai"],
+                "denied_providers": ["openai"],
+            }
+        },
+    )
+
+    assert routing["harness_unavailable"] == "scheduling_failed"
+    assert "harness_decision" not in routing
+
+
+@pytest.mark.parametrize(
+    "harness_policy",
+    [
+        [],
+        "openai",
+        None,
+        {"preferred_providers": {"openai"}},
+    ],
+)
+def test_malformed_harness_provider_policy_degrades_to_unavailable_payload(
+    harness_policy: object,
+) -> None:
+    repository = RecordingRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=RecordingHarnessScheduler(),
+    )
+
+    routing = service._with_harness_decision(
+        tenant_id=TENANT_ID,
+        message="普通问题",
+        mode=TaskMode.DIRECT,
+        routing_decision={"harness_policy": harness_policy},
+    )
+
+    assert routing["harness_unavailable"] == "scheduling_failed"
+    assert "harness_decision" not in routing
+
+
 async def test_explicit_workspace_write_sandbox_is_stamped_for_harness() -> None:
     repository = RecordingRepository()
     scheduler = RecordingHarnessScheduler()

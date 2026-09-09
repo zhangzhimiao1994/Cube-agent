@@ -73,6 +73,82 @@ def test_scheduler_never_lets_hermes_override_policy() -> None:
     assert "hermes_preferred_provider_blocked:deepseek" in decision.context_reasons
 
 
+def test_scheduler_prefers_policy_provider_without_overriding_hard_filters() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        requirements=HarnessTaskRequirements(required_capabilities=frozenset({"text"})),
+        policy=HarnessPolicy(
+            allowed_providers=frozenset({"DeepSeek", "OpenAI"}),
+            preferred_providers=("OpenAI",),
+        ),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_provider == "openai"
+    assert "provider_preferred:openai" in decision.policy_reasons
+
+
+def test_scheduler_never_lets_policy_preference_override_denied_provider() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        requirements=HarnessTaskRequirements(required_capabilities=frozenset({"text"})),
+        policy=HarnessPolicy(
+            denied_providers=frozenset({"openai"}),
+            preferred_providers=("openai",),
+        ),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_provider == "deepseek"
+    assert "provider_blocked:openai" in decision.fallbacks_considered
+    assert not any(reason.startswith("provider_preferred:") for reason in decision.policy_reasons)
+
+
+def test_scheduler_never_lets_policy_preference_override_health_demote() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex(
+                "gpt-5",
+                logical_model="main",
+                runtime_health=RuntimeHealth(
+                    recent_error_rate=0.95,
+                    queue_pressure=0.95,
+                    rate_limited=True,
+                ),
+            ),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        requirements=HarnessTaskRequirements(required_capabilities=frozenset({"text"})),
+        policy=HarnessPolicy(preferred_providers=("openai",)),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_provider == "deepseek"
+    assert "provider_health_degraded:openai" in decision.fallbacks_considered
+    assert "provider_preferred:deepseek" not in decision.policy_reasons
+
+
 def test_scheduler_requires_approval_for_sensitive_tasks_even_when_provider_matches() -> None:
     scheduler = CapabilityAwareHarnessScheduler(
         profiles=(ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),)

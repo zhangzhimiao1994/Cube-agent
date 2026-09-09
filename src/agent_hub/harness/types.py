@@ -264,12 +264,14 @@ class HarnessTaskRequirements:
 class HarnessPolicy:
     allowed_providers: frozenset[str] = field(default_factory=frozenset)
     denied_providers: frozenset[str] = field(default_factory=frozenset)
+    preferred_providers: tuple[str, ...] = ()
     prefer_low_cost: bool = False
     require_approval_for_sensitive: bool = True
 
     def __post_init__(self) -> None:
-        allowed = _safe_id_set("allowed provider", self.allowed_providers)
-        denied = _safe_id_set("denied provider", self.denied_providers)
+        allowed = _safe_provider_set("allowed provider", self.allowed_providers)
+        denied = _safe_provider_set("denied provider", self.denied_providers)
+        preferred = _safe_provider_tuple("preferred provider", self.preferred_providers)
         if allowed & denied:
             raise ValueError("provider policy is contradictory")
         if type(self.prefer_low_cost) is not bool:
@@ -278,6 +280,7 @@ class HarnessPolicy:
             raise ValueError("require_approval_for_sensitive must be a boolean")
         object.__setattr__(self, "allowed_providers", allowed)
         object.__setattr__(self, "denied_providers", denied)
+        object.__setattr__(self, "preferred_providers", preferred)
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +459,32 @@ def _safe_id_set(name: str, values: Iterable[str]) -> frozenset[str]:
     for value in result:
         _require_safe_id(name, value)
     return result
+
+
+def _safe_provider_set(name: str, values: Iterable[str]) -> frozenset[str]:
+    normalized: set[str] = set()
+    for value in values:
+        if type(value) is not str:
+            raise ValueError(f"{name} must be a safe identifier")
+        normalized_value = value.casefold()
+        _require_safe_id(name, normalized_value)
+        normalized.add(normalized_value)
+    return frozenset(normalized)
+
+
+def _safe_provider_tuple(name: str, values: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if type(value) is not str:
+            raise ValueError(f"{name} must be a safe identifier")
+        normalized_value = value.casefold()
+        _require_safe_id(name, normalized_value)
+        if normalized_value in seen:
+            continue
+        normalized.append(normalized_value)
+        seen.add(normalized_value)
+    return tuple(normalized)
 
 
 def _mutable_json(value: JsonValue) -> object:

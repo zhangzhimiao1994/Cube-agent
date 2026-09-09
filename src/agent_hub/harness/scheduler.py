@@ -172,6 +172,10 @@ class CapabilityAwareHarnessScheduler:
         if policy.prefer_low_cost and profile.cost_latency_tier == "low":
             score += 1
             policy_reasons.append("low_cost_preferred")
+        if profile.provider in policy.preferred_providers:
+            rank = policy.preferred_providers.index(profile.provider)
+            score += max(1.0, 6.0 - rank)
+            policy_reasons.append(f"provider_preferred:{profile.provider}")
         if hermes_hint is not None and hermes_hint.confidence >= 0.75:
             if hermes_hint.project_id or hermes_hint.conversation_id:
                 score += 0.5

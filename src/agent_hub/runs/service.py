@@ -949,6 +949,7 @@ class RunService:
         if mode is TaskMode.AUTO:
             return routing_decision
         try:
+            policy = _harness_policy(routing_decision)
             decision = scheduler.select(
                 tenant_id=tenant_id,
                 mode=mode,
@@ -957,7 +958,7 @@ class RunService:
                     mode=mode,
                     routing_decision=routing_decision,
                 ),
-                policy=HarnessPolicy(),
+                policy=policy,
                 hermes_hint=_harness_context_hint(routing_decision),
             )
         except HarnessSchedulingError as error:
@@ -2292,6 +2293,52 @@ def _harness_task_requirements(
         or token_estimate >= 32_000
         or _message_suggests_large_context(message),
     )
+
+
+def _harness_policy(routing_decision: Mapping[str, object]) -> HarnessPolicy:
+    if "harness_policy" not in routing_decision:
+        return HarnessPolicy()
+    raw_policy = routing_decision.get("harness_policy")
+    if not isinstance(raw_policy, Mapping):
+        raise HarnessSchedulingError("invalid harness provider policy")
+    try:
+        return HarnessPolicy(
+            allowed_providers=_provider_policy_set(raw_policy.get("allowed_providers")),
+            denied_providers=_provider_policy_set(raw_policy.get("denied_providers")),
+            preferred_providers=_provider_policy_tuple(raw_policy.get("preferred_providers")),
+            prefer_low_cost=_provider_policy_bool(raw_policy.get("prefer_low_cost"), default=False),
+            require_approval_for_sensitive=_provider_policy_bool(
+                raw_policy.get("require_approval_for_sensitive"),
+                default=True,
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise HarnessSchedulingError("invalid harness provider policy") from error
+
+
+def _provider_policy_set(value: object) -> frozenset[str]:
+    return frozenset(_provider_policy_tuple(value))
+
+
+def _provider_policy_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("provider policy entries must be arrays")
+    entries: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError("provider policy entries must be strings")
+        entries.append(item)
+    return tuple(entries)
+
+
+def _provider_policy_bool(value: object, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise ValueError("provider policy flags must be booleans")
+    return value
 
 
 def _routing_requests_vibe_coding(routing_decision: Mapping[str, object]) -> bool:
