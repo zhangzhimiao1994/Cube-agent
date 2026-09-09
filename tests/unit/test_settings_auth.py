@@ -180,3 +180,38 @@ def test_ipv4_mapped_trusted_proxy_is_stored_as_ipv4() -> None:
     )
 
     assert settings.trusted_proxy_ips == frozenset({"192.0.2.10"})
+
+
+def test_plugin_package_subprocess_runner_defaults_to_disabled() -> None:
+    settings = Settings.model_validate({})
+
+    assert settings.plugin_package_subprocess_runner_enabled is False
+    assert settings.plugin_package_subprocess_adapter_ids == frozenset()
+
+
+@pytest.mark.parametrize(
+    "adapter_id",
+    ["", "Calendar", "calendar python", "calendar/python", "http_json", "x" * 65],
+)
+def test_plugin_package_subprocess_adapter_ids_reject_invalid_values(
+    adapter_id: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"plugin_package_subprocess_adapter_ids": [adapter_id]})
+
+
+def test_plugin_package_subprocess_adapter_ids_reject_scalar_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"plugin_package_subprocess_adapter_ids": "calendar_python"}
+        )
+
+
+def test_plugin_package_subprocess_adapter_ids_are_normalized() -> None:
+    settings = Settings.model_validate(
+        {"plugin_package_subprocess_adapter_ids": ["calendar_python", "calendar-python"]}
+    )
+
+    assert settings.plugin_package_subprocess_adapter_ids == frozenset(
+        {"calendar_python", "calendar-python"}
+    )

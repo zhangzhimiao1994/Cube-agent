@@ -21,7 +21,10 @@ from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import RuntimeMcpService
-from agent_hub.plugins.runtime import RuntimePluginService
+from agent_hub.plugins.runtime import (
+    RuntimePluginService,
+    build_plugin_package_subprocess_adapters,
+)
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -259,6 +262,25 @@ def build_worker_service(
     runtime_plugin_service = RuntimePluginService(
         tenant_id=settings.bootstrap_tenant_id,
         admin_service=admin_service,
+        adapters=build_plugin_package_subprocess_adapters(
+            enabled=bool(
+                getattr(settings, "plugin_package_subprocess_runner_enabled", False)
+            ),
+            adapter_ids=tuple(
+                getattr(settings, "plugin_package_subprocess_adapter_ids", ())
+            ),
+            package_store_dir=getattr(
+                settings,
+                "plugin_package_store_dir",
+                Path("/var/lib/agent-hub/plugin-packages"),
+            ),
+            timeout_seconds=float(
+                getattr(settings, "plugin_package_subprocess_timeout_seconds", 10.0)
+            ),
+            max_stdout_bytes=int(
+                getattr(settings, "plugin_package_subprocess_max_stdout_bytes", 262_144)
+            ),
+        ),
     )
     runtime_capability_stack = build_runtime_capability_stack(
         tenant_id=settings.bootstrap_tenant_id,

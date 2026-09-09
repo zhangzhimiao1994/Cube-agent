@@ -146,11 +146,12 @@ class BlockingFeishuClient:
             self.cancelled.set()
 
 
-def valid_settings(attachment_store_dir: Path | None = None) -> Settings:
+def valid_settings(attachment_store_dir: Path | None = None, **overrides: object) -> Settings:
     key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
     values: dict[str, object] = {"jwt_signing_key": "base64url:" + key}
     if attachment_store_dir is not None:
         values["attachment_store_dir"] = attachment_store_dir
+    values.update(overrides)
     return Settings.model_validate(values)
 
 
@@ -559,6 +560,72 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     assert getattr(application.state, "plugin_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
     assert callable(getattr(application.state, "reload_plugin_runtime_config", None))
+
+
+def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRuntimeService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            del tenant_id
+
+        def capability_manifest_source(self) -> object:
+            return object()
+
+    class FakeRuntimeStack:
+        runtime_gateway = object()
+        harness_tool_gateway = object()
+
+    async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
+        del kwargs
+        return FakeRuntimeService()
+
+    async def fake_build_runtime_plugin_service(**kwargs: object) -> FakeRuntimeService:
+        captured["plugin_service_kwargs"] = kwargs
+        return FakeRuntimeService()
+
+    monkeypatch.setattr(app_module, "build_runtime_mcp_service", fake_build_runtime_mcp_service)
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_plugin_service",
+        fake_build_runtime_plugin_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_capability_stack",
+        lambda **kwargs: FakeRuntimeStack(),
+    )
+    monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
+
+    application = create_app(
+        settings=valid_settings(
+            tmp_path,
+            plugin_package_store_dir=tmp_path / "packages",
+            plugin_package_subprocess_runner_enabled=True,
+            plugin_package_subprocess_adapter_ids=["calendar_python"],
+            plugin_package_subprocess_timeout_seconds=1,
+            plugin_package_subprocess_max_stdout_bytes=1024,
+        ),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+    )
+
+    with TestClient(application):
+        pass
+
+    plugin_kwargs = cast(dict[str, object], captured["plugin_service_kwargs"])
+    adapters = cast(dict[str, Any], plugin_kwargs["adapters"])
+
+    assert tuple(adapters) == ("calendar_python",)
+    assert adapters["calendar_python"].descriptor()["id"] == "calendar_python"
 
 
 def test_create_app_publishes_runtime_invalidation_after_admin_reload(

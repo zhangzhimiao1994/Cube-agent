@@ -236,6 +236,81 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
     assert asyncio.run(approval_mode(OTHER_TENANT_ID)) == "auto_review"
 
 
+def test_worker_registers_enabled_plugin_package_subprocess_adapters(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeDatabase:
+        session_factory = object()
+
+    class FakeRedis:
+        @classmethod
+        def from_url(cls, url: str) -> FakeRedis:
+            captured["redis_url"] = url
+            return cls()
+
+    class FakeSettings:
+        bootstrap_tenant_id = TENANT_ID
+        skill_store_dir = tmp_path / "skills"
+        plugin_package_store_dir = tmp_path / "packages"
+        attachment_store_dir = tmp_path / "attachments"
+        generated_artifact_dir = tmp_path / "generated"
+        project_workspace_dir = tmp_path / "workspaces"
+        runtime_timeout_seconds = 10
+        runtime_token_budget = 1000
+        plugin_package_subprocess_runner_enabled = True
+        plugin_package_subprocess_adapter_ids = frozenset({"calendar_python"})
+        plugin_package_subprocess_timeout_seconds = 1
+        plugin_package_subprocess_max_stdout_bytes = 1024
+
+        def database_url_value(self) -> str:
+            return "postgresql+asyncpg://example"
+
+        def redis_url_value(self) -> str:
+            return "redis://example"
+
+        def master_key_bytes(self) -> bytes:
+            return b"0" * 32
+
+    class FakeRuntimeService:
+        def __init__(self, **kwargs: object) -> None:
+            captured["plugin_service"] = kwargs
+
+        def capability_manifest_source(self) -> object:
+            return object()
+
+    class FakeRuntimeStack:
+        runtime_gateway = object()
+        harness_tool_gateway = object()
+
+    monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
+    monkeypatch.setattr(worker, "Redis", FakeRedis)
+    monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
+    monkeypatch.setattr(worker, "RunRepository", lambda session_factory: object())
+    monkeypatch.setattr(worker, "SecretCipher", lambda key: object())
+    monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
+    monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
+    monkeypatch.setattr(worker, "_evolution_terminal_hooks", lambda **kwargs: ())
+    monkeypatch.setattr(worker, "configured_runtime_registry", lambda **kwargs: object())
+    monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
+    monkeypatch.setattr(worker, "RuntimeMcpService", lambda **kwargs: FakeRuntimeService())
+    monkeypatch.setattr(worker, "RuntimePluginService", FakeRuntimeService)
+    monkeypatch.setattr(
+        worker,
+        "build_runtime_capability_stack",
+        lambda **kwargs: FakeRuntimeStack(),
+    )
+
+    worker.build_worker_service(cast(Settings, FakeSettings()))
+
+    plugin_service = cast(dict[str, object], captured["plugin_service"])
+    adapters = cast(dict[str, Any], plugin_service["adapters"])
+
+    assert tuple(adapters) == ("calendar_python",)
+    assert adapters["calendar_python"].descriptor()["id"] == "calendar_python"
+
+
 def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> None:
     class FakeBus:
         def __init__(self) -> None:

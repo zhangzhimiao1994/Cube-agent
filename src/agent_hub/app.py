@@ -95,7 +95,10 @@ from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
 from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
-from agent_hub.plugins.runtime import build_runtime_plugin_service
+from agent_hub.plugins.runtime import (
+    build_plugin_package_subprocess_adapters,
+    build_runtime_plugin_service,
+)
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (
@@ -961,6 +964,19 @@ def create_app(
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,
+                        adapters=build_plugin_package_subprocess_adapters(
+                            enabled=configured.plugin_package_subprocess_runner_enabled,
+                            adapter_ids=tuple(
+                                configured.plugin_package_subprocess_adapter_ids
+                            ),
+                            package_store_dir=configured.plugin_package_store_dir,
+                            timeout_seconds=(
+                                configured.plugin_package_subprocess_timeout_seconds
+                            ),
+                            max_stdout_bytes=(
+                                configured.plugin_package_subprocess_max_stdout_bytes
+                            ),
+                        ),
                     )
                     application.state.plugin_service = runtime_plugin_service
                     reload_plugin_runtime_config = getattr(

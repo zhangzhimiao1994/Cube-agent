@@ -920,6 +920,34 @@ def _minimal_python_subprocess_environment() -> dict[str, str]:
     return environment
 
 
+def build_plugin_package_subprocess_adapters(
+    *,
+    enabled: bool,
+    adapter_ids: Sequence[str],
+    package_store_dir: Path,
+    python_executable: str | None = None,
+    timeout_seconds: float = 10.0,
+    max_stdout_bytes: int = 262_144,
+) -> dict[str, PluginAdapter]:
+    if not enabled:
+        return {}
+    if any(adapter_id == "http_json" for adapter_id in adapter_ids):
+        raise ValueError("plugin package subprocess adapter id is reserved")
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=python_executable,
+        timeout_seconds=timeout_seconds,
+        max_stdout_bytes=max_stdout_bytes,
+    )
+    return {
+        adapter_id: PluginPackageAdapter(
+            adapter_id=adapter_id,
+            package_store_dir=package_store_dir,
+            runner=runner,
+        )
+        for adapter_id in adapter_ids
+    }
+
+
 def _plugin_schema_validator(
     *,
     schema: Mapping[str, JsonValue] | None,
@@ -1025,5 +1053,6 @@ __all__ = [
     "PythonSubprocessPluginPackageRunner",
     "RuntimePluginService",
     "_plugin_package_execution_target",
+    "build_plugin_package_subprocess_adapters",
     "build_runtime_plugin_service",
 ]

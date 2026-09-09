@@ -5,7 +5,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import pytest
@@ -31,6 +31,7 @@ from agent_hub.plugins.runtime import (
     PluginPackageExecutionTarget,
     PythonSubprocessPluginPackageRunner,
     _plugin_package_execution_target,
+    build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
 )
 from agent_hub.runtime.contracts import JsonValue
@@ -1324,6 +1325,46 @@ async def test_python_subprocess_plugin_package_runner_discards_stderr(
     )
 
     assert result == {"ok": True}
+
+
+def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
+    tmp_path: Path,
+) -> None:
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=False,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+        )
+        == {}
+    )
+
+
+def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
+    tmp_path: Path,
+) -> None:
+    adapters = build_plugin_package_subprocess_adapters(
+        enabled=True,
+        adapter_ids=("calendar_python", "crm-python"),
+        package_store_dir=tmp_path,
+        timeout_seconds=1,
+        max_stdout_bytes=1024,
+    )
+
+    assert tuple(adapters) == ("calendar_python", "crm-python")
+    assert cast(Any, adapters["calendar_python"]).descriptor()["id"] == "calendar_python"
+    assert cast(Any, adapters["crm-python"]).descriptor()["id"] == "crm-python"
+
+
+def test_build_plugin_package_subprocess_adapters_rejects_reserved_adapter_id(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("http_json",),
+            package_store_dir=tmp_path,
+        )
 
 
 async def test_runtime_plugin_service_rechecks_runtime_registered_package_metadata() -> None:

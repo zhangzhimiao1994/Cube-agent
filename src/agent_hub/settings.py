@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar
@@ -51,6 +52,17 @@ class Settings(BaseSettings):
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     plugin_package_store_dir: Path = Path("/var/lib/agent-hub/plugin-packages")
+    plugin_package_subprocess_runner_enabled: bool = False
+    plugin_package_subprocess_adapter_ids: frozenset[str] = Field(
+        default=frozenset(),
+        max_length=32,
+    )
+    plugin_package_subprocess_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
+    plugin_package_subprocess_max_stdout_bytes: int = Field(
+        default=262_144,
+        ge=1,
+        le=1_048_576,
+    )
     attachment_store_dir: Path = Path("/var/lib/agent-hub/attachments")
     generated_artifact_dir: Path = Path("/var/lib/agent-hub/generated")
     project_workspace_dir: Path = Path("/var/lib/agent-hub/workspaces")
@@ -120,6 +132,32 @@ class Settings(BaseSettings):
                 raise ValueError("trusted proxy must be an IP address")
             canonical.add(normalized)
         return frozenset(canonical)
+
+    @field_validator("plugin_package_subprocess_adapter_ids", mode="before")
+    @classmethod
+    def validate_plugin_package_subprocess_adapter_ids(
+        cls, values: object
+    ) -> frozenset[str]:
+        if values is None:
+            return frozenset()
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            raise ValueError(  # noqa: TRY004 - Pydantic converts this to ValidationError.
+                "plugin package adapter ids must be a collection of adapter ids"
+            )
+        if len(values) > 32:
+            raise ValueError("at most 32 plugin package adapter ids may be configured")
+        adapter_ids: set[str] = set()
+        pattern = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+        reserved = {"http_json"}
+        for value in values:
+            if (
+                not isinstance(value, str)
+                or value in reserved
+                or pattern.fullmatch(value) is None
+            ):
+                raise ValueError("plugin package adapter id is invalid")
+            adapter_ids.add(value)
+        return frozenset(adapter_ids)
 
     @field_validator("bootstrap_tenant_name", mode="after")
     @classmethod
