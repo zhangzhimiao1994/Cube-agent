@@ -118,6 +118,7 @@ _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
 _MAX_ORCHESTRATION_HANDOFFS = 12
 _ORCHESTRATION_CONTRACT_READY_STATUS = "done"
 _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES = ("blocked", "needs_user")
+_ORCHESTRATION_CONTRACT_RECOVERY_HINT = "retry_blocked_contract_chain"
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
@@ -1794,6 +1795,7 @@ def _orchestration_contracts_payload(
             "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
             "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
             "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
+            "recovery_hint": _ORCHESTRATION_CONTRACT_RECOVERY_HINT,
         }
         for handoff in handoffs
     ]

@@ -609,6 +609,7 @@ describe("RunDetailPage", () => {
                     required_output_fields: ["status", "summary"],
                     ready_status: "done",
                     blocking_statuses: ["blocked", "needs_user"],
+                    recovery_hint: "retry_blocked_contract_chain",
                   },
                 ],
                 truncated: false,
@@ -676,6 +677,7 @@ describe("RunDetailPage", () => {
                     required_output_fields: ["status", "summary", "evidence"],
                     ready_status: "done",
                     blocking_statuses: ["blocked", "needs_user"],
+                    recovery_hint: "retry_blocked_contract_chain",
                   },
                 ],
                 truncated: false,
@@ -720,8 +722,272 @@ describe("RunDetailPage", () => {
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(within(summary).getByText("已记录契约")).not.toBeNull();
     expect(within(summary).getByText("1 个契约，阻塞 1")).not.toBeNull();
-    expect(screen.queryByText("research_step")).toBeNull();
-    expect(screen.queryByText("research_step-to-final_response_step")).toBeNull();
+    expect(screen.queryByText(/research_step/)).toBeNull();
+    expect(screen.queryByText(/research_step-to-final_response_step/)).toBeNull();
+  });
+
+  it("shows a compact recovery hint when an orchestration contract is blocked", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "blocked",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                    recovery_hint: "retry_blocked_contract_chain",
+                  },
+                ],
+                truncated: false,
+              },
+            },
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const diagnostics = await screen.findByLabelText("故障诊断");
+    expect(within(diagnostics).getByText("契约恢复提示")).not.toBeNull();
+    expect(within(diagnostics).getByText("1 个契约阻塞")).not.toBeNull();
+    expect(within(diagnostics).getByText("按契约提示只重试阻塞角色链路，保留已完成产物和步骤。")).not.toBeNull();
+    expect(screen.queryByText(/research_step/)).toBeNull();
+    expect(screen.queryByText(/research_step-to-final_response_step/)).toBeNull();
+  });
+
+  it("uses the latest orchestration contract snapshot before showing recovery hints", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "blocked",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                    recovery_hint: "retry_blocked_contract_chain",
+                  },
+                ],
+                truncated: false,
+              },
+            },
+          },
+        },
+        {
+          sequence: 9,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "done",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                    recovery_hint: "retry_blocked_contract_chain",
+                  },
+                ],
+                truncated: false,
+              },
+            },
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("1 个契约")).not.toBeNull();
+    expect(within(summary).queryByText(/阻塞/)).toBeNull();
+    expect(screen.queryByLabelText("故障诊断")).toBeNull();
+    expect(screen.queryByText(/retry_blocked_contract_chain/)).toBeNull();
+  });
+
+  it("uses the latest orchestration contract snapshot for truncation state", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "planned",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                  },
+                ],
+                truncated: true,
+              },
+            },
+          },
+        },
+        {
+          sequence: 9,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "planned",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                  },
+                ],
+                truncated: false,
+              },
+            },
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("1 个契约")).not.toBeNull();
+    expect(within(summary).queryByText(/已截断/)).toBeNull();
   });
 
   it("deduplicates generated downloads that reuse the same file URL", async () => {

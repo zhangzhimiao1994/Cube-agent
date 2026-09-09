@@ -41,9 +41,11 @@ type OrchestrationContractSummary = {
   truncated: boolean;
   completedCount: number;
   blockedCount: number;
+  recoveryHints: string[];
 };
 
 type OrchestrationContract = {
+  contractId: string;
   sourceStepId: string;
   targetStepId: string;
   sourceRoleId: string;
@@ -51,6 +53,7 @@ type OrchestrationContract = {
   handoffKind: string;
   status: string;
   blockingStatuses: string[];
+  recoveryHint: string;
 };
 
 function detailTimestampValue(value: string | null | undefined) {
@@ -155,7 +158,7 @@ type RunExecutionIntent = {
 
 type DetailFailureDiagnostic = {
   id: string;
-  label: "工具执行失败" | "模型链路失败" | "运行阶段失败" | "等待人工确认";
+  label: "工具执行失败" | "模型链路失败" | "运行阶段失败" | "等待人工确认" | "契约阻塞";
   title: string;
   detail: string;
   recommendation: string;
@@ -942,7 +945,7 @@ function orchestrationHandoffSummary(events: RunEvent[]): OrchestrationHandoffSu
 }
 
 function orchestrationContractSummary(events: RunEvent[]): OrchestrationContractSummary | null {
-  const contracts: OrchestrationContract[] = [];
+  const contractByKey = new Map<string, OrchestrationContract>();
   let truncated = false;
   const stepStatuses = new Map<string, "completed" | "failed">();
   events.forEach((event) => {
@@ -957,30 +960,36 @@ function orchestrationContractSummary(events: RunEvent[]): OrchestrationContract
     const plan = objectPayload(event.payload.model_execution_plan);
     const contractsPayload = objectPayload(plan?.orchestration_contracts);
     if (!contractsPayload) return;
-    truncated = truncated || contractsPayload.truncated === true;
+    truncated = contractsPayload.truncated === true;
     const rawItems = Array.isArray(contractsPayload.items) ? contractsPayload.items : [];
     rawItems.forEach((item) => {
       const contract = orchestrationContractFromPayload(item);
-      if (contract) contracts.push(contract);
+      if (contract) contractByKey.set(orchestrationContractKey(contract), contract);
     });
   });
+  const contracts = [...contractByKey.values()];
   if (contracts.length === 0) return null;
   const completedCount = contracts.filter((contract) => {
     return stepStatuses.get(contract.targetStepId) === "completed";
   }).length;
-  const blockedCount = contracts.filter((contract) => {
+  const blockedContracts = contracts.filter((contract) => {
     return (
       stepStatuses.get(contract.sourceStepId) === "failed" ||
       stepStatuses.get(contract.targetStepId) === "failed" ||
       contract.blockingStatuses.includes(contract.status)
     );
-  }).length;
+  });
   return {
     count: contracts.length,
     truncated,
     completedCount,
-    blockedCount,
+    blockedCount: blockedContracts.length,
+    recoveryHints: uniqueHandoffValues(blockedContracts.map((contract) => contract.recoveryHint).filter(Boolean)),
   };
+}
+
+function orchestrationContractKey(contract: OrchestrationContract) {
+  return contract.contractId || `${contract.sourceStepId}->${contract.targetStepId}:${contract.handoffKind}`;
 }
 
 function objectPayload(value: unknown): Record<string, unknown> | null {
@@ -1005,6 +1014,7 @@ function orchestrationContractFromPayload(value: unknown) {
   const item = objectPayload(value);
   if (!item) return null;
   const contract = {
+    contractId: safeOrchestrationToken(item.contract_id),
     sourceStepId: safeOrchestrationToken(item.source_step_id),
     targetStepId: safeOrchestrationToken(item.target_step_id),
     sourceRoleId: safeOrchestrationToken(item.source_role_id),
@@ -1012,6 +1022,7 @@ function orchestrationContractFromPayload(value: unknown) {
     handoffKind: safeOrchestrationToken(item.handoff_kind),
     status: safeOrchestrationToken(item.status),
     blockingStatuses: safeOrchestrationTokenList(item.blocking_statuses),
+    recoveryHint: safeOrchestrationRecoveryHint(item.recovery_hint),
   };
   return contract.sourceStepId &&
     contract.targetStepId &&
@@ -1021,6 +1032,11 @@ function orchestrationContractFromPayload(value: unknown) {
     contract.status
     ? contract
     : null;
+}
+
+function safeOrchestrationRecoveryHint(value: unknown) {
+  const text = safeOrchestrationToken(value);
+  return text === "retry_blocked_contract_chain" ? text : "";
 }
 
 function safeOrchestrationTokenList(value: unknown) {
@@ -1060,6 +1076,13 @@ function orchestrationContractLabel(summary: OrchestrationContractSummary) {
   if (summary.completedCount > 0) parts.push(`已完成 ${summary.completedCount}`);
   if (summary.blockedCount > 0) parts.push(`阻塞 ${summary.blockedCount}`);
   return parts.join("，");
+}
+
+function orchestrationContractRecoveryRecommendation(summary: OrchestrationContractSummary) {
+  if (summary.recoveryHints.includes("retry_blocked_contract_chain")) {
+    return "按契约提示只重试阻塞角色链路，保留已完成产物和步骤。";
+  }
+  return "只重试阻塞契约关联的角色链路，保留已经完成的产物和步骤。";
 }
 
 function replaySafetyLabel(value: unknown) {
@@ -1231,7 +1254,6 @@ function detailDiagnosticFromApi(
       diagnostic.error_code ? `错误码 ${diagnostic.error_code}` : "",
       typeof diagnostic.retryable === "boolean" ? `可重试 ${diagnostic.retryable ? "是" : "否"}` : "",
       diagnostic.error_category ? `类型 ${diagnostic.error_category}` : "",
-      diagnostic.step_id ? `步骤 ${diagnostic.step_id}` : "",
       diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
       diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
       `#${diagnostic.sequence}`,
@@ -1267,9 +1289,33 @@ function pendingApprovalDiagnostics(detail: RunDetail): DetailFailureDiagnostic[
   }));
 }
 
+function orchestrationContractRecoveryDiagnostics(detail: RunDetail): DetailFailureDiagnostic[] {
+  const contractSummary = orchestrationContractSummary(detail.events);
+  if (!contractSummary || contractSummary.blockedCount === 0) return [];
+  return [
+    {
+      id: `${detail.id}-diagnostic-orchestration-contracts`,
+      label: "契约阻塞",
+      title: "契约恢复提示",
+      detail: `${contractSummary.blockedCount} 个契约阻塞`,
+      recommendation: orchestrationContractRecoveryRecommendation(contractSummary),
+      meta: [
+        `${contractSummary.count} 个契约`,
+        contractSummary.completedCount > 0 ? `已完成 ${contractSummary.completedCount}` : "",
+        contractSummary.truncated ? "契约已截断" : "",
+      ].filter(Boolean),
+      tone: "runtime",
+    },
+  ];
+}
+
 function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic[] {
+  const contractDiagnostics = orchestrationContractRecoveryDiagnostics(detail);
   if (detail.failure_diagnostics.length > 0) {
-    return detail.failure_diagnostics.map((diagnostic, index) => detailDiagnosticFromApi(detail.id, diagnostic, index));
+    return [
+      ...detail.failure_diagnostics.map((diagnostic, index) => detailDiagnosticFromApi(detail.id, diagnostic, index)),
+      ...contractDiagnostics,
+    ];
   }
 
   const diagnostics: DetailFailureDiagnostic[] = [];
@@ -1292,7 +1338,7 @@ function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic
             .filter(Boolean)
             .join("；") || "工具调用未完成",
         recommendation: "检查工具权限、参数和运行环境，再决定是否重试或改派。",
-        meta: [displayDetailActor(event.actor), event.step_id ? `步骤 ${event.step_id}` : "", `#${event.sequence}`].filter(Boolean),
+        meta: [displayDetailActor(event.actor), `#${event.sequence}`].filter(Boolean),
         tone: "tool",
       });
       return;
@@ -1316,12 +1362,13 @@ function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic
         label === "模型链路失败"
           ? "检查模型配置、API Key、上游状态码和限流，再重试或切换模型。"
           : "按失败阶段查看上下文，优先保留已有产物并缩小重试范围。",
-      meta: [actor, event.step_id ? `步骤 ${event.step_id}` : "", `#${event.sequence}`].filter(Boolean),
+      meta: [actor, `#${event.sequence}`].filter(Boolean),
       tone: label === "模型链路失败" ? "model" : "runtime",
     });
   });
 
   pendingApprovalDiagnostics(detail).forEach((diagnostic) => pushUniqueDiagnostic(diagnostics, diagnostic));
+  contractDiagnostics.forEach((diagnostic) => pushUniqueDiagnostic(diagnostics, diagnostic));
   return diagnostics;
 }
 

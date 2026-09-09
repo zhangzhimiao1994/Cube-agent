@@ -1372,6 +1372,7 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
                 ),
                 "ready_status": "done",
                 "blocking_statuses": ("blocked", "needs_user"),
+                "recovery_hint": "retry_blocked_contract_chain",
             },
         ),
         "truncated": False,

@@ -563,7 +563,12 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                         ),
                                         "ready_status": "done",
                                         "blocking_statuses": ("blocked", "needs_user"),
+                                        "recovery_hint": "retry_blocked_contract_chain",
                                         "api_base": "https://contract-internal.example.invalid",
+                                        "capacity_pool": "capacity-private",
+                                        "lease": "lease-private-short",
+                                        "quota_scope": "quota-private-short",
+                                        "release_channel": "stable",
                                         "quota_scope_id": "contract-private-quota",
                                     },
                                 ),
@@ -618,7 +623,12 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                 "required_output_fields": ["status", "summary", "evidence"],
                 "ready_status": "done",
                 "blocking_statuses": ["blocked", "needs_user"],
+                "recovery_hint": "retry_blocked_contract_chain",
                 "api_base": "[redacted]",
+                "capacity_pool": "[redacted]",
+                "lease": "[redacted]",
+                "quota_scope": "[redacted]",
+                "release_channel": "stable",
                 "quota_scope_id": "[redacted]",
             }
         ],
@@ -628,6 +638,9 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert "lease-private" not in serialized
     assert "tenant-private-quota" not in serialized
     assert "contract-private-quota" not in serialized
+    assert "capacity-private" not in serialized
+    assert "lease-private-short" not in serialized
+    assert "quota-private-short" not in serialized
     assert "contract-internal.example.invalid" not in serialized
     assert "credential-private" not in serialized
     assert "internal.example.invalid" not in serialized

@@ -10227,6 +10227,7 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
         "traceback",
     }
 )
+_SENSITIVE_EVENT_DETAIL_KEY_PARTS = frozenset({"capacity", "lease", "quota"})
 _SENSITIVE_EVENT_DETAIL_EXACT_KEYS = frozenset(
     {
         "api_base",
@@ -10325,6 +10326,8 @@ def _safe_event_detail(value: object, *, key: str | None = None, depth: int = 0)
 def _is_sensitive_event_detail_key(key: str) -> bool:
     lowered = key.lower()
     if lowered in _SENSITIVE_EVENT_DETAIL_EXACT_KEYS:
+        return True
+    if any(part in _SENSITIVE_EVENT_DETAIL_KEY_PARTS for part in re.split(r"[_\-.]+", lowered)):
         return True
     return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
