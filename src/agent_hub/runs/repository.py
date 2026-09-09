@@ -27,7 +27,10 @@ from agent_hub.db.models import (
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
-from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
+from agent_hub.runtime.failure_reason import (
+    RECOVERY_BLOCKED_FAILURE_REASON,
+    runtime_failure_diagnostic_from_reason,
+)
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset({"harness.started"})
 
@@ -565,6 +568,18 @@ class RunRepository:
                 )
             )
             if latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence:
+                sequence = await self.next_event_sequence(session, row.id)
+                await self.persist_event(
+                    session,
+                    tenant_id=row.tenant_id,
+                    run_id=row.id,
+                    event=RunEvent(
+                        kind=EventKind.RUNTIME_FAILED,
+                        sequence=sequence,
+                        run_id=row.id,
+                        reason=RECOVERY_BLOCKED_FAILURE_REASON,
+                    ),
+                )
                 row.status = RunStatus.FAILED.value
                 row.version += 1
                 await session.flush()

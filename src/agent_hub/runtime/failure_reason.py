@@ -54,6 +54,9 @@ EMPTY_MODEL_RESPONSE_ACTION = (
     "模型返回了空内容；先压缩输入和历史上下文，必要时拆分提示、标记模型 fallback "
     "或切换备用模型后重试，重试后仍失败则保留中断前输出并闭环失败原因。"
 )
+RECOVERY_BLOCKED_FAILURE_REASON = (
+    "runtime recovery blocked: non-replayable event after checkpoint"
+)
 
 
 def safe_model_gateway_failure_reason(error: Exception) -> str | None:
@@ -157,6 +160,19 @@ def runtime_failure_diagnostic_from_reason(
             suggested_action=(
                 "工具结果可能已经产生不可确认副作用，系统已停止自动重放；"
                 "请查看上一条工具事件并人工确认状态后再继续。"
+            ),
+            status_code=status_code,
+        )
+    if normalized == RECOVERY_BLOCKED_FAILURE_REASON:
+        return _base_diagnostic(
+            normalized,
+            error_stage="runtime_recovery",
+            error_category="non_replayable_event_after_checkpoint",
+            error_code="runtime.recovery_blocked",
+            retryable=False,
+            suggested_action=(
+                "恢复点之后已经存在不可重放事件，系统已阻止自动恢复以避免重复副作用；"
+                "请检查最后一个 checkpoint 之后的事件和外部产物状态，再人工决定是否新建任务或补偿。"
             ),
             status_code=status_code,
         )
@@ -545,6 +561,7 @@ def is_legacy_generic_failure_reason(reason: str | None) -> bool:
 __all__ = [
     "GENERIC_MODEL_GATEWAY_FAILURE",
     "MAX_FAILURE_REASON_LENGTH",
+    "RECOVERY_BLOCKED_FAILURE_REASON",
     "SENSITIVE_FAILURE_REASON",
     "is_legacy_generic_failure_reason",
     "is_safe_failure_reason",

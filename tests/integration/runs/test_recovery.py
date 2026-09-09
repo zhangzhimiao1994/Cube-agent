@@ -1112,6 +1112,17 @@ async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(
     assert recovered.status is RunStatus.FAILED
     assert runtime.calls == 1
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
+    failure_events = [event for event in events if event["kind"] == "runtime.failed"]
+    assert len(failure_events) == 1
+    assert (
+        failure_events[0]["reason"]
+        == "runtime recovery blocked: non-replayable event after checkpoint"
+    )
+    failure_payload = failure_events[0]["payload"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["error_code"] == "runtime.recovery_blocked"
+    assert failure_payload["error_stage"] == "runtime_recovery"
+    assert failure_payload["retryable"] is False
 
 
 async def test_submission_writes_run_and_outbox_atomically_then_publisher_delivers_once(

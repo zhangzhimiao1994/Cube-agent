@@ -247,6 +247,21 @@ def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_n
     assert diagnostic["retryable"] is False
 
 
+def test_runtime_failure_diagnostic_classifies_recovery_replay_block_as_non_retryable() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "runtime recovery blocked: non-replayable event after checkpoint"
+    )
+
+    assert (
+        diagnostic["error_summary"]
+        == "runtime recovery blocked: non-replayable event after checkpoint"
+    )
+    assert diagnostic["error_stage"] == "runtime_recovery"
+    assert diagnostic["error_category"] == "non_replayable_event_after_checkpoint"
+    assert diagnostic["error_code"] == "runtime.recovery_blocked"
+    assert diagnostic["retryable"] is False
+
+
 @pytest.mark.parametrize(
     ("status_code", "error_category", "error_code"),
     [
