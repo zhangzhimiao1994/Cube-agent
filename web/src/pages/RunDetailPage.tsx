@@ -17,6 +17,7 @@ const MANUAL_RUN_MODES = [
 type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
+type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
 
 function detailTimestampValue(value: string | null | undefined) {
   if (!value) return 0;
@@ -493,6 +494,8 @@ function detailPayloadLabel(key: string) {
 }
 
 function isSensitivePayloadKey(key: string) {
+  const normalized = key.trim().toLowerCase();
+  if (["lease_id", "quota_scope_id", "capacity_scope_id", "reservation_id"].includes(normalized)) return true;
   return /api[_-]?key|secret|token|password|credential/i.test(key);
 }
 
@@ -825,6 +828,28 @@ function detailPosture(detail: RunDetail) {
     return "执行异常";
   }
   return displayRunStatus(detail.status);
+}
+
+function hasModelOutcomeSummary(summary: ModelOutcomeSummary) {
+  return (
+    summary.completion_count > 0 ||
+    summary.fallback_attempt_count > 0 ||
+    summary.requested_logical_models.length > 0 ||
+    summary.actual_logical_models.length > 0 ||
+    summary.provider_ids.length > 0 ||
+    Boolean(summary.last_requested_logical_model || summary.last_logical_model || summary.last_provider_id)
+  );
+}
+
+function modelOutcomeList(values: string[]) {
+  return values.length > 0 ? values.join(", ") : "未记录";
+}
+
+function modelOutcomeHandoff(summary: ModelOutcomeSummary) {
+  const requested = summary.last_requested_logical_model;
+  const actual = summary.last_logical_model;
+  if (requested && actual && requested !== actual) return `${requested} -> ${actual}`;
+  return actual || requested || "未记录";
 }
 
 function replaySafetyLabel(value: unknown) {
@@ -1533,6 +1558,7 @@ export function RunDetailPage() {
   const explicitRows = explicitDetailRows(orderedRunData.explicit_details);
   const executionIntents = executionIntentsForDetail(orderedRunData);
   const failureDiagnostics = failureDiagnosticsForDetail(orderedRunData);
+  const modelOutcomeSummary = orderedRunData.model_outcome_summary;
 
   return (
     <section>
@@ -1574,6 +1600,42 @@ export function RunDetailPage() {
           <li>产物 <strong>{run.data.artifacts.length}</strong></li>
         </ul>
       </div>
+
+      {hasModelOutcomeSummary(modelOutcomeSummary) ? (
+        <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
+          <div>
+            <span>Model outcome</span>
+            <strong>模型结果</strong>
+            <small>{modelOutcomeSummary.fallback_used ? "已发生回退" : "未发生回退"}</small>
+          </div>
+          <ul aria-label="模型结果指标">
+            <li>
+              <span>完成</span>
+              <strong>{modelOutcomeSummary.completion_count} 次完成</strong>
+            </li>
+            <li>
+              <span>回退</span>
+              <strong>{modelOutcomeSummary.fallback_attempt_count} 次回退</strong>
+            </li>
+            <li>
+              <span>请求模型</span>
+              <strong>{modelOutcomeList(modelOutcomeSummary.requested_logical_models)}</strong>
+            </li>
+            <li>
+              <span>实际模型</span>
+              <strong>{modelOutcomeList(modelOutcomeSummary.actual_logical_models)}</strong>
+            </li>
+            <li>
+              <span>Provider</span>
+              <strong>{modelOutcomeList(modelOutcomeSummary.provider_ids)}</strong>
+            </li>
+            <li>
+              <span>最后结果</span>
+              <strong>{modelOutcomeHandoff(modelOutcomeSummary)}</strong>
+            </li>
+          </ul>
+        </div>
+      ) : null}
 
       <article>
         <h3>原始请求</h3>

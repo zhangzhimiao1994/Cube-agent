@@ -131,6 +131,7 @@ describe("RunDetailPage", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    expect(screen.queryByRole("status", { name: "模型结果摘要" })).toBeNull();
     expect(screen.queryByText(longArtifactText)).toBeNull();
     expect(screen.queryByText(rawPayloadOutput)).toBeNull();
     expect(screen.queryByText(longUnsafeSummary)).toBeNull();
@@ -240,6 +241,76 @@ describe("RunDetailPage", () => {
       expect.stringContaining("第一步规划"),
       expect.stringContaining("第二步产物"),
     ]);
+  });
+
+  it("renders model outcome summary without capacity internals", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      model_outcome_summary: {
+        completion_count: 2,
+        fallback_used: true,
+        fallback_attempt_count: 1,
+        requested_logical_models: ["planner", "main"],
+        actual_logical_models: ["planner", "backup"],
+        attempted_logical_models: ["planner", "main", "backup"],
+        provider_ids: ["deepseek", "openai"],
+        last_requested_logical_model: "main",
+        last_logical_model: "backup",
+        last_provider_id: "openai",
+      },
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 9,
+          kind: "model.completed",
+          message: "model.completed",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: "main_agent",
+          participants: [],
+          payload: {
+            lease_id: "lease-private",
+            quota_scope_id: "tenant-private-quota",
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("模型结果")).not.toBeNull();
+    expect(within(summary).getByText("2 次完成")).not.toBeNull();
+    expect(within(summary).getByText("1 次回退")).not.toBeNull();
+    expect(within(summary).getByText("planner, main")).not.toBeNull();
+    expect(within(summary).getByText("planner, backup")).not.toBeNull();
+    expect(within(summary).getByText("deepseek, openai")).not.toBeNull();
+    expect(within(summary).getByText("main -> backup")).not.toBeNull();
+    expect(screen.queryByText("lease-private")).toBeNull();
+    expect(screen.queryByText("tenant-private-quota")).toBeNull();
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /模型过程/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    expect(within(drawer).queryByText("lease-private")).toBeNull();
+    expect(within(drawer).queryByText("tenant-private-quota")).toBeNull();
   });
 
   it("deduplicates generated downloads that reuse the same file URL", async () => {
