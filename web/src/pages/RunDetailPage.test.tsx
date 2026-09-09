@@ -476,6 +476,42 @@ describe("RunDetailPage", () => {
             },
           },
         },
+        {
+          sequence: 9,
+          kind: "step.failed",
+          message: "copywriter retryable failure",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: "copywriter",
+          participants: [],
+          step_id: "copywriter_step",
+          payload: {
+            error_code: "temporary_failure",
+          },
+        },
+        {
+          sequence: 10,
+          kind: "step.completed",
+          message: "copywriter finished",
+          created_at: "2026-08-20T00:00:10Z",
+          actor: "copywriter",
+          participants: [],
+          step_id: "copywriter_step",
+          payload: {
+            status: "done",
+          },
+        },
+        {
+          sequence: 11,
+          kind: "step.completed",
+          message: "final synthesizer finished",
+          created_at: "2026-08-20T00:00:11Z",
+          actor: "final_synthesizer",
+          participants: [],
+          step_id: "final_response_step",
+          payload: {
+            status: "done",
+          },
+        },
       ],
     };
     vi.stubGlobal(
@@ -502,7 +538,7 @@ describe("RunDetailPage", () => {
     expect(summary.classList.contains("run-model-outcome-summary")).toBe(true);
     expect(within(summary).getByText("已记录交接")).not.toBeNull();
     expect(within(summary).getByText("1 次交接")).not.toBeNull();
-    expect(within(summary).getByText("1 个契约")).not.toBeNull();
+    expect(within(summary).getByText("1 个契约，已完成 1")).not.toBeNull();
     expect(within(summary).getByText("copywriter -> final_synthesizer")).not.toBeNull();
     expect(within(summary).getByText("creative -> main")).not.toBeNull();
     expect(within(summary).getByText("step_dependency")).not.toBeNull();
@@ -564,6 +600,8 @@ describe("RunDetailPage", () => {
                 items: [
                   {
                     contract_id: "copywriter_step-to-final_response_step",
+                    source_step_id: "copywriter_step",
+                    target_step_id: "final_response_step",
                     source_role_id: "copywriter",
                     target_role_id: "final_synthesizer",
                     handoff_kind: "step_dependency",
@@ -606,6 +644,84 @@ describe("RunDetailPage", () => {
     expect(within(summary).getByText("1 次交接")).not.toBeNull();
     expect(within(summary).getByText("1 个契约")).not.toBeNull();
     expect(within(summary).queryByText("已记录交接")).toBeNull();
+  });
+
+  it("summarizes blocked orchestration contracts without expanding contract details", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              orchestration_contracts: {
+                schema_version: 1,
+                items: [
+                  {
+                    contract_id: "research_step-to-final_response_step",
+                    source_step_id: "research_step",
+                    target_step_id: "final_response_step",
+                    source_role_id: "researcher",
+                    target_role_id: "final_synthesizer",
+                    handoff_kind: "step_dependency",
+                    status: "planned",
+                    required_output_fields: ["status", "summary", "evidence"],
+                    ready_status: "done",
+                    blocking_statuses: ["blocked", "needs_user"],
+                  },
+                ],
+                truncated: false,
+              },
+            },
+          },
+        },
+        {
+          sequence: 9,
+          kind: "step.failed",
+          message: "research failed",
+          created_at: "2026-08-20T00:00:09Z",
+          actor: "researcher",
+          participants: [],
+          step_id: "research_step",
+          payload: {
+            error_code: "runtime.failed",
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("已记录契约")).not.toBeNull();
+    expect(within(summary).getByText("1 个契约，阻塞 1")).not.toBeNull();
+    expect(screen.queryByText("research_step")).toBeNull();
+    expect(screen.queryByText("research_step-to-final_response_step")).toBeNull();
   });
 
   it("deduplicates generated downloads that reuse the same file URL", async () => {

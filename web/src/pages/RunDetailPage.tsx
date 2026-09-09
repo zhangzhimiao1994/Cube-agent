@@ -39,6 +39,18 @@ type OrchestrationHandoffSummary = {
 type OrchestrationContractSummary = {
   count: number;
   truncated: boolean;
+  completedCount: number;
+  blockedCount: number;
+};
+
+type OrchestrationContract = {
+  sourceStepId: string;
+  targetStepId: string;
+  sourceRoleId: string;
+  targetRoleId: string;
+  handoffKind: string;
+  status: string;
+  blockingStatuses: string[];
 };
 
 function detailTimestampValue(value: string | null | undefined) {
@@ -930,20 +942,45 @@ function orchestrationHandoffSummary(events: RunEvent[]): OrchestrationHandoffSu
 }
 
 function orchestrationContractSummary(events: RunEvent[]): OrchestrationContractSummary | null {
-  let count = 0;
+  const contracts: OrchestrationContract[] = [];
   let truncated = false;
+  const stepStatuses = new Map<string, "completed" | "failed">();
+  events.forEach((event) => {
+    const stepId = safeOrchestrationToken(event.step_id);
+    if (!stepId) return;
+    if (event.kind === "step.completed") stepStatuses.set(stepId, "completed");
+    if (event.kind === "step.failed" || event.kind === "runtime.failed") {
+      stepStatuses.set(stepId, "failed");
+    }
+  });
   events.forEach((event) => {
     const plan = objectPayload(event.payload.model_execution_plan);
-    const contracts = objectPayload(plan?.orchestration_contracts);
-    if (!contracts) return;
-    truncated = truncated || contracts.truncated === true;
-    const rawItems = Array.isArray(contracts.items) ? contracts.items : [];
+    const contractsPayload = objectPayload(plan?.orchestration_contracts);
+    if (!contractsPayload) return;
+    truncated = truncated || contractsPayload.truncated === true;
+    const rawItems = Array.isArray(contractsPayload.items) ? contractsPayload.items : [];
     rawItems.forEach((item) => {
-      if (orchestrationContractFromPayload(item)) count += 1;
+      const contract = orchestrationContractFromPayload(item);
+      if (contract) contracts.push(contract);
     });
   });
-  if (count === 0) return null;
-  return { count, truncated };
+  if (contracts.length === 0) return null;
+  const completedCount = contracts.filter((contract) => {
+    return stepStatuses.get(contract.targetStepId) === "completed";
+  }).length;
+  const blockedCount = contracts.filter((contract) => {
+    return (
+      stepStatuses.get(contract.sourceStepId) === "failed" ||
+      stepStatuses.get(contract.targetStepId) === "failed" ||
+      contract.blockingStatuses.includes(contract.status)
+    );
+  }).length;
+  return {
+    count: contracts.length,
+    truncated,
+    completedCount,
+    blockedCount,
+  };
 }
 
 function objectPayload(value: unknown): Record<string, unknown> | null {
@@ -968,12 +1005,27 @@ function orchestrationContractFromPayload(value: unknown) {
   const item = objectPayload(value);
   if (!item) return null;
   const contract = {
+    sourceStepId: safeOrchestrationToken(item.source_step_id),
+    targetStepId: safeOrchestrationToken(item.target_step_id),
     sourceRoleId: safeOrchestrationToken(item.source_role_id),
     targetRoleId: safeOrchestrationToken(item.target_role_id),
     handoffKind: safeOrchestrationToken(item.handoff_kind),
     status: safeOrchestrationToken(item.status),
+    blockingStatuses: safeOrchestrationTokenList(item.blocking_statuses),
   };
-  return Object.values(contract).every(Boolean) ? contract : null;
+  return contract.sourceStepId &&
+    contract.targetStepId &&
+    contract.sourceRoleId &&
+    contract.targetRoleId &&
+    contract.handoffKind &&
+    contract.status
+    ? contract
+    : null;
+}
+
+function safeOrchestrationTokenList(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => safeOrchestrationToken(item)).filter(Boolean);
 }
 
 function safeOrchestrationToken(value: unknown) {
@@ -1001,6 +1053,13 @@ function orchestrationPair(left: string[], right: string[]) {
   const leftText = orchestrationList(left);
   const rightText = orchestrationList(right);
   return leftText === rightText ? leftText : `${leftText} -> ${rightText}`;
+}
+
+function orchestrationContractLabel(summary: OrchestrationContractSummary) {
+  const parts = [`${summary.count} 个契约${summary.truncated ? "，已截断" : ""}`];
+  if (summary.completedCount > 0) parts.push(`已完成 ${summary.completedCount}`);
+  if (summary.blockedCount > 0) parts.push(`阻塞 ${summary.blockedCount}`);
+  return parts.join("，");
 }
 
 function replaySafetyLabel(value: unknown) {
@@ -1872,9 +1931,7 @@ export function RunDetailPage() {
             {contractSummary ? (
               <li>
                 <span>契约</span>
-                <strong>
-                  {contractSummary.count} 个契约{contractSummary.truncated ? "，已截断" : ""}
-                </strong>
+                <strong>{orchestrationContractLabel(contractSummary)}</strong>
               </li>
             ) : null}
           </ul>
