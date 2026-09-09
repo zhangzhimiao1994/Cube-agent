@@ -393,6 +393,10 @@ def _map_completion_tool_names(
         provider_id=completion.provider_id,
         provider_model=completion.provider_model,
         cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
     )
 
 
@@ -411,6 +415,10 @@ def _generated_file_ready_completion(
         provider_id=completion.provider_id,
         provider_model=completion.provider_model,
         cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
     )
 
 
@@ -534,6 +542,10 @@ def _reconcile_final_attachment_completion(
         provider_id=completion.provider_id,
         provider_model=completion.provider_model,
         cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
     )
 
 
@@ -2390,6 +2402,10 @@ class CrewDispatchRuntime:
                 provider_id=completion.provider_id,
                 provider_model=completion.provider_model,
                 cost_usd=completion.cost_usd,
+                fallback_used=completion.fallback_used,
+                fallback_from_logical_model=completion.fallback_from_logical_model,
+                fallback_reason=completion.fallback_reason,
+                attempted_logical_models=completion.attempted_logical_models,
             )
         return completion, tuple(evidence)
 
@@ -3054,6 +3070,10 @@ class CrewDispatchRuntime:
             ),
             "usage": usage,
             "cost_usd": None if completion.cost_usd is None else str(completion.cost_usd),
+            "fallback_used": completion.fallback_used,
+            "fallback_from_logical_model": completion.fallback_from_logical_model,
+            "fallback_reason": completion.fallback_reason,
+            "attempted_logical_models": completion.attempted_logical_models,
         }
         encoded = json.dumps(_mutable_json(content), ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > _MAX_PROMPT_BYTES:
@@ -3079,19 +3099,34 @@ class CrewDispatchRuntime:
         if (
             artifact.type != "model_response"
             or provenance is None
-            or set(content)
-            != {
+            or not {
                 "text",
                 "tool_calls",
                 "usage",
                 "cost_usd",
-            }
+            }.issubset(content)
+            or not set(content).issubset(
+                {
+                    "text",
+                    "tool_calls",
+                    "usage",
+                    "cost_usd",
+                    "fallback_used",
+                    "fallback_from_logical_model",
+                    "fallback_reason",
+                    "attempted_logical_models",
+                }
+            )
         ):
             _fail("model response artifact is invalid")
         text = content["text"]
         raw_calls = content["tool_calls"]
         raw_usage = content["usage"]
         raw_cost = content["cost_usd"]
+        raw_fallback_used = content.get("fallback_used", False)
+        raw_fallback_from = content.get("fallback_from_logical_model")
+        raw_fallback_reason = content.get("fallback_reason")
+        raw_attempted_logical_models = content.get("attempted_logical_models", ())
         if text is not None and type(text) is not str:
             _fail("model response artifact is invalid")
         if not isinstance(raw_calls, tuple):
@@ -3137,6 +3172,17 @@ class CrewDispatchRuntime:
                 cost = Decimal(raw_cost)
             except Exception:  # noqa: BLE001 - hostile artifact decimal
                 _fail("model response artifact is invalid")
+        if type(raw_fallback_used) is not bool:
+            _fail("model response artifact is invalid")
+        if raw_fallback_from is not None and type(raw_fallback_from) is not str:
+            _fail("model response artifact is invalid")
+        if raw_fallback_reason is not None and type(raw_fallback_reason) is not str:
+            _fail("model response artifact is invalid")
+        if not isinstance(raw_attempted_logical_models, tuple) or not all(
+            type(item) is str for item in raw_attempted_logical_models
+        ):
+            _fail("model response artifact is invalid")
+        attempted_logical_models = cast(tuple[str, ...], raw_attempted_logical_models)
         try:
             return GatewayCompletion(
                 response=ModelResponse(text=text, tool_calls=tuple(calls), usage=usage),
@@ -3145,6 +3191,10 @@ class CrewDispatchRuntime:
                 provider_id=provenance.provider_id,
                 provider_model=provenance.provider_model,
                 cost_usd=cost,
+                fallback_used=raw_fallback_used,
+                fallback_from_logical_model=raw_fallback_from,
+                fallback_reason=raw_fallback_reason,
+                attempted_logical_models=attempted_logical_models,
             )
         except (TypeError, ValueError):
             _fail("model response artifact is invalid")

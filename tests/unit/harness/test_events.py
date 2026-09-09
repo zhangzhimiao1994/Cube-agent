@@ -281,6 +281,7 @@ def test_gateway_completion_projects_safe_model_completed_event() -> None:
         provider_id="deepseek",
         provider_model="deepseek/deepseek-chat",
         cost_usd=Decimal("0.000123"),
+        attempted_logical_models=("main",),
     )
 
     (event,) = gateway_completion_events(
@@ -303,6 +304,10 @@ def test_gateway_completion_projects_safe_model_completed_event() -> None:
         "output_tokens": 11,
         "total_tokens": 18,
         "cost_usd": "0.000123",
+        "fallback_used": False,
+        "fallback_from_logical_model": None,
+        "fallback_reason": None,
+        "attempted_logical_models": ("main",),
         "text_bytes": len(b"final answer"),
         "tool_calls": (),
         "metadata": {"request_id": "req_123", "finish_reason": "stop"},

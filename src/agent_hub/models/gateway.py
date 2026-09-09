@@ -71,6 +71,10 @@ class GatewayCompletion:
     provider_id: str
     provider_model: str = field(repr=False)
     cost_usd: Decimal | None = None
+    fallback_used: bool = False
+    fallback_from_logical_model: str | None = None
+    fallback_reason: str | None = None
+    attempted_logical_models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
@@ -80,6 +84,24 @@ class GatewayCompletion:
         _require_safe_identifier("provider id", self.provider_id)
         if self.cost_usd is not None and type(self.cost_usd) is not Decimal:
             raise ValueError("gateway cost must be a bounded USD decimal")
+        if type(self.fallback_used) is not bool:
+            raise ValueError("fallback_used must be a boolean")
+        if self.fallback_from_logical_model is not None:
+            _require_safe_identifier(
+                "fallback source logical model", self.fallback_from_logical_model
+            )
+        if self.fallback_reason is not None:
+            _require_safe_identifier("fallback reason", self.fallback_reason)
+        for logical_model in self.attempted_logical_models:
+            _require_safe_identifier("attempted logical model", logical_model)
+        if not self.fallback_used and (
+            self.fallback_from_logical_model is not None or self.fallback_reason is not None
+        ):
+            raise ValueError("fallback metadata requires fallback_used")
+        if self.fallback_used and (
+            self.fallback_from_logical_model is None or self.fallback_reason is None
+        ):
+            raise ValueError("fallback metadata is required when fallback_used is true")
         cost_exponent = None if self.cost_usd is None else self.cost_usd.as_tuple().exponent
         if (
             not self.provider_model
@@ -126,6 +148,17 @@ def _retryable_model_failure(error: BaseException) -> bool:
             "model response is empty",
         }
     return False
+
+
+def _fallback_reason(error: BaseException) -> str:
+    if isinstance(error, ModelTransportError):
+        return "transport_retryable"
+    if isinstance(error, ModelGatewayError) and str(error) in {
+        "model response text is empty",
+        "model response is empty",
+    }:
+        return "empty_response"
+    return "gateway_retryable"
 
 
 class SecretResolver(Protocol):
@@ -312,7 +345,11 @@ class ModelGateway:
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         last_retryable_error: BaseException | None = None
-        for _logical_model, candidates in candidate_groups:
+        attempted_logical_models: list[str] = []
+        fallback_from_logical_model: str | None = None
+        fallback_reason: str | None = None
+        for logical_model, candidates in candidate_groups:
+            attempted_logical_models.append(logical_model)
             try:
                 await capacity.initialize()
                 lease = await capacity.acquire(
@@ -321,6 +358,9 @@ class ModelGateway:
                     estimated_tokens=estimated_tokens,
                 )
             except (CapacityWaitTimeout, CapacityQueueFull):
+                if fallback_from_logical_model is None:
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = "capacity_unavailable"
                 continue
             selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
@@ -336,6 +376,9 @@ class ModelGateway:
                 if not _retryable_model_failure(error):
                     raise
                 last_retryable_error = error
+                if fallback_from_logical_model is None:
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = _fallback_reason(error)
                 continue
             return GatewayCompletion(
                 response=response,
@@ -344,6 +387,16 @@ class ModelGateway:
                 provider_id=selected.provider_model.split("/", 1)[0],
                 provider_model=selected.provider_model,
                 cost_usd=self._cost_usd(selected, response),
+                fallback_used=selected.logical_model != request.logical_model,
+                fallback_from_logical_model=(
+                    fallback_from_logical_model
+                    if selected.logical_model != request.logical_model
+                    else None
+                ),
+                fallback_reason=(
+                    fallback_reason if selected.logical_model != request.logical_model else None
+                ),
+                attempted_logical_models=tuple(dict.fromkeys(attempted_logical_models)),
             )
         if last_retryable_error is not None:
             raise last_retryable_error from None

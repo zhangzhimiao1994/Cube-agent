@@ -437,6 +437,10 @@ async def test_unrelated_deployment_fingerprint_failure_does_not_block_request()
     completion = await gateway.complete_with_context(request())
 
     assert completion.deployment_id == "selected"
+    assert completion.fallback_used is False
+    assert completion.fallback_from_logical_model is None
+    assert completion.fallback_reason is None
+    assert completion.attempted_logical_models == ("primary",)
     assert capacity.scoped_ids == ("selected",)
     assert transport.calls[0][0] is selected
 
@@ -859,6 +863,10 @@ async def test_transport_failure_tries_fallback_model_when_available() -> None:
 
     assert completion.response.text == "backup ok"
     assert completion.deployment_id == "backup-key"
+    assert completion.fallback_used is True
+    assert completion.fallback_from_logical_model == "primary"
+    assert completion.fallback_reason == "transport_retryable"
+    assert completion.attempted_logical_models == ("primary", "backup")
     assert [record[3] for record in capacity.records] == [False, True]
     transport_events = [
         event
@@ -901,6 +909,10 @@ async def test_empty_model_response_tries_fallback_model_when_available() -> Non
 
     assert completion.response.text == "backup ok"
     assert completion.deployment_id == "backup-key"
+    assert completion.fallback_used is True
+    assert completion.fallback_from_logical_model == "primary"
+    assert completion.fallback_reason == "empty_response"
+    assert completion.attempted_logical_models == ("primary", "backup")
     assert [record[3] for record in capacity.records] == [False, True]
 
 
@@ -1235,6 +1247,10 @@ async def test_completion_context_reports_actual_fallback_provenance() -> None:
     assert completion.logical_model == "backup"
     assert completion.provider_id == "openai"
     assert completion.provider_model == "openai/gpt-4o-mini"
+    assert completion.fallback_used is True
+    assert completion.fallback_from_logical_model == "primary"
+    assert completion.fallback_reason == "capacity_unavailable"
+    assert completion.attempted_logical_models == ("primary", "backup")
     assert "provider_model" not in repr(completion)
     assert not hasattr(completion, "quota_scope_id")
 
@@ -1435,6 +1451,10 @@ async def test_queue_full_tries_fallback_model_when_available() -> None:
 
     assert completion.response.text == "ok"
     assert completion.deployment_id == "backup-key"
+    assert completion.fallback_used is True
+    assert completion.fallback_from_logical_model == "primary"
+    assert completion.fallback_reason == "capacity_unavailable"
+    assert completion.attempted_logical_models == ("primary", "backup")
     acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
     assert len(acquire_events) == 2
     assert acquire_events[0][1] == ("primary-key",)  # type: ignore[index]

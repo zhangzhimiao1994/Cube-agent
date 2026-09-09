@@ -577,6 +577,11 @@ class DirectRuntime:
                 logical_model=completion.logical_model,
                 provider_id=completion.provider_id,
                 provider_model=completion.provider_model,
+                cost_usd=completion.cost_usd,
+                fallback_used=completion.fallback_used,
+                fallback_from_logical_model=completion.fallback_from_logical_model,
+                fallback_reason=completion.fallback_reason,
+                attempted_logical_models=completion.attempted_logical_models,
             )
         except Exception as error:  # noqa: BLE001 - untrusted gateway response boundary
             error.__traceback__ = None

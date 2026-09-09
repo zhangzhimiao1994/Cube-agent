@@ -17,7 +17,14 @@ from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    GatewayProvenance,
+    JsonValue,
+    RunEvent,
+    TaskContext,
+)
 from agent_hub.runtime.crew.adapter import (
     CapabilityOutcomeUncertain,
     CrewAgentDefinition,
@@ -689,6 +696,65 @@ def test_text_only_empty_model_response_still_fails() -> None:
 
     with pytest.raises(RuntimeExecutionError, match="model response text is empty"):
         CrewDispatchRuntime._valid_response(completion)
+
+
+def test_model_response_artifact_preserves_gateway_fallback_metadata() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(text="fallback answer", usage=TokenUsage(10, 2, 12)),
+        deployment_id="backup",
+        logical_model="backup",
+        provider_id="openai",
+        provider_model="openai/gpt-5",
+        cost_usd=Decimal("0.000123"),
+        fallback_used=True,
+        fallback_from_logical_model="primary",
+        fallback_reason="capacity_unavailable",
+        attempted_logical_models=("primary", "backup"),
+    )
+
+    artifact = CrewDispatchRuntime._model_artifact(
+        actor="writer",
+        completion=completion,
+        sources=(),
+    )
+    restored = CrewDispatchRuntime._completion_from_model_artifact(artifact)
+
+    assert artifact.content["fallback_used"] is True
+    assert restored.fallback_used is True
+    assert restored.fallback_from_logical_model == "primary"
+    assert restored.fallback_reason == "capacity_unavailable"
+    assert restored.attempted_logical_models == ("primary", "backup")
+
+
+def test_legacy_model_response_artifact_defaults_to_no_gateway_fallback() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="model_response",
+        producer="writer",
+        content={
+            "text": "legacy answer",
+            "tool_calls": (),
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            },
+            "cost_usd": "0",
+        },
+        provenance=GatewayProvenance(
+            logical_model="primary",
+            deployment_id="primary",
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-chat",
+        ),
+    )
+
+    restored = CrewDispatchRuntime._completion_from_model_artifact(artifact)
+
+    assert restored.fallback_used is False
+    assert restored.fallback_from_logical_model is None
+    assert restored.fallback_reason is None
+    assert restored.attempted_logical_models == ()
 
 
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
