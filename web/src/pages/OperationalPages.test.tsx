@@ -3397,7 +3397,8 @@ describe("operational management pages", () => {
 
     await user.click(workbenchCard);
 
-    const panel = within(stream).getByRole("region", { name: "Agent 工作席详情" });
+    const panel = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    expect(document.querySelector(".process-drawer-backdrop")?.parentElement).toBe(document.body);
     expect(within(panel).getByText("文案生成")).not.toBeNull();
     expect(within(panel).getByText("Copywriter · qwen-max")).not.toBeNull();
     expect(within(panel).getByText("负责输出可拍摄脚本文案。")).not.toBeNull();
@@ -3472,9 +3473,12 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const workbenchCard = within(stream).getByRole("button", { name: /Agent 工作席 3 个 Agent/ });
     expect(within(workbenchCard).getByText("3 个 Agent · 1 异常 · 1 工作中 · 1 已安排")).not.toBeNull();
+    expect(stream.querySelectorAll(".agent-workbench-agent-card")).toHaveLength(0);
     await user.click(workbenchCard);
 
-    const panel = within(stream).getByRole("region", { name: "Agent 工作席详情" });
+    const panel = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const backdrop = document.querySelector(".process-drawer-backdrop");
+    expect(backdrop?.parentElement).toBe(document.body);
 
     const alphaCard = within(panel).getByText("alpha").closest(".agent-workbench-agent-card") as HTMLElement;
     const betaCard = within(panel).getByText("beta").closest(".agent-workbench-agent-card") as HTMLElement;
@@ -4044,13 +4048,16 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     await user.click(within(stream).getByRole("button", { name: /Agent 工作席/ }));
-    const mainPlan = within(stream).getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
-    const dispatch = within(stream).getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
-    const copywriterStart = within(stream).getByRole("button", { name: /文案生成 接收任务：输出中秋节活动主题/ });
-    const copywriterModel = within(stream).getByRole("button", { name: /文案生成 调用模型：qwen-max/ });
-    const copywriterOutput = within(stream).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ });
-    const directorStart = within(stream).getByRole("button", { name: /导演 接收任务：审查活动动线/ });
-    const minutes = within(stream).getByRole("button", { name: /讨论纪要：共识 采用灯谜游园会，压缩签到流程；分歧 是否保留嘉宾签到/ });
+    const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const mainPlan = within(workbenchDrawer).getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
+    const dispatch = within(workbenchDrawer).getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
+    const copywriterStart = within(workbenchDrawer).getByRole("button", { name: /文案生成 接收任务：输出中秋节活动主题/ });
+    const copywriterModel = within(workbenchDrawer).getByRole("button", { name: /文案生成 调用模型：qwen-max/ });
+    const copywriterOutput = within(workbenchDrawer).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ });
+    const directorStart = within(workbenchDrawer).getByRole("button", { name: /导演 接收任务：审查活动动线/ });
+    const minutes = within(workbenchDrawer).getByRole("button", {
+      name: /讨论纪要：共识 采用灯谜游园会，压缩签到流程；分歧 是否保留嘉宾签到/,
+    });
     const ordered = [
       mainPlan,
       dispatch,
@@ -4078,8 +4085,11 @@ describe("operational management pages", () => {
     expect(within(planEvidence).getAllByText("main").length).toBeGreaterThan(0);
     await user.click(within(planEvidence).getByRole("button", { name: "关闭" }));
     await user.click(within(planDrawer).getByRole("button", { name: "关闭" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
 
-    await user.click(copywriterOutput);
+    await user.click(within(stream).getByRole("button", { name: /Agent 工作席/ }));
+    const outputWorkbench = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(outputWorkbench).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByRole("group", { name: "运行详情摘要" })).not.toBeNull();
     expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
@@ -4097,7 +4107,14 @@ describe("operational management pages", () => {
     await user.click(within(outputProduct).getByRole("button", { name: "关闭" }));
 
     await user.click(within(drawer).getByRole("button", { name: "关闭" }));
-    await user.click(minutes);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
+    await user.click(within(stream).getByRole("button", { name: /Agent 工作席/ }));
+    const minutesWorkbench = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(
+      within(minutesWorkbench).getByRole("button", {
+        name: /讨论纪要：共识 采用灯谜游园会，压缩签到流程；分歧 是否保留嘉宾签到/,
+      }),
+    );
     const minutesDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     const minutesConclusion = await openProcessDetailGroup(user, minutesDrawer, "结论");
     expect(within(minutesConclusion).getByText("会议纪要")).not.toBeNull();
@@ -4412,7 +4429,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     await user.click(within(stream).getByRole("button", { name: /Agent 工作席/ }));
-    const chain = within(stream).getByRole("region", { name: "任务链路" });
+    const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const chain = within(workbenchDrawer).getByRole("region", { name: "任务链路" });
 
     expect(within(chain).getByText("任务链路")).not.toBeNull();
     expect(within(chain).getByText("3 个步骤")).not.toBeNull();
@@ -5847,10 +5865,11 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     await user.click(within(stream).getByRole("button", { name: /Agent 工作席 1 个 Agent/ }));
-    await waitFor(() => expect(screen.getAllByText("文案生成").length).toBeGreaterThan(0));
+    const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await waitFor(() => expect(within(workbenchDrawer).getAllByText("文案生成").length).toBeGreaterThan(0));
     expect(screen.queryByText("导演")).toBeNull();
 
-    await user.click(within(stream).getByRole("button", { name: /主 Agent 接收任务：main_agent_plan/ }));
+    await user.click(within(workbenchDrawer).getByRole("button", { name: /主 Agent 接收任务：main_agent_plan/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText("导演")).toBeNull();
 
@@ -5887,16 +5906,22 @@ describe("operational management pages", () => {
     visibleRunDetail = refreshedRunDetail;
     visibleConversationRuns = [refreshedRunDetail];
 
-    await waitFor(() => expect(screen.getAllByText("导演").length).toBeGreaterThan(0), { timeout: 2500 });
     await waitFor(() => expect(within(drawer).getByText("2026-08-07T00:00:02Z")).not.toBeNull(), {
       timeout: 2500,
     });
     const activityDetail = await openProcessDetailGroup(user, drawer, "活动");
     expect(within(activityDetail).getByText(/负责审查活动动线与现场节奏/)).not.toBeNull();
     await user.click(within(activityDetail).getByRole("button", { name: "关闭" }));
+    await user.click(within(drawer).getByRole("button", { name: "关闭" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
     await waitFor(() => expect(screen.getByRole("button", { name: /Agent 工作席 2 个 Agent/ })).not.toBeNull());
+    await user.click(screen.getByRole("button", { name: /Agent 工作席 2 个 Agent/ }));
+    const refreshedWorkbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await waitFor(() => expect(within(refreshedWorkbenchDrawer).getAllByText("导演").length).toBeGreaterThan(0), {
+      timeout: 2500,
+    });
     const directorCard = await waitFor(() => {
-      const card = Array.from(document.querySelectorAll(".agent-workbench-agent-card")).find((candidate) =>
+      const card = Array.from(refreshedWorkbenchDrawer.querySelectorAll(".agent-workbench-agent-card")).find((candidate) =>
         candidate.textContent?.includes("负责审查活动动线"),
       );
       expect(card).not.toBeUndefined();

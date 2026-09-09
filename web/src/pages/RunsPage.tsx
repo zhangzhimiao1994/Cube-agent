@@ -2850,6 +2850,117 @@ export function runProcessItems(
   return [...routingItem, ...eventItems];
 }
 
+function AgentWorkbenchDrawer({
+  dispatchCards,
+  items,
+  taskChain,
+  onClose,
+  onOpen,
+}: {
+  dispatchCards: AgentDispatchCard[];
+  items: ProcessDetailTarget[];
+  taskChain: TaskChainStep[];
+  onClose: () => void;
+  onOpen: (target: ProcessDetailTarget) => void;
+}) {
+  return createPortal(
+    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="process-drawer agent-workbench-drawer"
+        role="dialog"
+        aria-label="Agent 工作席详情"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-handle" aria-hidden="true" />
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">Agent workbench</span>
+            <h3>Agent 工作席</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="agent-workbench-detail">
+          <div className="agent-workbench-list">
+            {dispatchCards.map((card) => {
+              const activityItems = agentActivityItems(card, items);
+              return (
+                <article key={card.id} className={`agent-workbench-agent-card status-${card.status}`}>
+                  <div className="agent-workbench-agent-header">
+                    <div className="agent-workbench-avatar" aria-hidden="true">
+                      {card.name.slice(0, 1)}
+                    </div>
+                    <div>
+                      <strong>{card.name}</strong>
+                      <small>
+                        {card.role} · {card.model}
+                      </small>
+                    </div>
+                    <span>{card.status}</span>
+                  </div>
+                  <p>{card.summary}</p>
+                  {activityItems.length > 0 ? (
+                    <div className="agent-workbench-activity">
+                      <small>活动轨迹</small>
+                      <ul>
+                        {activityItems.map((item) => (
+                          <li key={item.id}>{item.message}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+          {taskChain.length > 0 ? (
+            <section className="run-task-chain" aria-label="任务链路">
+              <div className="run-task-chain-header">
+                <span aria-hidden="true">⌁</span>
+                <strong>任务链路</strong>
+                <small>{taskChain.length} 个步骤</small>
+              </div>
+              <div className="run-task-chain-list">
+                {taskChain.map((step, index) => (
+                  <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
+                    <small>第 {index + 1} 步</small>
+                    <div>
+                      <strong>{step.agentName}</strong>
+                      <span>{step.status}</span>
+                    </div>
+                    <p>{step.summary || "等待执行"}</p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {items.length > 0 ? (
+            <section className="agent-workbench-actions" aria-label="重点摘要">
+              <div className="agent-workbench-actions-header">
+                <strong>重点摘要</strong>
+                <small>{items.length} 个关键动作</small>
+              </div>
+              <div className="agent-cluster-actions">
+                {items.map((item) => (
+                  <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+                    <span aria-hidden="true">›</span>
+                    <small className="process-card-badge">{item.badge}</small>
+                    <strong>{item.message}</strong>
+                    {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function RunProcessSummary({
   detail,
   onOpen,
@@ -2862,6 +2973,7 @@ function RunProcessSummary({
   mainAgentModelName?: string;
 }) {
   const [isWorkbenchOpen, setIsWorkbenchOpen] = useState(false);
+  const previouslyFocused = useRef<HTMLElement | null>(null);
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
   const workbenchMeta = agentWorkbenchMeta(dispatchCards);
@@ -2875,6 +2987,27 @@ function RunProcessSummary({
     taskChain.length > 0 ||
     failureDiagnostics.length > 0 ||
     executionIntents.length > 0;
+  useEffect(() => {
+    if (!isWorkbenchOpen) return undefined;
+    previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyTouchAction = document.body.style.touchAction;
+    const previousDocumentOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.body.style.touchAction = "none";
+    document.documentElement.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsWorkbenchOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousBodyOverflow || "";
+      document.body.style.touchAction = previousBodyTouchAction || "";
+      document.documentElement.style.overflow = previousDocumentOverflow || "";
+      previouslyFocused.current?.focus();
+    };
+  }, [isWorkbenchOpen]);
   if (!shouldShowSummary) return null;
   return (
     <section className="run-process-summary" aria-label="Agent 集群动作">
@@ -2898,79 +3031,16 @@ function RunProcessSummary({
             <small className="agent-workbench-meta">{workbenchMeta}</small>
           </button>
           {isWorkbenchOpen ? (
-            <div className="agent-workbench-detail" role="region" aria-label="Agent 工作席详情">
-              <div className="agent-workbench-list">
-                {dispatchCards.map((card) => {
-                  const activityItems = agentActivityItems(card, items);
-                  return (
-                    <article key={card.id} className={`agent-workbench-agent-card status-${card.status}`}>
-                      <div className="agent-workbench-agent-header">
-                        <div className="agent-workbench-avatar" aria-hidden="true">
-                          {card.name.slice(0, 1)}
-                        </div>
-                        <div>
-                          <strong>{card.name}</strong>
-                          <small>
-                            {card.role} · {card.model}
-                          </small>
-                        </div>
-                        <span>{card.status}</span>
-                      </div>
-                      <p>{card.summary}</p>
-                      {activityItems.length > 0 ? (
-                        <div className="agent-workbench-activity">
-                          <small>活动轨迹</small>
-                          <ul>
-                            {activityItems.map((item) => (
-                              <li key={item.id}>{item.message}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-                    </article>
-                  );
-                })}
-              </div>
-              {taskChain.length > 0 ? (
-                <section className="run-task-chain" aria-label="任务链路">
-                  <div className="run-task-chain-header">
-                    <span aria-hidden="true">⌁</span>
-                    <strong>任务链路</strong>
-                    <small>{taskChain.length} 个步骤</small>
-                  </div>
-                  <div className="run-task-chain-list">
-                    {taskChain.map((step, index) => (
-                      <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
-                        <small>第 {index + 1} 步</small>
-                        <div>
-                          <strong>{step.agentName}</strong>
-                          <span>{step.status}</span>
-                        </div>
-                        <p>{step.summary || "等待执行"}</p>
-                      </article>
-                    ))}
-                  </div>
-                </section>
-              ) : null}
-              {items.length > 0 ? (
-                <section className="agent-workbench-actions" aria-label="重点摘要">
-                  <div className="agent-workbench-actions-header">
-                    <strong>重点摘要</strong>
-                    <small>{items.length} 个关键动作</small>
-                  </div>
-                  <div className="agent-cluster-actions">
-                    {items.map((item) => (
-                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{item.badge}</small>
-                        <strong>{item.message}</strong>
-                        {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
-                      </button>
-                    ))}
-                  </div>
-                </section>
-              ) : null}
-            </div>
+            <AgentWorkbenchDrawer
+              dispatchCards={dispatchCards}
+              items={items}
+              taskChain={taskChain}
+              onClose={() => setIsWorkbenchOpen(false)}
+              onOpen={(item) => {
+                onOpen(item);
+                setIsWorkbenchOpen(false);
+              }}
+            />
           ) : null}
         </section>
       ) : null}
