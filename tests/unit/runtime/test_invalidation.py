@@ -50,20 +50,283 @@ class Runtime:
         self.reloaded.append(tenant_id)
 
 
+class FlakyRuntime(Runtime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    async def reload(self, tenant_id: UUID | None = None) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary reload failure")
+        await super().reload(tenant_id)
+
+
 @pytest.mark.asyncio
 async def test_runtime_invalidation_bus_publishes_tenant_target_payload() -> None:
     redis = FakeRedis()
-    bus = RuntimeConfigInvalidationBus(redis, channel="runtime:test")
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="api-1",
+    )
 
     await bus.publish(TENANT_ID, RuntimeConfigInvalidationTarget.MCP)
 
     assert len(redis.published) == 1
     channel, payload = redis.published[0]
     assert channel == "runtime:test"
-    assert json.loads(payload) == {
-        "tenant_id": str(TENANT_ID),
-        "target": "mcp",
-    }
+    decoded = json.loads(payload)
+    assert decoded["tenant_id"] == str(TENANT_ID)
+    assert decoded["target"] == "mcp"
+    assert decoded["source_instance_id"] == "api-1"
+    assert isinstance(decoded["event_id"], str)
+    assert decoded["event_id"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_keeps_legacy_messages_replayable() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(redis, channel="runtime:test")
+    mcp_runtime = Runtime()
+
+    await bus.listen(mcp_runtime=mcp_runtime, max_messages=2)
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_skips_self_originated_events() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-1",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "plugin",
+                    }
+                ),
+            }
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="api-1",
+    )
+    plugin_runtime = Runtime()
+
+    await bus.listen(plugin_runtime=plugin_runtime, max_messages=1)
+
+    assert plugin_runtime.reloaded == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_deduplicates_successful_event_ids() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+
+    await bus.listen(mcp_runtime=mcp_runtime, max_messages=2)
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_eviction_allows_old_event_id_again() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-2",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="worker-1",
+        max_seen_event_ids=1,
+    )
+    mcp_runtime = Runtime()
+
+    await bus.listen(mcp_runtime=mcp_runtime, max_messages=3)
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID, OTHER_TENANT_ID, OTHER_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_retries_duplicate_event_after_reload_failure() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "plugin",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "plugin",
+                    }
+                ),
+            },
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="worker-1",
+    )
+    plugin_runtime = FlakyRuntime()
+
+    await bus.listen(plugin_runtime=plugin_runtime, max_messages=2)
+
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_keeps_distinct_event_ids_for_same_target() -> None:
+    redis = FakeRedis(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {
+                        "event_id": "event-2",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "mcp",
+                    }
+                ),
+            },
+        ]
+    )
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+
+    await bus.listen(mcp_runtime=mcp_runtime, max_messages=2)
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_bus_rejects_invalid_seen_event_capacity() -> None:
+    with pytest.raises(ValueError, match="max_seen_event_ids"):
+        RuntimeConfigInvalidationBus(FakeRedis(), max_seen_event_ids=0)
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_bus_rejects_invalid_source_instance_id() -> None:
+    with pytest.raises(ValueError, match="source_instance_id"):
+        RuntimeConfigInvalidationBus(FakeRedis(), source_instance_id="api:1")
 
 
 @pytest.mark.asyncio
