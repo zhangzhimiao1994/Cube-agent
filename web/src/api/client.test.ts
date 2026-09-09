@@ -589,6 +589,7 @@ describe("api client transport", () => {
         },
         signature_verification: "verified",
         verified_public_key_sha256: "a".repeat(64),
+        signature_trust_expires_at: null,
         approval_state: "pending",
         approval_reason: "adapter package requires plugin approval before activation",
         approved_by: null,
@@ -670,6 +671,7 @@ describe("api client transport", () => {
         signature: null,
         signature_verification: "not_provided",
         verified_public_key_sha256: null,
+        signature_trust_expires_at: "2026-10-09T04:00:00Z",
         approval_state: "approved",
         approval_reason: "reviewed",
         approved_by: "11111111-1111-4111-8111-111111111111",
@@ -740,6 +742,7 @@ describe("api client transport", () => {
         },
         signature_verification: "verified",
         verified_public_key_sha256: "a".repeat(64),
+        signature_trust_expires_at: "2026-10-09T04:00:00Z",
         approval_state: "approved",
         approval_reason: "reviewed",
         approved_by: "11111111-1111-4111-8111-111111111111",
@@ -784,6 +787,7 @@ describe("api client transport", () => {
 
     expect(result[0]?.package_metadata?.install_mode).toBe("runtime_registered");
     expect(result[0]?.package_metadata?.activation_state).toBe("eligible");
+    expect(result[0]?.package_metadata?.signature_trust_expires_at).toBe("2026-10-09T04:00:00Z");
     expect(result[0]?.package_metadata?.dependencies).toEqual([
       {
         kind: "python",

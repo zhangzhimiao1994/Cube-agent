@@ -7,6 +7,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
 from typing import Any, Protocol, cast
@@ -353,6 +354,8 @@ class RuntimePluginService:
         loaded_at = self._plugins_loaded_at.get(tenant_id)
         if loaded_at is None:
             return True
+        if _plugin_cache_has_expired_package_signature_trust(self._plugins_by_tenant.get(tenant_id)):
+            return True
         return self._monotonic() - loaded_at >= self._cache_ttl_seconds
 
     def capability_manifest_source(self) -> RuntimePluginService:
@@ -600,10 +603,56 @@ def _plugins_with_runtime_activation(
     return tuple(_plugin_with_runtime_activation(plugin, adapters) for plugin in plugins)
 
 
+def _plugin_cache_has_expired_package_signature_trust(
+    plugins: tuple[PluginResourceResponse, ...] | None,
+) -> bool:
+    if not plugins:
+        return False
+    now = datetime.now(UTC)
+    for plugin in plugins:
+        package = plugin.package_metadata
+        if (
+            package is not None
+            and package.signature_trust_expires_at is not None
+            and package.signature_trust_expires_at <= now
+        ):
+            return True
+    return False
+
+
+def _plugin_package_signature_trust_expired(plugin: PluginResourceResponse) -> bool:
+    package = plugin.package_metadata
+    return (
+        package is not None
+        and package.signature_verification == "verified"
+        and package.signature_trust_expires_at is not None
+        and package.signature_trust_expires_at <= datetime.now(UTC)
+    )
+
+
+def _plugin_with_expired_package_signature_trust(
+    plugin: PluginResourceResponse,
+) -> PluginResourceResponse:
+    if not _plugin_package_signature_trust_expired(plugin):
+        return plugin
+    package = plugin.package_metadata
+    if package is None:
+        return plugin
+    effective_package = type(package).model_validate(
+        {
+            **package.model_dump(mode="json"),
+            "signature_verification": "untrusted_key",
+            "signature_trust_expires_at": None,
+        }
+    )
+    return plugin.model_copy(update={"package_metadata": effective_package})
+
+
 def _plugin_with_runtime_activation(
     plugin: PluginResourceResponse,
     adapters: Mapping[str, PluginAdapter],
 ) -> PluginResourceResponse:
+    plugin = _plugin_with_expired_package_signature_trust(plugin)
     package = plugin.package_metadata
     reason = _runtime_package_activation_block_reason(plugin, adapters)
     if (
@@ -632,6 +681,8 @@ def _runtime_package_activation_block_reason(
     package = plugin.package_metadata
     if package is None or package.kind != "adapter_package":
         return None
+    if _plugin_package_signature_trust_expired(plugin):
+        return "package signature key is not trusted for this tenant"
     if package.activation_state != "eligible":
         return package.activation_reason or "plugin package is not eligible for activation"
     if package.install_mode != "runtime_registered":

@@ -1469,6 +1469,10 @@ export function McpPage() {
                           : plugin.package_metadata?.signature_verification ?? "未配置"}
                       </span>
                     </p>
+                    <p>
+                      签名信任过期：
+                      <span>{plugin.package_metadata?.signature_trust_expires_at ?? "未配置"}</span>
+                    </p>
                     <p>激活状态：<span>{plugin.package_metadata?.activation_state ?? "未配置"}</span></p>
                     <p>激活原因：<span>{plugin.package_metadata?.activation_reason ?? "未配置"}</span></p>
                     <p>包审批：<span>{plugin.package_metadata?.approval_state ?? "未配置"}</span></p>

@@ -4,6 +4,7 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import UUID
@@ -1688,6 +1689,167 @@ async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust()
     assert admin_service.calls == 2
     assert adapter.calls == []
     assert service.is_available(TENANT_ID, "calendar.create_event") is False
+
+
+async def test_runtime_plugin_service_refreshes_expired_package_signature_trust_before_ttl() -> None:
+    now = 1000.0
+
+    def monotonic() -> float:
+        return now
+
+    eligible_package = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "signature_trust_expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "in_process",
+            "install_mode": "runtime_registered",
+        }
+    )
+    stale_package = eligible_package.model_copy(
+        update={
+            "signature_verification": "untrusted_key",
+            "activation_state": "blocked_untrusted_key",
+            "activation_reason": "package signature key is not trusted for this tenant",
+        }
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                package_metadata=eligible_package,
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"calendar_python": adapter},
+        cache_ttl_seconds=3600,
+        monotonic=monotonic,
+    )
+    admin_service.plugins = (
+        plugin(
+            "calendar",
+            adapter="calendar_python",
+            sandbox_profile="in_process",
+            package_metadata=stale_package,
+        ),
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="invoke-1",
+        )
+
+    assert admin_service.calls == 2
+    assert adapter.calls == []
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+
+
+async def test_runtime_plugin_service_marks_cached_expired_signature_trust_unavailable_without_reload() -> None:
+    expired_package = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "signature_trust_expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "in_process",
+            "install_mode": "runtime_registered",
+        }
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="in_process",
+                policy_effect="allow",
+                package_metadata=expired_package,
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"calendar_python": adapter},
+        cache_ttl_seconds=3600,
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert admin_service.calls == 1
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert service.capability_policy_rules(TENANT_ID) == ()
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
 
 
 async def test_runtime_plugin_service_reloads_and_invokes_plugins_for_requested_tenant() -> None:

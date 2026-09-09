@@ -764,6 +764,7 @@ class PluginPackageMetadata(BaseModel):
         max_length=64,
         pattern=r"^[a-f0-9]{64}$",
     )
+    signature_trust_expires_at: datetime | None = None
     approval_state: Literal["not_required", "pending", "approved", "rejected"] = "not_required"
     approval_reason: str = Field(default="", max_length=256)
     approved_by: str | None = Field(default=None, max_length=128)
@@ -794,6 +795,11 @@ class PluginPackageMetadata(BaseModel):
     install_mode: PluginPackageInstallMode = "scan_only"
     dependencies: tuple[PluginPackageDependency, ...] = Field(default_factory=tuple, max_length=32)
     artifact: PluginPackageArtifactMetadata | None = None
+
+    @field_validator("signature_trust_expires_at")
+    @classmethod
+    def validate_signature_trust_expiry(cls, value: datetime | None) -> datetime | None:
+        return PluginSigningKeyRequest.validate_window_timestamp(value)
 
     @model_validator(mode="after")
     def derive_server_controlled_state(self) -> PluginPackageMetadata:
@@ -3464,6 +3470,8 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package signature verification is server-controlled")
     if "verified_public_key_sha256" in package:
         raise InvalidSkillPackage("plugin package verified public key is server-controlled")
+    if "signature_trust_expires_at" in package:
+        raise InvalidSkillPackage("plugin package signature trust expiry is server-controlled")
     if "artifact" in package:
         raise InvalidSkillPackage("plugin package artifact is server-controlled")
     dependencies = package.get("dependencies")
@@ -3716,6 +3724,7 @@ def _verified_plugin_package_metadata(
         update={
             "signature_verification": "verified",
             "verified_public_key_sha256": _plugin_public_key_sha256(public_key_bytes),
+            "signature_trust_expires_at": signing_key.not_after,
         }
     )
 
@@ -3773,11 +3782,20 @@ def _plugin_with_effective_package_trust(
         None,
     )
     if active_signing_key is not None:
-        return plugin
+        if package.signature_trust_expires_at == active_signing_key.not_after:
+            return plugin
+        return plugin.model_copy(
+            update={
+                "package_metadata": package.model_copy(
+                    update={"signature_trust_expires_at": active_signing_key.not_after}
+                )
+            }
+        )
     effective_package = PluginPackageMetadata.model_validate(
         {
             **package.model_dump(mode="json"),
             "signature_verification": "untrusted_key",
+            "signature_trust_expires_at": None,
         }
     )
     return plugin.model_copy(update={"package_metadata": effective_package})
@@ -3794,6 +3812,9 @@ def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: by
             "approval_reason",
             "approved_by",
             "approved_at",
+            "signature_trust_expires_at",
+            "signature_verification",
+            "verified_public_key_sha256",
             "artifact",
         ):
             package.pop(field, None)

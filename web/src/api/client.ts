@@ -976,6 +976,7 @@ const PluginPackageMetadataSchema = z.object({
     .enum(["not_provided", "not_verified", "untrusted_key", "verified", "failed"])
     .default("not_provided"),
   verified_public_key_sha256: z.string().nullable().default(null),
+  signature_trust_expires_at: z.string().nullable().default(null),
   approval_state: z
     .enum(["not_required", "pending", "approved", "rejected"])
     .default("not_required"),

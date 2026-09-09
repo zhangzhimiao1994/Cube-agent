@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Self, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -3713,6 +3713,9 @@ def test_plugin_signature_payload_excludes_server_controlled_activation_fields()
                 "approved_at": "2026-09-09T00:00:00Z",
                 "activation_state": "eligible",
                 "activation_reason": "approved",
+                "signature_trust_expires_at": "2026-10-09T00:00:00Z",
+                "signature_verification": "verified",
+                "verified_public_key_sha256": "a" * 64,
                 "runtime": "python",
                 "entrypoint": "adapter/main.py",
                 "isolation": "local_process",
@@ -3735,6 +3738,9 @@ def test_plugin_signature_payload_excludes_server_controlled_activation_fields()
     assert "approval_reason" not in signed_package
     assert "approved_by" not in signed_package
     assert "approved_at" not in signed_package
+    assert "signature_trust_expires_at" not in signed_package
+    assert "signature_verification" not in signed_package
+    assert "verified_public_key_sha256" not in signed_package
     assert signed_package["signature"] == {
         "algorithm": "ed25519",
         "key_id": "calendar-prod",
@@ -3876,6 +3882,7 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
         },
         "signature_verification": "untrusted_key",
         "verified_public_key_sha256": None,
+        "signature_trust_expires_at": None,
         "approval_state": "pending",
         "approval_reason": "adapter package requires plugin approval before activation",
         "approved_by": None,
@@ -4607,6 +4614,51 @@ def test_plugin_archive_install_rejects_forged_verified_public_key() -> None:
     )
 
 
+def test_plugin_archive_install_rejects_forged_signature_trust_expiry() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "signature_trust_expires_at": (
+                        datetime.now(UTC) + timedelta(days=1)
+                    ).isoformat(),
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature trust expiry is server-controlled"
+    )
+
+
 def test_plugin_archive_install_rejects_forged_package_artifact() -> None:
     api = client()
 
@@ -4745,6 +4797,37 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     )
     assert other_tenant.status_code == 200
     assert other_tenant.json() == []
+
+
+def test_plugin_archive_install_records_signature_trust_expiry() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    not_after = datetime.now(UTC) + timedelta(days=30)
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+            "not_after": not_after.isoformat(),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    assert response.status_code == 200
+    metadata = response.json()["plugin"]["package_metadata"]
+    assert metadata["signature_verification"] == "verified"
+    assert datetime.fromisoformat(metadata["signature_trust_expires_at"]) == not_after
 
 
 def test_plugin_signing_key_upsert_and_delete_trigger_runtime_reload_callback() -> None:
@@ -4989,6 +5072,57 @@ def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -
     listed = api.get("/api/v1/admin/plugins", headers=headers())
     metadata = listed.json()[0]["package_metadata"]
     assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["activation_state"] == "blocked_untrusted_key"
+    assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
+
+
+def test_plugin_listing_downgrades_verified_package_when_signing_key_expires_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: object = None) -> Self:
+            if tz is UTC:
+                return cls.fromtimestamp(cls.current.timestamp(), UTC)
+            return cls.fromtimestamp(cls.current.timestamp())
+
+    monkeypatch.setattr(admin_router, "datetime", FrozenDateTime)
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = plugin_public_key_value(private_key)
+    not_after = FrozenDateTime.current + timedelta(seconds=10)
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": public_key,
+            "not_after": not_after.isoformat(),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    metadata = install.json()["plugin"]["package_metadata"]
+    assert metadata["signature_verification"] == "verified"
+    assert datetime.fromisoformat(metadata["signature_trust_expires_at"]) == not_after
+
+    FrozenDateTime.current = not_after + timedelta(seconds=1)
+
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+    assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["signature_trust_expires_at"] is None
     assert metadata["activation_state"] == "blocked_untrusted_key"
     assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
