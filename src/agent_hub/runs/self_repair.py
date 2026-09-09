@@ -42,8 +42,15 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
         "empty model response",
     }
 )
+_MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
+    {
+        "harness_model_unavailable",
+        "model capability unavailable",
+    }
+)
 _RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = {
     "capacity_pressure": "switch_to_available_model_and_retry",
+    "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
     "empty_model_response": "retry_with_fallback_or_reassign_model",
     "runtime_failure": "preserve_outputs_and_retry_scope",
     "step_failure": "retry_failed_step_after_context_compaction",
@@ -57,6 +64,7 @@ _SAFE_OBSERVER_RECOMMENDATIONS = frozenset(
         "retry_with_fallback_or_reassign_model",
         "pause_for_scheduler_review",
         "preserve_outputs_and_retry_scope",
+        "reassign_tool_role_to_capable_model_and_retry",
         "watch_retry_budget_before_requeue",
         "compact_context_before_next_model_call",
     }
@@ -377,6 +385,8 @@ def _repair_instruction(failure_category: str) -> str:
             "先压缩输入和历史上下文，再拆分提示或降负载重试；必要时标记模型 "
             "fallback/切换备用模型，重试后仍为空则保留中断前输出并闭环失败。"
         )
+    if failure_category == "model_capability_routing_unavailable":
+        return "检查工具角色的模型能力要求，将工具角色改派给支持工具调用的模型后再受控重试。"
     if failure_category == "tool_failure":
         return "先检查工具权限、参数和产物状态，只执行可审计的最小修复步骤。"
     if failure_category == "step_failure":
@@ -485,6 +495,8 @@ def _failure_category(event: RunEvent) -> str:
         return "outcome_uncertain"
     if _contains_marker(text, _EMPTY_RESPONSE_MARKERS):
         return "empty_model_response"
+    if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
+        return "model_capability_routing_unavailable"
     if _contains_marker(text, _CAPACITY_MARKERS):
         return "capacity_pressure"
     if event.kind is EventKind.TOOL_FAILED:

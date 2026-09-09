@@ -28,8 +28,15 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
         "empty model response",
     }
 )
+_MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
+    {
+        "harness_model_unavailable",
+        "model capability unavailable",
+    }
+)
 _RECOMMENDATIONS = {
     "model_capacity_pressure": "switch_to_available_model_and_retry",
+    "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
     "empty_model_response": "retry_with_fallback_or_reassign_model",
     "repeated_failure": "pause_for_scheduler_review",
     "runtime_failure": "preserve_outputs_and_retry_scope",
@@ -120,6 +127,13 @@ class RunMonitor:
                 return self._emit(
                     "model_capacity_pressure",
                     "reschedule_or_reassign_model",
+                    "warning",
+                    event,
+                )
+            if _contains_marker(failure_text, _MODEL_CAPABILITY_ROUTING_MARKERS):
+                return self._emit(
+                    "model_capability_routing_unavailable",
+                    "reassign_tool_role_to_capable_model",
                     "warning",
                     event,
                 )

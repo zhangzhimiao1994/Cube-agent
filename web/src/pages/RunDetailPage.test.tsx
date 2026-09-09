@@ -385,6 +385,28 @@ describe("RunDetailPage", () => {
           participants: [],
           step_id: null,
           payload: {
+            trigger: "model_capability_routing_unavailable",
+            action: "reassign_tool_role_to_capable_model",
+            severity: "warning",
+            recommendation: "reassign_tool_role_to_capable_model_and_retry",
+            source_kind: "runtime.failed",
+            source_sequence: 5,
+            failure_events: 2,
+            retry_events: 0,
+            message_events: 3,
+            artifact_events: 1,
+            actor: "main_agent",
+          },
+        },
+        {
+          sequence: 10,
+          kind: "observer.notice",
+          message: "observer.notice",
+          created_at: "2026-08-20T00:00:10Z",
+          actor: null,
+          participants: [],
+          step_id: null,
+          payload: {
             trigger: "runtime_failure",
             action: "preserve_partial_outputs",
             severity: "info",
@@ -423,8 +445,9 @@ describe("RunDetailPage", () => {
     const observerHeading = await screen.findByRole("heading", { name: "调度观察" });
     const observerArticle = observerHeading.closest("article") as HTMLElement;
     expect(within(observerArticle).getByText("恢复建议：切换到有容量的同类模型，保留已有产物后重试。")).not.toBeNull();
+    expect(within(observerArticle).getByText("恢复建议：将工具角色改派给支持工具调用的模型后重试。")).not.toBeNull();
     expect(within(observerArticle).getByText("角色：planner")).not.toBeNull();
-    expect(within(observerArticle).getByText("角色：主 Agent")).not.toBeNull();
+    expect(within(observerArticle).getAllByText("角色：主 Agent").length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText(/raw_unknown_recommendation_should_not_render/)).toBeNull();
   });
 

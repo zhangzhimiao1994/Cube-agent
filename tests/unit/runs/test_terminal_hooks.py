@@ -1055,6 +1055,36 @@ def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None
     assert "secret" not in repr(proposal)
 
 
+def test_repair_classification_handles_model_capability_routing_failure() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=2,
+                run_id=run_id,
+                reason="harness_model_unavailable: model capability unavailable",
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "model_capability_routing_unavailable"
+    assert decision.recovery_strategy == "reassign_tool_role_to_capable_model_and_retry"
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["failure_kind"] == "model_capability_routing_unavailable"
+    assert proposal["recovery_strategy"] == "reassign_tool_role_to_capable_model_and_retry"
+    assert "工具角色" in str(proposal["instruction"])
+    assert "harness_model_unavailable" not in repr(proposal)
+    assert "model capability unavailable" not in repr(proposal)
+
+
 @pytest.mark.asyncio
 async def test_execute_records_empty_response_closure_when_runtime_raises() -> None:
     class RuntimeRaisesEmptyResponse:

@@ -34,6 +34,29 @@ def test_monitor_emits_capacity_pressure_notice_without_message_body() -> None:
     assert "prompt" not in event.payload
 
 
+def test_monitor_emits_model_capability_routing_notice_without_raw_failure() -> None:
+    run_id = uuid4()
+    monitor = RunMonitor()
+
+    decision = monitor.observe(
+        RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=run_id,
+            reason="harness_model_unavailable: model capability unavailable",
+        )
+    )
+
+    assert decision is not None
+    assert decision.trigger == "model_capability_routing_unavailable"
+    event = decision.to_event(run_id=run_id, sequence=3)
+    assert event.payload["action"] == "reassign_tool_role_to_capable_model"
+    assert event.payload["recommendation"] == "reassign_tool_role_to_capable_model_and_retry"
+    assert event.payload["source_kind"] == "runtime.failed"
+    assert "model capability unavailable" not in repr(event.payload)
+    assert "harness_model_unavailable" not in repr(event.payload)
+
+
 def test_monitor_emits_empty_model_response_notice_once() -> None:
     run_id = uuid4()
     monitor = RunMonitor()

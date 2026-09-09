@@ -186,6 +186,7 @@ type DetailFailureDiagnostic = {
 
 const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
   model_capacity_pressure: "模型容量拥堵",
+  model_capability_routing_unavailable: "模型能力路由不可用",
   empty_model_response: "模型空响应",
   repeated_failure: "连续失败",
   step_retrying: "正在重试",
@@ -194,6 +195,7 @@ const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
 
 const OBSERVER_ACTION_LABELS: Record<string, string> = {
   reschedule_or_reassign_model: "建议改派模型或重新调度",
+  reassign_tool_role_to_capable_model: "建议将工具角色改派给支持工具调用的模型",
   retry_fallback_or_reassign_model: "建议重试、切换备用模型或改派",
   pause_and_request_scheduler_review: "建议暂停并等待调度复核",
   preserve_partial_outputs: "保留失败前产物用于复盘",
@@ -209,6 +211,7 @@ const OBSERVER_SEVERITY_LABELS: Record<string, string> = {
 
 const OBSERVER_RECOMMENDATION_LABELS: Record<string, string> = {
   switch_to_available_model_and_retry: "恢复建议：切换到有容量的同类模型，保留已有产物后重试。",
+  reassign_tool_role_to_capable_model_and_retry: "恢复建议：将工具角色改派给支持工具调用的模型后重试。",
   retry_with_fallback_or_reassign_model: "恢复建议：重试空响应步骤，必要时切换备用模型或改派角色。",
   pause_for_scheduler_review: "恢复建议：暂停自动重试，先复核调度策略和失败集中点。",
   preserve_outputs_and_retry_scope: "恢复建议：保留已有产物，只缩小重试失败阶段。",
