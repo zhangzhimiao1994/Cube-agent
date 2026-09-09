@@ -40,7 +40,7 @@ from agent_hub.models.routing_policy import (
     deployment_routing_constraint_from_decision,
     fallback_execution_policy_from_decision,
 )
-from agent_hub.models.types import Deployment
+from agent_hub.models.types import Deployment, ModelCapability
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
@@ -186,6 +186,22 @@ _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
 _MAX_MODEL_ROUTING_MATRIX_ROLES = 24
 _MAX_MODEL_ROUTING_MATRIX_REASONS = 16
 _MAX_MODEL_ROUTING_MATRIX_TRAITS = 16
+_MODEL_CAPABILITY_TRAIT_ALIASES: Mapping[str, ModelCapability] = {
+    "general": ModelCapability.TEXT,
+    "text": ModelCapability.TEXT,
+    "tool": ModelCapability.TOOL_CALLING,
+    "tool_calling": ModelCapability.TOOL_CALLING,
+    "structured": ModelCapability.STRUCTURED_OUTPUT,
+    "structured_output": ModelCapability.STRUCTURED_OUTPUT,
+    "vision": ModelCapability.VISION,
+    "image": ModelCapability.VISION,
+    "audio": ModelCapability.AUDIO,
+    "speech": ModelCapability.AUDIO,
+    "voice": ModelCapability.AUDIO,
+    "image_generation": ModelCapability.IMAGE_GENERATION,
+    "video_generation": ModelCapability.VIDEO_GENERATION,
+    "audio_generation": ModelCapability.AUDIO_GENERATION,
+}
 
 
 class UnavailableRuntime:
@@ -1763,6 +1779,11 @@ def _model_execution_plan_payload(
             roles=roles,
             steps=steps,
         ),
+        "model_capability_negotiation": _model_capability_negotiation_payload(
+            roles=roles,
+            model_routing_matrix=model_routing_matrix,
+            model_routing_matrix_truncated=model_routing_matrix_truncated,
+        ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
@@ -1847,6 +1868,137 @@ def _orchestration_protocol_payload(
         "recovery_hints": recovery_hints,
         "truncated": truncated,
     }
+
+
+def _model_capability_negotiation_payload(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    model_routing_matrix: tuple[Mapping[str, JsonValue], ...],
+    model_routing_matrix_truncated: bool,
+) -> Mapping[str, JsonValue]:
+    selected_capabilities = _selected_model_capabilities_by_role(model_routing_matrix)
+    items: list[Mapping[str, JsonValue]] = []
+    truncated = model_routing_matrix_truncated
+    for role in roles:
+        role_id = _optional_orchestration_handoff_token(role.get("id"), max_length=128)
+        logical_model = _optional_orchestration_handoff_token(
+            role.get("logical_model"),
+            max_length=128,
+        )
+        if role_id is None or logical_model is None:
+            continue
+        if len(items) >= _MAX_MODEL_ROUTING_MATRIX_ROLES:
+            truncated = True
+            break
+        required = _required_model_capabilities_for_role(role)
+        selected = selected_capabilities.get(role_id)
+        matched = tuple(capability for capability in required if selected and capability in selected)
+        missing = (
+            tuple(capability for capability in required if capability not in selected)
+            if selected is not None
+            else ()
+        )
+        status = (
+            "unknown"
+            if selected is None
+            else "satisfied"
+            if not missing
+            else "missing_capability"
+        )
+        items.append(
+            {
+                "role_id": role_id,
+                "logical_model": logical_model,
+                "required_capabilities": tuple(capability.value for capability in required),
+                "matched_capabilities": tuple(capability.value for capability in matched),
+                "missing_capabilities": tuple(capability.value for capability in missing),
+                "status": status,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+        "role_count": len(items),
+        "satisfied_count": sum(1 for item in items if item["status"] == "satisfied"),
+        "missing_count": sum(1 for item in items if item["status"] == "missing_capability"),
+        "unknown_count": sum(1 for item in items if item["status"] == "unknown"),
+        "truncated": truncated,
+    }
+
+
+def _required_model_capabilities_for_role(
+    role: Mapping[str, JsonValue],
+) -> tuple[ModelCapability, ...]:
+    required = [ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT]
+    tools = role.get("tools")
+    if isinstance(tools, tuple | list) and tools:
+        required.append(ModelCapability.TOOL_CALLING)
+    return tuple(dict.fromkeys(required))
+
+
+def _selected_model_capabilities_by_role(
+    model_routing_matrix: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, frozenset[ModelCapability]]:
+    capabilities_by_role: dict[str, frozenset[ModelCapability]] = {}
+    for entry in model_routing_matrix:
+        role_id = _optional_orchestration_handoff_token(entry.get("role_id"), max_length=128)
+        if role_id is None:
+            continue
+        selected_candidate = _selected_model_routing_candidate(entry)
+        if selected_candidate is None:
+            continue
+        capabilities_by_role[role_id] = _safe_model_capabilities_from_candidate(
+            selected_candidate,
+        )
+    return capabilities_by_role
+
+
+def _selected_model_routing_candidate(
+    entry: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    candidates = entry.get("candidates")
+    if not isinstance(candidates, tuple | list):
+        return None
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        logical_model = _optional_orchestration_handoff_token(
+            candidate.get("logical_model"),
+            max_length=128,
+        )
+        if logical_model is None:
+            continue
+        if candidate.get("selected") is True:
+            return candidate
+    return None
+
+
+def _safe_model_capabilities_from_candidate(
+    candidate: Mapping[str, JsonValue],
+) -> frozenset[ModelCapability]:
+    capabilities: set[ModelCapability] = set()
+    for token in _candidate_capability_tokens(candidate.get("traits")):
+        capability = _MODEL_CAPABILITY_TRAIT_ALIASES.get(token)
+        if capability is not None:
+            capabilities.add(capability)
+    for reason in _candidate_capability_tokens(candidate.get("reasons")):
+        if reason == "capability:tool_role_supported":
+            capabilities.add(ModelCapability.TOOL_CALLING)
+    return frozenset(capabilities)
+
+
+def _candidate_capability_tokens(value: JsonValue | object) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    tokens: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        token = item.strip().casefold()
+        if _optional_orchestration_handoff_token(token, max_length=128) is None:
+            continue
+        tokens.append(token)
+    return tuple(tokens)
 
 
 def _orchestration_handoff_items(

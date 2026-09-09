@@ -1415,6 +1415,138 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
         assert unsafe_marker not in serialized_protocol
 
 
+def test_model_execution_plan_reports_safe_model_capability_negotiation() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Build and verify a small Python project.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "builder",
+                "role": "Builder",
+                "purpose": "execute",
+                "logical_model": "coder",
+                "tools": ("run_safe_command",),
+            },
+            {
+                "id": "reviewer",
+                "role": "Reviewer",
+                "purpose": "execute",
+                "logical_model": "critic",
+                "tools": (),
+            },
+            {
+                "id": "token_leak",
+                "role": "Leaky",
+                "purpose": "execute",
+                "logical_model": "sk_secret",
+                "tools": ("run_safe_command",),
+            },
+        ),
+        model_routing_matrix=(
+            {
+                "role_id": "builder",
+                "purpose": "execute",
+                "selected_logical_model": "coder",
+                "candidate_count": 1,
+                "truncated_candidates": False,
+                "candidates": (
+                    {
+                        "logical_model": "coder",
+                        "score": 42,
+                        "adjusted_score": 42,
+                        "eligible": True,
+                        "selected": True,
+                        "traits": ("code", "structured_output", "tool_calling"),
+                        "reasons": ("capability:tool_role_supported",),
+                    },
+                ),
+            },
+            {
+                "role_id": "reviewer",
+                "purpose": "execute",
+                "selected_logical_model": "critic",
+                "candidate_count": 1,
+                "truncated_candidates": False,
+                "candidates": (
+                    {
+                        "logical_model": "critic",
+                        "score": 9,
+                        "adjusted_score": 9,
+                        "eligible": True,
+                        "selected": True,
+                        "traits": ("review",),
+                        "reasons": (),
+                    },
+                ),
+            },
+            {
+                "role_id": "token_leak",
+                "purpose": "execute",
+                "selected_logical_model": "sk_secret",
+                "candidate_count": 1,
+                "truncated_candidates": False,
+                "candidates": (
+                    {
+                        "logical_model": "sk_secret",
+                        "score": 0,
+                        "adjusted_score": 0,
+                        "eligible": True,
+                        "selected": True,
+                        "traits": ("tool_calling",),
+                        "reasons": ("capacity:configured:8",),
+                    },
+                ),
+            },
+        ),
+    )
+
+    assert plan["model_capability_negotiation"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "role_id": "builder",
+                "logical_model": "coder",
+                "required_capabilities": ("text", "structured_output", "tool_calling"),
+                "matched_capabilities": ("structured_output", "tool_calling"),
+                "missing_capabilities": ("text",),
+                "status": "missing_capability",
+            },
+            {
+                "role_id": "reviewer",
+                "logical_model": "critic",
+                "required_capabilities": ("text", "structured_output"),
+                "matched_capabilities": (),
+                "missing_capabilities": ("text", "structured_output"),
+                "status": "missing_capability",
+            },
+        ),
+        "role_count": 2,
+        "satisfied_count": 0,
+        "missing_count": 2,
+        "unknown_count": 0,
+        "truncated": False,
+    }
+    serialized_negotiation = json.dumps(
+        plan["model_capability_negotiation"],
+        ensure_ascii=False,
+    )
+    for unsafe_marker in (
+        "sk_secret",
+        "token_leak",
+        "credential",
+        "capacity",
+        "quota",
+        "lease",
+        "api_base",
+    ):
+        assert unsafe_marker not in serialized_negotiation
+
+
 def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
     source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
         {
@@ -1841,6 +1973,32 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         ),
         "truncated": False,
     }
+    assert model_execution_plan["model_capability_negotiation"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "role_id": "copywriter",
+                "logical_model": "creative",
+                "required_capabilities": ("text", "structured_output"),
+                "matched_capabilities": ("text",),
+                "missing_capabilities": ("structured_output",),
+                "status": "missing_capability",
+            },
+            {
+                "role_id": "final_synthesizer",
+                "logical_model": "main",
+                "required_capabilities": ("text", "structured_output"),
+                "matched_capabilities": (),
+                "missing_capabilities": (),
+                "status": "unknown",
+            },
+        ),
+        "role_count": 2,
+        "satisfied_count": 0,
+        "missing_count": 1,
+        "unknown_count": 1,
+        "truncated": False,
+    }
     assert model_execution_plan == {
         "schema_version": 1,
         "main_agent": {
@@ -1886,6 +2044,9 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         "orchestration_handoffs": model_execution_plan["orchestration_handoffs"],
         "orchestration_contracts": model_execution_plan["orchestration_contracts"],
         "orchestration_protocol": model_execution_plan["orchestration_protocol"],
+        "model_capability_negotiation": model_execution_plan[
+            "model_capability_negotiation"
+        ],
     }
 
 
