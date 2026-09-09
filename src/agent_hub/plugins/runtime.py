@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
@@ -32,7 +37,7 @@ from agent_hub.plugins.contracts import (
     http_json_adapter_descriptor,
 )
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
-from agent_hub.runtime.contracts import JsonValue, _mutable_json
+from agent_hub.runtime.contracts import JsonValue, _freeze_object, _mutable_json
 
 
 class PluginConfigService(Protocol):
@@ -221,6 +226,81 @@ class PluginPackageAdapter:
 
     def descriptor(self) -> Mapping[str, JsonValue]:
         return adapter_descriptor_with_contract(_package_adapter_descriptor(self._adapter_id))
+
+
+class PythonSubprocessPluginPackageRunner:
+    def __init__(
+        self,
+        *,
+        python_executable: str | None = None,
+        timeout_seconds: float = 10,
+        max_stdout_bytes: int = 262_144,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        self._python_executable = sys.executable if python_executable is None else python_executable
+        self._timeout_seconds = max(0.001, timeout_seconds)
+        self._max_stdout_bytes = max(1, max_stdout_bytes)
+        self._environment = (
+            _minimal_python_subprocess_environment()
+            if environment is None
+            else {key: value for key, value in environment.items() if key and value}
+        )
+
+    async def invoke(
+        self,
+        *,
+        target: PluginPackageExecutionTarget,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]:
+        request = _plugin_package_runner_request(
+            plugin=plugin,
+            capability=capability,
+            arguments=arguments,
+            context=context,
+        )
+        payload = json.dumps(
+            request,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._python_executable,
+                "-I",
+                str(target.entrypoint),
+                cwd=target.root,
+                env=self._environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin tool failed") from error
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(input=payload),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError as error:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await process.communicate()
+            raise RuntimeCapabilityError("Plugin tool timed out") from error
+        if process.returncode != 0:
+            raise RuntimeCapabilityError("Plugin tool failed")
+        if len(stdout) > self._max_stdout_bytes:
+            raise RuntimeCapabilityError("Plugin result is invalid")
+        try:
+            decoded = json.loads(stdout.decode("utf-8"))
+            return _freeze_object(decoded, name="plugin result")
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin result is invalid") from error
 
 
 class RuntimePluginService:
@@ -792,6 +872,54 @@ def _package_adapter_descriptor(adapter_id: str) -> Mapping[str, JsonValue]:
     }
 
 
+def _plugin_package_runner_request(
+    *,
+    plugin: PluginResourceResponse,
+    capability: PluginCapabilityRequest,
+    arguments: Mapping[str, JsonValue],
+    context: PluginInvocationContext,
+) -> Mapping[str, JsonValue]:
+    payload: Mapping[str, JsonValue] = {
+        "schema_version": 1,
+        "plugin_id": plugin.id,
+        "capability_id": capability.id,
+        "arguments": arguments,
+        "resource_config": plugin.resource_config,
+        "capability_config": capability.capability_config,
+        "context": {
+            "tenant_id": str(context.tenant_id),
+            "user_id": str(context.user_id),
+            "run_id": str(context.run_id),
+            "actor": context.actor,
+            "idempotency_key": context.idempotency_key,
+        },
+    }
+    return cast(Mapping[str, JsonValue], _mutable_json(cast(JsonValue, payload)))
+
+
+def _minimal_python_subprocess_environment() -> dict[str, str]:
+    allowed_keys = {
+        "COMSPEC",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "WINDIR",
+    }
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in allowed_keys and isinstance(value, str) and value
+    }
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    return environment
+
+
 def _plugin_schema_validator(
     *,
     schema: Mapping[str, JsonValue] | None,
@@ -894,6 +1022,7 @@ __all__ = [
     "PluginPackageExecutionTarget",
     "PluginPackageRunner",
     "PluginSecretResolver",
+    "PythonSubprocessPluginPackageRunner",
     "RuntimePluginService",
     "_plugin_package_execution_target",
     "build_runtime_plugin_service",

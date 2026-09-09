@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,7 @@ from agent_hub.plugins.runtime import (
     PluginInvocationContext,
     PluginPackageAdapter,
     PluginPackageExecutionTarget,
+    PythonSubprocessPluginPackageRunner,
     _plugin_package_execution_target,
     build_runtime_plugin_service,
 )
@@ -1085,6 +1088,203 @@ async def test_runtime_plugin_service_rejects_package_adapter_result_that_violat
             name="calendar.create_event",
             arguments={"title": "review"},
             idempotency_key="invoke-1",
+        )
+
+
+async def test_python_subprocess_plugin_package_runner_sends_stable_json_request(
+    tmp_path: Path,
+) -> None:
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "import json\n"
+        "import sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "json.dump({\n"
+        "    'ok': True,\n"
+        "    'keys': sorted(payload),\n"
+        "    'plugin_id': payload['plugin_id'],\n"
+        "    'capability_id': payload['capability_id'],\n"
+        "    'title': payload['arguments']['title'],\n"
+        "    'resource_zone': payload['resource_config']['zone'],\n"
+        "    'capability_mode': payload['capability_config']['mode'],\n"
+        "    'actor': payload['context']['actor'],\n"
+        "    'tenant_id': payload['context']['tenant_id'],\n"
+        "}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+        plugin=plugin(
+            "calendar",
+            adapter="calendar_python",
+            resource_config={"zone": "utc"},
+        ),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="in_process",
+            capability_config={"mode": "dry_run"},
+        ),
+        arguments={"title": "review"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert result == {
+        "ok": True,
+        "keys": (
+            "arguments",
+            "capability_config",
+            "capability_id",
+            "context",
+            "plugin_id",
+            "resource_config",
+            "schema_version",
+        ),
+        "plugin_id": "calendar",
+        "capability_id": "calendar.create_event",
+        "title": "review",
+        "resource_zone": "utc",
+        "capability_mode": "dry_run",
+        "actor": "tester",
+        "tenant_id": str(TENANT_ID),
+    }
+
+
+async def test_python_subprocess_plugin_package_runner_uses_package_root_and_minimal_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_HUB_SECRET_TOKEN", "must-not-leak")
+    monkeypatch.setenv("PYTHONPATH", "must-not-leak")
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "json.load(sys.stdin)\n"
+        "json.dump({\n"
+        "    'cwd': os.getcwd(),\n"
+        "    'secret_present': 'AGENT_HUB_SECRET_TOKEN' in os.environ,\n"
+        "    'pythonpath_present': 'PYTHONPATH' in os.environ,\n"
+        "    'isolated': sys.flags.isolated,\n"
+        "}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+        plugin=plugin("calendar", adapter="calendar_python"),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="in_process",
+        ),
+        arguments={"title": "review"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert Path(cast(str, result["cwd"])) == tmp_path
+    assert result["secret_present"] is False
+    assert result["pythonpath_present"] is False
+    assert result["isolated"] == 1
+    assert os.environ["AGENT_HUB_SECRET_TOKEN"] == "must-not-leak"
+
+
+@pytest.mark.parametrize(
+    ("script", "error"),
+    [
+        ("import sys; sys.stdout.write('not json')", "Plugin result is invalid"),
+        ("import json, sys; json.dump(['not', 'object'], sys.stdout)", "Plugin result is invalid"),
+        (
+            "import sys; sys.stderr.write('secret detail from plugin'); sys.exit(7)",
+            "Plugin tool failed",
+        ),
+    ],
+)
+async def test_python_subprocess_plugin_package_runner_fails_closed_for_bad_process_result(
+    tmp_path: Path,
+    script: str,
+    error: str,
+) -> None:
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(script)
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as failure:
+        await runner.invoke(
+            target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+            plugin=plugin("calendar", adapter="calendar_python"),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert str(failure.value) == error
+
+
+async def test_python_subprocess_plugin_package_runner_times_out(
+    tmp_path: Path,
+) -> None:
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text("import time; time.sleep(5)")
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=0.05,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool timed out"):
+        await runner.invoke(
+            target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+            plugin=plugin("calendar", adapter="calendar_python"),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
         )
 
 
