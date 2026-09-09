@@ -9,6 +9,31 @@ from agent_hub.runtime.contracts import JsonValue
 
 _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
+_SAFE_FAILURE_KINDS = frozenset(
+    {
+        "capacity_pressure",
+        "empty_model_response",
+        "missing_failure_event",
+        "model_capability_routing_unavailable",
+        "runtime_failure",
+        "step_failure",
+        "tool_failure",
+    }
+)
+_SAFE_RECOVERY_STRATEGIES = frozenset(
+    {
+        "compact_context_before_next_model_call",
+        "pause_for_scheduler_review",
+        "preserve_outputs_and_retry_scope",
+        "reassign_tool_role_to_capable_model_and_retry",
+        "repair_tool_invocation_after_permission_check",
+        "retry_failed_step_after_context_compaction",
+        "retry_with_fallback_or_reassign_model",
+        "switch_to_available_model_and_retry",
+        "watch_retry_budget_before_requeue",
+    }
+)
+_SAFE_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
 
 
 def self_repair_context_text(
@@ -23,7 +48,12 @@ def self_repair_context_text(
     payload = {
         "source_run_id": _safe_text(repair.get("source_run_id"), "unknown", 96),
         "source_event_sequence": _safe_int(repair.get("source_event_sequence"), 0),
-        "failure_kind": _safe_text(repair.get("failure_kind"), "runtime_failure", 64),
+        "failure_kind": _safe_enum_text(
+            repair.get("failure_kind"),
+            default="runtime_failure",
+            allowed=_SAFE_FAILURE_KINDS,
+            max_chars=64,
+        ),
         "repair_action": _safe_text(
             repair.get("repair_action"),
             "draft_repair_proposal",
@@ -36,11 +66,17 @@ def self_repair_context_text(
             "Run one bounded repair attempt, then stop.",
             _MAX_INSTRUCTION_CHARS,
         ),
-        "recovery_strategy": _safe_text(repair.get("recovery_strategy"), "", 128),
-        "orchestration_recovery_hint": _safe_text(
+        "recovery_strategy": _safe_enum_text(
+            repair.get("recovery_strategy"),
+            default="",
+            allowed=_SAFE_RECOVERY_STRATEGIES,
+            max_chars=128,
+        ),
+        "orchestration_recovery_hint": _safe_enum_text(
             repair.get("orchestration_recovery_hint"),
-            "",
-            128,
+            default="",
+            allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS,
+            max_chars=128,
         ),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -63,6 +99,17 @@ def _safe_text(value: object, default: str, max_chars: int) -> str:
         return default
     text = " ".join(value.split())[:max_chars]
     return text or default
+
+
+def _safe_enum_text(
+    value: object,
+    *,
+    default: str,
+    allowed: frozenset[str],
+    max_chars: int,
+) -> str:
+    text = _safe_text(value, default, max_chars)
+    return text if text in allowed else default
 
 
 def _safe_int(value: object, default: int) -> int:

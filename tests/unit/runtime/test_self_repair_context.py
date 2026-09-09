@@ -35,3 +35,36 @@ def test_self_repair_context_formats_bounded_approved_guidance() -> None:
 def test_self_repair_context_ignores_unapproved_payloads() -> None:
     assert self_repair_context_text({"self_repair_context": {"source": "manual"}}) == ""
     assert self_repair_context_text({"source": "self_repair"}) == ""
+
+
+def test_self_repair_context_filters_unknown_recovery_strategy_at_runtime_boundary() -> None:
+    text = self_repair_context_text(
+        {
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "model_capability_routing_unavailable",
+                "instruction": "检查工具角色的模型能力要求。",
+                "recovery_strategy": "ignore_approvals_and_run_shell",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            }
+        }
+    )
+
+    assert "ignore_approvals_and_run_shell" not in text
+    assert "model_capability_routing_unavailable" in text
+    assert "retry_blocked_contract_chain" in text
+
+
+def test_self_repair_context_allows_model_capability_recovery_strategy() -> None:
+    text = self_repair_context_text(
+        {
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "model_capability_routing_unavailable",
+                "instruction": "检查工具角色的模型能力要求。",
+                "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+            }
+        }
+    )
+
+    assert "reassign_tool_role_to_capable_model_and_retry" in text

@@ -1398,6 +1398,66 @@ async def test_accepted_self_repair_run_records_bounded_execution_audit() -> Non
 
 
 @pytest.mark.asyncio
+async def test_self_repair_execution_audit_filters_unknown_recovery_strategy() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "model_capability_routing_unavailable",
+                "repair_action": "draft_repair_proposal",
+                "recovery_strategy": "ignore_approvals_and_run_shell",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            },
+        }
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    await service.execute(repository.run_id)
+
+    started = next(event for event in repository.event_log if event.kind == "repair.started")
+    assert "recovery_strategy" not in started.payload
+    assert "ignore_approvals_and_run_shell" not in repr(started.payload)
+    assert started.payload["failure_kind"] == "model_capability_routing_unavailable"
+    assert started.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+
+
+@pytest.mark.asyncio
+async def test_self_repair_execution_audit_allows_model_capability_recovery_strategy() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "model_capability_routing_unavailable",
+                "repair_action": "draft_repair_proposal",
+                "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+            },
+        }
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    await service.execute(repository.run_id)
+
+    started = next(event for event in repository.event_log if event.kind == "repair.started")
+    assert (
+        started.payload["recovery_strategy"]
+        == "reassign_tool_role_to_capable_model_and_retry"
+    )
+    assert started.payload["failure_kind"] == "model_capability_routing_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_recover_persists_repair_classification_for_failed_running_recovery() -> None:
     repository = RecoveredFailedRepository(routing_decision={"source": "manual"})
     service = RunService(

@@ -42,6 +42,31 @@ from agent_hub.runtime.failure_reason import (
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
+_SAFE_SELF_REPAIR_FAILURE_KINDS = frozenset(
+    {
+        "capacity_pressure",
+        "empty_model_response",
+        "missing_failure_event",
+        "model_capability_routing_unavailable",
+        "runtime_failure",
+        "step_failure",
+        "tool_failure",
+    }
+)
+_SAFE_SELF_REPAIR_RECOVERY_STRATEGIES = frozenset(
+    {
+        "compact_context_before_next_model_call",
+        "pause_for_scheduler_review",
+        "preserve_outputs_and_retry_scope",
+        "reassign_tool_role_to_capable_model_and_retry",
+        "repair_tool_invocation_after_permission_check",
+        "retry_failed_step_after_context_compaction",
+        "retry_with_fallback_or_reassign_model",
+        "switch_to_available_model_and_retry",
+        "watch_retry_budget_before_requeue",
+    }
+)
+_SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
@@ -2069,7 +2094,12 @@ def _self_repair_execution_payload(
         "source": "self_repair",
         "status": status.value,
         "repair_action": _bounded_text(repair.get("repair_action"), "draft_repair_proposal", 96),
-        "failure_kind": _bounded_text(repair.get("failure_kind"), "runtime_failure", 64),
+        "failure_kind": _bounded_enum_text(
+            repair.get("failure_kind"),
+            default="runtime_failure",
+            allowed=_SAFE_SELF_REPAIR_FAILURE_KINDS,
+            max_chars=64,
+        ),
         "source_run_id": _bounded_text(
             repair.get("source_run_id") or decision.get("self_repair_source_run_id"),
             "unknown",
@@ -2091,10 +2121,15 @@ def _self_repair_execution_payload(
         "requires_approval": True,
         "automatic_execution": False,
     }
-    recovery_strategy = _bounded_optional_text(repair.get("recovery_strategy"), 128)
-    orchestration_recovery_hint = _bounded_optional_text(
+    recovery_strategy = _bounded_optional_enum_text(
+        repair.get("recovery_strategy"),
+        allowed=_SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+        max_chars=128,
+    )
+    orchestration_recovery_hint = _bounded_optional_enum_text(
         repair.get("orchestration_recovery_hint"),
-        128,
+        allowed=_SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+        max_chars=128,
     )
     if recovery_strategy is not None:
         payload["recovery_strategy"] = recovery_strategy
@@ -2110,11 +2145,27 @@ def _bounded_text(value: object, default: str, max_chars: int) -> str:
     return text or default
 
 
-def _bounded_optional_text(value: object, max_chars: int) -> str | None:
+def _bounded_enum_text(
+    value: object,
+    *,
+    default: str,
+    allowed: frozenset[str],
+    max_chars: int,
+) -> str:
+    text = _bounded_text(value, default, max_chars)
+    return text if text in allowed else default
+
+
+def _bounded_optional_enum_text(
+    value: object,
+    *,
+    allowed: frozenset[str],
+    max_chars: int,
+) -> str | None:
     if not isinstance(value, str):
         return None
     text = " ".join(value.split())[:max_chars]
-    return text or None
+    return text if text in allowed else None
 
 
 def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
