@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import Mapping
@@ -31,6 +32,7 @@ from agent_hub.plugins.runtime import (
     PluginPackageAdapter,
     PluginPackageExecutionTarget,
     PythonSubprocessPluginPackageRunner,
+    RuntimePluginService,
     _plugin_package_execution_target,
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
@@ -93,6 +95,47 @@ class TenantMappedPluginAdminService(FakeAdminService):
     ) -> tuple[PluginResourceResponse, ...]:
         assert tenant_id is not None
         self.tenant_ids.append(tenant_id)
+        return self.plugins_by_tenant.get(tenant_id, ())
+
+
+class BlockingTenantMappedPluginAdminService(TenantMappedPluginAdminService):
+    def __init__(
+        self,
+        plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]],
+    ) -> None:
+        super().__init__(plugins_by_tenant)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        assert tenant_id is not None
+        self.entered.set()
+        await self.release.wait()
+        return await super().list_plugins(tenant_id=tenant_id)
+
+
+class FailingOnceTenantMappedPluginAdminService(TenantMappedPluginAdminService):
+    def __init__(
+        self,
+        plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]],
+    ) -> None:
+        super().__init__(plugins_by_tenant)
+        self.failures_remaining = 1
+
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        assert tenant_id is not None
+        self.tenant_ids.append(tenant_id)
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary plugin reload failure")
         return self.plugins_by_tenant.get(tenant_id, ())
 
 
@@ -1936,6 +1979,122 @@ async def test_runtime_plugin_reload_without_tenant_refreshes_loaded_tenants() -
         "schema_version": 1,
         "capabilities": (),
     }
+
+
+async def test_runtime_plugin_service_coalesces_concurrent_reload_for_same_tenant() -> None:
+    admin_service = BlockingTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    reloads = [
+        asyncio.create_task(service.reload(OTHER_TENANT_ID)),
+        asyncio.create_task(service.reload(OTHER_TENANT_ID)),
+    ]
+    await admin_service.entered.wait()
+    admin_service.release.set()
+    await asyncio.gather(*reloads)
+
+    assert admin_service.tenant_ids == [OTHER_TENANT_ID]
+
+
+async def test_runtime_plugin_reload_waiter_cancellation_does_not_cancel_shared_reload() -> None:
+    admin_service = BlockingTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    leader = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await admin_service.entered.wait()
+    follower = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await asyncio.sleep(0)
+
+    follower.cancel()
+    try:
+        await follower
+    except asyncio.CancelledError:
+        pass
+    admin_service.release.set()
+    await leader
+
+    assert admin_service.tenant_ids == [OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
+
+
+async def test_runtime_plugin_reload_cleans_inflight_task_after_only_waiter_cancelled() -> None:
+    admin_service = BlockingTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    waiter = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await admin_service.entered.wait()
+    waiter.cancel()
+    try:
+        await waiter
+    except asyncio.CancelledError:
+        pass
+    admin_service.release.set()
+    for _ in range(10):
+        if service._reload_tasks_by_tenant == {}:
+            break
+        await asyncio.sleep(0)
+
+    assert service._reload_tasks_by_tenant == {}
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
+
+
+async def test_runtime_plugin_reload_failure_does_not_block_later_retry() -> None:
+    admin_service = FailingOnceTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+    await service.reload(OTHER_TENANT_ID)
+
+    assert admin_service.tenant_ids == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
 
 
 async def test_runtime_plugin_manifest_includes_capability_schemas() -> None:

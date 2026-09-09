@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 from agent_hub.mcp.client import InMemoryMcpClient
-from agent_hub.mcp.runtime import build_runtime_mcp_service
+from agent_hub.mcp.runtime import RuntimeMcpService, build_runtime_mcp_service
 from agent_hub.mcp.types import McpInvocationResult, McpToolSchema, McpTransportKind
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -31,6 +32,33 @@ class TenantMappedAdminService:
     async def list_mcp_servers(self, *, tenant_id: UUID | None = None) -> tuple[object, ...]:
         assert tenant_id is not None
         self.tenants.append(tenant_id)
+        return self.servers_by_tenant.get(tenant_id, ())
+
+
+class BlockingTenantMappedAdminService(TenantMappedAdminService):
+    def __init__(self, servers_by_tenant: dict[UUID, tuple[object, ...]]) -> None:
+        super().__init__(servers_by_tenant)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def list_mcp_servers(self, *, tenant_id: UUID | None = None) -> tuple[object, ...]:
+        assert tenant_id is not None
+        self.entered.set()
+        await self.release.wait()
+        return await super().list_mcp_servers(tenant_id=tenant_id)
+
+
+class FailingOnceTenantMappedAdminService(TenantMappedAdminService):
+    def __init__(self, servers_by_tenant: dict[UUID, tuple[object, ...]]) -> None:
+        super().__init__(servers_by_tenant)
+        self.failures_remaining = 1
+
+    async def list_mcp_servers(self, *, tenant_id: UUID | None = None) -> tuple[object, ...]:
+        assert tenant_id is not None
+        self.tenants.append(tenant_id)
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary mcp reload failure")
         return self.servers_by_tenant.get(tenant_id, ())
 
 
@@ -264,3 +292,115 @@ async def test_runtime_mcp_reload_without_tenant_refreshes_loaded_tenants() -> N
         "schema_version": 1,
         "capabilities": (),
     }
+
+
+async def test_runtime_mcp_service_coalesces_concurrent_reload_for_same_tenant() -> None:
+    admin_service = BlockingTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+
+    reloads = [
+        asyncio.create_task(service.reload(OTHER_TENANT_ID)),
+        asyncio.create_task(service.reload(OTHER_TENANT_ID)),
+    ]
+    await admin_service.entered.wait()
+    admin_service.release.set()
+    await asyncio.gather(*reloads)
+
+    assert admin_service.tenants == [OTHER_TENANT_ID]
+
+
+async def test_runtime_mcp_reload_waiter_cancellation_does_not_cancel_shared_reload() -> None:
+    admin_service = BlockingTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+
+    leader = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await admin_service.entered.wait()
+    follower = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await asyncio.sleep(0)
+
+    follower.cancel()
+    try:
+        await follower
+    except asyncio.CancelledError:
+        pass
+    admin_service.release.set()
+    await leader
+
+    assert admin_service.tenants == [OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
+
+
+async def test_runtime_mcp_reload_cleans_inflight_task_after_only_waiter_cancelled() -> None:
+    admin_service = BlockingTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+
+    waiter = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await admin_service.entered.wait()
+    waiter.cancel()
+    try:
+        await waiter
+    except asyncio.CancelledError:
+        pass
+    admin_service.release.set()
+    for _ in range(10):
+        if service._reload_tasks_by_tenant == {}:
+            break
+        await asyncio.sleep(0)
+
+    assert service._reload_tasks_by_tenant == {}
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
+
+
+async def test_runtime_mcp_reload_failure_does_not_block_later_retry() -> None:
+    admin_service = FailingOnceTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+    await service.reload(OTHER_TENANT_ID)
+
+    assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True

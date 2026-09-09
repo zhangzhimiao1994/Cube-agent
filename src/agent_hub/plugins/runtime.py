@@ -322,6 +322,8 @@ class RuntimePluginService:
         self._plugins_loaded_at: dict[UUID, float] = {}
         self._cache_ttl_seconds = max(0.0, cache_ttl_seconds)
         self._monotonic = default_monotonic if monotonic is None else monotonic
+        self._reload_lock = asyncio.Lock()
+        self._reload_tasks_by_tenant: dict[UUID, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         await self.reload(self._tenant_id)
@@ -331,7 +333,28 @@ class RuntimePluginService:
             for target_tenant_id in self._loaded_tenant_ids():
                 await self.reload(target_tenant_id)
             return
-        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
+        async with self._reload_lock:
+            task = self._reload_tasks_by_tenant.get(tenant_id)
+            if task is None or task.done():
+                task = asyncio.create_task(self._reload_tenant(tenant_id))
+                self._reload_tasks_by_tenant[tenant_id] = task
+                target_tenant_id = tenant_id
+
+                def discard_completed_task(completed_task: asyncio.Future[None]) -> None:
+                    self._discard_reload_task(target_tenant_id, completed_task)
+
+                task.add_done_callback(discard_completed_task)
+        await asyncio.shield(task)
+
+    def _discard_reload_task(
+        self,
+        tenant_id: UUID,
+        completed_task: asyncio.Future[None],
+    ) -> None:
+        if self._reload_tasks_by_tenant.get(tenant_id) is completed_task:
+            del self._reload_tasks_by_tenant[tenant_id]
+
+    async def _reload_tenant(self, target_tenant_id: UUID) -> None:
         try:
             self._plugins_by_tenant[target_tenant_id] = tuple(
                 PluginResourceResponse.model_validate(plugin)
