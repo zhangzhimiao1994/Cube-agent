@@ -690,27 +690,36 @@ def _schema_property(description: str) -> dict[str, JsonValue]:
     return {"type": "string", "description": description}
 
 
-def _validate_structured_handoff_output(
+def _validate_structured_role_output(
     plan: DispatchPlan,
     step: DispatchStep,
     agent: AgentSpec,
     text: object,
 ) -> None:
-    if not agent.output_schema or not _step_has_dependents(plan, step):
+    if not agent.output_schema:
         return
+    diagnostic_prefix = (
+        "structured handoff output"
+        if _step_has_dependents(plan, step)
+        else "structured role output"
+    )
+
+    def fail(reason: str) -> Never:
+        _fail(f"{diagnostic_prefix} {reason}")
+
     if not isinstance(text, str):
-        _fail("structured handoff output is not valid json")
+        fail("is not valid json")
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        _fail("structured handoff output is not valid json")
+        fail("is not valid json")
     if not isinstance(payload, dict):
-        _fail("structured handoff output is not an object")
+        fail("is not an object")
     for field_name, description in agent.output_schema.items():
         if field_name not in payload:
-            _fail("structured handoff output missing field")
+            fail("missing field")
         if not _structured_handoff_field_matches(payload[field_name], description):
-            _fail("structured handoff output field type mismatch")
+            fail("field type mismatch")
 
 
 def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
@@ -2147,7 +2156,7 @@ class CrewDispatchRuntime:
                     run_state,
                     step_deadline,
                 )
-                _validate_structured_handoff_output(plan, step, agent, completion.response.text)
+                _validate_structured_role_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(
                     step,
                     completion,

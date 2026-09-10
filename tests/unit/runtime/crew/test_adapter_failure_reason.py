@@ -984,7 +984,7 @@ async def test_invalid_dependent_structured_role_output_blocks_handoff(
 
 
 async def test_agent_output_schema_becomes_structured_model_request() -> None:
-    gateway = RoleAwareGateway()
+    gateway = SequenceGateway('{"summary":"done","risks":[]}')
     plan = DispatchPlan(
         agents=(
             AgentSpec(
@@ -1027,6 +1027,42 @@ async def test_agent_output_schema_becomes_structured_model_request() -> None:
         "required": ("summary", "risks"),
         "additionalProperties": False,
     }
+
+
+async def test_final_structured_role_output_must_match_schema() -> None:
+    gateway = SequenceGateway("plain text")
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string", "risks": "string[]"},
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="structured role output is not valid json"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
+    assert failed.step_id == "final"
+    assert failed.reason == "structured role output is not valid json"
+    assert "blocked_contract_ids" not in failed.payload
 
 
 async def test_reviewer_verdict_uses_structured_model_request() -> None:
