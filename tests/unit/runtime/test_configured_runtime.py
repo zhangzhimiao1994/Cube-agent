@@ -2121,16 +2121,16 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             {
                 "role_id": "final_synthesizer",
                 "logical_model": "main",
-                "required_capabilities": ("text", "structured_output"),
-                "matched_capabilities": (),
+                "required_capabilities": ("text",),
+                "matched_capabilities": ("text",),
                 "missing_capabilities": (),
-                "status": "unknown",
+                "status": "satisfied",
             },
         ),
         "role_count": 2,
-        "satisfied_count": 1,
+        "satisfied_count": 2,
         "missing_count": 0,
-        "unknown_count": 1,
+        "unknown_count": 0,
         "truncated": False,
     }
     assert model_execution_plan == {

@@ -263,6 +263,7 @@ class _PlannedRuntime:
         deployment_constraint: DeploymentRoutingConstraint | None = None,
         fallback_policy: FallbackExecutionPolicy = "configured",
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        config: PlatformConfig | None = None,
     ) -> None:
         self.mode = mode
         self._child = child
@@ -275,6 +276,7 @@ class _PlannedRuntime:
         self._deployment_constraint = deployment_constraint
         self._fallback_policy = fallback_policy
         self._capability_gateway = capability_gateway
+        self._config = config
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         sequence_offset = 1
@@ -303,6 +305,7 @@ class _PlannedRuntime:
                         deployment_constraints=self._deployment_constraints,
                         deployment_constraint=self._deployment_constraint,
                         fallback_policy=self._fallback_policy,
+                        config=self._config,
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
@@ -537,6 +540,7 @@ class ConfigBackedDispatchRuntime:
             deployment_constraint=deployment_constraint,
             fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
+            config=config,
         )
 
 
@@ -681,6 +685,7 @@ class ConfigBackedDiscussionRuntime:
             deployment_constraint=deployment_constraint,
             fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
+            config=config,
         )
 
 
@@ -910,6 +915,7 @@ class ConfigBackedHybridRuntime:
             deployment_constraint=deployment_constraint,
             fallback_policy=fallback_policy,
             capability_gateway=self._capability_gateway,
+            config=config,
         )
 
 
@@ -1789,6 +1795,7 @@ def _model_execution_plan_payload(
     deployment_constraints: Mapping[str, JsonValue] | None = None,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
     fallback_policy: FallbackExecutionPolicy = "configured",
+    config: PlatformConfig | None = None,
 ) -> Mapping[str, JsonValue]:
     explicit_main = context.routing_decision.get("main_agent_model")
     main_agent_constraint = (
@@ -1853,6 +1860,7 @@ def _model_execution_plan_payload(
             roles=roles,
             model_routing_matrix=model_routing_matrix,
             model_routing_matrix_truncated=model_routing_matrix_truncated,
+            config=config,
         ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
@@ -1945,6 +1953,7 @@ def _model_capability_negotiation_payload(
     roles: tuple[Mapping[str, JsonValue], ...],
     model_routing_matrix: tuple[Mapping[str, JsonValue], ...],
     model_routing_matrix_truncated: bool,
+    config: PlatformConfig | None = None,
 ) -> Mapping[str, JsonValue]:
     selected_capabilities = _selected_model_capabilities_by_role(model_routing_matrix)
     items: list[Mapping[str, JsonValue]] = []
@@ -1962,6 +1971,8 @@ def _model_capability_negotiation_payload(
             break
         required = _required_model_capabilities_for_role(role)
         selected = selected_capabilities.get(role_id)
+        if selected is None and config is not None:
+            selected = _logical_model_capabilities(config, logical_model)
         matched = tuple(capability for capability in required if selected and capability in selected)
         missing = (
             tuple(capability for capability in required if capability not in selected)
@@ -1999,11 +2010,26 @@ def _model_capability_negotiation_payload(
 def _required_model_capabilities_for_role(
     role: Mapping[str, JsonValue],
 ) -> tuple[ModelCapability, ...]:
-    required = [ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT]
+    required = [ModelCapability.TEXT]
+    if role.get("purpose") != "synthesize":
+        required.append(ModelCapability.STRUCTURED_OUTPUT)
     tools = role.get("tools")
     if isinstance(tools, tuple | list) and tools:
         required.append(ModelCapability.TOOL_CALLING)
     return tuple(dict.fromkeys(required))
+
+
+def _logical_model_capabilities(
+    config: PlatformConfig,
+    logical_model: str,
+) -> frozenset[ModelCapability] | None:
+    definition = config.models.get(logical_model)
+    if definition is None:
+        return None
+    capabilities: set[ModelCapability] = set()
+    for deployment in definition.deployments:
+        capabilities.update(ModelCapability(item) for item in deployment.capabilities)
+    return frozenset(capabilities)
 
 
 def _selected_model_capabilities_by_role(
