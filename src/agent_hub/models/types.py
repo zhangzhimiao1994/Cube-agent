@@ -1,6 +1,6 @@
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
@@ -35,6 +35,29 @@ class ModelCapability(StrEnum):
     IMAGE_GENERATION = "image_generation"
     VIDEO_GENERATION = "video_generation"
     AUDIO_GENERATION = "audio_generation"
+
+
+def is_messages_endpoint_api_base(api_base: str | None) -> bool:
+    if api_base is None:
+        return False
+    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
+
+
+def effective_capabilities_for_api_base(
+    capabilities: Iterable[ModelCapability],
+    api_base: str | None,
+) -> frozenset[ModelCapability]:
+    effective = set(capabilities)
+    if is_messages_endpoint_api_base(api_base):
+        effective.discard(ModelCapability.TOOL_CALLING)
+    return frozenset(effective)
+
+
+def effective_deployment_capabilities(deployment: "Deployment") -> frozenset[ModelCapability]:
+    return effective_capabilities_for_api_base(
+        deployment.capabilities,
+        deployment.api_base,
+    )
 
 
 def _require_safe_identifier(name: str, value: str) -> None:

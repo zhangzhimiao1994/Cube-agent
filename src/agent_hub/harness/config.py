@@ -3,6 +3,7 @@ from __future__ import annotations
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler
 from agent_hub.harness.types import ProviderCapabilityProfile
+from agent_hub.models.types import ModelCapability, effective_capabilities_for_api_base
 
 _GENERATION_CAPABILITIES = frozenset(
     {"image_generation", "video_generation", "audio_generation"}
@@ -14,7 +15,11 @@ def provider_profiles_from_config(config: PlatformConfig) -> tuple[ProviderCapab
     for logical_model, definition in sorted(config.models.items()):
         for deployment in definition.deployments:
             provider = deployment.provider.casefold()
-            capabilities = frozenset(str(capability) for capability in deployment.capabilities)
+            effective_capabilities = effective_capabilities_for_api_base(
+                (ModelCapability(capability) for capability in deployment.capabilities),
+                deployment.api_base,
+            )
+            capabilities = frozenset(str(capability) for capability in effective_capabilities)
             is_generation_only = bool(capabilities & _GENERATION_CAPABILITIES) and "tool_calling" not in capabilities
             profiles.append(
                 ProviderCapabilityProfile(

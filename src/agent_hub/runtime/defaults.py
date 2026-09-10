@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from typing import Literal, Protocol, cast
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -40,7 +39,11 @@ from agent_hub.models.routing_policy import (
     deployment_routing_constraint_from_decision,
     fallback_execution_policy_from_decision,
 )
-from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    effective_capabilities_for_api_base,
+)
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
@@ -2098,12 +2101,10 @@ def _logical_model_capabilities_for_requirements(
             )
         )
     for deployment in deployments:
-        capability_items = {ModelCapability(item) for item in deployment.capabilities}
-        if ModelCapability.TOOL_CALLING in required and _is_messages_endpoint_api_base(
-            deployment.api_base
-        ):
-            capability_items.discard(ModelCapability.TOOL_CALLING)
-        capabilities = frozenset(capability_items)
+        capabilities = effective_capabilities_for_api_base(
+            (ModelCapability(item) for item in deployment.capabilities),
+            deployment.api_base,
+        )
         if all(capability in capabilities for capability in required):
             return capabilities
         deployment_capabilities.append(capabilities)
@@ -2659,8 +2660,11 @@ def _logical_model_satisfies_deployment_constraint(
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
     return any(
-        "tool_calling" in {str(capability).lower() for capability in deployment.capabilities}
-        and not _is_messages_endpoint_api_base(deployment.api_base)
+        ModelCapability.TOOL_CALLING
+        in effective_capabilities_for_api_base(
+            (ModelCapability(capability) for capability in deployment.capabilities),
+            deployment.api_base,
+        )
         for deployment in definition.deployments
     )
 
@@ -2677,11 +2681,6 @@ def _required_model_capabilities_for_assignment(
         required.add(ModelCapability.TOOL_CALLING)
     return frozenset(required)
 
-
-def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
-    if api_base is None:
-        return False
-    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
 def _model_characteristics(
     logical_model: str,

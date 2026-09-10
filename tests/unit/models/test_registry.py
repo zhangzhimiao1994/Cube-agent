@@ -39,6 +39,27 @@ def test_registry_filters_by_all_required_capabilities() -> None:
     assert registry.candidates("primary", frozenset()) == (text, vision)
 
 
+def test_registry_treats_messages_endpoint_tool_calling_as_unavailable() -> None:
+    deployment = Deployment(
+        id="messages",
+        logical_model="primary",
+        provider_model="anthropic/claude-sonnet-4",
+        api_base="https://api.anthropic.com/v1/messages",
+        capabilities={ModelCapability.TEXT, ModelCapability.TOOL_CALLING},  # type: ignore[arg-type]
+    )
+    registry = ModelRegistry([deployment])
+
+    assert registry.candidates("primary", {ModelCapability.TEXT}) == (deployment,)
+    with pytest.raises(
+        NoCapableDeployment,
+        match="^no capable deployment for logical model 'primary': text, tool_calling$",
+    ):
+        registry.candidates(
+            "primary",
+            {ModelCapability.TEXT, ModelCapability.TOOL_CALLING},
+        )
+
+
 def test_known_video_generation_models_are_inferred_conservatively() -> None:
     inferred = infer_model_capabilities(
         provider="minimax",

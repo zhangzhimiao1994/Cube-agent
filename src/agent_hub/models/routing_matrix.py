@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
 
 from agent_hub.config.schema import LogicalModelDefinition, PlatformConfig
 from agent_hub.models.profiles import infer_model_traits
-from agent_hub.models.types import ModelCapability
+from agent_hub.models.types import (
+    ModelCapability,
+    effective_capabilities_for_api_base,
+)
 
 _SOFTWARE_TASK_KEYWORDS = (
     "code",
@@ -325,8 +327,11 @@ def _logical_model_haystack(logical_model: str, definition: LogicalModelDefiniti
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
     return any(
-        "tool_calling" in {str(capability).lower() for capability in deployment.capabilities}
-        and not _is_messages_endpoint_api_base(deployment.api_base)
+        ModelCapability.TOOL_CALLING
+        in effective_capabilities_for_api_base(
+            (ModelCapability(capability) for capability in deployment.capabilities),
+            deployment.api_base,
+        )
         for deployment in definition.deployments
     )
 
@@ -348,18 +353,20 @@ def _unsupported_required_capabilities(
     if not required:
         return frozenset()
     for deployment in definition.deployments:
-        capabilities = deployment.capabilities
+        capabilities = effective_capabilities_for_api_base(
+            (ModelCapability(capability) for capability in deployment.capabilities),
+            deployment.api_base,
+        )
         if not required.issubset(capabilities):
-            continue
-        if ModelCapability.TOOL_CALLING in required and _is_messages_endpoint_api_base(
-            deployment.api_base
-        ):
             continue
         return frozenset()
     declared = frozenset(
-        capability
+        effective_capability
         for deployment in definition.deployments
-        for capability in deployment.capabilities
+        for effective_capability in effective_capabilities_for_api_base(
+            (ModelCapability(capability) for capability in deployment.capabilities),
+            deployment.api_base,
+        )
     )
     unsupported = set(required - declared)
     if not unsupported:
@@ -370,12 +377,6 @@ def _unsupported_required_capabilities(
     ):
         unsupported.add(ModelCapability.TOOL_CALLING)
     return frozenset(unsupported)
-
-
-def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
-    if api_base is None:
-        return False
-    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
 
 __all__ = [

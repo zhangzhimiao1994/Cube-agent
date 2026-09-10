@@ -2,7 +2,12 @@ from collections import defaultdict
 from collections.abc import Iterable
 from types import MappingProxyType
 
-from agent_hub.models.types import Deployment, ModelCapability, _require_safe_identifier
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    _require_safe_identifier,
+    effective_deployment_capabilities,
+)
 
 
 class NoCapableDeployment(LookupError):
@@ -45,7 +50,7 @@ class ModelRegistry:
         matches = tuple(
             deployment
             for deployment in self._by_logical_model.get(logical_model, ())
-            if required_capabilities.issubset(deployment.capabilities)
+            if required_capabilities.issubset(effective_deployment_capabilities(deployment))
         )
         if matches:
             return matches

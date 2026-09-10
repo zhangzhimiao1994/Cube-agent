@@ -1,5 +1,7 @@
 from uuid import UUID
 
+import pytest
+
 from agent_hub.config.schema import (
     AgentDefinition,
     DeploymentDefinition,
@@ -8,6 +10,7 @@ from agent_hub.config.schema import (
 )
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.config import harness_scheduler_from_config, provider_profiles_from_config
+from agent_hub.harness.scheduler import HarnessSchedulingError
 from agent_hub.harness.types import HarnessPolicy, HarnessTaskRequirements
 
 TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -108,6 +111,46 @@ def test_multimodal_generation_profile_does_not_gain_reasoning_strengths() -> No
     assert video.supports_reasoning_delta is False
     assert video.supports_streamed_tool_call_delta is False
     assert video.supports_long_running_tasks is False
+
+
+def test_messages_endpoint_profile_does_not_expose_tool_calling() -> None:
+    config = PlatformConfig(
+        models={
+            "messages": LogicalModelDefinition(
+                deployments=[
+                    DeploymentDefinition(
+                        provider="anthropic",
+                        model="claude-sonnet-4",
+                        api_base="https://api.anthropic.com/v1/messages",
+                        credential_ref="anthropic-key",
+                        quota_scope_id="anthropic-account",
+                        capabilities={"text", "tool_calling"},
+                    )
+                ]
+            )
+        },
+        agents=[],
+    )
+
+    profiles = provider_profiles_from_config(config)
+    assert profiles[0].capabilities == frozenset({"text"})
+    assert profiles[0].supports_streamed_tool_call_delta is False
+    assert profiles[0].supports_parallel_tool_calls is False
+    scheduler = harness_scheduler_from_config(config)
+    assert scheduler is not None
+    with pytest.raises(
+        HarnessSchedulingError,
+        match="no harness provider satisfies policy and capabilities",
+    ):
+        scheduler.select(
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            requirements=HarnessTaskRequirements(
+                required_capabilities=frozenset({"text", "tool_calling"}),
+            ),
+            policy=HarnessPolicy(),
+            hermes_hint=None,
+        )
 
 
 def test_scheduler_factory_returns_none_without_usable_text_models() -> None:
