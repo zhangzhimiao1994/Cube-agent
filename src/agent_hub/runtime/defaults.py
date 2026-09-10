@@ -618,7 +618,7 @@ class ConfigBackedDiscussionRuntime:
             context,
             config,
             purpose=RolePurpose.EXPERTISE,
-            output_schema=_DISCUSSION_OUTPUT_SCHEMA,
+            output_schema={},
         )
         if len(selected_roles) >= 2:
             planned_roles = selected_roles
@@ -772,7 +772,7 @@ class ConfigBackedHybridRuntime:
             context,
             config,
             purpose=RolePurpose.EXPERTISE,
-            output_schema=_DISCUSSION_OUTPUT_SCHEMA,
+            output_schema={},
         )
         if selected_dispatch_roles:
             dispatch_roles = selected_dispatch_roles
@@ -796,7 +796,7 @@ class ConfigBackedHybridRuntime:
                     role,
                     purpose=RolePurpose.EXPERTISE,
                     must_answer=("What is this agent's position and evidence?",),
-                    output_schema=_DISCUSSION_OUTPUT_SCHEMA,
+                    output_schema={},
                 )
                 for role in selected_dispatch_roles
             )

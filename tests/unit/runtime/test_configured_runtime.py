@@ -3280,6 +3280,85 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
 
 
 @pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_does_not_require_structured_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDiscussionRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "plain": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://plain",
+                                "quota_scope_id": "plain",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [
+                    {
+                        "id": "analyst",
+                        "role": "Analyst",
+                        "prompt": "Compare options.",
+                        "model": "plain",
+                        "skills": [],
+                    },
+                    {
+                        "id": "critic",
+                        "role": "Critic",
+                        "prompt": "Review risks.",
+                        "model": "plain",
+                        "skills": [],
+                    },
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISCUSS,
+                request="Compare two launch options.",
+                routing_decision={
+                    "selected_agent_ids": ("analyst", "critic"),
+                    "main_agent_model": "plain",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].actor == "main_agent"
+    assert events[0].payload["main_agent_model"] == "plain"
+    model_execution_plan = events[0].payload["model_execution_plan"]
+    assert isinstance(model_execution_plan, Mapping)
+    negotiation = model_execution_plan["model_capability_negotiation"]
+    assert isinstance(negotiation, Mapping)
+    assert negotiation["satisfied_count"] == 2
+    assert negotiation["missing_count"] == 0
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory_planning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
