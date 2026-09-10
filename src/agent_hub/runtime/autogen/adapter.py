@@ -509,7 +509,18 @@ class _CapabilityHarnessBackend:
         )
 
 
-def _tool_sandbox(name: str) -> str:
+def _tool_sandbox(
+    name: str,
+    *,
+    sandbox_profile: str | None = None,
+    arguments: Mapping[str, JsonValue] | None = None,
+) -> str:
+    if (
+        name == "project.generate_zip"
+        and _has_project_workspace_write_side_effect(arguments)
+        and sandbox_profile == "workspace_write"
+    ):
+        return "workspace_write"
     if name in {"read_context", "workspace_read", "workspace.read"}:
         return "read_only"
     if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
@@ -519,6 +530,25 @@ def _tool_sandbox(name: str) -> str:
 
 def _tool_requires_approval(name: str) -> bool:
     return _tool_sandbox(name) == "restricted"
+
+
+def _has_project_workspace_write_side_effect(arguments: Mapping[str, JsonValue] | None) -> bool:
+    if arguments is None:
+        return False
+    return _nonblank_argument(arguments, "project_id") and _nonblank_argument(
+        arguments,
+        "workspace_session_id",
+    )
+
+
+def _nonblank_argument(arguments: Mapping[str, JsonValue], name: str) -> bool:
+    value = arguments.get(name)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _routing_sandbox_profile(routing_decision: Mapping[str, JsonValue]) -> str | None:
+    value = routing_decision.get("sandbox_profile")
+    return value if isinstance(value, str) else None
 
 
 def _safe_id(value: str, name: str) -> str:
@@ -675,6 +705,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         user_id: UUID | None = None,
         role: Role | None = None,
         approval_envelope_required: bool = True,
+        sandbox_profile: str | None = None,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -692,6 +723,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._user_id = user_id
         self._role = role
         self._approval_envelope_required = approval_envelope_required
+        self._sandbox_profile = sandbox_profile
 
     async def run(
         self, args: _DynamicToolArguments, cancellation_token: CancellationToken
@@ -737,6 +769,11 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         replay_safe = self._gateway.is_replay_safe(self.name)
         if type(replay_safe) is not bool:
             raise RuntimeExecutionError("capability replay policy is invalid")
+        tool_sandbox = _tool_sandbox(
+            self.name,
+            sandbox_profile=self._sandbox_profile,
+            arguments=cast(Mapping[str, JsonValue], arguments),
+        )
         replayed, idempotency_key = await self._durability.before_tool(
             actor=self._actor,
             name=self.name,
@@ -753,7 +790,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     name=self.name,
                     status="running",
                     arguments=cast(Mapping[str, JsonValue], arguments),
-                    sandbox=_tool_sandbox(self.name),
+                    sandbox=tool_sandbox,
                     replay_safe=replay_safe,
                 ),
             )
@@ -789,7 +826,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 tool_name=self.name,
                 arguments=cast(Mapping[str, JsonValue], arguments),
                 approval_required=self._approval_envelope_required and _tool_requires_approval(self.name),
-                sandbox=_tool_sandbox(self.name),
+                sandbox=tool_sandbox,
                 idempotency_key=idempotency_key,
                 call_id=safe_call_id,
             )
@@ -804,7 +841,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                         name=self.name,
                         status="failed",
                         arguments=cast(Mapping[str, JsonValue], arguments),
-                        sandbox=_tool_sandbox(self.name),
+                        sandbox=tool_sandbox,
                         replay_safe=replay_safe,
                         failure_kind="invalid_request",
                     ),
@@ -838,7 +875,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                         name=self.name,
                         status="failed",
                         arguments=cast(Mapping[str, JsonValue], arguments),
-                        sandbox=_tool_sandbox(self.name),
+                        sandbox=tool_sandbox,
                         replay_safe=replay_safe,
                         failure_kind="uncertain",
                     ),
@@ -884,7 +921,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                         name=self.name,
                         status="failed",
                         arguments=cast(Mapping[str, JsonValue], arguments),
-                        sandbox=_tool_sandbox(self.name),
+                        sandbox=tool_sandbox,
                         replay_safe=replay_safe,
                         failure_kind="capability_failed",
                     ),
@@ -1376,6 +1413,9 @@ class AutoGenDiscussionRuntime:
                                     user_id=context.actor_id,
                                     role=context.actor_role,
                                     approval_envelope_required=self._uses_external_harness_tool_gateway,
+                                    sandbox_profile=_routing_sandbox_profile(
+                                        context.routing_decision
+                                    ),
                                 )
                                 for name in participant.allowed_tools
                             ]

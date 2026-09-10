@@ -352,7 +352,17 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
     return {"type": "object", "additionalProperties": True}
 
 
-def _tool_sandbox(name: str) -> str:
+def _tool_sandbox(
+    name: str,
+    routing_decision: Mapping[str, JsonValue] | None = None,
+    arguments: Mapping[str, JsonValue] | None = None,
+) -> str:
+    if (
+        name == "project.generate_zip"
+        and _has_project_workspace_write_side_effect(arguments)
+        and _routing_sandbox_profile(routing_decision) == "workspace_write"
+    ):
+        return "workspace_write"
     if name in {"read_context", "workspace_read", "workspace.read"}:
         return "read_only"
     if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
@@ -362,6 +372,27 @@ def _tool_sandbox(name: str) -> str:
 
 def _tool_requires_approval(name: str) -> bool:
     return _tool_sandbox(name) == "restricted"
+
+
+def _has_project_workspace_write_side_effect(arguments: Mapping[str, JsonValue] | None) -> bool:
+    if arguments is None:
+        return False
+    return _nonblank_argument(arguments, "project_id") and _nonblank_argument(
+        arguments,
+        "workspace_session_id",
+    )
+
+
+def _nonblank_argument(arguments: Mapping[str, JsonValue], name: str) -> bool:
+    value = arguments.get(name)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _routing_sandbox_profile(routing_decision: Mapping[str, JsonValue] | None) -> str | None:
+    if routing_decision is None:
+        return None
+    value = routing_decision.get("sandbox_profile")
+    return value if isinstance(value, str) else None
 
 
 def _map_completion_tool_names(
@@ -2900,6 +2931,11 @@ class CrewDispatchRuntime:
                     "sha256": None,
                 }
                 await tool_boundary(idempotency_key, tool_prepared, None)
+                tool_sandbox = _tool_sandbox(
+                    tool_call.name,
+                    context.routing_decision,
+                    tool_call.arguments,
+                )
                 await emit(
                     kind=EventKind.TOOL_STARTED,
                     actor=step.agent,
@@ -2909,7 +2945,7 @@ class CrewDispatchRuntime:
                         name=tool_call.name,
                         status="running",
                         arguments=tool_call.arguments,
-                        sandbox=_tool_sandbox(tool_call.name),
+                        sandbox=tool_sandbox,
                         replay_safe=replay_safe,
                     ),
                 )
@@ -2926,7 +2962,7 @@ class CrewDispatchRuntime:
                             self._uses_external_harness_tool_gateway
                             and _tool_requires_approval(tool_call.name)
                         ),
-                        sandbox=_tool_sandbox(tool_call.name),
+                        sandbox=tool_sandbox,
                         idempotency_key=idempotency_key,
                         call_id=call_id,
                     )
@@ -2940,7 +2976,7 @@ class CrewDispatchRuntime:
                             name=tool_call.name,
                             status="failed",
                             arguments=tool_call.arguments,
-                            sandbox=_tool_sandbox(tool_call.name),
+                            sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="invalid_request",
                         ),
@@ -2973,7 +3009,7 @@ class CrewDispatchRuntime:
                             name=tool_call.name,
                             status="failed",
                             arguments=tool_call.arguments,
-                            sandbox=_tool_sandbox(tool_call.name),
+                            sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed",
                         ),
@@ -3006,7 +3042,7 @@ class CrewDispatchRuntime:
                             name=tool_call.name,
                             status="failed",
                             arguments=tool_call.arguments,
-                            sandbox=_tool_sandbox(tool_call.name),
+                            sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed"
                             if replay_safe
@@ -3069,7 +3105,7 @@ class CrewDispatchRuntime:
                             name=tool_call.name,
                             status="failed",
                             arguments=tool_call.arguments,
-                            sandbox=_tool_sandbox(tool_call.name),
+                            sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed",
                         ),
@@ -3101,7 +3137,7 @@ class CrewDispatchRuntime:
                             name=tool_call.name,
                             status="failed",
                             arguments=tool_call.arguments,
-                            sandbox=_tool_sandbox(tool_call.name),
+                            sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed"
                             if replay_safe

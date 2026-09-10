@@ -91,6 +91,42 @@ class ToolGateway:
         )
 
 
+class ProjectZipWorkspaceGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call",
+                        name="project_generate_zip",
+                        arguments={
+                            "title": "Hello Workspace",
+                            "project_id": "project-main",
+                            "workspace_session_id": "session-main",
+                            "files": {"main.py": "print('hello')\n"},
+                        },
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="workspace zip ready", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class FakeCapabilities:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -1392,6 +1428,31 @@ async def test_tool_calls_forward_trusted_actor_identity_to_harness_gateway() ->
         if event.artifact and event.artifact.type == "tool_result"
     )
     assert result == {"items": ("identity result",)}
+
+
+async def test_project_zip_workspace_write_uses_run_sandbox_for_harness_request() -> None:
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ProjectZipWorkspaceGateway(),
+        _project_zip_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(routing_decision={"sandbox_profile": "workspace_write"})
+        )
+    ]
+
+    assert len(harness.calls) == 1
+    _tenant_id, request = harness.calls[0]
+    assert request.tool_name == "project.generate_zip"
+    assert request.sandbox == "workspace_write"
+    started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
+    assert started.payload["sandbox"] == "workspace_write"
 
 
 async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
