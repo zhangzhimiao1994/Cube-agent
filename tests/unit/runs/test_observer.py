@@ -57,6 +57,29 @@ def test_monitor_emits_model_capability_routing_notice_without_raw_failure() -> 
     assert "harness_model_unavailable" not in repr(event.payload)
 
 
+def test_monitor_treats_planned_capability_unavailable_as_capability_routing() -> None:
+    run_id = uuid4()
+    monitor = RunMonitor()
+
+    decision = monitor.observe(
+        RunEvent(
+            kind=EventKind.STEP_FAILED,
+            sequence=2,
+            run_id=run_id,
+            step_id="tool_step",
+            actor="writer",
+            reason="planned capability is unavailable",
+            payload={"error_code": "capability.planned_unavailable"},
+        )
+    )
+
+    assert decision is not None
+    assert decision.trigger == "model_capability_routing_unavailable"
+    event = decision.to_event(run_id=run_id, sequence=3)
+    assert event.payload["recommendation"] == "reassign_tool_role_to_capable_model_and_retry"
+    assert "planned capability is unavailable" not in repr(event.payload)
+
+
 def test_monitor_emits_empty_model_response_notice_once() -> None:
     run_id = uuid4()
     monitor = RunMonitor()

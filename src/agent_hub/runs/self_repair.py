@@ -50,8 +50,10 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
 )
 _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
     {
+        "capability.planned_unavailable",
         "harness_model_unavailable",
         "model capability unavailable",
+        "planned capability is unavailable",
     }
 )
 _REPAIR_PROPOSAL_FIELDS = frozenset(

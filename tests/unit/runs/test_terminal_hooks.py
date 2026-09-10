@@ -1120,6 +1120,37 @@ def test_repair_classification_handles_model_capability_routing_failure() -> Non
     assert "model capability unavailable" not in repr(proposal)
 
 
+def test_repair_classification_handles_planned_capability_unavailable() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=2,
+                run_id=run_id,
+                step_id="tool_step",
+                actor="writer",
+                reason="planned capability is unavailable",
+                payload={"error_code": "capability.planned_unavailable"},
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "model_capability_routing_unavailable"
+    assert decision.recovery_strategy == "reassign_tool_role_to_capable_model_and_retry"
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["failure_kind"] == "model_capability_routing_unavailable"
+    assert proposal["recovery_strategy"] == "reassign_tool_role_to_capable_model_and_retry"
+    assert "planned capability is unavailable" not in repr(proposal)
+
+
 @pytest.mark.asyncio
 async def test_execute_records_empty_response_closure_when_runtime_raises() -> None:
     class RuntimeRaisesEmptyResponse:
