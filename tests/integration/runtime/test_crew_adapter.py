@@ -115,6 +115,8 @@ class FakeGateway:
             prompt = " ".join(cast(str, message.content) for message in request.messages)
             if "REVIEWER" in prompt:
                 text = self.reviews.pop(0) if self.reviews else '{"verdict":"approve"}'
+            elif request.response_schema is not None:
+                text = '{"summary":"safe result","findings":["safe"]}'
             else:
                 text = f"safe result {len(self.requests)}"
             return GatewayCompletion(
@@ -242,7 +244,13 @@ class FastFactory:
 
 def plan(*, review: bool = False, max_parallelism: int = 2) -> DispatchPlan:
     agents = (
-        AgentSpec(id="researcher", role="researcher", goal="Research", logical_model="general"),
+        AgentSpec(
+            id="researcher",
+            role="researcher",
+            goal="Research",
+            logical_model="general",
+            output_schema={"summary": "string", "findings": "string[]"},
+        ),
         AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
         AgentSpec(id="writer", role="writer", goal="Synthesize", logical_model="general"),
     )
@@ -299,7 +307,15 @@ def one_step_plan(*, tools: tuple[str, ...] = ()) -> DispatchPlan:
 
 
 def chain_plan(step_count: int, *, review: bool = False) -> DispatchPlan:
-    agents = [AgentSpec(id="writer", role="writer", goal="Write", logical_model="general")]
+    agents = [
+        AgentSpec(
+            id="writer",
+            role="writer",
+            goal="Write",
+            logical_model="general",
+            output_schema={"summary": "string", "findings": "string[]"},
+        )
+    ]
     if review:
         agents.append(AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"))
     return DispatchPlan(
