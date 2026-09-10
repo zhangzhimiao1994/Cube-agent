@@ -40,6 +40,7 @@ from agent_hub.api.routers.admin import (
     PersistentAdminResourceService,
     PluginArchiveManifest,
     PluginCapabilityRequest,
+    PluginPackageDependency,
     PluginPackageMetadata,
     PluginResourceRequest,
     PluginResourceResponse,
@@ -6847,14 +6848,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_dependencies(
         update={
             "package_metadata": current.package_metadata.model_copy(
                 update={
-                    "dependencies": (
-                        {
-                            "kind": "python",
-                            "source": "pypi",
-                            "name": "requests",
-                            "version": "2.32.0",
-                        },
-                    )
+                    "dependencies": (PluginPackageDependency(name="requests", version="2.32.0"),)
                 }
             )
         }
@@ -7011,6 +7005,90 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
     assert metadata["activation_state"] == "blocked_unsupported_runtime"
     assert metadata["activation_reason"] == (
         "runtime-registered adapter package requires a registered adapter descriptor"
+    )
+
+
+def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    current = service.plugins["calendar"]
+    assert current.package_metadata is not None
+    service.plugins["calendar"] = current.model_copy(
+        update={
+            "package_metadata": current.package_metadata.model_copy(
+                update={
+                    "dependencies": (PluginPackageDependency(name="requests", version="2.32.0"),)
+                }
+            )
+        }
+    )
+
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert metadata["activation_state"] == "blocked_unsupported_runtime"
+    assert metadata["activation_reason"] == (
+        "plugin package dependencies are not supported by this runtime"
     )
 
 
