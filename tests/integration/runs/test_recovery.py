@@ -445,6 +445,69 @@ async def test_recovery_ignores_harness_started_marker_before_first_checkpoint(
     assert checkpoint is None
 
 
+async def test_recovery_ignores_runtime_recovered_marker_after_checkpoint(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="resume after recovered marker",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision=None,
+        enqueue=False,
+    )
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="fake-dispatch",
+        runtime_version="1",
+        run_id=submitted.id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DISPATCH,
+        state={"phase": "running", "next_sequence": 2},
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=1,
+                run_id=submitted.id,
+                checkpoint=checkpoint,
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind="runtime.recovered",
+                sequence=2,
+                run_id=submitted.id,
+                payload={"checkpoint_id": str(checkpoint.id), "checkpoint_phase": "running"},
+            ),
+        )
+
+        claimed = await repository.claim_for_execution(
+            session,
+            submitted.id,
+            allow_running_recovery=True,
+        )
+
+    assert not isinstance(claimed, RunRecord)
+    row, restored_checkpoint = claimed
+    assert row.status == RunStatus.RUNNING.value
+    assert restored_checkpoint is not None
+    assert restored_checkpoint.id == checkpoint.id
+
+
 async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_window(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

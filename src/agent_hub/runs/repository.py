@@ -32,7 +32,7 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
 )
 
-_RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset({"harness.started"})
+_RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset({"harness.started", "runtime.recovered"})
 
 
 @dataclass(frozen=True, slots=True)
