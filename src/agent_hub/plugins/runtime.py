@@ -1102,6 +1102,8 @@ def build_plugin_package_subprocess_adapters(
         isolation_backend != "bubblewrap"
         or bubblewrap_executable is None
         or not bubblewrap_executable.is_absolute()
+        or not bubblewrap_executable.is_file()
+        or (os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK))
     ):
         return {}
     runner = PythonSubprocessPluginPackageRunner(

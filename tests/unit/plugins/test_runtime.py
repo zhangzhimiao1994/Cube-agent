@@ -1645,15 +1645,55 @@ def test_build_plugin_package_subprocess_adapters_requires_absolute_launcher(
     )
 
 
+def test_build_plugin_package_subprocess_adapters_requires_existing_launcher_file(
+    tmp_path: Path,
+) -> None:
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=tmp_path / "missing-bwrap",
+        )
+        == {}
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX executable bit only")
+def test_build_plugin_package_subprocess_adapters_requires_executable_launcher(
+    tmp_path: Path,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    bubblewrap_executable.chmod(0o644)
+
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        == {}
+    )
+
+
 def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
     tmp_path: Path,
 ) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    if os.name == "posix":
+        bubblewrap_executable.chmod(0o755)
+
     adapters = build_plugin_package_subprocess_adapters(
         enabled=True,
         adapter_ids=("calendar_python", "crm-python"),
         package_store_dir=tmp_path,
         isolation_backend="bubblewrap",
-        bubblewrap_executable=tmp_path / "bwrap",
+        bubblewrap_executable=bubblewrap_executable,
         timeout_seconds=1,
         max_stdout_bytes=1024,
     )
