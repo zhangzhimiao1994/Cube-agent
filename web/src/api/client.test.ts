@@ -285,6 +285,17 @@ describe("api client transport", () => {
             blocked_contract_count: 1,
             truncated: false,
           },
+          model_capability_negotiation_summary: {
+            role_count: 3,
+            satisfied_count: 1,
+            missing_count: 2,
+            unknown_count: 0,
+            missing_capability_counts: {
+              structured_output: 1,
+              tool_calling: 1,
+            },
+            truncated: true,
+          },
           runtime_recovery_summary: {
             recovery_count: 1,
             last_completed_steps: 2,
@@ -292,6 +303,13 @@ describe("api client transport", () => {
             model_status_counts: { failed: 1, succeeded: 2 },
             tool_status_counts: { running: 1 },
             review_artifacts: 1,
+          },
+          capability_execution_summary: {
+            permission_boundary: "runtime_capability_gateway",
+            role_count: 2,
+            capability_count: 3,
+            inventory_count: 4,
+            truncated: true,
           },
         }),
         {
@@ -325,6 +343,17 @@ describe("api client transport", () => {
       blocked_contract_count: 1,
       truncated: false,
     });
+    expect(run.model_capability_negotiation_summary).toEqual({
+      role_count: 3,
+      satisfied_count: 1,
+      missing_count: 2,
+      unknown_count: 0,
+      missing_capability_counts: {
+        structured_output: 1,
+        tool_calling: 1,
+      },
+      truncated: true,
+    });
     expect(run.runtime_recovery_summary).toEqual({
       recovery_count: 1,
       last_completed_steps: 2,
@@ -332,6 +361,13 @@ describe("api client transport", () => {
       model_status_counts: { failed: 1, succeeded: 2 },
       tool_status_counts: { running: 1 },
       review_artifacts: 1,
+    });
+    expect(run.capability_execution_summary).toEqual({
+      permission_boundary: "runtime_capability_gateway",
+      role_count: 2,
+      capability_count: 3,
+      inventory_count: 4,
+      truncated: true,
     });
   });
 

@@ -695,6 +695,16 @@ describe("RunDetailPage", () => {
         satisfied_count: 1,
         missing_count: 1,
         unknown_count: 1,
+        missing_capability_counts: {
+          tool_calling: 1,
+        },
+        truncated: true,
+      },
+      capability_execution_summary: {
+        permission_boundary: "runtime_capability_gateway",
+        role_count: 2,
+        capability_count: 3,
+        inventory_count: 4,
         truncated: true,
       },
       events: [
@@ -757,13 +767,15 @@ describe("RunDetailPage", () => {
 
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(within(summary).getByText("能力协商")).not.toBeNull();
-    expect(within(summary).getByText("3 个角色，满足 1，缺口 1，未知 1，已截断")).not.toBeNull();
+    expect(within(summary).getByText("3 个角色，满足 1，缺口 1，缺 tool_calling 1，未知 1，已截断")).not.toBeNull();
+    expect(within(summary).getByText("能力执行边界")).not.toBeNull();
+    expect(within(summary).getByText("2 个角色，3 项能力，库存 4，已截断")).not.toBeNull();
     expect(within(summary).getByText("已记录能力协商")).not.toBeNull();
     expect(screen.queryByText("sk_secret")).toBeNull();
     expect(screen.queryByText("token_leak")).toBeNull();
     expect(screen.queryByText("model-internal.example.invalid")).toBeNull();
     expect(screen.queryByText("tenant-private-quota")).toBeNull();
-    expect(screen.queryByText("tool_calling")).toBeNull();
+    expect(screen.queryByText("credential-private")).toBeNull();
   });
 
   it("keeps model outcome fallback posture when outcome and handoff summaries both exist", async () => {

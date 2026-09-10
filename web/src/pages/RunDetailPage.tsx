@@ -7,6 +7,15 @@ import { api, formatApiError, type RunDetail } from "../api/client";
 import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const MODEL_CAPABILITY_LABELS: Record<string, string> = {
+  text: "text",
+  tool_calling: "tool_calling",
+  structured_output: "structured_output",
+  vision: "vision",
+  image_generation: "image_generation",
+  video_generation: "video_generation",
+  audio_generation: "audio_generation",
+};
 const MANUAL_RUN_MODES = [
   { value: "direct", label: "直接执行", description: "让主 Agent 或指定角色直接回答。" },
   { value: "dispatch", label: "派单式", description: "拆分任务并分派给多个角色。" },
@@ -20,6 +29,7 @@ type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
 type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
 type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
+type ApiCapabilityExecutionSummary = RunDetail["capability_execution_summary"];
 type ApiRuntimeRecoverySummary = RunDetail["runtime_recovery_summary"];
 type OrchestrationHandoff = {
   sourceRoleId: string;
@@ -59,6 +69,15 @@ type ModelCapabilityNegotiationSummary = {
   satisfiedCount: number;
   missingCount: number;
   unknownCount: number;
+  missingCapabilityCounts: Record<string, number>;
+  missingCapabilityLabel: string;
+  truncated: boolean;
+};
+
+type CapabilityExecutionSummary = {
+  roleCount: number;
+  capabilityCount: number;
+  inventoryCount: number;
   truncated: boolean;
 };
 
@@ -1071,11 +1090,29 @@ function modelCapabilityNegotiationSummaryFromApi(
   summary: ApiModelCapabilityNegotiationSummary,
 ): ModelCapabilityNegotiationSummary | null {
   if (!summary || summary.role_count === 0) return null;
+  const missingCapabilityCounts = safeModelCapabilityCounts(summary.missing_capability_counts);
   return {
     roleCount: summary.role_count,
     satisfiedCount: summary.satisfied_count,
     missingCount: summary.missing_count,
     unknownCount: summary.unknown_count,
+    missingCapabilityCounts,
+    missingCapabilityLabel: modelCapabilityCountsLabel(missingCapabilityCounts),
+    truncated: summary.truncated,
+  };
+}
+
+function capabilityExecutionSummaryFromApi(
+  summary: ApiCapabilityExecutionSummary,
+): CapabilityExecutionSummary | null {
+  if (!summary || summary.permission_boundary !== "runtime_capability_gateway") return null;
+  if (summary.role_count === 0 && summary.capability_count === 0 && summary.inventory_count === 0) {
+    return null;
+  }
+  return {
+    roleCount: summary.role_count,
+    capabilityCount: summary.capability_count,
+    inventoryCount: summary.inventory_count,
     truncated: summary.truncated,
   };
 }
@@ -1194,13 +1231,42 @@ function orchestrationProtocolLabel(summary: OrchestrationProtocolSummary) {
   return parts.join("，");
 }
 
+function safeModelCapabilityCounts(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const counts: Record<string, number> = {};
+  Object.entries(value as Record<string, unknown>).forEach(([capability, count]) => {
+    if (!MODEL_CAPABILITY_LABELS[capability]) return;
+    if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) return;
+    counts[capability] = count;
+  });
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function modelCapabilityCountsLabel(counts: Record<string, number>) {
+  const parts = Object.entries(counts)
+    .filter(([, count]) => count > 0)
+    .map(([capability, count]) => `${MODEL_CAPABILITY_LABELS[capability]} ${count}`);
+  return parts.join("，");
+}
+
 function modelCapabilityNegotiationLabel(summary: ModelCapabilityNegotiationSummary) {
   const parts = [
     `${summary.roleCount} 个角色`,
     `满足 ${summary.satisfiedCount}`,
     `缺口 ${summary.missingCount}`,
   ];
+  if (summary.missingCapabilityLabel) parts.push(`缺 ${summary.missingCapabilityLabel}`);
   if (summary.unknownCount > 0) parts.push(`未知 ${summary.unknownCount}`);
+  if (summary.truncated) parts.push("已截断");
+  return parts.join("，");
+}
+
+function capabilityExecutionLabel(summary: CapabilityExecutionSummary) {
+  const parts = [
+    `${summary.roleCount} 个角色`,
+    `${summary.capabilityCount} 项能力`,
+    `库存 ${summary.inventoryCount}`,
+  ];
   if (summary.truncated) parts.push("已截断");
   return parts.join("，");
 }
@@ -2022,6 +2088,9 @@ export function RunDetailPage() {
   const capabilityNegotiationSummary = modelCapabilityNegotiationSummaryFromApi(
     orderedRunData.model_capability_negotiation_summary,
   );
+  const capabilityExecutionSummary = capabilityExecutionSummaryFromApi(
+    orderedRunData.capability_execution_summary,
+  );
   const runtimeRecoverySummary = runtimeRecoverySummaryFromApi(
     orderedRunData.runtime_recovery_summary,
   );
@@ -2072,6 +2141,7 @@ export function RunDetailPage() {
       contractSummary ||
       protocolSummary ||
       capabilityNegotiationSummary ||
+      capabilityExecutionSummary ||
       runtimeRecoverySummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
@@ -2090,7 +2160,9 @@ export function RunDetailPage() {
                       ? "已记录协议"
                       : capabilityNegotiationSummary
                         ? "已记录能力协商"
-                        : "已恢复续跑"}
+                        : capabilityExecutionSummary
+                          ? "已记录能力边界"
+                          : "已恢复续跑"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -2132,6 +2204,12 @@ export function RunDetailPage() {
               <li>
                 <span>能力协商</span>
                 <strong>{modelCapabilityNegotiationLabel(capabilityNegotiationSummary)}</strong>
+              </li>
+            ) : null}
+            {capabilityExecutionSummary ? (
+              <li>
+                <span>能力执行边界</span>
+                <strong>{capabilityExecutionLabel(capabilityExecutionSummary)}</strong>
               </li>
             ) : null}
             {runtimeRecoverySummary ? (

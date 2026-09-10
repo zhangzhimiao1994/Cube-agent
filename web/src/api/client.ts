@@ -753,6 +753,15 @@ const ModelCapabilityNegotiationSummarySchema = z.object({
   satisfied_count: z.number().int().nonnegative().default(0),
   missing_count: z.number().int().nonnegative().default(0),
   unknown_count: z.number().int().nonnegative().default(0),
+  missing_capability_counts: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  truncated: z.boolean().default(false),
+});
+
+const CapabilityExecutionSummarySchema = z.object({
+  permission_boundary: z.literal("runtime_capability_gateway"),
+  role_count: z.number().int().nonnegative().default(0),
+  capability_count: z.number().int().nonnegative().default(0),
+  inventory_count: z.number().int().nonnegative().default(0),
   truncated: z.boolean().default(false),
 });
 
@@ -783,6 +792,10 @@ const RunDetailSchema = RunListItemSchema.extend({
   model_capability_negotiation_summary: z.preprocess(
     (value) => value ?? null,
     ModelCapabilityNegotiationSummarySchema.nullable(),
+  ).optional(),
+  capability_execution_summary: z.preprocess(
+    (value) => value ?? null,
+    CapabilityExecutionSummarySchema.nullable(),
   ).optional(),
   runtime_recovery_summary: z.preprocess(
     (value) => value ?? null,

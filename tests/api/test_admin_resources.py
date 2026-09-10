@@ -746,6 +746,40 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                 "unknown_count": 0,
                                 "truncated": True,
                             },
+                            "capability_execution_plan": {
+                                "schema_version": 1,
+                                "permission_boundary": "runtime_capability_gateway",
+                                "role_capability_assignments": (
+                                    {
+                                        "role_id": "copywriter",
+                                        "capabilities": (
+                                            {
+                                                "name": "read_context",
+                                                "replay_safe": True,
+                                                "approval_policy": "not_required",
+                                            },
+                                            {
+                                                "name": "docx-private",
+                                                "replay_safe": False,
+                                                "approval_policy": "runtime_policy",
+                                                "credential_ref": "credential-private",
+                                            },
+                                        ),
+                                    },
+                                    {
+                                        "role_id": "final_synthesizer",
+                                        "capabilities": (),
+                                    },
+                                ),
+                                "capability_inventory": {
+                                    "schema_version": 1,
+                                    "items": (
+                                        {"id": "docx-private"},
+                                        {"id": "filesystem.read_file"},
+                                    ),
+                                    "truncated": True,
+                                },
+                            },
                             "quota_scope_id": "tenant-private-quota",
                             "credential_ref": "credential-private",
                             "api_base": "https://internal.example.invalid",
@@ -820,6 +854,17 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         "satisfied_count": 1,
         "missing_count": 2,
         "unknown_count": 0,
+        "missing_capability_counts": {
+            "structured_output": 1,
+            "tool_calling": 1,
+        },
+        "truncated": True,
+    }
+    assert body["capability_execution_summary"] == {
+        "permission_boundary": "runtime_capability_gateway",
+        "role_count": 2,
+        "capability_count": 2,
+        "inventory_count": 2,
         "truncated": True,
     }
     serialized = json.dumps(body, ensure_ascii=False)

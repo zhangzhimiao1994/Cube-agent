@@ -415,6 +415,17 @@ class ModelCapabilityNegotiationSummaryResponse(BaseModel):
     satisfied_count: int = Field(default=0, ge=0)
     missing_count: int = Field(default=0, ge=0)
     unknown_count: int = Field(default=0, ge=0)
+    missing_capability_counts: dict[str, int] = Field(default_factory=dict, max_length=8)
+    truncated: bool = False
+
+
+class CapabilityExecutionSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    permission_boundary: Literal["runtime_capability_gateway"]
+    role_count: int = Field(default=0, ge=0)
+    capability_count: int = Field(default=0, ge=0)
+    inventory_count: int = Field(default=0, ge=0)
     truncated: bool = False
 
 
@@ -443,6 +454,7 @@ class RunDetailResponse(RunListItem):
     model_capability_negotiation_summary: (
         ModelCapabilityNegotiationSummaryResponse | None
     ) = None
+    capability_execution_summary: CapabilityExecutionSummaryResponse | None = None
     runtime_recovery_summary: RuntimeRecoverySummaryResponse | None = None
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
@@ -463,6 +475,9 @@ class RunDetailResponse(RunListItem):
         )
         self.model_capability_negotiation_summary = (
             _model_capability_negotiation_summary_from_run_events(self.events)
+        )
+        self.capability_execution_summary = _capability_execution_summary_from_run_events(
+            self.events
         )
         self.runtime_recovery_summary = _runtime_recovery_summary_from_run_events(
             self.events
@@ -9318,12 +9333,83 @@ def _model_capability_negotiation_summary_from_run_events(
         or unknown_count is None
     ):
         return None
+    missing_capability_counts: dict[str, int] = {}
+    raw_items = latest.get("items")
+    if isinstance(raw_items, list | tuple):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, Mapping):
+                continue
+            for raw_capability in _model_outcome_string_list(
+                raw_item.get("missing_capabilities")
+            ):
+                capability = _safe_model_capability_value(raw_capability)
+                if capability is None:
+                    continue
+                missing_capability_counts[capability] = (
+                    missing_capability_counts.get(capability, 0) + 1
+                )
     return ModelCapabilityNegotiationSummaryResponse(
         role_count=role_count,
         satisfied_count=satisfied_count,
         missing_count=missing_count,
         unknown_count=unknown_count,
+        missing_capability_counts=dict(sorted(missing_capability_counts.items())),
         truncated=latest.get("truncated") is True,
+    )
+
+
+def _capability_execution_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> CapabilityExecutionSummaryResponse | None:
+    latest: Mapping[str, object] | None = None
+    for event in sorted(events, key=lambda item: item.sequence):
+        plan = event.payload.get("capability_execution_plan")
+        if isinstance(plan, Mapping):
+            latest = cast(Mapping[str, object], plan)
+            continue
+        model_plan = event.payload.get("model_execution_plan")
+        if isinstance(model_plan, Mapping):
+            nested_plan = model_plan.get("capability_execution_plan")
+            if isinstance(nested_plan, Mapping):
+                latest = cast(Mapping[str, object], nested_plan)
+
+    if latest is None:
+        return None
+    if latest.get("permission_boundary") != "runtime_capability_gateway":
+        return None
+    role_count = 0
+    capability_count = 0
+    assignments = latest.get("role_capability_assignments")
+    if isinstance(assignments, list | tuple):
+        for assignment in assignments:
+            if not isinstance(assignment, Mapping):
+                continue
+            role_count += 1
+            capabilities = assignment.get("capabilities")
+            if not isinstance(capabilities, list | tuple):
+                continue
+            for capability in capabilities:
+                if not isinstance(capability, Mapping):
+                    continue
+                capability_count += 1
+
+    inventory_count = 0
+    inventory_truncated = False
+    inventory = latest.get("capability_inventory")
+    if isinstance(inventory, Mapping):
+        inventory_items = inventory.get("items")
+        if isinstance(inventory_items, list | tuple):
+            inventory_count = len(inventory_items)
+        inventory_truncated = inventory.get("truncated") is True
+
+    if role_count == 0 and capability_count == 0 and inventory_count == 0:
+        return None
+    return CapabilityExecutionSummaryResponse(
+        permission_boundary="runtime_capability_gateway",
+        role_count=role_count,
+        capability_count=capability_count,
+        inventory_count=inventory_count,
+        truncated=latest.get("truncated") is True or inventory_truncated,
     )
 
 
@@ -9380,6 +9466,16 @@ def _runtime_recovery_status_counts(value: object) -> dict[str, int]:
 def _orchestration_protocol_id(value: object) -> str | None:
     protocol = _model_outcome_string(value)
     return protocol if protocol == "role_handoff_contract_v1" else None
+
+
+def _safe_model_capability_value(value: object) -> str | None:
+    text = _model_outcome_string(value)
+    if text is None:
+        return None
+    try:
+        return ModelCapability(text).value
+    except ValueError:
+        return None
 
 
 def _orchestration_protocol_int(value: object) -> int | None:
