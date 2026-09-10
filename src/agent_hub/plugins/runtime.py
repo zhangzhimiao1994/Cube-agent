@@ -1209,6 +1209,8 @@ def _plugin_package_subprocess_registration_status(
         return "launcher_path_not_absolute"
     if not bubblewrap_executable.is_file():
         return "launcher_not_found"
+    if os.name != "posix":
+        return "unsupported_isolation_backend"
     if os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK):
         return "launcher_not_executable"
     return "ready"

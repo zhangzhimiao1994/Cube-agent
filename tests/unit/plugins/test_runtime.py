@@ -1916,11 +1916,11 @@ def test_plugin_package_subprocess_registration_status_reports_relative_launcher
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bubblewrap registration is POSIX-only")
 def test_plugin_package_subprocess_registration_status_reports_ready(tmp_path: Path) -> None:
     bubblewrap_executable = tmp_path / "bwrap"
     bubblewrap_executable.write_text("")
-    if os.name == "posix":
-        bubblewrap_executable.chmod(0o755)
+    bubblewrap_executable.chmod(0o755)
 
     assert (
         _plugin_package_subprocess_registration_status(
@@ -1930,6 +1930,25 @@ def test_plugin_package_subprocess_registration_status_reports_ready(tmp_path: P
             bubblewrap_executable=bubblewrap_executable,
         )
         == "ready"
+    )
+
+
+def test_plugin_package_subprocess_registration_status_rejects_bubblewrap_on_non_posix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.name", "nt")
+
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        == "unsupported_isolation_backend"
     )
 
 
@@ -2031,13 +2050,13 @@ def test_build_plugin_package_subprocess_adapters_requires_executable_launcher(
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bubblewrap registration is POSIX-only")
 def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
     tmp_path: Path,
 ) -> None:
     bubblewrap_executable = tmp_path / "bwrap"
     bubblewrap_executable.write_text("")
-    if os.name == "posix":
-        bubblewrap_executable.chmod(0o755)
+    bubblewrap_executable.chmod(0o755)
 
     adapters = build_plugin_package_subprocess_adapters(
         enabled=True,
