@@ -587,11 +587,20 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
         captured["plugin_service_kwargs"] = kwargs
         return FakeRuntimeService()
 
+    def fake_build_plugin_package_subprocess_adapters(**kwargs: object) -> dict[str, object]:
+        captured["plugin_package_adapter_kwargs"] = kwargs
+        return {"calendar_python": object()}
+
     monkeypatch.setattr(app_module, "build_runtime_mcp_service", fake_build_runtime_mcp_service)
     monkeypatch.setattr(
         app_module,
         "build_runtime_plugin_service",
         fake_build_runtime_plugin_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_plugin_package_subprocess_adapters",
+        fake_build_plugin_package_subprocess_adapters,
     )
     monkeypatch.setattr(
         app_module,
@@ -607,6 +616,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
             plugin_package_subprocess_runner_enabled=True,
             plugin_package_subprocess_adapter_ids=["calendar_python"],
             plugin_package_subprocess_timeout_seconds=1,
+            plugin_package_subprocess_max_stdin_bytes=2048,
             plugin_package_subprocess_max_stdout_bytes=1024,
         ),
         database=FakeDatabase(),
@@ -623,9 +633,14 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
 
     plugin_kwargs = cast(dict[str, object], captured["plugin_service_kwargs"])
     adapters = cast(dict[str, Any], plugin_kwargs["adapters"])
+    adapter_kwargs = cast(dict[str, object], captured["plugin_package_adapter_kwargs"])
 
     assert tuple(adapters) == ("calendar_python",)
-    assert adapters["calendar_python"].descriptor()["id"] == "calendar_python"
+    assert adapter_kwargs["enabled"] is True
+    assert adapter_kwargs["adapter_ids"] == ("calendar_python",)
+    assert adapter_kwargs["timeout_seconds"] == 1
+    assert adapter_kwargs["max_stdin_bytes"] == 2048
+    assert adapter_kwargs["max_stdout_bytes"] == 1024
 
 
 def test_create_app_publishes_runtime_invalidation_after_admin_reload(

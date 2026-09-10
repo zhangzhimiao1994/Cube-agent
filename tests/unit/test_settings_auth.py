@@ -187,6 +187,14 @@ def test_plugin_package_subprocess_runner_defaults_to_disabled() -> None:
 
     assert settings.plugin_package_subprocess_runner_enabled is False
     assert settings.plugin_package_subprocess_adapter_ids == frozenset()
+    assert settings.plugin_package_subprocess_max_stdin_bytes == 262_144
+    assert settings.plugin_package_subprocess_max_stdout_bytes == 262_144
+
+
+@pytest.mark.parametrize("value", [0, 1_048_577])
+def test_plugin_package_subprocess_stdin_limit_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"plugin_package_subprocess_max_stdin_bytes": value})
 
 
 @pytest.mark.parametrize(

@@ -235,11 +235,13 @@ class PythonSubprocessPluginPackageRunner:
         *,
         python_executable: str | None = None,
         timeout_seconds: float = 10,
+        max_stdin_bytes: int = 262_144,
         max_stdout_bytes: int = 262_144,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         self._python_executable = sys.executable if python_executable is None else python_executable
         self._timeout_seconds = max(0.001, timeout_seconds)
+        self._max_stdin_bytes = max(1, max_stdin_bytes)
         self._max_stdout_bytes = max(1, max_stdout_bytes)
         self._environment = _minimal_python_subprocess_environment(environment)
 
@@ -265,6 +267,8 @@ class PythonSubprocessPluginPackageRunner:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        if len(payload) > self._max_stdin_bytes:
+            raise RuntimeCapabilityError("Plugin request is too large")
         try:
             process = await asyncio.create_subprocess_exec(
                 self._python_executable,
@@ -1000,6 +1004,7 @@ def build_plugin_package_subprocess_adapters(
     package_store_dir: Path,
     python_executable: str | None = None,
     timeout_seconds: float = 10.0,
+    max_stdin_bytes: int = 262_144,
     max_stdout_bytes: int = 262_144,
 ) -> dict[str, PluginAdapter]:
     if not enabled:
@@ -1009,6 +1014,7 @@ def build_plugin_package_subprocess_adapters(
     runner = PythonSubprocessPluginPackageRunner(
         python_executable=python_executable,
         timeout_seconds=timeout_seconds,
+        max_stdin_bytes=max_stdin_bytes,
         max_stdout_bytes=max_stdout_bytes,
     )
     return {

@@ -277,6 +277,9 @@ def build_worker_service(
             timeout_seconds=float(
                 getattr(settings, "plugin_package_subprocess_timeout_seconds", 10.0)
             ),
+            max_stdin_bytes=int(
+                getattr(settings, "plugin_package_subprocess_max_stdin_bytes", 262_144)
+            ),
             max_stdout_bytes=int(
                 getattr(settings, "plugin_package_subprocess_max_stdout_bytes", 262_144)
             ),

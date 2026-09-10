@@ -973,6 +973,9 @@ def create_app(
                             timeout_seconds=(
                                 configured.plugin_package_subprocess_timeout_seconds
                             ),
+                            max_stdin_bytes=(
+                                configured.plugin_package_subprocess_max_stdin_bytes
+                            ),
                             max_stdout_bytes=(
                                 configured.plugin_package_subprocess_max_stdout_bytes
                             ),

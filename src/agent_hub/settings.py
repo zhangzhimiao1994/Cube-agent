@@ -58,6 +58,11 @@ class Settings(BaseSettings):
         max_length=32,
     )
     plugin_package_subprocess_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
+    plugin_package_subprocess_max_stdin_bytes: int = Field(
+        default=262_144,
+        ge=1,
+        le=1_048_576,
+    )
     plugin_package_subprocess_max_stdout_bytes: int = Field(
         default=262_144,
         ge=1,

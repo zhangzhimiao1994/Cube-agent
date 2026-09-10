@@ -262,6 +262,7 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         plugin_package_subprocess_runner_enabled = True
         plugin_package_subprocess_adapter_ids = frozenset({"calendar_python"})
         plugin_package_subprocess_timeout_seconds = 1
+        plugin_package_subprocess_max_stdin_bytes = 2048
         plugin_package_subprocess_max_stdout_bytes = 1024
 
         def database_url_value(self) -> str:
@@ -284,6 +285,10 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         runtime_gateway = object()
         harness_tool_gateway = object()
 
+    def fake_build_plugin_package_subprocess_adapters(**kwargs: object) -> dict[str, object]:
+        captured["plugin_package_adapter_kwargs"] = kwargs
+        return {"calendar_python": object()}
+
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
@@ -298,6 +303,11 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
     monkeypatch.setattr(worker, "RuntimePluginService", FakeRuntimeService)
     monkeypatch.setattr(
         worker,
+        "build_plugin_package_subprocess_adapters",
+        fake_build_plugin_package_subprocess_adapters,
+    )
+    monkeypatch.setattr(
+        worker,
         "build_runtime_capability_stack",
         lambda **kwargs: FakeRuntimeStack(),
     )
@@ -306,9 +316,14 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
 
     plugin_service = cast(dict[str, object], captured["plugin_service"])
     adapters = cast(dict[str, Any], plugin_service["adapters"])
+    adapter_kwargs = cast(dict[str, object], captured["plugin_package_adapter_kwargs"])
 
     assert tuple(adapters) == ("calendar_python",)
-    assert adapters["calendar_python"].descriptor()["id"] == "calendar_python"
+    assert adapter_kwargs["enabled"] is True
+    assert adapter_kwargs["adapter_ids"] == ("calendar_python",)
+    assert adapter_kwargs["timeout_seconds"] == 1
+    assert adapter_kwargs["max_stdin_bytes"] == 2048
+    assert adapter_kwargs["max_stdout_bytes"] == 1024
 
 
 def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> None:

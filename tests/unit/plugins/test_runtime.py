@@ -1519,6 +1519,48 @@ async def test_python_subprocess_plugin_package_runner_discards_stderr(
     assert result == {"ok": True}
 
 
+async def test_python_subprocess_plugin_package_runner_rejects_oversized_stdin_before_spawn(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "started.txt"
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started')\n"
+        "import json\n"
+        "import sys\n"
+        "json.load(sys.stdin)\n"
+        "json.dump({'ok': True}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+        max_stdin_bytes=128,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin request is too large"):
+        await runner.invoke(
+            target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+            plugin=plugin("calendar", adapter="calendar_python"),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="in_process",
+            ),
+            arguments={"title": "x" * 512},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert not marker.exists()
+
+
 def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
     tmp_path: Path,
 ) -> None:
