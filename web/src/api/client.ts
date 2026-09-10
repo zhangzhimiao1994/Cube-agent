@@ -260,6 +260,7 @@ const SystemSettingsSchema = z.object({
   channel_entry: z.string(),
   attachment_retention_days: z.number(),
   attachment_max_mb: z.number(),
+  plugin_package_subprocess_registration_status: z.string().nullable().default(null),
 });
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;

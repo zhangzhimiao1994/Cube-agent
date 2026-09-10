@@ -96,6 +96,7 @@ from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVide
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.plugins.runtime import (
+    _plugin_package_subprocess_registration_status,
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
 )
@@ -961,6 +962,25 @@ def create_app(
                                 RuntimeConfigInvalidationTarget.MCP,
                             )
                         )
+                    plugin_package_subprocess_registration_status = (
+                        _plugin_package_subprocess_registration_status(
+                            enabled=(
+                                configured.plugin_package_subprocess_runner_enabled
+                            ),
+                            adapter_ids=tuple(
+                                configured.plugin_package_subprocess_adapter_ids
+                            ),
+                            isolation_backend=(
+                                configured.plugin_package_subprocess_isolation_backend
+                            ),
+                            bubblewrap_executable=(
+                                configured.plugin_package_subprocess_bubblewrap_executable
+                            ),
+                        )
+                    )
+                    application.state.plugin_package_subprocess_registration_status = (
+                        plugin_package_subprocess_registration_status
+                    )
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,

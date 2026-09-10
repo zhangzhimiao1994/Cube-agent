@@ -1455,7 +1455,21 @@ class SystemSettingsRequest(BaseModel):
 
 
 class SystemSettingsResponse(SystemSettingsRequest):
-    pass
+    plugin_package_subprocess_registration_status: str | None = None
+
+
+_PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
+    {
+        "disabled",
+        "no_adapter_ids",
+        "unsupported_isolation_backend",
+        "missing_isolation_launcher",
+        "launcher_path_not_absolute",
+        "launcher_not_found",
+        "launcher_not_executable",
+        "ready",
+    }
+)
 
 
 def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str, object]:
@@ -1463,6 +1477,22 @@ def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str,
     if migrated.get("tool_approval_mode") not in {"ask", "auto_review"}:
         migrated["tool_approval_mode"] = "ask"
     return migrated
+
+
+def _settings_with_runtime_status(
+    settings: SystemSettingsResponse,
+    request: Request,
+) -> SystemSettingsResponse:
+    status = getattr(
+        request.app.state,
+        "plugin_package_subprocess_registration_status",
+        None,
+    )
+    if status not in _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES:
+        status = None
+    return settings.model_copy(
+        update={"plugin_package_subprocess_registration_status": status}
+    )
 
 
 class OpenClawOperationRequest(BaseModel):
@@ -11447,11 +11477,12 @@ async def delete_workflow(
     "/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422)
 )
 async def get_settings(
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> SystemSettingsResponse:
     _require(principal, "config:read")
-    return await service.get_settings()
+    return _settings_with_runtime_status(await service.get_settings(), request)
 
 
 @router.put(
@@ -11459,11 +11490,12 @@ async def get_settings(
 )
 async def update_settings(
     body: SystemSettingsRequest,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
-    return await service.update_settings(body)
+    return _settings_with_runtime_status(await service.update_settings(body), request)
 
 
 @router.post(

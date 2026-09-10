@@ -276,14 +276,27 @@ def test_system_settings_default_openclaw_is_disabled() -> None:
 
     assert settings.vibe_coding_enabled is False
     assert settings.openclaw_enabled is False
+    assert settings.plugin_package_subprocess_registration_status is None
     assert settings.tool_approval_mode == "auto_review"
     assert settings.openclaw_mode == "ask"
     assert settings.openclaw_allowed_commands == []
     assert settings.model_dump()["vibe_coding_enabled"] is False
     assert settings.model_dump()["openclaw_enabled"] is False
+    assert settings.model_dump()["plugin_package_subprocess_registration_status"] is None
     assert settings.model_dump()["tool_approval_mode"] == "auto_review"
     assert settings.model_dump()["openclaw_mode"] == "ask"
     assert settings.model_dump()["openclaw_allowed_commands"] == []
+
+
+def test_settings_response_projects_plugin_package_subprocess_registration_status() -> None:
+    api = client()
+    cast(Any, api.app).state.plugin_package_subprocess_registration_status = (
+        "launcher_not_found"
+    )
+
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+
+    assert payload["plugin_package_subprocess_registration_status"] == "launcher_not_found"
 
 
 @pytest.mark.asyncio

@@ -77,6 +77,46 @@ describe("api client transport", () => {
     const settings = await api.settings();
 
     expect(settings.tool_approval_mode).toBe("ask");
+    expect(settings.plugin_package_subprocess_registration_status).toBeNull();
+  });
+
+  it("parses plugin package subprocess registration status on settings responses", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          default_mode: "auto",
+          default_workflow_id: null,
+          default_agent_ids: [],
+          log_level: "warning",
+          hermes_enabled: true,
+          safe_tools_enabled: true,
+          require_approval_for_tools: true,
+          tool_approval_mode: "auto_review",
+          allow_main_agent_override: false,
+          allow_temporary_agents: false,
+          vibe_coding_enabled: false,
+          multimedia_generation_enabled: false,
+          openclaw_enabled: false,
+          openclaw_mode: "ask",
+          openclaw_allowed_commands: [],
+          openclaw_remote_adapters: [],
+          temporary_agent_policy: "policy",
+          channel_entry: "web",
+          attachment_retention_days: 7,
+          attachment_max_mb: 25,
+          plugin_package_subprocess_registration_status: "launcher_not_found",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = await api.settings();
+
+    expect(settings.plugin_package_subprocess_registration_status).toBe("launcher_not_found");
   });
 
   it("preserves nested model execution plans on run detail events", async () => {
