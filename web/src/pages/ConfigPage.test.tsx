@@ -34,6 +34,7 @@ const settings = {
   attachment_max_mb: 25,
   plugin_package_subprocess_registration_status: "launcher_not_found",
 };
+let currentSettings = { ...settings };
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
@@ -52,6 +53,7 @@ describe("ConfigPage", () => {
     requests.length = 0;
     openClawSessions = [];
     lastOpenClawOperationBody = {};
+    currentSettings = { ...settings };
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -66,7 +68,7 @@ describe("ConfigPage", () => {
         }
         if (path === "/api/v1/admin/settings") {
           if (method === "PUT") return jsonResponse(JSON.parse(String(init?.body)));
-          return jsonResponse(settings);
+          return jsonResponse(currentSettings);
         }
         if (path === "/api/v1/admin/openclaw/operations" && method === "POST") {
           const body = JSON.parse(String(init?.body));
@@ -324,6 +326,26 @@ describe("ConfigPage", () => {
 
     expect(await screen.findByText("本地进程插件")).not.toBeNull();
     expect(screen.getByText("启动器文件不可用，未注册本地进程适配器。")).not.toBeNull();
+  });
+
+  it.each([
+    ["ready", "隔离启动器就绪，可注册本地进程适配器。"],
+    ["disabled", "本地进程插件运行器未启用。"],
+    ["no_adapter_ids", "未配置本地进程适配器白名单。"],
+    ["unsupported_isolation_backend", "隔离后端未启用 bubblewrap。"],
+    ["missing_isolation_launcher", "未配置隔离启动器。"],
+    ["launcher_path_not_absolute", "启动器路径不是绝对路径。"],
+    ["launcher_not_found", "启动器文件不可用，未注册本地进程适配器。"],
+    ["launcher_not_executable", "启动器不可执行，未注册本地进程适配器。"],
+  ])("renders package subprocess registration status %s", async (status, text) => {
+    currentSettings = {
+      ...settings,
+      plugin_package_subprocess_registration_status: status,
+    };
+
+    render(<TestApp initialPath="/config" />);
+
+    expect(await screen.findByText(text)).not.toBeNull();
   });
 
   it("keeps advanced JSON publishing available with detailed parse errors", async () => {
