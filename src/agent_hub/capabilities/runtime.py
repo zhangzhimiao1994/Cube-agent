@@ -132,6 +132,9 @@ class RuntimeCapabilityGateway:
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
+        manifest_builtin_name = _manifest_builtin_name(normalized_name)
+        if manifest_builtin_name is not None:
+            return self._builtin_availability_reason(manifest_builtin_name) is None
         if normalized_name in _REPLAY_SAFE:
             return True
         if self._tool_registry is not None and _manifest_available(
@@ -675,6 +678,15 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
 
 def _normalize_tool_name(name: str) -> str:
     return _BUILTIN_ALIASES.get(name, name)
+
+
+def _manifest_builtin_name(name: str) -> str | None:
+    if name in _MANIFEST_BUILTINS:
+        return name
+    for builtin_name, alias in _BUILTIN_ALIASES.items():
+        if name == alias:
+            return builtin_name
+    return None
 
 
 def _builtin_aliases(name: str) -> tuple[str, ...]:

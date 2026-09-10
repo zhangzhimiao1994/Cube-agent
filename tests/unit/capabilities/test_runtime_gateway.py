@@ -593,6 +593,21 @@ async def test_runtime_gateway_invokes_installed_skill_through_sandbox(tmp_path:
     assert sandbox.invocations[0].input["arguments"] == {"task": "draft"}
 
 
+def test_runtime_gateway_is_available_matches_builtin_manifest_availability(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
+
+    assert gateway.is_available(TENANT_ID, "calculator.evaluate") is True
+    assert gateway.is_available(TENANT_ID, "calculator") is True
+    assert gateway.is_available(TENANT_ID, "read_context") is True
+    assert gateway.is_available(TENANT_ID, "document.generate_docx") is False
+    assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is False
+    assert gateway.is_available(TENANT_ID, "project.generate_zip") is False
+    assert gateway.is_available(TENANT_ID, "workspace.read") is False
+    assert gateway.is_available(TENANT_ID, "workspace_read") is False
+
+
 def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
     tmp_path: Path,
 ) -> None:
