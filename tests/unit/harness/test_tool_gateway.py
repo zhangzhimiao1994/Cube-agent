@@ -381,6 +381,23 @@ def project_zip_create_request() -> HarnessToolCallRequest:
     )
 
 
+def project_zip_workspace_write_request(*, sandbox: str = "workspace_write") -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="engineer",
+        tool_name="project.generate_zip",
+        arguments={
+            "title": "Hello World",
+            "project_id": "project-main",
+            "workspace_session_id": "session-main",
+            "files": {"main.py": "print('hello')\n"},
+        },
+        approval_required=False,
+        sandbox=sandbox,
+        idempotency_key="project_zip_workspace_1",
+    )
+
+
 async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     gateway = HarnessToolGateway(runtime)
@@ -818,6 +835,24 @@ async def test_harness_tool_gateway_maps_project_zip_to_file_create_policy() -> 
     assert capability_request.operation == "create"
     assert capability_request.resource == "generated/project.generate_zip"
     assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_rejects_project_zip_workspace_write_outside_workspace_sandbox() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        project_zip_workspace_write_request(sandbox="read_only"),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "workspace write requires workspace_write sandbox"
+    assert runtime.calls == []
+    assert policy.requests == []
 
 
 async def test_harness_tool_gateway_denies_before_runtime_execute() -> None:

@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
 import pytest
 
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.service import _submitted
 from agent_hub.runs.workspace import workspace_selection
+
+TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
+ACTOR_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
 def test_workspace_selection_normalizes_project_and_session_segments() -> None:
@@ -60,3 +69,46 @@ def test_workspace_selection_requires_explicit_network_permission() -> None:
     )
 
     assert selection.requested_permissions == ("workspace.read", "workspace.write", "network.read")
+
+
+def test_submitted_projection_reconciles_persisted_permissions_with_sandbox_profile() -> None:
+    submitted = _submitted(
+        RunRecord(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            request="inspect workspace",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.QUEUED,
+            version=1,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "sandbox_profile": "read_only",
+                "requested_permissions": ["workspace.write", "workspace.read"],
+            },
+        )
+    )
+
+    assert submitted.sandbox_profile == "read_only"
+    assert submitted.requested_permissions == ("workspace.read",)
+
+
+def test_submitted_projection_drops_unknown_persisted_permissions_without_profile() -> None:
+    submitted = _submitted(
+        RunRecord(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            request="inspect workspace",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.QUEUED,
+            version=1,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "requested_permissions": ["workspace.read", "credential.dump"],
+            },
+        )
+    )
+
+    assert submitted.sandbox_profile is None
+    assert submitted.requested_permissions == ("workspace.read",)

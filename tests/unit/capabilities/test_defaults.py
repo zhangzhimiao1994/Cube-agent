@@ -859,6 +859,31 @@ async def test_generated_file_scope_approval_reuses_run_level_tool_consent() -> 
     assert first_request.run_id == second_request.run_id
 
 
+async def test_generated_file_scope_approval_does_not_authorize_workspace_side_effect_target() -> None:
+    repository = ScopeApprovedRepository()
+    repository.approved_scopes.add(GENERATED_ZIP_SCOPE)
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        require_approval_for_tools=approval_required,
+    )
+
+    result = await gateway.invoke(
+        capability_request(
+            agent_id="reviewer",
+            arguments={
+                "filename": "final.zip",
+                "project_id": "project-main",
+                "workspace_session_id": "session-main",
+            },
+        ),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.WAITING_APPROVAL
+    assert repository.pending_approvals == 1
+
+
 async def test_generated_file_scope_approval_does_not_authorize_other_tools_or_runs() -> None:
     repository = ScopeApprovedRepository()
     repository.approved_scopes.add(GENERATED_ZIP_SCOPE)

@@ -328,6 +328,9 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
         or not normalized_resource.startswith("generated/")
     ):
         return None
+    workspace_scope = _workspace_side_effect_scope(request, normalized_resource)
+    if workspace_scope is not None:
+        return workspace_scope
     return (
         "capability-scope:v1:"
         f"tenant={request.tenant_id}:"
@@ -337,6 +340,37 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
         f"operation={request.operation}:"
         f"resource={normalized_resource}"
     )
+
+
+def _workspace_side_effect_scope(
+    request: CapabilityRequest,
+    normalized_resource: str,
+) -> str | None:
+    if normalized_resource != "generated/project.generate_zip":
+        return None
+    project_id = _nonblank_argument(request, "project_id")
+    workspace_session_id = _nonblank_argument(request, "workspace_session_id")
+    if project_id is None or workspace_session_id is None:
+        return None
+    return (
+        "capability-scope:v1:"
+        f"tenant={request.tenant_id}:"
+        f"user={request.user_id}:"
+        f"run={request.run_id}:"
+        f"capability={request.capability}:"
+        f"operation={request.operation}:"
+        f"resource={normalized_resource}:"
+        f"project_id={project_id}:"
+        f"workspace_session_id={workspace_session_id}"
+    )
+
+
+def _nonblank_argument(request: CapabilityRequest, name: str) -> str | None:
+    value = request.arguments.get(name)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _fingerprint_request(request: CapabilityRequest) -> str:

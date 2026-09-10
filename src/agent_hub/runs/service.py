@@ -38,7 +38,7 @@ from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
     classify_terminal_run,
 )
-from agent_hub.runs.workspace import DEFAULT_PROJECT_ID, workspace_selection
+from agent_hub.runs.workspace import DEFAULT_PROJECT_ID, REQUESTED_PERMISSIONS, workspace_selection
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
@@ -2251,12 +2251,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     evolution_proposal = decision.get("evolution_proposal")
     openclaw_proposal = decision.get("openclaw_proposal")
     repair_proposal = decision.get("repair_proposal")
-    requested_permissions_value = decision.get("requested_permissions")
-    requested_permissions = (
-        tuple(item for item in requested_permissions_value if isinstance(item, str))
-        if isinstance(requested_permissions_value, list | tuple)
-        else ()
-    )
+    sandbox_profile, requested_permissions = _safe_submitted_workspace_policy(decision)
     waiting_for_decision = record.status in {
         RunStatus.WAITING_USER_MODE,
         RunStatus.WAITING_APPROVAL,
@@ -2284,7 +2279,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         workspace_session_id=_string_or_none(decision.get("workspace_session_id")),
         workspace_session_path=_string_or_none(decision.get("workspace_session_path")),
         workspace_artifacts_path=_string_or_none(decision.get("workspace_artifacts_path")),
-        sandbox_profile=_string_or_none(decision.get("sandbox_profile")),
+        sandbox_profile=sandbox_profile,
         requested_permissions=requested_permissions,
         temporary_agent_proposal=cast(dict[str, object], proposal)
         if isinstance(proposal, dict)
@@ -2301,6 +2296,45 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         repair_proposal=cast(dict[str, object], repair_proposal)
         if isinstance(repair_proposal, dict)
         else None,
+    )
+
+
+def _safe_submitted_workspace_policy(
+    decision: Mapping[str, object],
+) -> tuple[str | None, tuple[str, ...]]:
+    sandbox_profile = _string_or_none(decision.get("sandbox_profile"))
+    requested_permissions = _requested_permissions_from_routing_decision(decision)
+    if sandbox_profile is None:
+        return None, requested_permissions
+    try:
+        selection = workspace_selection(
+            project_id=None,
+            session_id=None,
+            sandbox_profile=sandbox_profile,
+            requested_permissions=requested_permissions,
+        )
+    except ValueError:
+        try:
+            selection = workspace_selection(
+                project_id=None,
+                session_id=None,
+                sandbox_profile=sandbox_profile,
+            )
+        except ValueError:
+            return None, ()
+    return selection.sandbox_profile, selection.requested_permissions
+
+
+def _requested_permissions_from_routing_decision(
+    decision: Mapping[str, object],
+) -> tuple[str, ...]:
+    requested_permissions_value = decision.get("requested_permissions")
+    if not isinstance(requested_permissions_value, list | tuple):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item for item in requested_permissions_value if isinstance(item, str) and item in REQUESTED_PERMISSIONS
+        )
     )
 
 

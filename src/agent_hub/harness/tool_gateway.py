@@ -101,6 +101,9 @@ class HarnessToolGateway:
     ) -> HarnessToolCallResult:
         if not isinstance(request, HarnessToolCallRequest):
             raise TypeError("request must be HarnessToolCallRequest")
+        sandbox_failure = _workspace_write_sandbox_failure(request)
+        if sandbox_failure is not None:
+            return self._failure(request, sandbox_failure)
         if request.approval_required and self._policy_gateway is None:
             return self._failure(request, "approval required")
         await self._prepare_external_backends(tenant_id)
@@ -339,6 +342,27 @@ def _plugin_declared_capability_parts(
 
 
 _SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+
+
+def _workspace_write_sandbox_failure(request: HarnessToolCallRequest) -> str | None:
+    if not _has_project_workspace_write_side_effect(request):
+        return None
+    if request.sandbox == "workspace_write":
+        return None
+    return "workspace write requires workspace_write sandbox"
+
+
+def _has_project_workspace_write_side_effect(request: HarnessToolCallRequest) -> bool:
+    return (
+        request.tool_name == "project.generate_zip"
+        and _nonblank_argument(request, "project_id")
+        and _nonblank_argument(request, "workspace_session_id")
+    )
+
+
+def _nonblank_argument(request: HarnessToolCallRequest, name: str) -> bool:
+    value = request.arguments.get(name)
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _capability_parts(request: HarnessToolCallRequest) -> CapabilityPolicyParts:
