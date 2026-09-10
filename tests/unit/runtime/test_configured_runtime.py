@@ -1822,6 +1822,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
             "purpose": "execute",
             "logical_model": "creative",
             "tools": (),
+            "has_output_schema": True,
         },
         {
             "id": "final_synthesizer",
@@ -1829,6 +1830,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
             "purpose": "synthesize",
             "logical_model": "main",
             "tools": (),
+            "has_output_schema": False,
         },
     )
     assert events[0].payload["steps"] == (
@@ -2084,6 +2086,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             "purpose": "execute",
             "logical_model": "creative",
             "tools": (),
+            "has_output_schema": True,
         },
         {
             "id": "final_synthesizer",
@@ -2091,6 +2094,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             "purpose": "synthesize",
             "logical_model": "main",
             "tools": (),
+            "has_output_schema": False,
         },
     )
     assert {deployment.provider_model for deployment in capacities[0].deployments} == {
@@ -3637,6 +3641,41 @@ def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids()
         "final_synthesizer",
     ]
     assert plan.max_parallelism == 1
+
+
+def test_dispatch_role_payload_reports_schema_presence_without_field_names() -> None:
+    plan = _dispatch_plan(
+        (
+            RoleAssignment(
+                id="writer",
+                role="Writer",
+                purpose=RolePurpose.EXECUTE,
+                mission="Write structured output.",
+                must_answer=("What changed?",),
+                allowed_tools=(),
+                forbidden_actions=("Do not perform dangerous operations.",),
+                skills=(),
+                output_schema={"summary": "string", "secret_token": "string"},
+                model="main",
+            ),
+        ),
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Write a summary.",
+        ),
+    )
+
+    payload = defaults_module._dispatch_role_payload(plan)
+
+    writer = next(item for item in payload if item["id"] == "writer")
+    final = next(item for item in payload if item["id"] == "final_synthesizer")
+    assert writer["has_output_schema"] is True
+    assert final["has_output_schema"] is False
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "summary" not in serialized
+    assert "secret_token" not in serialized
 
 
 def test_dispatch_plan_runs_review_roles_after_producer_roles() -> None:

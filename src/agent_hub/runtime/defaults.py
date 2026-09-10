@@ -1209,6 +1209,7 @@ def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue],
             "purpose": step_purposes.get(agent.id, "execute"),
             "logical_model": agent.logical_model,
             "tools": agent.allowed_tools,
+            "has_output_schema": bool(agent.output_schema),
         }
         for agent in plan.agents
     )
@@ -2015,7 +2016,10 @@ def _required_model_capabilities_for_role(
     role: Mapping[str, JsonValue],
 ) -> tuple[ModelCapability, ...]:
     required = [ModelCapability.TEXT]
-    if role.get("purpose") != "synthesize":
+    has_output_schema = role.get("has_output_schema")
+    if (isinstance(has_output_schema, bool) and has_output_schema) or (
+        not isinstance(has_output_schema, bool) and role.get("purpose") != "synthesize"
+    ):
         required.append(ModelCapability.STRUCTURED_OUTPUT)
     tools = role.get("tools")
     if isinstance(tools, tuple | list) and tools:
