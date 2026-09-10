@@ -238,6 +238,19 @@ def test_runtime_failure_diagnostic_classifies_replay_safe_capability_failure_as
     assert "压缩输入" in suggested_action
 
 
+def test_runtime_failure_diagnostic_classifies_planned_capability_unavailable() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason("planned capability is unavailable")
+
+    assert diagnostic["error_summary"] == "planned capability is unavailable"
+    assert diagnostic["error_stage"] == "capability"
+    assert diagnostic["error_category"] == "planned_capability_unavailable"
+    assert diagnostic["error_code"] == "capability.planned_unavailable"
+    assert diagnostic["retryable"] is False
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "重新加载" in suggested_action
+    assert "重新规划" in suggested_action
+
+
 def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_non_retryable() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("capability outcome requires confirmation")
 

@@ -150,6 +150,19 @@ def runtime_failure_diagnostic_from_reason(
             ),
             status_code=status_code,
         )
+    if lowered == "planned capability is unavailable":
+        return _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="planned_capability_unavailable",
+            error_code="capability.planned_unavailable",
+            retryable=False,
+            suggested_action=(
+                "计划中的工具能力在执行前已经不可用；请重新加载插件/MCP 能力清单，"
+                "重新规划角色工具边界，或切换到仍可用的能力后再重试。"
+            ),
+            status_code=status_code,
+        )
     if lowered == "capability outcome requires confirmation":
         return _base_diagnostic(
             normalized,
