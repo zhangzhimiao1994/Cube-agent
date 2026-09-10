@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agent_hub.domain.runs import RunStatus
 from agent_hub.recovery_metadata import (
+    ORCHESTRATION_CONTRACT_RECOVERY_HINT,
     SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
@@ -9,6 +10,10 @@ from agent_hub.recovery_metadata import (
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runs.service import _self_repair_execution_payload
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+
+
+def test_orchestration_contract_recovery_hint_is_safe_for_self_repair() -> None:
+    assert ORCHESTRATION_CONTRACT_RECOVERY_HINT in SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS
 
 
 def test_safe_recovery_metadata_allowlists_stay_consistent_across_boundaries() -> None:

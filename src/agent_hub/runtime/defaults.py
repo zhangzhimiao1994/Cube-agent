@@ -41,6 +41,7 @@ from agent_hub.models.routing_policy import (
     fallback_execution_policy_from_decision,
 )
 from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
@@ -118,7 +119,6 @@ _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
 _MAX_ORCHESTRATION_HANDOFFS = 12
 _ORCHESTRATION_CONTRACT_READY_STATUS = "done"
 _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES = ("blocked", "needs_user")
-_ORCHESTRATION_CONTRACT_RECOVERY_HINT = "retry_blocked_contract_chain"
 _ORCHESTRATION_PROTOCOL_ID = "role_handoff_contract_v1"
 _DISPATCH_OUTPUT_SCHEMA_ID = "dispatch_output_v1"
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -1892,7 +1892,7 @@ def _orchestration_contracts_payload(
             "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
             "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
             "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
-            "recovery_hint": _ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+            "recovery_hint": ORCHESTRATION_CONTRACT_RECOVERY_HINT,
         }
         for handoff in handoffs
     ]
@@ -1919,7 +1919,7 @@ def _orchestration_protocol_payload(
         )
     }
     recovery_hints = (
-        (_ORCHESTRATION_CONTRACT_RECOVERY_HINT,)
+        (ORCHESTRATION_CONTRACT_RECOVERY_HINT,)
         if handoffs
         else ()
     )
