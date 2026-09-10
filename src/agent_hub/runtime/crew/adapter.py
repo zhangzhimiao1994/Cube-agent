@@ -875,6 +875,21 @@ class _CapabilityHarnessBackend:
         )
 
 
+def _unavailable_step_tools(
+    capability_gateway: object,
+    tenant_id: UUID,
+    tools: Sequence[str],
+) -> tuple[str, ...]:
+    is_available = getattr(capability_gateway, "is_available", None)
+    if not callable(is_available):
+        return ()
+    unavailable: list[str] = []
+    for name in tools:
+        if not bool(is_available(tenant_id, name)):
+            unavailable.append(name)
+    return tuple(unavailable)
+
+
 class CapabilityOutcomeUncertain(RuntimeExecutionError):
     """A restricted capability may have committed but cannot be confirmed."""
 
@@ -2663,6 +2678,13 @@ class CrewDispatchRuntime:
         messages = list(self._normalize_crewai_messages(crew_messages))
         tool_mapping = _tool_name_mapping(step.tools)
         request_tools = _tool_definitions(step.tools)
+        unavailable_tools = _unavailable_step_tools(
+            self._capabilities,
+            context.tenant_id,
+            step.tools,
+        )
+        if unavailable_tools:
+            _fail("planned capability is unavailable")
         response_schema = _agent_response_schema(agent)
         required_capabilities = {ModelCapability.TEXT}
         if request_tools:

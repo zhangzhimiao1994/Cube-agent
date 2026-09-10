@@ -149,6 +149,16 @@ class FakeCapabilities:
         return name == "web.search"
 
 
+class UnavailableCapabilities(FakeCapabilities):
+    def __init__(self) -> None:
+        super().__init__()
+        self.availability_checks: list[tuple[UUID, str]] = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.availability_checks.append((tenant_id, name))
+        return False
+
+
 class RaisingCapabilities(FakeCapabilities):
     async def execute(
         self,
@@ -944,6 +954,24 @@ async def test_step_failed_reports_blocked_orchestration_contracts() -> None:
     assert draft_failed.payload["orchestration_protocol"] == "role_handoff_contract_v1"
     assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
     assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+
+
+async def test_unavailable_planned_capability_fails_before_model_call() -> None:
+    gateway = RoleAwareGateway()
+    capabilities = UnavailableCapabilities()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _tool_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="planned capability is unavailable"):
+        await _collect(runtime)
+
+    assert capabilities.availability_checks == [(TENANT_ID, "web.search")]
+    assert gateway.requests == []
+    assert capabilities.calls == []
 
 
 async def test_dependent_structured_role_output_must_match_handoff_schema() -> None:
