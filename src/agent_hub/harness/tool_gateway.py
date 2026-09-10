@@ -113,6 +113,14 @@ class HarnessToolGateway:
             if mcp_backend is not None
             else self._available_plugin_backend(tenant_id, request.tool_name)
         )
+        sandbox_mismatch = _external_sandbox_mismatch(
+            tenant_id,
+            request,
+            mcp_backend=mcp_backend,
+            plugin_backend=plugin_backend,
+        )
+        if sandbox_mismatch is not None:
+            return self._failure(request, sandbox_mismatch)
         if (mcp_backend is not None or plugin_backend is not None) and self._policy_gateway is None:
             return self._failure(request, "capability identity unavailable")
         authorization_failure = await self._authorize(
@@ -311,6 +319,37 @@ def _external_capability_parts(
             return declared
         return _plugin_capability_parts(request)
     return None
+
+
+def _external_sandbox_mismatch(
+    tenant_id: UUID,
+    request: HarnessToolCallRequest,
+    *,
+    mcp_backend: McpToolBackend | None,
+    plugin_backend: PluginToolBackend | None,
+) -> str | None:
+    backend: object | None = mcp_backend if mcp_backend is not None else plugin_backend
+    if backend is None:
+        return None
+    declared = _declared_sandbox_profile(backend, tenant_id, request.tool_name)
+    if declared is None:
+        return None
+    if declared == request.sandbox:
+        return None
+    return "tool sandbox does not match declared sandbox profile"
+
+
+def _declared_sandbox_profile(backend: object, tenant_id: UUID, tool_name: str) -> str | None:
+    sandbox_profile = getattr(backend, "sandbox_profile", None)
+    if not callable(sandbox_profile):
+        return None
+    try:
+        value = sandbox_profile(tenant_id, tool_name)
+    except Exception:  # noqa: BLE001 - sandbox declaration lookup must fail closed.
+        return "unavailable"
+    if not isinstance(value, str) or not value.strip():
+        return "unavailable"
+    return value
 
 
 def _plugin_declared_capability_parts(

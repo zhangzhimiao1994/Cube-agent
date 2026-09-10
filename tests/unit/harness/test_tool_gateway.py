@@ -161,6 +161,18 @@ class PolicyPartsPluginToolBackend(FakePluginToolBackend):
         return "calendar", "write", "plugin/calendar/calendar/create_event"
 
 
+class SandboxProfilePluginToolBackend(FakePluginToolBackend):
+    def sandbox_profile(self, tenant_id: UUID, name: str) -> str:
+        self.calls.append(
+            (
+                "sandbox_profile",
+                {"tenant_id": str(tenant_id), "name": name},
+                "",
+            )
+        )
+        return "remote_connector"
+
+
 class FailingAvailabilityMcpToolBackend(FakeMcpToolBackend):
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         del tenant_id, name
@@ -297,6 +309,7 @@ def plugin_request(
     *,
     approval_required: bool = False,
     arguments: Mapping[str, JsonValue] | None = None,
+    sandbox: str = "remote_connector",
 ) -> HarnessToolCallRequest:
     return HarnessToolCallRequest(
         run_id=RUN_ID,
@@ -304,7 +317,7 @@ def plugin_request(
         tool_name="calendar.create_event",
         arguments={"title": "Mofang review"} if arguments is None else arguments,
         approval_required=approval_required,
-        sandbox="remote_connector",
+        sandbox=sandbox,
         idempotency_key="plugin_1",
     )
 
@@ -668,6 +681,30 @@ async def test_harness_tool_gateway_reports_plugin_validation_error_without_raw_
     assert result.failure_reason == "Plugin arguments do not match input schema: invalid type"
     assert "do-not-leak" not in repr(result)
     assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_rejects_plugin_when_envelope_sandbox_mismatches_declared_profile() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = SandboxProfilePluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(sandbox="read_only"),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "tool sandbox does not match declared sandbox profile"
+    assert [call[0] for call in plugin_backend.calls] == ["available", "sandbox_profile"]
+    assert policy.requests == []
     assert runtime.calls == []
 
 
