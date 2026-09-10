@@ -237,7 +237,7 @@ def _plugin_availability_reason(plugin: PluginConfig) -> str:
     if not plugin.enabled:
         return "plugin_disabled"
     if _plugin_package_blocks_activation(plugin):
-        return "plugin_package_not_eligible"
+        return _plugin_package_activation_reason(plugin)
     if plugin.status == "running" and plugin.health != "healthy":
         return "plugin_unhealthy"
     if plugin.status in {"stopped", "disabled", "failed"}:
@@ -260,6 +260,14 @@ def _plugin_package_blocks_activation(plugin: PluginConfig) -> bool:
         getattr(package, "kind", None) == "adapter_package"
         and getattr(package, "activation_state", None) != "eligible"
     )
+
+
+def _plugin_package_activation_reason(plugin: PluginConfig) -> str:
+    package = getattr(plugin, "package_metadata", None)
+    reason = getattr(package, "activation_reason", None)
+    if type(reason) is str and reason.strip():
+        return reason
+    return "plugin_package_not_eligible"
 
 
 def _source_manifest_items(

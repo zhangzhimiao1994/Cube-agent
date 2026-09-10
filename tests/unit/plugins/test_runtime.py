@@ -2019,7 +2019,7 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
     assert service.is_available(TENANT_ID, "calendar.create_event") is False
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "plugin_package_not_eligible"
+        "package signature has not been verified by the server"
     )
     with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
         await service.invoke(
@@ -2086,7 +2086,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_dependen
     assert service.is_available(TENANT_ID, "calendar.create_event") is False
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "plugin_package_not_eligible"
+        "plugin package dependencies are not supported by this runtime"
     )
     with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
         await service.invoke(
@@ -2142,7 +2142,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_without_
     assert service.is_available(TENANT_ID, "calendar.create_event") is False
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "plugin_package_not_eligible"
+        "runtime-registered adapter package requires a registered adapter"
     )
     with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
         await service.invoke(
@@ -2407,7 +2407,7 @@ async def test_runtime_plugin_service_marks_cached_expired_signature_trust_unava
     assert service.capability_policy_rules(TENANT_ID) == ()
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "plugin_package_not_eligible"
+        "package signature key is not trusted for this tenant"
     )
 
 
