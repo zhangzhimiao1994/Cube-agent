@@ -494,6 +494,7 @@ async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> Non
             provider_model="deepseek/chat",
             secret_ref=f"secret://deepseek-{index}",
             quota_scope_id="shared-deepseek",
+            capabilities=frozenset({ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
         )
         for index in range(2)
     )
