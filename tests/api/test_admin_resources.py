@@ -6938,6 +6938,92 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
     )
 
 
+def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    current = service.plugins["calendar"]
+    assert current.package_metadata is not None
+    service.plugins["calendar"] = current.model_copy(
+        update={
+            "package_metadata": current.package_metadata.model_copy(
+                update={
+                    "dependencies": (PluginPackageDependency(name="requests", version="2.32.0"),)
+                }
+            )
+        }
+    )
+
+    manifest = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+    capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert manifest.status_code == 200
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
+
+
 def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None:
     class CalendarPluginService:
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
