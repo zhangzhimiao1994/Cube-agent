@@ -546,6 +546,13 @@ class RuntimePluginService:
         plugin, capability = target
         return _plugin_capability_policy_parts(plugin, capability)
 
+    def sandbox_profile(self, tenant_id: UUID, name: str) -> str | None:
+        target = self._available_plugin_capability(tenant_id, name)
+        if target is None:
+            return None
+        _plugin, capability = target
+        return capability.sandbox_profile
+
     def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]:
         plugins = self._plugins_for_tenant(tenant_id)
         if plugins is None:

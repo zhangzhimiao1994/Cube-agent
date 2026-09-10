@@ -22,9 +22,12 @@ from agent_hub.api.routers.admin import (
     PluginResourceResponse,
 )
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import PolicyEffect
+from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.plugins.contracts import (
     adapter_descriptor_with_contract,
     http_json_adapter_descriptor,
@@ -82,6 +85,40 @@ class FakeAdminService:
         }
         self.audit_events.append(event)
         return event
+
+
+class AllowingPolicyGateway:
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def invoke(self, request: Any, *, role: Role) -> CapabilityResult:
+        del role
+        self.requests += 1
+        return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+
+
+class UnavailableRuntimeCapabilityGateway:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        del tenant_id, name
+        self.calls.append("available")
+        return False
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        self.calls.append("execute")
+        return {}
 
 
 class TenantMappedPluginAdminService(FakeAdminService):
@@ -3080,6 +3117,43 @@ async def test_runtime_plugin_service_resolves_aliases_to_canonical_plugin_polic
         "use",
         "plugin/calendar/create_event",
     )
+
+
+async def test_runtime_stack_rejects_plugin_envelope_sandbox_mismatch_from_runtime_service() -> None:
+    adapter = RecordingPluginAdapter([])
+    plugin_service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar"),)),
+        adapters={"plugin_runtime": adapter},
+    )
+    runtime = UnavailableRuntimeCapabilityGateway()
+    policy = AllowingPolicyGateway()
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_service,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=TENANT_ID,
+            actor="scheduler",
+            tool_name="calendar.create_event",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="read_only",
+            idempotency_key="plugin_1",
+        ),
+        user_id=TENANT_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "tool sandbox does not match declared sandbox profile"
+    assert adapter.calls == []
+    assert policy.requests == 0
+    assert runtime.calls == []
 
 
 async def test_runtime_plugin_service_exposes_explicit_policy_effect_rules() -> None:
