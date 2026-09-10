@@ -189,6 +189,8 @@ class RuntimeConfigInvalidationBus:
             count=max_stream_replay_messages,
             block=0,
         )
+        seen_event_ids: set[str] = set()
+        seen_event_order: deque[str] = deque()
         for stream, entries in _stream_read_entries(raw_entries):
             acked: list[str] = []
             for entry_id, fields in entries:
@@ -199,8 +201,8 @@ class RuntimeConfigInvalidationBus:
                     {"type": "message", "data": payload},
                     mcp_runtime=mcp_runtime,
                     plugin_runtime=plugin_runtime,
-                    seen_event_ids=set(),
-                    seen_event_order=deque(),
+                    seen_event_ids=seen_event_ids,
+                    seen_event_order=seen_event_order,
                 )
                 if handled:
                     acked.append(entry_id)

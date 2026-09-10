@@ -195,6 +195,39 @@ async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsu
 
 
 @pytest.mark.asyncio
+async def test_runtime_invalidation_listener_deduplicates_stream_replay_event_ids() -> None:
+    payload = json.dumps(
+        {
+            "event_id": "event-1",
+            "source_instance_id": "api-2",
+            "tenant_id": str(OTHER_TENANT_ID),
+            "target": "plugin",
+        }
+    )
+    redis = FakeRedis()
+    redis.stream_replay_entries = [
+        ("1-0", {"payload": payload}),
+        ("2-0", {"payload": payload}),
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0", "2-0"))]
+
+
+@pytest.mark.asyncio
 async def test_runtime_invalidation_listener_keeps_legacy_messages_replayable() -> None:
     redis = FakeRedis(
         [
