@@ -1284,7 +1284,15 @@ async def test_approved_capability_resume_fails_safe_when_non_replayable_event_a
                 kind=EventKind.TOOL_COMPLETED,
                 sequence=2,
                 run_id=submitted.id,
-                payload={"tool": "external.message", "result": "sent"},
+                actor="operator",
+                tool_call_id="tool_call_1",
+                tool_name="external_message",
+                payload={
+                    "status": "completed",
+                    "operation_kind": "external_message",
+                    "replay_safe": False,
+                    "output_bytes": 4,
+                },
             ),
         )
     approval_id = "approval-after-checkpoint"
