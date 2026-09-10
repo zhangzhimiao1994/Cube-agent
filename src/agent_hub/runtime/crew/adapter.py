@@ -1144,6 +1144,36 @@ class _ReviewLedger:
     artifacts: dict[str, Artifact] = field(default_factory=dict)
 
 
+def _ledger_status_counts(
+    states: Mapping[str, Mapping[str, JsonValue]],
+) -> dict[str, JsonValue]:
+    counts: dict[str, int] = {}
+    for state in states.values():
+        status = state.get("status")
+        if type(status) is str:
+            counts[status] = counts.get(status, 0) + 1
+    return cast(dict[str, JsonValue], {key: counts[key] for key in sorted(counts)})
+
+
+def _checkpoint_recovery_payload(
+    checkpoint: RuntimeCheckpoint,
+    plan: DispatchPlan,
+    completed: Mapping[str, Artifact],
+    tool_ledger: _ToolLedger,
+    model_ledger: _ModelLedger,
+    review_ledger: _ReviewLedger,
+) -> Mapping[str, JsonValue]:
+    return {
+        "checkpoint_id": str(checkpoint.id),
+        "checkpoint_phase": cast(str, checkpoint.state["phase"]),
+        "completed_steps": len(completed),
+        "total_steps": len(plan.steps),
+        "model_status_counts": _ledger_status_counts(model_ledger.states),
+        "tool_status_counts": _ledger_status_counts(tool_ledger.states),
+        "review_artifacts": len(review_ledger.artifacts),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _RunToken:
     generation: int
@@ -1398,6 +1428,18 @@ class CrewDispatchRuntime:
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
+                if restored_phase == "running":
+                    await emit(
+                        kind="runtime.recovered",
+                        payload=_checkpoint_recovery_payload(
+                            restored,
+                            plan,
+                            completed,
+                            tool_ledger,
+                            model_ledger,
+                            review_ledger,
+                        ),
+                    )
                 if restored_phase == "completed":
                     await emit(
                         kind=EventKind.RUNTIME_COMPLETED,

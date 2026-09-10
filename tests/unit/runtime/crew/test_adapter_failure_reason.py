@@ -1688,6 +1688,15 @@ async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -
 
     events = [event async for event in restored.run(_context(checkpoint=failed_checkpoint))]
 
+    recovered = next(event for event in events if event.kind == "runtime.recovered")
+    assert events[0].kind == "runtime.recovered"
+    assert recovered.payload["checkpoint_id"] == str(failed_checkpoint.id)
+    assert recovered.payload["checkpoint_phase"] == "running"
+    assert recovered.payload["completed_steps"] == 0
+    assert recovered.payload["total_steps"] == 1
+    assert recovered.payload["model_status_counts"] == {"failed": 1}
+    assert recovered.payload["tool_status_counts"] == {}
+    assert recovered.payload["review_artifacts"] == 0
     retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
     assert retrying.actor == "writer"
     assert retrying.payload["error_code"] == "model.empty_response"
