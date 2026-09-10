@@ -18,6 +18,7 @@ class FakeRedis:
         self.stream_entries: list[tuple[str, dict[str, str], int | None, bool]] = []
         self.stream_replay_entries: list[tuple[str, dict[str, str]]] = []
         self.stream_replay_batches: list[list[tuple[str, dict[str, str]]]] = []
+        self.stream_replay_pending_batches: list[list[tuple[str, dict[str, str]]]] = []
         self.consumer_groups_created: list[tuple[str, str, str, bool]] = []
         self.stream_reads: list[tuple[str, str, dict[str, str], int | None]] = []
         self.acked: list[tuple[str, str, tuple[str, ...]]] = []
@@ -60,6 +61,8 @@ class FakeRedis:
     ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
         del block
         self.stream_reads.append((groupname, consumername, streams, count))
+        if streams == {"runtime:test:stream": "0"} and self.stream_replay_pending_batches:
+            return [("runtime:test:stream", self.stream_replay_pending_batches.pop(0))]
         if self.stream_replay_batches:
             return [("runtime:test:stream", self.stream_replay_batches.pop(0))]
         return [("runtime:test:stream", self.stream_replay_entries[: count or None])]
@@ -107,6 +110,11 @@ class FlakyRuntime(Runtime):
             self.failures_remaining -= 1
             raise RuntimeError("temporary reload failure")
         await super().reload(tenant_id)
+
+
+class FailingRuntime(Runtime):
+    async def reload(self, tenant_id: UUID | None = None) -> None:
+        raise RuntimeError("permanent reload failure")
 
 
 @pytest.mark.asyncio
@@ -356,7 +364,7 @@ async def test_runtime_invalidation_listener_does_not_ack_failed_stream_replay()
         stream="runtime:test:stream",
         source_instance_id="worker-1",
     )
-    plugin_runtime = FlakyRuntime()
+    plugin_runtime = FailingRuntime()
 
     await bus.listen(
         plugin_runtime=plugin_runtime,
@@ -366,6 +374,60 @@ async def test_runtime_invalidation_listener_does_not_ack_failed_stream_replay()
 
     assert plugin_runtime.reloaded == []
     assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_retries_failed_pending_stream_replay_before_pubsub() -> None:
+    plugin_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-1",
+                "source_instance_id": "api-2",
+                "tenant_id": str(OTHER_TENANT_ID),
+                "target": "plugin",
+            }
+        )
+    }
+    mcp_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-2",
+                "source_instance_id": "api-2",
+                "tenant_id": str(TENANT_ID),
+                "target": "mcp",
+            }
+        )
+    }
+    redis = FakeRedis()
+    redis.stream_replay_batches = [[("1-0", plugin_payload), ("2-0", mcp_payload)]]
+    redis.stream_replay_pending_batches = [[("1-0", plugin_payload)]]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = FlakyRuntime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+        max_stream_replay_messages=128,
+    )
+
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert mcp_runtime.reloaded == [TENANT_ID]
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
+    ]
+    assert redis.acked == [
+        ("runtime:test:stream", "worker-runtime-1", ("2-0",)),
+        ("runtime:test:stream", "worker-runtime-1", ("1-0",)),
+    ]
 
 
 @pytest.mark.asyncio
