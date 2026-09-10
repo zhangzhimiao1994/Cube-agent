@@ -741,11 +741,13 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     assert bus.listen_kwargs["plugin_runtime"] is application.state.plugin_service
     assert str(bus.listen_kwargs["stream_consumer_group"]).startswith("api-")
     assert str(bus.listen_kwargs["stream_consumer_name"]).startswith("api-")
+    assert bus.listen_kwargs["reload_on_empty_stream_replay"] is True
     assert set(bus.listen_kwargs) == {
         "mcp_runtime",
         "plugin_runtime",
         "stream_consumer_group",
         "stream_consumer_name",
+        "reload_on_empty_stream_replay",
     }
 
 

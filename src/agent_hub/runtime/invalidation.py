@@ -120,15 +120,23 @@ class RuntimeConfigInvalidationBus:
         stream_consumer_group: str | None = None,
         stream_consumer_name: str | None = None,
         max_stream_replay_messages: int = 128,
+        reload_on_empty_stream_replay: bool = False,
     ) -> None:
         if stream_consumer_group is not None:
-            await self._replay_stream(
+            replayed = await self._replay_stream(
                 mcp_runtime=mcp_runtime,
                 plugin_runtime=plugin_runtime,
                 stream_consumer_group=stream_consumer_group,
                 stream_consumer_name=stream_consumer_name,
                 max_stream_replay_messages=max_stream_replay_messages,
             )
+            if not replayed and reload_on_empty_stream_replay:
+                await self._reload_target(
+                    None,
+                    RuntimeConfigInvalidationTarget.ALL,
+                    mcp_runtime=mcp_runtime,
+                    plugin_runtime=plugin_runtime,
+                )
         pubsub = self._redis.pubsub()
         handled = 0
         seen_event_ids: set[str] = set()
@@ -160,9 +168,9 @@ class RuntimeConfigInvalidationBus:
         stream_consumer_group: str,
         stream_consumer_name: str | None,
         max_stream_replay_messages: int,
-    ) -> None:
+    ) -> bool:
         if self._stream is None:
-            return
+            return False
         if _optional_safe_identifier(stream_consumer_group) is None:
             raise ValueError("stream_consumer_group must be a safe identifier")
         consumer_name = stream_consumer_name or self._source_instance_id
@@ -182,32 +190,40 @@ class RuntimeConfigInvalidationBus:
                 "runtime_config_invalidation_stream_group_create_skipped error_type=%s",
                 type(error).__name__,
             )
-        raw_entries = await self._redis.xreadgroup(
-            stream_consumer_group,
-            consumer_name,
-            {self._stream: ">"},
-            count=max_stream_replay_messages,
-            block=0,
-        )
         seen_event_ids: set[str] = set()
         seen_event_order: deque[str] = deque()
-        for stream, entries in _stream_read_entries(raw_entries):
-            acked: list[str] = []
-            for entry_id, fields in entries:
-                payload = fields.get("payload")
-                if payload is None:
-                    continue
-                handled = await self._handle_message(
-                    {"type": "message", "data": payload},
-                    mcp_runtime=mcp_runtime,
-                    plugin_runtime=plugin_runtime,
-                    seen_event_ids=seen_event_ids,
-                    seen_event_order=seen_event_order,
-                )
-                if handled:
-                    acked.append(entry_id)
-            if acked:
-                await self._redis.xack(stream, stream_consumer_group, *acked)
+        replayed = False
+        while True:
+            raw_entries = await self._redis.xreadgroup(
+                stream_consumer_group,
+                consumer_name,
+                {self._stream: ">"},
+                count=max_stream_replay_messages,
+                block=0,
+            )
+            entries_read = 0
+            for stream, entries in _stream_read_entries(raw_entries):
+                entries_read += len(entries)
+                acked: list[str] = []
+                for entry_id, fields in entries:
+                    payload = fields.get("payload")
+                    if payload is None:
+                        continue
+                    replayed = True
+                    handled = await self._handle_message(
+                        {"type": "message", "data": payload},
+                        mcp_runtime=mcp_runtime,
+                        plugin_runtime=plugin_runtime,
+                        seen_event_ids=seen_event_ids,
+                        seen_event_order=seen_event_order,
+                    )
+                    if handled:
+                        acked.append(entry_id)
+                if acked:
+                    await self._redis.xack(stream, stream_consumer_group, *acked)
+            if entries_read < max_stream_replay_messages:
+                return replayed
+        return replayed
 
     async def _handle_message(
         self,
@@ -253,7 +269,7 @@ class RuntimeConfigInvalidationBus:
 
     async def _reload_target(
         self,
-        tenant_id: UUID,
+        tenant_id: UUID | None,
         target: RuntimeConfigInvalidationTarget,
         *,
         mcp_runtime: ReloadableRuntime | None,
@@ -336,7 +352,7 @@ def _stream_read_entries(
 
 async def _reload_runtime(
     runtime: ReloadableRuntime | None,
-    tenant_id: UUID,
+    tenant_id: UUID | None,
     runtime_name: str,
 ) -> bool:
     if runtime is None:

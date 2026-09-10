@@ -105,6 +105,7 @@ async def _run_runtime_config_invalidation_listener(
                 plugin_runtime=cast(Any, plugin_runtime),
                 stream_consumer_group=stream_consumer_id,
                 stream_consumer_name=stream_consumer_id,
+                reload_on_empty_stream_replay=True,
             )
             return
         except asyncio.CancelledError:

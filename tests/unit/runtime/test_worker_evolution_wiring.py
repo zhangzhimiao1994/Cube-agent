@@ -361,11 +361,13 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
     assert bus.kwargs["plugin_runtime"] is plugin_runtime
     assert str(bus.kwargs["stream_consumer_group"]).startswith("worker-")
     assert str(bus.kwargs["stream_consumer_name"]).startswith("worker-")
+    assert bus.kwargs["reload_on_empty_stream_replay"] is True
     assert set(bus.kwargs) == {
         "mcp_runtime",
         "plugin_runtime",
         "stream_consumer_group",
         "stream_consumer_name",
+        "reload_on_empty_stream_replay",
     }
 
 

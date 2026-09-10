@@ -17,6 +17,7 @@ class FakeRedis:
         self.published: list[tuple[str, str]] = []
         self.stream_entries: list[tuple[str, dict[str, str], int | None, bool]] = []
         self.stream_replay_entries: list[tuple[str, dict[str, str]]] = []
+        self.stream_replay_batches: list[list[tuple[str, dict[str, str]]]] = []
         self.consumer_groups_created: list[tuple[str, str, str, bool]] = []
         self.stream_reads: list[tuple[str, str, dict[str, str], int | None]] = []
         self.acked: list[tuple[str, str, tuple[str, ...]]] = []
@@ -59,6 +60,8 @@ class FakeRedis:
     ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
         del block
         self.stream_reads.append((groupname, consumername, streams, count))
+        if self.stream_replay_batches:
+            return [("runtime:test:stream", self.stream_replay_batches.pop(0))]
         return [("runtime:test:stream", self.stream_replay_entries[: count or None])]
 
     async def xack(self, stream: str, groupname: str, *ids: str) -> int:
@@ -192,6 +195,79 @@ async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsu
     ]
     assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
     assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_can_reload_loaded_tenants_when_stream_replay_empty() -> None:
+    redis = FakeRedis()
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+        reload_on_empty_stream_replay=True,
+    )
+
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128)
+    ]
+    assert mcp_runtime.reloaded == [None]
+    assert plugin_runtime.reloaded == [None]
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_drains_stream_replay_batches_before_pubsub() -> None:
+    def payload(event_id: str, tenant_id: UUID) -> dict[str, str]:
+        return {
+            "payload": json.dumps(
+                {
+                    "event_id": event_id,
+                    "source_instance_id": "api-2",
+                    "tenant_id": str(tenant_id),
+                    "target": "plugin",
+                }
+            )
+        }
+
+    redis = FakeRedis()
+    redis.stream_replay_batches = [
+        [("1-0", payload("event-1", TENANT_ID)), ("2-0", payload("event-2", OTHER_TENANT_ID))],
+        [("3-0", payload("event-3", TENANT_ID))],
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+        max_stream_replay_messages=2,
+    )
+
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 2),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 2),
+    ]
+    assert plugin_runtime.reloaded == [TENANT_ID, OTHER_TENANT_ID, TENANT_ID]
+    assert redis.acked == [
+        ("runtime:test:stream", "worker-runtime-1", ("1-0", "2-0")),
+        ("runtime:test:stream", "worker-runtime-1", ("3-0",)),
+    ]
 
 
 @pytest.mark.asyncio
