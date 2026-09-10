@@ -2480,6 +2480,102 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
     }
 
 
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_routes_roles_away_from_constrained_deployment_without_required_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            },
+                            {
+                                "provider": "qwen",
+                                "model": "qwen3-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            },
+                        ]
+                    },
+                    "structured": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "planner",
+                        "role": "Planner",
+                        "prompt": "Return structured dispatch output.",
+                        "model": "main",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Return structured dispatch output.",
+                routing_decision={
+                    "selected_agent_ids": ("planner",),
+                    "harness_decision": {
+                        "selected_provider": "DeepSeek",
+                        "selected_model": "deepseek-chat",
+                        "selected_logical_model": "main",
+                    },
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    assert role_plan[0]["id"] == "planner"
+    assert role_plan[0]["logical_model"] == "structured"
+
+
 def test_model_execution_plan_does_not_report_unrelated_constraint_as_main_agent() -> None:
     plan = defaults_module._model_execution_plan_payload(
         TaskContext(

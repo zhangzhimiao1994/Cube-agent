@@ -468,6 +468,7 @@ class ConfigBackedDispatchRuntime:
             context.tenant_id,
             capability_gateway=self._capability_gateway,
         )
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -500,6 +501,7 @@ class ConfigBackedDispatchRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
             role_sources,
@@ -508,6 +510,7 @@ class ConfigBackedDispatchRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         plan = _dispatch_plan(
             roles,
@@ -516,7 +519,6 @@ class ConfigBackedDispatchRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _dispatch_role_payload(plan)
-        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             CrewDispatchRuntime(
                 gateway,
@@ -614,6 +616,7 @@ class ConfigBackedDiscussionRuntime:
             context.tenant_id,
             capability_gateway=self._capability_gateway,
         )
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -645,6 +648,7 @@ class ConfigBackedDiscussionRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         model_routing_matrix, model_routing_matrix_truncated = _role_model_routing_matrix_payload(
             planned_roles,
@@ -653,6 +657,7 @@ class ConfigBackedDiscussionRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         plan = _discussion_plan(
             roles,
@@ -661,7 +666,6 @@ class ConfigBackedDiscussionRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _discussion_role_payload(plan)
-        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             AutoGenDiscussionRuntime(
                 gateway,
@@ -759,6 +763,7 @@ class ConfigBackedHybridRuntime:
             context.tenant_id,
             capability_gateway=self._capability_gateway,
         )
+        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
         high_risk = _high_risk_task(context.request)
@@ -833,6 +838,7 @@ class ConfigBackedHybridRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=dispatch_role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         discussion_roles = _assign_models_to_roles(
             discussion_role_sources,
@@ -840,6 +846,7 @@ class ConfigBackedHybridRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=discussion_role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         dispatch_matrix, dispatch_matrix_truncated = _role_model_routing_matrix_payload(
             dispatch_role_sources,
@@ -848,6 +855,7 @@ class ConfigBackedHybridRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=dispatch_role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         discussion_matrix, discussion_matrix_truncated = _role_model_routing_matrix_payload(
             discussion_role_sources,
@@ -856,6 +864,7 @@ class ConfigBackedHybridRuntime:
             default_model=logical_model,
             task=context.request,
             role_tools_by_id=discussion_role_tools_by_id,
+            deployment_constraint=deployment_constraint,
         )
         model_routing_matrix = (*dispatch_matrix, *discussion_matrix)
         model_routing_matrix_truncated = dispatch_matrix_truncated or discussion_matrix_truncated
@@ -872,7 +881,6 @@ class ConfigBackedHybridRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
-        deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         return _PlannedRuntime(
             HybridRuntime(
                 CrewDispatchRuntime(
@@ -1532,6 +1540,7 @@ def _assign_models_to_roles(
     default_model: str,
     task: object,
     role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> tuple[RoleAssignment, ...]:
     assigned_counts: dict[str, int] = {}
     capacities = {
@@ -1546,6 +1555,7 @@ def _assign_models_to_roles(
             default_model=default_model,
             task=task,
             allowed_tools=_routing_tools_for_role(role, role_tools_by_id),
+            deployment_constraint=deployment_constraint,
         )
         selected = default_model
         if ranked:
@@ -2255,6 +2265,7 @@ def _role_model_routing_matrix_payload(
     default_model: str,
     task: object,
     role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> tuple[tuple[Mapping[str, JsonValue], ...], bool]:
     payload: list[Mapping[str, JsonValue]] = []
     truncated = len(source_roles) > _MAX_MODEL_ROUTING_MATRIX_ROLES
@@ -2265,24 +2276,34 @@ def _role_model_routing_matrix_payload(
     assigned_counts: dict[str, int] = {}
     for index, role in enumerate(source_roles[:_MAX_MODEL_ROUTING_MATRIX_ROLES]):
         role_tools = _routing_tools_for_role(role, role_tools_by_id)
-        ranked = rank_role_models(
-            RoleModelRoutingRequest(
-                task=task,
-                role_id=role.id,
-                role=role.role,
-                purpose=role.purpose.value,
-                mission=role.mission,
-                skills=role.skills,
-                must_answer=role.must_answer,
-                allowed_tools=role_tools,
-                preferred_model=role.model,
-                default_model=default_model,
-                required_capabilities=_required_model_capabilities_for_assignment(
-                    role,
+        required_capabilities = _required_model_capabilities_for_assignment(
+            role,
+            allowed_tools=role_tools,
+        )
+        ranked = tuple(
+            candidate
+            for candidate in rank_role_models(
+                RoleModelRoutingRequest(
+                    task=task,
+                    role_id=role.id,
+                    role=role.role,
+                    purpose=role.purpose.value,
+                    mission=role.mission,
+                    skills=role.skills,
+                    must_answer=role.must_answer,
                     allowed_tools=role_tools,
+                    preferred_model=role.model,
+                    default_model=default_model,
+                    required_capabilities=required_capabilities,
                 ),
-            ),
-            config,
+                config,
+            )
+            if _logical_model_satisfies_deployment_constraint(
+                config,
+                candidate.logical_model,
+                required_capabilities,
+                deployment_constraint=deployment_constraint,
+            )
         )
         assigned_role = assigned_roles[index] if index < len(assigned_roles) else None
         selected = assigned_role.model if assigned_role is not None else default_model
@@ -2542,7 +2563,12 @@ def _rank_logical_models_for_role(
     default_model: str,
     task: object,
     allowed_tools: tuple[str, ...] | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> list[tuple[int, int, str]]:
+    required_capabilities = _required_model_capabilities_for_assignment(
+        role,
+        allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
+    )
     ranked = rank_role_models(
         RoleModelRoutingRequest(
             task=task,
@@ -2555,20 +2581,46 @@ def _rank_logical_models_for_role(
             allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
             preferred_model=role.model,
             default_model=default_model,
-            required_capabilities=_required_model_capabilities_for_assignment(
-                role,
-                allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
-            ),
+            required_capabilities=required_capabilities,
         ),
         config,
     )
-    eligible = [candidate for candidate in ranked if candidate.eligible]
+    eligible = [
+        candidate
+        for candidate in ranked
+        if candidate.eligible
+        and _logical_model_satisfies_deployment_constraint(
+            config,
+            candidate.logical_model,
+            required_capabilities,
+            deployment_constraint=deployment_constraint,
+        )
+    ]
     if ranked and not eligible:
         raise HarnessModelSelectionError("model capability unavailable")
     return [
         (candidate.score, -len(candidate.logical_model), candidate.logical_model)
         for candidate in eligible
     ]
+
+
+def _logical_model_satisfies_deployment_constraint(
+    config: PlatformConfig,
+    logical_model: str,
+    required: frozenset[ModelCapability],
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None,
+) -> bool:
+    if deployment_constraint is None or deployment_constraint.logical_model != logical_model:
+        return True
+    required_tuple = tuple(sorted(required, key=lambda capability: capability.value))
+    capabilities = _logical_model_capabilities_for_requirements(
+        config,
+        logical_model,
+        required_tuple,
+        deployment_constraint=deployment_constraint,
+    )
+    return capabilities is not None and required.issubset(capabilities)
 
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
