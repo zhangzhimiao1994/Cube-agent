@@ -809,6 +809,72 @@ def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses()
     assert completed.blocked_contract_count == 0
 
 
+def test_orchestration_protocol_summary_uses_step_contract_event_ids() -> None:
+    now = datetime.now(UTC)
+    protocol_plan = {
+        "schema_version": 1,
+        "orchestration_protocol": {
+            "schema_version": 1,
+            "protocol": "role_handoff_contract_v1",
+            "mode": "dispatch",
+            "role_count": 2,
+            "handoff_count": 1,
+            "contract_count": 1,
+            "structured_output_schema": "dispatch_output_v1",
+            "required_output_fields": ("status", "summary"),
+            "ready_status": "done",
+            "blocking_statuses": ("blocked", "needs_user"),
+            "recovery_hints": ("retry_blocked_contract_chain",),
+            "truncated": False,
+        },
+    }
+    planned_event = RunEventResponse(
+        sequence=1,
+        kind="step.started",
+        message="main_agent_plan",
+        created_at=now,
+        actor="main_agent",
+        step_id="main_agent_plan",
+        payload={"model_execution_plan": cast(JsonValue, protocol_plan)},
+    )
+
+    blocked = _orchestration_protocol_summary_from_run_events(
+        (
+            planned_event,
+            RunEventResponse(
+                sequence=2,
+                kind="step.failed",
+                message="writer failed",
+                created_at=now,
+                actor="writer",
+                step_id="writer_step",
+                payload={"blocked_contract_ids": ("writer_step-to-final_response_step",)},
+            ),
+        )
+    )
+    completed = _orchestration_protocol_summary_from_run_events(
+        (
+            planned_event,
+            RunEventResponse(
+                sequence=2,
+                kind="step.completed",
+                message="final done",
+                created_at=now,
+                actor="final_synthesizer",
+                step_id="final_response_step",
+                payload={"completed_contract_ids": ("writer_step-to-final_response_step",)},
+            ),
+        )
+    )
+
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert blocked.blocked_contract_count == 1
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.blocked_contract_count == 0
+
+
 def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)

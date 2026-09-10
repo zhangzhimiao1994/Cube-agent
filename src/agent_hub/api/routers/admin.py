@@ -9132,6 +9132,7 @@ def _orchestration_protocol_summary_from_run_events(
     latest_contracts: Mapping[str, object] | None = None
     step_statuses: dict[str, str] = {}
     active_steps: set[str] = set()
+    contract_statuses: dict[str, Literal["blocked", "completed"]] = {}
 
     for event in ordered:
         if event.step_id is not None:
@@ -9143,6 +9144,14 @@ def _orchestration_protocol_summary_from_run_events(
                 event.kind.startswith("step.") or event.kind.startswith("model.")
             ):
                 active_steps.add(event.step_id)
+        for completed_contract_id in _model_outcome_string_list(
+            event.payload.get("completed_contract_ids")
+        ):
+            contract_statuses[completed_contract_id] = "completed"
+        for blocked_contract_id in _model_outcome_string_list(
+            event.payload.get("blocked_contract_ids")
+        ):
+            contract_statuses[blocked_contract_id] = "blocked"
         plan = event.payload.get("model_execution_plan")
         if not isinstance(plan, Mapping):
             continue
@@ -9167,19 +9176,29 @@ def _orchestration_protocol_summary_from_run_events(
 
     blocked_contract_count = 0
     completed_contract_count = 0
+    counted_contract_ids: set[str] = set()
+    for contract_status in contract_statuses.values():
+        if contract_status == "blocked":
+            blocked_contract_count += 1
+        elif contract_status == "completed":
+            completed_contract_count += 1
+    counted_contract_ids.update(contract_statuses)
     if latest_contracts is not None:
         contract_items = latest_contracts.get("items")
         if isinstance(contract_items, list | tuple):
             for raw_item in contract_items:
                 if not isinstance(raw_item, Mapping):
                     continue
+                contract_id = _model_outcome_string(raw_item.get("contract_id"))
+                if contract_id is not None and contract_id in counted_contract_ids:
+                    continue
                 source_step = _model_outcome_string(raw_item.get("source_step_id"))
                 target_step = _model_outcome_string(raw_item.get("target_step_id"))
                 blocking_statuses = set(_model_outcome_string_list(raw_item.get("blocking_statuses")))
-                contract_status = _model_outcome_string(raw_item.get("status"))
+                legacy_contract_status = _model_outcome_string(raw_item.get("status"))
                 source_failed = source_step is not None and step_statuses.get(source_step) == "failed"
                 target_failed = target_step is not None and step_statuses.get(target_step) == "failed"
-                if source_failed or target_failed or contract_status in blocking_statuses:
+                if source_failed or target_failed or legacy_contract_status in blocking_statuses:
                     blocked_contract_count += 1
                 if target_step is not None and step_statuses.get(target_step) == "completed":
                     completed_contract_count += 1

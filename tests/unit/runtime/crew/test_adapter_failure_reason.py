@@ -761,6 +761,69 @@ async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
 
 
+async def test_step_events_include_orchestration_contract_context() -> None:
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    final_started = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+    )
+    assert final_started.payload["orchestration_protocol"] == "role_handoff_contract_v1"
+    assert final_started.payload["depends_on"] == ("draft",)
+    assert final_started.payload["incoming_contract_ids"] == ("draft-to-final_response",)
+
+    draft_started = next(
+        event for event in events if event.kind is EventKind.STEP_STARTED and event.step_id == "draft"
+    )
+    assert draft_started.payload["dependent_step_ids"] == ("final_response",)
+    assert draft_started.payload["outgoing_contract_ids"] == ("draft-to-final_response",)
+
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+
+    single_step_runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan(),
+        crew_factory=FastFactory(),
+    )
+    single_step_events = await _collect(single_step_runtime)
+    single_step_started = next(
+        event for event in single_step_events if event.kind is EventKind.STEP_STARTED
+    )
+    assert "orchestration_protocol" not in single_step_started.payload
+
+
+async def test_step_failed_reports_blocked_orchestration_contracts() -> None:
+    runtime = CrewDispatchRuntime(
+        FailingModelGateway(),
+        _dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    draft_failed = next(
+        event for event in events if event.kind is EventKind.STEP_FAILED and event.step_id == "draft"
+    )
+    assert draft_failed.payload["orchestration_protocol"] == "role_handoff_contract_v1"
+    assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
+    assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+
+
 async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     capabilities = FakeCapabilities()
     harness = RecordingHarnessToolGateway()

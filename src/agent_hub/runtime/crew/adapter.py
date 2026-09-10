@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import Any, Never, Protocol, cast
+from typing import Any, Literal, Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
@@ -43,6 +43,7 @@ from agent_hub.models.types import (
     ToolCall,
     ToolDefinition,
 )
+from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
     ArtifactRepository,
@@ -89,6 +90,7 @@ _MAX_AUDITED_COST_USD = Decimal(64000000)
 _STEP_TIMEOUT_RECOVERY_RETRIES = 1
 _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
 _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS = 60.0
+_ORCHESTRATION_PROTOCOL_ID = "role_handoff_contract_v1"
 _STEP_TIMEOUT_RECOVERY_LAYERS = (
     "input_compression",
     "prompt_decomposition",
@@ -588,6 +590,37 @@ def _subagent_recovery_payload(
         payload["recovery_attempt"] = recovery_attempt
     if recovery_attempts is not None:
         payload["recovery_attempts"] = recovery_attempts
+    return payload
+
+
+def _step_orchestration_payload(
+    plan: DispatchPlan,
+    step: DispatchStep,
+    *,
+    terminal_status: Literal["completed", "blocked"] | None = None,
+) -> dict[str, object]:
+    known_steps = {item.id for item in plan.steps}
+    dependencies = tuple(item for item in step.depends_on if item in known_steps)
+    dependents = tuple(item.id for item in plan.steps if step.id in item.depends_on)
+    incoming_contract_ids = tuple(f"{dependency}-to-{step.id}" for dependency in dependencies)
+    outgoing_contract_ids = tuple(f"{step.id}-to-{dependent}" for dependent in dependents)
+    if not dependencies and not dependents:
+        return {}
+
+    payload: dict[str, object] = {"orchestration_protocol": _ORCHESTRATION_PROTOCOL_ID}
+    if dependencies:
+        payload["depends_on"] = dependencies
+        payload["incoming_contract_ids"] = incoming_contract_ids
+    if dependents:
+        payload["dependent_step_ids"] = dependents
+        payload["outgoing_contract_ids"] = outgoing_contract_ids
+    if terminal_status == "completed" and incoming_contract_ids:
+        payload["completed_contract_ids"] = incoming_contract_ids
+    if terminal_status == "blocked":
+        blocked_contract_ids = tuple(dict.fromkeys((*incoming_contract_ids, *outgoing_contract_ids)))
+        if blocked_contract_ids:
+            payload["blocked_contract_ids"] = blocked_contract_ids
+            payload["orchestration_recovery_hint"] = ORCHESTRATION_CONTRACT_RECOVERY_HINT
     return payload
 
 
@@ -1930,6 +1963,7 @@ class CrewDispatchRuntime:
                     "role": agent.role,
                     "logical_model": agent.logical_model,
                     "tools": tuple(step.tools),
+                    **_step_orchestration_payload(plan, step),
                 },
             )
             try:
@@ -2029,6 +2063,7 @@ class CrewDispatchRuntime:
                                             recovery_attempt=review_recovery_attempt,
                                         ),
                                         **review_diagnostic,
+                                        **_step_orchestration_payload(plan, step),
                                     },
                                 )
                                 continue
@@ -2069,6 +2104,7 @@ class CrewDispatchRuntime:
                                         "logical_model": reviewer.logical_model,
                                         "candidate_artifact_id": str(artifact.id),
                                         **review_diagnostic,
+                                        **_step_orchestration_payload(plan, step),
                                     },
                                 )
                                 continue
@@ -2147,7 +2183,11 @@ class CrewDispatchRuntime:
                                     step_id=step.id,
                                     actor=step.agent,
                                     reason="review requested revision",
-                                    payload={"attempt": retries + 1, "feedback": feedback},
+                                    payload={
+                                        "attempt": retries + 1,
+                                        "feedback": feedback,
+                                        **_step_orchestration_payload(plan, step),
+                                    },
                                 )
                                 retry_requested = True
                                 break
@@ -2166,6 +2206,11 @@ class CrewDispatchRuntime:
                         "logical_model": agent.logical_model,
                         "artifact_id": str(artifact.id),
                         "output": _artifact_text_preview(artifact) or "step completed",
+                        **_step_orchestration_payload(
+                            plan,
+                            step,
+                            terminal_status="completed",
+                        ),
                     },
                 )
                 return _StepResult(step=step, artifact=artifact, retries=retries)
@@ -2197,6 +2242,7 @@ class CrewDispatchRuntime:
                                 recovery_attempt=recovery_attempt,
                             ),
                             **diagnostic,
+                            **_step_orchestration_payload(plan, step),
                         },
                     )
                     continue
@@ -2226,7 +2272,14 @@ class CrewDispatchRuntime:
                     step_id=step.id,
                     actor=step.agent,
                     reason=failure_reason,
-                    payload=diagnostic,
+                    payload={
+                        **diagnostic,
+                        **_step_orchestration_payload(
+                            plan,
+                            step,
+                            terminal_status="blocked",
+                        ),
+                    },
                 )
                 raise
             except Exception as error:  # noqa: BLE001
@@ -2244,6 +2297,11 @@ class CrewDispatchRuntime:
                             status="failed_without_compact_retry",
                             recovery_attempts=recovery_attempt,
                             strategy="failure_closure",
+                        ),
+                        **_step_orchestration_payload(
+                            plan,
+                            step,
+                            terminal_status="blocked",
                         ),
                     },
                 )
