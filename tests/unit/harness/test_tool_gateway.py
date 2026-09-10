@@ -145,6 +145,18 @@ class TenantPreparedMcpToolBackend(FakeMcpToolBackend):
         self.available = True
 
 
+class FailingTenantPreparedPluginToolBackend(FakePluginToolBackend):
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        self.calls.append(("prepare", {"tenant_id": str(tenant_id)}, ""))
+        raise RuntimeError("raw tenant load failure")
+
+
+class FailingTenantPreparedMcpToolBackend(FakeMcpToolBackend):
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        self.calls.append(("prepare", {"tenant_id": str(tenant_id)}, ""))
+        raise RuntimeError("raw tenant load failure")
+
+
 class PolicyPartsPluginToolBackend(FakePluginToolBackend):
     def capability_policy_parts(
         self,
@@ -574,6 +586,69 @@ async def test_harness_tool_gateway_loads_mcp_tenant_before_availability_and_pol
     assert mcp_backend.prepared_tenants == [TENANT_ID]
     assert [call[0] for call in mcp_backend.calls] == ["available", "invoke"]
     assert len(policy.requests) == 1
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_fails_external_tool_closed_when_prepare_fails() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = FailingTenantPreparedPluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "external tool tenant preparation failed"
+    assert [call[0] for call in plugin_backend.calls] == ["prepare"]
+    assert policy.requests == []
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_does_not_prepare_external_backends_for_runtime_tool() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = FailingTenantPreparedPluginToolBackend(available=False)
+    gateway = HarnessToolGateway(runtime, plugin_backend=plugin_backend)
+
+    result = await gateway.invoke(TENANT_ID, request())
+
+    assert result.status == "succeeded"
+    assert result.payload == {"value": "14"}
+    assert [call[0] for call in plugin_backend.calls] == ["available"]
+    assert [call[0] for call in runtime.calls] == ["available", "execute"]
+
+
+async def test_harness_tool_gateway_prepares_only_matching_external_backend() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    mcp_backend = FailingTenantPreparedMcpToolBackend(available=False)
+    plugin_backend = TenantPreparedPluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        mcp_backend=mcp_backend,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert mcp_backend.calls == []
+    assert plugin_backend.prepared_tenants == [TENANT_ID]
+    assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
     assert runtime.calls == []
 
 

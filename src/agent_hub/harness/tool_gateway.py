@@ -106,12 +106,23 @@ class HarnessToolGateway:
             return self._failure(request, sandbox_failure)
         if request.approval_required and self._policy_gateway is None:
             return self._failure(request, "approval required")
-        await self._prepare_external_backends(tenant_id)
-        mcp_backend = self._available_mcp_backend(tenant_id, request.tool_name)
+        uses_external_envelope = _uses_external_envelope(request)
+        if uses_external_envelope:
+            preparation_failure = await self._prepare_external_backends(
+                tenant_id,
+                backends=_external_backends_for_request(self, request),
+            )
+            if preparation_failure is not None:
+                return self._failure(request, preparation_failure)
+        mcp_backend = (
+            self._available_mcp_backend(tenant_id, request.tool_name)
+            if _may_route_to_mcp_backend(request)
+            else None
+        )
         plugin_backend = (
-            None
-            if mcp_backend is not None
-            else self._available_plugin_backend(tenant_id, request.tool_name)
+            self._available_plugin_backend(tenant_id, request.tool_name)
+            if mcp_backend is None and _may_route_to_plugin_backend(request)
+            else None
         )
         sandbox_mismatch = _external_sandbox_mismatch(
             tenant_id,
@@ -256,8 +267,13 @@ class HarnessToolGateway:
             return None
         return self._plugin_backend
 
-    async def _prepare_external_backends(self, tenant_id: UUID) -> None:
-        for backend in (self._mcp_backend, self._plugin_backend):
+    async def _prepare_external_backends(
+        self,
+        tenant_id: UUID,
+        *,
+        backends: tuple[object | None, ...],
+    ) -> str | None:
+        for backend in backends:
             if backend is None:
                 continue
             ensure_tenant_loaded = getattr(backend, "ensure_tenant_loaded", None)
@@ -272,7 +288,8 @@ class HarnessToolGateway:
                     tenant_id,
                     type(error).__name__,
                 )
-                continue
+                return "external tool tenant preparation failed"
+        return None
 
 
 def _capability_request(
@@ -381,6 +398,40 @@ def _plugin_declared_capability_parts(
 
 
 _SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+
+_EXTERNAL_SANDBOX_PROFILES = frozenset(
+    {
+        "http_read",
+        "in_process",
+        "local_process",
+        "mcp_remote",
+        "mcp_stdio",
+        "remote_connector",
+    }
+)
+
+_MCP_SANDBOX_PROFILES = frozenset({"mcp_remote", "mcp_stdio"})
+
+
+def _uses_external_envelope(request: HarnessToolCallRequest) -> bool:
+    return request.sandbox in _EXTERNAL_SANDBOX_PROFILES
+
+
+def _may_route_to_mcp_backend(request: HarnessToolCallRequest) -> bool:
+    return request.sandbox in _MCP_SANDBOX_PROFILES or not _uses_external_envelope(request)
+
+
+def _may_route_to_plugin_backend(request: HarnessToolCallRequest) -> bool:
+    return request.sandbox not in _MCP_SANDBOX_PROFILES
+
+
+def _external_backends_for_request(
+    gateway: HarnessToolGateway,
+    request: HarnessToolCallRequest,
+) -> tuple[object | None, ...]:
+    if request.sandbox in _MCP_SANDBOX_PROFILES:
+        return (gateway._mcp_backend,)
+    return (gateway._plugin_backend,)
 
 
 def _workspace_write_sandbox_failure(request: HarnessToolCallRequest) -> str | None:
