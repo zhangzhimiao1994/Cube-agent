@@ -475,12 +475,17 @@ async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> Non
             self.maximum_active = 0
 
         async def complete(self, deployment, request, api_key):  # type: ignore[no-untyped-def]
-            del deployment, request, api_key
+            del deployment, api_key
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
             await asyncio.sleep(0.01)
             self.active -= 1
-            return ModelResponse(text="leased result", usage=TokenUsage(1, 1, 2))
+            text = (
+                '{"summary":"leased result","findings":["safe"]}'
+                if request.response_schema is not None
+                else "leased result"
+            )
+            return ModelResponse(text=text, usage=TokenUsage(1, 1, 2))
 
     deployments = tuple(
         Deployment(
@@ -2623,8 +2628,13 @@ async def test_real_crewai_cancellation_reaches_gateway_without_residual_work_an
             try:
                 if self.block:
                     await self.release.wait()
+                text = (
+                    '{"summary":"safe result","findings":["safe"]}'
+                    if request.response_schema is not None
+                    else "safe result"
+                )
                 return GatewayCompletion(
-                    response=ModelResponse(text="safe result", usage=TokenUsage(1, 1, 2)),
+                    response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
                     deployment_id="primary",
                     logical_model=request.logical_model,
                     provider_id="deepseek",
