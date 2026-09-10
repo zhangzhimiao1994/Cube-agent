@@ -4027,14 +4027,15 @@ def _stored_plugin_package_metadata(
         artifact_root.parent.mkdir(parents=True, exist_ok=True)
         _ensure_path_inside(store_root, artifact_root)
         _ensure_path_inside(store_root, temp_root)
-        for path, content in files:
-            target = temp_root.joinpath(*PurePosixPath(path).parts)
-            _ensure_path_inside(temp_root, target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-        if artifact_root.exists():
-            shutil.rmtree(artifact_root)
-        temp_root.replace(artifact_root)
+        if not _plugin_package_artifact_matches(artifact_root, files):
+            for path, content in files:
+                target = temp_root.joinpath(*PurePosixPath(path).parts)
+                _ensure_path_inside(temp_root, target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            if artifact_root.exists():
+                shutil.rmtree(artifact_root)
+            temp_root.replace(artifact_root)
     except OSError as error:
         with contextlib.suppress(OSError):
             if temp_root.exists():
@@ -4056,6 +4057,23 @@ def _stored_plugin_package_metadata(
             )
         }
     )
+
+
+def _plugin_package_artifact_matches(
+    artifact_root: Path,
+    files: tuple[tuple[str, bytes], ...],
+) -> bool:
+    if not artifact_root.is_dir():
+        return False
+    try:
+        for path, content in files:
+            target = artifact_root.joinpath(*PurePosixPath(path).parts)
+            _ensure_path_inside(artifact_root, target)
+            if not target.is_file() or target.read_bytes() != content:
+                return False
+    except OSError:
+        return False
+    return True
 
 
 def _cleanup_plugin_package_artifact(

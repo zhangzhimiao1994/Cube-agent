@@ -4986,6 +4986,55 @@ def test_plugin_archive_install_stores_verified_adapter_package_artifact(
     assert not (artifact_root / "plugin.json").exists()
 
 
+def test_plugin_archive_install_reuses_existing_verified_package_artifact_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(
+        private_key,
+        files={"adapter/main.py": "def invoke():\n    return {'ok': True}\n"},
+    )
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    install_headers = {
+        **headers(),
+        "Content-Type": "application/zip",
+        "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+    }
+
+    first = api.post(
+        "/api/v1/admin/plugins/install",
+        headers=install_headers,
+        content=archive_bytes,
+    )
+    assert first.status_code == 200
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    marker = artifact_root / ".existing-marker"
+    marker.write_text("keep existing artifact directory")
+
+    second = api.post(
+        "/api/v1/admin/plugins/install",
+        headers=install_headers,
+        content=archive_bytes,
+    )
+
+    assert second.status_code == 200
+    assert marker.read_text() == "keep existing artifact directory"
+    assert (artifact_root / "adapter" / "main.py").read_text() == (
+        "def invoke():\n    return {'ok': True}\n"
+    )
+
+
 def test_plugin_archive_install_does_not_store_untrusted_adapter_package_artifact(
     tmp_path: Path,
 ) -> None:
