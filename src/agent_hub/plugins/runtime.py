@@ -1094,18 +1094,19 @@ def build_plugin_package_subprocess_adapters(
     max_stdin_bytes: int = 262_144,
     max_stdout_bytes: int = 262_144,
 ) -> dict[str, PluginAdapter]:
-    if not enabled:
-        return {}
     if any(adapter_id == "http_json" for adapter_id in adapter_ids):
         raise ValueError("plugin package subprocess adapter id is reserved")
     if (
-        isolation_backend != "bubblewrap"
-        or bubblewrap_executable is None
-        or not bubblewrap_executable.is_absolute()
-        or not bubblewrap_executable.is_file()
-        or (os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK))
+        _plugin_package_subprocess_registration_status(
+            enabled=enabled,
+            adapter_ids=adapter_ids,
+            isolation_backend=isolation_backend,
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        != "ready"
     ):
         return {}
+    assert bubblewrap_executable is not None
     runner = PythonSubprocessPluginPackageRunner(
         python_executable=python_executable,
         process_launcher=BubblewrapPluginPackageProcessLauncher(
@@ -1123,6 +1124,30 @@ def build_plugin_package_subprocess_adapters(
         )
         for adapter_id in adapter_ids
     }
+
+
+def _plugin_package_subprocess_registration_status(
+    *,
+    enabled: bool,
+    adapter_ids: Sequence[str],
+    isolation_backend: Literal["disabled", "bubblewrap"],
+    bubblewrap_executable: Path | None,
+) -> str:
+    if not enabled:
+        return "disabled"
+    if not adapter_ids:
+        return "no_adapter_ids"
+    if isolation_backend != "bubblewrap":
+        return "unsupported_isolation_backend"
+    if bubblewrap_executable is None:
+        return "missing_isolation_launcher"
+    if not bubblewrap_executable.is_absolute():
+        return "launcher_path_not_absolute"
+    if not bubblewrap_executable.is_file():
+        return "launcher_not_found"
+    if os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK):
+        return "launcher_not_executable"
+    return "ready"
 
 
 def _plugin_schema_validator(

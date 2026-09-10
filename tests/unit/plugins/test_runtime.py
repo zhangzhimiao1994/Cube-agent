@@ -35,6 +35,7 @@ from agent_hub.plugins.runtime import (
     PythonSubprocessPluginPackageRunner,
     RuntimePluginService,
     _plugin_package_execution_target,
+    _plugin_package_subprocess_registration_status,
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
 )
@@ -1612,6 +1613,72 @@ def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
             package_store_dir=tmp_path,
         )
         == {}
+    )
+
+
+def test_plugin_package_subprocess_registration_status_reports_disabled(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=False,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=tmp_path / "bwrap",
+        )
+        == "disabled"
+    )
+
+
+def test_plugin_package_subprocess_registration_status_reports_missing_adapter_ids(
+    tmp_path: Path,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    if os.name == "posix":
+        bubblewrap_executable.chmod(0o755)
+
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=(),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        == "no_adapter_ids"
+    )
+
+
+def test_plugin_package_subprocess_registration_status_reports_launcher_reason(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=tmp_path / "missing-bwrap",
+        )
+        == "launcher_not_found"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX executable bit only")
+def test_plugin_package_subprocess_registration_status_reports_nonexecutable_launcher(
+    tmp_path: Path,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    bubblewrap_executable.chmod(0o644)
+
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        == "launcher_not_executable"
     )
 
 
