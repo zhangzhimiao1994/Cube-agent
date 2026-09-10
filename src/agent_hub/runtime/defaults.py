@@ -1050,6 +1050,7 @@ def _dispatch_plan(
             goal=role.mission,
             logical_model=role.model,
             allowed_tools=role_tools_by_id[role.id],
+            output_schema=dict(role.output_schema),
         )
         for role in selected_roles
     ]

@@ -39,6 +39,7 @@ from agent_hub.models.types import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    StructuredResponseSchema,
     TokenUsage,
     ToolCall,
     ToolDefinition,
@@ -622,6 +623,40 @@ def _step_orchestration_payload(
             payload["blocked_contract_ids"] = blocked_contract_ids
             payload["orchestration_recovery_hint"] = ORCHESTRATION_CONTRACT_RECOVERY_HINT
     return payload
+
+
+def _agent_response_schema(agent: AgentSpec) -> StructuredResponseSchema | None:
+    if not agent.output_schema:
+        return None
+    properties: dict[str, JsonValue] = {
+        key: _schema_property(description) for key, description in agent.output_schema.items()
+    }
+    return StructuredResponseSchema(
+        name="DispatchRoleOutput",
+        schema={
+            "type": "object",
+            "properties": properties,
+            "required": tuple(agent.output_schema),
+            "additionalProperties": False,
+        },
+    )
+
+
+def _schema_property(description: str) -> dict[str, JsonValue]:
+    normalized = description.strip().casefold()
+    if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
+        return {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": description,
+        }
+    if normalized in {"boolean", "bool"}:
+        return {"type": "boolean", "description": description}
+    if normalized in {"number", "float", "decimal"}:
+        return {"type": "number", "description": description}
+    if normalized in {"integer", "int"}:
+        return {"type": "integer", "description": description}
+    return {"type": "string", "description": description}
 
 
 def _can_compact_retry_subagent(
@@ -2491,11 +2526,12 @@ class CrewDispatchRuntime:
         messages = list(self._normalize_crewai_messages(crew_messages))
         tool_mapping = _tool_name_mapping(step.tools)
         request_tools = _tool_definitions(step.tools)
-        required_capabilities = frozenset(
-            {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
-            if request_tools
-            else {ModelCapability.TEXT}
-        )
+        response_schema = _agent_response_schema(agent)
+        required_capabilities = {ModelCapability.TEXT}
+        if request_tools:
+            required_capabilities.add(ModelCapability.TOOL_CALLING)
+        if response_schema is not None:
+            required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
         for _round in range(_MAX_TOOL_ROUNDS + 1):
             await emit(
                 kind=EventKind.MODEL_STARTED,
@@ -2512,9 +2548,10 @@ class CrewDispatchRuntime:
             request = ModelRequest(
                 logical_model=agent.logical_model,
                 messages=tuple(messages),
-                required_capabilities=required_capabilities,
+                required_capabilities=frozenset(required_capabilities),
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),
                 max_output_tokens=min(agent.max_output_tokens, step.token_budget),
+                response_schema=response_schema,
                 tools=request_tools,
             )
             call_index = call_cursor.value

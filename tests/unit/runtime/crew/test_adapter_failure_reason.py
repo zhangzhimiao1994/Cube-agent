@@ -15,7 +15,13 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import (
+    ModelCapability,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+    ToolCall,
+)
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -822,6 +828,52 @@ async def test_step_failed_reports_blocked_orchestration_contracts() -> None:
     assert draft_failed.payload["orchestration_protocol"] == "role_handoff_contract_v1"
     assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
     assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+
+
+async def test_agent_output_schema_becomes_structured_model_request() -> None:
+    gateway = RoleAwareGateway()
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string", "risks": "string[]"},
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
+
+    await _collect(runtime)
+
+    request = gateway.requests[0]
+    assert ModelCapability.STRUCTURED_OUTPUT in request.required_capabilities
+    assert request.response_schema is not None
+    assert request.response_schema.name == "DispatchRoleOutput"
+    assert request.response_schema.schema == {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "string"},
+            "risks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "string[]",
+            },
+        },
+        "required": ("summary", "risks"),
+        "additionalProperties": False,
+    }
 
 
 async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:

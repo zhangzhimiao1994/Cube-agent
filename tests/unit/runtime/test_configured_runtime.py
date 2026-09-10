@@ -3547,6 +3547,11 @@ def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids()
         ("copywriter", "文案生成"),
         ("final_synthesizer", "Final Synthesizer"),
     ]
+    assert [agent.output_schema for agent in plan.agents] == [
+        {"summary": "string"},
+        {"summary": "string"},
+        {},
+    ]
     assert [step.agent for step in plan.steps] == [
         "director",
         "copywriter",

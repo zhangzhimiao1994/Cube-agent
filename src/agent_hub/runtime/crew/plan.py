@@ -7,6 +7,7 @@ import json
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, Self
 
@@ -130,6 +131,7 @@ class AgentSpec(_PlanModel):
     logical_model: str
     allowed_tools: tuple[str, ...] = ()
     max_output_tokens: int = Field(default=4096, ge=1, le=1_000_000)
+    output_schema: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("id", "logical_model")
     @classmethod
@@ -150,6 +152,22 @@ class AgentSpec(_PlanModel):
     @classmethod
     def tools(cls, value: object) -> tuple[str, ...]:
         return _id_tuple(value, "agent tools")
+
+    @field_validator("output_schema", mode="before")
+    @classmethod
+    def output_schema_values(cls, value: object) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            raise TypeError("agent output_schema must be a mapping")
+        normalized: dict[str, str] = {}
+        for key, item in value.items():
+            if type(key) is not str or type(item) is not str:
+                raise ValueError("agent output_schema must map strings to strings")
+            normalized[_identifier(key, "output_schema key")] = _text(
+                item,
+                "output_schema value",
+                limit=1024,
+            )
+        return normalized
 
     @field_validator("max_output_tokens")
     @classmethod
