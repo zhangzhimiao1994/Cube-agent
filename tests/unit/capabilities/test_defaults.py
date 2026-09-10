@@ -8,7 +8,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.approvals import ApprovalService, InMemoryApprovalStore
+from agent_hub.capabilities.approvals import (
+    ApprovalService,
+    InMemoryApprovalStore,
+    capability_approval_scope,
+)
 from agent_hub.capabilities.defaults import (
     CodexAutoApprovalReviewer,
     DefaultRuntimeCapabilityPolicyGateway,
@@ -882,6 +886,28 @@ async def test_generated_file_scope_approval_does_not_authorize_workspace_side_e
 
     assert result.status is CapabilityStatus.WAITING_APPROVAL
     assert repository.pending_approvals == 1
+
+
+def test_workspace_side_effect_approval_scope_cannot_collide_on_argument_delimiters() -> None:
+    first = capability_request(
+        agent_id="engineer",
+        arguments={
+            "filename": "first.zip",
+            "project_id": "project-main:workspace_session_id=session-a",
+            "workspace_session_id": "session-b",
+        },
+    )
+    second = capability_request(
+        agent_id="engineer",
+        arguments={
+            "filename": "second.zip",
+            "project_id": "project-main",
+            "workspace_session_id": "session-a:workspace_session_id=session-b",
+        },
+    )
+
+    assert first.arguments != second.arguments
+    assert capability_approval_scope(first) != capability_approval_scope(second)
 
 
 async def test_generated_file_scope_approval_does_not_authorize_other_tools_or_runs() -> None:

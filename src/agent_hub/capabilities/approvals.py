@@ -360,9 +360,17 @@ def _workspace_side_effect_scope(
         f"capability={request.capability}:"
         f"operation={request.operation}:"
         f"resource={normalized_resource}:"
-        f"project_id={project_id}:"
-        f"workspace_session_id={workspace_session_id}"
+        f"workspace_target_sha256={_workspace_target_scope_digest(project_id, workspace_session_id)}"
     )
+
+
+def _workspace_target_scope_digest(project_id: str, workspace_session_id: str) -> str:
+    payload = {
+        "project_id": project_id,
+        "workspace_session_id": workspace_session_id,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _nonblank_argument(request: CapabilityRequest, name: str) -> str | None:
