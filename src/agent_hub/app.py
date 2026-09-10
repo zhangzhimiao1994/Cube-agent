@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import FastAPI, Request
@@ -739,11 +739,14 @@ async def _run_runtime_config_invalidation_listener(
     plugin_runtime: object,
     retry_delay_seconds: float = 1.0,
 ) -> None:
+    stream_consumer_id = f"api-{uuid4()}"
     while True:
         try:
             await bus.listen(
                 mcp_runtime=cast(Any, mcp_runtime),
                 plugin_runtime=cast(Any, plugin_runtime),
+                stream_consumer_group=stream_consumer_id,
+                stream_consumer_name=stream_consumer_id,
             )
             return
         except asyncio.CancelledError:

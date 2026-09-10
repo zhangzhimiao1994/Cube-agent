@@ -356,9 +356,16 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
             )
         )
 
-    assert bus.kwargs == {
-        "mcp_runtime": mcp_runtime,
-        "plugin_runtime": plugin_runtime,
+    assert bus.kwargs is not None
+    assert bus.kwargs["mcp_runtime"] is mcp_runtime
+    assert bus.kwargs["plugin_runtime"] is plugin_runtime
+    assert str(bus.kwargs["stream_consumer_group"]).startswith("worker-")
+    assert str(bus.kwargs["stream_consumer_name"]).startswith("worker-")
+    assert set(bus.kwargs) == {
+        "mcp_runtime",
+        "plugin_runtime",
+        "stream_consumer_group",
+        "stream_consumer_name",
     }
 
 
@@ -399,10 +406,13 @@ def test_worker_runtime_invalidation_listener_restarts_after_listen_failure(
         )
 
     assert bus.calls == 2
-    assert bus.kwargs == [
-        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
-        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
-    ]
+    assert len(bus.kwargs) == 2
+    first_kwargs, second_kwargs = bus.kwargs
+    assert first_kwargs == second_kwargs
+    assert first_kwargs["mcp_runtime"] is mcp_runtime
+    assert first_kwargs["plugin_runtime"] is plugin_runtime
+    assert str(first_kwargs["stream_consumer_group"]).startswith("worker-")
+    assert str(first_kwargs["stream_consumer_name"]).startswith("worker-")
     assert sleep_delays == [0.0]
 
 

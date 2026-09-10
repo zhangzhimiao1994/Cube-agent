@@ -736,9 +736,16 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     assert captured["mcp_reloads"] == [OTHER_TENANT_ID]
     assert captured["plugin_reloads"] == [OTHER_TENANT_ID]
     assert bus.published == [(OTHER_TENANT_ID, "mcp"), (OTHER_TENANT_ID, "plugin")]
-    assert bus.listen_kwargs == {
-        "mcp_runtime": application.state.mcp_service,
-        "plugin_runtime": application.state.plugin_service,
+    assert bus.listen_kwargs is not None
+    assert bus.listen_kwargs["mcp_runtime"] is application.state.mcp_service
+    assert bus.listen_kwargs["plugin_runtime"] is application.state.plugin_service
+    assert str(bus.listen_kwargs["stream_consumer_group"]).startswith("api-")
+    assert str(bus.listen_kwargs["stream_consumer_name"]).startswith("api-")
+    assert set(bus.listen_kwargs) == {
+        "mcp_runtime",
+        "plugin_runtime",
+        "stream_consumer_group",
+        "stream_consumer_name",
     }
 
 
@@ -779,10 +786,13 @@ def test_runtime_config_invalidation_listener_restarts_after_listen_failure(
         )
 
     assert bus.calls == 2
-    assert bus.kwargs == [
-        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
-        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
-    ]
+    assert len(bus.kwargs) == 2
+    first_kwargs, second_kwargs = bus.kwargs
+    assert first_kwargs == second_kwargs
+    assert first_kwargs["mcp_runtime"] is mcp_runtime
+    assert first_kwargs["plugin_runtime"] is plugin_runtime
+    assert str(first_kwargs["stream_consumer_group"]).startswith("api-")
+    assert str(first_kwargs["stream_consumer_name"]).startswith("api-")
     assert sleep_delays == [0.0]
 
 
