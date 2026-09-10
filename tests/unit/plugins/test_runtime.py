@@ -218,7 +218,17 @@ def _argv_contains_ordered_pair(
     destination: Path,
 ) -> bool:
     expected = (flag, str(source), str(destination))
-    return any(argv[index : index + 3] == expected for index in range(len(argv) - 2))
+    return _argv_contains_ordered_args(argv, expected)
+
+
+def _argv_contains_ordered_args(
+    argv: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> bool:
+    size = len(expected)
+    return any(
+        argv[index : index + size] == expected for index in range(len(argv) - size + 1)
+    )
 
 
 def plugin(
@@ -1596,6 +1606,8 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     assert "--unshare-net" in argv
     assert _argv_contains_ordered_pair(argv, "--ro-bind", package_root, package_root)
     assert _argv_contains_ordered_pair(argv, "--ro-bind", runtime_root, runtime_root)
+    assert _argv_contains_ordered_args(argv, ("--dev", "/dev"))
+    assert _argv_contains_ordered_args(argv, ("--proc", "/proc"))
     assert argv[-3:] == (
         str(runtime_root / "bin" / "python"),
         "-I",
