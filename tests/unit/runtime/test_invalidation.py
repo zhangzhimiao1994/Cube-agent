@@ -61,8 +61,10 @@ class FakeRedis:
     ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
         del block
         self.stream_reads.append((groupname, consumername, streams, count))
-        if streams == {"runtime:test:stream": "0"} and self.stream_replay_pending_batches:
-            return [("runtime:test:stream", self.stream_replay_pending_batches.pop(0))]
+        if streams == {"runtime:test:stream": "0"}:
+            if self.stream_replay_pending_batches:
+                return [("runtime:test:stream", self.stream_replay_pending_batches.pop(0))]
+            return [("runtime:test:stream", [])]
         if self.stream_replay_batches:
             return [("runtime:test:stream", self.stream_replay_batches.pop(0))]
         return [("runtime:test:stream", self.stream_replay_entries[: count or None])]
@@ -199,7 +201,8 @@ async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsu
         ("runtime:test:stream", "worker-runtime-1", "0-0", True)
     ]
     assert redis.stream_reads == [
-        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128)
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
     ]
     assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
     assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
@@ -226,7 +229,8 @@ async def test_runtime_invalidation_listener_can_reload_loaded_tenants_when_stre
     )
 
     assert redis.stream_reads == [
-        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128)
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
     ]
     assert mcp_runtime.reloaded == [None]
     assert plugin_runtime.reloaded == [None]
@@ -299,6 +303,7 @@ async def test_runtime_invalidation_listener_drains_stream_replay_batches_before
     assert redis.stream_reads == [
         ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 2),
         ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 2),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 2),
     ]
     assert plugin_runtime.reloaded == [TENANT_ID, OTHER_TENANT_ID, TENANT_ID]
     assert redis.acked == [
@@ -424,6 +429,135 @@ async def test_runtime_invalidation_listener_retries_failed_pending_stream_repla
         ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
         ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
     ]
+    assert redis.acked == [
+        ("runtime:test:stream", "worker-runtime-1", ("2-0",)),
+        ("runtime:test:stream", "worker-runtime-1", ("1-0",)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_replays_pending_entries_when_restart_has_no_new_messages() -> None:
+    plugin_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-1",
+                "source_instance_id": "api-2",
+                "tenant_id": str(OTHER_TENANT_ID),
+                "target": "plugin",
+            }
+        )
+    }
+    redis = FakeRedis()
+    redis.stream_replay_pending_batches = [[("1-0", plugin_payload)]]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+        reload_on_empty_stream_replay=True,
+    )
+
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
+    ]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert mcp_runtime.reloaded == []
+    assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_replays_pending_entries_without_empty_replay_fallback() -> None:
+    plugin_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-1",
+                "source_instance_id": "api-2",
+                "tenant_id": str(OTHER_TENANT_ID),
+                "target": "plugin",
+            }
+        )
+    }
+    redis = FakeRedis()
+    redis.stream_replay_pending_batches = [[("1-0", plugin_payload)]]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
+    ]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_replays_pending_entries_when_new_messages_also_exist() -> None:
+    new_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-2",
+                "source_instance_id": "api-2",
+                "tenant_id": str(TENANT_ID),
+                "target": "mcp",
+            }
+        )
+    }
+    pending_payload = {
+        "payload": json.dumps(
+            {
+                "event_id": "event-1",
+                "source_instance_id": "api-2",
+                "tenant_id": str(OTHER_TENANT_ID),
+                "target": "plugin",
+            }
+        )
+    }
+    redis = FakeRedis()
+    redis.stream_replay_batches = [[("2-0", new_payload)]]
+    redis.stream_replay_pending_batches = [[("1-0", pending_payload)]]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128),
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": "0"}, 128),
+    ]
+    assert mcp_runtime.reloaded == [TENANT_ID]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
     assert redis.acked == [
         ("runtime:test:stream", "worker-runtime-1", ("2-0",)),
         ("runtime:test:stream", "worker-runtime-1", ("1-0",)),

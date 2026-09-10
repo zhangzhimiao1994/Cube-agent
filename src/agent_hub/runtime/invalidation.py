@@ -214,7 +214,9 @@ class RuntimeConfigInvalidationBus:
             failed_replay = failed_replay or failed
             if entries_read < max_stream_replay_messages:
                 break
-        if failed_replay:
+        pending_entries_read = 0
+        pending_failed = False
+        while True:
             raw_pending_entries = await self._redis.xreadgroup(
                 stream_consumer_group,
                 consumer_name,
@@ -230,8 +232,12 @@ class RuntimeConfigInvalidationBus:
                 seen_event_ids=seen_event_ids,
                 seen_event_order=seen_event_order,
             )
+            pending_entries_read += entries_read
             replayed = replayed or handled
-            failed_replay = failed or entries_read == 0
+            pending_failed = pending_failed or failed
+            if failed or entries_read < max_stream_replay_messages:
+                break
+        failed_replay = pending_failed or (failed_replay and pending_entries_read == 0)
         return replayed and not failed_replay
 
     async def _handle_stream_replay_entries(
