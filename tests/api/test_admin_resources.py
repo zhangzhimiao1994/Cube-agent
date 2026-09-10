@@ -4901,6 +4901,41 @@ def test_plugin_archive_install_rejects_malformed_package_dependencies_with_stab
     )
 
 
+def test_plugin_package_metadata_blocks_restored_runtime_registered_dependencies() -> None:
+    package = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": VALID_PLUGIN_SIGNATURE,
+            },
+            "signature_verification": "verified",
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "local_process",
+            "install_mode": "runtime_registered",
+            "dependencies": [
+                {
+                    "kind": "python",
+                    "source": "pypi",
+                    "name": "requests",
+                    "version": "2.32.0",
+                }
+            ],
+        }
+    )
+
+    assert package.activation_state == "blocked_unsupported_runtime"
+    assert package.activation_reason == (
+        "plugin package dependencies are not supported by this runtime"
+    )
+
+
 def test_plugin_archive_install_stores_verified_adapter_package_artifact(
     tmp_path: Path,
 ) -> None:

@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 
 from agent_hub.api.routers.admin import (
+    PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
     PluginCapabilityRequest,
     PluginPackageDependency,
     PluginPackageMetadata,
@@ -593,7 +594,7 @@ def test_plugin_package_execution_target_rejects_missing_artifact_metadata(
         )
 
 
-def test_plugin_package_execution_target_rejects_package_dependencies(
+def test_plugin_package_execution_target_rejects_package_dependencies_with_stable_reason(
     tmp_path: Path,
 ) -> None:
     content_sha256 = "a" * 64
@@ -611,10 +612,7 @@ def test_plugin_package_execution_target_rejects_package_dependencies(
         }
     )
 
-    with pytest.raises(
-        RuntimeCapabilityError,
-        match="Plugin package dependencies are not supported by this runtime",
-    ):
+    with pytest.raises(RuntimeCapabilityError) as exc_info:
         _plugin_package_execution_target(
             plugin(
                 "calendar",
@@ -626,6 +624,7 @@ def test_plugin_package_execution_target_rejects_package_dependencies(
             tenant_id=TENANT_ID,
             package_store_dir=tmp_path,
         )
+    assert str(exc_info.value) == PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON
 
 
 def test_plugin_package_execution_target_rejects_missing_artifact_directory(

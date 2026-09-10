@@ -1031,6 +1031,11 @@ def _plugin_package_activation_state(
             "blocked_unsupported_runtime",
             "plugin package isolation is not supported for activation",
         )
+    if package.dependencies:
+        return (
+            "blocked_unsupported_runtime",
+            PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
+        )
     return (
         "eligible",
         "package signature, approval, SDK, adapter, and isolation policy allow execution",

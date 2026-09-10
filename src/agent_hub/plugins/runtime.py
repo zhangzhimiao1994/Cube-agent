@@ -892,6 +892,8 @@ def _plugin_package_execution_target(
     package = plugin.package_metadata
     if package is None or package.kind != "adapter_package":
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    if package.dependencies:
+        raise RuntimeCapabilityError(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     if (
         package.activation_state != "eligible"
         or package.install_mode != "runtime_registered"
@@ -902,10 +904,6 @@ def _plugin_package_execution_target(
         or package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS
     ):
         raise RuntimeCapabilityError("Plugin package is not eligible for executable activation")
-    if package.dependencies:
-        raise RuntimeCapabilityError(
-            "Plugin package dependencies are not supported by this runtime"
-        )
     artifact = package.artifact
     if artifact is None:
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
