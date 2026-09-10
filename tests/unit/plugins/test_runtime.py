@@ -1351,6 +1351,59 @@ async def test_python_subprocess_plugin_package_runner_uses_package_root_and_min
     assert os.environ["AGENT_HUB_SECRET_TOKEN"] == "must-not-leak"
 
 
+async def test_python_subprocess_plugin_package_runner_filters_custom_environment(
+    tmp_path: Path,
+) -> None:
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "json.load(sys.stdin)\n"
+        "json.dump({\n"
+        "    'secret_present': 'AGENT_HUB_SECRET_TOKEN' in os.environ,\n"
+        "    'pythonpath_present': 'PYTHONPATH' in os.environ,\n"
+        "    'lang': os.environ.get('LANG'),\n"
+        "    'python_no_user_site': os.environ.get('PYTHONNOUSERSITE'),\n"
+        "}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+        environment={
+            "AGENT_HUB_SECRET_TOKEN": "must-not-leak",
+            "PYTHONPATH": "must-not-leak",
+            "LANG": "C.UTF-8",
+        },
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+        plugin=plugin("calendar", adapter="calendar_python"),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="in_process",
+        ),
+        arguments={"title": "review"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert result == {
+        "secret_present": False,
+        "pythonpath_present": False,
+        "lang": "C.UTF-8",
+        "python_no_user_site": "1",
+    }
+
+
 @pytest.mark.parametrize(
     ("script", "error"),
     [

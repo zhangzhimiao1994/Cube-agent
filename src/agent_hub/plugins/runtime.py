@@ -241,11 +241,7 @@ class PythonSubprocessPluginPackageRunner:
         self._python_executable = sys.executable if python_executable is None else python_executable
         self._timeout_seconds = max(0.001, timeout_seconds)
         self._max_stdout_bytes = max(1, max_stdout_bytes)
-        self._environment = (
-            _minimal_python_subprocess_environment()
-            if environment is None
-            else {key: value for key, value in environment.items() if key and value}
-        )
+        self._environment = _minimal_python_subprocess_environment(environment)
 
     async def invoke(
         self,
@@ -971,7 +967,9 @@ def _plugin_package_runner_request(
     return cast(Mapping[str, JsonValue], _mutable_json(cast(JsonValue, payload)))
 
 
-def _minimal_python_subprocess_environment() -> dict[str, str]:
+def _minimal_python_subprocess_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     allowed_keys = {
         "COMSPEC",
         "HOME",
@@ -984,9 +982,10 @@ def _minimal_python_subprocess_environment() -> dict[str, str]:
         "TMP",
         "WINDIR",
     }
+    source = os.environ if environment is None else environment
     environment = {
         key: value
-        for key, value in os.environ.items()
+        for key, value in source.items()
         if key in allowed_keys and isinstance(value, str) and value
     }
     environment["PYTHONNOUSERSITE"] = "1"
