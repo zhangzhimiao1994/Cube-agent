@@ -32,6 +32,7 @@ const settings = {
   channel_entry: "web",
   attachment_retention_days: 7,
   attachment_max_mb: 25,
+  plugin_package_subprocess_registration_status: "launcher_not_found",
 };
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
@@ -316,6 +317,13 @@ describe("ConfigPage", () => {
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });
+  });
+
+  it("shows package subprocess registration status as runtime state", async () => {
+    render(<TestApp initialPath="/config" />);
+
+    expect(await screen.findByText("本地进程插件")).not.toBeNull();
+    expect(screen.getByText("启动器文件不可用，未注册本地进程适配器。")).not.toBeNull();
   });
 
   it("keeps advanced JSON publishing available with detailed parse errors", async () => {

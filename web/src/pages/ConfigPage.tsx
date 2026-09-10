@@ -54,6 +54,31 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
+function pluginPackageSubprocessStatusText(
+  status: SystemSettings["plugin_package_subprocess_registration_status"],
+) {
+  switch (status) {
+    case "ready":
+      return "隔离启动器就绪，可注册本地进程适配器。";
+    case "disabled":
+      return "本地进程插件运行器未启用。";
+    case "no_adapter_ids":
+      return "未配置本地进程适配器白名单。";
+    case "unsupported_isolation_backend":
+      return "隔离后端未启用 bubblewrap。";
+    case "missing_isolation_launcher":
+      return "未配置隔离启动器。";
+    case "launcher_path_not_absolute":
+      return "启动器路径不是绝对路径。";
+    case "launcher_not_found":
+      return "启动器文件不可用，未注册本地进程适配器。";
+    case "launcher_not_executable":
+      return "启动器不可执行，未注册本地进程适配器。";
+    default:
+      return "状态未上报。";
+  }
+}
+
 export function ConfigPage() {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
@@ -200,6 +225,10 @@ export function ConfigPage() {
         <article className="status-card">
           <span>OpenClaw</span>
           <p>{settings.openclaw_enabled ? `已启用，权限模式：${settings.openclaw_mode}。` : "已关闭长时间电脑操作能力。"}</p>
+        </article>
+        <article className="status-card">
+          <span>本地进程插件</span>
+          <p>{pluginPackageSubprocessStatusText(settings.plugin_package_subprocess_registration_status)}</p>
         </article>
       </div>
 
