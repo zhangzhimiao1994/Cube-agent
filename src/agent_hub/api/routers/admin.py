@@ -3658,6 +3658,8 @@ def _validate_runtime_registered_plugin_package(
         return
     if package.install_mode != "runtime_registered":
         return
+    if package.dependencies:
+        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
     descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
     descriptor = descriptors.get(package.adapter_id or "")
     if descriptor is None:
