@@ -226,6 +226,35 @@ async def test_runtime_invalidation_listener_can_reload_loaded_tenants_when_stre
 
 
 @pytest.mark.asyncio
+async def test_runtime_invalidation_listener_reloads_loaded_tenants_when_stream_replay_has_no_valid_events() -> None:
+    redis = FakeRedis()
+    redis.stream_replay_entries = [
+        ("1-0", {"payload": "not json"}),
+        ("2-0", {"other": "missing payload"}),
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+        reload_on_empty_stream_replay=True,
+    )
+
+    assert mcp_runtime.reloaded == [None]
+    assert plugin_runtime.reloaded == [None]
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_invalidation_listener_drains_stream_replay_batches_before_pubsub() -> None:
     def payload(event_id: str, tenant_id: UUID) -> dict[str, str]:
         return {

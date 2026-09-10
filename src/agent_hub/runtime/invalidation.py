@@ -209,7 +209,6 @@ class RuntimeConfigInvalidationBus:
                     payload = fields.get("payload")
                     if payload is None:
                         continue
-                    replayed = True
                     handled = await self._handle_message(
                         {"type": "message", "data": payload},
                         mcp_runtime=mcp_runtime,
@@ -218,6 +217,7 @@ class RuntimeConfigInvalidationBus:
                         seen_event_order=seen_event_order,
                     )
                     if handled:
+                        replayed = True
                         acked.append(entry_id)
                 if acked:
                     await self._redis.xack(stream, stream_consumer_group, *acked)
