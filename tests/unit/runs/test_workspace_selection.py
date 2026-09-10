@@ -112,3 +112,29 @@ def test_submitted_projection_drops_unknown_persisted_permissions_without_profil
 
     assert submitted.sandbox_profile is None
     assert submitted.requested_permissions == ("workspace.read",)
+
+
+def test_submitted_projection_drops_write_permissions_without_sandbox_profile() -> None:
+    submitted = _submitted(
+        RunRecord(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            request="inspect workspace",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.QUEUED,
+            version=1,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "requested_permissions": [
+                    "workspace.read",
+                    "workspace.write",
+                    "command.run",
+                    "network.read",
+                ],
+            },
+        )
+    )
+
+    assert submitted.sandbox_profile is None
+    assert submitted.requested_permissions == ("workspace.read",)

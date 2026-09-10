@@ -2305,7 +2305,9 @@ def _safe_submitted_workspace_policy(
     sandbox_profile = _string_or_none(decision.get("sandbox_profile"))
     requested_permissions = _requested_permissions_from_routing_decision(decision)
     if sandbox_profile is None:
-        return None, requested_permissions
+        return None, tuple(
+            permission for permission in requested_permissions if permission == "workspace.read"
+        )
     try:
         selection = workspace_selection(
             project_id=None,
