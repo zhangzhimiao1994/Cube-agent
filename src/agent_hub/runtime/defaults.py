@@ -1236,6 +1236,7 @@ def _discussion_role_payload(plan: DiscussionPlan) -> tuple[Mapping[str, JsonVal
             "purpose": "expertise",
             "logical_model": participant.logical_model,
             "tools": participant.allowed_tools,
+            "has_output_schema": False,
         }
         for participant in plan.participants
     )

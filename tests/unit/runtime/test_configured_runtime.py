@@ -3248,6 +3248,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
             "purpose": "expertise",
             "logical_model": "main",
             "tools": (),
+            "has_output_schema": False,
         },
         {
             "id": "reviewer",
@@ -3255,6 +3256,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
             "purpose": "expertise",
             "logical_model": "review",
             "tools": (),
+            "has_output_schema": False,
         },
     )
     assert events[0].payload["steps"] == (
