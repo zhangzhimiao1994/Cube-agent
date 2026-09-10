@@ -1699,6 +1699,68 @@ def test_model_capability_negotiation_does_not_union_split_deployment_capabiliti
     assert negotiation["missing_count"] == 1
 
 
+def test_model_capability_negotiation_treats_messages_endpoint_tool_calling_as_missing() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "messages": {
+                    "deployments": [
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-3-5-sonnet",
+                            "api_base": "https://api.anthropic.com/v1/messages",
+                            "credential_ref": "secret://messages",
+                            "quota_scope_id": "messages",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling"],
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Read context using a tool.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "reader",
+                "role": "Reader",
+                "purpose": "synthesize",
+                "logical_model": "messages",
+                "has_output_schema": False,
+                "tools": ("read_context",),
+            },
+        ),
+        model_routing_matrix=(),
+        config=config,
+    )
+
+    negotiation = plan["model_capability_negotiation"]
+    assert isinstance(negotiation, Mapping)
+    assert negotiation["items"] == (
+        {
+            "role_id": "reader",
+            "logical_model": "messages",
+            "required_capabilities": ("text", "tool_calling"),
+            "matched_capabilities": ("text",),
+            "missing_capabilities": ("tool_calling",),
+            "status": "missing_capability",
+        },
+    )
+    assert negotiation["satisfied_count"] == 0
+    assert negotiation["missing_count"] == 1
+
+
 def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
     source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
         {

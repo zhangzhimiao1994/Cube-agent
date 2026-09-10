@@ -2038,7 +2038,12 @@ def _logical_model_capabilities_for_requirements(
         return None
     deployment_capabilities: list[frozenset[ModelCapability]] = []
     for deployment in definition.deployments:
-        capabilities = frozenset(ModelCapability(item) for item in deployment.capabilities)
+        capability_items = {ModelCapability(item) for item in deployment.capabilities}
+        if ModelCapability.TOOL_CALLING in required and _is_messages_endpoint_api_base(
+            deployment.api_base
+        ):
+            capability_items.discard(ModelCapability.TOOL_CALLING)
+        capabilities = frozenset(capability_items)
         if all(capability in capabilities for capability in required):
             return capabilities
         deployment_capabilities.append(capabilities)
