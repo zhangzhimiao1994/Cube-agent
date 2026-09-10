@@ -360,11 +360,10 @@ class RoleAwareGateway:
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
-        text = (
-            '{"verdict":"approve"}'
-            if request.logical_model == "review"
-            else "role output " + ("内容" * 600)
-        )
+        if request.logical_model == "review":
+            text = '{"verdict":"approve"}'
+        else:
+            text = _role_output_text(request, fallback="role output " + ("内容" * 600))
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -373,6 +372,12 @@ class RoleAwareGateway:
             provider_model="deepseek/deepseek-v4-flash",
             cost_usd=Decimal(0),
         )
+
+
+def _role_output_text(request: ModelRequest, *, fallback: str = "role output") -> str:
+    if request.response_schema is not None:
+        return '{"summary":"role output","findings":["ok"],"risks":[]}'
+    return fallback
 
 
 class SequenceGateway:
@@ -404,12 +409,10 @@ class EmptyThenRoleAwareGateway(RoleAwareGateway):
         if request.logical_model == self.empty_logical_model and not self._empty_returned:
             self._empty_returned = True
             text = ""
+        elif request.logical_model == "review":
+            text = '{"verdict":"approve"}'
         else:
-            text = (
-                '{"verdict":"approve"}'
-                if request.logical_model == "review"
-                else "role output " + ("内容" * 600)
-            )
+            text = _role_output_text(request, fallback="role output " + ("内容" * 600))
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -431,7 +434,11 @@ class CapacityUnavailableThenRoleAwareGateway(RoleAwareGateway):
         if request.logical_model == self.unavailable_logical_model and not self._unavailable_returned:
             self._unavailable_returned = True
             raise CapacityUnavailable("model capacity unavailable")
-        text = '{"verdict":"approve"}' if request.logical_model == "review" else "role output"
+        text = (
+            '{"verdict":"approve"}'
+            if request.logical_model == "review"
+            else _role_output_text(request)
+        )
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -455,7 +462,10 @@ class SlowCapacityRecoveryGateway(RoleAwareGateway):
             raise CapacityUnavailable("model capacity unavailable")
         await asyncio.sleep(1.5)
         return GatewayCompletion(
-            response=ModelResponse(text="role output", usage=TokenUsage(1, 1, 2)),
+            response=ModelResponse(
+                text=_role_output_text(request),
+                usage=TokenUsage(1, 1, 2),
+            ),
             deployment_id="primary",
             logical_model=request.logical_model,
             provider_id="deepseek",
@@ -475,7 +485,11 @@ class RepeatedCapacityUnavailableGateway(RoleAwareGateway):
         if request.logical_model == self.unavailable_logical_model and self.failures > 0:
             self.failures -= 1
             raise CapacityUnavailable("model capacity unavailable")
-        text = '{"verdict":"approve"}' if request.logical_model == "review" else "role output"
+        text = (
+            '{"verdict":"approve"}'
+            if request.logical_model == "review"
+            else _role_output_text(request)
+        )
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -656,7 +670,13 @@ def _project_zip_plan() -> DispatchPlan:
 def _reviewed_step_plan(*, reviewer_retries: int = 0) -> DispatchPlan:
     return DispatchPlan(
         agents=(
-            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string"},
+            ),
             AgentSpec(id="reviewer", role="reviewer", goal="Review", logical_model="review"),
             AgentSpec(
                 id="final_synthesizer",
@@ -690,7 +710,13 @@ def _reviewed_step_plan(*, reviewer_retries: int = 0) -> DispatchPlan:
 def _dependent_final_plan() -> DispatchPlan:
     return DispatchPlan(
         agents=(
-            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string"},
+            ),
             AgentSpec(
                 id="final_synthesizer",
                 role="Final Synthesizer",

@@ -11,13 +11,19 @@ from agent_hub.runtime.crew.plan import (
 )
 
 
-def agent(agent_id: str, *, tools: tuple[str, ...] = ()) -> AgentSpec:
+def agent(
+    agent_id: str,
+    *,
+    tools: tuple[str, ...] = (),
+    output_schema: dict[str, str] | None = None,
+) -> AgentSpec:
     return AgentSpec(
         id=agent_id,
         role=agent_id,
         goal=f"Goal for {agent_id}",
         logical_model="general",
         allowed_tools=tools,
+        output_schema=output_schema or {},
     )
 
 
@@ -54,7 +60,14 @@ def test_agent_role_is_display_text_while_machine_fields_stay_safe_identifiers()
 
 def test_valid_plan_has_deterministic_layers_and_round_trip() -> None:
     plan = DispatchPlan(
-        agents=(agent("researcher", tools=("web.search",)), agent("writer")),
+        agents=(
+            agent(
+                "researcher",
+                tools=("web.search",),
+                output_schema={"summary": "string"},
+            ),
+            agent("writer"),
+        ),
         steps=(
             DispatchStep(
                 id="research",
@@ -80,6 +93,80 @@ def test_valid_plan_has_deterministic_layers_and_round_trip() -> None:
     assert plan.final_step.id == "write"
     assert DispatchPlan.from_payload(plan.to_payload()) == plan
     assert len(plan.digest) == 64
+
+
+def test_handoff_source_steps_require_structured_output_schema() -> None:
+    with pytest.raises((InvalidDispatchPlan, ValidationError), match="output_schema"):
+        DispatchPlan(
+            agents=(agent("researcher"), agent("writer")),
+            steps=(
+                DispatchStep(
+                    id="research",
+                    agent="researcher",
+                    task="Research facts",
+                    token_budget=100,
+                ),
+                DispatchStep(
+                    id="write",
+                    agent="writer",
+                    task="Write answer",
+                    depends_on=("research",),
+                    final_synthesizer=True,
+                    token_budget=100,
+                ),
+            ),
+            total_token_budget=200,
+        )
+
+
+def test_revalidate_rejects_constructed_handoff_source_without_output_schema() -> None:
+    unsafe = DispatchPlan.model_construct(
+        agents=(agent("researcher"), agent("writer")),
+        steps=(
+            DispatchStep(
+                id="research",
+                agent="researcher",
+                task="Research facts",
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="write",
+                agent="writer",
+                task="Write answer",
+                depends_on=("research",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=(),
+        denied_tools=(),
+        max_steps=64,
+        max_parallelism=4,
+        total_token_budget=200,
+        total_timeout_seconds=3600.0,
+        total_cost_usd=Decimal(0),
+    )
+
+    with pytest.raises(InvalidDispatchPlan):
+        DispatchPlan.revalidate(unsafe)
+
+
+def test_single_final_step_can_use_plain_text_without_output_schema() -> None:
+    plan = DispatchPlan(
+        agents=(agent("writer"),),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Write answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+
+    assert plan.final_step.id == "final"
 
 
 def test_fixed_yaml_plan_loads_and_yaml_aliases_are_rejected() -> None:
@@ -157,7 +244,11 @@ def test_yaml_rejects_duplicate_keys_at_every_depth(source: str) -> None:
 )
 def test_invalid_graphs_are_rejected(steps: tuple[DispatchStep, ...], message: str) -> None:
     with pytest.raises((InvalidDispatchPlan, ValidationError), match=message):
-        DispatchPlan(agents=(agent("x"),), steps=steps, total_token_budget=10_000)
+        DispatchPlan(
+            agents=(agent("x", output_schema={"summary": "string"}),),
+            steps=steps,
+            total_token_budget=10_000,
+        )
 
 
 def test_tool_permission_is_intersection_and_dangerous_tools_are_rejected() -> None:
@@ -249,7 +340,7 @@ def test_plan_rejects_unknown_agent_budget_overflow_and_construct_bypass() -> No
 
 def test_plan_allows_shared_total_token_budget_across_sequential_steps() -> None:
     plan = DispatchPlan(
-        agents=(agent("x"),),
+        agents=(agent("x", output_schema={"summary": "string"}),),
         steps=(
             DispatchStep(id="draft", agent="x", task="Draft", token_budget=100),
             DispatchStep(
@@ -270,7 +361,7 @@ def test_plan_allows_shared_total_token_budget_across_sequential_steps() -> None
 def test_plan_rejects_aggregate_oversized_text() -> None:
     with pytest.raises(ValidationError, match="size"):
         DispatchPlan(
-            agents=(agent("x"),),
+            agents=(agent("x", output_schema={"summary": "string"}),),
             steps=tuple(
                 DispatchStep(
                     id=f"step-{index}",

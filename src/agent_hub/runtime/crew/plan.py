@@ -357,6 +357,14 @@ class DispatchPlan(_PlanModel):
         final_step = final[0]
         if any(final_step.id in step.depends_on for step in self.steps):
             raise InvalidDispatchPlan("final synthesizer must be terminal")
+        dependent_step_ids = {
+            dependency for step in self.steps for dependency in step.depends_on
+        }
+        for step in self.steps:
+            if step.id in dependent_step_ids and not agents[step.agent].output_schema:
+                raise InvalidDispatchPlan(
+                    "handoff source steps require agent output_schema"
+                )
         ancestors = self._ancestors(final_step.id)
         leaves = {
             step.id
