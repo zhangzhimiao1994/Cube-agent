@@ -15,6 +15,7 @@ import pytest
 
 from agent_hub.api.routers.admin import (
     PluginCapabilityRequest,
+    PluginPackageDependency,
     PluginPackageMetadata,
     PluginResourceRequest,
     PluginResourceResponse,
@@ -586,6 +587,41 @@ def test_plugin_package_execution_target_rejects_missing_artifact_metadata(
                 sandbox_profile="in_process",
                 package_metadata=package_metadata,
                 content_sha256="a" * 64,
+            ),
+            tenant_id=TENANT_ID,
+            package_store_dir=tmp_path,
+        )
+
+
+def test_plugin_package_execution_target_rejects_package_dependencies(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    ).model_copy(
+        update={
+            "dependencies": (
+                PluginPackageDependency(name="requests", version="2.32.0"),
+            )
+        }
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="Plugin package dependencies are not supported by this runtime",
+    ):
+        _plugin_package_execution_target(
+            plugin(
+                "calendar",
+                adapter="calendar_python",
+                sandbox_profile="local_process",
+                package_metadata=package_metadata,
+                content_sha256=content_sha256,
             ),
             tenant_id=TENANT_ID,
             package_store_dir=tmp_path,
@@ -1927,6 +1963,73 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
                     adapter="calendar_python",
                     sandbox_profile="local_process",
                     package_metadata=package_metadata,
+                ),
+            )
+        ),
+        adapters={"calendar_python": adapter},
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="invoke-1",
+        )
+    assert adapter.calls == []
+
+
+async def test_runtime_plugin_service_blocks_runtime_registered_package_dependencies() -> None:
+    package_metadata = verified_package_with_artifact(
+        content_sha256="a" * 64,
+        storage_key=f"{TENANT_ID}/calendar/{'a' * 64}",
+    ).model_copy(
+        update={
+            "artifact": None,
+            "dependencies": (
+                PluginPackageDependency(name="requests", version="2.32.0"),
+            ),
+        }
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="local_process",
+                    package_metadata=package_metadata,
+                    content_sha256="a" * 64,
                 ),
             )
         ),

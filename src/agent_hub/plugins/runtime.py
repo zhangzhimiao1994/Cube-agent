@@ -809,6 +809,8 @@ def _runtime_package_activation_block_reason(
         return "plugin package runtime is not supported for activation"
     if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
         return "plugin package isolation is not supported for activation"
+    if package.dependencies:
+        return "plugin package dependencies are not supported by this runtime"
     adapter = adapters.get(package.adapter_id or "")
     if adapter is None:
         return "runtime-registered adapter package requires a registered adapter"
@@ -851,6 +853,10 @@ def _plugin_package_execution_target(
         or package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS
     ):
         raise RuntimeCapabilityError("Plugin package is not eligible for executable activation")
+    if package.dependencies:
+        raise RuntimeCapabilityError(
+            "Plugin package dependencies are not supported by this runtime"
+        )
     artifact = package.artifact
     if artifact is None:
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
