@@ -1547,6 +1547,85 @@ def test_model_execution_plan_reports_safe_model_capability_negotiation() -> Non
         assert unsafe_marker not in serialized_negotiation
 
 
+def test_model_capability_negotiation_prefers_config_deployment_capabilities() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "coder": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://coder",
+                            "quota_scope_id": "coder",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Build and verify a small Python project.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "builder",
+                "role": "Builder",
+                "purpose": "execute",
+                "logical_model": "coder",
+                "tools": ("run_safe_command",),
+            },
+        ),
+        model_routing_matrix=(
+            {
+                "role_id": "builder",
+                "purpose": "execute",
+                "selected_logical_model": "coder",
+                "candidate_count": 1,
+                "truncated_candidates": False,
+                "candidates": (
+                    {
+                        "logical_model": "coder",
+                        "score": 42,
+                        "adjusted_score": 42,
+                        "eligible": True,
+                        "selected": True,
+                        "traits": ("text", "structured_output", "tool_calling"),
+                        "reasons": ("capability:tool_role_supported",),
+                    },
+                ),
+            },
+        ),
+        config=config,
+    )
+
+    negotiation = plan["model_capability_negotiation"]
+    assert isinstance(negotiation, Mapping)
+    assert negotiation["items"] == (
+        {
+            "role_id": "builder",
+            "logical_model": "coder",
+            "required_capabilities": ("text", "structured_output", "tool_calling"),
+            "matched_capabilities": ("text",),
+            "missing_capabilities": ("structured_output", "tool_calling"),
+            "status": "missing_capability",
+        },
+    )
+    assert negotiation["satisfied_count"] == 0
+    assert negotiation["missing_count"] == 1
+
+
 def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
     source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
         {

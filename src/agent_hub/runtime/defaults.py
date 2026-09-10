@@ -1970,9 +1970,13 @@ def _model_capability_negotiation_payload(
             truncated = True
             break
         required = _required_model_capabilities_for_role(role)
-        selected = selected_capabilities.get(role_id)
-        if selected is None and config is not None:
-            selected = _logical_model_capabilities(config, logical_model)
+        selected = (
+            _logical_model_capabilities(config, logical_model)
+            if config is not None
+            else selected_capabilities.get(role_id)
+        )
+        if selected is None:
+            selected = selected_capabilities.get(role_id)
         matched = tuple(capability for capability in required if selected and capability in selected)
         missing = (
             tuple(capability for capability in required if capability not in selected)
