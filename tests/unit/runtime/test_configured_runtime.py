@@ -1677,7 +1677,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -1692,7 +1692,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -1928,7 +1928,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             },
                             {
                                 "provider": "deepseek",
@@ -1939,7 +1939,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             },
                         ]
                     },
@@ -1954,7 +1954,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -2114,9 +2114,9 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                 "role_id": "copywriter",
                 "logical_model": "creative",
                 "required_capabilities": ("text", "structured_output"),
-                "matched_capabilities": ("text",),
-                "missing_capabilities": ("structured_output",),
-                "status": "missing_capability",
+                "matched_capabilities": ("text", "structured_output"),
+                "missing_capabilities": (),
+                "status": "satisfied",
             },
             {
                 "role_id": "final_synthesizer",
@@ -2128,8 +2128,8 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
             },
         ),
         "role_count": 2,
-        "satisfied_count": 0,
-        "missing_count": 1,
+        "satisfied_count": 1,
+        "missing_count": 0,
         "unknown_count": 1,
         "truncated": False,
     }
@@ -2517,7 +2517,7 @@ async def test_config_backed_dispatch_runtime_omits_invalid_capability_inventory
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -2583,7 +2583,7 @@ async def test_config_backed_dispatch_runtime_bounds_capability_inventory(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -2684,7 +2684,7 @@ async def test_config_backed_dispatch_runtime_bounds_invalid_inventory_scan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -2985,7 +2985,7 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -3000,7 +3000,7 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -3093,7 +3093,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -3108,7 +3108,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
-                                "capabilities": ["text"],
+                                "capabilities": ["text", "structured_output"],
                             }
                         ]
                     },
@@ -4926,6 +4926,115 @@ def test_role_model_assignment_fails_closed_when_tool_role_has_no_eligible_model
             config,
             default_model="sonnet",
             task="读取上下文后生成计划。",
+        )
+
+
+def test_role_model_assignment_routes_structured_output_roles_to_capable_model() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "plain": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://plain",
+                            "quota_scope_id": "plain",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "structured": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://structured",
+                            "quota_scope_id": "structured",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="reviewer",
+        role="Reviewer",
+        purpose=RolePurpose.VERIFY,
+        mission="按 schema 输出验收摘要。",
+        must_answer=("验收结果是什么？",),
+        allowed_tools=(),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="plain",
+    )
+
+    assigned = _assign_models_to_roles(
+        (role,),
+        config,
+        default_model="plain",
+        task="生成结构化验收摘要。",
+    )
+
+    assert assigned[0].model == "structured"
+
+
+def test_role_model_assignment_fails_closed_when_structured_output_role_has_no_capable_model() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "plain": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://plain",
+                            "quota_scope_id": "plain",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="reviewer",
+        role="Reviewer",
+        purpose=RolePurpose.VERIFY,
+        mission="按 schema 输出验收摘要。",
+        must_answer=("验收结果是什么？",),
+        allowed_tools=(),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="plain",
+    )
+
+    with pytest.raises(
+        defaults_module.HarnessModelSelectionError,
+        match="model capability unavailable",
+    ):
+        _assign_models_to_roles(
+            (role,),
+            config,
+            default_model="plain",
+            task="生成结构化验收摘要。",
         )
 
 

@@ -1,5 +1,6 @@
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.models.routing_matrix import RoleModelRoutingRequest, rank_role_models
+from agent_hub.models.types import ModelCapability
 
 
 def test_role_model_routing_matrix_explains_creative_model_selection() -> None:
@@ -112,3 +113,127 @@ def test_role_model_routing_matrix_blocks_messages_endpoint_for_tool_roles() -> 
     assert blocked.eligible is False
     assert "capability:tool_role_unsupported_messages_endpoint" in blocked.reasons
     assert "capability:tool_role_supported" in ranked[0].reasons
+
+
+def test_role_model_routing_matrix_blocks_missing_required_capabilities() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "plain": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://plain",
+                            "quota_scope_id": "plain",
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "structured": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "capabilities": ["text", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+
+    ranked = rank_role_models(
+        RoleModelRoutingRequest(
+            task="生成结构化验收摘要。",
+            role_id="reviewer",
+            role="Reviewer",
+            purpose="execute",
+            mission="按 schema 输出验收摘要。",
+            skills=(),
+            must_answer=("结果是什么？",),
+            allowed_tools=(),
+            preferred_model="plain",
+            default_model="plain",
+            required_capabilities=frozenset(
+                {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
+            ),
+        ),
+        config,
+    )
+
+    assert ranked[0].logical_model == "structured"
+    blocked = next(candidate for candidate in ranked if candidate.logical_model == "plain")
+    assert blocked.eligible is False
+    assert "capability:missing:structured_output" in blocked.reasons
+
+
+def test_role_model_routing_matrix_requires_single_deployment_with_all_capabilities() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "split": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "capabilities": ["text"],
+                        },
+                        {
+                            "provider": "qwen",
+                            "model": "qwen-json",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "capabilities": ["structured_output"],
+                        },
+                    ]
+                },
+                "complete": {
+                    "deployments": [
+                        {
+                            "provider": "openai",
+                            "model": "gpt-5.6-sol",
+                            "api_base": "https://api.openai.com/v1",
+                            "credential_ref": "secret://openai",
+                            "quota_scope_id": "openai",
+                            "capabilities": ["text", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+
+    ranked = rank_role_models(
+        RoleModelRoutingRequest(
+            task="生成结构化验收摘要。",
+            role_id="reviewer",
+            role="Reviewer",
+            purpose="execute",
+            mission="按 schema 输出验收摘要。",
+            skills=(),
+            must_answer=("结果是什么？",),
+            allowed_tools=(),
+            preferred_model="split",
+            default_model="split",
+            required_capabilities=frozenset(
+                {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
+            ),
+        ),
+        config,
+    )
+
+    assert ranked[0].logical_model == "complete"
+    split = next(candidate for candidate in ranked if candidate.logical_model == "split")
+    assert split.eligible is False
+    assert "capability:missing:structured_output" in split.reasons

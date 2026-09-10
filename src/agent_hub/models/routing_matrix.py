@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from agent_hub.config.schema import LogicalModelDefinition, PlatformConfig
 from agent_hub.models.profiles import infer_model_traits
+from agent_hub.models.types import ModelCapability
 
 _SOFTWARE_TASK_KEYWORDS = (
     "code",
@@ -78,6 +79,7 @@ class RoleModelRoutingRequest:
     allowed_tools: tuple[str, ...]
     preferred_model: str
     default_model: str
+    required_capabilities: frozenset[ModelCapability] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,14 +136,17 @@ def rank_role_models(
         if capacity_bonus:
             score += capacity_bonus
             reasons.append(f"capacity:configured:{capacity_bonus}")
-        eligible = True
-        if request.allowed_tools:
-            if _logical_model_supports_tool_roles(definition):
-                reasons.append("capability:tool_role_supported")
-            else:
-                score -= 1000
-                eligible = False
-                reasons.append("capability:tool_role_unsupported_messages_endpoint")
+        required_capabilities = _required_capabilities_for_request(request)
+        unsupported = _unsupported_required_capabilities(definition, required_capabilities)
+        eligible = not unsupported
+        if request.allowed_tools and ModelCapability.TOOL_CALLING not in unsupported:
+            reasons.append("capability:tool_role_supported")
+        elif request.allowed_tools and ModelCapability.TOOL_CALLING in unsupported:
+            reasons.append("capability:tool_role_unsupported_messages_endpoint")
+        if unsupported:
+            score -= 1000
+            for capability in sorted(unsupported, key=lambda item: item.value):
+                reasons.append(f"capability:missing:{capability.value}")
         traits = _model_traits(logical_model, definition)
         score += _task_characteristic_score(text, traits, reasons)
         score += _domain_keyword_score(text, haystack, reasons)
@@ -324,6 +329,47 @@ def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bo
         and not _is_messages_endpoint_api_base(deployment.api_base)
         for deployment in definition.deployments
     )
+
+
+def _required_capabilities_for_request(
+    request: RoleModelRoutingRequest,
+) -> frozenset[ModelCapability]:
+    required = set(request.required_capabilities)
+    required.add(ModelCapability.TEXT)
+    if request.allowed_tools:
+        required.add(ModelCapability.TOOL_CALLING)
+    return frozenset(required)
+
+
+def _unsupported_required_capabilities(
+    definition: LogicalModelDefinition,
+    required: frozenset[ModelCapability],
+) -> frozenset[ModelCapability]:
+    if not required:
+        return frozenset()
+    for deployment in definition.deployments:
+        capabilities = deployment.capabilities
+        if not required.issubset(capabilities):
+            continue
+        if ModelCapability.TOOL_CALLING in required and _is_messages_endpoint_api_base(
+            deployment.api_base
+        ):
+            continue
+        return frozenset()
+    declared = frozenset(
+        capability
+        for deployment in definition.deployments
+        for capability in deployment.capabilities
+    )
+    unsupported = set(required - declared)
+    if not unsupported:
+        unsupported.update(required)
+    if (
+        ModelCapability.TOOL_CALLING in required
+        and not _logical_model_supports_tool_roles(definition)
+    ):
+        unsupported.add(ModelCapability.TOOL_CALLING)
+    return frozenset(unsupported)
 
 
 def _is_messages_endpoint_api_base(api_base: str | None) -> bool:

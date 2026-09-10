@@ -2191,6 +2191,7 @@ def _role_model_routing_matrix_payload(
     }
     assigned_counts: dict[str, int] = {}
     for index, role in enumerate(source_roles[:_MAX_MODEL_ROUTING_MATRIX_ROLES]):
+        role_tools = _routing_tools_for_role(role, role_tools_by_id)
         ranked = rank_role_models(
             RoleModelRoutingRequest(
                 task=task,
@@ -2200,9 +2201,13 @@ def _role_model_routing_matrix_payload(
                 mission=role.mission,
                 skills=role.skills,
                 must_answer=role.must_answer,
-                allowed_tools=_routing_tools_for_role(role, role_tools_by_id),
+                allowed_tools=role_tools,
                 preferred_model=role.model,
                 default_model=default_model,
+                required_capabilities=_required_model_capabilities_for_assignment(
+                    role,
+                    allowed_tools=role_tools,
+                ),
             ),
             config,
         )
@@ -2477,6 +2482,10 @@ def _rank_logical_models_for_role(
             allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
             preferred_model=role.model,
             default_model=default_model,
+            required_capabilities=_required_model_capabilities_for_assignment(
+                role,
+                allowed_tools=allowed_tools if allowed_tools is not None else role.allowed_tools,
+            ),
         ),
         config,
     )
@@ -2495,6 +2504,19 @@ def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bo
         and not _is_messages_endpoint_api_base(deployment.api_base)
         for deployment in definition.deployments
     )
+
+
+def _required_model_capabilities_for_assignment(
+    role: RoleAssignment,
+    *,
+    allowed_tools: tuple[str, ...],
+) -> frozenset[ModelCapability]:
+    required = {ModelCapability.TEXT}
+    if role.output_schema:
+        required.add(ModelCapability.STRUCTURED_OUTPUT)
+    if allowed_tools:
+        required.add(ModelCapability.TOOL_CALLING)
+    return frozenset(required)
 
 
 def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
