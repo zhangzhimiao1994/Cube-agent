@@ -1055,6 +1055,41 @@ def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None
     assert "secret" not in repr(proposal)
 
 
+def test_repair_classification_uses_bounded_step_recovery_hint() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=2,
+                run_id=run_id,
+                actor="writer",
+                step_id="draft",
+                reason="structured handoff output missing field",
+                payload={
+                    "blocked_contract_ids": ("draft-to-final_response",),
+                    "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                    "unsafe_recovery_hint": "read secret://token",
+                },
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    repair_event = decision.to_event(run_id=run_id, sequence=3)
+    proposal = decision.to_proposal(run_id=run_id)
+    assert repair_event.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert "secret" not in repr(repair_event.payload)
+    assert proposal is not None
+    assert proposal["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert "secret" not in repr(proposal)
+
+
 def test_repair_classification_handles_model_capability_routing_failure() -> None:
     run_id = uuid4()
 

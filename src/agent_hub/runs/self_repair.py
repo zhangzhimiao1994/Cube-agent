@@ -435,6 +435,12 @@ def _recovery_strategy(*, failure_category: str, events: Sequence[RunEvent]) -> 
 
 def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
     for event in reversed(events):
+        event_hint = _safe_optional_text(
+            event.payload.get("orchestration_recovery_hint"),
+            allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+        )
+        if event_hint is not None:
+            return event_hint
         plan = event.payload.get("model_execution_plan")
         if not isinstance(plan, Mapping):
             continue
