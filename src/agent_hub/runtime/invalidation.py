@@ -23,6 +23,27 @@ class ReloadableRuntime(Protocol):
 
 
 class RedisInvalidationClient(Protocol):
+    async def xgroup_create(
+        self,
+        stream: str,
+        groupname: str,
+        id: str = "0-0",
+        *,
+        mkstream: bool = False,
+    ) -> object: ...
+
+    async def xreadgroup(
+        self,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        *,
+        count: int | None = None,
+        block: int | None = None,
+    ) -> object: ...
+
+    async def xack(self, stream: str, groupname: str, *ids: str) -> object: ...
+
     async def xadd(
         self,
         stream: str,
@@ -96,7 +117,18 @@ class RuntimeConfigInvalidationBus:
         mcp_runtime: ReloadableRuntime | None = None,
         plugin_runtime: ReloadableRuntime | None = None,
         max_messages: int | None = None,
+        stream_consumer_group: str | None = None,
+        stream_consumer_name: str | None = None,
+        max_stream_replay_messages: int = 128,
     ) -> None:
+        if stream_consumer_group is not None:
+            await self._replay_stream(
+                mcp_runtime=mcp_runtime,
+                plugin_runtime=plugin_runtime,
+                stream_consumer_group=stream_consumer_group,
+                stream_consumer_name=stream_consumer_name,
+                max_stream_replay_messages=max_stream_replay_messages,
+            )
         pubsub = self._redis.pubsub()
         handled = 0
         seen_event_ids: set[str] = set()
@@ -119,6 +151,61 @@ class RuntimeConfigInvalidationBus:
             close = getattr(pubsub, "aclose", None)
             if callable(close):
                 await close()
+
+    async def _replay_stream(
+        self,
+        *,
+        mcp_runtime: ReloadableRuntime | None,
+        plugin_runtime: ReloadableRuntime | None,
+        stream_consumer_group: str,
+        stream_consumer_name: str | None,
+        max_stream_replay_messages: int,
+    ) -> None:
+        if self._stream is None:
+            return
+        if _optional_safe_identifier(stream_consumer_group) is None:
+            raise ValueError("stream_consumer_group must be a safe identifier")
+        consumer_name = stream_consumer_name or self._source_instance_id
+        if _optional_safe_identifier(consumer_name) is None:
+            raise ValueError("stream_consumer_name must be a safe identifier")
+        if type(max_stream_replay_messages) is not int or max_stream_replay_messages < 1:
+            raise ValueError("max_stream_replay_messages must be a positive integer")
+        try:
+            await self._redis.xgroup_create(
+                self._stream,
+                stream_consumer_group,
+                "0-0",
+                mkstream=True,
+            )
+        except Exception as error:  # noqa: BLE001 - Redis reports existing groups by exception.
+            _LOGGER.debug(
+                "runtime_config_invalidation_stream_group_create_skipped error_type=%s",
+                type(error).__name__,
+            )
+        raw_entries = await self._redis.xreadgroup(
+            stream_consumer_group,
+            consumer_name,
+            {self._stream: ">"},
+            count=max_stream_replay_messages,
+            block=0,
+        )
+        for stream, entries in _stream_read_entries(raw_entries):
+            acked: list[str] = []
+            for entry_id, fields in entries:
+                payload = fields.get("payload")
+                if payload is None:
+                    continue
+                handled = await self._handle_message(
+                    {"type": "message", "data": payload},
+                    mcp_runtime=mcp_runtime,
+                    plugin_runtime=plugin_runtime,
+                    seen_event_ids=set(),
+                    seen_event_order=deque(),
+                )
+                if handled:
+                    acked.append(entry_id)
+            if acked:
+                await self._redis.xack(stream, stream_consumer_group, *acked)
 
     async def _handle_message(
         self,
@@ -207,6 +294,42 @@ def _optional_safe_stream_name(value: object) -> str | None:
     if any(character.isspace() or ord(character) < 33 for character in value):
         return None
     return value
+
+
+def _stream_read_entries(
+    raw_entries: object,
+) -> tuple[tuple[str, tuple[tuple[str, dict[str, str]], ...]], ...]:
+    if not isinstance(raw_entries, list | tuple):
+        return ()
+    streams: list[tuple[str, tuple[tuple[str, dict[str, str]], ...]]] = []
+    for raw_stream in raw_entries:
+        if not isinstance(raw_stream, list | tuple) or len(raw_stream) != 2:
+            continue
+        stream_name, raw_messages = raw_stream
+        if isinstance(stream_name, bytes):
+            stream_name = stream_name.decode("utf-8", "replace")
+        if not isinstance(stream_name, str) or not isinstance(raw_messages, list | tuple):
+            continue
+        messages: list[tuple[str, dict[str, str]]] = []
+        for raw_message in raw_messages:
+            if not isinstance(raw_message, list | tuple) or len(raw_message) != 2:
+                continue
+            entry_id, raw_fields = raw_message
+            if isinstance(entry_id, bytes):
+                entry_id = entry_id.decode("utf-8", "replace")
+            if not isinstance(entry_id, str) or not isinstance(raw_fields, dict):
+                continue
+            fields: dict[str, str] = {}
+            for key, value in raw_fields.items():
+                if isinstance(key, bytes):
+                    key = key.decode("utf-8", "replace")
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", "replace")
+                if isinstance(key, str) and isinstance(value, str):
+                    fields[key] = value
+            messages.append((entry_id, fields))
+        streams.append((stream_name, tuple(messages)))
+    return tuple(streams)
 
 
 async def _reload_runtime(

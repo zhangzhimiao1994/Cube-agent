@@ -16,6 +16,10 @@ class FakeRedis:
     def __init__(self, messages: list[dict[str, object]] | None = None) -> None:
         self.published: list[tuple[str, str]] = []
         self.stream_entries: list[tuple[str, dict[str, str], int | None, bool]] = []
+        self.stream_replay_entries: list[tuple[str, dict[str, str]]] = []
+        self.consumer_groups_created: list[tuple[str, str, str, bool]] = []
+        self.stream_reads: list[tuple[str, str, dict[str, str], int | None]] = []
+        self.acked: list[tuple[str, str, tuple[str, ...]]] = []
         self._messages = messages or []
 
     async def publish(self, channel: str, payload: str) -> int:
@@ -32,6 +36,34 @@ class FakeRedis:
     ) -> str:
         self.stream_entries.append((stream, fields, maxlen, approximate))
         return "1-0"
+
+    async def xgroup_create(
+        self,
+        stream: str,
+        groupname: str,
+        id: str = "0-0",
+        *,
+        mkstream: bool = False,
+    ) -> str:
+        self.consumer_groups_created.append((stream, groupname, id, mkstream))
+        return "OK"
+
+    async def xreadgroup(
+        self,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        *,
+        count: int | None = None,
+        block: int | None = None,
+    ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+        del block
+        self.stream_reads.append((groupname, consumername, streams, count))
+        return [("runtime:test:stream", self.stream_replay_entries[: count or None])]
+
+    async def xack(self, stream: str, groupname: str, *ids: str) -> int:
+        self.acked.append((stream, groupname, ids))
+        return len(ids)
 
     def pubsub(self) -> "FakePubSub":
         return FakePubSub(self._messages)
@@ -118,6 +150,48 @@ async def test_runtime_invalidation_bus_records_durable_stream_entry() -> None:
     pubsub_payload = json.loads(redis.published[0][1])
     assert stream_payload == pubsub_payload
     assert stream_payload["target"] == "plugin"
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsub() -> None:
+    redis = FakeRedis()
+    redis.stream_replay_entries = [
+        (
+            "1-0",
+            {
+                "payload": json.dumps(
+                    {
+                        "event_id": "event-1",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "plugin",
+                    }
+                )
+            },
+        )
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert redis.consumer_groups_created == [
+        ("runtime:test:stream", "worker-runtime-1", "0-0", True)
+    ]
+    assert redis.stream_reads == [
+        ("worker-runtime-1", "worker-1", {"runtime:test:stream": ">"}, 128)
+    ]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
 
 
 @pytest.mark.asyncio
