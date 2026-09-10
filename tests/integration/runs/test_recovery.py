@@ -445,6 +445,50 @@ async def test_recovery_ignores_harness_started_marker_before_first_checkpoint(
     assert checkpoint is None
 
 
+async def test_recovery_ignores_repair_started_marker_before_first_checkpoint(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="retry after self repair marker",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {"status": "started"},
+        },
+        enqueue=False,
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind="repair.started",
+                sequence=1,
+                run_id=submitted.id,
+                payload={"source": "self_repair", "status": "running"},
+            ),
+        )
+        claimed = await repository.claim_for_execution(
+            session,
+            submitted.id,
+            allow_running_recovery=True,
+        )
+
+    assert not isinstance(claimed, RunRecord)
+    row, checkpoint = claimed
+    assert row.status == RunStatus.RUNNING.value
+    assert checkpoint is None
+
+
 async def test_recovery_ignores_runtime_recovered_marker_after_checkpoint(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
