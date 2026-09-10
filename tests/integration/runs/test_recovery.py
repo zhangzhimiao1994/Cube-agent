@@ -1232,6 +1232,91 @@ async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(
     assert failure_payload["retryable"] is False
 
 
+async def test_approved_capability_resume_fails_safe_when_non_replayable_event_after_checkpoint(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="resume after approval",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="fake-dispatch",
+        runtime_version="1",
+        run_id=submitted.id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DISPATCH,
+        state={"completed_step_ids": ("prepare",)},
+    )
+    async with run_session_factory() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=1,
+                run_id=submitted.id,
+                checkpoint=checkpoint,
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.TOOL_COMPLETED,
+                sequence=2,
+                run_id=submitted.id,
+                payload={"tool": "external.message", "result": "sent"},
+            ),
+        )
+    approval_id = "approval-after-checkpoint"
+    approval_fingerprint = "fingerprint-after-checkpoint"
+    await repository.begin_capability_approval(
+        tenant_id=tenant_id,
+        run_id=submitted.id,
+        approval_id=approval_id,
+        approval_fingerprint=approval_fingerprint,
+    )
+    waiting = await repository.get(tenant_id, submitted.id)
+    await repository.approve_capability_and_enqueue(
+        tenant_id=tenant_id,
+        run_id=submitted.id,
+        approval_id=approval_id,
+        version=waiting.version,
+    )
+
+    resumed = await service.execute(submitted.id)
+    events = await service.events(tenant_id, submitted.id)
+
+    assert resumed.status is RunStatus.FAILED
+    assert runtime.calls == 0
+    assert runtime.restored == []
+    failure_events = [event for event in events if event["kind"] == "runtime.failed"]
+    assert len(failure_events) == 1
+    failure_payload = failure_events[0]["payload"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["error_code"] == "runtime.recovery_blocked"
+    assert failure_payload["retryable"] is False
+
+
 async def test_submission_writes_run_and_outbox_atomically_then_publisher_delivers_once(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

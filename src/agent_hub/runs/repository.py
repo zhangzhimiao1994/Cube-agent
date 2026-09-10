@@ -554,22 +554,15 @@ class RunRepository:
         row.status = RunStatus.RUNNING.value
         row.version += 1
         checkpoint = await self.latest_checkpoint(session, tenant_id=row.tenant_id, run_id=row.id)
-        if allow_running_recovery and status is RunStatus.RUNNING:
-            checkpoint_sequence = (
-                await session.scalar(
-                    select(func.max(RunCheckpointRow.sequence)).where(
-                        RunCheckpointRow.run_id == row.id
-                    )
-                )
-                or 0
+        should_guard_recovery = (allow_running_recovery and status is RunStatus.RUNNING) or (
+            status in {RunStatus.QUEUED, RunStatus.RETRYING} and checkpoint is not None
+        )
+        if should_guard_recovery:
+            recovery_blocked = await self._recovery_blocked_after_checkpoint(
+                session,
+                run_id=row.id,
             )
-            latest_event_sequence = await session.scalar(
-                select(func.max(RunEventRow.sequence)).where(
-                    RunEventRow.run_id == row.id,
-                    ~RunEventRow.kind.in_(_RECOVERY_REPLAYABLE_EVENT_KINDS),
-                )
-            )
-            if latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence:
+            if recovery_blocked:
                 sequence = await self.next_event_sequence(session, row.id)
                 await self.persist_event(
                     session,
@@ -587,6 +580,28 @@ class RunRepository:
                 await session.flush()
                 return self._record(row)
         return row, checkpoint
+
+    async def _recovery_blocked_after_checkpoint(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: UUID,
+    ) -> bool:
+        checkpoint_sequence = (
+            await session.scalar(
+                select(func.max(RunCheckpointRow.sequence)).where(
+                    RunCheckpointRow.run_id == run_id
+                )
+            )
+            or 0
+        )
+        latest_event_sequence = await session.scalar(
+            select(func.max(RunEventRow.sequence)).where(
+                RunEventRow.run_id == run_id,
+                ~RunEventRow.kind.in_(_RECOVERY_REPLAYABLE_EVENT_KINDS),
+            )
+        )
+        return latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence
 
     async def update_control_status(
         self,
