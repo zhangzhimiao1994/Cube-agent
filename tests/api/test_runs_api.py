@@ -668,6 +668,24 @@ def test_run_submission_defaults_to_workspace_write_without_network() -> None:
     assert details["requested_permissions"] == ["workspace.read", "workspace.write", "command.run"]
 
 
+def test_run_submission_rejects_permissions_outside_sandbox_profile() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "只读工作区里尝试写文件",
+            "mode": "dispatch",
+            "sandbox_profile": "read_only",
+            "requested_permissions": ["workspace.write"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
 def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
     client, service, principal = _client()
 

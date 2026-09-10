@@ -253,12 +253,12 @@ class CreateRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def default_requested_permissions_from_sandbox(self) -> CreateRunRequest:
-        if not self.requested_permissions:
-            self.requested_permissions = workspace_selection(
-                project_id=None,
-                session_id=None,
-                sandbox_profile=self.sandbox_profile,
-            ).requested_permissions
+        self.requested_permissions = workspace_selection(
+            project_id=None,
+            session_id=None,
+            sandbox_profile=self.sandbox_profile,
+            requested_permissions=self.requested_permissions,
+        ).requested_permissions
         return self
 
 
