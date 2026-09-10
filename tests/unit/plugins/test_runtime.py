@@ -1631,6 +1631,48 @@ async def test_python_subprocess_plugin_package_runner_rejects_oversized_stdin_b
     assert not marker.exists()
 
 
+async def test_python_subprocess_plugin_package_runner_rejects_entrypoint_outside_root_before_spawn(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    package_root.mkdir()
+    marker = tmp_path / "started.txt"
+    entrypoint = tmp_path / "outside.py"
+    entrypoint.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started')\n"
+        "import json\n"
+        "import sys\n"
+        "json.dump({'ok': True}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin package path is invalid"):
+        await runner.invoke(
+            target=PluginPackageExecutionTarget(root=package_root, entrypoint=entrypoint),
+            plugin=plugin("calendar", adapter="calendar_python"),
+            capability=PluginCapabilityRequest(
+                id="calendar.create_event",
+                adapter="calendar_python",
+                permission_class="calendar.write",
+                sandbox_profile="local_process",
+            ),
+            arguments={"title": "x"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="invoke-1",
+            ),
+        )
+
+    assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bubblewrap integration is POSIX-only")
 async def test_python_subprocess_plugin_package_runner_with_bubblewrap_blocks_writes_and_network(
     tmp_path: Path,

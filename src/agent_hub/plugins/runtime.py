@@ -338,6 +338,7 @@ class PythonSubprocessPluginPackageRunner:
         arguments: Mapping[str, JsonValue],
         context: PluginInvocationContext,
     ) -> Mapping[str, JsonValue]:
+        _ensure_plugin_package_runner_target(target)
         request = _plugin_package_runner_request(
             plugin=plugin,
             capability=capability,
@@ -392,6 +393,14 @@ class PythonSubprocessPluginPackageRunner:
             return _freeze_object(decoded, name="plugin result")
         except Exception as error:
             raise RuntimeCapabilityError("Plugin result is invalid") from error
+
+
+def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -> None:
+    _ensure_runtime_path_inside(target.root, target.entrypoint)
+    if not target.root.is_dir():
+        raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    if not target.entrypoint.is_file():
+        raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
 
 
 class RuntimePluginService:
