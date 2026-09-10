@@ -515,7 +515,12 @@ class ConfigBackedDispatchRuntime:
         plan = _dispatch_plan(
             roles,
             context,
-            max_parallelism=_dispatch_parallelism(config, logical_model, roles),
+            max_parallelism=_dispatch_parallelism(
+                config,
+                logical_model,
+                roles,
+                deployment_constraint=deployment_constraint,
+            ),
             capability_gateway=self._capability_gateway,
         )
         role_payload = _dispatch_role_payload(plan)
@@ -871,7 +876,12 @@ class ConfigBackedHybridRuntime:
         dispatch_plan = _dispatch_plan(
             dispatch_roles,
             context,
-            max_parallelism=_dispatch_parallelism(config, logical_model, dispatch_roles),
+            max_parallelism=_dispatch_parallelism(
+                config,
+                logical_model,
+                dispatch_roles,
+                deployment_constraint=deployment_constraint,
+            ),
             capability_gateway=self._capability_gateway,
         )
         discussion_plan = _discussion_plan(
@@ -1544,7 +1554,11 @@ def _assign_models_to_roles(
 ) -> tuple[RoleAssignment, ...]:
     assigned_counts: dict[str, int] = {}
     capacities = {
-        logical_model: _logical_model_capacity(config, logical_model)
+        logical_model: _logical_model_capacity(
+            config,
+            logical_model,
+            deployment_constraint=deployment_constraint,
+        )
         for logical_model in config.models
     }
     assigned: list[RoleAssignment] = []
@@ -1597,17 +1611,33 @@ def _routing_tools_for_role(
     return role_tools_by_id.get(role.id, role.allowed_tools)
 
 
-def _logical_model_capacity(config: PlatformConfig, logical_model: str) -> int:
+def _logical_model_capacity(
+    config: PlatformConfig,
+    logical_model: str,
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
+) -> int:
     definition = config.models.get(logical_model)
     if definition is None:
         return 1
+    deployments = tuple(definition.deployments)
+    if deployment_constraint is not None and deployment_constraint.logical_model == logical_model:
+        deployments = tuple(
+            deployment
+            for deployment in deployments
+            if _deployment_definition_matches_constraint(
+                logical_model,
+                deployment,
+                deployment_constraint,
+            )
+        )
     slots = sum(
         safe_operational_limit(
             deployment.max_concurrency,
             deployment.target_utilization,
             deployment.reserved_slots,
         )
-        for deployment in definition.deployments
+        for deployment in deployments
     )
     return max(1, slots)
 
@@ -2270,7 +2300,11 @@ def _role_model_routing_matrix_payload(
     payload: list[Mapping[str, JsonValue]] = []
     truncated = len(source_roles) > _MAX_MODEL_ROUTING_MATRIX_ROLES
     capacities = {
-        logical_model: _logical_model_capacity(config, logical_model)
+        logical_model: _logical_model_capacity(
+            config,
+            logical_model,
+            deployment_constraint=deployment_constraint,
+        )
         for logical_model in config.models
     }
     assigned_counts: dict[str, int] = {}
@@ -2829,6 +2863,8 @@ def _dispatch_parallelism(
     config: PlatformConfig,
     logical_model: str,
     roles: tuple[RoleAssignment, ...] | None = None,
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> int:
     logical_models = (
         {role.model for role in roles if role.model in config.models}
@@ -2837,7 +2873,14 @@ def _dispatch_parallelism(
     )
     if not logical_models:
         logical_models = {logical_model}
-    slots = sum(_logical_model_capacity(config, item) for item in logical_models)
+    slots = sum(
+        _logical_model_capacity(
+            config,
+            item,
+            deployment_constraint=deployment_constraint,
+        )
+        for item in logical_models
+    )
     return max(1, min(slots, 16))
 
 
