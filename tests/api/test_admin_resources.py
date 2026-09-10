@@ -5854,6 +5854,55 @@ def test_plugin_archive_install_does_not_verify_inactive_signing_key(
     assert metadata["activation_state"] == "blocked_untrusted_key"
 
 
+def test_plugin_listing_revalidates_future_signing_key_after_not_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz: object = None) -> Self:
+            if tz is UTC:
+                return cls.fromtimestamp(cls.current.timestamp(), UTC)
+            return cls.fromtimestamp(cls.current.timestamp())
+
+    monkeypatch.setattr(admin_router, "datetime", FrozenDateTime)
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    not_before = FrozenDateTime.current + timedelta(seconds=10)
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-future",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+            "not_before": not_before.isoformat(),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key, key_id="calendar-future"),
+    )
+    assert install.status_code == 200
+    installed_metadata = install.json()["plugin"]["package_metadata"]
+    assert installed_metadata["signature_verification"] == "untrusted_key"
+    assert installed_metadata["activation_state"] == "blocked_untrusted_key"
+
+    FrozenDateTime.current = not_before + timedelta(seconds=1)
+
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+    assert metadata["signature_verification"] == "verified"
+    assert metadata["activation_state"] == "blocked_pending_approval"
+    assert metadata["verified_public_key_sha256"] == plugin_public_key_sha256(private_key)
+
+
 def test_plugin_signing_key_rejects_invalid_activation_window() -> None:
     private_key = ed25519.Ed25519PrivateKey.generate()
     not_before = datetime.now(UTC) + timedelta(days=1)

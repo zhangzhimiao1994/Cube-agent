@@ -3837,6 +3837,22 @@ def _verified_plugin_package_metadata(
         ),
         None,
     )
+    verification: PluginSignatureVerification = "verified"
+    if signing_key is None:
+        signing_key = next(
+            (
+                key
+                for key in signing_keys
+                if key.trusted
+                and key.algorithm == package.signature.algorithm
+                and key.key_id == package.signature.key_id
+                and key.not_before is not None
+                and now.astimezone(UTC) < key.not_before.astimezone(UTC)
+                and (key.not_after is None or now.astimezone(UTC) < key.not_after.astimezone(UTC))
+            ),
+            None,
+        )
+        verification = "untrusted_key"
     if signing_key is None:
         return package.model_copy(update={"signature_verification": "untrusted_key"})
     payload = _plugin_signature_payload(manifest, archive_bytes)
@@ -3858,9 +3874,11 @@ def _verified_plugin_package_metadata(
         raise InvalidSkillPackage("trusted plugin signing key is invalid") from None
     return package.model_copy(
         update={
-            "signature_verification": "verified",
+            "signature_verification": verification,
             "verified_public_key_sha256": _plugin_public_key_sha256(public_key_bytes),
-            "signature_trust_expires_at": signing_key.not_after,
+            "signature_trust_expires_at": signing_key.not_after
+            if verification == "verified"
+            else None,
         }
     )
 
@@ -3899,11 +3917,7 @@ def _plugin_with_effective_package_trust(
     now: datetime,
 ) -> PluginResourceResponse:
     package = plugin.package_metadata
-    if (
-        package is None
-        or package.signature is None
-        or package.signature_verification != "verified"
-    ):
+    if package is None or package.signature is None:
         return plugin
     active_signing_key = next(
         (
@@ -3918,6 +3932,17 @@ def _plugin_with_effective_package_trust(
         None,
     )
     if active_signing_key is not None:
+        if package.signature_verification == "untrusted_key" and package.artifact is not None:
+            effective_package = PluginPackageMetadata.model_validate(
+                {
+                    **package.model_dump(mode="json"),
+                    "signature_verification": "verified",
+                    "signature_trust_expires_at": active_signing_key.not_after,
+                }
+            )
+            return plugin.model_copy(update={"package_metadata": effective_package})
+        if package.signature_verification != "verified":
+            return plugin
         if package.signature_trust_expires_at == active_signing_key.not_after:
             return plugin
         return plugin.model_copy(
@@ -3927,6 +3952,8 @@ def _plugin_with_effective_package_trust(
                 )
             }
         )
+    if package.signature_verification != "verified":
+        return plugin
     effective_package = PluginPackageMetadata.model_validate(
         {
             **package.model_dump(mode="json"),
@@ -4010,7 +4037,10 @@ def _stored_plugin_package_metadata(
     if (
         package is None
         or package.kind != "adapter_package"
-        or package.signature_verification != "verified"
+        or (
+            package.signature_verification != "verified"
+            and package.verified_public_key_sha256 is None
+        )
     ):
         return package
     files = _plugin_archive_signature_files(archive_bytes)
