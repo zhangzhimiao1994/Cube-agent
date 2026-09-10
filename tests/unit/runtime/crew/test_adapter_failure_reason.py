@@ -339,6 +339,24 @@ class RoleAwareGateway:
         )
 
 
+class SequenceGateway:
+    def __init__(self, *texts: str) -> None:
+        self._texts = list(texts)
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        text = self._texts.pop(0) if self._texts else "done"
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class EmptyThenRoleAwareGateway(RoleAwareGateway):
     def __init__(self, *, empty_logical_model: str) -> None:
         super().__init__()
@@ -659,6 +677,42 @@ def _dependent_final_plan() -> DispatchPlan:
     )
 
 
+def _structured_dependent_final_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={
+                    "summary": "string",
+                    "findings": "string[]",
+                    "risks": "string[]",
+                },
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(id="draft", agent="writer", task="Draft", token_budget=1000),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("draft",),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        total_token_budget=1000,
+    )
+
+
 def _context(**changes: object) -> TaskContext:
     values: dict[str, object] = {
         "run_id": RUN_ID,
@@ -828,6 +882,69 @@ async def test_step_failed_reports_blocked_orchestration_contracts() -> None:
     assert draft_failed.payload["orchestration_protocol"] == "role_handoff_contract_v1"
     assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
     assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+
+
+async def test_dependent_structured_role_output_must_match_handoff_schema() -> None:
+    gateway = SequenceGateway(
+        '{"summary":"done","findings":["ok"],"risks":[]}',
+        "final answer",
+    )
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _structured_dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(gateway.requests) == 2
+    draft_completed = next(
+        event for event in events if event.kind is EventKind.STEP_COMPLETED and event.step_id == "draft"
+    )
+    assert draft_completed.payload["outgoing_contract_ids"] == ("draft-to-final_response",)
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+
+
+@pytest.mark.parametrize(
+    ("writer_output", "reason"),
+    (
+        ('{"summary":"done","findings":["ok"]}', "structured handoff output missing field"),
+        (
+            '{"summary":"done","findings":"ok","risks":[]}',
+            "structured handoff output field type mismatch",
+        ),
+        ("plain text", "structured handoff output is not valid json"),
+    ),
+)
+async def test_invalid_dependent_structured_role_output_blocks_handoff(
+    writer_output: str,
+    reason: str,
+) -> None:
+    gateway = SequenceGateway(writer_output, "final answer")
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _structured_dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match=reason):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert len(gateway.requests) == 1
+    draft_failed = next(
+        event for event in events if event.kind is EventKind.STEP_FAILED and event.step_id == "draft"
+    )
+    assert draft_failed.reason == reason
+    assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
+    assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert not any(event.step_id == "final_response" for event in events)
 
 
 async def test_agent_output_schema_becomes_structured_model_request() -> None:

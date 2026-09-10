@@ -659,6 +659,46 @@ def _schema_property(description: str) -> dict[str, JsonValue]:
     return {"type": "string", "description": description}
 
 
+def _validate_structured_handoff_output(
+    plan: DispatchPlan,
+    step: DispatchStep,
+    agent: AgentSpec,
+    text: object,
+) -> None:
+    if not agent.output_schema or not _step_has_dependents(plan, step):
+        return
+    if not isinstance(text, str):
+        _fail("structured handoff output is not valid json")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        _fail("structured handoff output is not valid json")
+    if not isinstance(payload, dict):
+        _fail("structured handoff output is not an object")
+    for field_name, description in agent.output_schema.items():
+        if field_name not in payload:
+            _fail("structured handoff output missing field")
+        if not _structured_handoff_field_matches(payload[field_name], description):
+            _fail("structured handoff output field type mismatch")
+
+
+def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
+    return any(step.id in candidate.depends_on for candidate in plan.steps)
+
+
+def _structured_handoff_field_matches(value: object, description: str) -> bool:
+    normalized = description.strip().casefold()
+    if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if normalized in {"boolean", "bool"}:
+        return isinstance(value, bool)
+    if normalized in {"integer", "int"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if normalized in {"number", "float", "decimal"}:
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    return isinstance(value, str)
+
+
 _REVIEW_RESPONSE_SCHEMA = StructuredResponseSchema(
     name="DispatchReviewVerdict",
     schema={
@@ -2076,6 +2116,7 @@ class CrewDispatchRuntime:
                     run_state,
                     step_deadline,
                 )
+                _validate_structured_handoff_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(
                     step,
                     completion,
