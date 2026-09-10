@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 RUNTIME_CONFIG_INVALIDATION_CHANNEL = "agent-hub:runtime-config-invalidations"
+RUNTIME_CONFIG_INVALIDATION_STREAM = "agent-hub:runtime-config-invalidations:stream"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -22,6 +23,15 @@ class ReloadableRuntime(Protocol):
 
 
 class RedisInvalidationClient(Protocol):
+    async def xadd(
+        self,
+        stream: str,
+        fields: dict[str, str],
+        *,
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> object: ...
+
     async def publish(self, channel: str, payload: str) -> object: ...
 
     def pubsub(self) -> Any: ...
@@ -33,11 +43,17 @@ class RuntimeConfigInvalidationBus:
         redis_client: RedisInvalidationClient,
         *,
         channel: str = RUNTIME_CONFIG_INVALIDATION_CHANNEL,
+        stream: str | None = RUNTIME_CONFIG_INVALIDATION_STREAM,
+        stream_maxlen: int = 4096,
         source_instance_id: str | None = None,
         max_seen_event_ids: int = 1024,
     ) -> None:
         if type(max_seen_event_ids) is not int or max_seen_event_ids < 1:
             raise ValueError("max_seen_event_ids must be a positive integer")
+        if stream is not None and _optional_safe_stream_name(stream) is None:
+            raise ValueError("stream must be a safe Redis stream name or None")
+        if type(stream_maxlen) is not int or stream_maxlen < 1:
+            raise ValueError("stream_maxlen must be a positive integer")
         if source_instance_id is not None and _optional_safe_identifier(source_instance_id) is None:
             raise ValueError(
                 "source_instance_id must be 1-128 characters and contain only "
@@ -45,6 +61,8 @@ class RuntimeConfigInvalidationBus:
             )
         self._redis = redis_client
         self._channel = channel
+        self._stream = stream
+        self._stream_maxlen = stream_maxlen
         self._source_instance_id = source_instance_id or str(uuid4())
         self._max_seen_event_ids = max_seen_event_ids
 
@@ -63,6 +81,13 @@ class RuntimeConfigInvalidationBus:
             separators=(",", ":"),
             sort_keys=True,
         )
+        if self._stream is not None:
+            await self._redis.xadd(
+                self._stream,
+                {"payload": payload},
+                maxlen=self._stream_maxlen,
+                approximate=True,
+            )
         await self._redis.publish(self._channel, payload)
 
     async def listen(
@@ -172,6 +197,16 @@ def _optional_safe_identifier(value: object) -> str | None:
     ):
         return value
     return None
+
+
+def _optional_safe_stream_name(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    if not 1 <= len(value) <= 256:
+        return None
+    if any(character.isspace() or ord(character) < 33 for character in value):
+        return None
+    return value
 
 
 async def _reload_runtime(

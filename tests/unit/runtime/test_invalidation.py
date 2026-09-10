@@ -15,11 +15,23 @@ OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 class FakeRedis:
     def __init__(self, messages: list[dict[str, object]] | None = None) -> None:
         self.published: list[tuple[str, str]] = []
+        self.stream_entries: list[tuple[str, dict[str, str], int | None, bool]] = []
         self._messages = messages or []
 
     async def publish(self, channel: str, payload: str) -> int:
         self.published.append((channel, payload))
         return 1
+
+    async def xadd(
+        self,
+        stream: str,
+        fields: dict[str, str],
+        *,
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> str:
+        self.stream_entries.append((stream, fields, maxlen, approximate))
+        return "1-0"
 
     def pubsub(self) -> "FakePubSub":
         return FakePubSub(self._messages)
@@ -82,6 +94,30 @@ async def test_runtime_invalidation_bus_publishes_tenant_target_payload() -> Non
     assert decoded["source_instance_id"] == "api-1"
     assert isinstance(decoded["event_id"], str)
     assert decoded["event_id"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_bus_records_durable_stream_entry() -> None:
+    redis = FakeRedis()
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="api-1",
+    )
+
+    await bus.publish(TENANT_ID, RuntimeConfigInvalidationTarget.PLUGIN)
+
+    assert len(redis.stream_entries) == 1
+    stream, fields, maxlen, approximate = redis.stream_entries[0]
+    assert stream == "runtime:test:stream"
+    assert maxlen == 4096
+    assert approximate is True
+    assert set(fields) == {"payload"}
+    stream_payload = json.loads(fields["payload"])
+    pubsub_payload = json.loads(redis.published[0][1])
+    assert stream_payload == pubsub_payload
+    assert stream_payload["target"] == "plugin"
 
 
 @pytest.mark.asyncio
