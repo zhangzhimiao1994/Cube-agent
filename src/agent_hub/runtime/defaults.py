@@ -1863,6 +1863,7 @@ def _model_execution_plan_payload(
             model_routing_matrix=model_routing_matrix,
             model_routing_matrix_truncated=model_routing_matrix_truncated,
             config=config,
+            deployment_constraint=deployment_constraint,
         ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
@@ -1956,6 +1957,7 @@ def _model_capability_negotiation_payload(
     model_routing_matrix: tuple[Mapping[str, JsonValue], ...],
     model_routing_matrix_truncated: bool,
     config: PlatformConfig | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> Mapping[str, JsonValue]:
     selected_capabilities = _selected_model_capabilities_by_role(model_routing_matrix)
     items: list[Mapping[str, JsonValue]] = []
@@ -1973,7 +1975,12 @@ def _model_capability_negotiation_payload(
             break
         required = _required_model_capabilities_for_role(role)
         selected = (
-            _logical_model_capabilities_for_requirements(config, logical_model, required)
+            _logical_model_capabilities_for_requirements(
+                config,
+                logical_model,
+                required,
+                deployment_constraint=deployment_constraint,
+            )
             if config is not None
             else selected_capabilities.get(role_id)
         )
@@ -2032,12 +2039,25 @@ def _logical_model_capabilities_for_requirements(
     config: PlatformConfig,
     logical_model: str,
     required: tuple[ModelCapability, ...],
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> frozenset[ModelCapability] | None:
     definition = config.models.get(logical_model)
     if definition is None:
         return None
     deployment_capabilities: list[frozenset[ModelCapability]] = []
-    for deployment in definition.deployments:
+    deployments = tuple(definition.deployments)
+    if deployment_constraint is not None and deployment_constraint.logical_model == logical_model:
+        deployments = tuple(
+            deployment
+            for deployment in deployments
+            if _deployment_definition_matches_constraint(
+                logical_model,
+                deployment,
+                deployment_constraint,
+            )
+        )
+    for deployment in deployments:
         capability_items = {ModelCapability(item) for item in deployment.capabilities}
         if ModelCapability.TOOL_CALLING in required and _is_messages_endpoint_api_base(
             deployment.api_base
