@@ -1443,6 +1443,7 @@ class SystemSettingsRequest(BaseModel):
     channel_entry: str = Field(default="web", max_length=64)
     attachment_retention_days: int = Field(default=7, ge=1, le=365)
     attachment_max_mb: int = Field(default=25, ge=1, le=200)
+    plugin_package_subprocess_registration_status: str | None = None
 
     @field_validator("openclaw_allowed_commands")
     @classmethod
@@ -1455,7 +1456,7 @@ class SystemSettingsRequest(BaseModel):
 
 
 class SystemSettingsResponse(SystemSettingsRequest):
-    plugin_package_subprocess_registration_status: str | None = None
+    pass
 
 
 _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
@@ -1492,6 +1493,14 @@ def _settings_with_runtime_status(
         status = None
     return settings.model_copy(
         update={"plugin_package_subprocess_registration_status": status}
+    )
+
+
+def _persisted_system_settings_payload(
+    settings: SystemSettingsRequest | SystemSettingsResponse,
+) -> dict[str, Any]:
+    return settings.model_dump(
+        exclude={"plugin_package_subprocess_registration_status"}
     )
 
 
@@ -4967,7 +4976,7 @@ class InMemoryAdminResourceService:
         return self.settings
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
-        response = SystemSettingsResponse(**request.model_dump())
+        response = SystemSettingsResponse(**_persisted_system_settings_payload(request))
         self.settings = response
         return response
 
@@ -6632,9 +6641,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return SystemSettingsResponse.model_validate(_migrate_system_settings_payload(payload))
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
-        response = SystemSettingsResponse(**request.model_dump())
+        response = SystemSettingsResponse(**_persisted_system_settings_payload(request))
         if not await self._upsert_admin_payload(
-            "setting", "system", response.model_dump(mode="json")
+            "setting",
+            "system",
+            _persisted_system_settings_payload(response),
         ):
             return await super().update_settings(request)
         await self._record_audit(

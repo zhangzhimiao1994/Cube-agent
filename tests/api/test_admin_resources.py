@@ -299,6 +299,22 @@ def test_settings_response_projects_plugin_package_subprocess_registration_statu
     assert payload["plugin_package_subprocess_registration_status"] == "launcher_not_found"
 
 
+def test_settings_update_accepts_projected_plugin_package_subprocess_registration_status() -> None:
+    api = client()
+    cast(Any, api.app).state.plugin_package_subprocess_registration_status = (
+        "launcher_not_found"
+    )
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+
+    response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
+
+    assert response.status_code == 200
+    assert (
+        response.json()["plugin_package_subprocess_registration_status"]
+        == "launcher_not_found"
+    )
+
+
 @pytest.mark.asyncio
 async def test_persistent_settings_missing_tool_approval_mode_migrates_to_ask() -> None:
     class StoredPersistentService(PersistentAdminResourceService):
