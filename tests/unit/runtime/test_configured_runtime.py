@@ -1626,6 +1626,79 @@ def test_model_capability_negotiation_prefers_config_deployment_capabilities() -
     assert negotiation["missing_count"] == 1
 
 
+def test_model_capability_negotiation_does_not_union_split_deployment_capabilities() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "split": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://split-text",
+                            "quota_scope_id": "split-text",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        },
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://split-structured",
+                            "quota_scope_id": "split-structured",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["structured_output"],
+                        },
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Produce a structured dispatch result.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "planner",
+                "role": "Planner",
+                "purpose": "execute",
+                "logical_model": "split",
+                "has_output_schema": True,
+                "tools": (),
+            },
+        ),
+        model_routing_matrix=(),
+        config=config,
+    )
+
+    negotiation = plan["model_capability_negotiation"]
+    assert isinstance(negotiation, Mapping)
+    assert negotiation["items"] == (
+        {
+            "role_id": "planner",
+            "logical_model": "split",
+            "required_capabilities": ("text", "structured_output"),
+            "matched_capabilities": ("text",),
+            "missing_capabilities": ("structured_output",),
+            "status": "missing_capability",
+        },
+    )
+    assert negotiation["satisfied_count"] == 0
+    assert negotiation["missing_count"] == 1
+
+
 def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
     source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
         {

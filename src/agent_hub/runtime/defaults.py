@@ -1973,7 +1973,7 @@ def _model_capability_negotiation_payload(
             break
         required = _required_model_capabilities_for_role(role)
         selected = (
-            _logical_model_capabilities(config, logical_model)
+            _logical_model_capabilities_for_requirements(config, logical_model, required)
             if config is not None
             else selected_capabilities.get(role_id)
         )
@@ -2028,17 +2028,29 @@ def _required_model_capabilities_for_role(
     return tuple(dict.fromkeys(required))
 
 
-def _logical_model_capabilities(
+def _logical_model_capabilities_for_requirements(
     config: PlatformConfig,
     logical_model: str,
+    required: tuple[ModelCapability, ...],
 ) -> frozenset[ModelCapability] | None:
     definition = config.models.get(logical_model)
     if definition is None:
         return None
-    capabilities: set[ModelCapability] = set()
+    deployment_capabilities: list[frozenset[ModelCapability]] = []
     for deployment in definition.deployments:
-        capabilities.update(ModelCapability(item) for item in deployment.capabilities)
-    return frozenset(capabilities)
+        capabilities = frozenset(ModelCapability(item) for item in deployment.capabilities)
+        if all(capability in capabilities for capability in required):
+            return capabilities
+        deployment_capabilities.append(capabilities)
+    if not deployment_capabilities:
+        return frozenset()
+    return max(
+        deployment_capabilities,
+        key=lambda capabilities: (
+            sum(1 for capability in required if capability in capabilities),
+            ModelCapability.TEXT in capabilities,
+        ),
+    )
 
 
 def _selected_model_capabilities_by_role(
