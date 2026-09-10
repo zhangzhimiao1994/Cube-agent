@@ -5,7 +5,9 @@ from collections.abc import Mapping, Sequence
 from agent_hub.runtime.contracts import JsonValue
 
 SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
-ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(("http_read", "in_process"))
+ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(
+    ("http_read", "in_process", "local_process")
+)
 
 
 def http_json_adapter_descriptor() -> Mapping[str, JsonValue]:

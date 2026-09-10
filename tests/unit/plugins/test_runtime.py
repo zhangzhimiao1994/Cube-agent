@@ -360,7 +360,7 @@ async def test_runtime_plugin_service_invokes_runtime_registered_adapter_package
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": "adapter/main.py",
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
         }
     )
@@ -374,7 +374,7 @@ async def test_runtime_plugin_service_invokes_runtime_registered_adapter_package
             "capability_schema": {
                 "type": "object",
                 "properties": {
-                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                 },
                 "additionalProperties": True,
             },
@@ -388,7 +388,7 @@ async def test_runtime_plugin_service_invokes_runtime_registered_adapter_package
                 plugin(
                     "calendar",
                     adapter="calendar_python",
-                    sandbox_profile="in_process",
+                    sandbox_profile="local_process",
                     package_metadata=package_metadata,
                 ),
             )
@@ -432,7 +432,7 @@ def verified_package_with_artifact(
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": entrypoint,
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
             "artifact": {
                 "storage_key": storage_key,
@@ -1055,7 +1055,7 @@ async def test_runtime_plugin_service_can_invoke_registered_package_adapter_runn
                 plugin(
                     "calendar",
                     adapter="calendar_python",
-                    sandbox_profile="in_process",
+                    sandbox_profile="local_process",
                     package_metadata=package_metadata,
                     content_sha256=content_sha256,
                 ),
@@ -1111,7 +1111,7 @@ async def test_runtime_plugin_service_invokes_allowlisted_package_adapter_throug
             plugin(
                 "calendar",
                 adapter="calendar_python",
-                sandbox_profile="in_process",
+                sandbox_profile="local_process",
                 package_metadata=package_metadata,
                 content_sha256=content_sha256,
                 resource_config={"zone": "utc"},
@@ -1168,7 +1168,7 @@ async def test_runtime_plugin_service_invokes_allowlisted_package_adapter_throug
                 "capability_id": "calendar.create_event",
                 "adapter": "calendar_python",
                 "permission_class": "calendar.write",
-                "sandbox_profile": "in_process",
+                "sandbox_profile": "local_process",
                 "replay_safe": False,
                 "run_id": str(TENANT_ID),
                 "user_id": str(TENANT_ID),
@@ -1198,7 +1198,7 @@ async def test_runtime_plugin_service_rejects_package_adapter_result_that_violat
                 plugin(
                     "calendar",
                     adapter="calendar_python",
-                    sandbox_profile="in_process",
+                    sandbox_profile="local_process",
                     package_metadata=package_metadata,
                     content_sha256=content_sha256,
                     output_schema={
@@ -1544,7 +1544,19 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
     )
 
     assert tuple(adapters) == ("calendar_python", "crm-python")
-    assert cast(Any, adapters["calendar_python"]).descriptor()["id"] == "calendar_python"
+    calendar_descriptor = cast(Any, adapters["calendar_python"]).descriptor()
+    assert calendar_descriptor["id"] == "calendar_python"
+    capability_schema = cast(Mapping[str, object], calendar_descriptor["capability_schema"])
+    capability_properties = cast(Mapping[str, object], capability_schema["properties"])
+    assert capability_properties["sandbox_profile"] == {
+        "type": "string",
+        "enum": ("local_process",),
+    }
+    assert calendar_descriptor["capability_contract"] == {
+        "schema_version": 1,
+        "declared_sandbox_profiles": ("local_process",),
+        "runtime_sandbox_profiles": ("local_process", "remote_connector"),
+    }
     assert cast(Any, adapters["crm-python"]).descriptor()["id"] == "crm-python"
 
 
@@ -1581,7 +1593,7 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
         activation_reason="stale eligible state",
         runtime="python",
         entrypoint="adapter/main.py",
-        isolation="in_process",
+        isolation="local_process",
         install_mode="runtime_registered",
     )
     adapter = RecordingPluginAdapter(
@@ -1594,7 +1606,7 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
             "capability_schema": {
                 "type": "object",
                 "properties": {
-                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                 },
                 "additionalProperties": True,
             },
@@ -1608,7 +1620,7 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
                 plugin(
                     "calendar",
                     adapter="calendar_python",
-                    sandbox_profile="in_process",
+                    sandbox_profile="local_process",
                     package_metadata=package_metadata,
                 ),
             )
@@ -1654,7 +1666,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_without_
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": "adapter/main.py",
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
         }
     )
@@ -1665,7 +1677,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_without_
                 plugin(
                     "calendar",
                     adapter="calendar_python",
-                    sandbox_profile="in_process",
+                    sandbox_profile="local_process",
                     package_metadata=package_metadata,
                 ),
             )
@@ -1714,7 +1726,7 @@ async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust()
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": "adapter/main.py",
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
         }
     )
@@ -1735,7 +1747,7 @@ async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust()
             "capability_schema": {
                 "type": "object",
                 "properties": {
-                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                 },
                 "additionalProperties": True,
             },
@@ -1747,7 +1759,7 @@ async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust()
             plugin(
                 "calendar",
                 adapter="calendar_python",
-                sandbox_profile="in_process",
+                sandbox_profile="local_process",
                 package_metadata=eligible_package,
             ),
         )
@@ -1763,7 +1775,7 @@ async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust()
         plugin(
             "calendar",
             adapter="calendar_python",
-            sandbox_profile="in_process",
+            sandbox_profile="local_process",
             package_metadata=stale_package,
         ),
     )
@@ -1809,7 +1821,7 @@ async def test_runtime_plugin_service_refreshes_expired_package_signature_trust_
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": "adapter/main.py",
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
         }
     )
@@ -1830,7 +1842,7 @@ async def test_runtime_plugin_service_refreshes_expired_package_signature_trust_
             "capability_schema": {
                 "type": "object",
                 "properties": {
-                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                 },
                 "additionalProperties": True,
             },
@@ -1842,7 +1854,7 @@ async def test_runtime_plugin_service_refreshes_expired_package_signature_trust_
             plugin(
                 "calendar",
                 adapter="calendar_python",
-                sandbox_profile="in_process",
+                sandbox_profile="local_process",
                 package_metadata=eligible_package,
             ),
         )
@@ -1858,7 +1870,7 @@ async def test_runtime_plugin_service_refreshes_expired_package_signature_trust_
         plugin(
             "calendar",
             adapter="calendar_python",
-            sandbox_profile="in_process",
+            sandbox_profile="local_process",
             package_metadata=stale_package,
         ),
     )
@@ -1896,7 +1908,7 @@ async def test_runtime_plugin_service_marks_cached_expired_signature_trust_unava
             "approval_state": "approved",
             "runtime": "python",
             "entrypoint": "adapter/main.py",
-            "isolation": "in_process",
+            "isolation": "local_process",
             "install_mode": "runtime_registered",
         }
     )
@@ -1910,7 +1922,7 @@ async def test_runtime_plugin_service_marks_cached_expired_signature_trust_unava
             "capability_schema": {
                 "type": "object",
                 "properties": {
-                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                 },
                 "additionalProperties": True,
             },
@@ -1922,7 +1934,7 @@ async def test_runtime_plugin_service_marks_cached_expired_signature_trust_unava
             plugin(
                 "calendar",
                 adapter="calendar_python",
-                sandbox_profile="in_process",
+                sandbox_profile="local_process",
                 policy_effect="allow",
                 package_metadata=expired_package,
             ),
@@ -2823,7 +2835,7 @@ async def test_runtime_plugin_service_allows_adapter_declared_http_read_sandbox_
     assert adapter.calls[0][1] == "calendar.create_event"
 
 
-async def test_runtime_plugin_service_rejects_adapter_declared_local_process_sandbox_profile() -> None:
+async def test_runtime_plugin_service_allows_adapter_declared_local_process_sandbox_profile() -> None:
     adapter = RecordingPluginAdapter(
         [],
         descriptor_payload={
@@ -2851,20 +2863,18 @@ async def test_runtime_plugin_service_rejects_adapter_declared_local_process_san
         adapters={"plugin_runtime": adapter},
     )
 
-    with pytest.raises(RuntimeCapabilityError, match="Plugin sandbox profile unsupported"):
-        await service.invoke(
-            tenant_id=TENANT_ID,
-            user_id=TENANT_ID,
-            run_id=TENANT_ID,
-            actor="scheduler",
-            name="calendar.create_event",
-            arguments={"title": "Mofang review"},
-            idempotency_key="plugin_1",
-        )
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "Mofang review"},
+        idempotency_key="plugin_1",
+    )
 
-    assert adapter.calls == []
-    details = cast(dict[str, object], admin_service.audit_events[0]["details"])
-    assert details["sandbox_profile"] == "local_process"
+    assert result["ok"] is True
+    assert len(adapter.calls) == 1
 
 
 async def test_runtime_plugin_service_rejects_arguments_that_violate_input_schema() -> None:

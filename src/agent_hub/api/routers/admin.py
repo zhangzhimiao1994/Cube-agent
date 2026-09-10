@@ -744,7 +744,7 @@ PluginPackageInstallMode = Literal["scan_only", "runtime_registered"]
 
 SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS = frozenset(("1.0",))
 SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES = frozenset(("python",))
-SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS = frozenset(("in_process",))
+SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS = frozenset(("local_process",))
 
 
 class PluginPackageArtifactMetadata(BaseModel):

@@ -934,7 +934,7 @@ def _package_adapter_descriptor(adapter_id: str) -> Mapping[str, JsonValue]:
         "capability_schema": {
             "type": "object",
             "properties": {
-                "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                "sandbox_profile": {"type": "string", "enum": ("local_process",)}
             },
             "additionalProperties": True,
         },

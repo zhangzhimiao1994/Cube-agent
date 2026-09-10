@@ -5971,12 +5971,12 @@ def test_runtime_registered_adapter_package_requires_known_adapter() -> None:
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6000,7 +6000,7 @@ def test_runtime_registered_adapter_package_requires_capabilities_to_use_package
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6030,12 +6030,12 @@ def test_runtime_registered_adapter_package_requires_capabilities_to_use_package
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "other_adapter",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6054,13 +6054,13 @@ def test_runtime_registered_adapter_package_requires_capabilities_to_use_package
             {
                 "install_mode": "runtime_registered",
                 "sdk_api_version": "9.9",
-                "isolation": "in_process",
+                "isolation": "local_process",
             },
             [
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
             "plugin package SDK API version is not supported",
@@ -6069,19 +6069,19 @@ def test_runtime_registered_adapter_package_requires_capabilities_to_use_package
             {
                 "install_mode": "runtime_registered",
                 "runtime": "node",
-                "isolation": "in_process",
+                "isolation": "local_process",
             },
             [
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
             "runtime-registered plugin package runtime is not supported",
         ),
         (
-            {"install_mode": "runtime_registered"},
+            {"install_mode": "runtime_registered", "isolation": "in_process"},
             [
                 {
                     "id": "calendar.create_event",
@@ -6092,12 +6092,12 @@ def test_runtime_registered_adapter_package_requires_capabilities_to_use_package
             "runtime-registered plugin package isolation is not supported",
         ),
         (
-            {"install_mode": "runtime_registered", "isolation": "in_process"},
+            {"install_mode": "runtime_registered", "isolation": "local_process"},
             [],
             "runtime-registered adapter packages must declare at least one capability",
         ),
         (
-            {"install_mode": "runtime_registered", "isolation": "in_process"},
+            {"install_mode": "runtime_registered", "isolation": "local_process"},
             [
                 {
                     "id": "calendar.create_event",
@@ -6125,7 +6125,7 @@ def test_runtime_registered_adapter_package_rejects_unsupported_activation_contr
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6177,7 +6177,7 @@ def test_runtime_registered_adapter_package_can_be_approved_and_started() -> Non
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6206,12 +6206,12 @@ def test_runtime_registered_adapter_package_can_be_approved_and_started() -> Non
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6249,7 +6249,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6278,12 +6278,12 @@ def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6316,7 +6316,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() 
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6345,12 +6345,12 @@ def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() 
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6385,7 +6385,7 @@ def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() 
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6414,12 +6414,12 @@ def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() 
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6454,7 +6454,7 @@ def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> 
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6483,12 +6483,12 @@ def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> 
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6529,7 +6529,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapte
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6558,12 +6558,12 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapte
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6601,7 +6601,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6630,12 +6630,12 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6675,7 +6675,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6705,12 +6705,12 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -6747,7 +6747,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
                     "capability_schema": {
                         "type": "object",
                         "properties": {
-                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
                         },
                         "additionalProperties": True,
                     },
@@ -6776,12 +6776,12 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
         },
         content=signed_plugin_archive(
             private_key,
-            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            package_overrides={"install_mode": "runtime_registered", "isolation": "local_process"},
             capabilities=[
                 {
                     "id": "calendar.create_event",
                     "adapter": "calendar_python",
-                    "sandbox_profile": "in_process",
+                    "sandbox_profile": "local_process",
                 }
             ],
         ),
@@ -9126,7 +9126,7 @@ def test_plugin_adapter_catalog_exposes_runtime_contract_for_declared_sandboxes(
     assert descriptor["capability_contract"] == {
         "schema_version": 1,
         "declared_sandbox_profiles": ["http_read", "local_process"],
-        "runtime_sandbox_profiles": ["http_read", "remote_connector"],
+        "runtime_sandbox_profiles": ["http_read", "local_process", "remote_connector"],
     }
 
 
