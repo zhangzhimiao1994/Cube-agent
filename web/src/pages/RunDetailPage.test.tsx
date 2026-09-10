@@ -891,6 +891,7 @@ describe("RunDetailPage", () => {
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(within(summary).getByText("已恢复续跑")).not.toBeNull();
     expect(within(summary).getByText("1 次续跑，2/5 步")).not.toBeNull();
+    expect(within(summary).getByText("模型状态：异常 1，已完成 2；工具状态：进行中 1；审查产物 1")).not.toBeNull();
     expect(screen.queryByText("00000000-0000-4000-8000-000000000001")).toBeNull();
   });
 

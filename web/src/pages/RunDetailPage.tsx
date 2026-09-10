@@ -1209,6 +1209,24 @@ function runtimeRecoveryLabel(summary: RuntimeRecoverySummary) {
   return `${summary.recoveryCount} 次续跑，${summary.completedSteps}/${summary.totalSteps} 步`;
 }
 
+function runtimeRecoveryStatusParts(counts: Record<string, number>, labels: Record<string, string>) {
+  return Object.entries(counts)
+    .filter(([, count]) => count > 0)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([status, count]) => `${labels[status] ?? status} ${count}`);
+}
+
+function runtimeRecoveryDetailLabel(summary: RuntimeRecoverySummary) {
+  const modelParts = runtimeRecoveryStatusParts(summary.modelStatusCounts, TOOL_STATUS_LABELS);
+  const toolParts = runtimeRecoveryStatusParts(summary.toolStatusCounts, TOOL_STATUS_LABELS);
+  const parts = [
+    modelParts.length > 0 ? `模型状态：${modelParts.join("，")}` : "",
+    toolParts.length > 0 ? `工具状态：${toolParts.join("，")}` : "",
+    summary.reviewArtifacts > 0 ? `审查产物 ${summary.reviewArtifacts}` : "",
+  ].filter(Boolean);
+  return parts.join("；");
+}
+
 function orchestrationContractRecoveryRecommendation(summary: OrchestrationContractSummary) {
   if (summary.recoveryHints.includes("retry_blocked_contract_chain")) {
     return "按契约提示只重试阻塞角色链路，保留已完成产物和步骤。";
@@ -2120,6 +2138,12 @@ export function RunDetailPage() {
               <li>
                 <span>恢复</span>
                 <strong>{runtimeRecoveryLabel(runtimeRecoverySummary)}</strong>
+              </li>
+            ) : null}
+            {runtimeRecoverySummary && runtimeRecoveryDetailLabel(runtimeRecoverySummary) ? (
+              <li>
+                <span>恢复明细</span>
+                <strong>{runtimeRecoveryDetailLabel(runtimeRecoverySummary)}</strong>
               </li>
             ) : null}
             {handoffSummary ? (
