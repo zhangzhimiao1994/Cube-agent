@@ -1766,6 +1766,32 @@ def test_plugin_package_subprocess_registration_status_reports_missing_adapter_i
     )
 
 
+def test_plugin_package_subprocess_registration_status_reports_unsupported_isolation_backend(
+    tmp_path: Path,
+) -> None:
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="disabled",
+            bubblewrap_executable=tmp_path / "bwrap",
+        )
+        == "unsupported_isolation_backend"
+    )
+
+
+def test_plugin_package_subprocess_registration_status_reports_relative_launcher() -> None:
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=Path("bwrap"),
+        )
+        == "launcher_path_not_absolute"
+    )
+
+
 def test_plugin_package_subprocess_registration_status_reports_launcher_reason(
     tmp_path: Path,
 ) -> None:
