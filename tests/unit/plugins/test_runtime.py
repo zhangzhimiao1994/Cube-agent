@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -229,6 +230,14 @@ def _argv_contains_ordered_args(
     return any(
         argv[index : index + size] == expected for index in range(len(argv) - size + 1)
     )
+
+
+def _argv_index(argv: tuple[str, ...], expected: tuple[str, ...]) -> int:
+    size = len(expected)
+    for index in range(len(argv) - size + 1):
+        if argv[index : index + size] == expected:
+            return index
+    raise AssertionError(f"missing argv sequence: {expected!r}")
 
 
 def plugin(
@@ -1586,6 +1595,62 @@ async def test_python_subprocess_plugin_package_runner_rejects_oversized_stdin_b
     assert not marker.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bubblewrap integration is POSIX-only")
+async def test_python_subprocess_plugin_package_runner_with_bubblewrap_blocks_writes_and_network(
+    tmp_path: Path,
+) -> None:
+    bubblewrap_executable = shutil.which("bwrap")
+    if bubblewrap_executable is None:
+        pytest.skip("bubblewrap is not installed")
+    package_root = tmp_path / "package"
+    entrypoint = package_root / "adapter" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text(
+        "import json\n"
+        "import socket\n"
+        "import sys\n"
+        "write_blocked = False\n"
+        "network_blocked = False\n"
+        "try:\n"
+        "    open('blocked.txt', 'w').write('x')\n"
+        "except OSError:\n"
+        "    write_blocked = True\n"
+        "try:\n"
+        "    socket.create_connection(('1.1.1.1', 53), 1)\n"
+        "except OSError:\n"
+        "    network_blocked = True\n"
+        "json.dump({'write_blocked': write_blocked, 'network_blocked': network_blocked}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        process_launcher=BubblewrapPluginPackageProcessLauncher(
+            bubblewrap_executable=Path(bubblewrap_executable)
+        ),
+        timeout_seconds=5,
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(root=package_root, entrypoint=entrypoint),
+        plugin=plugin("calendar", adapter="calendar_python"),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="local_process",
+        ),
+        arguments={"title": "isolated"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert result == {"write_blocked": True, "network_blocked": True}
+    assert not (package_root / "blocked.txt").exists()
+
+
 def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     tmp_path: Path,
 ) -> None:
@@ -1608,6 +1673,10 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     assert _argv_contains_ordered_pair(argv, "--ro-bind", runtime_root, runtime_root)
     assert _argv_contains_ordered_args(argv, ("--dev", "/dev"))
     assert _argv_contains_ordered_args(argv, ("--proc", "/proc"))
+    assert _argv_index(argv, ("--tmpfs", "/tmp")) < _argv_index(
+        argv,
+        ("--ro-bind", str(package_root), str(package_root)),
+    )
     assert argv[-3:] == (
         str(runtime_root / "bin" / "python"),
         "-I",
