@@ -249,7 +249,7 @@ class RuntimeConfigInvalidationBus:
                 seen_event_order,
                 max_seen_event_ids=self._max_seen_event_ids,
             )
-        return True
+        return reloaded
 
     async def _reload_target(
         self,
