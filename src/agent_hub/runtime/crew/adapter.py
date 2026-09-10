@@ -659,6 +659,20 @@ def _schema_property(description: str) -> dict[str, JsonValue]:
     return {"type": "string", "description": description}
 
 
+_REVIEW_RESPONSE_SCHEMA = StructuredResponseSchema(
+    name="DispatchReviewVerdict",
+    schema={
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ("approve", "revise", "reject")},
+            "feedback": {"type": "string"},
+        },
+        "required": ("verdict",),
+        "additionalProperties": False,
+    },
+)
+
+
 def _can_compact_retry_subagent(
     diagnostic: Mapping[str, object],
     *,
@@ -3391,9 +3405,12 @@ class CrewDispatchRuntime:
                 request = ModelRequest(
                     logical_model=reviewer.logical_model,
                     messages=runtime._normalize_crewai_messages(crew_messages),
-                    required_capabilities=frozenset({ModelCapability.TEXT}),
+                    required_capabilities=frozenset(
+                        {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
+                    ),
                     timeout_seconds=runtime._remaining_timeout(run_state, step_deadline),
                     max_output_tokens=min(reviewer.max_output_tokens, step.token_budget),
+                    response_schema=_REVIEW_RESPONSE_SCHEMA,
                 )
                 call_index = call_cursor.value
                 call_cursor.value += 1

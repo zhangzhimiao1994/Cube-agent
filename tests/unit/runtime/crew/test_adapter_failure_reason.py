@@ -876,6 +876,27 @@ async def test_agent_output_schema_becomes_structured_model_request() -> None:
     }
 
 
+async def test_reviewer_verdict_uses_structured_model_request() -> None:
+    gateway = RoleAwareGateway()
+    runtime = CrewDispatchRuntime(gateway, _reviewed_step_plan(), crew_factory=FastFactory())
+
+    await _collect(runtime)
+
+    request = next(item for item in gateway.requests if item.logical_model == "review")
+    assert ModelCapability.STRUCTURED_OUTPUT in request.required_capabilities
+    assert request.response_schema is not None
+    assert request.response_schema.name == "DispatchReviewVerdict"
+    assert request.response_schema.schema == {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ("approve", "revise", "reject")},
+            "feedback": {"type": "string"},
+        },
+        "required": ("verdict",),
+        "additionalProperties": False,
+    }
+
+
 async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     capabilities = FakeCapabilities()
     harness = RecordingHarnessToolGateway()
