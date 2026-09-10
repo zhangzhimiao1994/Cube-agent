@@ -19,6 +19,7 @@ from jsonschema import ValidationError  # type: ignore[import-untyped]
 from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import (
+    PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
     SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS,
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS,
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES,
@@ -810,7 +811,7 @@ def _runtime_package_activation_block_reason(
     if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
         return "plugin package isolation is not supported for activation"
     if package.dependencies:
-        return "plugin package dependencies are not supported by this runtime"
+        return PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON
     adapter = adapters.get(package.adapter_id or "")
     if adapter is None:
         return "runtime-registered adapter package requires a registered adapter"

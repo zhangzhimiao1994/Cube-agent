@@ -760,6 +760,9 @@ PluginPackageInstallMode = Literal["scan_only", "runtime_registered"]
 SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS = frozenset(("1.0",))
 SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES = frozenset(("python",))
 SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS = frozenset(("local_process",))
+PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON = (
+    "plugin package dependencies are not supported by this runtime"
+)
 
 
 class PluginPackageArtifactMetadata(BaseModel):
@@ -3587,7 +3590,7 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package artifact is server-controlled")
     dependencies = package.get("dependencies")
     if dependencies not in (None, []):
-        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
+        raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     if package.get("kind") == "manifest_only" and set(package) & {
         "package_version",
         "adapter_id",
@@ -3617,7 +3620,7 @@ def _validate_plugin_package_contract(
     if package is None:
         return
     if package.dependencies:
-        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
+        raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     if package.kind == "manifest_only":
         if (
             package.package_version is not None
@@ -3659,7 +3662,7 @@ def _validate_runtime_registered_plugin_package(
     if package.install_mode != "runtime_registered":
         return
     if package.dependencies:
-        raise InvalidSkillPackage("plugin package dependencies are not supported by this runtime")
+        raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
     descriptor = descriptors.get(package.adapter_id or "")
     if descriptor is None:
