@@ -25,6 +25,11 @@ from agent_hub.harness.types import (
     HarnessTaskRequirements,
     HermesContextHint,
 )
+from agent_hub.recovery_metadata import (
+    SAFE_SELF_REPAIR_FAILURE_KINDS,
+    SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+    SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+)
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
@@ -42,31 +47,6 @@ from agent_hub.runtime.failure_reason import (
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
-_SAFE_SELF_REPAIR_FAILURE_KINDS = frozenset(
-    {
-        "capacity_pressure",
-        "empty_model_response",
-        "missing_failure_event",
-        "model_capability_routing_unavailable",
-        "runtime_failure",
-        "step_failure",
-        "tool_failure",
-    }
-)
-_SAFE_SELF_REPAIR_RECOVERY_STRATEGIES = frozenset(
-    {
-        "compact_context_before_next_model_call",
-        "pause_for_scheduler_review",
-        "preserve_outputs_and_retry_scope",
-        "reassign_tool_role_to_capable_model_and_retry",
-        "repair_tool_invocation_after_permission_check",
-        "retry_failed_step_after_context_compaction",
-        "retry_with_fallback_or_reassign_model",
-        "switch_to_available_model_and_retry",
-        "watch_retry_budget_before_requeue",
-    }
-)
-_SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
@@ -2097,7 +2077,7 @@ def _self_repair_execution_payload(
         "failure_kind": _bounded_enum_text(
             repair.get("failure_kind"),
             default="runtime_failure",
-            allowed=_SAFE_SELF_REPAIR_FAILURE_KINDS,
+            allowed=SAFE_SELF_REPAIR_FAILURE_KINDS,
             max_chars=64,
         ),
         "source_run_id": _bounded_text(
@@ -2123,12 +2103,12 @@ def _self_repair_execution_payload(
     }
     recovery_strategy = _bounded_optional_enum_text(
         repair.get("recovery_strategy"),
-        allowed=_SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+        allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
         max_chars=128,
     )
     orchestration_recovery_hint = _bounded_optional_enum_text(
         repair.get("orchestration_recovery_hint"),
-        allowed=_SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+        allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
         max_chars=128,
     )
     if recovery_strategy is not None:

@@ -5,35 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 
+from agent_hub.recovery_metadata import (
+    SAFE_SELF_REPAIR_FAILURE_KINDS,
+    SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+    SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+)
 from agent_hub.runtime.contracts import JsonValue
 
 _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
-_SAFE_FAILURE_KINDS = frozenset(
-    {
-        "capacity_pressure",
-        "empty_model_response",
-        "missing_failure_event",
-        "model_capability_routing_unavailable",
-        "runtime_failure",
-        "step_failure",
-        "tool_failure",
-    }
-)
-_SAFE_RECOVERY_STRATEGIES = frozenset(
-    {
-        "compact_context_before_next_model_call",
-        "pause_for_scheduler_review",
-        "preserve_outputs_and_retry_scope",
-        "reassign_tool_role_to_capable_model_and_retry",
-        "repair_tool_invocation_after_permission_check",
-        "retry_failed_step_after_context_compaction",
-        "retry_with_fallback_or_reassign_model",
-        "switch_to_available_model_and_retry",
-        "watch_retry_budget_before_requeue",
-    }
-)
-_SAFE_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
 
 
 def self_repair_context_text(
@@ -51,7 +31,7 @@ def self_repair_context_text(
         "failure_kind": _safe_enum_text(
             repair.get("failure_kind"),
             default="runtime_failure",
-            allowed=_SAFE_FAILURE_KINDS,
+            allowed=SAFE_SELF_REPAIR_FAILURE_KINDS,
             max_chars=64,
         ),
         "repair_action": _safe_text(
@@ -69,13 +49,13 @@ def self_repair_context_text(
         "recovery_strategy": _safe_enum_text(
             repair.get("recovery_strategy"),
             default="",
-            allowed=_SAFE_RECOVERY_STRATEGIES,
+            allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
             max_chars=128,
         ),
         "orchestration_recovery_hint": _safe_enum_text(
             repair.get("orchestration_recovery_hint"),
             default="",
-            allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS,
+            allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
             max_chars=128,
         ),
     }

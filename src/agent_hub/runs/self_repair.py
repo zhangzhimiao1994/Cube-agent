@@ -10,6 +10,12 @@ from typing import Literal
 from uuid import UUID
 
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.recovery_metadata import (
+    RECOVERY_STRATEGY_BY_FAILURE_CATEGORY,
+    SAFE_OBSERVER_RECOMMENDATIONS,
+    SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+    SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+)
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 
 _FAILURE_KINDS = frozenset({EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED})
@@ -48,28 +54,6 @@ _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
         "model capability unavailable",
     }
 )
-_RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = {
-    "capacity_pressure": "switch_to_available_model_and_retry",
-    "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
-    "empty_model_response": "retry_with_fallback_or_reassign_model",
-    "runtime_failure": "preserve_outputs_and_retry_scope",
-    "step_failure": "retry_failed_step_after_context_compaction",
-    "tool_failure": "repair_tool_invocation_after_permission_check",
-    "missing_failure_event": "manual_review_missing_failure_event",
-}
-_SAFE_RECOVERY_STRATEGIES = frozenset(_RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.values())
-_SAFE_OBSERVER_RECOMMENDATIONS = frozenset(
-    {
-        "switch_to_available_model_and_retry",
-        "retry_with_fallback_or_reassign_model",
-        "pause_for_scheduler_review",
-        "preserve_outputs_and_retry_scope",
-        "reassign_tool_role_to_capable_model_and_retry",
-        "watch_retry_budget_before_requeue",
-        "compact_context_before_next_model_call",
-    }
-)
-_SAFE_ORCHESTRATION_RECOVERY_HINTS = frozenset({"retry_blocked_contract_chain"})
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -349,11 +333,11 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
     }
     recovery_strategy = _safe_optional_text(
         proposal.get("recovery_strategy"),
-        allowed=_SAFE_RECOVERY_STRATEGIES | _SAFE_OBSERVER_RECOMMENDATIONS,
+        allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
     )
     orchestration_recovery_hint = _safe_optional_text(
         proposal.get("orchestration_recovery_hint"),
-        allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS,
+        allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     )
     if recovery_strategy is not None:
         context["recovery_strategy"] = recovery_strategy
@@ -424,10 +408,13 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
     if key == "recovery_strategy":
         return _safe_optional_text(
             value,
-            allowed=_SAFE_RECOVERY_STRATEGIES | _SAFE_OBSERVER_RECOMMENDATIONS,
+            allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
         )
     if key == "orchestration_recovery_hint":
-        return _safe_optional_text(value, allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS)
+        return _safe_optional_text(
+            value,
+            allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+        )
     if isinstance(value, str | int | float | bool):
         return value
     return None
@@ -439,11 +426,11 @@ def _recovery_strategy(*, failure_category: str, events: Sequence[RunEvent]) -> 
             continue
         recommendation = _safe_optional_text(
             event.payload.get("recommendation"),
-            allowed=_SAFE_OBSERVER_RECOMMENDATIONS,
+            allowed=SAFE_OBSERVER_RECOMMENDATIONS,
         )
         if recommendation is not None:
             return recommendation
-    return _RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.get(failure_category)
+    return RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.get(failure_category)
 
 
 def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
@@ -458,7 +445,10 @@ def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
         if not isinstance(hints, Sequence) or isinstance(hints, str | bytes):
             continue
         for hint in hints:
-            safe_hint = _safe_optional_text(hint, allowed=_SAFE_ORCHESTRATION_RECOVERY_HINTS)
+            safe_hint = _safe_optional_text(
+                hint,
+                allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+            )
             if safe_hint is not None:
                 return safe_hint
     return None
