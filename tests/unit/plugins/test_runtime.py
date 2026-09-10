@@ -1792,6 +1792,23 @@ def test_plugin_package_subprocess_registration_status_reports_relative_launcher
     )
 
 
+def test_plugin_package_subprocess_registration_status_reports_ready(tmp_path: Path) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    if os.name == "posix":
+        bubblewrap_executable.chmod(0o755)
+
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+        )
+        == "ready"
+    )
+
+
 def test_plugin_package_subprocess_registration_status_reports_launcher_reason(
     tmp_path: Path,
 ) -> None:
