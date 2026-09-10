@@ -237,6 +237,17 @@ const OpenClawRemoteAdapterConfigSchema = z.object({
   credential_ref: z.string(),
 });
 
+const PluginPackageSubprocessRegistrationStatusSchema = z.enum([
+  "disabled",
+  "no_adapter_ids",
+  "unsupported_isolation_backend",
+  "missing_isolation_launcher",
+  "launcher_path_not_absolute",
+  "launcher_not_found",
+  "launcher_not_executable",
+  "ready",
+]);
+
 const SystemSettingsSchema = z.object({
   default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
   default_workflow_id: z.string().nullable(),
@@ -260,7 +271,9 @@ const SystemSettingsSchema = z.object({
   channel_entry: z.string(),
   attachment_retention_days: z.number(),
   attachment_max_mb: z.number(),
-  plugin_package_subprocess_registration_status: z.string().nullable().default(null),
+  plugin_package_subprocess_registration_status: PluginPackageSubprocessRegistrationStatusSchema.nullable()
+    .default(null)
+    .catch(null),
 });
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;

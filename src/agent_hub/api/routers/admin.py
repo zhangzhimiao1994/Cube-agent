@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast, get_args
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -1412,6 +1412,18 @@ class OpenClawRemoteAdapterSettings(BaseModel):
         return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
 
 
+PluginPackageSubprocessRegistrationStatus = Literal[
+    "disabled",
+    "no_adapter_ids",
+    "unsupported_isolation_backend",
+    "missing_isolation_launcher",
+    "launcher_path_not_absolute",
+    "launcher_not_found",
+    "launcher_not_executable",
+    "ready",
+]
+
+
 class SystemSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1443,7 +1455,9 @@ class SystemSettingsRequest(BaseModel):
     channel_entry: str = Field(default="web", max_length=64)
     attachment_retention_days: int = Field(default=7, ge=1, le=365)
     attachment_max_mb: int = Field(default=25, ge=1, le=200)
-    plugin_package_subprocess_registration_status: str | None = None
+    plugin_package_subprocess_registration_status: (
+        PluginPackageSubprocessRegistrationStatus | None
+    ) = None
 
     @field_validator("openclaw_allowed_commands")
     @classmethod
@@ -1460,16 +1474,7 @@ class SystemSettingsResponse(SystemSettingsRequest):
 
 
 _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
-    {
-        "disabled",
-        "no_adapter_ids",
-        "unsupported_isolation_backend",
-        "missing_isolation_launcher",
-        "launcher_path_not_absolute",
-        "launcher_not_found",
-        "launcher_not_executable",
-        "ready",
-    }
+    get_args(PluginPackageSubprocessRegistrationStatus)
 )
 
 

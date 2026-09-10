@@ -315,6 +315,16 @@ def test_settings_update_accepts_projected_plugin_package_subprocess_registratio
     )
 
 
+def test_settings_update_rejects_unknown_plugin_package_subprocess_registration_status() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["plugin_package_subprocess_registration_status"] = "unexpected_raw_status"
+
+    response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
+
+    assert response.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_persistent_settings_missing_tool_approval_mode_migrates_to_ask() -> None:
     class StoredPersistentService(PersistentAdminResourceService):
