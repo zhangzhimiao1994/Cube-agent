@@ -206,6 +206,14 @@ describe("api client transport", () => {
             blocked_contract_count: 1,
             truncated: false,
           },
+          runtime_recovery_summary: {
+            recovery_count: 1,
+            last_completed_steps: 2,
+            last_total_steps: 5,
+            model_status_counts: { failed: 1, succeeded: 2 },
+            tool_status_counts: { running: 1 },
+            review_artifacts: 1,
+          },
         }),
         {
           status: 200,
@@ -237,6 +245,56 @@ describe("api client transport", () => {
       contract_count: 2,
       blocked_contract_count: 1,
       truncated: false,
+    });
+    expect(run.runtime_recovery_summary).toEqual({
+      recovery_count: 1,
+      last_completed_steps: 2,
+      last_total_steps: 5,
+      model_status_counts: { failed: 1, succeeded: 2 },
+      tool_status_counts: { running: 1 },
+      review_artifacts: 1,
+    });
+  });
+
+  it("accepts a zero-count runtime recovery summary without checkpoint internals", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_1",
+          status: "completed",
+          mode: "dispatch",
+          version: 1,
+          request: "Draft copy.",
+          created_at: "2026-09-06T13:50:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+          runtime_recovery_summary: {
+            recovery_count: 0,
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const run = await api.run("run_1");
+
+    expect(run.runtime_recovery_summary).toEqual({
+      recovery_count: 0,
+      last_completed_steps: 0,
+      last_total_steps: 0,
+      model_status_counts: {},
+      tool_status_counts: {},
+      review_artifacts: 0,
     });
   });
 

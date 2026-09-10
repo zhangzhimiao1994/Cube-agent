@@ -20,6 +20,7 @@ type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
 type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
 type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
+type ApiRuntimeRecoverySummary = RunDetail["runtime_recovery_summary"];
 type OrchestrationHandoff = {
   sourceRoleId: string;
   targetRoleId: string;
@@ -59,6 +60,15 @@ type ModelCapabilityNegotiationSummary = {
   missingCount: number;
   unknownCount: number;
   truncated: boolean;
+};
+
+type RuntimeRecoverySummary = {
+  recoveryCount: number;
+  completedSteps: number;
+  totalSteps: number;
+  modelStatusCounts: Record<string, number>;
+  toolStatusCounts: Record<string, number>;
+  reviewArtifacts: number;
 };
 
 type OrchestrationContract = {
@@ -1070,6 +1080,20 @@ function modelCapabilityNegotiationSummaryFromApi(
   };
 }
 
+function runtimeRecoverySummaryFromApi(
+  summary: ApiRuntimeRecoverySummary,
+): RuntimeRecoverySummary | null {
+  if (!summary || summary.recovery_count === 0) return null;
+  return {
+    recoveryCount: summary.recovery_count,
+    completedSteps: summary.last_completed_steps,
+    totalSteps: summary.last_total_steps,
+    modelStatusCounts: summary.model_status_counts,
+    toolStatusCounts: summary.tool_status_counts,
+    reviewArtifacts: summary.review_artifacts,
+  };
+}
+
 function orchestrationContractKey(contract: OrchestrationContract) {
   return contract.contractId || `${contract.sourceStepId}->${contract.targetStepId}:${contract.handoffKind}`;
 }
@@ -1179,6 +1203,10 @@ function modelCapabilityNegotiationLabel(summary: ModelCapabilityNegotiationSumm
   if (summary.unknownCount > 0) parts.push(`未知 ${summary.unknownCount}`);
   if (summary.truncated) parts.push("已截断");
   return parts.join("，");
+}
+
+function runtimeRecoveryLabel(summary: RuntimeRecoverySummary) {
+  return `${summary.recoveryCount} 次续跑，${summary.completedSteps}/${summary.totalSteps} 步`;
 }
 
 function orchestrationContractRecoveryRecommendation(summary: OrchestrationContractSummary) {
@@ -1976,6 +2004,9 @@ export function RunDetailPage() {
   const capabilityNegotiationSummary = modelCapabilityNegotiationSummaryFromApi(
     orderedRunData.model_capability_negotiation_summary,
   );
+  const runtimeRecoverySummary = runtimeRecoverySummaryFromApi(
+    orderedRunData.runtime_recovery_summary,
+  );
 
   return (
     <section>
@@ -2018,7 +2049,12 @@ export function RunDetailPage() {
         </ul>
       </div>
 
-      {hasOutcomeSummary || handoffSummary || contractSummary || protocolSummary || capabilityNegotiationSummary ? (
+      {hasOutcomeSummary ||
+      handoffSummary ||
+      contractSummary ||
+      protocolSummary ||
+      capabilityNegotiationSummary ||
+      runtimeRecoverySummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
@@ -2034,7 +2070,9 @@ export function RunDetailPage() {
                     ? "已记录契约"
                     : protocolSummary
                       ? "已记录协议"
-                      : "已记录能力协商"}
+                      : capabilityNegotiationSummary
+                        ? "已记录能力协商"
+                        : "已恢复续跑"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -2076,6 +2114,12 @@ export function RunDetailPage() {
               <li>
                 <span>能力协商</span>
                 <strong>{modelCapabilityNegotiationLabel(capabilityNegotiationSummary)}</strong>
+              </li>
+            ) : null}
+            {runtimeRecoverySummary ? (
+              <li>
+                <span>恢复</span>
+                <strong>{runtimeRecoveryLabel(runtimeRecoverySummary)}</strong>
               </li>
             ) : null}
             {handoffSummary ? (

@@ -742,6 +742,15 @@ const ModelCapabilityNegotiationSummarySchema = z.object({
   truncated: z.boolean().default(false),
 });
 
+const RuntimeRecoverySummarySchema = z.object({
+  recovery_count: z.number().int().nonnegative().default(0),
+  last_completed_steps: z.number().int().nonnegative().default(0),
+  last_total_steps: z.number().int().nonnegative().default(0),
+  model_status_counts: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  tool_status_counts: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  review_artifacts: z.number().int().nonnegative().default(0),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
@@ -760,6 +769,10 @@ const RunDetailSchema = RunListItemSchema.extend({
   model_capability_negotiation_summary: z.preprocess(
     (value) => value ?? null,
     ModelCapabilityNegotiationSummarySchema.nullable(),
+  ).optional(),
+  runtime_recovery_summary: z.preprocess(
+    (value) => value ?? null,
+    RuntimeRecoverySummarySchema.nullable(),
   ).optional(),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),

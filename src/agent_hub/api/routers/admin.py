@@ -418,6 +418,17 @@ class ModelCapabilityNegotiationSummaryResponse(BaseModel):
     truncated: bool = False
 
 
+class RuntimeRecoverySummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recovery_count: int = Field(default=0, ge=0)
+    last_completed_steps: int = Field(default=0, ge=0)
+    last_total_steps: int = Field(default=0, ge=0)
+    model_status_counts: dict[str, int] = Field(default_factory=dict, max_length=8)
+    tool_status_counts: dict[str, int] = Field(default_factory=dict, max_length=8)
+    review_artifacts: int = Field(default=0, ge=0)
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
@@ -432,6 +443,7 @@ class RunDetailResponse(RunListItem):
     model_capability_negotiation_summary: (
         ModelCapabilityNegotiationSummaryResponse | None
     ) = None
+    runtime_recovery_summary: RuntimeRecoverySummaryResponse | None = None
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -451,6 +463,9 @@ class RunDetailResponse(RunListItem):
         )
         self.model_capability_negotiation_summary = (
             _model_capability_negotiation_summary_from_run_events(self.events)
+        )
+        self.runtime_recovery_summary = _runtime_recovery_summary_from_run_events(
+            self.events
         )
         return self
 
@@ -9261,6 +9276,56 @@ def _model_capability_negotiation_summary_from_run_events(
     )
 
 
+def _runtime_recovery_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> RuntimeRecoverySummaryResponse | None:
+    recovered_events = [
+        event
+        for event in sorted(events, key=lambda item: item.sequence)
+        if event.kind == "runtime.recovered"
+    ]
+    if not recovered_events:
+        return None
+    latest = recovered_events[-1]
+    payload = latest.payload
+    completed_steps = _orchestration_protocol_int(payload.get("completed_steps"))
+    total_steps = _orchestration_protocol_int(payload.get("total_steps"))
+    review_artifacts = _orchestration_protocol_int(payload.get("review_artifacts"))
+    if (
+        completed_steps is None
+        or total_steps is None
+        or review_artifacts is None
+        or completed_steps > total_steps
+    ):
+        return None
+    return RuntimeRecoverySummaryResponse(
+        recovery_count=len(recovered_events),
+        last_completed_steps=completed_steps,
+        last_total_steps=total_steps,
+        model_status_counts=_runtime_recovery_status_counts(
+            payload.get("model_status_counts")
+        ),
+        tool_status_counts=_runtime_recovery_status_counts(
+            payload.get("tool_status_counts")
+        ),
+        review_artifacts=review_artifacts,
+    )
+
+
+def _runtime_recovery_status_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    counts: dict[str, int] = {}
+    for raw_key, raw_count in value.items():
+        if len(counts) >= 8:
+            break
+        key = _model_outcome_string(raw_key)
+        if key is None or type(raw_count) is not int or raw_count < 0:
+            continue
+        counts[key] = raw_count
+    return counts
+
+
 def _orchestration_protocol_id(value: object) -> str | None:
     protocol = _model_outcome_string(value)
     return protocol if protocol == "role_handoff_contract_v1" else None
@@ -10300,7 +10365,12 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     actor = _optional_event_string(event.get("actor"))
     action = _optional_event_action(event.get("action"))
     decision = _optional_event_string(event.get("decision"))
-    safe_payload = _tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload)
+    if kind_text.startswith("tool."):
+        safe_payload = _tool_event_payload(payload)
+    elif kind_text == "runtime.recovered":
+        safe_payload = _runtime_recovered_event_payload(payload)
+    else:
+        safe_payload = _event_payload(payload)
     safe_artifact = _admin_run_artifact(artifact) if isinstance(artifact, dict) else None
     summary = _event_source_summary(event.get("summary")) or _event_summary(
         kind_text,
@@ -10437,6 +10507,29 @@ def _event_payload(value: object) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = {}
     for key, item in value.items():
         key_text = str(key)
+        payload[key_text] = _safe_event_detail(item, key=key_text)
+    return payload
+
+
+_SAFE_RUNTIME_RECOVERED_PAYLOAD_KEYS = frozenset(
+    {
+        "completed_steps",
+        "total_steps",
+        "model_status_counts",
+        "tool_status_counts",
+        "review_artifacts",
+    }
+)
+
+
+def _runtime_recovered_event_payload(value: object) -> dict[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text not in _SAFE_RUNTIME_RECOVERED_PAYLOAD_KEYS:
+            continue
         payload[key_text] = _safe_event_detail(item, key=key_text)
     return payload
 

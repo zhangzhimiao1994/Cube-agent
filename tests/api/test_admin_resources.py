@@ -502,6 +502,82 @@ def test_admin_run_detail_serializes_model_outcome_summary_without_capacity_inte
     assert "tenant-private-quota" not in serialized
 
 
+def test_admin_run_detail_serializes_runtime_recovery_summary_without_internals() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    checkpoint_id = str(uuid4())
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="running",
+        mode="dispatch",
+        request="resume a long running dispatch",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 3,
+                    "kind": "runtime.recovered",
+                    "message": "runtime.recovered",
+                    "created_at": now,
+                    "payload": {
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_phase": "running",
+                        "completed_steps": 2,
+                        "total_steps": 5,
+                        "model_status_counts": {
+                            "failed": 1,
+                            "running": 1,
+                            "succeeded": 2,
+                        },
+                        "tool_status_counts": {
+                            "running": 1,
+                            "succeeded": 3,
+                        },
+                        "review_artifacts": 1,
+                        "lease_id": "lease-private",
+                        "quota_scope_id": "tenant-private-quota",
+                        "credential_ref": "credential-private",
+                    },
+                }
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_recovery_summary"] == {
+        "recovery_count": 1,
+        "last_completed_steps": 2,
+        "last_total_steps": 5,
+        "model_status_counts": {
+            "failed": 1,
+            "running": 1,
+            "succeeded": 2,
+        },
+        "tool_status_counts": {
+            "running": 1,
+            "succeeded": 3,
+        },
+        "review_artifacts": 1,
+    }
+    assert "checkpoint_id" not in body["events"][0]["payload"]
+    assert "checkpoint_phase" not in body["events"][0]["payload"]
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert checkpoint_id not in serialized
+    assert "lease-private" not in serialized
+    assert "tenant-private-quota" not in serialized
+    assert "credential-private" not in serialized
+
+
 def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)

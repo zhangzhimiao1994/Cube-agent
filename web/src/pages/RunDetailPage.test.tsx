@@ -856,6 +856,80 @@ describe("RunDetailPage", () => {
     expect(within(summary).queryByText("已记录交接")).toBeNull();
   });
 
+  it("shows runtime recovery summary as a compact outcome metric", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      runtime_recovery_summary: {
+        recovery_count: 1,
+        last_completed_steps: 2,
+        last_total_steps: 5,
+        model_status_counts: { failed: 1, succeeded: 2 },
+        tool_status_counts: { running: 1 },
+        review_artifacts: 1,
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("已恢复续跑")).not.toBeNull();
+    expect(within(summary).getByText("1 次续跑，2/5 步")).not.toBeNull();
+    expect(screen.queryByText("00000000-0000-4000-8000-000000000001")).toBeNull();
+  });
+
+  it("hides zero-count runtime recovery summaries", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      runtime_recovery_summary: {
+        recovery_count: 0,
+        last_completed_steps: 0,
+        last_total_steps: 0,
+        model_status_counts: {},
+        tool_status_counts: {},
+        review_artifacts: 0,
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    await screen.findByText("请生成独立运行详情页回归样例。");
+    expect(screen.queryByRole("status", { name: "模型结果摘要" })).toBeNull();
+  });
+
   it("summarizes blocked orchestration contracts without expanding contract details", async () => {
     const detailedRun: RunDetail = {
       ...runDetail,
