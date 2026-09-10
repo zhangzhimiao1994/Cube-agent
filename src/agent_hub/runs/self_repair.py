@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -13,6 +14,7 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.recovery_metadata import (
     RECOVERY_STRATEGY_BY_FAILURE_CATEGORY,
     SAFE_OBSERVER_RECOMMENDATIONS,
+    SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
@@ -55,6 +57,10 @@ _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
         "model capability unavailable",
         "planned capability is unavailable",
     }
+)
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
+    re.IGNORECASE,
 )
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
@@ -383,7 +389,7 @@ def _repair_instruction(failure_category: str) -> str:
 def _safe_text(value: object, *, default: str, max_chars: int = 128) -> str:
     if not isinstance(value, str):
         return default
-    text = " ".join(value.split())[:max_chars]
+    text = _SENSITIVE_TEXT_PATTERN.sub("[redacted]", " ".join(value.split()))[:max_chars]
     return text or default
 
 
@@ -407,6 +413,8 @@ def _safe_optional_text(value: object, *, allowed: frozenset[str]) -> str | None
 
 
 def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | None:
+    if key == "failure_kind":
+        return _safe_optional_text(value, allowed=SAFE_SELF_REPAIR_FAILURE_KINDS) or "runtime_failure"
     if key == "recovery_strategy":
         return _safe_optional_text(
             value,
@@ -417,8 +425,24 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
             value,
             allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
         )
-    if isinstance(value, str | int | float | bool):
-        return value
+    if key == "automatic_execution":
+        return False
+    if key in {"requires_approval", "replay_safe"}:
+        return value if type(value) is bool else None
+    if key in {"attempt", "max_attempts"}:
+        return _safe_int(value, default=1, minimum=1, maximum=3)
+    if key == "source_event_sequence":
+        return _safe_int(value, default=0, minimum=0, maximum=2**63 - 1)
+    if key in {"kind", "repair_action"}:
+        return _safe_text(value, default="", max_chars=96)
+    if key == "title":
+        return _safe_text(value, default="", max_chars=96)
+    if key == "summary":
+        return _safe_text(value, default="", max_chars=160)
+    if key == "instruction":
+        return _safe_text(value, default="", max_chars=240)
+    if key in {"source_run_id", "fingerprint"}:
+        return _safe_text(value, default="", max_chars=96)
     return None
 
 

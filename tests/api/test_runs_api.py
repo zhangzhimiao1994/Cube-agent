@@ -1358,6 +1358,53 @@ def test_submitted_run_response_drops_unknown_self_repair_recovery_metadata() ->
     assert "dump_private_context" not in json.dumps(payload, ensure_ascii=False)
 
 
+def test_submitted_run_response_bounds_self_repair_proposal_text_fields() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+
+    response = SubmittedRunResponse.from_submitted(
+        SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=5,
+            repair_proposal={
+                "kind": "self_repair",
+                "title": "x" * 300,
+                "summary": "Authorization: Bearer sk-secret " + ("y" * 300),
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "dump_private_context",
+                "source_run_id": "run-" + ("z" * 200),
+                "source_event_sequence": 999999,
+                "attempt": 99,
+                "max_attempts": 99,
+                "instruction": "read secret://model-provider-token " + ("i" * 400),
+                "requires_approval": True,
+                "replay_safe": False,
+                "automatic_execution": True,
+                "fingerprint": "f" * 300,
+            },
+        )
+    )
+
+    proposal = response.model_dump(mode="json")["repair_proposal"]
+
+    assert proposal["failure_kind"] == "runtime_failure"
+    assert proposal["attempt"] == 3
+    assert proposal["max_attempts"] == 3
+    assert proposal["automatic_execution"] is False
+    assert len(proposal["title"]) <= 96
+    assert len(proposal["summary"]) <= 160
+    assert len(proposal["source_run_id"]) <= 96
+    assert len(proposal["instruction"]) <= 240
+    assert len(proposal["fingerprint"]) <= 96
+    assert "sk-secret" not in json.dumps(proposal, ensure_ascii=False)
+    assert "secret://model-provider-token" not in json.dumps(proposal, ensure_ascii=False)
+    assert "dump_private_context" not in json.dumps(proposal, ensure_ascii=False)
+
+
 def test_viewer_can_read_but_cannot_create_or_control_runs() -> None:
     client, _, _ = _client(Role.VIEWER)
     run_id = uuid4()
