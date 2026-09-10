@@ -615,6 +615,8 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
             plugin_package_store_dir=tmp_path / "packages",
             plugin_package_subprocess_runner_enabled=True,
             plugin_package_subprocess_adapter_ids=["calendar_python"],
+            plugin_package_subprocess_isolation_backend="bubblewrap",
+            plugin_package_subprocess_bubblewrap_executable=tmp_path / "bwrap",
             plugin_package_subprocess_timeout_seconds=1,
             plugin_package_subprocess_max_stdin_bytes=2048,
             plugin_package_subprocess_max_stdout_bytes=1024,
@@ -638,6 +640,8 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     assert tuple(adapters) == ("calendar_python",)
     assert adapter_kwargs["enabled"] is True
     assert adapter_kwargs["adapter_ids"] == ("calendar_python",)
+    assert adapter_kwargs["isolation_backend"] == "bubblewrap"
+    assert adapter_kwargs["bubblewrap_executable"] == tmp_path / "bwrap"
     assert adapter_kwargs["timeout_seconds"] == 1
     assert adapter_kwargs["max_stdin_bytes"] == 2048
     assert adapter_kwargs["max_stdout_bytes"] == 1024

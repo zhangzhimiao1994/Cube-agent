@@ -27,6 +27,7 @@ from agent_hub.plugins.contracts import (
     http_json_adapter_descriptor,
 )
 from agent_hub.plugins.runtime import (
+    BubblewrapPluginPackageProcessLauncher,
     HttpJsonPluginAdapter,
     PluginInvocationContext,
     PluginPackageAdapter,
@@ -207,6 +208,16 @@ class RecordingPluginPackageRunner:
             "ok": True,
             "entrypoint": str(target.entrypoint),
         }
+
+
+def _argv_contains_ordered_pair(
+    argv: tuple[str, ...],
+    flag: str,
+    source: Path,
+    destination: Path,
+) -> bool:
+    expected = (flag, str(source), str(destination))
+    return any(argv[index : index + 3] == expected for index in range(len(argv) - 2))
 
 
 def plugin(
@@ -1133,13 +1144,16 @@ async def test_runtime_plugin_service_invokes_allowlisted_package_adapter_throug
     service = await build_runtime_plugin_service(
         tenant_id=TENANT_ID,
         admin_service=admin_service,
-        adapters=build_plugin_package_subprocess_adapters(
-            enabled=True,
-            adapter_ids=("calendar_python",),
-            package_store_dir=tmp_path,
-            python_executable=sys.executable,
-            timeout_seconds=2,
-        ),
+        adapters={
+            "calendar_python": PluginPackageAdapter(
+                adapter_id="calendar_python",
+                package_store_dir=tmp_path,
+                runner=PythonSubprocessPluginPackageRunner(
+                    python_executable=sys.executable,
+                    timeout_seconds=2,
+                ),
+            )
+        },
     )
 
     result = await service.invoke(
@@ -1561,6 +1575,33 @@ async def test_python_subprocess_plugin_package_runner_rejects_oversized_stdin_b
     assert not marker.exists()
 
 
+def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    runtime_root = tmp_path / "python-runtime"
+    entrypoint = package_root / "adapter" / "main.py"
+    launcher = BubblewrapPluginPackageProcessLauncher(
+        bubblewrap_executable=tmp_path / "bwrap",
+        readonly_bind_paths=(runtime_root,),
+    )
+
+    argv = launcher.argv(
+        python_executable=str(runtime_root / "bin" / "python"),
+        target=PluginPackageExecutionTarget(root=package_root, entrypoint=entrypoint),
+    )
+
+    assert argv[0] == str(tmp_path / "bwrap")
+    assert "--unshare-net" in argv
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", package_root, package_root)
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", runtime_root, runtime_root)
+    assert argv[-3:] == (
+        str(runtime_root / "bin" / "python"),
+        "-I",
+        str(entrypoint),
+    )
+
+
 def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
     tmp_path: Path,
 ) -> None:
@@ -1574,6 +1615,36 @@ def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
     )
 
 
+def test_build_plugin_package_subprocess_adapters_requires_isolation_launcher(
+    tmp_path: Path,
+) -> None:
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            isolation_backend="disabled",
+            bubblewrap_executable=None,
+        )
+        == {}
+    )
+
+
+def test_build_plugin_package_subprocess_adapters_requires_absolute_launcher(
+    tmp_path: Path,
+) -> None:
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=Path("bwrap"),
+        )
+        == {}
+    )
+
+
 def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
     tmp_path: Path,
 ) -> None:
@@ -1581,6 +1652,8 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
         enabled=True,
         adapter_ids=("calendar_python", "crm-python"),
         package_store_dir=tmp_path,
+        isolation_backend="bubblewrap",
+        bubblewrap_executable=tmp_path / "bwrap",
         timeout_seconds=1,
         max_stdout_bytes=1024,
     )
@@ -1610,6 +1683,8 @@ def test_build_plugin_package_subprocess_adapters_rejects_reserved_adapter_id(
             enabled=True,
             adapter_ids=("http_json",),
             package_store_dir=tmp_path,
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=tmp_path / "bwrap",
         )
 
 

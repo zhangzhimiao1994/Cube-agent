@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -104,6 +104,15 @@ class PluginPackageRunner(Protocol):
         arguments: Mapping[str, JsonValue],
         context: PluginInvocationContext,
     ) -> Mapping[str, JsonValue]: ...
+
+
+class PluginPackageProcessLauncher(Protocol):
+    def argv(
+        self,
+        *,
+        python_executable: str,
+        target: PluginPackageExecutionTarget,
+    ) -> tuple[str, ...]: ...
 
 
 class HttpJsonPluginAdapter:
@@ -229,17 +238,87 @@ class PluginPackageAdapter:
         return adapter_descriptor_with_contract(_package_adapter_descriptor(self._adapter_id))
 
 
+class BubblewrapPluginPackageProcessLauncher:
+    def __init__(
+        self,
+        *,
+        bubblewrap_executable: Path,
+        readonly_bind_paths: Sequence[Path] | None = None,
+    ) -> None:
+        self._bubblewrap_executable = bubblewrap_executable
+        self._readonly_bind_paths = tuple(readonly_bind_paths or ())
+
+    def argv(
+        self,
+        *,
+        python_executable: str,
+        target: PluginPackageExecutionTarget,
+    ) -> tuple[str, ...]:
+        root = target.root
+        entrypoint = target.entrypoint
+        readonly_bind_paths = self._readonly_bind_paths or (
+            _default_python_runtime_readonly_bind_paths(python_executable)
+        )
+        readonly_bind_args = tuple(
+            argument
+            for path in readonly_bind_paths
+            for argument in ("--ro-bind", str(path), str(path))
+        )
+        return (
+            str(self._bubblewrap_executable),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--ro-bind",
+            str(root),
+            str(root),
+            *readonly_bind_args,
+            "--tmpfs",
+            "/tmp",
+            "--chdir",
+            str(root),
+            "--",
+            python_executable,
+            "-I",
+            str(entrypoint),
+        )
+
+
+def _default_python_runtime_readonly_bind_paths(python_executable: str) -> tuple[Path, ...]:
+    candidates = [
+        Path(python_executable).resolve().parent,
+        Path(sys.prefix).resolve(),
+        Path(sys.base_prefix).resolve(),
+    ]
+    for system_path in (Path("/lib"), Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")):
+        if system_path.exists():
+            candidates.append(system_path.resolve())
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if path.exists() and key not in seen:
+            deduped.append(path)
+            seen.add(key)
+    return tuple(deduped)
+
+
 class PythonSubprocessPluginPackageRunner:
     def __init__(
         self,
         *,
         python_executable: str | None = None,
+        process_launcher: PluginPackageProcessLauncher | None = None,
         timeout_seconds: float = 10,
         max_stdin_bytes: int = 262_144,
         max_stdout_bytes: int = 262_144,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         self._python_executable = sys.executable if python_executable is None else python_executable
+        self._process_launcher = process_launcher
         self._timeout_seconds = max(0.001, timeout_seconds)
         self._max_stdin_bytes = max(1, max_stdin_bytes)
         self._max_stdout_bytes = max(1, max_stdout_bytes)
@@ -269,11 +348,17 @@ class PythonSubprocessPluginPackageRunner:
         ).encode("utf-8")
         if len(payload) > self._max_stdin_bytes:
             raise RuntimeCapabilityError("Plugin request is too large")
+        argv = (
+            self._process_launcher.argv(
+                python_executable=self._python_executable,
+                target=target,
+            )
+            if self._process_launcher is not None
+            else (self._python_executable, "-I", str(target.entrypoint))
+        )
         try:
             process = await asyncio.create_subprocess_exec(
-                self._python_executable,
-                "-I",
-                str(target.entrypoint),
+                *argv,
                 cwd=target.root,
                 env=self._environment,
                 stdin=asyncio.subprocess.PIPE,
@@ -1002,6 +1087,8 @@ def build_plugin_package_subprocess_adapters(
     enabled: bool,
     adapter_ids: Sequence[str],
     package_store_dir: Path,
+    isolation_backend: Literal["disabled", "bubblewrap"] = "disabled",
+    bubblewrap_executable: Path | None = None,
     python_executable: str | None = None,
     timeout_seconds: float = 10.0,
     max_stdin_bytes: int = 262_144,
@@ -1011,8 +1098,17 @@ def build_plugin_package_subprocess_adapters(
         return {}
     if any(adapter_id == "http_json" for adapter_id in adapter_ids):
         raise ValueError("plugin package subprocess adapter id is reserved")
+    if (
+        isolation_backend != "bubblewrap"
+        or bubblewrap_executable is None
+        or not bubblewrap_executable.is_absolute()
+    ):
+        return {}
     runner = PythonSubprocessPluginPackageRunner(
         python_executable=python_executable,
+        process_launcher=BubblewrapPluginPackageProcessLauncher(
+            bubblewrap_executable=bubblewrap_executable
+        ),
         timeout_seconds=timeout_seconds,
         max_stdin_bytes=max_stdin_bytes,
         max_stdout_bytes=max_stdout_bytes,

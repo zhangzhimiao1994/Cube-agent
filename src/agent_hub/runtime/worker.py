@@ -274,6 +274,16 @@ def build_worker_service(
                 "plugin_package_store_dir",
                 Path("/var/lib/agent-hub/plugin-packages"),
             ),
+            isolation_backend=getattr(
+                settings,
+                "plugin_package_subprocess_isolation_backend",
+                "disabled",
+            ),
+            bubblewrap_executable=getattr(
+                settings,
+                "plugin_package_subprocess_bubblewrap_executable",
+                None,
+            ),
             timeout_seconds=float(
                 getattr(settings, "plugin_package_subprocess_timeout_seconds", 10.0)
             ),

@@ -970,6 +970,12 @@ def create_app(
                                 configured.plugin_package_subprocess_adapter_ids
                             ),
                             package_store_dir=configured.plugin_package_store_dir,
+                            isolation_backend=(
+                                configured.plugin_package_subprocess_isolation_backend
+                            ),
+                            bubblewrap_executable=(
+                                configured.plugin_package_subprocess_bubblewrap_executable
+                            ),
                             timeout_seconds=(
                                 configured.plugin_package_subprocess_timeout_seconds
                             ),

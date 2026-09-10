@@ -5,7 +5,7 @@ import binascii
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 from uuid import UUID
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
@@ -57,6 +57,11 @@ class Settings(BaseSettings):
         default=frozenset(),
         max_length=32,
     )
+    plugin_package_subprocess_isolation_backend: Literal[
+        "disabled",
+        "bubblewrap",
+    ] = "disabled"
+    plugin_package_subprocess_bubblewrap_executable: Path | None = None
     plugin_package_subprocess_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
     plugin_package_subprocess_max_stdin_bytes: int = Field(
         default=262_144,
@@ -163,6 +168,15 @@ class Settings(BaseSettings):
                 raise ValueError("plugin package adapter id is invalid")
             adapter_ids.add(value)
         return frozenset(adapter_ids)
+
+    @field_validator("plugin_package_subprocess_bubblewrap_executable", mode="after")
+    @classmethod
+    def validate_plugin_package_subprocess_bubblewrap_executable(
+        cls, value: Path | None
+    ) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("plugin package bubblewrap executable must be absolute")
+        return value
 
     @field_validator("bootstrap_tenant_name", mode="after")
     @classmethod

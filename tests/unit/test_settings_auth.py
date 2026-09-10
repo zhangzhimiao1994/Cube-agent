@@ -1,5 +1,6 @@
 import base64
 import secrets
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -187,8 +188,24 @@ def test_plugin_package_subprocess_runner_defaults_to_disabled() -> None:
 
     assert settings.plugin_package_subprocess_runner_enabled is False
     assert settings.plugin_package_subprocess_adapter_ids == frozenset()
+    assert settings.plugin_package_subprocess_isolation_backend == "disabled"
+    assert settings.plugin_package_subprocess_bubblewrap_executable is None
     assert settings.plugin_package_subprocess_max_stdin_bytes == 262_144
     assert settings.plugin_package_subprocess_max_stdout_bytes == 262_144
+
+
+def test_plugin_package_subprocess_isolation_backend_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"plugin_package_subprocess_isolation_backend": "unsandboxed"}
+        )
+
+
+def test_plugin_package_subprocess_bubblewrap_executable_must_be_absolute() -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"plugin_package_subprocess_bubblewrap_executable": Path("bwrap")}
+        )
 
 
 @pytest.mark.parametrize("value", [0, 1_048_577])
