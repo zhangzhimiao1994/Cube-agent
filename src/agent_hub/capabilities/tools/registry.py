@@ -10,6 +10,27 @@ from agent_hub.runtime.contracts import JsonValue
 
 _LOGGER = logging.getLogger(__name__)
 
+_PLUGIN_PACKAGE_ACTIVATION_REASON_CODES = {
+    "adapter packages must include a trusted verified signature before activation": (
+        "plugin_package_signature_unverified"
+    ),
+    "package signature has not been verified by the server": (
+        "plugin_package_signature_unverified"
+    ),
+    "package signature key is not trusted for this tenant": (
+        "plugin_package_signature_untrusted"
+    ),
+    "plugin package dependencies are not supported by this runtime": (
+        "plugin_package_dependencies_unsupported"
+    ),
+    "runtime-registered adapter package requires a registered adapter": (
+        "plugin_package_adapter_unavailable"
+    ),
+    "runtime-registered adapter package requires a registered adapter descriptor": (
+        "plugin_package_adapter_unavailable"
+    ),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ToolManifest:
@@ -266,7 +287,10 @@ def _plugin_package_activation_reason(plugin: PluginConfig) -> str:
     package = getattr(plugin, "package_metadata", None)
     reason = getattr(package, "activation_reason", None)
     if type(reason) is str and reason.strip():
-        return reason
+        return _PLUGIN_PACKAGE_ACTIVATION_REASON_CODES.get(
+            reason,
+            "plugin_package_not_eligible",
+        )
     return "plugin_package_not_eligible"
 
 

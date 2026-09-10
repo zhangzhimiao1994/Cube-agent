@@ -198,6 +198,42 @@ def test_plugin_manifest_source_marks_stopped_plugins_unavailable() -> None:
     }
 
 
+def test_plugin_manifest_source_maps_package_activation_reason_to_safe_token() -> None:
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["available"] is False
+    assert capability["availability_reason"] == "plugin_package_dependencies_unsupported"
+
+
 def test_composite_manifest_source_combines_sources_for_tenant() -> None:
     class TenantSource:
         def manifests_for_tenant(self, tenant_id: object) -> dict[str, object]:

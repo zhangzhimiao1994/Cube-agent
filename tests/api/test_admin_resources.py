@@ -6934,7 +6934,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
     assert manifest.status_code == 200
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "runtime-registered adapter package requires a registered adapter descriptor"
+        "plugin_package_adapter_unavailable"
     )
 
 
@@ -7020,7 +7020,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
     assert manifest.status_code == 200
     assert capabilities["calendar.create_event"]["available"] is False
     assert capabilities["calendar.create_event"]["availability_reason"] == (
-        "plugin package dependencies are not supported by this runtime"
+        "plugin_package_dependencies_unsupported"
     )
 
 
