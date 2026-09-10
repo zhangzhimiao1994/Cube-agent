@@ -374,25 +374,64 @@ class PythonSubprocessPluginPackageRunner:
         except Exception as error:
             raise RuntimeCapabilityError("Plugin tool failed") from error
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(input=payload),
+            stdout = await asyncio.wait_for(
+                _communicate_with_bounded_stdout(
+                    process,
+                    payload,
+                    max_stdout_bytes=self._max_stdout_bytes,
+                ),
                 timeout=self._timeout_seconds,
             )
         except TimeoutError as error:
             with suppress(ProcessLookupError):
                 process.kill()
             with suppress(Exception):
-                await process.communicate()
+                await process.wait()
             raise RuntimeCapabilityError("Plugin tool timed out") from error
         if process.returncode != 0:
             raise RuntimeCapabilityError("Plugin tool failed")
-        if len(stdout) > self._max_stdout_bytes:
-            raise RuntimeCapabilityError("Plugin result is invalid")
         try:
             decoded = json.loads(stdout.decode("utf-8"))
             return _freeze_object(decoded, name="plugin result")
         except Exception as error:
             raise RuntimeCapabilityError("Plugin result is invalid") from error
+
+
+async def _communicate_with_bounded_stdout(
+    process: asyncio.subprocess.Process,
+    payload: bytes,
+    *,
+    max_stdout_bytes: int,
+) -> bytes:
+    if process.stdin is None or process.stdout is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
+        raise RuntimeCapabilityError("Plugin tool failed")
+    try:
+        process.stdin.write(payload)
+        await process.stdin.drain()
+        process.stdin.close()
+        await process.stdin.wait_closed()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    chunks: list[bytes] = []
+    total_size = 0
+    while True:
+        chunk = await process.stdout.read(max(1, min(65536, max_stdout_bytes + 1 - total_size)))
+        if not chunk:
+            break
+        total_size += len(chunk)
+        if total_size > max_stdout_bytes:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await process.wait()
+            raise RuntimeCapabilityError("Plugin result is invalid")
+        chunks.append(chunk)
+    await process.wait()
+    return b"".join(chunks)
 
 
 def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -> None:
