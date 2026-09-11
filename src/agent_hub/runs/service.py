@@ -1707,6 +1707,21 @@ class RunService:
     async def recover(self, run_id: UUID) -> SubmittedRun:
         return await self.execute(run_id, allow_running_recovery=True)
 
+    async def recover_running(self, limit: int = 100) -> int:
+        recovered = 0
+        for run_id in await self._repository.running_for_recovery(limit):
+            try:
+                await self.recover(run_id)
+            except Exception as error:
+                _LOGGER.exception(
+                    "run_recover_running_failed run_id=%s error_type=%s",
+                    run_id,
+                    type(error).__name__,
+                )
+                continue
+            recovered += 1
+        return recovered
+
     async def _submitted_by_run_id(self, tenant_id: UUID, run_id: UUID) -> SubmittedRun:
         return _submitted(await self._repository.get(tenant_id, run_id))
 

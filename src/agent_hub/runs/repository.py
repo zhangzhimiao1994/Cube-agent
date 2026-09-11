@@ -595,6 +595,24 @@ class RunRepository:
                 return self._record(row)
         return row, checkpoint
 
+    async def running_for_recovery(self, limit: int) -> tuple[UUID, ...]:
+        if limit <= 0:
+            return ()
+        async with self._session_factory() as session:
+            return tuple(
+                (
+                    await session.scalars(
+                        select(RunRow.id)
+                        .where(
+                            RunRow.status == RunStatus.RUNNING.value,
+                            RunRow.mode.is_not(None),
+                        )
+                        .order_by(RunRow.updated_at, RunRow.id)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+
     async def _recovery_blocked_after_checkpoint(
         self,
         session: AsyncSession,

@@ -63,6 +63,30 @@ def test_worker_recovers_after_publish_pending_failure() -> None:
     asyncio.run(scenario())
 
 
+def test_worker_publishes_recoverable_running_runs() -> None:
+    async def scenario() -> None:
+        run_id = uuid4()
+        queue = LocalRunQueue()
+        service = RecoveringRunService(queue, run_id)
+        stop = asyncio.Event()
+
+        await run_worker_loop(
+            service,
+            queue,
+            stop=stop,
+            poll_interval_seconds=0.01,
+            batch_limit=10,
+            max_idle_polls=1,
+        )
+
+        assert service.published_limits == [10, 10]
+        assert service.recovery_limits == [10, 10]
+        assert service.recovered_run_ids == [run_id]
+        assert service.executed_run_ids == []
+
+    asyncio.run(scenario())
+
+
 def test_worker_loop_refreshes_mcp_runtime_after_interval() -> None:
     async def scenario() -> None:
         run_id = uuid4()
@@ -161,6 +185,10 @@ class RecordingRunService:
     async def execute(self, run_id: UUID) -> None:
         self.executed_run_ids.append(run_id)
 
+    async def recover_running(self, limit: int) -> int:
+        del limit
+        return 0
+
 
 class RecordingMcpRuntime:
     def __init__(self) -> None:
@@ -202,3 +230,25 @@ class FlakyPublishRunService:
 
     async def execute(self, run_id: UUID) -> None:
         self.executed_run_ids.append(run_id)
+
+    async def recover_running(self, limit: int) -> int:
+        del limit
+        return 0
+
+
+class RecoveringRunService(RecordingRunService):
+    def __init__(self, queue: LocalRunQueue, run_id: UUID) -> None:
+        super().__init__(queue, run_id)
+        self.recovery_limits: list[int] = []
+        self.recovered_run_ids: list[UUID] = []
+
+    async def publish_pending(self, limit: int) -> int:
+        self.published_limits.append(limit)
+        return 0
+
+    async def recover_running(self, limit: int) -> int:
+        self.recovery_limits.append(limit)
+        if self.recovery_limits != [limit]:
+            return 0
+        self.recovered_run_ids.append(self._run_id)
+        return 1

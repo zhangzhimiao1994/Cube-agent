@@ -392,6 +392,113 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert len(runtime.restored) == 1
 
 
+async def test_recover_running_restores_recoverable_running_run(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="recover running topic",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="tenant-safe-key-auto-recover",
+    )
+
+    first = await service.execute(submitted.id, crash_after_event_kind=EventKind.CHECKPOINT_SAVED)
+    recovered_count = await service.recover_running(limit=10)
+    recovered = await service.get(tenant_id, submitted.id)
+
+    assert first.status is RunStatus.RUNNING
+    assert recovered_count == 1
+    assert recovered.status is RunStatus.COMPLETED
+    assert runtime.calls == 2
+    assert len(runtime.restored) == 1
+
+
+async def test_recover_running_fails_safe_for_non_replayable_running_run(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="recover unsafe running topic",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="tenant-unsafe-key-auto-recover",
+    )
+
+    first = await service.execute(submitted.id, crash_after_event_kind=EventKind.ARTIFACT_CREATED)
+    recovered_count = await service.recover_running(limit=10)
+    recovered = await service.get(tenant_id, submitted.id)
+    events = await service.events(tenant_id, submitted.id)
+
+    assert first.status is RunStatus.RUNNING
+    assert recovered_count == 1
+    assert recovered.status is RunStatus.FAILED
+    assert runtime.calls == 1
+    assert runtime.restored == []
+    assert any(event["kind"] == "runtime.failed" for event in events)
+
+
+async def test_recover_running_skips_terminal_and_unrouted_runs(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    terminal = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="already finished",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+    unrouted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="waiting for mode",
+        mode=None,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+
+    recovered_count = await service.recover_running(limit=10)
+    terminal_summary = await service.get(tenant_id, terminal.id)
+    unrouted_summary = await service.get(tenant_id, unrouted.id)
+
+    assert recovered_count == 0
+    assert terminal_summary.status is RunStatus.COMPLETED
+    assert unrouted_summary.status is RunStatus.RUNNING
+    assert runtime.calls == 0
+
+
 async def test_recovery_ignores_harness_started_marker_before_first_checkpoint(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

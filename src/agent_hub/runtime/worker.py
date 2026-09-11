@@ -39,6 +39,8 @@ _LOGGER = logging.getLogger(__name__)
 class WorkerRunService(Protocol):
     async def publish_pending(self, limit: int) -> int: ...
 
+    async def recover_running(self, limit: int) -> int: ...
+
     async def execute(self, run_id: UUID) -> object: ...
 
 
@@ -210,6 +212,13 @@ async def run_worker_loop(
             delivered = 0
             _LOGGER.exception(
                 "run_worker_publish_pending_failed error_type=%s",
+                type(error).__name__,
+            )
+        try:
+            delivered += await service.recover_running(batch_limit)
+        except Exception as error:
+            _LOGGER.exception(
+                "run_worker_recover_running_failed error_type=%s",
                 type(error).__name__,
             )
         while not queue.empty() and not stop.is_set():
