@@ -2256,6 +2256,48 @@ async def test_blocked_contract_self_repair_reopens_completed_target_step() -> N
     recovered = next(event for event in events if event.kind == "runtime.recovered")
     assert recovered.payload["checkpoint_phase"] == "completed"
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    repaired_checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    restored_again_generation = RecordingGeneration()
+    restored_again = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_again_generation),
+    )
+    await restored_again.restore_checkpoint(repaired_checkpoint)
+
+    restored_again_events = [
+        event
+        async for event in restored_again.run(
+            _context(
+                checkpoint=repaired_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_accepted": True,
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("draft-to-final_response",),
+                        "instruction": "重规划角色交接契约链。",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert restored_again_generation.prompts == []
+    assert [event.kind for event in restored_again_events] == [EventKind.RUNTIME_COMPLETED]
 
 
 async def test_blocked_contract_self_repair_preserves_unrelated_completed_branch() -> None:

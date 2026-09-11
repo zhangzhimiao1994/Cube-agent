@@ -1312,10 +1312,22 @@ def _orchestration_repair_reopen_steps(
     return frozenset(reopen)
 
 
+def _orchestration_repair_contract_ids(
+    repair_payload: Mapping[str, JsonValue] | None,
+) -> tuple[str, ...]:
+    if repair_payload is None:
+        return ()
+    raw_contract_ids = repair_payload.get("blocked_contract_ids")
+    if not isinstance(raw_contract_ids, Sequence) or isinstance(raw_contract_ids, str | bytes):
+        return ()
+    return tuple(dict.fromkeys(item for item in raw_contract_ids if type(item) is str))
+
+
 def _apply_orchestration_repair_recovery(
     plan: DispatchPlan,
     routing_decision: Mapping[str, JsonValue],
     repair_payload: Mapping[str, JsonValue] | None,
+    already_reopened_contract_ids: Sequence[str],
     completed: dict[str, Artifact],
     retry_counts: dict[str, int],
     tool_ledger: _ToolLedger,
@@ -1325,6 +1337,9 @@ def _apply_orchestration_repair_recovery(
     artifact_registry: dict[str, Artifact],
 ) -> bool:
     if routing_decision.get("self_repair_accepted") is not True:
+        return False
+    repair_contract_ids = _orchestration_repair_contract_ids(repair_payload)
+    if repair_contract_ids and tuple(already_reopened_contract_ids) == repair_contract_ids:
         return False
     reopen_steps = _orchestration_repair_reopen_steps(plan, repair_payload)
     if not reopen_steps:
@@ -1567,6 +1582,7 @@ class CrewDispatchRuntime:
         hydrating_restored = protected_checkpoint is not None
         terminal_item: _Terminal | None = None
         repair_tool_key_steps: frozenset[str] = frozenset()
+        repair_reopened_contract_ids: tuple[str, ...] = ()
 
         async def store_artifact(artifact: Artifact) -> UUID:
             if not self._accepts_artifact_writes(state):
@@ -1634,6 +1650,13 @@ class CrewDispatchRuntime:
                     restored_artifacts,
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
                 artifact_registry.update(restored_artifacts)
+                restored_repair_contract_ids = restored.state.get("repair_reopened_contract_ids")
+                if isinstance(restored_repair_contract_ids, tuple) and all(
+                    type(item) is str for item in restored_repair_contract_ids
+                ):
+                    repair_reopened_contract_ids = tuple(
+                        cast(tuple[str, ...], restored_repair_contract_ids)
+                    )
                 repair_payload = self_repair_recovery_plan_payload(context.routing_decision)
                 repair_tool_key_steps = (
                     _orchestration_repair_reopen_steps(plan, repair_payload)
@@ -1644,6 +1667,7 @@ class CrewDispatchRuntime:
                     plan,
                     context.routing_decision,
                     repair_payload,
+                    repair_reopened_contract_ids,
                     completed,
                     retry_counts,
                     tool_ledger,
@@ -1652,6 +1676,10 @@ class CrewDispatchRuntime:
                     review_ledger,
                     artifact_registry,
                 )
+                if repair_reopened_steps:
+                    repair_reopened_contract_ids = _orchestration_repair_contract_ids(
+                        repair_payload
+                    )
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
@@ -1726,6 +1754,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=usage_ledger.terminal_phase is not None,
                         phase=usage_ledger.terminal_phase or "running",
+                        repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
@@ -1755,6 +1784,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=usage_ledger.terminal_phase is not None,
                         phase=usage_ledger.terminal_phase or "running",
+                        repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
@@ -1781,6 +1811,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=False,
                         phase="running",
+                        repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
@@ -1944,6 +1975,7 @@ class CrewDispatchRuntime:
                         terminal=terminal_phase is not None,
                         phase=terminal_phase or "running",
                         artifact_registry=candidate_registry,
+                        repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     checkpoint = self._make_checkpoint(
                         context,
@@ -1966,6 +1998,7 @@ class CrewDispatchRuntime:
                             **artifact_registry,
                             str(artifact.id): artifact,
                         },
+                        repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     write_id = await store_artifact(artifact)
                     if not self._accepts_artifact_writes(state):
@@ -2082,6 +2115,7 @@ class CrewDispatchRuntime:
                                             else "running"
                                         )
                                     ),
+                                    repair_reopened_contract_ids=repair_reopened_contract_ids,
                                 )
                                 self._publish_checkpoint(state, checkpoint)
                                 await emit(
@@ -2118,6 +2152,7 @@ class CrewDispatchRuntime:
                             next_sequence=sequence.value + 3,
                             terminal=False,
                             phase="cancelled",
+                            repair_reopened_contract_ids=repair_reopened_contract_ids,
                         )
                         self._publish_checkpoint(state, checkpoint)
                         if run_open and self._is_current_run(state):
@@ -4150,6 +4185,7 @@ class CrewDispatchRuntime:
         terminal: bool,
         phase: str,
         artifact_registry: Mapping[str, Artifact] | None = None,
+        repair_reopened_contract_ids: Sequence[str] = (),
     ) -> RuntimeCheckpoint:
         checkpoint_artifacts = (
             self._current_artifact_registry if artifact_registry is None else artifact_registry
@@ -4215,6 +4251,7 @@ class CrewDispatchRuntime:
                     "step_tokens": tuple(sorted(usage_ledger.step_token_overflows)),
                     "step_cost_usd": tuple(sorted(usage_ledger.step_cost_overflows)),
                 },
+                "repair_reopened_contract_ids": tuple(repair_reopened_contract_ids),
             },
         )
 
@@ -4233,7 +4270,7 @@ class CrewDispatchRuntime:
         ):
             _fail("runtime checkpoint is incompatible")
         state = checkpoint.state
-        if set(state) != {
+        required_state_keys = {
             "plan_digest",
             "completed",
             "retries",
@@ -4249,7 +4286,9 @@ class CrewDispatchRuntime:
             "usage",
             "step_usage",
             "audit_overflow",
-        }:
+        }
+        optional_state_keys = {"repair_reopened_contract_ids"}
+        if not required_state_keys <= set(state) <= required_state_keys | optional_state_keys:
             _fail("runtime checkpoint is incompatible")
         completed = state["completed"]
         retries = state["retries"]
@@ -4262,6 +4301,7 @@ class CrewDispatchRuntime:
         usage = state["usage"]
         step_usage = state["step_usage"]
         audit_overflow = state["audit_overflow"]
+        repair_reopened_contract_ids = state.get("repair_reopened_contract_ids", ())
         if (
             not isinstance(completed, tuple)
             or not isinstance(frontier, tuple)
@@ -4274,6 +4314,8 @@ class CrewDispatchRuntime:
             or not isinstance(usage, Mapping)
             or not isinstance(step_usage, Mapping)
             or not isinstance(audit_overflow, Mapping)
+            or not isinstance(repair_reopened_contract_ids, tuple)
+            or not all(type(item) is str for item in repair_reopened_contract_ids)
             or type(state["next_sequence"]) is not int
             or type(state["terminal"]) is not bool
             or state["phase"]
