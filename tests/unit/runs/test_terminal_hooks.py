@@ -1148,6 +1148,81 @@ def test_repair_classification_uses_bounded_step_recovery_hint() -> None:
     assert "secret" not in repr(proposal)
 
 
+def test_repair_classification_infers_blocked_contract_ids_from_latest_contract_snapshot() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_STARTED,
+                sequence=1,
+                run_id=run_id,
+                actor="orchestrator",
+                step_id="draft",
+                payload={
+                    "model_execution_plan": {
+                        "orchestration_protocol": {
+                            "protocol": "role_handoff_contract_v1",
+                            "recovery_hints": ("retry_blocked_contract_chain",),
+                        },
+                        "orchestration_contracts": {
+                            "items": (
+                                {
+                                    "contract_id": "draft-to-final_response",
+                                    "source_step_id": "draft",
+                                    "target_step_id": "final_response",
+                                    "status": "blocked",
+                                    "recovery_hint": "retry_blocked_contract_chain",
+                                },
+                                {
+                                    "contract_id": "secret://token-to-final_response",
+                                    "source_step_id": "secret://token",
+                                    "target_step_id": "final_response",
+                                    "status": "blocked",
+                                    "recovery_hint": "retry_blocked_contract_chain",
+                                },
+                                {
+                                    "contract_id": "research-to-final_response",
+                                    "source_step_id": "research",
+                                    "target_step_id": "final_response",
+                                    "status": "satisfied",
+                                    "recovery_hint": "retry_blocked_contract_chain",
+                                },
+                                {
+                                    "contract_id": "draft-to-review",
+                                    "source_step_id": "draft",
+                                    "target_step_id": "review",
+                                    "status": "blocked",
+                                    "recovery_hint": "retry_blocked_contract_chain",
+                                },
+                            )
+                        },
+                    }
+                },
+            ),
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=2,
+                run_id=run_id,
+                actor="final_synthesizer",
+                step_id="final_response",
+                reason="structured handoff output missing field",
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    assert decision.recovery_strategy == "retry_blocked_contract_chain_after_replanning"
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["blocked_contract_ids"] == ("draft-to-final_response",)
+    assert "secret" not in repr(proposal)
+
+
 def test_repair_classification_handles_model_capability_routing_failure() -> None:
     run_id = uuid4()
 

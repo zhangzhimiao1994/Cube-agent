@@ -543,7 +543,43 @@ def _blocked_contract_ids(events: Sequence[RunEvent]) -> tuple[str, ...]:
                 collected.append(contract_id)
             if len(collected) >= _MAX_BLOCKED_CONTRACT_IDS:
                 return tuple(collected)
+    failed_step_ids = _failed_step_ids(events)
+    if not failed_step_ids:
+        return tuple(collected)
+    for event in reversed(events):
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        contracts = plan.get("orchestration_contracts")
+        if not isinstance(contracts, Mapping):
+            continue
+        items = contracts.get("items")
+        if not isinstance(items, Sequence) or isinstance(items, str | bytes):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping) or item.get("status") != "blocked":
+                continue
+            if item.get("recovery_hint") != "retry_blocked_contract_chain":
+                continue
+            source_step_id = item.get("source_step_id")
+            target_step_id = item.get("target_step_id")
+            if source_step_id not in failed_step_ids and target_step_id not in failed_step_ids:
+                continue
+            for contract_id in _safe_contract_ids((item.get("contract_id"),)):
+                if contract_id not in collected:
+                    collected.append(contract_id)
+                if len(collected) >= _MAX_BLOCKED_CONTRACT_IDS:
+                    return tuple(collected)
+        break
     return tuple(collected)
+
+
+def _failed_step_ids(events: Sequence[RunEvent]) -> frozenset[str]:
+    step_ids: set[str] = set()
+    for event in events:
+        if event.kind in _FAILURE_KINDS and event.step_id is not None:
+            step_ids.add(event.step_id)
+    return frozenset(step_ids)
 
 
 def _safe_contract_ids(value: object) -> tuple[str, ...]:

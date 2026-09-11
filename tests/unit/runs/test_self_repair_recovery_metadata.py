@@ -134,3 +134,27 @@ def test_blocked_contract_ids_are_hidden_without_contract_recovery_gate() -> Non
     assert repair_context["blocked_contract_ids"] == ("draft-to-final_response",)
     assert "draft-to-final_response" not in self_repair_context_text(routing_decision)
     assert self_repair_recovery_plan_payload(routing_decision) is None
+
+
+def test_inferred_blocked_contract_ids_drive_recovery_plan_payload() -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": "step_failure",
+            "source_run_id": "run_1",
+            "source_event_sequence": 2,
+            "attempt": 1,
+            "max_attempts": 1,
+            "fingerprint": "fp",
+            "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+            "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            "blocked_contract_ids": ("draft-to-final_response",),
+        }
+    )
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+
+    assert recovery_plan is not None
+    assert recovery_plan["retry_blocked_contracts_only"] is True
+    assert recovery_plan["blocked_contract_ids"] == ("draft-to-final_response",)
