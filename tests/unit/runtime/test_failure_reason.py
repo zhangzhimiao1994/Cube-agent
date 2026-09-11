@@ -15,6 +15,7 @@ from agent_hub.models.gateway import ModelGatewayError
 from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.runtime.failure_reason import (
+    ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
@@ -119,6 +120,16 @@ def test_runtime_failure_diagnostic_from_reason_redacts_sensitive_unknown_reason
     assert diagnostic["error_summary"] == "runtime_failed"
     assert diagnostic["error_code"] == "runtime.failed"
     assert "sk-secret" not in str(diagnostic)
+
+
+def test_runtime_failure_diagnostic_classifies_orchestration_checkpoint_failures() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(ORCHESTRATION_CHECKPOINT_FAILURE_REASON)
+
+    assert diagnostic["error_stage"] == "runtime_recovery"
+    assert diagnostic["error_category"] == "orchestration_checkpoint_incompatible"
+    assert diagnostic["error_code"] == "runtime.orchestration_checkpoint_incompatible"
+    assert diagnostic["retryable"] is False
+    assert diagnostic["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
 
 
 def test_runtime_failure_diagnostic_from_reason_extracts_status_code() -> None:

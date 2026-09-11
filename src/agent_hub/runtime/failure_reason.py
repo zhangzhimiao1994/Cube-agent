@@ -57,6 +57,9 @@ EMPTY_MODEL_RESPONSE_ACTION = (
 RECOVERY_BLOCKED_FAILURE_REASON = (
     "runtime recovery blocked: non-replayable event after checkpoint"
 )
+ORCHESTRATION_CHECKPOINT_FAILURE_REASON = (
+    "runtime orchestration checkpoint is incompatible"
+)
 
 
 def safe_model_gateway_failure_reason(error: Exception) -> str | None:
@@ -189,6 +192,19 @@ def runtime_failure_diagnostic_from_reason(
             ),
             status_code=status_code,
         )
+    if normalized == ORCHESTRATION_CHECKPOINT_FAILURE_REASON:
+        return _base_diagnostic(
+            normalized,
+            error_stage="runtime_recovery",
+            error_category="orchestration_checkpoint_incompatible",
+            error_code="runtime.orchestration_checkpoint_incompatible",
+            retryable=False,
+            suggested_action=(
+                "角色交接恢复点与当前编排计划不一致，系统已阻止自动恢复以避免跳过或重复执行角色步骤；"
+                "请按角色交接恢复链重新规划，或从安全检查点重新运行。"
+            ),
+            status_code=status_code,
+        ) | {"orchestration_recovery_hint": "retry_blocked_contract_chain"}
 
     hybrid_child = _HYBRID_CHILD_FAILURE.fullmatch(normalized)
     if hybrid_child is not None:
@@ -574,6 +590,7 @@ def is_legacy_generic_failure_reason(reason: str | None) -> bool:
 __all__ = [
     "GENERIC_MODEL_GATEWAY_FAILURE",
     "MAX_FAILURE_REASON_LENGTH",
+    "ORCHESTRATION_CHECKPOINT_FAILURE_REASON",
     "RECOVERY_BLOCKED_FAILURE_REASON",
     "SENSITIVE_FAILURE_REASON",
     "is_legacy_generic_failure_reason",

@@ -29,6 +29,7 @@ from agent_hub.runtime.contracts import (
     GatewayProvenance,
     JsonValue,
     RunEvent,
+    RuntimeCheckpoint,
     TaskContext,
 )
 from agent_hub.runtime.crew.adapter import (
@@ -934,6 +935,31 @@ async def test_step_events_include_orchestration_contract_context() -> None:
         event for event in single_step_events if event.kind is EventKind.STEP_STARTED
     )
     assert "orchestration_protocol" not in single_step_started.payload
+
+
+async def test_orchestration_checkpoint_frontier_mismatch_reports_recovery_reason() -> None:
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+    events = await _collect(runtime)
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, object], payload["state"])
+    state["frontier"] = ["final_response"]
+    payload["state_sha256"] = ""
+    corrupted = RuntimeCheckpoint.from_payload(payload)
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="orchestration checkpoint is incompatible"):
+        await restored.restore_checkpoint(corrupted)
 
 
 async def test_step_failed_reports_blocked_orchestration_contracts() -> None:

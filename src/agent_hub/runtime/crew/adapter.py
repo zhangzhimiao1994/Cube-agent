@@ -62,6 +62,7 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.failure_reason import (
+    ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
@@ -724,6 +725,10 @@ def _validate_structured_role_output(
 
 def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
     return any(step.id in candidate.depends_on for candidate in plan.steps)
+
+
+def _plan_has_orchestration_contracts(plan: DispatchPlan) -> bool:
+    return any(step.depends_on for step in plan.steps)
 
 
 def _structured_handoff_field_matches(value: object, description: str) -> bool:
@@ -4068,6 +4073,7 @@ class CrewDispatchRuntime:
     def _validate_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext, plan: DispatchPlan
     ) -> None:
+        checkpoint_failure_reason = self._checkpoint_failure_reason(plan)
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE
             or checkpoint.runtime_version != _RUNTIME_VERSION
@@ -4552,7 +4558,7 @@ class CrewDispatchRuntime:
                 and budget_exceeded
             )
         ):
-            _fail("runtime checkpoint is incompatible")
+            _fail(checkpoint_failure_reason)
 
     @staticmethod
     async def _cancel_tasks_bounded(tasks: tuple[asyncio.Task[Any], ...]) -> None:
@@ -4584,6 +4590,12 @@ class CrewDispatchRuntime:
                 estimated_nodes += 10
         if estimated_nodes > 3_800:
             _fail("dispatch checkpoint metadata budget is insufficient")
+
+    @staticmethod
+    def _checkpoint_failure_reason(plan: DispatchPlan) -> str:
+        if _plan_has_orchestration_contracts(plan):
+            return ORCHESTRATION_CHECKPOINT_FAILURE_REASON
+        return "runtime checkpoint is incompatible"
 
     @staticmethod
     def _retrieve_detached_task(task: asyncio.Task[Any]) -> None:
@@ -5120,10 +5132,12 @@ class CrewDispatchRuntime:
         if type(checkpoint) is not RuntimeCheckpoint:
             _fail("runtime checkpoint is incompatible")
         failed = False
+        failure_reason = "runtime checkpoint is incompatible"
         validated: RuntimeCheckpoint | None = None
         try:
             validated = RuntimeCheckpoint.from_payload(checkpoint.to_payload())
             plan = DispatchPlan.revalidate(self._plan)
+            failure_reason = self._checkpoint_failure_reason(plan)
             # Context-specific identity is checked at run time.
             dummy = TaskContext(
                 run_id=validated.run_id,
@@ -5135,6 +5149,7 @@ class CrewDispatchRuntime:
             )
             self._validate_checkpoint(validated, dummy, plan)
         except RuntimeExecutionError as error:
+            failure_reason = safe_runtime_failure_reason(error, fallback=failure_reason)
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -5147,7 +5162,7 @@ class CrewDispatchRuntime:
             del error
             failed = True
         if failed or validated is None:
-            _fail("runtime checkpoint is incompatible")
+            _fail(failure_reason)
         self._restored_checkpoint = validated
 
     async def cancel(self) -> None:
