@@ -272,6 +272,7 @@ def _dependency_cache_signature_artifacts(
         path = item.get("path")
         sha256 = item.get("sha256")
         size_bytes = item.get("size_bytes")
+        origin = _dependency_cache_artifact_origin(item.get("origin"))
         if (
             type(kind) is not str
             or type(source) is not str
@@ -280,6 +281,7 @@ def _dependency_cache_signature_artifacts(
             or type(path) is not str
             or type(sha256) is not str
             or type(size_bytes) is not int
+            or origin is None
         ):
             return None
         normalized.append(
@@ -291,6 +293,7 @@ def _dependency_cache_signature_artifacts(
                 "path": path,
                 "sha256": sha256,
                 "size_bytes": size_bytes,
+                "origin": origin,
             }
         )
     return sorted(
@@ -329,6 +332,7 @@ def _dependency_cache_artifacts_match(
         raw_path = item.get("path")
         sha256 = item.get("sha256")
         size_bytes = item.get("size_bytes")
+        origin = _dependency_cache_artifact_origin(item.get("origin"))
         if (
             type(kind) is not str
             or type(source) is not str
@@ -337,6 +341,7 @@ def _dependency_cache_artifacts_match(
             or type(raw_path) is not str
             or type(sha256) is not str
             or type(size_bytes) is not int
+            or origin is None
         ):
             return False
         normalized_name = normalize_plugin_package_dependency_name(name)
@@ -351,10 +356,43 @@ def _dependency_cache_artifacts_match(
         if (
             expected_file.get("sha256") != sha256
             or expected_file.get("size_bytes") != size_bytes
+            or origin["archive_sha256"] != sha256
             or not _dependency_cache_manifest_path_valid(raw_path)
         ):
             return False
     return seen_dependencies == set(expected_dependencies)
+
+
+def _dependency_cache_artifact_origin(origin: object) -> dict[str, str] | None:
+    if not isinstance(origin, dict):
+        return None
+    origin_type = origin.get("type")
+    index_url = origin.get("index_url")
+    archive_url = origin.get("archive_url")
+    archive_sha256 = origin.get("archive_sha256")
+    if (
+        origin_type != "package_index"
+        or not _dependency_cache_origin_url_valid(index_url)
+        or not _dependency_cache_origin_url_valid(archive_url)
+        or type(archive_sha256) is not str
+        or re.fullmatch(r"[a-f0-9]{64}", archive_sha256) is None
+    ):
+        return None
+    return {
+        "type": "package_index",
+        "index_url": cast(str, index_url),
+        "archive_url": cast(str, archive_url),
+        "archive_sha256": archive_sha256,
+    }
+
+
+def _dependency_cache_origin_url_valid(value: object) -> bool:
+    return (
+        type(value) is str
+        and value.startswith("https://")
+        and 8 < len(value) <= 2048
+        and not any(ord(character) < 32 for character in value)
+    )
 
 
 def _dependency_cache_files_match(

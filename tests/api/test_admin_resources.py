@@ -4943,6 +4943,14 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
             "path": "artifacts/requests-2.31.0.whl",
             "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
             "size_bytes": len(artifact_bytes),
+            "origin": {
+                "type": "package_index",
+                "index_url": "https://pypi.org/simple/requests/",
+                "archive_url": (
+                    "https://files.pythonhosted.org/packages/requests-2.31.0.whl"
+                ),
+                "archive_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            },
         }
     ]
     files = [
@@ -7371,6 +7379,14 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
             "path": "artifacts/requests-2.32.0.whl",
             "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
             "size_bytes": len(artifact_bytes),
+            "origin": {
+                "type": "package_index",
+                "index_url": "https://pypi.org/simple/requests/",
+                "archive_url": (
+                    "https://files.pythonhosted.org/packages/requests-2.32.0.whl"
+                ),
+                "archive_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            },
         }
     ]
     files = [

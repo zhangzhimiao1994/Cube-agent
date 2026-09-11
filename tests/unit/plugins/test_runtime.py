@@ -555,6 +555,15 @@ def write_dependency_cache_manifest(
             "path": artifact_relative_path,
             "sha256": artifact_digest,
             "size_bytes": len(artifact_bytes),
+            "origin": {
+                "type": "package_index",
+                "index_url": f"https://pypi.org/simple/{artifact_name}/",
+                "archive_url": (
+                    "https://files.pythonhosted.org/packages/"
+                    f"{artifact_name}-{artifact_version}.whl"
+                ),
+                "archive_sha256": artifact_digest,
+            },
         }
         artifact_entries.append(artifact_entry)
         artifact_files.append(
