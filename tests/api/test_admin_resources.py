@@ -7117,6 +7117,8 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
 
 
 def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() -> None:
+    dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+
     class CalendarPluginService:
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -7200,6 +7202,19 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
     assert capabilities["calendar.create_event"]["availability_reason"] == (
         "plugin_package_dependencies_unsupported"
     )
+    assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
+        "status": "unsupported",
+        "sha256": dependency_lock_hash,
+        "dependency_count": 1,
+        "dependencies": [
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            }
+        ],
+    }
 
 
 def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None:

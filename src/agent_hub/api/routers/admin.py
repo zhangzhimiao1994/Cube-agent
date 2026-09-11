@@ -36,6 +36,7 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from sqlalchemy import delete, select
@@ -1183,6 +1184,24 @@ class McpServerRequest(BaseModel):
     timeout_seconds: float = Field(default=10, gt=0, le=120)
 
 
+class CapabilityManifestPackageDependencyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["python"]
+    source: Literal["pypi"]
+    name: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=128)
+
+
+class CapabilityManifestPackageDependencyLockResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["unsupported"]
+    sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    dependency_count: int = Field(ge=1, le=32)
+    dependencies: list[CapabilityManifestPackageDependencyResponse] = Field(max_length=32)
+
+
 class CapabilityManifestItemResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1198,6 +1217,14 @@ class CapabilityManifestItemResponse(BaseModel):
     aliases: list[str] = Field(default_factory=list, max_length=128)
     input_schema: dict[str, JsonValue] | None = None
     output_schema: dict[str, JsonValue] | None = None
+    package_dependency_lock: CapabilityManifestPackageDependencyLockResponse | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_without_empty_dependency_lock(self, handler: Any) -> dict[str, Any]:
+        data = cast(dict[str, Any], handler(self))
+        if self.package_dependency_lock is None:
+            data.pop("package_dependency_lock", None)
+        return data
 
 
 class CapabilityManifestResponse(BaseModel):

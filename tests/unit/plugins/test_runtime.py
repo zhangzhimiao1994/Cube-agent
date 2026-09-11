@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import sys
@@ -2178,6 +2179,9 @@ async def test_runtime_plugin_service_rechecks_runtime_registered_package_metada
 
 
 async def test_runtime_plugin_service_blocks_runtime_registered_package_dependencies() -> None:
+    dependency_lock_hash = hashlib.sha256(
+        b"python pypi requests==2.32.0\npython pypi zlib==1.0\n"
+    ).hexdigest()
     package_metadata = verified_package_with_artifact(
         content_sha256="a" * 64,
         storage_key=f"{TENANT_ID}/calendar/{'a' * 64}",
@@ -2185,6 +2189,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_dependen
         update={
             "artifact": None,
             "dependencies": (
+                PluginPackageDependency(name="Zlib", version="1.0"),
                 PluginPackageDependency(name="requests", version="2.32.0"),
             ),
         }
@@ -2231,6 +2236,25 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_dependen
     assert capabilities["calendar.create_event"]["availability_reason"] == (
         "plugin_package_dependencies_unsupported"
     )
+    assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
+        "status": "unsupported",
+        "sha256": dependency_lock_hash,
+        "dependency_count": 2,
+        "dependencies": (
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            },
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "zlib",
+                "version": "1.0",
+            },
+        ),
+    }
     with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
         await service.invoke(
             tenant_id=TENANT_ID,

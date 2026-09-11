@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from inspect import isawaitable
@@ -179,6 +181,9 @@ class PluginConfigCapabilityManifestSource:
                 output_schema = getattr(capability, "output_schema", None)
                 if isinstance(output_schema, Mapping):
                     item["output_schema"] = cast(JsonValue, output_schema)
+                dependency_lock = _plugin_package_dependency_lock(plugin)
+                if dependency_lock is not None:
+                    item["package_dependency_lock"] = dependency_lock
                 capabilities.append(
                     item
                 )
@@ -292,6 +297,54 @@ def _plugin_package_activation_reason(plugin: PluginConfig) -> str:
             "plugin_package_not_eligible",
         )
     return "plugin_package_not_eligible"
+
+
+def _plugin_package_dependency_lock(plugin: PluginConfig) -> Mapping[str, JsonValue] | None:
+    package = getattr(plugin, "package_metadata", None)
+    dependencies = getattr(package, "dependencies", None)
+    if not isinstance(dependencies, tuple | list) or not dependencies:
+        return None
+    locked: list[dict[str, str]] = []
+    for dependency in dependencies:
+        kind = getattr(dependency, "kind", None)
+        source = getattr(dependency, "source", None)
+        name = getattr(dependency, "name", None)
+        version = getattr(dependency, "version", None)
+        if not all(type(value) is str for value in (kind, source, name, version)):
+            return None
+        locked.append(
+            {
+                "kind": cast(str, kind),
+                "source": cast(str, source),
+                "name": _normalize_dependency_name(cast(str, name)),
+                "version": cast(str, version),
+            }
+        )
+    ordered = tuple(
+        sorted(
+            locked,
+            key=lambda item: (
+                item["kind"],
+                item["source"],
+                item["name"],
+                item["version"],
+            ),
+        )
+    )
+    lock_bytes = "".join(
+        f"{item['kind']} {item['source']} {item['name']}=={item['version']}\n"
+        for item in ordered
+    ).encode("utf-8")
+    return {
+        "status": "unsupported",
+        "sha256": hashlib.sha256(lock_bytes).hexdigest(),
+        "dependency_count": len(ordered),
+        "dependencies": cast(tuple[JsonValue, ...], ordered),
+    }
+
+
+def _normalize_dependency_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).lower()
 
 
 def _source_manifest_items(
