@@ -19,7 +19,7 @@ def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints
         == "agent_hub.openclaw.local_adapter:main"
     )
     assert "openclaw-adapter     Start a local OpenClaw Adapter" in launcher
-    assert "doctor|status|logs|backup|restore|upgrade|openclaw-adapter" in launcher
+    assert "doctor|status|logs|backup|restore|upgrade|prune-releases|openclaw-adapter" in launcher
     assert "OPENCLAW_ADAPTER_TOKEN" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON" in command
@@ -34,13 +34,34 @@ def test_release_packager_includes_built_web_dist() -> None:
     command = read("scripts/commands/package-release.sh")
 
     assert "package-release     Build a deployable source archive including web/dist." in launcher
-    assert "doctor|status|logs|backup|restore|upgrade|openclaw-adapter|package-release" in launcher
+    assert (
+        "doctor|status|logs|backup|restore|upgrade|prune-releases|openclaw-adapter|package-release"
+        in launcher
+    )
     assert "npm --prefix \"$SOURCE_DIR/web\" run build" in command
     assert '[[ -f "$SOURCE_DIR/web/dist/index.html" ]]' in command
     assert "--exclude='./web/node_modules'" in command
     assert "--exclude='./.tmp'" in command
     assert "--exclude='./web/dist'" not in command
     assert 'tar -cf "$output"' in command
+
+
+def test_release_pruner_is_registered_and_protects_current_release() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/prune-releases.sh")
+
+    assert "prune-releases      Preview or remove old native release directories." in launcher
+    assert "doctor|status|logs|backup|restore|upgrade|prune-releases" in launcher
+    assert 'keep="${AGENT_HUB_RELEASES_TO_KEEP:-2}"' in command
+    assert "Usage: scripts/agent-hub prune-releases" in command
+    assert "--install-root" in command
+    assert "--execute" in command
+    assert "--yes" in command
+    assert '"$release_dir_real"/*)' in command
+    assert 'die "current must point inside release directory' in command
+    assert 'protected["$(basename -- "$current_real")"]="current"' in command
+    assert 'find "$release_dir_real" -mindepth 1 -maxdepth 1 -type d' in command
+    assert 'rm -rf -- "$release_path"' in command
 
 
 def test_native_installer_deploys_release_before_starting_services() -> None:

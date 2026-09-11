@@ -309,6 +309,7 @@ scripts/agent-hub backup /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub backup verify /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub restore /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub upgrade
+scripts/agent-hub prune-releases --keep 2
 ```
 
 更多内容见 [docs/operations.md](docs/operations.md) 和 [docs/installation.md](docs/installation.md)。

@@ -9,9 +9,12 @@ scripts/agent-hub doctor
 scripts/agent-hub backup /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub backup verify /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub upgrade --version 0.2.0
+scripts/agent-hub prune-releases --keep 2
+scripts/agent-hub prune-releases --keep 2 --execute
 ```
 
 Upgrades create a backup first. If readiness fails, the command restores the previous application version marker.
+Release pruning is a dry run by default. It always protects the active `current` release target and only removes old directories under the configured native release directory when `--execute` is passed.
 
 ## Logs
 

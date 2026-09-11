@@ -15,6 +15,7 @@ Commands:
   backup              Create or verify a backup.
   restore             Restore a verified backup.
   upgrade             Upgrade with backup and readiness rollback.
+  prune-releases      Preview or remove old native release directories.
   openclaw-adapter     Start a local OpenClaw Adapter.
   package-release     Build a deployable source archive including web/dist.
   version             Print installed version.
@@ -29,7 +30,7 @@ fi
 shift || true
 
 case "$command" in
-  doctor|status|logs|backup|restore|upgrade|openclaw-adapter|package-release)
+  doctor|status|logs|backup|restore|upgrade|prune-releases|openclaw-adapter|package-release)
     exec "$COMMAND_DIR/$command.sh" "$@"
     ;;
   version)

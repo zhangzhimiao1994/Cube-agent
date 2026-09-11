@@ -23,3 +23,42 @@
   [ "$status" -ne 0 ]
   [ "$(scripts/agent-hub version)" = "0.1.0" ]
 }
+
+@test "prune-releases previews old releases without deleting by default" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  mkdir -p "$root/releases/202601010000-old" "$root/releases/202601020000-current" "$root/releases/202601030000-new"
+  ln -s "$root/releases/202601020000-current" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub prune-releases --keep 1
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mode=dry-run"* ]]
+  [[ "$output" == *"keep $root/releases/202601020000-current reason=current"* ]]
+  [[ "$output" == *"remove $root/releases/202601010000-old reason=older"* ]]
+  [ -d "$root/releases/202601010000-old" ]
+}
+
+@test "prune-releases execution preserves current even when current is old" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  mkdir -p "$root/releases/202601010000-current" "$root/releases/202601020000-old" "$root/releases/202601030000-new"
+  ln -s "$root/releases/202601010000-current" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub prune-releases --keep 1 --execute
+
+  [ "$status" -eq 0 ]
+  [ -d "$root/releases/202601010000-current" ]
+  [ ! -e "$root/releases/202601020000-old" ]
+  [ -d "$root/releases/202601030000-new" ]
+}
+
+@test "prune-releases refuses to run when current is outside releases" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  mkdir -p "$root/releases/202601010000-release" "$root/outside"
+  ln -s "$root/outside" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub prune-releases --keep 1 --execute
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"current must point inside release directory"* ]]
+  [ -d "$root/releases/202601010000-release" ]
+}
