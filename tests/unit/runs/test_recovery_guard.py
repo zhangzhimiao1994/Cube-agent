@@ -1,4 +1,211 @@
-from agent_hub.runs.repository import _is_recovery_replayable_event_kind
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Self, cast
+from uuid import UUID, uuid4
+
+import pytest
+from sqlalchemy.dialects import postgresql
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import (
+    RunRecord,
+    RunRepository,
+    _is_recovery_replayable_event_kind,
+    _is_self_repair_recovery_baseline_event_kind,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
+
+
+@dataclass(slots=True)
+class _FakeRunRow:
+    id: UUID
+    tenant_id: UUID
+    actor_id: UUID | None
+    actor_role: str | None
+    request: str
+    mode: str | None
+    status: str
+    version: int
+    created_at: datetime
+    routing_decision: dict[str, object] | None
+
+
+class _FakeTransaction:
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    def begin(self) -> Self:
+        return self
+
+    async def flush(self) -> None:
+        pass
+
+
+class _AcceptSelfRepairSession(_FakeTransaction):
+    def __init__(self, row: _FakeRunRow) -> None:
+        self._row = row
+        self.added: list[object] = []
+
+    async def scalar(self, statement: object) -> _FakeRunRow:
+        del statement
+        return self._row
+
+    def add(self, item: object) -> None:
+        self.added.append(item)
+
+
+class _AcceptSelfRepairSessionFactory:
+    def __init__(self, row: _FakeRunRow) -> None:
+        self._row = row
+
+    def __call__(self) -> _AcceptSelfRepairSession:
+        return _AcceptSelfRepairSession(self._row)
+
+
+class _ScalarRecordingSession:
+    def __init__(self, responses: tuple[object, ...]) -> None:
+        self._responses = list(responses)
+        self.statements: list[object] = []
+
+    async def scalar(self, statement: object) -> object:
+        self.statements.append(statement)
+        return self._responses.pop(0)
+
+
+class _AcceptSelfRepairRepository(RunRepository):
+    def __init__(self, *, latest_event_sequence: int) -> None:
+        self.run_id = uuid4()
+        self.tenant_id = uuid4()
+        self.latest_event_sequence = latest_event_sequence
+        self.row = _FakeRunRow(
+            id=self.run_id,
+            tenant_id=self.tenant_id,
+            actor_id=uuid4(),
+            actor_role=None,
+            request="repair failed run",
+            mode=TaskMode.DISPATCH.value,
+            status=RunStatus.FAILED.value,
+            version=7,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "approval_kind": "self_repair",
+                "decision_token": "repair-token",
+                "repair_proposal": {
+                    "kind": "self_repair",
+                    "attempt": 1,
+                    "max_attempts": 1,
+                },
+            },
+        )
+        self._session_factory = cast(Any, _AcceptSelfRepairSessionFactory(self.row))
+
+    async def next_event_sequence(
+        self,
+        session: Any,
+        run_id: UUID,
+    ) -> int:
+        del session
+        assert run_id == self.run_id
+        return self.latest_event_sequence + 1
+
+
+class _RecoveryBlockingRepository(RunRepository):
+    def __init__(
+        self,
+        *,
+        status: RunStatus,
+        routing_decision: dict[str, object] | None,
+        blocked_after_sequence: int,
+        blocked_after_kind: str = EventKind.RUNTIME_FAILED.value,
+    ) -> None:
+        self.run_id = uuid4()
+        self.tenant_id = uuid4()
+        self.row = _FakeRunRow(
+            id=self.run_id,
+            tenant_id=self.tenant_id,
+            actor_id=uuid4(),
+            actor_role=None,
+            request="repair blocked contract",
+            mode=TaskMode.DISPATCH.value,
+            status=status.value,
+            version=1,
+            created_at=datetime.now(UTC),
+            routing_decision=routing_decision,
+        )
+        self.checkpoint = RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type="test_runtime",
+            runtime_version="1.0",
+            run_id=self.run_id,
+            tenant_id=self.tenant_id,
+            mode=TaskMode.DISPATCH,
+            state={"step": "draft"},
+        )
+        self.blocked_after_sequence = blocked_after_sequence
+        self.blocked_after_kind = blocked_after_kind
+        self.persisted_events: list[RunEvent] = []
+
+    async def get_for_update(self, session: Any, run_id: UUID) -> Any:
+        del session
+        assert run_id == self.run_id
+        return self.row
+
+    async def latest_checkpoint(
+        self,
+        session: Any,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> RuntimeCheckpoint | None:
+        del session
+        assert tenant_id == self.tenant_id
+        assert run_id == self.run_id
+        return self.checkpoint
+
+    async def _recovery_blocked_after_checkpoint(
+        self,
+        session: Any,
+        *,
+        run_id: UUID,
+        minimum_event_sequence: int = 0,
+    ) -> bool:
+        del session
+        assert run_id == self.run_id
+        return self.blocked_after_sequence > 1 and not (
+            self.blocked_after_sequence <= minimum_event_sequence
+            and _is_self_repair_recovery_baseline_event_kind(self.blocked_after_kind)
+        )
+
+    async def next_event_sequence(self, session: Any, run_id: UUID) -> int:
+        del session
+        assert run_id == self.run_id
+        return len(self.persisted_events) + 1
+
+    async def persist_event(
+        self,
+        session: Any,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        event: RunEvent,
+    ) -> None:
+        del session
+        assert tenant_id == self.tenant_id
+        assert run_id == self.run_id
+        self.persisted_events.append(event)
+
+
+def _accepted_self_repair_routing(*, baseline_sequence: int) -> dict[str, object]:
+    return {
+        "source": "self_repair",
+        "self_repair_accepted": True,
+        "self_repair_recovery_baseline_sequence": baseline_sequence,
+    }
 
 
 def test_harness_started_is_recovery_replayable_observability() -> None:
@@ -16,3 +223,109 @@ def test_repair_started_is_recovery_replayable_observability() -> None:
 def test_runtime_and_tool_events_remain_recovery_blocking() -> None:
     assert not _is_recovery_replayable_event_kind("runtime.completed")
     assert not _is_recovery_replayable_event_kind("tool.completed")
+
+
+def test_self_repair_baseline_only_ignores_diagnostic_events() -> None:
+    assert _is_self_repair_recovery_baseline_event_kind("runtime.failed")
+    assert _is_self_repair_recovery_baseline_event_kind("step.failed")
+    assert _is_self_repair_recovery_baseline_event_kind("repair.classified")
+    assert _is_self_repair_recovery_baseline_event_kind("observer.notice")
+    assert not _is_self_repair_recovery_baseline_event_kind("tool.completed")
+    assert not _is_self_repair_recovery_baseline_event_kind("artifact.created")
+
+
+@pytest.mark.asyncio
+async def test_recovery_block_query_ignores_only_baseline_diagnostic_events() -> None:
+    repository = RunRepository(cast(Any, None))
+    session = _ScalarRecordingSession((1, 4))
+
+    blocked = await repository._recovery_blocked_after_checkpoint(
+        cast(Any, session),
+        run_id=uuid4(),
+        minimum_event_sequence=3,
+    )
+
+    assert blocked is True
+    assert len(session.statements) == 2
+    compiled = str(session.statements[1].compile(dialect=postgresql.dialect()))  # type: ignore[attr-defined, no-untyped-call]
+    assert "agent_hub_run_events.sequence <= " in compiled
+    assert "agent_hub_run_events.kind IN" in compiled
+    assert "agent_hub_run_events.kind NOT IN" in compiled
+    assert "NOT (" in compiled
+    assert session.statements[1].compile(dialect=postgresql.dialect()).params["sequence_1"] == 3  # type: ignore[attr-defined, no-untyped-call]
+
+
+@pytest.mark.asyncio
+async def test_accept_self_repair_records_current_event_sequence_as_recovery_baseline() -> None:
+    repository = _AcceptSelfRepairRepository(latest_event_sequence=3)
+
+    record = await repository.accept_self_repair_and_enqueue(
+        tenant_id=repository.tenant_id,
+        run_id=repository.run_id,
+        decision_token="repair-token",
+        version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.routing_decision is not None
+    assert record.routing_decision["self_repair_accepted"] is True
+    assert record.routing_decision["self_repair_recovery_baseline_sequence"] == 3
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_ignores_events_recorded_before_requeue() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.QUEUED,
+        routing_decision=_accepted_self_repair_routing(baseline_sequence=3),
+        blocked_after_sequence=3,
+    )
+
+    claimed = await repository.claim_for_execution(
+        cast(Any, _FakeTransaction()),
+        repository.run_id,
+        allow_running_recovery=False,
+    )
+
+    assert not isinstance(claimed, RunRecord)
+    row, checkpoint = claimed
+    assert row.status == RunStatus.RUNNING.value
+    assert checkpoint == repository.checkpoint
+    assert repository.persisted_events == []
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_blocks_events_recorded_after_requeue() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING,
+        routing_decision=_accepted_self_repair_routing(baseline_sequence=3),
+        blocked_after_sequence=4,
+    )
+
+    claimed = await repository.claim_for_execution(
+        cast(Any, _FakeTransaction()),
+        repository.run_id,
+        allow_running_recovery=True,
+    )
+
+    assert isinstance(claimed, RunRecord)
+    assert claimed.status is RunStatus.FAILED
+    assert [event.kind for event in repository.persisted_events] == [EventKind.RUNTIME_FAILED]
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_still_blocks_prior_tool_side_effect() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.QUEUED,
+        routing_decision=_accepted_self_repair_routing(baseline_sequence=3),
+        blocked_after_sequence=2,
+        blocked_after_kind=EventKind.TOOL_COMPLETED.value,
+    )
+
+    claimed = await repository.claim_for_execution(
+        cast(Any, _FakeTransaction()),
+        repository.run_id,
+        allow_running_recovery=False,
+    )
+
+    assert isinstance(claimed, RunRecord)
+    assert claimed.status is RunStatus.FAILED

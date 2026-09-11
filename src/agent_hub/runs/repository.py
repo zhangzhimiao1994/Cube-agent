@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, and_, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -34,6 +34,14 @@ from agent_hub.runtime.failure_reason import (
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
     {"harness.started", "repair.started", "runtime.recovered"}
+)
+_SELF_REPAIR_RECOVERY_BASELINE_EVENT_KINDS = frozenset(
+    {
+        EventKind.RUNTIME_FAILED.value,
+        EventKind.STEP_FAILED.value,
+        "observer.notice",
+        "repair.classified",
+    }
 )
 
 
@@ -468,6 +476,7 @@ class RunRepository:
             max_attempts = proposal.get("max_attempts", 1)
             if type(attempt) is not int or type(max_attempts) is not int or attempt > max_attempts:
                 raise RunConflict("self repair proposal exceeds retry budget")
+            recovery_baseline_sequence = await self.next_event_sequence(session, row.id) - 1
             next_decision = {
                 key: value
                 for key, value in routing_decision.items()
@@ -481,6 +490,7 @@ class RunRepository:
                     "self_repair_max_attempts": max_attempts,
                     "self_repair_source_run_id": str(run_id),
                     "self_repair_source_event_sequence": proposal.get("source_event_sequence"),
+                    "self_repair_recovery_baseline_sequence": recovery_baseline_sequence,
                     "self_repair_fingerprint": proposal.get("fingerprint"),
                     "self_repair_context": repair_context_from_proposal(proposal),
                 }
@@ -558,9 +568,13 @@ class RunRepository:
             status in {RunStatus.QUEUED, RunStatus.RETRYING} and checkpoint is not None
         )
         if should_guard_recovery:
+            minimum_event_sequence = _self_repair_recovery_baseline_sequence(
+                row.routing_decision
+            )
             recovery_blocked = await self._recovery_blocked_after_checkpoint(
                 session,
                 run_id=row.id,
+                minimum_event_sequence=minimum_event_sequence,
             )
             if recovery_blocked:
                 sequence = await self.next_event_sequence(session, row.id)
@@ -586,6 +600,7 @@ class RunRepository:
         session: AsyncSession,
         *,
         run_id: UUID,
+        minimum_event_sequence: int = 0,
     ) -> bool:
         checkpoint_sequence = (
             await session.scalar(
@@ -595,10 +610,15 @@ class RunRepository:
             )
             or 0
         )
+        self_repair_baseline_event = and_(
+            RunEventRow.sequence <= minimum_event_sequence,
+            RunEventRow.kind.in_(_SELF_REPAIR_RECOVERY_BASELINE_EVENT_KINDS),
+        )
         latest_event_sequence = await session.scalar(
             select(func.max(RunEventRow.sequence)).where(
                 RunEventRow.run_id == run_id,
                 ~RunEventRow.kind.in_(_RECOVERY_REPLAYABLE_EVENT_KINDS),
+                ~self_repair_baseline_event,
             )
         )
         return latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence
@@ -1410,6 +1430,24 @@ class RunRepository:
 
 def _is_recovery_replayable_event_kind(kind: str) -> bool:
     return kind in _RECOVERY_REPLAYABLE_EVENT_KINDS
+
+
+def _is_self_repair_recovery_baseline_event_kind(kind: str) -> bool:
+    return kind in _SELF_REPAIR_RECOVERY_BASELINE_EVENT_KINDS
+
+
+def _self_repair_recovery_baseline_sequence(
+    routing_decision: dict[str, object] | None,
+) -> int:
+    if routing_decision is None:
+        return 0
+    if (
+        routing_decision.get("source") != "self_repair"
+        or routing_decision.get("self_repair_accepted") is not True
+    ):
+        return 0
+    value = routing_decision.get("self_repair_recovery_baseline_sequence")
+    return value if type(value) is int and value >= 0 else 0
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
