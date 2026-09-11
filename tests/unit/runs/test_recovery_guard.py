@@ -30,6 +30,10 @@ class _FakeRunRow:
     version: int
     created_at: datetime
     routing_decision: dict[str, object] | None
+    worker_id: str | None = None
+    worker_lease_token: UUID | None = None
+    worker_lease_expires_at: datetime | None = None
+    worker_heartbeat_at: datetime | None = None
 
 
 class _FakeTransaction:
@@ -125,6 +129,8 @@ class _RecoveryBlockingRepository(RunRepository):
     ) -> None:
         self.run_id = uuid4()
         self.tenant_id = uuid4()
+        self.lease_token = uuid4()
+        self.lease_expires_at = datetime(2026, 9, 12, 0, 1, tzinfo=UTC)
         self.row = _FakeRunRow(
             id=self.run_id,
             tenant_id=self.tenant_id,
@@ -291,6 +297,43 @@ async def test_accepted_self_repair_ignores_events_recorded_before_requeue() -> 
     assert row.status == RunStatus.RUNNING.value
     assert checkpoint == repository.checkpoint
     assert repository.persisted_events == []
+
+
+@pytest.mark.asyncio
+async def test_claim_for_execution_records_worker_lease() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.QUEUED,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+
+    claimed = await repository.claim_for_execution(
+        cast(Any, _FakeTransaction()),
+        repository.run_id,
+        allow_running_recovery=False,
+        worker_id="worker-alpha",
+        worker_lease_token=repository.lease_token,
+        worker_lease_expires_at=repository.lease_expires_at,
+    )
+
+    assert not isinstance(claimed, RunRecord)
+    assert repository.row.worker_id == "worker-alpha"
+    assert repository.row.worker_lease_token == repository.lease_token
+    assert repository.row.worker_lease_expires_at == repository.lease_expires_at
+    assert repository.row.worker_heartbeat_at is not None
+
+
+def test_running_for_recovery_requires_expired_worker_lease() -> None:
+    repository = RunRepository(cast(Any, None))
+    now = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
+
+    statement = repository._running_for_recovery_select(limit=5, now=now)
+
+    compiled = str(statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert "agent_hub_runs.worker_lease_expires_at IS NOT NULL" in compiled
+    assert "agent_hub_runs.worker_lease_expires_at <=" in compiled
+    assert "agent_hub_runs.worker_lease_expires_at IS NULL" not in compiled
+    assert statement.compile(dialect=postgresql.dialect()).params["worker_lease_expires_at_1"] == now  # type: ignore[no-untyped-call]
 
 
 @pytest.mark.asyncio

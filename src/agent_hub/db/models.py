@@ -164,6 +164,16 @@ class RunRow(Base):
     status: Mapped[str] = mapped_column(String(32))
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     routing_decision: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    worker_lease_token: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), nullable=True
+    )
+    worker_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    worker_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

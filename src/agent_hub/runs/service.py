@@ -362,6 +362,8 @@ class RunService:
         observer_policy: ObserverPolicy | None = None,
         harness_scheduler: HarnessSchedulerProtocol | None = None,
         self_repair_policy: SelfRepairPolicy | None = None,
+        worker_id: str | None = None,
+        run_worker_lease_seconds: float = 60.0,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -380,6 +382,8 @@ class RunService:
         self._observer_policy = observer_policy or ObserverPolicy()
         self._harness_scheduler = harness_scheduler
         self._self_repair_policy = self_repair_policy or SelfRepairPolicy()
+        self._worker_id = _safe_worker_id(worker_id)
+        self._run_worker_lease_seconds = _run_worker_lease_seconds(run_worker_lease_seconds)
 
     async def submit(
         self,
@@ -1233,12 +1237,16 @@ class RunService:
         allow_running_recovery: bool = False,
     ) -> SubmittedRun:
         claimed_record: RunRecord | None = None
+        worker_lease_token = uuid4()
         async with await self._repository.run_transaction() as session, session.begin():
             try:
                 claimed = await self._repository.claim_for_execution(
                     session,
                     run_id,
                     allow_running_recovery=allow_running_recovery,
+                    worker_id=self._worker_id,
+                    worker_lease_token=worker_lease_token,
+                    worker_lease_expires_at=self._worker_lease_expires_at(),
                 )
             except RunAlreadyActive:
                 active = await self._repository.get_for_update(session, run_id)
@@ -1271,6 +1279,7 @@ class RunService:
         observer_decisions: list[ObserverDecision] = []
         observed_events: list[RunEvent] = []
         scheduler_notice_payloads: list[dict[str, object]] = []
+        lease_lost = False
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
@@ -1333,6 +1342,19 @@ class RunService:
                     if current_status is RunStatus.WAITING_APPROVAL:
                         terminal = RunStatus.WAITING_APPROVAL
                         break
+                    if current_status is RunStatus.RUNNING and not RunRepository.renew_worker_lease(
+                        locked,
+                        worker_id=self._worker_id,
+                        worker_lease_token=worker_lease_token,
+                        worker_lease_expires_at=self._worker_lease_expires_at(),
+                    ):
+                        _LOGGER.warning(
+                            "run_worker_lease_lost run_id=%s worker_id=%s",
+                            run_id,
+                            self._worker_id,
+                        )
+                        lease_lost = True
+                        break
                     sequence = await self._repository.next_event_sequence(session, run_id)
                     event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
                     await self._repository.persist_event(
@@ -1353,9 +1375,12 @@ class RunService:
                         terminal = RunStatus.FAILED
                     if terminal is not RunStatus.RUNNING:
                         locked.status = terminal.value
+                        RunRepository.clear_worker_lease(locked)
                         locked.version += 1
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
+            if lease_lost:
+                return await self._submitted_by_run_id(tenant_id, run_id)
         except Exception as error:
             _LOGGER.exception(
                 "run_execute_failed run_id=%s error_type=%s",
@@ -1709,7 +1734,10 @@ class RunService:
 
     async def recover_running(self, limit: int = 100) -> int:
         recovered = 0
-        for run_id in await self._repository.running_for_recovery(limit):
+        for run_id in await self._repository.running_for_recovery(
+            limit,
+            now=datetime.now(UTC),
+        ):
             try:
                 await self.recover(run_id)
             except Exception as error:
@@ -1721,6 +1749,9 @@ class RunService:
                 continue
             recovered += 1
         return recovered
+
+    def _worker_lease_expires_at(self) -> datetime:
+        return datetime.now(UTC) + timedelta(seconds=self._run_worker_lease_seconds)
 
     async def _submitted_by_run_id(self, tenant_id: UUID, run_id: UUID) -> SubmittedRun:
         return _submitted(await self._repository.get(tenant_id, run_id))
@@ -3170,6 +3201,26 @@ def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
     if type(configured_tokens) is not int or configured_tokens <= 0:
         return 1_000_000
     return max(1, min(configured_tokens, 10_000_000))
+
+
+def _safe_worker_id(worker_id: str | None) -> str:
+    if worker_id is None:
+        return f"worker-{uuid4().hex}"
+    cleaned = worker_id.strip()
+    if _SAFE_MODEL_ID.fullmatch(cleaned) is None:
+        raise ValueError("worker_id must be a safe identifier")
+    return cleaned
+
+
+def _run_worker_lease_seconds(configured_seconds: float) -> float:
+    if (
+        isinstance(configured_seconds, bool)
+        or not isinstance(configured_seconds, int | float)
+        or not math.isfinite(configured_seconds)
+        or configured_seconds <= 0
+    ):
+        return 60.0
+    return max(1.0, min(float(configured_seconds), 3600.0))
 
 
 def _conversation_history_token_budget(

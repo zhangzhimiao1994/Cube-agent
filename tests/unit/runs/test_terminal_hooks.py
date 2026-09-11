@@ -43,6 +43,10 @@ class FakeRunRow:
     version: int
     created_at: datetime
     routing_decision: dict[str, object] | None
+    worker_id: str | None = None
+    worker_lease_token: UUID | None = None
+    worker_lease_expires_at: datetime | None = None
+    worker_heartbeat_at: datetime | None = None
 
 
 class FakeTransaction:
@@ -85,6 +89,9 @@ class ExecutableFakeRepository:
         run_id: UUID,
         *,
         allow_running_recovery: bool,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+        worker_lease_expires_at: datetime | None = None,
     ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
         del session, allow_running_recovery
         assert run_id == self.run_id
@@ -95,6 +102,10 @@ class ExecutableFakeRepository:
         }:
             return self._record()
         self.row.status = RunStatus.RUNNING.value
+        self.row.worker_id = worker_id
+        self.row.worker_lease_token = worker_lease_token
+        self.row.worker_lease_expires_at = worker_lease_expires_at
+        self.row.worker_heartbeat_at = datetime.now(UTC)
         self.row.version += 1
         return self.row, None
 
@@ -275,8 +286,11 @@ class RecoveredFailedRepository(ExecutableFakeRepository):
         run_id: UUID,
         *,
         allow_running_recovery: bool,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+        worker_lease_expires_at: datetime | None = None,
     ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
-        del session
+        del session, worker_id, worker_lease_token, worker_lease_expires_at
         assert allow_running_recovery is True
         assert run_id == self.run_id
         self.row.status = RunStatus.FAILED.value
@@ -301,8 +315,11 @@ class RecoveredEmptyResponseRepository(ExecutableFakeRepository):
         run_id: UUID,
         *,
         allow_running_recovery: bool,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+        worker_lease_expires_at: datetime | None = None,
     ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
-        del session, allow_running_recovery
+        del session, allow_running_recovery, worker_id, worker_lease_token, worker_lease_expires_at
         assert run_id == self.run_id
         self.row.status = RunStatus.FAILED.value
         self.row.version += 1
@@ -662,6 +679,10 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.COMPLETED
+    assert repository.row.worker_id is None
+    assert repository.row.worker_lease_token is None
+    assert repository.row.worker_lease_expires_at is None
+    assert repository.row.worker_heartbeat_at is None
     assert hook.calls == [
         {
             "tenant_id": TENANT_ID,

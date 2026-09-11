@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -351,6 +351,12 @@ async def run_session_factory(
         await database.dispose()
 
 
+async def _expire_worker_lease(repository: RunRepository, run_id: UUID) -> None:
+    async with await repository.run_transaction() as session, session.begin():
+        row = await repository.get_for_update(session, run_id)
+        row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+
 async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_artifact_work(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -413,6 +419,7 @@ async def test_recover_running_restores_recoverable_running_run(
     )
 
     first = await service.execute(submitted.id, crash_after_event_kind=EventKind.CHECKPOINT_SAVED)
+    await _expire_worker_lease(repository, submitted.id)
     recovered_count = await service.recover_running(limit=10)
     recovered = await service.get(tenant_id, submitted.id)
 
@@ -444,6 +451,7 @@ async def test_recover_running_fails_safe_for_non_replayable_running_run(
     )
 
     first = await service.execute(submitted.id, crash_after_event_kind=EventKind.ARTIFACT_CREATED)
+    await _expire_worker_lease(repository, submitted.id)
     recovered_count = await service.recover_running(limit=10)
     recovered = await service.get(tenant_id, submitted.id)
     events = await service.events(tenant_id, submitted.id)

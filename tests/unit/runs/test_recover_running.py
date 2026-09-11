@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -36,7 +37,8 @@ class RecoverableRunRepository:
     def __init__(self, candidates: tuple[UUID, ...]) -> None:
         self._candidates = candidates
 
-    async def running_for_recovery(self, limit: int) -> tuple[UUID, ...]:
+    async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
+        del now
         return self._candidates[:limit]
 
 
