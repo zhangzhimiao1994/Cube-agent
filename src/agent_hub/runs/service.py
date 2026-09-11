@@ -51,6 +51,8 @@ _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
 
@@ -2115,6 +2117,9 @@ def _self_repair_execution_payload(
         payload["recovery_strategy"] = recovery_strategy
     if orchestration_recovery_hint is not None:
         payload["orchestration_recovery_hint"] = orchestration_recovery_hint
+    blocked_contract_ids = _bounded_contract_ids(repair.get("blocked_contract_ids"))
+    if blocked_contract_ids:
+        payload["blocked_contract_ids"] = blocked_contract_ids
     return payload
 
 
@@ -2152,6 +2157,24 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
     if type(value) is not int:
         return default
     return min(max(value, minimum), maximum)
+
+
+def _bounded_contract_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if _SAFE_CONTRACT_ID.fullmatch(text) is None:
+            continue
+        if text in safe:
+            continue
+        safe.append(text)
+        if len(safe) >= _MAX_BLOCKED_CONTRACT_IDS:
+            break
+    return tuple(safe)
 
 
 def _needs_empty_response_closure_artifact(events: tuple[RunEvent, ...]) -> bool:

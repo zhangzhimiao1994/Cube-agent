@@ -66,6 +66,8 @@ _SENSITIVE_TEXT_PATTERN = re.compile(
     r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
     re.IGNORECASE,
 )
+_SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_MAX_BLOCKED_CONTRACT_IDS = 8
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -121,6 +123,7 @@ class SelfRepairDecision:
     skip_reason: str | None = None
     recovery_strategy: str | None = None
     orchestration_recovery_hint: str | None = None
+    blocked_contract_ids: tuple[str, ...] = ()
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
         return SelfRepairDecision(
@@ -141,6 +144,7 @@ class SelfRepairDecision:
             skip_reason=self.skip_reason,
             recovery_strategy=self.recovery_strategy,
             orchestration_recovery_hint=self.orchestration_recovery_hint,
+            blocked_contract_ids=self.blocked_contract_ids,
         )
 
     def to_event(self, *, run_id: UUID, sequence: int) -> RunEvent:
@@ -195,6 +199,8 @@ class SelfRepairDecision:
             proposal["recovery_strategy"] = self.recovery_strategy
         if self.orchestration_recovery_hint is not None:
             proposal["orchestration_recovery_hint"] = self.orchestration_recovery_hint
+        if self.blocked_contract_ids:
+            proposal["blocked_contract_ids"] = self.blocked_contract_ids
         return proposal
 
 
@@ -218,6 +224,11 @@ def classify_terminal_run(
         events=events,
         orchestration_recovery_hint=orchestration_recovery_hint,
     )
+    blocked_contract_ids = (
+        _blocked_contract_ids(events)
+        if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY
+        else ()
+    )
     fingerprint = _fingerprint(
         status=status,
         mode=mode,
@@ -239,6 +250,7 @@ def classify_terminal_run(
             skip_reason="recursive_self_repair",
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
+            blocked_contract_ids=blocked_contract_ids,
         )
     if failure_category == "outcome_uncertain":
         return _skipped_decision(
@@ -255,6 +267,7 @@ def classify_terminal_run(
             severity="warning",
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
+            blocked_contract_ids=blocked_contract_ids,
         )
     return SelfRepairDecision(
         kind="repair.classified",
@@ -273,6 +286,7 @@ def classify_terminal_run(
         max_attempts=policy.max_attempts,
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
+        blocked_contract_ids=blocked_contract_ids,
     )
 
 
@@ -291,6 +305,7 @@ def _skipped_decision(
     severity: str = "info",
     recovery_strategy: str | None = None,
     orchestration_recovery_hint: str | None = None,
+    blocked_contract_ids: tuple[str, ...] = (),
 ) -> SelfRepairDecision:
     return SelfRepairDecision(
         kind="repair.skipped",
@@ -310,6 +325,7 @@ def _skipped_decision(
         skip_reason=skip_reason,
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
+        blocked_contract_ids=blocked_contract_ids,
     )
 
 
@@ -368,6 +384,9 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         context["recovery_strategy"] = recovery_strategy
     if orchestration_recovery_hint is not None:
         context["orchestration_recovery_hint"] = orchestration_recovery_hint
+    blocked_contract_ids = _safe_contract_ids(proposal.get("blocked_contract_ids"))
+    if blocked_contract_ids:
+        context["blocked_contract_ids"] = blocked_contract_ids
     return context
 
 
@@ -514,6 +533,35 @@ def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
             if safe_hint is not None:
                 return safe_hint
     return None
+
+
+def _blocked_contract_ids(events: Sequence[RunEvent]) -> tuple[str, ...]:
+    collected: list[str] = []
+    for event in reversed(events):
+        for contract_id in _safe_contract_ids(event.payload.get("blocked_contract_ids")):
+            if contract_id not in collected:
+                collected.append(contract_id)
+            if len(collected) >= _MAX_BLOCKED_CONTRACT_IDS:
+                return tuple(collected)
+    return tuple(collected)
+
+
+def _safe_contract_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if _SAFE_CONTRACT_ID.fullmatch(text) is None:
+            continue
+        if text in safe:
+            continue
+        safe.append(text)
+        if len(safe) >= _MAX_BLOCKED_CONTRACT_IDS:
+            break
+    return tuple(safe)
 
 
 def _already_classified(events: Sequence[RunEvent]) -> bool:

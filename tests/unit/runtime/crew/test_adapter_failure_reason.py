@@ -2044,6 +2044,7 @@ async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_
                         "max_attempts": 1,
                         "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
                         "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("draft-to-final_response",),
                         "instruction": "重规划角色交接契约链。",
                         "automatic_execution": False,
                         "requires_approval": True,
@@ -2058,6 +2059,7 @@ async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_
     assert "SELF_REPAIR_CONTEXT" in prompt
     assert "orchestration_repair" in prompt
     assert "retry_blocked_contract_chain_after_replanning" in prompt
+    assert "draft-to-final_response" in prompt
     started_steps = [
         event.step_id
         for event in events

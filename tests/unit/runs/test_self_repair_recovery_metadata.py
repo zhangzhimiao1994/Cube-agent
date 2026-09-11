@@ -9,7 +9,10 @@ from agent_hub.recovery_metadata import (
 )
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runs.service import _self_repair_execution_payload
-from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.runtime.self_repair_context import (
+    self_repair_context_text,
+    self_repair_recovery_plan_payload,
+)
 
 
 def test_orchestration_contract_recovery_hint_is_safe_for_self_repair() -> None:
@@ -69,3 +72,65 @@ def test_safe_recovery_metadata_allowlists_stay_consistent_across_boundaries() -
             status=RunStatus.RUNNING,
         )
         assert audit_payload["failure_kind"] == failure_kind
+
+
+def test_blocked_contract_ids_stay_internal_bounded_and_prompt_visible() -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": "step_failure",
+            "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+            "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            "blocked_contract_ids": (
+                "draft-to-final_response",
+                "draft-to-final_response",
+                "unsafe secret://token",
+                "x" * 97,
+                "research-to-final_response",
+            ),
+        }
+    )
+    assert repair_context["blocked_contract_ids"] == (
+        "draft-to-final_response",
+        "research-to-final_response",
+    )
+
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+    prompt_context = self_repair_context_text(routing_decision)
+    assert "draft-to-final_response" in prompt_context
+    assert "research-to-final_response" in prompt_context
+    assert "secret://token" not in prompt_context
+
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+    assert recovery_plan is not None
+    assert recovery_plan["blocked_contract_ids"] == (
+        "draft-to-final_response",
+        "research-to-final_response",
+    )
+
+    audit_payload = _self_repair_execution_payload(
+        routing_decision,
+        status=RunStatus.RUNNING,
+    )
+    assert audit_payload["blocked_contract_ids"] == (
+        "draft-to-final_response",
+        "research-to-final_response",
+    )
+    assert "secret://token" not in repr(audit_payload)
+
+
+def test_blocked_contract_ids_are_hidden_without_contract_recovery_gate() -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": "runtime_failure",
+            "recovery_strategy": "switch_to_available_model_and_retry",
+            "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            "blocked_contract_ids": ("draft-to-final_response",),
+        }
+    )
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+
+    assert repair_context["blocked_contract_ids"] == ("draft-to-final_response",)
+    assert "draft-to-final_response" not in self_repair_context_text(routing_decision)
+    assert self_repair_recovery_plan_payload(routing_decision) is None

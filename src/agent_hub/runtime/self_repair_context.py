@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
@@ -16,6 +17,8 @@ from agent_hub.runtime.contracts import JsonValue
 
 _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
+_SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_MAX_BLOCKED_CONTRACT_IDS = 8
 
 
 def self_repair_context_text(
@@ -61,6 +64,15 @@ def self_repair_context_text(
             max_chars=128,
         ),
     }
+    blocked_contract_ids = (
+        _safe_contract_ids(repair.get("blocked_contract_ids"))
+        if routing_decision.get("source") == "self_repair"
+        and payload["recovery_strategy"] == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY
+        and payload["orchestration_recovery_hint"] == ORCHESTRATION_CONTRACT_RECOVERY_HINT
+        else ()
+    )
+    if blocked_contract_ids:
+        payload["blocked_contract_ids"] = blocked_contract_ids
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > _MAX_TOTAL_BYTES:
         encoded = encoded.encode("utf-8")[:_MAX_TOTAL_BYTES].decode(
@@ -100,7 +112,7 @@ def self_repair_recovery_plan_payload(
         return None
     if orchestration_recovery_hint != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
         return None
-    return {
+    payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "status": "active",
         "recovery_strategy": ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
@@ -110,6 +122,10 @@ def self_repair_recovery_plan_payload(
         "retry_blocked_contracts_only": True,
         "automatic_execution": False,
     }
+    blocked_contract_ids = _safe_contract_ids(repair.get("blocked_contract_ids"))
+    if blocked_contract_ids:
+        payload["blocked_contract_ids"] = blocked_contract_ids
+    return payload
 
 
 def _safe_text(value: object, default: str, max_chars: int) -> str:
@@ -134,6 +150,24 @@ def _safe_int(value: object, default: int) -> int:
     if type(value) is not int:
         return default
     return min(max(value, 0), 3)
+
+
+def _safe_contract_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if _SAFE_CONTRACT_ID.fullmatch(text) is None:
+            continue
+        if text in safe:
+            continue
+        safe.append(text)
+        if len(safe) >= _MAX_BLOCKED_CONTRACT_IDS:
+            break
+    return tuple(safe)
 
 
 __all__ = ["self_repair_context_text", "self_repair_recovery_plan_payload"]

@@ -1052,6 +1052,7 @@ def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None
     proposal = decision.to_proposal(run_id=run_id)
     assert repair_event.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert repair_event.payload["recovery_strategy"] == "retry_blocked_contract_chain_after_replanning"
+    assert "blocked_contract_ids" not in repair_event.payload
     assert "secret" not in repr(repair_event.payload)
     assert proposal is not None
     assert proposal["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
@@ -1121,6 +1122,7 @@ def test_repair_classification_uses_bounded_step_recovery_hint() -> None:
     assert proposal is not None
     assert proposal["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert proposal["recovery_strategy"] == "retry_blocked_contract_chain_after_replanning"
+    assert proposal["blocked_contract_ids"] == ("draft-to-final_response",)
     assert "契约链" in str(proposal["instruction"])
     assert "secret" not in repr(proposal)
 
