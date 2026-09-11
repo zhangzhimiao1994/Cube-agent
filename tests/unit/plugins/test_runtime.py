@@ -2238,6 +2238,9 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_dependen
     )
     assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
         "status": "unsupported",
+        "install_policy": "not_configured",
+        "cache_status": "missing",
+        "allowlist_status": "missing",
         "sha256": dependency_lock_hash,
         "dependency_count": 2,
         "dependencies": (

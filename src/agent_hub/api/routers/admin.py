@@ -1217,6 +1217,9 @@ class CapabilityManifestPackageDependencyLockResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["unsupported"]
+    install_policy: Literal["not_configured"]
+    cache_status: Literal["missing"]
+    allowlist_status: Literal["missing"]
     sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
     dependency_count: int = Field(ge=1, le=32)
     dependencies: list[CapabilityManifestPackageDependencyResponse] = Field(max_length=32)
@@ -3657,7 +3660,15 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package artifact is server-controlled")
     dependencies = package.get("dependencies")
     if dependencies not in (None, []):
-        raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+        if package.get("install_mode") != "scan_only" or not isinstance(
+            dependencies, list | tuple
+        ):
+            raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+        for dependency in dependencies:
+            try:
+                PluginPackageDependency.model_validate(dependency)
+            except ValidationError:
+                raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON) from None
     if package.get("kind") == "manifest_only" and set(package) & {
         "package_version",
         "adapter_id",
@@ -3686,7 +3697,7 @@ def _validate_plugin_package_contract(
 ) -> None:
     if package is None:
         return
-    if package.dependencies:
+    if package.dependencies and package.install_mode != "scan_only":
         raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     if package.kind == "manifest_only":
         if (

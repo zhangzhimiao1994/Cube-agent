@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 from agent_hub.capabilities.tools.registry import (
@@ -232,6 +233,64 @@ def test_plugin_manifest_source_maps_package_activation_reason_to_safe_token() -
 
     assert capability["available"] is False
     assert capability["availability_reason"] == "plugin_package_dependencies_unsupported"
+
+
+def test_plugin_manifest_source_exposes_fail_closed_dependency_policy() -> None:
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"] == {
+        "status": "unsupported",
+        "install_policy": "not_configured",
+        "cache_status": "missing",
+        "allowlist_status": "missing",
+        "sha256": hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest(),
+        "dependency_count": 1,
+        "dependencies": (
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            },
+        ),
+    }
 
 
 def test_composite_manifest_source_combines_sources_for_tenant() -> None:

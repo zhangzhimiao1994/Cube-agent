@@ -337,6 +337,9 @@ def _plugin_package_dependency_lock(plugin: PluginConfig) -> Mapping[str, JsonVa
     ).encode("utf-8")
     return {
         "status": "unsupported",
+        "install_policy": "not_configured",
+        "cache_status": "missing",
+        "allowlist_status": "missing",
         "sha256": hashlib.sha256(lock_bytes).hexdigest(),
         "dependency_count": len(ordered),
         "dependencies": cast(tuple[JsonValue, ...], ordered),

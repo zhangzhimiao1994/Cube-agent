@@ -4819,8 +4819,10 @@ def test_plugin_archive_install_persists_empty_package_dependencies() -> None:
     assert response.json()["plugin"]["package_metadata"]["dependencies"] == []
 
 
-def test_plugin_archive_install_rejects_package_dependencies() -> None:
+def test_plugin_archive_install_preserves_scan_only_package_dependencies() -> None:
+    dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.31.0\n").hexdigest()
     api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
 
     response = api.post(
         "/api/v1/admin/plugins/install",
@@ -4864,6 +4866,92 @@ def test_plugin_archive_install_rejects_package_dependencies() -> None:
                     {
                         "id": "calendar.create_event",
                         "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["plugin"]["package_metadata"]["dependencies"] == [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.31.0",
+        }
+    ]
+    manifest = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+    capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
+    assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
+        "status": "unsupported",
+        "install_policy": "not_configured",
+        "cache_status": "missing",
+        "allowlist_status": "missing",
+        "sha256": dependency_lock_hash,
+        "dependency_count": 1,
+        "dependencies": [
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.31.0",
+            }
+        ],
+    }
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_package_not_eligible"
+
+
+def test_plugin_archive_install_rejects_runtime_registered_package_dependencies() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "runtime_registered",
+                    "dependencies": [
+                        {
+                            "kind": "python",
+                            "source": "pypi",
+                            "name": "requests",
+                            "version": "2.31.0",
+                        }
+                    ],
+                },
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "calendar_python",
                         "permission_class": "calendar.write",
                         "sandbox_profile": "remote_connector",
                     }
@@ -7237,6 +7325,9 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
     )
     assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
         "status": "unsupported",
+        "install_policy": "not_configured",
+        "cache_status": "missing",
+        "allowlist_status": "missing",
         "sha256": dependency_lock_hash,
         "dependency_count": 1,
         "dependencies": [

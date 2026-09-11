@@ -1220,6 +1220,23 @@ const PluginAdapterDescriptorSchema = z.object({
 
 export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSchema>;
 
+const CapabilityManifestPackageDependencyLockSchema = z.object({
+  status: z.enum(["unsupported"]),
+  install_policy: z.enum(["not_configured"]),
+  cache_status: z.enum(["missing"]),
+  allowlist_status: z.enum(["missing"]),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  dependency_count: z.number().int().min(1).max(32),
+  dependencies: z.array(
+    z.object({
+      kind: z.enum(["python"]),
+      source: z.enum(["pypi"]),
+      name: z.string().min(1).max(128),
+      version: z.string().min(1).max(128),
+    }),
+  ).max(32),
+});
+
 const CapabilityManifestItemSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -1233,6 +1250,7 @@ const CapabilityManifestItemSchema = z.object({
   aliases: z.array(z.string()).default([]),
   input_schema: JsonObjectSchema.nullable().default(null),
   output_schema: JsonObjectSchema.nullable().default(null),
+  package_dependency_lock: CapabilityManifestPackageDependencyLockSchema.optional(),
 });
 
 const CapabilityManifestSchema = z.object({

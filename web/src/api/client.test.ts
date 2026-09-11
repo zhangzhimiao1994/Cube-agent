@@ -158,6 +158,103 @@ describe("api client transport", () => {
     expect(settings.plugin_package_subprocess_registration_status).toBeNull();
   });
 
+  it("preserves plugin package dependency policy locks on capability manifests", async () => {
+    const dependencyLock = {
+      status: "unsupported",
+      install_policy: "not_configured",
+      cache_status: "missing",
+      allowlist_status: "missing",
+      sha256: "a".repeat(64),
+      dependency_count: 1,
+      dependencies: [
+        {
+          kind: "python",
+          source: "pypi",
+          name: "requests",
+          version: "2.32.0",
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          schema_version: 1,
+          capabilities: [
+            {
+              id: "calendar.create_event",
+              kind: "plugin",
+              adapter: "calendar_python",
+              permission_class: "calendar.write",
+              sandbox_profile: "local_process",
+              policy_effect: "inherit",
+              available: false,
+              availability_reason: "plugin_package_dependencies_unsupported",
+              replay_safe: false,
+              aliases: [],
+              package_dependency_lock: dependencyLock,
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const manifest = await api.capabilityManifest();
+
+    expect(manifest.capabilities[0]?.package_dependency_lock).toEqual(dependencyLock);
+  });
+
+  it("rejects malformed plugin package dependency locks on capability manifests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          schema_version: 1,
+          capabilities: [
+            {
+              id: "calendar.create_event",
+              kind: "plugin",
+              adapter: "calendar_python",
+              permission_class: "calendar.write",
+              sandbox_profile: "local_process",
+              policy_effect: "inherit",
+              available: false,
+              availability_reason: "plugin_package_dependencies_unsupported",
+              replay_safe: false,
+              aliases: [],
+              package_dependency_lock: {
+                status: "unsupported",
+                install_policy: "not_configured",
+                cache_status: "missing",
+                allowlist_status: "missing",
+                sha256: "not-a-sha",
+                dependency_count: 1,
+                dependencies: [
+                  {
+                    kind: "python",
+                    source: "pypi",
+                    name: "requests",
+                    version: "2.32.0",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.capabilityManifest()).rejects.toThrow();
+  });
+
   it("preserves nested model execution plans on run detail events", async () => {
     const modelExecutionPlan = {
       schema_version: 1,
