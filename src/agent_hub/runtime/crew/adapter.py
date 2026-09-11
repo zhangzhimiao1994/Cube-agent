@@ -1277,6 +1277,111 @@ def _checkpoint_recovery_payload(
     }
 
 
+def _orchestration_repair_reopen_steps(
+    plan: DispatchPlan,
+    repair_payload: Mapping[str, JsonValue] | None,
+) -> frozenset[str]:
+    if repair_payload is None:
+        return frozenset()
+    raw_contract_ids = repair_payload.get("blocked_contract_ids")
+    if not isinstance(raw_contract_ids, Sequence) or isinstance(raw_contract_ids, str | bytes):
+        return frozenset()
+    blocked_contract_ids = {item for item in raw_contract_ids if type(item) is str}
+    if not blocked_contract_ids:
+        return frozenset()
+
+    direct_targets: set[str] = set()
+    for step in plan.steps:
+        for dependency in step.depends_on:
+            if f"{dependency}-to-{step.id}" in blocked_contract_ids:
+                direct_targets.add(step.id)
+                break
+    if not direct_targets:
+        return frozenset()
+
+    reopen = set(direct_targets)
+    changed = True
+    while changed:
+        changed = False
+        for step in plan.steps:
+            if step.id in reopen:
+                continue
+            if any(dependency in reopen for dependency in step.depends_on):
+                reopen.add(step.id)
+                changed = True
+    return frozenset(reopen)
+
+
+def _apply_orchestration_repair_recovery(
+    plan: DispatchPlan,
+    routing_decision: Mapping[str, JsonValue],
+    repair_payload: Mapping[str, JsonValue] | None,
+    completed: dict[str, Artifact],
+    retry_counts: dict[str, int],
+    tool_ledger: _ToolLedger,
+    model_ledger: _ModelLedger,
+    usage_ledger: _UsageLedger,
+    review_ledger: _ReviewLedger,
+    artifact_registry: dict[str, Artifact],
+) -> bool:
+    if routing_decision.get("self_repair_accepted") is not True:
+        return False
+    reopen_steps = _orchestration_repair_reopen_steps(plan, repair_payload)
+    if not reopen_steps:
+        return False
+    if not any(step_id in completed for step_id in reopen_steps):
+        return False
+
+    pruned_artifact_ids: set[str] = set()
+    applied = False
+    for step_id in reopen_steps:
+        artifact = completed.pop(step_id, None)
+        if artifact is not None:
+            pruned_artifact_ids.add(str(artifact.id))
+            applied = True
+        if retry_counts.pop(step_id, None) is not None:
+            applied = True
+        review_artifact = review_ledger.artifacts.pop(step_id, None)
+        if review_artifact is not None:
+            pruned_artifact_ids.add(str(review_artifact.id))
+            applied = True
+
+    for key, state in tuple(tool_ledger.states.items()):
+        if state.get("step_id") not in reopen_steps:
+            continue
+        tool_ledger.states.pop(key, None)
+        artifact = tool_ledger.artifacts.pop(key, None)
+        if artifact is not None:
+            pruned_artifact_ids.add(str(artifact.id))
+        applied = True
+
+    for key, state in tuple(model_ledger.states.items()):
+        if state.get("step_id") not in reopen_steps:
+            continue
+        model_ledger.states.pop(key, None)
+        artifact = model_ledger.artifacts.pop(key, None)
+        if artifact is not None:
+            pruned_artifact_ids.add(str(artifact.id))
+        applied = True
+
+    changed = True
+    while changed:
+        changed = False
+        for artifact_id, artifact in tuple(artifact_registry.items()):
+            if (
+                artifact_id in pruned_artifact_ids
+                or artifact.producer in reopen_steps
+                or any(source_id in pruned_artifact_ids for source_id in artifact.source_ids)
+            ):
+                artifact_registry.pop(artifact_id, None)
+                if artifact_id not in pruned_artifact_ids:
+                    pruned_artifact_ids.add(artifact_id)
+                    changed = True
+    if applied:
+        usage_ledger.terminal_phase = None
+    return applied
+
+
 @dataclass(frozen=True, slots=True)
 class _RunToken:
     generation: int
@@ -1461,6 +1566,7 @@ class CrewDispatchRuntime:
         protected_checkpoint = restored or context.checkpoint
         hydrating_restored = protected_checkpoint is not None
         terminal_item: _Terminal | None = None
+        repair_tool_key_steps: frozenset[str] = frozenset()
 
         async def store_artifact(artifact: Artifact) -> UUID:
             if not self._accepts_artifact_writes(state):
@@ -1528,9 +1634,29 @@ class CrewDispatchRuntime:
                     restored_artifacts,
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
                 artifact_registry.update(restored_artifacts)
+                repair_payload = self_repair_recovery_plan_payload(context.routing_decision)
+                repair_tool_key_steps = (
+                    _orchestration_repair_reopen_steps(plan, repair_payload)
+                    if context.routing_decision.get("self_repair_accepted") is True
+                    else frozenset()
+                )
+                repair_reopened_steps = _apply_orchestration_repair_recovery(
+                    plan,
+                    context.routing_decision,
+                    repair_payload,
+                    completed,
+                    retry_counts,
+                    tool_ledger,
+                    model_ledger,
+                    usage_ledger,
+                    review_ledger,
+                    artifact_registry,
+                )
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
+                if repair_reopened_steps and restored_phase == "completed":
+                    restored_phase = "running"
                 if restored_phase == "running":
                     await emit(
                         kind="runtime.recovered",
@@ -1903,6 +2029,7 @@ class CrewDispatchRuntime:
                             model_ledger,
                             state,
                             review_ledger,
+                            use_repair_tool_keys=step.id in repair_tool_key_steps,
                         )
 
                 tasks = {asyncio.create_task(execute(step)): step for step in ready}
@@ -2126,6 +2253,8 @@ class CrewDispatchRuntime:
         model_ledger: _ModelLedger,
         run_state: _RunState,
         review_ledger: _ReviewLedger,
+        *,
+        use_repair_tool_keys: bool = False,
     ) -> _StepResult:
         async def event(**values: object) -> None:
             await emit(**values)
@@ -2178,6 +2307,7 @@ class CrewDispatchRuntime:
                     recovery_attempt,
                     run_state,
                     step_deadline,
+                    use_repair_tool_keys=use_repair_tool_keys,
                 )
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(
@@ -2520,6 +2650,8 @@ class CrewDispatchRuntime:
         recovery_attempt: int,
         run_state: _RunState,
         step_deadline: float,
+        *,
+        use_repair_tool_keys: bool = False,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         use_review_packets = step.final_synthesizer or bool(step.depends_on)
         source_payload = [
@@ -2594,6 +2726,7 @@ class CrewDispatchRuntime:
                     _subagent_model_attempt(retries, recovery_attempt),
                     run_state,
                     step_deadline,
+                    use_repair_tool_keys=use_repair_tool_keys,
                 )
                 text = last_completion.response.text
                 if text is None:
@@ -2685,6 +2818,8 @@ class CrewDispatchRuntime:
         model_attempt: int,
         run_state: _RunState,
         step_deadline: float,
+        *,
+        use_repair_tool_keys: bool = False,
     ) -> GatewayCompletion:
         messages = list(self._normalize_crewai_messages(crew_messages))
         tool_mapping = _tool_name_mapping(step.tools)
@@ -2875,6 +3010,9 @@ class CrewDispatchRuntime:
                     tool_index,
                     tool_call.name,
                     arguments_sha256,
+                    trigger_model_artifact_id=(
+                        str(trigger_model_artifact.id) if use_repair_tool_keys else None
+                    ),
                 )
                 call_id = f"call-{idempotency_key[:32]}"
                 existing = tool_ledger.states.get(idempotency_key)
@@ -3273,10 +3411,14 @@ class CrewDispatchRuntime:
         tool_index: int,
         name: str,
         arguments_sha256: str,
+        *,
+        trigger_model_artifact_id: str | None = None,
     ) -> str:
         material = (
             f"{run_id}:{step_id}:{attempt}:{round_index}:{tool_index}:{name}:{arguments_sha256}"
         )
+        if trigger_model_artifact_id is not None:
+            material = f"{material}:trigger:{trigger_model_artifact_id}"
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -4347,7 +4489,7 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint is incompatible")
             except ValueError:
                 _fail("runtime checkpoint is incompatible")
-            if key != self._tool_call_key(
+            legacy_tool_key = self._tool_call_key(
                 context.run_id,
                 tool_step_id,
                 attempt,
@@ -4355,7 +4497,18 @@ class CrewDispatchRuntime:
                 tool_index,
                 name,
                 arguments_sha256,
-            ):
+            )
+            trigger_tool_key = self._tool_call_key(
+                context.run_id,
+                tool_step_id,
+                attempt,
+                round_index,
+                tool_index,
+                name,
+                arguments_sha256,
+                trigger_model_artifact_id=trigger_model_artifact_id,
+            )
+            if key not in {legacy_tool_key, trigger_tool_key}:
                 _fail("runtime checkpoint is incompatible")
             tool_indices.setdefault((tool_step_id, attempt, round_index), set()).add(tool_index)
             if status == "succeeded":

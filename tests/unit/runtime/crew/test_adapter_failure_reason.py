@@ -92,6 +92,37 @@ class ToolGateway:
         )
 
 
+class ContractToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        has_tool_results = any(
+            isinstance(message.content, str)
+            and message.content.startswith("UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+            for message in request.messages
+        )
+        if ModelCapability.TOOL_CALLING in request.required_capabilities and not has_tool_results:
+            response = ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="provider-call", name="web_search", arguments={"q": "safe"}),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+        else:
+            response = ModelResponse(text=_role_output_text(request), usage=TokenUsage(1, 1, 2))
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ProjectZipWorkspaceGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -746,6 +777,88 @@ def _dependent_final_plan() -> DispatchPlan:
                 token_budget=1000,
             ),
         ),
+        total_token_budget=1000,
+    )
+
+
+def _branched_contract_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string"},
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(id="source_a", agent="writer", task="Source A", token_budget=1000),
+            DispatchStep(
+                id="blocked_target",
+                agent="writer",
+                task="Blocked target",
+                depends_on=("source_a",),
+                token_budget=1000,
+            ),
+            DispatchStep(id="side_note", agent="writer", task="Side note", token_budget=1000),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("blocked_target", "side_note"),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        total_token_budget=1000,
+    )
+
+
+def _tool_contract_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+                output_schema={"summary": "string"},
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(id="source_a", agent="writer", task="Source A", token_budget=1000),
+            DispatchStep(
+                id="tool_target",
+                agent="writer",
+                task="Use tool",
+                depends_on=("source_a",),
+                tools=("web.search",),
+                token_budget=1000,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("tool_target",),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        allowed_tools=("web.search",),
         total_token_budget=1000,
     )
 
@@ -2036,6 +2149,7 @@ async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_
                 checkpoint=draft_checkpoint,
                 routing_decision={
                     "source": "self_repair",
+                    "self_repair_accepted": True,
                     "self_repair_context": {
                         "source": "self_repair",
                         "failure_kind": "step_failure",
@@ -2073,6 +2187,284 @@ async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_
     )
     assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_blocked_contract_self_repair_reopens_completed_target_step() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _dependent_final_plan()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    completed_checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(checkpoints)
+        if checkpoint.state["phase"] == "completed"
+    )
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(completed_checkpoint)
+
+    events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=completed_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_accepted": True,
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("draft-to-final_response",),
+                        "instruction": "重规划角色交接契约链。",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert [item[0] for item in restored_generation.prompts] == ["final_response"]
+    prompt = restored_generation.prompts[0][2]
+    assert "orchestration_repair" in prompt
+    assert "draft-to-final_response" in prompt
+    started_steps = [
+        event.step_id
+        for event in events
+        if event.kind is EventKind.STEP_STARTED and event.step_id is not None
+    ]
+    assert started_steps == ["final_response"]
+    recovered = next(event for event in events if event.kind == "runtime.recovered")
+    assert recovered.payload["checkpoint_phase"] == "completed"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_blocked_contract_self_repair_preserves_unrelated_completed_branch() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _branched_contract_plan()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    completed_checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(checkpoints)
+        if checkpoint.state["phase"] == "completed"
+    )
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(completed_checkpoint)
+
+    events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=completed_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_accepted": True,
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("source_a-to-blocked_target",),
+                        "instruction": "Replan the blocked contract chain.",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert [item[0] for item in restored_generation.prompts] == [
+        "blocked_target",
+        "final_response",
+    ]
+    started_steps = [
+        event.step_id
+        for event in events
+        if event.kind is EventKind.STEP_STARTED and event.step_id is not None
+    ]
+    assert started_steps == ["blocked_target", "final_response"]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    final_checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    restored_again = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored_again.restore_checkpoint(final_checkpoint)
+
+
+async def test_blocked_contract_self_repair_requires_accepted_marker_to_reopen() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _dependent_final_plan()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    completed_checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(checkpoints)
+        if checkpoint.state["phase"] == "completed"
+    )
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(completed_checkpoint)
+
+    events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=completed_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("draft-to-final_response",),
+                        "instruction": "Replan the blocked contract chain.",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert restored_generation.prompts == []
+    assert [event.kind for event in events] == [EventKind.RUNTIME_COMPLETED]
+
+
+async def test_blocked_contract_self_repair_namespaces_reopened_tool_calls() -> None:
+    repository = InMemoryArtifactRepository()
+    harness = RecordingHarnessToolGateway()
+    capabilities = FakeCapabilities()
+    plan = _tool_contract_plan()
+    runtime = CrewDispatchRuntime(
+        ContractToolGateway(),
+        plan,
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    completed_checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(checkpoints)
+        if checkpoint.state["phase"] == "completed"
+    )
+    assert len(harness.calls) == 1
+    first_key = harness.calls[0][1].idempotency_key
+
+    restored = CrewDispatchRuntime(
+        ContractToolGateway(),
+        plan,
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(completed_checkpoint)
+
+    events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=completed_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_accepted": True,
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "blocked_contract_ids": ("source_a-to-tool_target",),
+                        "instruction": "Replan the blocked contract chain.",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert len(harness.calls) == 2
+    second_key = harness.calls[1][1].idempotency_key
+    assert second_key != first_key
+    started_steps = [
+        event.step_id
+        for event in events
+        if event.kind is EventKind.STEP_STARTED and event.step_id is not None
+    ]
+    assert started_steps == ["tool_target", "final_response"]
 
 
 async def test_non_retryable_failed_model_checkpoint_requires_confirmation() -> None:
