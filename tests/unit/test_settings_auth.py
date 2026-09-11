@@ -194,6 +194,7 @@ def test_plugin_package_subprocess_runner_defaults_to_disabled() -> None:
     assert settings.plugin_package_subprocess_max_stdout_bytes == 262_144
     assert settings.plugin_package_dependency_install_policy == "disabled"
     assert settings.plugin_package_dependency_allowlist == frozenset()
+    assert settings.plugin_package_dependency_trusted_cache_builders == frozenset()
     assert settings.plugin_package_dependency_cache_dir == Path(
         "/var/lib/agent-hub/plugin-package-dependencies"
     )
@@ -209,6 +210,10 @@ def test_plugin_package_dependency_policy_accepts_offline_cache_allowlist(
                 "python:pypi:Requests==2.32.0",
                 "python:pypi:z_lib==1.0",
             ],
+            "plugin_package_dependency_trusted_cache_builders": [
+                "agent-hub-offline-cache-builder",
+                "ci.cache_builder",
+            ],
             "plugin_package_dependency_cache_dir": tmp_path,
         }
     )
@@ -216,6 +221,9 @@ def test_plugin_package_dependency_policy_accepts_offline_cache_allowlist(
     assert settings.plugin_package_dependency_install_policy == "offline_cache"
     assert settings.plugin_package_dependency_allowlist == frozenset(
         {"python:pypi:requests==2.32.0", "python:pypi:z-lib==1.0"}
+    )
+    assert settings.plugin_package_dependency_trusted_cache_builders == frozenset(
+        {"agent-hub-offline-cache-builder", "ci.cache_builder"}
     )
     assert settings.plugin_package_dependency_cache_dir == tmp_path
 
@@ -235,6 +243,16 @@ def test_plugin_package_dependency_allowlist_rejects_invalid_entries(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings.model_validate({"plugin_package_dependency_allowlist": [dependency]})
+
+
+@pytest.mark.parametrize("builder_id", ["", "bad builder", "-bad", "Bad"])
+def test_plugin_package_dependency_trusted_cache_builders_rejects_invalid_entries(
+    builder_id: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"plugin_package_dependency_trusted_cache_builders": [builder_id]}
+        )
 
 
 def test_plugin_package_subprocess_isolation_backend_rejects_unknown_value() -> None:

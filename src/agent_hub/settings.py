@@ -82,6 +82,10 @@ class Settings(BaseSettings):
         default=frozenset(),
         max_length=256,
     )
+    plugin_package_dependency_trusted_cache_builders: frozenset[str] = Field(
+        default=frozenset(),
+        max_length=64,
+    )
     plugin_package_dependency_cache_dir: Path = Path(
         "/var/lib/agent-hub/plugin-package-dependencies"
     )
@@ -209,6 +213,27 @@ class Settings(BaseSettings):
                 raise TypeError("plugin package dependency allowlist entry is invalid")
             allowlist.add(normalize_plugin_package_dependency_allowlist_entry(value))
         return frozenset(allowlist)
+
+    @field_validator("plugin_package_dependency_trusted_cache_builders", mode="before")
+    @classmethod
+    def validate_plugin_package_dependency_trusted_cache_builders(
+        cls, values: object
+    ) -> frozenset[str]:
+        if values is None:
+            return frozenset()
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            raise ValueError(  # noqa: TRY004 - Pydantic converts this to ValidationError.
+                "plugin package dependency trusted cache builders must be a collection"
+            )
+        if len(values) > 64:
+            raise ValueError("at most 64 plugin package dependency cache builders are allowed")
+        builder_ids: set[str] = set()
+        pattern = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+        for value in values:
+            if not isinstance(value, str) or pattern.fullmatch(value) is None:
+                raise ValueError("plugin package dependency cache builder id is invalid")
+            builder_ids.add(value)
+        return frozenset(builder_ids)
 
     @field_validator("plugin_package_dependency_cache_dir", mode="after")
     @classmethod

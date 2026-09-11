@@ -581,6 +581,7 @@ def write_dependency_cache_manifest(
         dependencies,
         files,
         artifact_entries,
+        builder_id="agent-hub-offline-cache-builder",
     )
     assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
@@ -594,6 +595,7 @@ def write_dependency_cache_manifest(
                 "cache_signature": {
                     "schema_version": 1,
                     "algorithm": "sha256",
+                    "builder_id": "agent-hub-offline-cache-builder",
                     "payload_sha256": signature_sha256,
                 },
             },
@@ -803,6 +805,7 @@ def test_plugin_package_execution_target_allows_ready_offline_dependency_cache(
         dependency_policy=PluginPackageDependencyPolicy(
             install_policy="offline_cache",
             allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            trusted_cache_builders=frozenset({"agent-hub-offline-cache-builder"}),
             cache_dir=tmp_path / "dependency-cache",
         ),
     )
@@ -1052,6 +1055,7 @@ async def test_plugin_package_adapter_passes_ready_dependency_cache_to_runner(
         dependency_policy=PluginPackageDependencyPolicy(
             install_policy="offline_cache",
             allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            trusted_cache_builders=frozenset({"agent-hub-offline-cache-builder"}),
             cache_dir=tmp_path / "dependency-cache",
         ),
     )
@@ -2662,6 +2666,7 @@ async def test_runtime_plugin_service_allows_ready_offline_runtime_registered_de
                     "python:pypi:zlib==1.0",
                 }
             ),
+            trusted_cache_builders=frozenset({"agent-hub-offline-cache-builder"}),
             cache_dir=tmp_path / "dependency-cache",
         ),
     )

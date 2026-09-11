@@ -361,6 +361,7 @@ def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
         dependencies,
         files,
         artifacts,
+        builder_id="agent-hub-offline-cache-builder",
     )
     assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
@@ -374,6 +375,7 @@ def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
                 "cache_signature": {
                     "schema_version": 1,
                     "algorithm": "sha256",
+                    "builder_id": "agent-hub-offline-cache-builder",
                     "payload_sha256": signature_sha256,
                 },
             },
@@ -416,6 +418,7 @@ def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
         dependency_policy=PluginPackageDependencyPolicy(
             install_policy="offline_cache",
             allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            trusted_cache_builders=frozenset({"agent-hub-offline-cache-builder"}),
             cache_dir=tmp_path,
         ),
     )
@@ -786,6 +789,105 @@ def test_dependency_policy_requires_valid_dependency_cache_signature(
     )
 
     assert policy.evaluate(lock) == ("offline_cache", "missing", "allowed")
+
+
+def test_dependency_policy_requires_trusted_dependency_cache_builder(
+    tmp_path: Path,
+) -> None:
+    lock = plugin_package_dependency_lock(
+        (
+            SimpleNamespace(
+                kind="python",
+                source="pypi",
+                name="Requests",
+                version="2.32.0",
+            ),
+        )
+    )
+    assert lock is not None
+    cache_entry = tmp_path / lock.sha256
+    cache_entry.mkdir()
+    artifact_bytes = b"requests==2.32.0\n"
+    artifact_path = cache_entry / "artifacts" / "requests-2.32.0.whl"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(artifact_bytes)
+    marker_bytes = b"READY = True\n"
+    marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(marker_bytes)
+    dependencies = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.32.0",
+        }
+    ]
+    artifacts = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.32.0",
+            "path": "artifacts/requests-2.32.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        }
+    ]
+    files = [
+        {
+            "path": "artifacts/requests-2.32.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        },
+        {
+            "path": "site-packages/dependency_cache_marker.py",
+            "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+            "size_bytes": len(marker_bytes),
+        },
+    ]
+    signature_sha256 = plugin_package_dependency_cache_signature_payload_sha256(
+        lock,
+        dependencies,
+        files,
+        artifacts,
+        builder_id="untrusted-builder",
+    )
+    assert signature_sha256 is not None
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": lock.sha256,
+                "dependencies": dependencies,
+                "artifacts": artifacts,
+                "files": files,
+                "cache_signature": {
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "builder_id": "untrusted-builder",
+                    "payload_sha256": signature_sha256,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    policy = PluginPackageDependencyPolicy(
+        install_policy="offline_cache",
+        allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+        cache_dir=tmp_path,
+    )
+
+    assert policy.evaluate(lock) == ("offline_cache", "missing", "allowed")
+    trusted_policy = PluginPackageDependencyPolicy(
+        install_policy="offline_cache",
+        allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+        cache_dir=tmp_path,
+        trusted_cache_builders=frozenset({"trusted-builder"}),
+    )
+
+    assert trusted_policy.evaluate(lock) == ("offline_cache", "missing", "allowed")
 
 
 def test_plugin_manifest_source_rejects_mismatched_dependency_cache_manifest(

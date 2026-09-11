@@ -4966,6 +4966,7 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
         dependencies,
         files,
         artifacts,
+        builder_id="agent-hub-offline-cache-builder",
     )
     assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
@@ -4979,6 +4980,7 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
                 "cache_signature": {
                     "schema_version": 1,
                     "algorithm": "sha256",
+                    "builder_id": "agent-hub-offline-cache-builder",
                     "payload_sha256": signature_sha256,
                 },
             },
@@ -4993,6 +4995,9 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
                 "plugin_package_dependency_install_policy": "offline_cache",
                 "plugin_package_dependency_allowlist": frozenset(
                     {"python:pypi:requests==2.31.0"}
+                ),
+                "plugin_package_dependency_trusted_cache_builders": frozenset(
+                    {"agent-hub-offline-cache-builder"}
                 ),
                 "plugin_package_dependency_cache_dir": tmp_path,
             }
@@ -7389,6 +7394,7 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
         dependencies,
         files,
         artifacts,
+        builder_id="agent-hub-offline-cache-builder",
     )
     assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
@@ -7402,6 +7408,7 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
                 "cache_signature": {
                     "schema_version": 1,
                     "algorithm": "sha256",
+                    "builder_id": "agent-hub-offline-cache-builder",
                     "payload_sha256": signature_sha256,
                 },
             },
@@ -7436,6 +7443,9 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
                 "plugin_package_dependency_install_policy": "offline_cache",
                 "plugin_package_dependency_allowlist": frozenset(
                     {"python:pypi:requests==2.32.0"}
+                ),
+                "plugin_package_dependency_trusted_cache_builders": frozenset(
+                    {"agent-hub-offline-cache-builder"}
                 ),
                 "plugin_package_dependency_cache_dir": tmp_path / "dependency-cache",
             }

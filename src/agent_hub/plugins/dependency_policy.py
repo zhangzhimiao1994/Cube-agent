@@ -44,6 +44,7 @@ class PluginPackageDependencyLock:
 class PluginPackageDependencyPolicy:
     install_policy: PluginPackageDependencyInstallPolicy = "disabled"
     allowlist: frozenset[str] = frozenset()
+    trusted_cache_builders: frozenset[str] = frozenset()
     cache_dir: Path | None = None
 
     def evaluate(
@@ -59,7 +60,11 @@ class PluginPackageDependencyPolicy:
         cache_status: PluginPackageDependencyCacheStatus = (
             "present"
             if self.cache_dir is not None
-            and _dependency_cache_entry_matches(self.cache_dir, lock)
+            and _dependency_cache_entry_matches(
+                self.cache_dir,
+                lock,
+                trusted_cache_builders=self.trusted_cache_builders,
+            )
             else "missing"
         )
         dependency_keys = frozenset(dependency.allowlist_key for dependency in lock.dependencies)
@@ -83,15 +88,24 @@ def plugin_package_dependency_policy_from_settings(
     allowlist: object = getattr(
         settings, "plugin_package_dependency_allowlist", frozenset[str]()
     )
+    trusted_cache_builders: object = getattr(
+        settings, "plugin_package_dependency_trusted_cache_builders", frozenset[str]()
+    )
     cache_dir = getattr(settings, "plugin_package_dependency_cache_dir", None)
     normalized_allowlist: frozenset[str] = (
         frozenset(str(item) for item in allowlist)
         if isinstance(allowlist, frozenset | set)
         else frozenset()
     )
+    normalized_trusted_cache_builders: frozenset[str] = (
+        frozenset(str(item) for item in trusted_cache_builders)
+        if isinstance(trusted_cache_builders, frozenset | set)
+        else frozenset()
+    )
     return PluginPackageDependencyPolicy(
         install_policy=install_policy,
         allowlist=normalized_allowlist,
+        trusted_cache_builders=normalized_trusted_cache_builders,
         cache_dir=cache_dir if isinstance(cache_dir, Path) else None,
     )
 
@@ -99,6 +113,8 @@ def plugin_package_dependency_policy_from_settings(
 def _dependency_cache_entry_matches(
     cache_dir: Path,
     lock: PluginPackageDependencyLock,
+    *,
+    trusted_cache_builders: frozenset[str],
 ) -> bool:
     entry_dir = cache_dir / lock.sha256
     if not entry_dir.is_dir():
@@ -144,6 +160,7 @@ def _dependency_cache_entry_matches(
         files,
         artifacts,
         payload.get("cache_signature"),
+        trusted_cache_builders=trusted_cache_builders,
     ):
         return False
     return (
@@ -159,13 +176,19 @@ def _dependency_cache_signature_matches(
     files: Sequence[object],
     artifacts: Sequence[object],
     signature: object,
+    *,
+    trusted_cache_builders: frozenset[str],
 ) -> bool:
     if not isinstance(signature, dict):
         return False
     payload_sha256 = signature.get("payload_sha256")
+    builder_id = signature.get("builder_id")
     return (
         signature.get("schema_version") == 1
         and signature.get("algorithm") == "sha256"
+        and type(builder_id) is str
+        and builder_id in trusted_cache_builders
+        and _dependency_cache_builder_id_valid(builder_id)
         and type(payload_sha256) is str
         and re.fullmatch(r"[a-f0-9]{64}", payload_sha256) is not None
         and payload_sha256
@@ -174,6 +197,7 @@ def _dependency_cache_signature_matches(
             dependencies,
             files,
             artifacts,
+            builder_id=builder_id,
         )
     )
 
@@ -183,7 +207,11 @@ def plugin_package_dependency_cache_signature_payload_sha256(
     dependencies: Sequence[dict[str, str]],
     files: Sequence[object],
     artifacts: Sequence[object],
+    *,
+    builder_id: str,
 ) -> str | None:
+    if not _dependency_cache_builder_id_valid(builder_id):
+        return None
     normalized_files = _dependency_cache_signature_files(files)
     normalized_artifacts = _dependency_cache_signature_artifacts(artifacts)
     if normalized_files is None or normalized_artifacts is None:
@@ -194,6 +222,7 @@ def plugin_package_dependency_cache_signature_payload_sha256(
         "dependencies": list(dependencies),
         "files": normalized_files,
         "artifacts": normalized_artifacts,
+        "builder_id": builder_id,
     }
     payload_bytes = json.dumps(
         payload,
@@ -201,6 +230,10 @@ def plugin_package_dependency_cache_signature_payload_sha256(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload_bytes).hexdigest()
+
+
+def _dependency_cache_builder_id_valid(value: str) -> bool:
+    return re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", value) is not None
 
 
 def _dependency_cache_signature_files(
