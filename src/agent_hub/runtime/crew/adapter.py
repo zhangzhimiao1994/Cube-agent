@@ -73,7 +73,10 @@ from agent_hub.runtime.generated_file_recovery import (
     reusable_generated_file_result,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
-from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.runtime.self_repair_context import (
+    self_repair_context_text,
+    self_repair_recovery_plan_payload,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2541,6 +2544,9 @@ class CrewDispatchRuntime:
         repair_context = self_repair_context_text(context.routing_decision)
         if repair_context:
             user["self_repair_context"] = repair_context
+        orchestration_repair = self_repair_recovery_plan_payload(context.routing_decision)
+        if orchestration_repair is not None:
+            user["orchestration_repair"] = orchestration_repair
         if recovery_attempt > 0:
             user["recovery"] = {
                 "strategy": "compact_retry",

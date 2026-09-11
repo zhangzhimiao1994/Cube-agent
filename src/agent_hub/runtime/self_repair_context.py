@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 
 from agent_hub.recovery_metadata import (
+    ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+    ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
     SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
@@ -74,6 +76,42 @@ def self_repair_context_text(
     )
 
 
+def self_repair_recovery_plan_payload(
+    routing_decision: Mapping[str, JsonValue] | Mapping[str, object],
+) -> Mapping[str, JsonValue] | None:
+    repair = routing_decision.get("self_repair_context")
+    if routing_decision.get("source") != "self_repair" or not isinstance(repair, Mapping):
+        return None
+    if repair.get("source") != "self_repair":
+        return None
+    recovery_strategy = _safe_enum_text(
+        repair.get("recovery_strategy"),
+        default="",
+        allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+        max_chars=128,
+    )
+    orchestration_recovery_hint = _safe_enum_text(
+        repair.get("orchestration_recovery_hint"),
+        default="",
+        allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
+        max_chars=128,
+    )
+    if recovery_strategy != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+        return None
+    if orchestration_recovery_hint != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
+        return None
+    return {
+        "schema_version": 1,
+        "status": "active",
+        "recovery_strategy": ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
+        "orchestration_recovery_hint": ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+        "replan_scope": "blocked_contract_chain",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": True,
+        "automatic_execution": False,
+    }
+
+
 def _safe_text(value: object, default: str, max_chars: int) -> str:
     if not isinstance(value, str):
         return default
@@ -98,4 +136,4 @@ def _safe_int(value: object, default: int) -> int:
     return min(max(value, 0), 3)
 
 
-__all__ = ["self_repair_context_text"]
+__all__ = ["self_repair_context_text", "self_repair_recovery_plan_payload"]

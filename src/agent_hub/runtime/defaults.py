@@ -71,6 +71,7 @@ from agent_hub.runtime.role_planner import (
     RolePurpose,
     TaskProfile,
 )
+from agent_hub.runtime.self_repair_context import self_repair_recovery_plan_payload
 from agent_hub.security.secrets import SecretService
 
 
@@ -1911,10 +1912,12 @@ def _model_execution_plan_payload(
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
+    self_repair_recovery = self_repair_recovery_plan_payload(context.routing_decision)
+    if self_repair_recovery is not None:
+        payload["self_repair_recovery"] = self_repair_recovery
     if deployment_constraints is not None:
         payload["deployment_constraints"] = deployment_constraints
     return payload
-
 
 def _orchestration_handoffs_payload(
     *,

@@ -2000,6 +2000,79 @@ async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_policy() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _dependent_final_plan()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    draft_checkpoint = next(
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint.state["phase"] == "running"
+        and checkpoint.state["completed"] == ("draft",)
+    )
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(draft_checkpoint)
+
+    events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=draft_checkpoint,
+                routing_decision={
+                    "source": "self_repair",
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "step_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                        "instruction": "重规划角色交接契约链。",
+                        "automatic_execution": False,
+                        "requires_approval": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    assert [item[0] for item in restored_generation.prompts] == ["final_response"]
+    prompt = restored_generation.prompts[0][2]
+    assert "SELF_REPAIR_CONTEXT" in prompt
+    assert "orchestration_repair" in prompt
+    assert "retry_blocked_contract_chain_after_replanning" in prompt
+    started_steps = [
+        event.step_id
+        for event in events
+        if event.kind is EventKind.STEP_STARTED and event.step_id is not None
+    ]
+    assert started_steps == ["final_response"]
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_non_retryable_failed_model_checkpoint_requires_confirmation() -> None:
     repository = InMemoryArtifactRepository()
     runtime = CrewDispatchRuntime(

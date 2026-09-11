@@ -1167,6 +1167,77 @@ def test_model_execution_plan_reports_explicit_main_agent_selection_source() -> 
     }
 
 
+def test_model_execution_plan_reports_safe_blocked_contract_self_repair_recovery() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="重试被阻塞的角色交接链。",
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "step_failure",
+                "repair_action": "draft_repair_proposal",
+                "attempt": 1,
+                "max_attempts": 1,
+                "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                "instruction": "重规划角色交接契约链。",
+                "automatic_execution": False,
+                "requires_approval": True,
+            },
+        },
+    )
+
+    plan = defaults_module._model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=(),
+        steps=(),
+    )
+
+    assert plan["self_repair_recovery"] == {
+        "schema_version": 1,
+        "status": "active",
+        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+        "replan_scope": "blocked_contract_chain",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": True,
+        "automatic_execution": False,
+    }
+
+
+def test_model_execution_plan_drops_unknown_self_repair_recovery_metadata() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="重试失败运行。",
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {
+                "source": "self_repair",
+                "recovery_strategy": "secret://provider-token",
+                "orchestration_recovery_hint": "dump_private_context",
+                "automatic_execution": True,
+            },
+        },
+    )
+
+    plan = defaults_module._model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=(),
+        steps=(),
+    )
+
+    assert "self_repair_recovery" not in plan
+    assert "secret://provider-token" not in json.dumps(plan, ensure_ascii=False)
+    assert "dump_private_context" not in json.dumps(plan, ensure_ascii=False)
+
+
 def test_model_execution_plan_sanitizes_scheduler_selection_fields() -> None:
     plan = defaults_module._model_execution_plan_payload(
         TaskContext(
