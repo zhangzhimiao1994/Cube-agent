@@ -1311,7 +1311,7 @@ class RunRepository:
             )
             .on_conflict_do_update(
                 index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
-                set_={"status": status, "payload": payload},
+                set_={"action": "capability_tool", "status": status, "payload": payload},
             )
         )
 
@@ -1348,7 +1348,11 @@ class RunRepository:
             )
             .on_conflict_do_update(
                 index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
-                set_={"status": status, "payload": payload},
+                set_={
+                    "action": "capability_tool.auto_review",
+                    "status": status,
+                    "payload": payload,
+                },
             )
         )
 
@@ -1376,7 +1380,7 @@ class RunRepository:
             )
             .on_conflict_do_update(
                 index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
-                set_={"status": status, "payload": payload},
+                set_={"action": action, "status": status, "payload": payload},
             )
         )
 

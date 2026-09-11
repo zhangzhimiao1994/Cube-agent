@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import Role
@@ -19,8 +20,10 @@ from agent_hub.capabilities.approvals import (
 from agent_hub.capabilities.gateway import CapabilityGateway, CapabilityStatus
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
+from agent_hub.db.models import RunApprovalRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunRepository
+from agent_hub.runtime.contracts import EventKind, RunEvent
 
 TENANT_ID = UUID("33333333-3333-4333-8333-333333333333")
 USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -291,6 +294,109 @@ async def test_replayed_approval_request_returns_existing_pending_approval(
     assert first.status is CapabilityStatus.WAITING_APPROVAL
     assert replayed.status is CapabilityStatus.WAITING_APPROVAL
     assert replayed.approval_id == first.approval_id
+
+
+async def test_capability_approval_upserts_refresh_row_action_for_review_and_resolution(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = RunRepository(run_session_factory)
+    run_id = await create_running_run(repository)
+    gateway = CapabilityGateway(
+        approval_policy(),
+        ApprovalService(InMemoryApprovalStore()),
+        run_repository=repository,
+    )
+    result = await gateway.invoke(external_message_request(run_id), role=Role.OPERATOR)
+    approval_id = result.approval_id or ""
+
+    async def approval_row() -> RunApprovalRow:
+        async with run_session_factory() as session:
+            return (
+                await session.scalars(
+                    select(RunApprovalRow).where(
+                        RunApprovalRow.run_id == run_id,
+                        RunApprovalRow.approval_id == approval_id,
+                    )
+                )
+            ).one()
+
+    pending = await approval_row()
+    assert pending.action == "capability_tool"
+    assert pending.status == "pending"
+
+    await repository.record_capability_approval_review(
+        TENANT_ID,
+        run_id,
+        approval_id=approval_id,
+        approval_fingerprint=fingerprint_capability_request(external_message_request(run_id)),
+        reviewer="auto_policy",
+        reason="safe replay",
+        status="approved",
+    )
+    reviewed = await approval_row()
+    assert reviewed.action == "capability_tool.auto_review"
+    assert reviewed.status == "approved"
+
+    run = await repository.get(TENANT_ID, run_id)
+    await repository.approve_capability_and_enqueue(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        approval_id=approval_id,
+        version=run.version,
+    )
+    resolved = await approval_row()
+    assert resolved.action == "capability_tool"
+    assert resolved.status == "approved"
+
+
+async def test_runtime_approval_event_upsert_refreshes_row_action_on_resolution(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = RunRepository(run_session_factory)
+    run_id = await create_running_run(repository)
+    approval_id = "approval-event-upsert"
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=TENANT_ID,
+            run_id=run_id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_REQUESTED,
+                sequence=1,
+                run_id=run_id,
+                actor="main",
+                approval_id=approval_id,
+                action="publish_report",
+                reason="operator approval required",
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=TENANT_ID,
+            run_id=run_id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_RESOLVED,
+                sequence=2,
+                run_id=run_id,
+                actor="operator",
+                approval_id=approval_id,
+                decision="approved",
+            ),
+        )
+
+    async with run_session_factory() as session:
+        row = (
+            await session.scalars(
+                select(RunApprovalRow).where(
+                    RunApprovalRow.run_id == run_id,
+                    RunApprovalRow.approval_id == approval_id,
+                )
+            )
+        ).one()
+
+    assert row.action == "resolved"
+    assert row.status == "approved"
 
 
 async def test_approval_invocation_requires_running_run(
