@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Self, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -85,6 +86,10 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationResult,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
+from agent_hub.plugins.dependency_policy import (
+    plugin_package_dependency_cache_signature_payload_sha256,
+    plugin_package_dependency_lock,
+)
 from agent_hub.plugins.runtime import PluginInvocationContext, build_runtime_plugin_service
 from agent_hub.runs.repository import RunRecord, _event_with_failure_diagnostic
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
@@ -4921,42 +4926,61 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
     artifact_path = cache_entry / "artifacts" / "requests-2.31.0.whl"
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_bytes(artifact_bytes)
+    dependencies = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.31.0",
+        }
+    ]
+    artifacts = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.31.0",
+            "path": "artifacts/requests-2.31.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        }
+    ]
+    files = [
+        {
+            "path": "artifacts/requests-2.31.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        },
+        {
+            "path": "site-packages/dependency_cache_marker.py",
+            "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+            "size_bytes": len(marker_bytes),
+        },
+    ]
+    dependency_lock = plugin_package_dependency_lock(
+        tuple(SimpleNamespace(**dependency) for dependency in dependencies)
+    )
+    assert dependency_lock is not None
+    signature_sha256 = plugin_package_dependency_cache_signature_payload_sha256(
+        dependency_lock,
+        dependencies,
+        files,
+        artifacts,
+    )
+    assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "sha256": dependency_lock_hash,
-                "dependencies": [
-                    {
-                        "kind": "python",
-                        "source": "pypi",
-                        "name": "requests",
-                        "version": "2.31.0",
-                    }
-                ],
-                "artifacts": [
-                    {
-                        "kind": "python",
-                        "source": "pypi",
-                        "name": "requests",
-                        "version": "2.31.0",
-                        "path": "artifacts/requests-2.31.0.whl",
-                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-                        "size_bytes": len(artifact_bytes),
-                    }
-                ],
-                "files": [
-                    {
-                        "path": "artifacts/requests-2.31.0.whl",
-                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-                        "size_bytes": len(artifact_bytes),
-                    },
-                    {
-                        "path": "site-packages/dependency_cache_marker.py",
-                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
-                        "size_bytes": len(marker_bytes),
-                    }
-                ],
+                "dependencies": dependencies,
+                "artifacts": artifacts,
+                "files": files,
+                "cache_signature": {
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "payload_sha256": signature_sha256,
+                },
             },
             sort_keys=True,
         ),
@@ -7325,42 +7349,61 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
     artifact_path = cache_entry / "artifacts" / "requests-2.32.0.whl"
     artifact_path.parent.mkdir(parents=True)
     artifact_path.write_bytes(artifact_bytes)
+    dependencies = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.32.0",
+        }
+    ]
+    artifacts = [
+        {
+            "kind": "python",
+            "source": "pypi",
+            "name": "requests",
+            "version": "2.32.0",
+            "path": "artifacts/requests-2.32.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        }
+    ]
+    files = [
+        {
+            "path": "artifacts/requests-2.32.0.whl",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "size_bytes": len(artifact_bytes),
+        },
+        {
+            "path": "site-packages/dependency_cache_marker.py",
+            "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+            "size_bytes": len(marker_bytes),
+        },
+    ]
+    dependency_lock = plugin_package_dependency_lock(
+        tuple(SimpleNamespace(**dependency) for dependency in dependencies)
+    )
+    assert dependency_lock is not None
+    signature_sha256 = plugin_package_dependency_cache_signature_payload_sha256(
+        dependency_lock,
+        dependencies,
+        files,
+        artifacts,
+    )
+    assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "sha256": dependency_lock_hash,
-                "dependencies": [
-                    {
-                        "kind": "python",
-                        "source": "pypi",
-                        "name": "requests",
-                        "version": "2.32.0",
-                    }
-                ],
-                "artifacts": [
-                    {
-                        "kind": "python",
-                        "source": "pypi",
-                        "name": "requests",
-                        "version": "2.32.0",
-                        "path": "artifacts/requests-2.32.0.whl",
-                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-                        "size_bytes": len(artifact_bytes),
-                    }
-                ],
-                "files": [
-                    {
-                        "path": "artifacts/requests-2.32.0.whl",
-                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
-                        "size_bytes": len(artifact_bytes),
-                    },
-                    {
-                        "path": "site-packages/dependency_cache_marker.py",
-                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
-                        "size_bytes": len(marker_bytes),
-                    }
-                ],
+                "dependencies": dependencies,
+                "artifacts": artifacts,
+                "files": files,
+                "cache_signature": {
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "payload_sha256": signature_sha256,
+                },
             },
             sort_keys=True,
         ),

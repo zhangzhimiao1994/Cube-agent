@@ -138,10 +138,137 @@ def _dependency_cache_entry_matches(
         }
         for dependency in lock.dependencies
     ]
+    if not _dependency_cache_signature_matches(
+        lock,
+        expected_dependencies,
+        files,
+        artifacts,
+        payload.get("cache_signature"),
+    ):
+        return False
     return (
         payload.get("schema_version") == 1
         and payload.get("sha256") == lock.sha256
         and dependencies == expected_dependencies
+    )
+
+
+def _dependency_cache_signature_matches(
+    lock: PluginPackageDependencyLock,
+    dependencies: Sequence[dict[str, str]],
+    files: Sequence[object],
+    artifacts: Sequence[object],
+    signature: object,
+) -> bool:
+    if not isinstance(signature, dict):
+        return False
+    payload_sha256 = signature.get("payload_sha256")
+    return (
+        signature.get("schema_version") == 1
+        and signature.get("algorithm") == "sha256"
+        and type(payload_sha256) is str
+        and re.fullmatch(r"[a-f0-9]{64}", payload_sha256) is not None
+        and payload_sha256
+        == plugin_package_dependency_cache_signature_payload_sha256(
+            lock,
+            dependencies,
+            files,
+            artifacts,
+        )
+    )
+
+
+def plugin_package_dependency_cache_signature_payload_sha256(
+    lock: PluginPackageDependencyLock,
+    dependencies: Sequence[dict[str, str]],
+    files: Sequence[object],
+    artifacts: Sequence[object],
+) -> str | None:
+    normalized_files = _dependency_cache_signature_files(files)
+    normalized_artifacts = _dependency_cache_signature_artifacts(artifacts)
+    if normalized_files is None or normalized_artifacts is None:
+        return None
+    payload = {
+        "schema_version": 1,
+        "sha256": lock.sha256,
+        "dependencies": list(dependencies),
+        "files": normalized_files,
+        "artifacts": normalized_artifacts,
+    }
+    payload_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
+def _dependency_cache_signature_files(
+    files: Sequence[object],
+) -> list[dict[str, object]] | None:
+    normalized: list[dict[str, object]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            return None
+        path = item.get("path")
+        sha256 = item.get("sha256")
+        size_bytes = item.get("size_bytes")
+        if type(path) is not str or type(sha256) is not str or type(size_bytes) is not int:
+            return None
+        normalized.append(
+            {
+                "path": path,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            }
+        )
+    return sorted(normalized, key=lambda item: cast(str, item["path"]))
+
+
+def _dependency_cache_signature_artifacts(
+    artifacts: Sequence[object],
+) -> list[dict[str, object]] | None:
+    normalized: list[dict[str, object]] = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        source = item.get("source")
+        name = item.get("name")
+        version = item.get("version")
+        path = item.get("path")
+        sha256 = item.get("sha256")
+        size_bytes = item.get("size_bytes")
+        if (
+            type(kind) is not str
+            or type(source) is not str
+            or type(name) is not str
+            or type(version) is not str
+            or type(path) is not str
+            or type(sha256) is not str
+            or type(size_bytes) is not int
+        ):
+            return None
+        normalized.append(
+            {
+                "kind": kind,
+                "source": source,
+                "name": normalize_plugin_package_dependency_name(name),
+                "version": version,
+                "path": path,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            }
+        )
+    return sorted(
+        normalized,
+        key=lambda item: (
+            cast(str, item["kind"]),
+            cast(str, item["source"]),
+            cast(str, item["name"]),
+            cast(str, item["version"]),
+            cast(str, item["path"]),
+        ),
     )
 
 

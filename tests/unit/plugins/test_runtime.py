@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -34,7 +35,11 @@ from agent_hub.plugins.contracts import (
     adapter_descriptor_with_contract,
     http_json_adapter_descriptor,
 )
-from agent_hub.plugins.dependency_policy import PluginPackageDependencyPolicy
+from agent_hub.plugins.dependency_policy import (
+    PluginPackageDependencyPolicy,
+    plugin_package_dependency_cache_signature_payload_sha256,
+    plugin_package_dependency_lock,
+)
 from agent_hub.plugins.runtime import (
     BubblewrapPluginPackageProcessLauncher,
     HttpJsonPluginAdapter,
@@ -559,6 +564,25 @@ def write_dependency_cache_manifest(
                 "size_bytes": len(artifact_bytes),
             }
         )
+    files = [
+        *artifact_files,
+        {
+            "path": "site-packages/dependency_cache_marker.py",
+            "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+            "size_bytes": len(marker_bytes),
+        },
+    ]
+    dependency_lock = plugin_package_dependency_lock(
+        tuple(SimpleNamespace(**dependency) for dependency in dependencies)
+    )
+    assert dependency_lock is not None
+    signature_sha256 = plugin_package_dependency_cache_signature_payload_sha256(
+        dependency_lock,
+        dependencies,
+        files,
+        artifact_entries,
+    )
+    assert signature_sha256 is not None
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -566,14 +590,12 @@ def write_dependency_cache_manifest(
                 "sha256": lock_hash,
                 "dependencies": dependencies,
                 "artifacts": artifact_entries,
-                "files": [
-                    *artifact_files,
-                    {
-                        "path": "site-packages/dependency_cache_marker.py",
-                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
-                        "size_bytes": len(marker_bytes),
-                    }
-                ],
+                "files": files,
+                "cache_signature": {
+                    "schema_version": 1,
+                    "algorithm": "sha256",
+                    "payload_sha256": signature_sha256,
+                },
             },
             sort_keys=True,
         ),
