@@ -21,6 +21,7 @@ from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import RuntimeMcpService
+from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
 from agent_hub.plugins.runtime import (
     RuntimePluginService,
     build_plugin_package_subprocess_adapters,
@@ -266,6 +267,7 @@ def build_worker_service(
     runtime_plugin_service = RuntimePluginService(
         tenant_id=settings.bootstrap_tenant_id,
         admin_service=admin_service,
+        dependency_policy=plugin_package_dependency_policy_from_settings(settings),
         adapters=build_plugin_package_subprocess_adapters(
             enabled=bool(
                 getattr(settings, "plugin_package_subprocess_runner_enabled", False)

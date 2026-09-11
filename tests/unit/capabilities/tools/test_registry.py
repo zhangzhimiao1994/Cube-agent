@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent_hub.capabilities.tools.registry import (
@@ -9,6 +10,7 @@ from agent_hub.capabilities.tools.registry import (
     ToolRegistry,
     create_builtin_tool_registry,
 )
+from agent_hub.plugins.dependency_policy import PluginPackageDependencyPolicy
 
 
 def test_registry_registers_builtin_tool_names() -> None:
@@ -291,6 +293,125 @@ def test_plugin_manifest_source_exposes_fail_closed_dependency_policy() -> None:
             },
         ),
     }
+
+
+def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
+    tmp_path: Path,
+) -> None:
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    (tmp_path / lock_hash).mkdir()
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        ),
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path,
+        ),
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"] == {
+        "status": "unsupported",
+        "install_policy": "offline_cache",
+        "cache_status": "present",
+        "allowlist_status": "allowed",
+        "sha256": lock_hash,
+        "dependency_count": 1,
+        "dependencies": (
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            },
+        ),
+    }
+
+
+def test_plugin_manifest_source_reports_offline_dependency_policy_gaps(
+    tmp_path: Path,
+) -> None:
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        ),
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset(),
+            cache_dir=tmp_path,
+        ),
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"]["install_policy"] == "offline_cache"
+    assert capability["package_dependency_lock"]["cache_status"] == "missing"
+    assert capability["package_dependency_lock"]["allowlist_status"] == "not_allowed"
 
 
 def test_composite_manifest_source_combines_sources_for_tenant() -> None:

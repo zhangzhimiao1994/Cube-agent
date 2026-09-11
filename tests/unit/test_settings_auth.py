@@ -192,6 +192,49 @@ def test_plugin_package_subprocess_runner_defaults_to_disabled() -> None:
     assert settings.plugin_package_subprocess_bubblewrap_executable is None
     assert settings.plugin_package_subprocess_max_stdin_bytes == 262_144
     assert settings.plugin_package_subprocess_max_stdout_bytes == 262_144
+    assert settings.plugin_package_dependency_install_policy == "disabled"
+    assert settings.plugin_package_dependency_allowlist == frozenset()
+    assert settings.plugin_package_dependency_cache_dir == Path(
+        "/var/lib/agent-hub/plugin-package-dependencies"
+    )
+
+
+def test_plugin_package_dependency_policy_accepts_offline_cache_allowlist(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_validate(
+        {
+            "plugin_package_dependency_install_policy": "offline_cache",
+            "plugin_package_dependency_allowlist": [
+                "python:pypi:Requests==2.32.0",
+                "python:pypi:z_lib==1.0",
+            ],
+            "plugin_package_dependency_cache_dir": tmp_path,
+        }
+    )
+
+    assert settings.plugin_package_dependency_install_policy == "offline_cache"
+    assert settings.plugin_package_dependency_allowlist == frozenset(
+        {"python:pypi:requests==2.32.0", "python:pypi:z-lib==1.0"}
+    )
+    assert settings.plugin_package_dependency_cache_dir == tmp_path
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    [
+        "",
+        "requests==2.32.0",
+        "python:pypi:requests",
+        "python:npm:requests==2.32.0",
+        "python:pypi:bad name==2.32.0",
+    ],
+)
+def test_plugin_package_dependency_allowlist_rejects_invalid_entries(
+    dependency: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"plugin_package_dependency_allowlist": [dependency]})
 
 
 def test_plugin_package_subprocess_isolation_backend_rejects_unknown_value() -> None:

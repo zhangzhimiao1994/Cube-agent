@@ -1222,9 +1222,9 @@ export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSche
 
 const CapabilityManifestPackageDependencyLockSchema = z.object({
   status: z.enum(["unsupported"]),
-  install_policy: z.enum(["not_configured"]),
-  cache_status: z.enum(["missing"]),
-  allowlist_status: z.enum(["missing"]),
+  install_policy: z.enum(["not_configured", "offline_cache"]),
+  cache_status: z.enum(["missing", "present"]),
+  allowlist_status: z.enum(["missing", "allowed", "not_allowed"]),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
   dependency_count: z.number().int().min(1).max(32),
   dependencies: z.array(

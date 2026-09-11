@@ -161,9 +161,9 @@ describe("api client transport", () => {
   it("preserves plugin package dependency policy locks on capability manifests", async () => {
     const dependencyLock = {
       status: "unsupported",
-      install_policy: "not_configured",
-      cache_status: "missing",
-      allowlist_status: "missing",
+      install_policy: "offline_cache",
+      cache_status: "present",
+      allowlist_status: "allowed",
       sha256: "a".repeat(64),
       dependency_count: 1,
       dependencies: [

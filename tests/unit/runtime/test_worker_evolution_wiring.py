@@ -266,6 +266,9 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         plugin_package_subprocess_timeout_seconds = 1
         plugin_package_subprocess_max_stdin_bytes = 2048
         plugin_package_subprocess_max_stdout_bytes = 1024
+        plugin_package_dependency_install_policy = "offline_cache"
+        plugin_package_dependency_allowlist = frozenset({"python:pypi:requests==2.32.0"})
+        plugin_package_dependency_cache_dir = tmp_path / "dependency-cache"
 
         def database_url_value(self) -> str:
             return "postgresql+asyncpg://example"
@@ -318,9 +321,13 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
 
     plugin_service = cast(dict[str, object], captured["plugin_service"])
     adapters = cast(dict[str, Any], plugin_service["adapters"])
+    dependency_policy = cast(Any, plugin_service["dependency_policy"])
     adapter_kwargs = cast(dict[str, object], captured["plugin_package_adapter_kwargs"])
 
     assert tuple(adapters) == ("calendar_python",)
+    assert dependency_policy.install_policy == "offline_cache"
+    assert dependency_policy.allowlist == frozenset({"python:pypi:requests==2.32.0"})
+    assert dependency_policy.cache_dir == tmp_path / "dependency-cache"
     assert adapter_kwargs["enabled"] is True
     assert adapter_kwargs["adapter_ids"] == ("calendar_python",)
     assert adapter_kwargs["isolation_backend"] == "bubblewrap"

@@ -11,6 +11,10 @@ from uuid import UUID
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_hub.plugins.dependency_policy import (
+    PluginPackageDependencyInstallPolicy,
+    normalize_plugin_package_dependency_allowlist_entry,
+)
 from agent_hub.security.network import canonical_ip
 
 
@@ -72,6 +76,14 @@ class Settings(BaseSettings):
         default=262_144,
         ge=1,
         le=1_048_576,
+    )
+    plugin_package_dependency_install_policy: PluginPackageDependencyInstallPolicy = "disabled"
+    plugin_package_dependency_allowlist: frozenset[str] = Field(
+        default=frozenset(),
+        max_length=256,
+    )
+    plugin_package_dependency_cache_dir: Path = Path(
+        "/var/lib/agent-hub/plugin-package-dependencies"
     )
     attachment_store_dir: Path = Path("/var/lib/agent-hub/attachments")
     generated_artifact_dir: Path = Path("/var/lib/agent-hub/generated")
@@ -176,6 +188,34 @@ class Settings(BaseSettings):
     ) -> Path | None:
         if value is not None and not value.is_absolute():
             raise ValueError("plugin package bubblewrap executable must be absolute")
+        return value
+
+    @field_validator("plugin_package_dependency_allowlist", mode="before")
+    @classmethod
+    def validate_plugin_package_dependency_allowlist(
+        cls, values: object
+    ) -> frozenset[str]:
+        if values is None:
+            return frozenset()
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            raise ValueError(  # noqa: TRY004 - Pydantic converts this to ValidationError.
+                "plugin package dependency allowlist must be a collection"
+            )
+        if len(values) > 256:
+            raise ValueError("at most 256 plugin package dependency allowlist entries are allowed")
+        allowlist: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise TypeError("plugin package dependency allowlist entry is invalid")
+            allowlist.add(normalize_plugin_package_dependency_allowlist_entry(value))
+        return frozenset(allowlist)
+
+    @field_validator("plugin_package_dependency_cache_dir", mode="after")
+    @classmethod
+    def validate_plugin_package_dependency_cache_dir(cls, value: Path) -> Path:
+        rendered = str(value).replace("\\", "/")
+        if not value.is_absolute() and not rendered.startswith("/"):
+            raise ValueError("plugin package dependency cache dir must be absolute")
         return value
 
     @field_validator("bootstrap_tenant_name", mode="after")

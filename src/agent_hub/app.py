@@ -95,6 +95,7 @@ from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
 from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
+from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
 from agent_hub.plugins.runtime import (
     _plugin_package_subprocess_registration_status,
     build_plugin_package_subprocess_adapters,
@@ -988,6 +989,9 @@ def create_app(
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,
+                        dependency_policy=plugin_package_dependency_policy_from_settings(
+                            configured
+                        ),
                         adapters=build_plugin_package_subprocess_adapters(
                             enabled=configured.plugin_package_subprocess_runner_enabled,
                             adapter_ids=tuple(

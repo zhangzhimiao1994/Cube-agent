@@ -15,8 +15,8 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from jsonschema import ValidationError  # type: ignore[import-untyped]
-from jsonschema.protocols import Validator  # type: ignore[import-untyped]
+from jsonschema import ValidationError
+from jsonschema.protocols import Validator
 
 from agent_hub.api.routers.admin import (
     PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
@@ -38,6 +38,7 @@ from agent_hub.plugins.contracts import (
     adapter_descriptor_with_contract,
     http_json_adapter_descriptor,
 )
+from agent_hub.plugins.dependency_policy import PluginPackageDependencyPolicy
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runtime.contracts import JsonValue, _freeze_object, _mutable_json
 
@@ -449,6 +450,7 @@ class RuntimePluginService:
         tenant_id: UUID,
         admin_service: PluginConfigService,
         adapters: Mapping[str, PluginAdapter] | None = None,
+        dependency_policy: PluginPackageDependencyPolicy | None = None,
         cache_ttl_seconds: float = 60.0,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -456,6 +458,7 @@ class RuntimePluginService:
         self._admin_service = admin_service
         self._adapters = _default_plugin_adapters(admin_service)
         self._adapters.update(adapters or {})
+        self._dependency_policy = dependency_policy or PluginPackageDependencyPolicy()
         self._plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]] = {}
         self._plugins_loaded_at: dict[UUID, float] = {}
         self._cache_ttl_seconds = max(0.0, cache_ttl_seconds)
@@ -527,7 +530,8 @@ class RuntimePluginService:
         if plugins is None:
             return _empty_manifest()
         return PluginConfigCapabilityManifestSource(
-            cast(Any, _plugins_with_runtime_activation(plugins, self._adapters))
+            cast(Any, _plugins_with_runtime_activation(plugins, self._adapters)),
+            dependency_policy=self._dependency_policy,
         ).manifests()
 
     def adapter_descriptors(self) -> tuple[Mapping[str, JsonValue], ...]:
@@ -724,6 +728,7 @@ async def build_runtime_plugin_service(
     tenant_id: UUID,
     admin_service: PluginConfigService,
     adapters: Mapping[str, PluginAdapter] | None = None,
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
     cache_ttl_seconds: float = 60.0,
     monotonic: Callable[[], float] | None = None,
 ) -> RuntimePluginService:
@@ -731,6 +736,7 @@ async def build_runtime_plugin_service(
         tenant_id=tenant_id,
         admin_service=admin_service,
         adapters=adapters,
+        dependency_policy=dependency_policy,
         cache_ttl_seconds=cache_ttl_seconds,
         monotonic=monotonic,
     )

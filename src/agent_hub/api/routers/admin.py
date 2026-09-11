@@ -95,6 +95,7 @@ from agent_hub.plugins.contracts import (
     adapter_runtime_sandbox_profiles,
     http_json_adapter_descriptor,
 )
+from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
@@ -1217,9 +1218,9 @@ class CapabilityManifestPackageDependencyLockResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["unsupported"]
-    install_policy: Literal["not_configured"]
-    cache_status: Literal["missing"]
-    allowlist_status: Literal["missing"]
+    install_policy: Literal["not_configured", "offline_cache"]
+    cache_status: Literal["missing", "present"]
+    allowlist_status: Literal["missing", "allowed", "not_allowed"]
     sha256: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
     dependency_count: int = Field(ge=1, le=32)
     dependencies: list[CapabilityManifestPackageDependencyResponse] = Field(max_length=32)
@@ -13298,7 +13299,10 @@ async def capability_manifest(
                 request,
                 await service.list_plugins(tenant_id=principal.tenant_id),
             ),
-        )
+        ),
+        dependency_policy=plugin_package_dependency_policy_from_settings(
+            getattr(request.app.state, "settings", object())
+        ),
     )
     mcp_source = McpConfigCapabilityManifestSource(
         await service.list_mcp_servers(tenant_id=principal.tenant_id)

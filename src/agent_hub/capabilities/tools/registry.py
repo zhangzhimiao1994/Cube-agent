@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Protocol, cast
 
+from agent_hub.plugins.dependency_policy import (
+    PluginPackageDependencyPolicy,
+    plugin_package_dependency_lock,
+)
 from agent_hub.runtime.contracts import JsonValue
 
 _LOGGER = logging.getLogger(__name__)
@@ -154,8 +156,14 @@ class PluginConfig(Protocol):
 
 
 class PluginConfigCapabilityManifestSource:
-    def __init__(self, plugins: Sequence[PluginConfig]) -> None:
+    def __init__(
+        self,
+        plugins: Sequence[PluginConfig],
+        *,
+        dependency_policy: PluginPackageDependencyPolicy | None = None,
+    ) -> None:
         self._plugins = tuple(plugins)
+        self._dependency_policy = dependency_policy or PluginPackageDependencyPolicy()
 
     def manifests(self) -> Mapping[str, JsonValue]:
         capabilities: list[Mapping[str, JsonValue]] = []
@@ -181,7 +189,10 @@ class PluginConfigCapabilityManifestSource:
                 output_schema = getattr(capability, "output_schema", None)
                 if isinstance(output_schema, Mapping):
                     item["output_schema"] = cast(JsonValue, output_schema)
-                dependency_lock = _plugin_package_dependency_lock(plugin)
+                dependency_lock = _plugin_package_dependency_lock(
+                    plugin,
+                    dependency_policy=self._dependency_policy,
+                )
                 if dependency_lock is not None:
                     item["package_dependency_lock"] = dependency_lock
                 capabilities.append(
@@ -299,55 +310,37 @@ def _plugin_package_activation_reason(plugin: PluginConfig) -> str:
     return "plugin_package_not_eligible"
 
 
-def _plugin_package_dependency_lock(plugin: PluginConfig) -> Mapping[str, JsonValue] | None:
+def _plugin_package_dependency_lock(
+    plugin: PluginConfig,
+    *,
+    dependency_policy: PluginPackageDependencyPolicy,
+) -> Mapping[str, JsonValue] | None:
     package = getattr(plugin, "package_metadata", None)
     dependencies = getattr(package, "dependencies", None)
     if not isinstance(dependencies, tuple | list) or not dependencies:
         return None
-    locked: list[dict[str, str]] = []
-    for dependency in dependencies:
-        kind = getattr(dependency, "kind", None)
-        source = getattr(dependency, "source", None)
-        name = getattr(dependency, "name", None)
-        version = getattr(dependency, "version", None)
-        if not all(type(value) is str for value in (kind, source, name, version)):
-            return None
-        locked.append(
-            {
-                "kind": cast(str, kind),
-                "source": cast(str, source),
-                "name": _normalize_dependency_name(cast(str, name)),
-                "version": cast(str, version),
-            }
-        )
+    dependency_lock = plugin_package_dependency_lock(dependencies)
+    if dependency_lock is None:
+        return None
+    install_policy, cache_status, allowlist_status = dependency_policy.evaluate(dependency_lock)
     ordered = tuple(
-        sorted(
-            locked,
-            key=lambda item: (
-                item["kind"],
-                item["source"],
-                item["name"],
-                item["version"],
-            ),
-        )
+        {
+            "kind": dependency.kind,
+            "source": dependency.source,
+            "name": dependency.name,
+            "version": dependency.version,
+        }
+        for dependency in dependency_lock.dependencies
     )
-    lock_bytes = "".join(
-        f"{item['kind']} {item['source']} {item['name']}=={item['version']}\n"
-        for item in ordered
-    ).encode("utf-8")
     return {
         "status": "unsupported",
-        "install_policy": "not_configured",
-        "cache_status": "missing",
-        "allowlist_status": "missing",
-        "sha256": hashlib.sha256(lock_bytes).hexdigest(),
+        "install_policy": install_policy,
+        "cache_status": cache_status,
+        "allowlist_status": allowlist_status,
+        "sha256": dependency_lock.sha256,
         "dependency_count": len(ordered),
         "dependencies": cast(tuple[JsonValue, ...], ordered),
     }
-
-
-def _normalize_dependency_name(value: str) -> str:
-    return re.sub(r"[-_.]+", "-", value).lower()
 
 
 def _source_manifest_items(
