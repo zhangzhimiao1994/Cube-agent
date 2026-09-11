@@ -12,7 +12,9 @@ from uuid import UUID
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.recovery_metadata import (
+    ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
     RECOVERY_STRATEGY_BY_FAILURE_CATEGORY,
+    RECOVERY_STRATEGY_BY_ORCHESTRATION_RECOVERY_HINT,
     SAFE_OBSERVER_RECOMMENDATIONS,
     SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
@@ -180,7 +182,10 @@ class SelfRepairDecision:
             "source_event_sequence": self.source_sequence,
             "attempt": self.attempt,
             "max_attempts": self.max_attempts,
-            "instruction": _repair_instruction(self.failure_category),
+            "instruction": _repair_instruction(
+                self.failure_category,
+                recovery_strategy=self.recovery_strategy,
+            ),
             "requires_approval": self.requires_approval,
             "replay_safe": False,
             "automatic_execution": False,
@@ -207,8 +212,12 @@ def classify_terminal_run(
     source_kind = "run.failed" if failure is None else _kind_text(failure.kind)
     source_sequence = 0 if failure is None else failure.sequence
     failure_category = "missing_failure_event" if failure is None else _failure_category(failure)
-    recovery_strategy = _recovery_strategy(failure_category=failure_category, events=events)
     orchestration_recovery_hint = _orchestration_recovery_hint(events)
+    recovery_strategy = _recovery_strategy(
+        failure_category=failure_category,
+        events=events,
+        orchestration_recovery_hint=orchestration_recovery_hint,
+    )
     fingerprint = _fingerprint(
         status=status,
         mode=mode,
@@ -335,7 +344,13 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         "max_attempts": max_attempts,
         "instruction": _safe_text(
             proposal.get("instruction"),
-            default=_repair_instruction(failure_kind),
+            default=_repair_instruction(
+                failure_kind,
+                recovery_strategy=_safe_optional_text(
+                    proposal.get("recovery_strategy"),
+                    allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+                ),
+            ),
             max_chars=240,
         ),
         "requires_approval": True,
@@ -371,7 +386,9 @@ def repair_proposal_projection(proposal: Mapping[str, object] | None) -> dict[st
     return safe or None
 
 
-def _repair_instruction(failure_category: str) -> str:
+def _repair_instruction(failure_category: str, *, recovery_strategy: str | None = None) -> str:
+    if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+        return "重规划角色交接契约链，只重试被阻塞的交接链路，并保留原始交付目标和审批边界。"
     if failure_category == "capacity_pressure":
         return "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。"
     if failure_category == "empty_model_response":
@@ -448,7 +465,12 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
     return None
 
 
-def _recovery_strategy(*, failure_category: str, events: Sequence[RunEvent]) -> str | None:
+def _recovery_strategy(
+    *,
+    failure_category: str,
+    events: Sequence[RunEvent],
+    orchestration_recovery_hint: str | None,
+) -> str | None:
     for event in reversed(events):
         if _kind_text(event.kind) != "observer.notice":
             continue
@@ -458,6 +480,12 @@ def _recovery_strategy(*, failure_category: str, events: Sequence[RunEvent]) -> 
         )
         if recommendation is not None:
             return recommendation
+    if orchestration_recovery_hint is not None:
+        hinted_strategy = RECOVERY_STRATEGY_BY_ORCHESTRATION_RECOVERY_HINT.get(
+            orchestration_recovery_hint
+        )
+        if hinted_strategy is not None:
+            return hinted_strategy
     return RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.get(failure_category)
 
 
