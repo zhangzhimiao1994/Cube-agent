@@ -96,6 +96,10 @@ from agent_hub.plugins.contracts import (
     http_json_adapter_descriptor,
 )
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
+from agent_hub.recovery_metadata import (
+    ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+    ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
+)
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
@@ -441,6 +445,18 @@ class RuntimeRecoverySummaryResponse(BaseModel):
     review_artifacts: int = Field(default=0, ge=0)
 
 
+class SelfRepairRecoverySummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["active"] = "active"
+    recovery_strategy: Literal["retry_blocked_contract_chain_after_replanning"]
+    orchestration_recovery_hint: Literal["retry_blocked_contract_chain"]
+    replan_scope: Literal["blocked_contract_chain"]
+    reuse_completed_artifacts: bool
+    retry_blocked_contracts_only: bool
+    automatic_execution: bool = False
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
@@ -457,6 +473,7 @@ class RunDetailResponse(RunListItem):
     ) = None
     capability_execution_summary: CapabilityExecutionSummaryResponse | None = None
     runtime_recovery_summary: RuntimeRecoverySummaryResponse | None = None
+    self_repair_recovery_summary: SelfRepairRecoverySummaryResponse | None = None
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -481,6 +498,9 @@ class RunDetailResponse(RunListItem):
             self.events
         )
         self.runtime_recovery_summary = _runtime_recovery_summary_from_run_events(
+            self.events
+        )
+        self.self_repair_recovery_summary = _self_repair_recovery_summary_from_run_events(
             self.events
         )
         return self
@@ -9493,6 +9513,50 @@ def _capability_execution_summary_from_run_events(
     )
 
 
+def _self_repair_recovery_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> SelfRepairRecoverySummaryResponse | None:
+    latest: Mapping[str, object] | None = None
+    for event in sorted(events, key=lambda item: item.sequence):
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        recovery = plan.get("self_repair_recovery")
+        if isinstance(recovery, Mapping):
+            latest = cast(Mapping[str, object], recovery)
+
+    return _self_repair_recovery_summary_from_mapping(latest)
+
+
+def _self_repair_recovery_summary_from_mapping(
+    latest: Mapping[str, object] | None,
+) -> SelfRepairRecoverySummaryResponse | None:
+    if latest is None:
+        return None
+    if latest.get("status") != "active":
+        return None
+    if latest.get("recovery_strategy") != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+        return None
+    if latest.get("orchestration_recovery_hint") != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
+        return None
+    if latest.get("replan_scope") != "blocked_contract_chain":
+        return None
+    return SelfRepairRecoverySummaryResponse(
+        recovery_strategy=cast(
+            Literal["retry_blocked_contract_chain_after_replanning"],
+            ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
+        ),
+        orchestration_recovery_hint=cast(
+            Literal["retry_blocked_contract_chain"],
+            ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+        ),
+        replan_scope="blocked_contract_chain",
+        reuse_completed_artifacts=latest.get("reuse_completed_artifacts") is True,
+        retry_blocked_contracts_only=latest.get("retry_blocked_contracts_only") is True,
+        automatic_execution=False,
+    )
+
+
 def _runtime_recovery_summary_from_run_events(
     events: Iterable[RunEventResponse],
 ) -> RuntimeRecoverySummaryResponse | None:
@@ -10734,7 +10798,29 @@ def _event_payload(value: object) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = {}
     for key, item in value.items():
         key_text = str(key)
+        if key_text == "model_execution_plan":
+            payload[key_text] = _model_execution_plan_event_payload(item)
+            continue
         payload[key_text] = _safe_event_detail(item, key=key_text)
+    return payload
+
+
+def _model_execution_plan_event_payload(value: object) -> JsonValue:
+    if not isinstance(value, Mapping):
+        return _safe_event_detail(value, key="model_execution_plan")
+    payload: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text == "self_repair_recovery":
+            if not isinstance(item, Mapping):
+                continue
+            summary = _self_repair_recovery_summary_from_mapping(
+                cast(Mapping[str, object], item)
+            )
+            if summary is not None:
+                payload[key_text] = cast(JsonValue, summary.model_dump(mode="json"))
+            continue
+        payload[key_text] = _safe_event_detail(item, key=key_text, depth=1)
     return payload
 
 

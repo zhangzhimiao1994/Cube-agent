@@ -943,6 +943,47 @@ describe("RunDetailPage", () => {
     expect(screen.queryByRole("status", { name: "模型结果摘要" })).toBeNull();
   });
 
+  it("shows self-repair recovery summary as a compact outcome metric", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      self_repair_recovery_summary: {
+        status: "active",
+        recovery_strategy: "retry_blocked_contract_chain_after_replanning",
+        orchestration_recovery_hint: "retry_blocked_contract_chain",
+        replan_scope: "blocked_contract_chain",
+        reuse_completed_artifacts: true,
+        retry_blocked_contracts_only: true,
+        automatic_execution: false,
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("已记录自修复")).not.toBeNull();
+    expect(within(summary).getByText("自修复")).not.toBeNull();
+    expect(within(summary).getByText("契约链重规划，只重试阻塞链路，复用已完成产物")).not.toBeNull();
+    expect(screen.queryByText("retry_blocked_contract_chain_after_replanning")).toBeNull();
+    expect(screen.queryByText("retry_blocked_contract_chain")).toBeNull();
+  });
+
   it("summarizes blocked orchestration contracts without expanding contract details", async () => {
     const detailedRun: RunDetail = {
       ...runDetail,

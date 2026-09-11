@@ -774,6 +774,16 @@ const RuntimeRecoverySummarySchema = z.object({
   review_artifacts: z.number().int().nonnegative().default(0),
 });
 
+const SelfRepairRecoverySummarySchema = z.object({
+  status: z.literal("active"),
+  recovery_strategy: z.literal("retry_blocked_contract_chain_after_replanning"),
+  orchestration_recovery_hint: z.literal("retry_blocked_contract_chain"),
+  replan_scope: z.literal("blocked_contract_chain"),
+  reuse_completed_artifacts: z.boolean(),
+  retry_blocked_contracts_only: z.boolean(),
+  automatic_execution: z.boolean(),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
@@ -800,6 +810,10 @@ const RunDetailSchema = RunListItemSchema.extend({
   runtime_recovery_summary: z.preprocess(
     (value) => value ?? null,
     RuntimeRecoverySummarySchema.nullable(),
+  ).optional(),
+  self_repair_recovery_summary: z.preprocess(
+    (value) => value ?? null,
+    SelfRepairRecoverySummarySchema.nullable(),
   ).optional(),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),

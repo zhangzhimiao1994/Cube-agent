@@ -304,6 +304,15 @@ describe("api client transport", () => {
             tool_status_counts: { running: 1 },
             review_artifacts: 1,
           },
+          self_repair_recovery_summary: {
+            status: "active",
+            recovery_strategy: "retry_blocked_contract_chain_after_replanning",
+            orchestration_recovery_hint: "retry_blocked_contract_chain",
+            replan_scope: "blocked_contract_chain",
+            reuse_completed_artifacts: true,
+            retry_blocked_contracts_only: true,
+            automatic_execution: false,
+          },
           capability_execution_summary: {
             permission_boundary: "runtime_capability_gateway",
             role_count: 2,
@@ -361,6 +370,15 @@ describe("api client transport", () => {
       model_status_counts: { failed: 1, succeeded: 2 },
       tool_status_counts: { running: 1 },
       review_artifacts: 1,
+    });
+    expect(run.self_repair_recovery_summary).toEqual({
+      status: "active",
+      recovery_strategy: "retry_blocked_contract_chain_after_replanning",
+      orchestration_recovery_hint: "retry_blocked_contract_chain",
+      replan_scope: "blocked_contract_chain",
+      reuse_completed_artifacts: true,
+      retry_blocked_contracts_only: true,
+      automatic_execution: false,
     });
     expect(run.capability_execution_summary).toEqual({
       permission_boundary: "runtime_capability_gateway",

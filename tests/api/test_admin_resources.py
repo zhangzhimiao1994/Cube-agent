@@ -780,6 +780,19 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                     "truncated": True,
                                 },
                             },
+                            "self_repair_recovery": {
+                                "schema_version": 1,
+                                "status": "active",
+                                "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                                "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                                "replan_scope": "blocked_contract_chain",
+                                "reuse_completed_artifacts": True,
+                                "retry_blocked_contracts_only": True,
+                                "automatic_execution": False,
+                                "contract_id": "copywriter_step-to-final_response_step",
+                                "raw_plan": {"contract_id": "raw-private-contract"},
+                                "secret": "secret://repair-token",
+                            },
                             "quota_scope_id": "tenant-private-quota",
                             "credential_ref": "credential-private",
                             "api_base": "https://internal.example.invalid",
@@ -867,6 +880,24 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         "inventory_count": 2,
         "truncated": True,
     }
+    assert body["self_repair_recovery_summary"] == {
+        "status": "active",
+        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+        "replan_scope": "blocked_contract_chain",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": True,
+        "automatic_execution": False,
+    }
+    assert model_execution_plan["self_repair_recovery"] == {
+        "status": "active",
+        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+        "replan_scope": "blocked_contract_chain",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": True,
+        "automatic_execution": False,
+    }
     serialized = json.dumps(body, ensure_ascii=False)
     assert "lease-private" not in serialized
     assert "tenant-private-quota" not in serialized
@@ -880,6 +911,8 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert "model-internal.example.invalid" not in serialized
     assert "sk_secret" not in serialized
     assert "token_leak" not in serialized
+    assert "repair-token" not in serialized
+    assert "raw-private-contract" not in serialized
 
 
 def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses() -> None:

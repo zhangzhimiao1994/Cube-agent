@@ -31,6 +31,7 @@ type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary
 type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
 type ApiCapabilityExecutionSummary = RunDetail["capability_execution_summary"];
 type ApiRuntimeRecoverySummary = RunDetail["runtime_recovery_summary"];
+type ApiSelfRepairRecoverySummary = RunDetail["self_repair_recovery_summary"];
 type OrchestrationHandoff = {
   sourceRoleId: string;
   targetRoleId: string;
@@ -88,6 +89,13 @@ type RuntimeRecoverySummary = {
   modelStatusCounts: Record<string, number>;
   toolStatusCounts: Record<string, number>;
   reviewArtifacts: number;
+};
+
+type SelfRepairRecoverySummary = {
+  recoveryStrategy: "retry_blocked_contract_chain_after_replanning";
+  replanScope: "blocked_contract_chain";
+  reuseCompletedArtifacts: boolean;
+  retryBlockedContractsOnly: boolean;
 };
 
 type OrchestrationContract = {
@@ -1131,6 +1139,25 @@ function runtimeRecoverySummaryFromApi(
   };
 }
 
+function selfRepairRecoverySummaryFromApi(
+  summary: ApiSelfRepairRecoverySummary,
+): SelfRepairRecoverySummary | null {
+  if (!summary || summary.status !== "active") return null;
+  if (
+    summary.recovery_strategy !== "retry_blocked_contract_chain_after_replanning" ||
+    summary.orchestration_recovery_hint !== "retry_blocked_contract_chain" ||
+    summary.replan_scope !== "blocked_contract_chain"
+  ) {
+    return null;
+  }
+  return {
+    recoveryStrategy: summary.recovery_strategy,
+    replanScope: summary.replan_scope,
+    reuseCompletedArtifacts: summary.reuse_completed_artifacts,
+    retryBlockedContractsOnly: summary.retry_blocked_contracts_only,
+  };
+}
+
 function orchestrationContractKey(contract: OrchestrationContract) {
   return contract.contractId || `${contract.sourceStepId}->${contract.targetStepId}:${contract.handoffKind}`;
 }
@@ -1273,6 +1300,13 @@ function capabilityExecutionLabel(summary: CapabilityExecutionSummary) {
 
 function runtimeRecoveryLabel(summary: RuntimeRecoverySummary) {
   return `${summary.recoveryCount} 次续跑，${summary.completedSteps}/${summary.totalSteps} 步`;
+}
+
+function selfRepairRecoveryLabel(summary: SelfRepairRecoverySummary) {
+  const parts = ["契约链重规划"];
+  if (summary.retryBlockedContractsOnly) parts.push("只重试阻塞链路");
+  if (summary.reuseCompletedArtifacts) parts.push("复用已完成产物");
+  return parts.join("，");
 }
 
 function runtimeRecoveryStatusParts(counts: Record<string, number>, labels: Record<string, string>) {
@@ -2094,6 +2128,9 @@ export function RunDetailPage() {
   const runtimeRecoverySummary = runtimeRecoverySummaryFromApi(
     orderedRunData.runtime_recovery_summary,
   );
+  const selfRepairRecoverySummary = selfRepairRecoverySummaryFromApi(
+    orderedRunData.self_repair_recovery_summary,
+  );
 
   return (
     <section>
@@ -2142,7 +2179,8 @@ export function RunDetailPage() {
       protocolSummary ||
       capabilityNegotiationSummary ||
       capabilityExecutionSummary ||
-      runtimeRecoverySummary ? (
+      runtimeRecoverySummary ||
+      selfRepairRecoverySummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
@@ -2162,7 +2200,9 @@ export function RunDetailPage() {
                         ? "已记录能力协商"
                         : capabilityExecutionSummary
                           ? "已记录能力边界"
-                          : "已恢复续跑"}
+                          : runtimeRecoverySummary
+                            ? "已恢复续跑"
+                            : "已记录自修复"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -2222,6 +2262,12 @@ export function RunDetailPage() {
               <li>
                 <span>恢复明细</span>
                 <strong>{runtimeRecoveryDetailLabel(runtimeRecoverySummary)}</strong>
+              </li>
+            ) : null}
+            {selfRepairRecoverySummary ? (
+              <li>
+                <span>自修复</span>
+                <strong>{selfRepairRecoveryLabel(selfRepairRecoverySummary)}</strong>
               </li>
             ) : null}
             {handoffSummary ? (
