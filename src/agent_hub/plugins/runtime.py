@@ -565,7 +565,14 @@ class RuntimePluginService:
         if plugins is None:
             return _empty_manifest()
         return PluginConfigCapabilityManifestSource(
-            cast(Any, _plugins_with_runtime_activation(plugins, self._adapters)),
+            cast(
+                Any,
+                _plugins_with_runtime_activation(
+                    plugins,
+                    self._adapters,
+                    dependency_policy=self._dependency_policy,
+                ),
+            ),
             dependency_policy=self._dependency_policy,
         ).manifests()
 
@@ -598,7 +605,11 @@ class RuntimePluginService:
             return ()
         rules: list[CapabilityRule] = []
         for plugin in plugins:
-            if not _plugin_is_running(plugin, self._adapters):
+            if not _plugin_is_running(
+                plugin,
+                self._adapters,
+                dependency_policy=self._dependency_policy,
+            ):
                 continue
             for capability in plugin.capabilities:
                 effect = _plugin_policy_effect(capability.policy_effect)
@@ -718,7 +729,11 @@ class RuntimePluginService:
         if plugins is None:
             return None
         for plugin in plugins:
-            if not _plugin_is_running(plugin, self._adapters):
+            if not _plugin_is_running(
+                plugin,
+                self._adapters,
+                dependency_policy=self._dependency_policy,
+            ):
                 continue
             for capability in plugin.capabilities:
                 if capability.id == name or name in capability.aliases:
@@ -789,27 +804,48 @@ def _empty_manifest() -> Mapping[str, JsonValue]:
 def _plugin_is_running(
     plugin: PluginResourceResponse,
     adapters: Mapping[str, PluginAdapter] | None = None,
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> bool:
     return (
         plugin.enabled is True
         and plugin.status == "running"
         and plugin.health == "healthy"
-        and not _plugin_package_blocks_runtime_activation(plugin, adapters or {})
+        and not _plugin_package_blocks_runtime_activation(
+            plugin,
+            adapters or {},
+            dependency_policy=dependency_policy,
+        )
     )
 
 
 def _plugin_package_blocks_runtime_activation(
     plugin: PluginResourceResponse,
     adapters: Mapping[str, PluginAdapter],
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> bool:
-    return _runtime_package_activation_block_reason(plugin, adapters) is not None
+    return (
+        _runtime_package_activation_block_reason(
+            plugin,
+            adapters,
+            dependency_policy=dependency_policy,
+        )
+        is not None
+    )
 
 
 def _plugins_with_runtime_activation(
     plugins: tuple[PluginResourceResponse, ...],
     adapters: Mapping[str, PluginAdapter],
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> tuple[PluginResourceResponse, ...]:
-    return tuple(_plugin_with_runtime_activation(plugin, adapters) for plugin in plugins)
+    return tuple(
+        _plugin_with_runtime_activation(
+            plugin,
+            adapters,
+            dependency_policy=dependency_policy,
+        )
+        for plugin in plugins
+    )
 
 
 def _plugin_cache_has_expired_package_signature_trust(
@@ -860,10 +896,15 @@ def _plugin_with_expired_package_signature_trust(
 def _plugin_with_runtime_activation(
     plugin: PluginResourceResponse,
     adapters: Mapping[str, PluginAdapter],
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> PluginResourceResponse:
     plugin = _plugin_with_expired_package_signature_trust(plugin)
     package = plugin.package_metadata
-    reason = _runtime_package_activation_block_reason(plugin, adapters)
+    reason = _runtime_package_activation_block_reason(
+        plugin,
+        adapters,
+        dependency_policy=dependency_policy,
+    )
     if (
         reason is None
         or package is None
@@ -886,6 +927,7 @@ def _plugin_with_runtime_activation(
 def _runtime_package_activation_block_reason(
     plugin: PluginResourceResponse,
     adapters: Mapping[str, PluginAdapter],
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> str | None:
     package = plugin.package_metadata
     if package is None or package.kind != "adapter_package":
@@ -907,7 +949,13 @@ def _runtime_package_activation_block_reason(
     if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
         return "plugin package isolation is not supported for activation"
     if package.dependencies:
-        return PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON
+        try:
+            _plugin_package_dependency_root(
+                package,
+                dependency_policy=dependency_policy,
+            )
+        except RuntimeCapabilityError:
+            return PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON
     adapter = adapters.get(package.adapter_id or "")
     if adapter is None:
         return "runtime-registered adapter package requires a registered adapter"

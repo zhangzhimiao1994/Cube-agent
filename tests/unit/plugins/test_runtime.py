@@ -2523,6 +2523,130 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_dependen
     assert adapter.calls == []
 
 
+async def test_runtime_plugin_service_allows_ready_offline_runtime_registered_dependencies(
+    tmp_path: Path,
+) -> None:
+    dependency_lock_hash = hashlib.sha256(
+        b"python pypi requests==2.32.0\npython pypi zlib==1.0\n"
+    ).hexdigest()
+    write_dependency_cache_manifest(
+        tmp_path / "dependency-cache",
+        lock_hash=dependency_lock_hash,
+        dependencies=[
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            },
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "zlib",
+                "version": "1.0",
+            },
+        ],
+    )
+    package_metadata = verified_package_with_artifact(
+        content_sha256="a" * 64,
+        storage_key=f"{TENANT_ID}/calendar/{'a' * 64}",
+    ).model_copy(
+        update={
+            "artifact": None,
+            "dependencies": (
+                PluginPackageDependency(name="Zlib", version="1.0"),
+                PluginPackageDependency(name="requests", version="2.32.0"),
+            ),
+        }
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("local_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="local_process",
+                    policy_effect="allow",
+                    package_metadata=package_metadata,
+                    content_sha256="a" * 64,
+                ),
+            )
+        ),
+        adapters={"calendar_python": adapter},
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset(
+                {
+                    "python:pypi:requests==2.32.0",
+                    "python:pypi:zlib==1.0",
+                }
+            ),
+            cache_dir=tmp_path / "dependency-cache",
+        ),
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="tester",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="invoke-1",
+    )
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert result["ok"] is True
+    assert adapter.calls[0][0] == "calendar"
+    assert adapter.calls[0][1] == "calendar.create_event"
+    assert service.is_available(TENANT_ID, "calendar.create_event") is True
+    assert len(service.capability_policy_rules(TENANT_ID)) == 3
+    assert capabilities["calendar.create_event"]["available"] is True
+    assert capabilities["calendar.create_event"]["availability_reason"] is None
+    assert capabilities["calendar.create_event"]["package_dependency_lock"] == {
+        "status": "unsupported",
+        "install_policy": "offline_cache",
+        "cache_status": "present",
+        "allowlist_status": "allowed",
+        "sha256": dependency_lock_hash,
+        "dependency_count": 2,
+        "dependencies": (
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            },
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "zlib",
+                "version": "1.0",
+            },
+        ),
+    }
+
+
 async def test_runtime_plugin_service_blocks_runtime_registered_package_without_adapter() -> None:
     package_metadata = PluginPackageMetadata.model_validate(
         {

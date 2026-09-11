@@ -5137,7 +5137,7 @@ def test_plugin_archive_install_rejects_malformed_package_dependencies_with_stab
     )
 
 
-def test_plugin_package_metadata_blocks_restored_runtime_registered_dependencies() -> None:
+def test_plugin_package_metadata_keeps_runtime_registered_dependencies_request_recheckable() -> None:
     package = PluginPackageMetadata.model_validate(
         {
             "kind": "adapter_package",
@@ -5166,9 +5166,9 @@ def test_plugin_package_metadata_blocks_restored_runtime_registered_dependencies
         }
     )
 
-    assert package.activation_state == "blocked_unsupported_runtime"
+    assert package.activation_state == "eligible"
     assert package.activation_reason == (
-        "plugin package dependencies are not supported by this runtime"
+        "package signature, approval, SDK, adapter, and isolation policy allow execution"
     )
 
 
@@ -7278,6 +7278,118 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_dependencies(
     assert response.json()["error"]["message"] == (
         "plugin package dependencies are not supported by this runtime"
     )
+
+
+def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_start(
+    tmp_path: Path,
+) -> None:
+    dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    cache_entry = tmp_path / "dependency-cache" / dependency_lock_hash
+    cache_entry.mkdir(parents=True)
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": dependency_lock_hash,
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.32.0",
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("local_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client_with_settings(
+        Settings.model_validate(
+            {
+                "plugin_package_store_dir": tmp_path / "packages",
+                "plugin_package_dependency_install_policy": "offline_cache",
+                "plugin_package_dependency_allowlist": frozenset(
+                    {"python:pypi:requests==2.32.0"}
+                ),
+                "plugin_package_dependency_cache_dir": tmp_path / "dependency-cache",
+            }
+        )
+    )
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={
+                "install_mode": "runtime_registered",
+                "isolation": "local_process",
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "Requests",
+                        "version": "2.32.0",
+                    }
+                ],
+            },
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert started.status_code == 200
+    assert started.json()["status"] == "running"
 
 
 def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() -> None:

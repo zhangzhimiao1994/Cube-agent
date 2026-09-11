@@ -15,7 +15,7 @@ import shutil
 import stat
 import tarfile
 import zipfile
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -95,7 +95,11 @@ from agent_hub.plugins.contracts import (
     adapter_runtime_sandbox_profiles,
     http_json_adapter_descriptor,
 )
-from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
+from agent_hub.plugins.dependency_policy import (
+    PluginPackageDependencyLike,
+    plugin_package_dependency_lock,
+    plugin_package_dependency_policy_from_settings,
+)
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
@@ -1052,11 +1056,6 @@ def _plugin_package_activation_state(
         return (
             "blocked_unsupported_runtime",
             "plugin package isolation is not supported for activation",
-        )
-    if package.dependencies:
-        return (
-            "blocked_unsupported_runtime",
-            PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
         )
     return (
         "eligible",
@@ -3661,7 +3660,7 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package artifact is server-controlled")
     dependencies = package.get("dependencies")
     if dependencies not in (None, []):
-        if package.get("install_mode") != "scan_only" or not isinstance(
+        if package.get("install_mode") not in {"scan_only", "runtime_registered"} or not isinstance(
             dependencies, list | tuple
         ):
             raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
@@ -3698,8 +3697,6 @@ def _validate_plugin_package_contract(
 ) -> None:
     if package is None:
         return
-    if package.dependencies and package.install_mode != "scan_only":
-        raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     if package.kind == "manifest_only":
         if (
             package.package_version is not None
@@ -3740,7 +3737,10 @@ def _validate_runtime_registered_plugin_package(
         return
     if package.install_mode != "runtime_registered":
         return
-    if package.dependencies:
+    if package.dependencies and not _runtime_registered_package_dependencies_ready(
+        request,
+        package,
+    ):
         raise InvalidSkillPackage(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
     descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
     descriptor = descriptors.get(package.adapter_id or "")
@@ -3766,6 +3766,27 @@ def _validate_runtime_registered_plugin_package(
             raise InvalidSkillPackage(
                 "runtime-registered adapter package capabilities must use package isolation"
             )
+
+
+def _runtime_registered_package_dependencies_ready(
+    request: Request,
+    package: PluginPackageMetadata,
+) -> bool:
+    if not package.dependencies:
+        return True
+    settings = getattr(request.app.state, "settings", None)
+    policy = plugin_package_dependency_policy_from_settings(settings)
+    dependency_lock = plugin_package_dependency_lock(
+        cast(Sequence[PluginPackageDependencyLike], package.dependencies)
+    )
+    if dependency_lock is None:
+        return False
+    install_policy, cache_status, allowlist_status = policy.evaluate(dependency_lock)
+    return (
+        install_policy == "offline_cache"
+        and cache_status == "present"
+        and allowlist_status == "allowed"
+    )
 
 
 def _plugin_request_for_activation_check(
