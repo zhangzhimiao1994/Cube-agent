@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, cast
 
 PluginPackageDependencyInstallPolicy = Literal["disabled", "offline_cache"]
@@ -115,6 +115,13 @@ def _dependency_cache_entry_matches(
     dependencies = payload.get("dependencies")
     if not isinstance(dependencies, list):
         return False
+    files = payload.get("files")
+    if (
+        not isinstance(files, list)
+        or not files
+        or not _dependency_cache_files_match(entry_dir, files)
+    ):
+        return False
     expected_dependencies: list[dict[str, str]] = [
         {
             "kind": dependency.kind,
@@ -129,6 +136,91 @@ def _dependency_cache_entry_matches(
         and payload.get("sha256") == lock.sha256
         and dependencies == expected_dependencies
     )
+
+
+def _dependency_cache_files_match(
+    entry_dir: Path,
+    files: Sequence[object],
+) -> bool:
+    listed_paths: set[PurePosixPath] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            return False
+        raw_path = item.get("path")
+        expected_sha256 = item.get("sha256")
+        expected_size = item.get("size_bytes")
+        if (
+            type(raw_path) is not str
+            or type(expected_sha256) is not str
+            or type(expected_size) is not int
+            or expected_size < 0
+            or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None
+        ):
+            return False
+        if "\\" in raw_path:
+            return False
+        file_path = PurePosixPath(raw_path)
+        if (
+            not file_path.parts
+            or file_path.is_absolute()
+            or any(part in {"", ".", ".."} for part in file_path.parts)
+            or file_path == PurePosixPath("dependency-lock.json")
+            or file_path in listed_paths
+        ):
+            return False
+        listed_paths.add(file_path)
+        candidate = entry_dir.joinpath(*file_path.parts)
+        try:
+            candidate.resolve().relative_to(entry_dir.resolve())
+        except (OSError, ValueError):
+            return False
+        if candidate.is_symlink() or not candidate.is_file():
+            return False
+        try:
+            stat = candidate.stat()
+        except OSError:
+            return False
+        if stat.st_size != expected_size:
+            return False
+        if _sha256_file(candidate) != expected_sha256:
+            return False
+    return listed_paths == _dependency_cache_entry_file_paths(entry_dir)
+
+
+def _dependency_cache_entry_file_paths(entry_dir: Path) -> set[PurePosixPath]:
+    paths: set[PurePosixPath] = set()
+    try:
+        children = tuple(entry_dir.rglob("*"))
+    except OSError:
+        return {PurePosixPath("__invalid__")}
+    for child in children:
+        if child == entry_dir / "dependency-lock.json":
+            continue
+        try:
+            child.relative_to(entry_dir)
+        except ValueError:
+            return {PurePosixPath("__invalid__")}
+        if child.is_dir() and not child.is_symlink():
+            continue
+        if child.is_symlink() or not child.is_file():
+            return {PurePosixPath("__invalid__")}
+        try:
+            relative = child.relative_to(entry_dir)
+        except ValueError:
+            return {PurePosixPath("__invalid__")}
+        paths.add(PurePosixPath(*relative.parts))
+    return paths
+
+
+def _sha256_file(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def normalize_plugin_package_dependency_name(value: str) -> str:

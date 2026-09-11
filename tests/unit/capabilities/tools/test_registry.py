@@ -302,6 +302,10 @@ def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
     lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
     cache_entry = tmp_path / lock_hash
     cache_entry.mkdir()
+    marker_bytes = b"READY = True\n"
+    marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(marker_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -313,6 +317,13 @@ def test_plugin_manifest_source_reports_offline_dependency_policy_readiness(
                         "source": "pypi",
                         "name": "requests",
                         "version": "2.32.0",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "site-packages/dependency_cache_marker.py",
+                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                        "size_bytes": len(marker_bytes),
                     }
                 ],
             },
@@ -487,6 +498,77 @@ def test_plugin_manifest_source_requires_dependency_cache_manifest(
     assert capability["package_dependency_lock"]["allowlist_status"] == "allowed"
 
 
+def test_plugin_manifest_source_requires_dependency_cache_file_provenance(
+    tmp_path: Path,
+) -> None:
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    cache_entry = tmp_path / lock_hash
+    cache_entry.mkdir()
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": lock_hash,
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.32.0",
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        ),
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path,
+        ),
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"]["cache_status"] == "missing"
+
+
 def test_plugin_manifest_source_rejects_mismatched_dependency_cache_manifest(
     tmp_path: Path,
 ) -> None:
@@ -504,6 +586,171 @@ def test_plugin_manifest_source_rejects_mismatched_dependency_cache_manifest(
                         "source": "pypi",
                         "name": "urllib3",
                         "version": "2.32.0",
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        ),
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path,
+        ),
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"]["cache_status"] == "missing"
+
+
+def test_plugin_manifest_source_rejects_dependency_cache_manifest_with_bad_file_digest(
+    tmp_path: Path,
+) -> None:
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    cache_entry = tmp_path / lock_hash
+    cache_entry.mkdir()
+    cached_file = cache_entry / "site-packages" / "requests" / "__init__.py"
+    cached_file.parent.mkdir(parents=True)
+    cached_file.write_text("__version__ = '2.32.0'\n", encoding="utf-8")
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": lock_hash,
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.32.0",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "site-packages/requests/__init__.py",
+                        "sha256": "0" * 64,
+                        "size_bytes": cached_file.stat().st_size,
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="calendar",
+                enabled=True,
+                status="running",
+                health="healthy",
+                package_metadata=SimpleNamespace(
+                    kind="adapter_package",
+                    activation_state="blocked_unsupported_runtime",
+                    activation_reason="plugin package dependencies are not supported by this runtime",
+                    dependencies=(
+                        SimpleNamespace(
+                            kind="python",
+                            source="pypi",
+                            name="Requests",
+                            version="2.32.0",
+                        ),
+                    ),
+                ),
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="calendar_python",
+                        permission_class="calendar.write",
+                        sandbox_profile="local_process",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        ),
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path,
+        ),
+    )
+
+    capabilities = source.manifests()["capabilities"]
+    assert isinstance(capabilities, tuple)
+    capability = capabilities[0]
+    assert isinstance(capability, dict)
+
+    assert capability["package_dependency_lock"]["cache_status"] == "missing"
+
+
+def test_plugin_manifest_source_rejects_dependency_cache_with_unlisted_file(
+    tmp_path: Path,
+) -> None:
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    cache_entry = tmp_path / lock_hash
+    cache_entry.mkdir()
+    listed_file = cache_entry / "site-packages" / "requests" / "__init__.py"
+    listed_bytes = b"__version__ = '2.32.0'\n"
+    listed_file.parent.mkdir(parents=True)
+    listed_file.write_bytes(listed_bytes)
+    unlisted_file = cache_entry / "site-packages" / "requests" / "session.py"
+    unlisted_file.write_text("SECRET = 'not in provenance'\n", encoding="utf-8")
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": lock_hash,
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.32.0",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "site-packages/requests/__init__.py",
+                        "sha256": hashlib.sha256(listed_bytes).hexdigest(),
+                        "size_bytes": len(listed_bytes),
                     }
                 ],
             },

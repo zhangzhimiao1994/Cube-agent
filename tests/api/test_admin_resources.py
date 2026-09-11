@@ -4913,6 +4913,10 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
     dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.31.0\n").hexdigest()
     cache_entry = tmp_path / dependency_lock_hash
     cache_entry.mkdir()
+    marker_bytes = b"READY = True\n"
+    marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(marker_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -4924,6 +4928,13 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
                         "source": "pypi",
                         "name": "requests",
                         "version": "2.31.0",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "site-packages/dependency_cache_marker.py",
+                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                        "size_bytes": len(marker_bytes),
                     }
                 ],
             },
@@ -7286,6 +7297,10 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
     dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
     cache_entry = tmp_path / "dependency-cache" / dependency_lock_hash
     cache_entry.mkdir(parents=True)
+    marker_bytes = b"READY = True\n"
+    marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(marker_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -7297,6 +7312,13 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
                         "source": "pypi",
                         "name": "requests",
                         "version": "2.32.0",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "site-packages/dependency_cache_marker.py",
+                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                        "size_bytes": len(marker_bytes),
                     }
                 ],
             },

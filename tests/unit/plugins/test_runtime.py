@@ -527,12 +527,23 @@ def write_dependency_cache_manifest(
 ) -> Path:
     cache_entry = cache_root / lock_hash
     cache_entry.mkdir(parents=True)
+    marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
+    marker_bytes = b"READY = True\n"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_bytes(marker_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "sha256": lock_hash,
                 "dependencies": dependencies,
+                "files": [
+                    {
+                        "path": "site-packages/dependency_cache_marker.py",
+                        "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                        "size_bytes": len(marker_bytes),
+                    }
+                ],
             },
             sort_keys=True,
         ),
