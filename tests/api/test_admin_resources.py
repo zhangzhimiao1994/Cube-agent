@@ -4917,6 +4917,10 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
     marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_bytes(marker_bytes)
+    artifact_bytes = b"requests==2.31.0\n"
+    artifact_path = cache_entry / "artifacts" / "requests-2.31.0.whl"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(artifact_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -4930,7 +4934,23 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
                         "version": "2.31.0",
                     }
                 ],
+                "artifacts": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.31.0",
+                        "path": "artifacts/requests-2.31.0.whl",
+                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                        "size_bytes": len(artifact_bytes),
+                    }
+                ],
                 "files": [
+                    {
+                        "path": "artifacts/requests-2.31.0.whl",
+                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                        "size_bytes": len(artifact_bytes),
+                    },
                     {
                         "path": "site-packages/dependency_cache_marker.py",
                         "sha256": hashlib.sha256(marker_bytes).hexdigest(),
@@ -7301,6 +7321,10 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
     marker_path = cache_entry / "site-packages" / "dependency_cache_marker.py"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_bytes(marker_bytes)
+    artifact_bytes = b"requests==2.32.0\n"
+    artifact_path = cache_entry / "artifacts" / "requests-2.32.0.whl"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(artifact_bytes)
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
@@ -7314,7 +7338,23 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
                         "version": "2.32.0",
                     }
                 ],
+                "artifacts": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.32.0",
+                        "path": "artifacts/requests-2.32.0.whl",
+                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                        "size_bytes": len(artifact_bytes),
+                    }
+                ],
                 "files": [
+                    {
+                        "path": "artifacts/requests-2.32.0.whl",
+                        "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                        "size_bytes": len(artifact_bytes),
+                    },
                     {
                         "path": "site-packages/dependency_cache_marker.py",
                         "sha256": hashlib.sha256(marker_bytes).hexdigest(),

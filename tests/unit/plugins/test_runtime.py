@@ -531,13 +531,43 @@ def write_dependency_cache_manifest(
     marker_bytes = b"READY = True\n"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_bytes(marker_bytes)
+    artifact_entries: list[dict[str, object]] = []
+    artifact_files: list[dict[str, object]] = []
+    for dependency in dependencies:
+        artifact_name = dependency["name"]
+        artifact_version = dependency["version"]
+        artifact_relative_path = f"artifacts/{artifact_name}-{artifact_version}.whl"
+        artifact_path = cache_entry / "artifacts" / f"{artifact_name}-{artifact_version}.whl"
+        artifact_bytes = f"{artifact_name}=={artifact_version}\n".encode()
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(artifact_bytes)
+        artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
+        artifact_entry = {
+            "kind": dependency["kind"],
+            "source": dependency["source"],
+            "name": artifact_name,
+            "version": artifact_version,
+            "path": artifact_relative_path,
+            "sha256": artifact_digest,
+            "size_bytes": len(artifact_bytes),
+        }
+        artifact_entries.append(artifact_entry)
+        artifact_files.append(
+            {
+                "path": artifact_relative_path,
+                "sha256": artifact_digest,
+                "size_bytes": len(artifact_bytes),
+            }
+        )
     (cache_entry / "dependency-lock.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "sha256": lock_hash,
                 "dependencies": dependencies,
+                "artifacts": artifact_entries,
                 "files": [
+                    *artifact_files,
                     {
                         "path": "site-packages/dependency_cache_marker.py",
                         "sha256": hashlib.sha256(marker_bytes).hexdigest(),

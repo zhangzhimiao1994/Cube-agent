@@ -122,6 +122,13 @@ def _dependency_cache_entry_matches(
         or not _dependency_cache_files_match(entry_dir, files)
     ):
         return False
+    artifacts = payload.get("artifacts")
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or not _dependency_cache_artifacts_match(lock, artifacts, files)
+    ):
+        return False
     expected_dependencies: list[dict[str, str]] = [
         {
             "kind": dependency.kind,
@@ -136,6 +143,58 @@ def _dependency_cache_entry_matches(
         and payload.get("sha256") == lock.sha256
         and dependencies == expected_dependencies
     )
+
+
+def _dependency_cache_artifacts_match(
+    lock: PluginPackageDependencyLock,
+    artifacts: Sequence[object],
+    files: Sequence[object],
+) -> bool:
+    artifact_files = {
+        cast(str, item["path"]): item
+        for item in files
+        if isinstance(item, dict) and type(item.get("path")) is str
+    }
+    expected_dependencies = {
+        dependency.allowlist_key: dependency for dependency in lock.dependencies
+    }
+    seen_dependencies: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return False
+        kind = item.get("kind")
+        source = item.get("source")
+        name = item.get("name")
+        version = item.get("version")
+        raw_path = item.get("path")
+        sha256 = item.get("sha256")
+        size_bytes = item.get("size_bytes")
+        if (
+            type(kind) is not str
+            or type(source) is not str
+            or type(name) is not str
+            or type(version) is not str
+            or type(raw_path) is not str
+            or type(sha256) is not str
+            or type(size_bytes) is not int
+        ):
+            return False
+        normalized_name = normalize_plugin_package_dependency_name(name)
+        dependency_key = f"{kind}:{source}:{normalized_name}=={version}"
+        expected_dependency = expected_dependencies.get(dependency_key)
+        if expected_dependency is None or dependency_key in seen_dependencies:
+            return False
+        seen_dependencies.add(dependency_key)
+        expected_file = artifact_files.get(raw_path)
+        if expected_file is None:
+            return False
+        if (
+            expected_file.get("sha256") != sha256
+            or expected_file.get("size_bytes") != size_bytes
+            or not _dependency_cache_manifest_path_valid(raw_path)
+        ):
+            return False
+    return seen_dependencies == set(expected_dependencies)
 
 
 def _dependency_cache_files_match(
@@ -157,16 +216,10 @@ def _dependency_cache_files_match(
             or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None
         ):
             return False
-        if "\\" in raw_path:
+        if not _dependency_cache_manifest_path_valid(raw_path):
             return False
         file_path = PurePosixPath(raw_path)
-        if (
-            not file_path.parts
-            or file_path.is_absolute()
-            or any(part in {"", ".", ".."} for part in file_path.parts)
-            or file_path == PurePosixPath("dependency-lock.json")
-            or file_path in listed_paths
-        ):
+        if file_path in listed_paths:
             return False
         listed_paths.add(file_path)
         candidate = entry_dir.joinpath(*file_path.parts)
@@ -185,6 +238,18 @@ def _dependency_cache_files_match(
         if _sha256_file(candidate) != expected_sha256:
             return False
     return listed_paths == _dependency_cache_entry_file_paths(entry_dir)
+
+
+def _dependency_cache_manifest_path_valid(raw_path: str) -> bool:
+    if "\\" in raw_path:
+        return False
+    file_path = PurePosixPath(raw_path)
+    return not (
+        not file_path.parts
+        or file_path.is_absolute()
+        or any(part in {"", ".", ".."} for part in file_path.parts)
+        or file_path == PurePosixPath("dependency-lock.json")
+    )
 
 
 def _dependency_cache_entry_file_paths(entry_dir: Path) -> set[PurePosixPath]:
