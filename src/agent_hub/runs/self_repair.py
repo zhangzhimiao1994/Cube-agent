@@ -19,6 +19,7 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
+from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
 
 _FAILURE_KINDS = frozenset({EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED})
 _REPAIR_EVENT_KINDS = frozenset({"repair.classified", "repair.skipped"})
@@ -58,6 +59,7 @@ _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
         "planned capability is unavailable",
     }
 )
+_RECOVERY_BLOCKED_MARKERS = frozenset({RECOVERY_BLOCKED_FAILURE_REASON})
 _SENSITIVE_TEXT_PATTERN = re.compile(
     r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
     re.IGNORECASE,
@@ -519,6 +521,8 @@ def _failure_category(event: RunEvent) -> str:
         return "empty_model_response"
     if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
         return "model_capability_routing_unavailable"
+    if _contains_marker(text, _RECOVERY_BLOCKED_MARKERS):
+        return "runtime_recovery_blocked"
     if _contains_marker(text, _CAPACITY_MARKERS):
         return "capacity_pressure"
     if event.kind is EventKind.TOOL_FAILED:

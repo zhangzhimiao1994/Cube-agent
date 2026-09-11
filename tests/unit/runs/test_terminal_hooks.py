@@ -24,6 +24,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
 from agent_hub.runtime.registry import RuntimeRegistry
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -1053,6 +1054,32 @@ def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None
     assert proposal is not None
     assert proposal["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert "secret" not in repr(proposal)
+
+
+def test_repair_classification_identifies_recovery_blocked_failure() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=3,
+                run_id=run_id,
+                reason=RECOVERY_BLOCKED_FAILURE_REASON,
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "runtime_recovery_blocked"
+    assert decision.recovery_strategy == "manual_review_recovery_checkpoint"
+    repair_event = decision.to_event(run_id=run_id, sequence=4)
+    assert repair_event.payload["failure_category"] == "runtime_recovery_blocked"
+    assert repair_event.payload["recovery_strategy"] == "manual_review_recovery_checkpoint"
 
 
 def test_repair_classification_uses_bounded_step_recovery_hint() -> None:
