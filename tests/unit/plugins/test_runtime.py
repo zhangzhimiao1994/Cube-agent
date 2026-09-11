@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -33,6 +34,7 @@ from agent_hub.plugins.contracts import (
     adapter_descriptor_with_contract,
     http_json_adapter_descriptor,
 )
+from agent_hub.plugins.dependency_policy import PluginPackageDependencyPolicy
 from agent_hub.plugins.runtime import (
     BubblewrapPluginPackageProcessLauncher,
     HttpJsonPluginAdapter,
@@ -517,6 +519,28 @@ def verified_package_with_artifact(
     )
 
 
+def write_dependency_cache_manifest(
+    cache_root: Path,
+    *,
+    lock_hash: str,
+    dependencies: list[dict[str, str]],
+) -> Path:
+    cache_entry = cache_root / lock_hash
+    cache_entry.mkdir(parents=True)
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": lock_hash,
+                "dependencies": dependencies,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return cache_entry
+
+
 def test_plugin_package_execution_target_resolves_artifact_entrypoint(
     tmp_path: Path,
 ) -> None:
@@ -663,6 +687,66 @@ def test_plugin_package_execution_target_rejects_package_dependencies_with_stabl
             package_store_dir=tmp_path,
         )
     assert str(exc_info.value) == PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON
+
+
+def test_plugin_package_execution_target_allows_ready_offline_dependency_cache(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    artifact_root = tmp_path / "packages" / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    dependency_root = write_dependency_cache_manifest(
+        tmp_path / "dependency-cache",
+        lock_hash=lock_hash,
+        dependencies=[
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            }
+        ],
+    )
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    ).model_copy(
+        update={
+            "activation_state": "eligible",
+            "activation_reason": None,
+            "dependencies": (
+                PluginPackageDependency(name="Requests", version="2.32.0"),
+            ),
+        }
+    )
+
+    resource = plugin(
+        "calendar",
+        adapter="calendar_python",
+        sandbox_profile="local_process",
+        package_metadata=verified_package_with_artifact(
+            content_sha256=content_sha256,
+            storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+        ),
+        content_sha256=content_sha256,
+    ).model_copy(update={"package_metadata": package_metadata})
+
+    target = _plugin_package_execution_target(
+        resource,
+        tenant_id=TENANT_ID,
+        package_store_dir=tmp_path / "packages",
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path / "dependency-cache",
+        ),
+    )
+
+    assert target.root == artifact_root
+    assert target.entrypoint == artifact_root / "adapter" / "main.py"
+    assert target.dependency_root == dependency_root
 
 
 def test_plugin_package_execution_target_rejects_missing_artifact_directory(
@@ -862,6 +946,85 @@ async def test_plugin_package_adapter_invokes_runner_with_execution_target(
         {"title": "review"},
         context,
     )
+
+
+async def test_plugin_package_adapter_passes_ready_dependency_cache_to_runner(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    package_store_dir = tmp_path / "packages"
+    artifact_root = package_store_dir / str(TENANT_ID) / "calendar" / content_sha256
+    (artifact_root / "adapter").mkdir(parents=True)
+    (artifact_root / "adapter" / "main.py").write_text("def invoke():\n    return {}\n")
+    lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
+    dependency_root = write_dependency_cache_manifest(
+        tmp_path / "dependency-cache",
+        lock_hash=lock_hash,
+        dependencies=[
+            {
+                "kind": "python",
+                "source": "pypi",
+                "name": "requests",
+                "version": "2.32.0",
+            }
+        ],
+    )
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    ).model_copy(
+        update={
+            "activation_state": "eligible",
+            "activation_reason": None,
+            "dependencies": (
+                PluginPackageDependency(name="Requests", version="2.32.0"),
+            ),
+        }
+    )
+    runner = RecordingPluginPackageRunner(calls=[], result={"ok": True})
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=package_store_dir,
+        runner=runner,
+        dependency_policy=PluginPackageDependencyPolicy(
+            install_policy="offline_cache",
+            allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+            cache_dir=tmp_path / "dependency-cache",
+        ),
+    )
+    context = PluginInvocationContext(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="tester",
+        idempotency_key="invoke-1",
+    )
+    resource = plugin(
+        "calendar",
+        adapter="calendar_python",
+        sandbox_profile="local_process",
+        package_metadata=verified_package_with_artifact(
+            content_sha256=content_sha256,
+            storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+        ),
+        content_sha256=content_sha256,
+    ).model_copy(update={"package_metadata": package_metadata})
+
+    result = await adapter.invoke(
+        plugin=resource,
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="local_process",
+        ),
+        arguments={"title": "review"},
+        context=context,
+    )
+
+    assert result == {"ok": True}
+    assert runner.calls[0][0].root == artifact_root
+    assert runner.calls[0][0].dependency_root == dependency_root
 
 
 async def test_plugin_package_adapter_fails_closed_before_runner_when_target_invalid(
@@ -1408,6 +1571,57 @@ async def test_python_subprocess_plugin_package_runner_sends_stable_json_request
     }
 
 
+async def test_python_subprocess_plugin_package_runner_imports_dependency_cache(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    dependency_root = tmp_path / "dependency-cache"
+    entrypoint = package_root / "adapter" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    dependency_root.mkdir()
+    (dependency_root / "offline_dep.py").write_text(
+        "VALUE = 'from-offline-cache'\n",
+        encoding="utf-8",
+    )
+    entrypoint.write_text(
+        "import json\n"
+        "import sys\n"
+        "import offline_dep\n"
+        "json.load(sys.stdin)\n"
+        "json.dump({'value': offline_dep.VALUE}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(
+            root=package_root,
+            entrypoint=entrypoint,
+            dependency_root=dependency_root,
+        ),
+        plugin=plugin("calendar", adapter="calendar_python"),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="local_process",
+        ),
+        arguments={"title": "x"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert result == {"value": "from-offline-cache"}
+
+
 async def test_python_subprocess_plugin_package_runner_uses_package_root_and_minimal_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1816,6 +2030,7 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     tmp_path: Path,
 ) -> None:
     package_root = tmp_path / "package"
+    dependency_root = tmp_path / "dependency-cache"
     runtime_root = tmp_path / "python-runtime"
     entrypoint = package_root / "adapter" / "main.py"
     launcher = BubblewrapPluginPackageProcessLauncher(
@@ -1825,12 +2040,17 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
 
     argv = launcher.argv(
         python_executable=str(runtime_root / "bin" / "python"),
-        target=PluginPackageExecutionTarget(root=package_root, entrypoint=entrypoint),
+        target=PluginPackageExecutionTarget(
+            root=package_root,
+            entrypoint=entrypoint,
+            dependency_root=dependency_root,
+        ),
     )
 
     assert argv[0] == str(tmp_path / "bwrap")
     assert "--unshare-net" in argv
     assert _argv_contains_ordered_pair(argv, "--ro-bind", package_root, package_root)
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", dependency_root, dependency_root)
     assert _argv_contains_ordered_pair(argv, "--ro-bind", runtime_root, runtime_root)
     assert _argv_contains_ordered_args(argv, ("--dev", "/dev"))
     assert _argv_contains_ordered_args(argv, ("--proc", "/proc"))
@@ -1838,11 +2058,10 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
         argv,
         ("--ro-bind", str(package_root), str(package_root)),
     )
-    assert argv[-3:] == (
-        str(runtime_root / "bin" / "python"),
-        "-I",
-        str(entrypoint),
-    )
+    assert argv[-6] == str(runtime_root / "bin" / "python")
+    assert argv[-5] == "-I"
+    assert argv[-4] == "-c"
+    assert argv[-2:] == (str(dependency_root), str(entrypoint))
 
 
 def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
@@ -2031,6 +2250,32 @@ def test_build_plugin_package_subprocess_adapters_requires_existing_launcher_fil
     )
 
 
+def test_build_plugin_package_subprocess_adapters_accepts_dependency_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    dependency_policy = PluginPackageDependencyPolicy(
+        install_policy="offline_cache",
+        allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+        cache_dir=tmp_path / "dependency-cache",
+    )
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.name", "posix")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.access", lambda path, mode: True)
+
+    adapters = build_plugin_package_subprocess_adapters(
+        enabled=True,
+        adapter_ids=("calendar_python",),
+        package_store_dir=tmp_path,
+        isolation_backend="bubblewrap",
+        bubblewrap_executable=bubblewrap_executable,
+        dependency_policy=dependency_policy,
+    )
+
+    assert cast(Any, adapters["calendar_python"])._dependency_policy is dependency_policy
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX executable bit only")
 def test_build_plugin_package_subprocess_adapters_requires_executable_launcher(
     tmp_path: Path,
@@ -2058,6 +2303,11 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
     bubblewrap_executable = tmp_path / "bwrap"
     bubblewrap_executable.write_text("")
     bubblewrap_executable.chmod(0o755)
+    dependency_policy = PluginPackageDependencyPolicy(
+        install_policy="offline_cache",
+        allowlist=frozenset({"python:pypi:requests==2.32.0"}),
+        cache_dir=tmp_path / "dependency-cache",
+    )
 
     adapters = build_plugin_package_subprocess_adapters(
         enabled=True,
@@ -2067,9 +2317,11 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
         bubblewrap_executable=bubblewrap_executable,
         timeout_seconds=1,
         max_stdout_bytes=1024,
+        dependency_policy=dependency_policy,
     )
 
     assert tuple(adapters) == ("calendar_python", "crm-python")
+    assert cast(Any, adapters["calendar_python"])._dependency_policy is dependency_policy
     calendar_descriptor = cast(Any, adapters["calendar_python"]).descriptor()
     assert calendar_descriptor["id"] == "calendar_python"
     capability_schema = cast(Mapping[str, object], calendar_descriptor["capability_schema"])

@@ -4911,7 +4911,26 @@ def test_capability_manifest_projects_offline_dependency_policy_for_scan_only_pa
     tmp_path: Path,
 ) -> None:
     dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.31.0\n").hexdigest()
-    (tmp_path / dependency_lock_hash).mkdir()
+    cache_entry = tmp_path / dependency_lock_hash
+    cache_entry.mkdir()
+    (cache_entry / "dependency-lock.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sha256": dependency_lock_hash,
+                "dependencies": [
+                    {
+                        "kind": "python",
+                        "source": "pypi",
+                        "name": "requests",
+                        "version": "2.31.0",
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     api = client_with_settings(
         Settings.model_validate(
             {

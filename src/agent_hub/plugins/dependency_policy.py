@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -57,7 +58,8 @@ class PluginPackageDependencyPolicy:
             return ("not_configured", "missing", "missing")
         cache_status: PluginPackageDependencyCacheStatus = (
             "present"
-            if self.cache_dir is not None and (self.cache_dir / lock.sha256).is_dir()
+            if self.cache_dir is not None
+            and _dependency_cache_entry_matches(self.cache_dir, lock)
             else "missing"
         )
         dependency_keys = frozenset(dependency.allowlist_key for dependency in lock.dependencies)
@@ -91,6 +93,41 @@ def plugin_package_dependency_policy_from_settings(
         install_policy=install_policy,
         allowlist=normalized_allowlist,
         cache_dir=cache_dir if isinstance(cache_dir, Path) else None,
+    )
+
+
+def _dependency_cache_entry_matches(
+    cache_dir: Path,
+    lock: PluginPackageDependencyLock,
+) -> bool:
+    entry_dir = cache_dir / lock.sha256
+    if not entry_dir.is_dir():
+        return False
+    manifest_path = entry_dir / "dependency-lock.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    dependencies = payload.get("dependencies")
+    if not isinstance(dependencies, list):
+        return False
+    expected_dependencies: list[dict[str, str]] = [
+        {
+            "kind": dependency.kind,
+            "source": dependency.source,
+            "name": dependency.name,
+            "version": dependency.version,
+        }
+        for dependency in lock.dependencies
+    ]
+    return (
+        payload.get("schema_version") == 1
+        and payload.get("sha256") == lock.sha256
+        and dependencies == expected_dependencies
     )
 
 

@@ -652,6 +652,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     assert adapter_kwargs["timeout_seconds"] == 1
     assert adapter_kwargs["max_stdin_bytes"] == 2048
     assert adapter_kwargs["max_stdout_bytes"] == 1024
+    assert adapter_kwargs["dependency_policy"] is dependency_policy
     assert (
         application.state.plugin_package_subprocess_registration_status
         == "launcher_not_found"

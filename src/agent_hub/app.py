@@ -986,12 +986,13 @@ def create_app(
                     application.state.plugin_package_subprocess_registration_status = (
                         plugin_package_subprocess_registration_status
                     )
+                    plugin_dependency_policy = (
+                        plugin_package_dependency_policy_from_settings(configured)
+                    )
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,
-                        dependency_policy=plugin_package_dependency_policy_from_settings(
-                            configured
-                        ),
+                        dependency_policy=plugin_dependency_policy,
                         adapters=build_plugin_package_subprocess_adapters(
                             enabled=configured.plugin_package_subprocess_runner_enabled,
                             adapter_ids=tuple(
@@ -1013,6 +1014,7 @@ def create_app(
                             max_stdout_bytes=(
                                 configured.plugin_package_subprocess_max_stdout_bytes
                             ),
+                            dependency_policy=plugin_dependency_policy,
                         ),
                     )
                     application.state.plugin_service = runtime_plugin_service

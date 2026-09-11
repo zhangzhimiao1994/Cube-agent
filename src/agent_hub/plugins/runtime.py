@@ -24,6 +24,7 @@ from agent_hub.api.routers.admin import (
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS,
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES,
     PluginCapabilityRequest,
+    PluginPackageMetadata,
     PluginResourceResponse,
 )
 from agent_hub.auth.models import Role
@@ -38,9 +39,19 @@ from agent_hub.plugins.contracts import (
     adapter_descriptor_with_contract,
     http_json_adapter_descriptor,
 )
-from agent_hub.plugins.dependency_policy import PluginPackageDependencyPolicy
+from agent_hub.plugins.dependency_policy import (
+    PluginPackageDependencyLike,
+    PluginPackageDependencyPolicy,
+    plugin_package_dependency_lock,
+)
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runtime.contracts import JsonValue, _freeze_object, _mutable_json
+
+_PLUGIN_PACKAGE_DEPENDENCY_BOOTSTRAP = (
+    "import runpy, sys; "
+    "sys.path.insert(0, sys.argv[1]); "
+    "runpy.run_path(sys.argv[2], run_name='__main__')"
+)
 
 
 class PluginConfigService(Protocol):
@@ -76,6 +87,7 @@ class PluginInvocationContext:
 class PluginPackageExecutionTarget:
     root: Path
     entrypoint: Path
+    dependency_root: Path | None = None
 
 
 class PluginAdapter(Protocol):
@@ -195,10 +207,12 @@ class PluginPackageAdapter:
         adapter_id: str,
         package_store_dir: Path,
         runner: PluginPackageRunner,
+        dependency_policy: PluginPackageDependencyPolicy | None = None,
     ) -> None:
         self._adapter_id = adapter_id
         self._package_store_dir = package_store_dir
         self._runner = runner
+        self._dependency_policy = dependency_policy
 
     async def invoke(
         self,
@@ -219,6 +233,7 @@ class PluginPackageAdapter:
             plugin,
             tenant_id=context.tenant_id,
             package_store_dir=self._package_store_dir,
+            dependency_policy=self._dependency_policy,
         )
         try:
             result = await self._runner.invoke(
@@ -257,7 +272,13 @@ class BubblewrapPluginPackageProcessLauncher:
         target: PluginPackageExecutionTarget,
     ) -> tuple[str, ...]:
         root = target.root
-        entrypoint = target.entrypoint
+        dependency_bind_args: tuple[str, ...] = ()
+        if target.dependency_root is not None:
+            dependency_bind_args = (
+                "--ro-bind",
+                str(target.dependency_root),
+                str(target.dependency_root),
+            )
         readonly_bind_paths = self._readonly_bind_paths or (
             _default_python_runtime_readonly_bind_paths(python_executable)
         )
@@ -279,6 +300,7 @@ class BubblewrapPluginPackageProcessLauncher:
             "--ro-bind",
             str(root),
             str(root),
+            *dependency_bind_args,
             *readonly_bind_args,
             "--dev",
             "/dev",
@@ -288,8 +310,7 @@ class BubblewrapPluginPackageProcessLauncher:
             str(root),
             "--",
             python_executable,
-            "-I",
-            str(entrypoint),
+            *_plugin_package_python_args(target),
         )
 
 
@@ -361,7 +382,7 @@ class PythonSubprocessPluginPackageRunner:
                 target=target,
             )
             if self._process_launcher is not None
-            else (self._python_executable, "-I", str(target.entrypoint))
+            else (self._python_executable, *_plugin_package_python_args(target))
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -441,6 +462,20 @@ def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
     if not target.entrypoint.is_file():
         raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
+    if target.dependency_root is not None and not target.dependency_root.is_dir():
+        raise RuntimeCapabilityError("Plugin dependency cache is unavailable")
+
+
+def _plugin_package_python_args(target: PluginPackageExecutionTarget) -> tuple[str, ...]:
+    if target.dependency_root is None:
+        return ("-I", str(target.entrypoint))
+    return (
+        "-I",
+        "-c",
+        _PLUGIN_PACKAGE_DEPENDENCY_BOOTSTRAP,
+        str(target.dependency_root),
+        str(target.entrypoint),
+    )
 
 
 class RuntimePluginService:
@@ -901,12 +936,15 @@ def _plugin_package_execution_target(
     *,
     tenant_id: UUID,
     package_store_dir: Path,
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> PluginPackageExecutionTarget:
     package = plugin.package_metadata
     if package is None or package.kind != "adapter_package":
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
-    if package.dependencies:
-        raise RuntimeCapabilityError(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+    dependency_root = _plugin_package_dependency_root(
+        package,
+        dependency_policy=dependency_policy,
+    )
     if (
         package.activation_state != "eligible"
         or package.install_mode != "runtime_registered"
@@ -943,7 +981,39 @@ def _plugin_package_execution_target(
     _ensure_runtime_path_inside(root, entrypoint)
     if not entrypoint.is_file():
         raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
-    return PluginPackageExecutionTarget(root=root, entrypoint=entrypoint)
+    return PluginPackageExecutionTarget(
+        root=root,
+        entrypoint=entrypoint,
+        dependency_root=dependency_root,
+    )
+
+
+def _plugin_package_dependency_root(
+    package: PluginPackageMetadata,
+    *,
+    dependency_policy: PluginPackageDependencyPolicy | None,
+) -> Path | None:
+    if not package.dependencies:
+        return None
+    if dependency_policy is None:
+        raise RuntimeCapabilityError(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+    dependency_lock = plugin_package_dependency_lock(
+        cast(Sequence[PluginPackageDependencyLike], package.dependencies)
+    )
+    if dependency_lock is None or dependency_policy.cache_dir is None:
+        raise RuntimeCapabilityError(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+    install_policy, cache_status, allowlist_status = dependency_policy.evaluate(
+        dependency_lock
+    )
+    if (
+        install_policy != "offline_cache"
+        or cache_status != "present"
+        or allowlist_status != "allowed"
+    ):
+        raise RuntimeCapabilityError(PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON)
+    dependency_root = dependency_policy.cache_dir / dependency_lock.sha256
+    _ensure_runtime_path_inside(dependency_policy.cache_dir, dependency_root)
+    return dependency_root
 
 
 def _ensure_runtime_path_inside(root: Path, path: Path) -> None:
@@ -1163,6 +1233,7 @@ def build_plugin_package_subprocess_adapters(
     timeout_seconds: float = 10.0,
     max_stdin_bytes: int = 262_144,
     max_stdout_bytes: int = 262_144,
+    dependency_policy: PluginPackageDependencyPolicy | None = None,
 ) -> dict[str, PluginAdapter]:
     if any(adapter_id == "http_json" for adapter_id in adapter_ids):
         raise ValueError("plugin package subprocess adapter id is reserved")
@@ -1191,6 +1262,7 @@ def build_plugin_package_subprocess_adapters(
             adapter_id=adapter_id,
             package_store_dir=package_store_dir,
             runner=runner,
+            dependency_policy=dependency_policy,
         )
         for adapter_id in adapter_ids
     }

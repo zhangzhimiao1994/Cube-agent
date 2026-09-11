@@ -264,10 +264,11 @@ def build_worker_service(
         admin_service=admin_service,
         run_repository=run_repository,
     )
+    plugin_dependency_policy = plugin_package_dependency_policy_from_settings(settings)
     runtime_plugin_service = RuntimePluginService(
         tenant_id=settings.bootstrap_tenant_id,
         admin_service=admin_service,
-        dependency_policy=plugin_package_dependency_policy_from_settings(settings),
+        dependency_policy=plugin_dependency_policy,
         adapters=build_plugin_package_subprocess_adapters(
             enabled=bool(
                 getattr(settings, "plugin_package_subprocess_runner_enabled", False)
@@ -299,6 +300,7 @@ def build_worker_service(
             max_stdout_bytes=int(
                 getattr(settings, "plugin_package_subprocess_max_stdout_bytes", 262_144)
             ),
+            dependency_policy=plugin_dependency_policy,
         ),
     )
     runtime_capability_stack = build_runtime_capability_stack(
