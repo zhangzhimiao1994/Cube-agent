@@ -15,8 +15,8 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from jsonschema import ValidationError
-from jsonschema.protocols import Validator
+from jsonschema import ValidationError  # type: ignore[import-untyped]
+from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import (
     PLUGIN_PACKAGE_DEPENDENCIES_UNSUPPORTED_REASON,
