@@ -97,6 +97,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
     assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
     assert 'securitySchemes", {}).get("BearerAuth")' in command
+    assert '"$acceptance_python_bin" - "$acceptance_openapi_file" "$path" "$method"' in command
     assert 'if "401" not in responses or "403" not in responses:' in command
     assert 'check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get"' in command
     assert 'check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get"' in command

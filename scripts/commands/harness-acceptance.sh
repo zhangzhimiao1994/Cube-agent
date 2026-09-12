@@ -178,7 +178,7 @@ check_openapi_path() {
   local name="$1"
   local path="$2"
   local method="$3"
-  if "$acceptance_python_bin" "$acceptance_openapi_file" "$path" "$method" <<'PY'
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" "$path" "$method" <<'PY'
 import json
 import sys
 
