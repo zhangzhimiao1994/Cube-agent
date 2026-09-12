@@ -499,16 +499,16 @@ async def test_harness_tool_gateway_fails_mcp_closed_without_identity() -> None:
     assert runtime.calls == []
 
 
-async def test_harness_tool_gateway_falls_back_when_mcp_availability_fails() -> None:
-    runtime = FakeRuntimeCapabilityGateway(available=False)
+async def test_harness_tool_gateway_fails_mcp_envelope_closed_when_availability_fails() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
     mcp_backend = FailingAvailabilityMcpToolBackend()
     gateway = HarnessToolGateway(runtime, mcp_backend=mcp_backend)
 
     result = await gateway.invoke(TENANT_ID, mcp_request())
 
     assert result.status == "failed"
-    assert result.failure_reason == "tool unavailable"
-    assert [call[0] for call in runtime.calls] == ["available"]
+    assert result.failure_reason == "external tool unavailable"
+    assert runtime.calls == []
 
 
 async def test_harness_tool_gateway_routes_available_plugin_tool_through_policy() -> None:
@@ -723,16 +723,27 @@ async def test_harness_tool_gateway_fails_plugin_closed_without_identity() -> No
     assert runtime.calls == []
 
 
-async def test_harness_tool_gateway_falls_back_when_plugin_availability_fails() -> None:
-    runtime = FakeRuntimeCapabilityGateway(available=False)
+async def test_harness_tool_gateway_fails_plugin_envelope_closed_when_availability_fails() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
     plugin_backend = FailingAvailabilityPluginToolBackend()
     gateway = HarnessToolGateway(runtime, plugin_backend=plugin_backend)
 
     result = await gateway.invoke(TENANT_ID, plugin_request())
 
     assert result.status == "failed"
-    assert result.failure_reason == "tool unavailable"
-    assert [call[0] for call in runtime.calls] == ["available"]
+    assert result.failure_reason == "external tool unavailable"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_fails_plugin_envelope_closed_without_plugin_backend() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    gateway = HarnessToolGateway(runtime)
+
+    result = await gateway.invoke(TENANT_ID, plugin_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "external tool unavailable"
+    assert runtime.calls == []
 
 
 async def test_harness_tool_gateway_reports_plugin_validation_error_without_raw_arguments() -> None:

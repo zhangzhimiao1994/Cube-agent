@@ -124,6 +124,8 @@ class HarnessToolGateway:
             if mcp_backend is None and _may_route_to_plugin_backend(request)
             else None
         )
+        if _requires_external_backend(request) and mcp_backend is None and plugin_backend is None:
+            return self._failure(request, "external tool unavailable")
         sandbox_mismatch = _external_sandbox_mismatch(
             tenant_id,
             request,
@@ -414,6 +416,10 @@ _MCP_SANDBOX_PROFILES = frozenset({"mcp_remote", "mcp_stdio"})
 
 
 def _uses_external_envelope(request: HarnessToolCallRequest) -> bool:
+    return request.sandbox in _EXTERNAL_SANDBOX_PROFILES
+
+
+def _requires_external_backend(request: HarnessToolCallRequest) -> bool:
     return request.sandbox in _EXTERNAL_SANDBOX_PROFILES
 
 
