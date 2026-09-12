@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -87,6 +88,66 @@ class FakeRuntime:
             sequence=3,
             run_id=context.run_id,
             checkpoint=checkpoint,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("service persists checkpoint events directly")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored.append(checkpoint)
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class GatedTakeoverRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.checkpoint_saved = asyncio.Event()
+        self.release_stale_worker = asyncio.Event()
+        self.restored: list[RuntimeCheckpoint] = []
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.calls += 1
+        if context.checkpoint is not None:
+            yield RunEvent(
+                kind=EventKind.RUNTIME_COMPLETED,
+                sequence=2,
+                run_id=context.run_id,
+            )
+            return
+        checkpoint = RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type="gated-dispatch",
+            runtime_version="1",
+            run_id=context.run_id,
+            tenant_id=context.tenant_id,
+            mode=TaskMode.DISPATCH,
+            state={"completed_step_ids": ("prepare",)},
+        )
+        yield RunEvent(
+            kind=EventKind.CHECKPOINT_SAVED,
+            sequence=1,
+            run_id=context.run_id,
+            checkpoint=checkpoint,
+        )
+        self.checkpoint_saved.set()
+        await self.release_stale_worker.wait()
+        yield RunEvent(
+            kind=EventKind.TOOL_COMPLETED,
+            sequence=2,
+            run_id=context.run_id,
+            actor="tool",
+            tool_call_id="stale-tool",
+            tool_name="external_side_effect",
+            payload={"status": "completed"},
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=3,
+            run_id=context.run_id,
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -479,6 +540,56 @@ async def test_recover_refuses_running_run_with_unexpired_worker_lease(
     assert runtime.calls == 1
     assert runtime.restored == []
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
+
+
+async def test_expired_lease_takeover_drops_stale_worker_events_after_checkpoint_restore(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = GatedTakeoverRuntime()
+    repository = RunRepository(run_session_factory)
+    active_worker = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        worker_id="worker-active",
+        run_worker_lease_seconds=60,
+    )
+    recovery_worker = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        worker_id="worker-recovery",
+        run_worker_lease_seconds=60,
+    )
+    submitted = await active_worker.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="recover should drop stale worker events",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="tenant-stale-worker-key",
+    )
+
+    active_task = asyncio.create_task(active_worker.execute(submitted.id))
+    await asyncio.wait_for(runtime.checkpoint_saved.wait(), timeout=5)
+    await _expire_worker_lease(repository, submitted.id)
+
+    recovered = await recovery_worker.recover(submitted.id)
+    runtime.release_stale_worker.set()
+    stale_worker = await active_task
+    run = await recovery_worker.get(tenant_id, submitted.id)
+    events = await recovery_worker.events(tenant_id, submitted.id)
+
+    assert recovered.status is RunStatus.COMPLETED
+    assert stale_worker.status is RunStatus.COMPLETED
+    assert run.status is RunStatus.COMPLETED
+    assert runtime.calls == 2
+    assert len(runtime.restored) == 1
+    assert [event["kind"] for event in events].count("checkpoint.saved") == 1
+    assert [event["kind"] for event in events].count("runtime.completed") == 1
+    assert [event["kind"] for event in events].count("tool.completed") == 0
 
 
 async def test_recover_running_fails_safe_for_non_replayable_running_run(
