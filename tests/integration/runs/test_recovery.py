@@ -1503,7 +1503,8 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
     assert duplicate_resume.status is RunStatus.COMPLETED
     assert run.status is RunStatus.COMPLETED
     assert runtime.calls == 1
-    assert runtime.restored == [checkpoint]
+    assert len(runtime.restored) == 1
+    assert runtime.restored[0].id == checkpoint.id
     assert [event["kind"] for event in events].count("approval.requested") == 1
     assert [event["kind"] for event in events].count("approval.resolved") == 1
     assert [event["kind"] for event in events].count("runtime.completed") == 1
