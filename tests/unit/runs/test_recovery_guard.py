@@ -72,6 +72,36 @@ class _AcceptSelfRepairSessionFactory:
         return _AcceptSelfRepairSession(self._row)
 
 
+class _CapabilityApprovalSession(_FakeTransaction):
+    def __init__(self, row: _FakeRunRow, *, approved: bool) -> None:
+        self._row = row
+        self._approved = approved
+        self.scalar_calls = 0
+        self.added: list[object] = []
+        self.statements: list[object] = []
+
+    async def scalar(self, statement: object) -> object:
+        self.scalar_calls += 1
+        self.statements.append(statement)
+        if self.scalar_calls == 1:
+            return self._row
+        return uuid4() if self._approved else None
+
+    async def execute(self, statement: object) -> None:
+        self.statements.append(statement)
+
+    def add(self, item: object) -> None:
+        self.added.append(item)
+
+
+class _CapabilityApprovalSessionFactory:
+    def __init__(self, session: _CapabilityApprovalSession) -> None:
+        self._session = session
+
+    def __call__(self) -> _CapabilityApprovalSession:
+        return self._session
+
+
 class _ScalarRecordingSession:
     def __init__(self, responses: tuple[object, ...]) -> None:
         self._responses = list(responses)
@@ -282,6 +312,36 @@ async def test_accept_self_repair_records_current_event_sequence_as_recovery_bas
     assert record.routing_decision is not None
     assert record.routing_decision["self_repair_accepted"] is True
     assert record.routing_decision["self_repair_recovery_baseline_sequence"] == 3
+
+
+@pytest.mark.asyncio
+async def test_repeated_capability_approval_returns_record_without_duplicate_outbox() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="needs approved tool",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.approve_capability_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        approval_id="approval-1",
+        version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert session.added == []
 
 
 @pytest.mark.asyncio
