@@ -1743,13 +1743,15 @@ class RunService:
             now=datetime.now(UTC),
         ):
             try:
-                await self.recover(run_id)
+                recovered_run = await self.recover(run_id)
             except Exception as error:
                 _LOGGER.exception(
                     "run_recover_running_failed run_id=%s error_type=%s",
                     run_id,
                     type(error).__name__,
                 )
+                continue
+            if recovered_run.status is RunStatus.RUNNING:
                 continue
             recovered += 1
         return recovered
