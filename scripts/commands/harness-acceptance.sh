@@ -8,6 +8,8 @@ concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
 iterations="${AGENT_HUB_ACCEPTANCE_ITERATIONS:-10}"
 connect_timeout="${AGENT_HUB_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS:-5}"
 max_time="${AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS:-20}"
+retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
+retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
 failures=0
 
 usage() {
@@ -25,6 +27,8 @@ Options:
   --iterations N                 Requests per worker. Defaults to AGENT_HUB_ACCEPTANCE_ITERATIONS or 10.
   --connect-timeout SECONDS      Curl connect timeout. Defaults to 5.
   --max-time SECONDS             Curl total request timeout. Defaults to 20.
+  --retries N                    Attempts per smoke URL. Defaults to AGENT_HUB_ACCEPTANCE_RETRIES or 3.
+  --retry-delay SECONDS          Delay between URL attempts. Defaults to AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS or 2.
   --help                         Show this help.
 EOF
 }
@@ -59,6 +63,14 @@ while [[ $# -gt 0 ]]; do
       max_time="${2:?missing value for --max-time}"
       shift 2
       ;;
+    --retries)
+      retries="${2:?missing value for --retries}"
+      shift 2
+      ;;
+    --retry-delay)
+      retry_delay="${2:?missing value for --retry-delay}"
+      shift 2
+      ;;
     --help)
       usage
       exit 0
@@ -82,8 +94,8 @@ positive_int() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
-if ! positive_int "$concurrency" || ! positive_int "$iterations"; then
-  printf 'concurrency and iterations must be positive integers\n' >&2
+if ! positive_int "$concurrency" || ! positive_int "$iterations" || ! positive_int "$retries"; then
+  printf 'concurrency, iterations, and retries must be positive integers\n' >&2
   exit 2
 fi
 
@@ -98,17 +110,23 @@ check_url() {
   local name="$1"
   local path="$2"
   local expected="${3:-200}"
+  local attempt
   local status
-  if status="$(
-    curl --noproxy '*' \
-      --connect-timeout "$connect_timeout" \
-      --max-time "$max_time" \
-      -fsS -o /dev/null -w '%{http_code}' \
-      "$base_url$path"
-  )" && [[ "$status" == "$expected" ]]; then
-    printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
-    return 0
-  fi
+  for ((attempt = 1; attempt <= retries; attempt += 1)); do
+    if status="$(
+      curl --noproxy '*' \
+        --connect-timeout "$connect_timeout" \
+        --max-time "$max_time" \
+        -fsS -o /dev/null -w '%{http_code}' \
+        "$base_url$path"
+    )" && [[ "$status" == "$expected" ]]; then
+      printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$retries" ]]; then
+      sleep "$retry_delay"
+    fi
+  done
   printf 'fail: %s %s -> %s\n' "$name" "$path" "${status:-curl-error}"
   failures=$((failures + 1))
   return 1

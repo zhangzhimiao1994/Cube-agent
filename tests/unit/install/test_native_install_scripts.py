@@ -80,6 +80,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_ACCEPTANCE_BASE_URL" in command
     assert "AGENT_HUB_ACCEPTANCE_CONCURRENCY" in command
     assert "AGENT_HUB_ACCEPTANCE_ITERATIONS" in command
+    assert "AGENT_HUB_ACCEPTANCE_RETRIES" in command
+    assert "AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS" in command
+    assert "--retries N" in command
+    assert "--retry-delay SECONDS" in command
+    assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in command
 
 
 def test_native_installer_deploys_release_before_starting_services() -> None:
