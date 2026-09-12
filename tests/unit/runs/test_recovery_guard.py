@@ -463,6 +463,68 @@ async def test_repeated_capability_rejection_returns_cancelled_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_capability_approval_resolution_returns_record() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="runtime resumed after approved tool boundary",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.RUNNING.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.resolve_capability_approval(
+        row.tenant_id,
+        row.id,
+        RunStatus.RUNNING,
+        approval_id="approval-1",
+        approval_fingerprint="fingerprint-1",
+    )
+
+    assert record.status is RunStatus.RUNNING
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_capability_rejection_resolution_returns_record() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="runtime cancelled after rejected tool boundary",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=False, rejected=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.resolve_capability_approval(
+        row.tenant_id,
+        row.id,
+        RunStatus.CANCELLED,
+        approval_id="approval-1",
+        approval_fingerprint="fingerprint-1",
+    )
+
+    assert record.status is RunStatus.CANCELLED
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_temporary_agent_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(

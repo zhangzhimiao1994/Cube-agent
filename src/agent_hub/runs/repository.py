@@ -837,6 +837,15 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                if await self._capability_approval_has_status(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    approval_id=approval_id,
+                    approval_fingerprint=approval_fingerprint,
+                    status="approved" if status is RunStatus.RUNNING else "rejected",
+                ):
+                    return self._record(row)
                 raise RunConflict("run is not waiting for approval")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
             if (
@@ -948,6 +957,27 @@ class RunRepository:
                 RunApprovalRow.tenant_id == tenant_id,
                 RunApprovalRow.run_id == run_id,
                 RunApprovalRow.approval_id == approval_id,
+                RunApprovalRow.status == status,
+            )
+        )
+        return resolved_id is not None
+
+    @staticmethod
+    async def _capability_approval_has_status(
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        approval_fingerprint: str,
+        status: str,
+    ) -> bool:
+        resolved_id = await session.scalar(
+            select(RunApprovalRow.id).where(
+                RunApprovalRow.tenant_id == tenant_id,
+                RunApprovalRow.run_id == run_id,
+                RunApprovalRow.approval_id == approval_id,
+                RunApprovalRow.payload["approval_fingerprint"].astext == approval_fingerprint,
                 RunApprovalRow.status == status,
             )
         )
