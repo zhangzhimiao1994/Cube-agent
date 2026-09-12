@@ -293,6 +293,7 @@ run_codex_profile() {
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
+  check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
   check_url "openapi contract" "/openapi.json" || true
   check_url "management ui entry" "/login" || true
 }
@@ -303,6 +304,8 @@ run_deepseek_profile() {
   check_url "operator ui for plugin orchestration" "/login" || true
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
+  check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
+  check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
 }
 
 check_openapi_path() {
