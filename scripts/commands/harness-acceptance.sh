@@ -10,6 +10,8 @@ connect_timeout="${AGENT_HUB_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS:-5}"
 max_time="${AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS:-20}"
 retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
 retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
+bearer_token="${AGENT_HUB_ACCEPTANCE_BEARER_TOKEN:-}"
+run_message="${AGENT_HUB_ACCEPTANCE_RUN_MESSAGE:-Agent Hub harness acceptance run lifecycle probe}"
 failures=0
 
 usage() {
@@ -18,6 +20,9 @@ Usage: scripts/agent-hub harness-acceptance [options]
 
 Run non-destructive real-machine acceptance checks for Codex-style harness
 stability and DeepSeek-style pluggable harness goals.
+
+Set AGENT_HUB_ACCEPTANCE_BEARER_TOKEN to also run an authenticated
+create/read/events lifecycle probe against /api/v1/runs.
 
 Options:
   --base-url URL                 Base URL to test.
@@ -106,6 +111,30 @@ require_curl() {
   fi
 }
 
+detect_python() {
+  if [[ -n "${AGENT_HUB_ACCEPTANCE_PYTHON:-}" ]]; then
+    printf '%s\n' "$AGENT_HUB_ACCEPTANCE_PYTHON"
+    return 0
+  fi
+  local script_dir
+  local source_dir
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if [[ -x "$source_dir/.venv/bin/python" ]]; then
+    printf '%s\n' "$source_dir/.venv/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
 check_url() {
   local name="$1"
   local path="$2"
@@ -143,6 +172,81 @@ run_deepseek_profile() {
   check_url "plugin-safe openapi projection" "/openapi.json" || true
   check_url "operator ui for plugin orchestration" "/login" || true
   check_url "runtime readiness boundary" "/health/ready" || true
+}
+
+run_lifecycle_profile() {
+  local python_bin
+  local idempotency_key
+  local request_body
+  local response
+  local runs_path="/api/v1/runs"
+  local run_id
+  local run_path
+  local events_path
+
+  printf 'profile: authenticated run lifecycle\n'
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: run lifecycle probe requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! request_body="$(ACCEPTANCE_RUN_MESSAGE="$run_message" "$python_bin" -c 'import json, os; print(json.dumps({"message": os.environ["ACCEPTANCE_RUN_MESSAGE"], "mode": "direct", "sandbox_profile": "none", "requested_permissions": [], "skip_evolution_proposal": True}, ensure_ascii=False))')"; then
+    printf 'fail: could not build run lifecycle request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  idempotency_key="harness-acceptance-$(date +%s)-$$"
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $idempotency_key" \
+    -d "$request_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: run lifecycle create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! run_id="$(ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])')"; then
+    printf 'fail: run lifecycle create response did not include id\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  run_path="/api/v1/runs/$run_id"
+  events_path="/api/v1/runs/$run_id/events"
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS -o /dev/null \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url$run_path" 2>/dev/null; then
+    printf 'fail: run lifecycle read /api/v1/runs/%s\n' "$run_id" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS -o /dev/null \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url$events_path" 2>/dev/null; then
+    printf 'fail: run lifecycle events /api/v1/runs/%s/events\n' "$run_id" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
 }
 
 stress_worker() {
@@ -191,6 +295,7 @@ require_curl
 case "$profile" in
   codex)
     run_codex_profile
+    run_lifecycle_profile || true
     ;;
   deepseek)
     run_deepseek_profile
@@ -198,6 +303,7 @@ case "$profile" in
   all)
     run_codex_profile
     run_deepseek_profile
+    run_lifecycle_profile || true
     ;;
 esac
 

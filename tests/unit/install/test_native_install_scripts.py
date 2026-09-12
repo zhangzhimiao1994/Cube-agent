@@ -72,6 +72,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--stress" in command
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
+    assert "run_lifecycle_profile" in command
     assert "run_stress_profile" in command
     assert "/health/live" in command
     assert "/health/ready" in command
@@ -82,9 +83,16 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_ACCEPTANCE_ITERATIONS" in command
     assert "AGENT_HUB_ACCEPTANCE_RETRIES" in command
     assert "AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS" in command
+    assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+    assert "AGENT_HUB_ACCEPTANCE_RUN_MESSAGE" in command
     assert "--retries N" in command
     assert "--retry-delay SECONDS" in command
     assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in command
+    assert "Authorization: Bearer" in command
+    assert '"/api/v1/runs"' in command
+    assert '"/api/v1/runs/$run_id"' in command
+    assert '"/api/v1/runs/$run_id/events"' in command
+    assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 
 def test_native_installer_deploys_release_before_starting_services() -> None:
