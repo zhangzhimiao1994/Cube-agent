@@ -119,7 +119,7 @@ check_url() {
         --max-time "$max_time" \
         -fsS -o /dev/null -w '%{http_code}' \
         "$base_url$path"
-    )" && [[ "$status" == "$expected" ]]; then
+    2>/dev/null)" && [[ "$status" == "$expected" ]]; then
       printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
       return 0
     fi
@@ -157,7 +157,7 @@ stress_worker() {
         --connect-timeout "$connect_timeout" \
         --max-time "$max_time" \
         -fsS -o /dev/null \
-        "$base_url$path" || {
+        "$base_url$path" 2>/dev/null || {
           printf 'stress-fail: worker=%s iteration=%s path=%s\n' "$worker" "$index" "$path" >&2
           return 1
         }
