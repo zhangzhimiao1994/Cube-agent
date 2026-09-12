@@ -113,13 +113,11 @@ check_url() {
   local attempt
   local status
   for ((attempt = 1; attempt <= retries; attempt += 1)); do
-    if status="$(
-      curl --noproxy '*' \
-        --connect-timeout "$connect_timeout" \
-        --max-time "$max_time" \
-        -fsS -o /dev/null -w '%{http_code}' \
-        "$base_url$path"
-    2>/dev/null)" && [[ "$status" == "$expected" ]]; then
+    if status="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS -o /dev/null -w '%{http_code}' \
+      "$base_url$path" 2>/dev/null)" && [[ "$status" == "$expected" ]]; then
       printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
       return 0
     fi
