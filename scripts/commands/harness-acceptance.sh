@@ -285,6 +285,38 @@ PY
   return 1
 }
 
+check_openapi_safe_projection() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+serialized = json.dumps(document, ensure_ascii=False).lower()
+for sensitive in (
+    "password_hash",
+    "code_hash",
+    "ciphertext",
+    "nonce",
+    "private_key",
+    "secret_key_hash",
+    "encrypted_secret",
+    "chain_of_thought",
+    "hidden_reasoning",
+):
+    if sensitive in serialized:
+        raise SystemExit(1)
+PY
+  then
+    printf 'ok: openapi safe projection\n'
+    return 0
+  fi
+  printf 'fail: openapi safe projection\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
   check_url "api live health" "/health/live" || true
@@ -363,6 +395,7 @@ run_openapi_capability_profile() {
     failures=$((failures + 1))
     return 1
   fi
+  check_openapi_safe_projection || true
   check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
   check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
   check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post" || true

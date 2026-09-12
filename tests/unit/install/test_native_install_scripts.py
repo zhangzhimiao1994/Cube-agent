@@ -75,6 +75,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_health_json" in command
     assert "check_prometheus_metrics" in command
     assert "check_protected_boundary" in command
+    assert "check_openapi_safe_projection" in command
     assert "check_openapi_model_capability_schema" in command
     assert "run_lifecycle_profile" in command
     assert "run_openapi_capability_profile" in command
@@ -107,6 +108,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'securitySchemes", {}).get("BearerAuth")' in command
     assert '"$acceptance_python_bin" - "$acceptance_openapi_file" "$path" "$method"' in command
     assert 'if "401" not in responses or "403" not in responses:' in command
+    assert '"password_hash"' in command
+    assert '"chain_of_thought"' in command
+    assert "fail: openapi safe projection" in command
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command
     assert 'check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post"' in command
     assert 'check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get"' in command
