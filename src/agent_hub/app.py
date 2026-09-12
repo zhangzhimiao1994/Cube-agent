@@ -724,13 +724,38 @@ def _runtime_reload_with_invalidation(
     reload_config: RuntimeReloadCallback,
     bus: RuntimeConfigInvalidationBus,
     target: RuntimeConfigInvalidationTarget,
+    config_service: CurrentConfigService | None = None,
 ) -> RuntimeReloadCallback:
     async def reload_and_publish(tenant_id: UUID | None = None) -> None:
         await reload_config(tenant_id)
         if tenant_id is not None:
-            await bus.publish(tenant_id, target)
+            await bus.publish(
+                tenant_id,
+                target,
+                config_version=await _current_config_version(config_service, tenant_id),
+            )
 
     return reload_and_publish
+
+
+async def _current_config_version(
+    config_service: CurrentConfigService | None,
+    tenant_id: UUID,
+) -> int | None:
+    if config_service is None:
+        return None
+    try:
+        current = await config_service.get_current(tenant_id)
+    except Exception as error:  # noqa: BLE001 - invalidation still works without a watermark.
+        _LOGGER.warning(
+            "runtime_config_invalidation_version_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return None
+    version = getattr(current, "version", None)
+    if type(version) is int and version >= 1:
+        return version
+    return None
 
 
 async def _run_runtime_config_invalidation_listener(
@@ -965,6 +990,12 @@ def create_app(
                                 cast(RuntimeReloadCallback, reload_mcp_runtime_config),
                                 runtime_config_invalidation_bus,
                                 RuntimeConfigInvalidationTarget.MCP,
+                                cast(
+                                    CurrentConfigService,
+                                    config_service
+                                    if config_service is not None
+                                    else application.state.config_service,
+                                ),
                             )
                         )
                     plugin_package_subprocess_registration_status = (
@@ -1029,6 +1060,12 @@ def create_app(
                                 cast(RuntimeReloadCallback, reload_plugin_runtime_config),
                                 runtime_config_invalidation_bus,
                                 RuntimeConfigInvalidationTarget.PLUGIN,
+                                cast(
+                                    CurrentConfigService,
+                                    config_service
+                                    if config_service is not None
+                                    else application.state.config_service,
+                                ),
                             )
                         )
                     runtime_config_invalidation_task = asyncio.create_task(

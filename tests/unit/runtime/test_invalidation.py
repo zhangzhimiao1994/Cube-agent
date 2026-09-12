@@ -166,6 +166,30 @@ async def test_runtime_invalidation_bus_records_durable_stream_entry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_invalidation_bus_records_config_version_watermark() -> None:
+    redis = FakeRedis()
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="api-1",
+    )
+
+    await bus.publish(
+        TENANT_ID,
+        RuntimeConfigInvalidationTarget.ALL,
+        config_version=7,
+    )
+
+    stream_payload = json.loads(redis.stream_entries[0][1]["payload"])
+    pubsub_payload = json.loads(redis.published[0][1])
+    assert stream_payload == pubsub_payload
+    assert stream_payload["tenant_id"] == str(TENANT_ID)
+    assert stream_payload["target"] == "all"
+    assert stream_payload["config_version"] == 7
+
+
+@pytest.mark.asyncio
 async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsub() -> None:
     redis = FakeRedis()
     redis.stream_replay_entries = [
@@ -206,6 +230,93 @@ async def test_runtime_invalidation_listener_replays_stream_entries_before_pubsu
     ]
     assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
     assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1-0",))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_falls_back_when_first_watermark_is_not_initial() -> None:
+    redis = FakeRedis()
+    redis.stream_replay_entries = [
+        (
+            "1670000000000-0",
+            {
+                "payload": json.dumps(
+                    {
+                        "config_version": 5,
+                        "event_id": "event-5",
+                        "source_instance_id": "api-2",
+                        "tenant_id": str(OTHER_TENANT_ID),
+                        "target": "plugin",
+                    }
+                )
+            },
+        )
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert redis.acked == [("runtime:test:stream", "worker-runtime-1", ("1670000000000-0",))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidation_listener_uses_target_reload_for_contiguous_watermarks() -> None:
+    def payload(version: int, target: str, event_id: str) -> dict[str, str]:
+        return {
+            "payload": json.dumps(
+                {
+                    "config_version": version,
+                    "event_id": event_id,
+                    "source_instance_id": "api-2",
+                    "tenant_id": str(OTHER_TENANT_ID),
+                    "target": target,
+                }
+            )
+        }
+
+    redis = FakeRedis()
+    redis.stream_replay_entries = [
+        ("1670000000000-0", payload(1, "mcp", "event-1")),
+        ("1670000000001-0", payload(2, "plugin", "event-2")),
+    ]
+    bus = RuntimeConfigInvalidationBus(
+        redis,
+        channel="runtime:test",
+        stream="runtime:test:stream",
+        source_instance_id="worker-1",
+    )
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    await bus.listen(
+        mcp_runtime=mcp_runtime,
+        plugin_runtime=plugin_runtime,
+        stream_consumer_group="worker-runtime-1",
+        stream_consumer_name="worker-1",
+    )
+
+    assert mcp_runtime.reloaded == [OTHER_TENANT_ID]
+    assert plugin_runtime.reloaded == [OTHER_TENANT_ID]
+    assert redis.acked == [
+        (
+            "runtime:test:stream",
+            "worker-runtime-1",
+            ("1670000000000-0", "1670000000001-0"),
+        )
+    ]
 
 
 @pytest.mark.asyncio

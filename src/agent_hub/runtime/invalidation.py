@@ -91,14 +91,21 @@ class RuntimeConfigInvalidationBus:
         self,
         tenant_id: UUID,
         target: RuntimeConfigInvalidationTarget,
+        *,
+        config_version: int | None = None,
     ) -> None:
+        if config_version is not None and (type(config_version) is not int or config_version < 1):
+            raise ValueError("config_version must be a positive integer or None")
+        payload_data: dict[str, object] = {
+            "event_id": str(uuid4()),
+            "source_instance_id": self._source_instance_id,
+            "target": target.value,
+            "tenant_id": str(tenant_id),
+        }
+        if config_version is not None:
+            payload_data["config_version"] = config_version
         payload = json.dumps(
-            {
-                "event_id": str(uuid4()),
-                "source_instance_id": self._source_instance_id,
-                "target": target.value,
-                "tenant_id": str(tenant_id),
-            },
+            payload_data,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -122,6 +129,9 @@ class RuntimeConfigInvalidationBus:
         max_stream_replay_messages: int = 128,
         reload_on_empty_stream_replay: bool = False,
     ) -> None:
+        seen_event_ids: set[str] = set()
+        seen_event_order: deque[str] = deque()
+        seen_config_versions: dict[UUID, int] = {}
         if stream_consumer_group is not None:
             replayed = await self._replay_stream(
                 mcp_runtime=mcp_runtime,
@@ -129,6 +139,7 @@ class RuntimeConfigInvalidationBus:
                 stream_consumer_group=stream_consumer_group,
                 stream_consumer_name=stream_consumer_name,
                 max_stream_replay_messages=max_stream_replay_messages,
+                seen_config_versions=seen_config_versions,
             )
             if not replayed and reload_on_empty_stream_replay:
                 await self._reload_target(
@@ -139,8 +150,6 @@ class RuntimeConfigInvalidationBus:
                 )
         pubsub = self._redis.pubsub()
         handled = 0
-        seen_event_ids: set[str] = set()
-        seen_event_order: deque[str] = deque()
         try:
             await pubsub.subscribe(self._channel)
             async for message in pubsub.listen():
@@ -150,6 +159,7 @@ class RuntimeConfigInvalidationBus:
                     plugin_runtime=plugin_runtime,
                     seen_event_ids=seen_event_ids,
                     seen_event_order=seen_event_order,
+                    seen_config_versions=seen_config_versions,
                 ):
                     continue
                 handled += 1
@@ -168,6 +178,7 @@ class RuntimeConfigInvalidationBus:
         stream_consumer_group: str,
         stream_consumer_name: str | None,
         max_stream_replay_messages: int,
+        seen_config_versions: dict[UUID, int],
     ) -> bool:
         if self._stream is None:
             return False
@@ -209,6 +220,7 @@ class RuntimeConfigInvalidationBus:
                 stream_consumer_group=stream_consumer_group,
                 seen_event_ids=seen_event_ids,
                 seen_event_order=seen_event_order,
+                seen_config_versions=seen_config_versions,
             )
             replayed = replayed or handled
             failed_replay = failed_replay or failed
@@ -231,6 +243,7 @@ class RuntimeConfigInvalidationBus:
                 stream_consumer_group=stream_consumer_group,
                 seen_event_ids=seen_event_ids,
                 seen_event_order=seen_event_order,
+                seen_config_versions=seen_config_versions,
             )
             pending_entries_read += entries_read
             replayed = replayed or handled
@@ -249,6 +262,7 @@ class RuntimeConfigInvalidationBus:
         stream_consumer_group: str,
         seen_event_ids: set[str],
         seen_event_order: deque[str],
+        seen_config_versions: dict[UUID, int],
     ) -> tuple[int, bool, bool]:
         entries_read = 0
         handled_any = False
@@ -267,6 +281,7 @@ class RuntimeConfigInvalidationBus:
                     plugin_runtime=plugin_runtime,
                     seen_event_ids=seen_event_ids,
                     seen_event_order=seen_event_order,
+                    seen_config_versions=seen_config_versions,
                 )
                 if handled:
                     handled_any = True
@@ -285,6 +300,7 @@ class RuntimeConfigInvalidationBus:
         plugin_runtime: ReloadableRuntime | None,
         seen_event_ids: set[str],
         seen_event_order: deque[str],
+        seen_config_versions: dict[UUID, int],
     ) -> bool:
         if not isinstance(message, dict) or message.get("type") != "message":
             return False
@@ -294,6 +310,7 @@ class RuntimeConfigInvalidationBus:
             target = RuntimeConfigInvalidationTarget(str(payload["target"]))
             event_id = _optional_safe_identifier(payload.get("event_id"))
             source_instance_id = _optional_safe_identifier(payload.get("source_instance_id"))
+            config_version = _optional_positive_int(payload.get("config_version"))
         except Exception as error:  # noqa: BLE001 - bad invalidation messages are ignored.
             _LOGGER.warning(
                 "runtime_config_invalidation_message_invalid error_type=%s",
@@ -304,12 +321,38 @@ class RuntimeConfigInvalidationBus:
             return True
         if event_id is not None and event_id in seen_event_ids:
             return True
+        if config_version is not None and _config_watermark_has_gap(
+            tenant_id,
+            config_version,
+            seen_config_versions,
+        ):
+            reloaded = await self._reload_target(
+                tenant_id,
+                RuntimeConfigInvalidationTarget.ALL,
+                mcp_runtime=mcp_runtime,
+                plugin_runtime=plugin_runtime,
+            )
+            if reloaded:
+                seen_config_versions[tenant_id] = config_version
+                if event_id is not None:
+                    _remember_seen_event_id(
+                        event_id,
+                        seen_event_ids,
+                        seen_event_order,
+                        max_seen_event_ids=self._max_seen_event_ids,
+                    )
+            return reloaded
         reloaded = await self._reload_target(
             tenant_id,
             target,
             mcp_runtime=mcp_runtime,
             plugin_runtime=plugin_runtime,
         )
+        if config_version is not None and reloaded:
+            seen_config_versions[tenant_id] = max(
+                config_version,
+                seen_config_versions.get(tenant_id, 0),
+            )
         if event_id is not None and reloaded:
             _remember_seen_event_id(
                 event_id,
@@ -354,6 +397,23 @@ def _optional_safe_identifier(value: object) -> str | None:
     ):
         return value
     return None
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if type(value) is int and value >= 1:
+        return value
+    return None
+
+
+def _config_watermark_has_gap(
+    tenant_id: UUID,
+    config_version: int,
+    seen_config_versions: dict[UUID, int],
+) -> bool:
+    previous = seen_config_versions.get(tenant_id)
+    if previous is None:
+        return config_version > 1
+    return config_version > previous + 1
 
 
 def _optional_safe_stream_name(value: object) -> str | None:

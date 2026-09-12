@@ -665,17 +665,56 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
 ) -> None:
     captured: dict[str, object] = {"mcp_reloads": [], "plugin_reloads": []}
 
+    class VersionedConfigService:
+        async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
+            return ConfigRevision(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                version=3,
+                status=ConfigStatus.PUBLISHED,
+                document={
+                    "models": {
+                        "main": {
+                            "deployments": [
+                                {
+                                    "provider": "deepseek",
+                                    "model": "deepseek-chat",
+                                    "credential_ref": "secret://deepseek",
+                                    "capabilities": ["text"],
+                                }
+                            ]
+                        }
+                    },
+                    "agents": [
+                        {
+                            "id": "main-agent",
+                            "role": "Main Agent",
+                            "prompt": "Help with coding work.",
+                            "model": "main",
+                        }
+                    ],
+                },
+                created_by=tenant_id,
+                created_at=datetime.now(UTC),
+            )
+
     class FakeInvalidationBus:
         instances: ClassVar[list["FakeInvalidationBus"]] = []
 
         def __init__(self, redis_client: object) -> None:
             self.redis_client = redis_client
-            self.published: list[tuple[UUID, str]] = []
+            self.published: list[tuple[UUID, str, int | None]] = []
             self.listen_kwargs: dict[str, object] | None = None
             FakeInvalidationBus.instances.append(self)
 
-        async def publish(self, tenant_id: UUID, target: object) -> None:
-            self.published.append((tenant_id, str(target)))
+        async def publish(
+            self,
+            tenant_id: UUID,
+            target: object,
+            *,
+            config_version: int | None = None,
+        ) -> None:
+            self.published.append((tenant_id, str(target), config_version))
 
         async def listen(self, **kwargs: object) -> None:
             self.listen_kwargs = dict(kwargs)
@@ -731,7 +770,7 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
         rate_limiter=StubRateLimiter(),
-        config_service=StubConfigService(),
+        config_service=VersionedConfigService(),
         admin_resource_service=InMemoryAdminResourceService(),
         user_admin_service=object(),
     )
@@ -743,7 +782,10 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     bus = FakeInvalidationBus.instances[0]
     assert captured["mcp_reloads"] == [OTHER_TENANT_ID]
     assert captured["plugin_reloads"] == [OTHER_TENANT_ID]
-    assert bus.published == [(OTHER_TENANT_ID, "mcp"), (OTHER_TENANT_ID, "plugin")]
+    assert bus.published == [
+        (OTHER_TENANT_ID, "mcp", 3),
+        (OTHER_TENANT_ID, "plugin", 3),
+    ]
     assert bus.listen_kwargs is not None
     assert bus.listen_kwargs["mcp_runtime"] is application.state.mcp_service
     assert bus.listen_kwargs["plugin_runtime"] is application.state.plugin_service
