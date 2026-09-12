@@ -24,6 +24,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.defaults import HarnessModelSelectionError
 from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -454,6 +455,45 @@ class RuntimeReportsCapacityPressure:
             run_id=context.run_id,
             reason="model gateway failed: model capacity unavailable",
         )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeReportsModelCapabilityUnavailable:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            reason="harness_model_unavailable: model capability unavailable",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeRaisesModelCapabilityUnavailable:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        del context
+        raise HarnessModelSelectionError("model capability unavailable")
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=uuid4())
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise AssertionError("not used")
@@ -1790,6 +1830,57 @@ async def test_failed_accepted_self_repair_does_not_expose_stale_actionable_prop
         event.kind for event in repository.event_log if str(event.kind).startswith("repair.")
     ]
     assert repair_events[-2:] == ["repair.failed", "repair.skipped"]
+
+
+@pytest.mark.asyncio
+async def test_accepted_model_capability_self_repair_fails_closed_without_new_proposal() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    failure_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsModelCapabilityUnavailable(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    failed = await failure_service.execute(repository.run_id)
+    assert failed.decision_token is not None
+    assert failed.repair_proposal is not None
+    assert failed.repair_proposal["failure_kind"] == "model_capability_routing_unavailable"
+    assert (
+        failed.repair_proposal["recovery_strategy"]
+        == "reassign_tool_role_to_capable_model_and_retry"
+    )
+    await failure_service.accept_self_repair(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=repository.run_id,
+        decision_token=failed.decision_token,
+        version=failed.version,
+    )
+    repair_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeRaisesModelCapabilityUnavailable(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    repaired = await repair_service.execute(repository.run_id)
+
+    assert repaired.status is RunStatus.FAILED
+    assert repaired.decision_token is None
+    assert repaired.repair_proposal is None
+    repair_events = [
+        event for event in repository.event_log if str(event.kind).startswith("repair.")
+    ]
+    assert [event.kind for event in repair_events[-2:]] == ["repair.failed", "repair.skipped"]
+    assert repair_events[-1].payload["skip_reason"] == "recursive_self_repair"
+    assert (
+        repair_events[-1].payload["failure_category"]
+        == "model_capability_routing_unavailable"
+    )
+    assert (
+        repair_events[-1].payload["recovery_strategy"]
+        == "reassign_tool_role_to_capable_model_and_retry"
+    )
 
 
 @pytest.mark.asyncio
