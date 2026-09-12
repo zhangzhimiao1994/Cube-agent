@@ -174,6 +174,72 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
 }
 
+check_openapi_path() {
+  local name="$1"
+  local path="$2"
+  local method="$3"
+  if "$acceptance_python_bin" "$acceptance_openapi_file" "$path" "$method" <<'PY'
+import json
+import sys
+
+openapi_file, path, method = sys.argv[1:4]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+security_scheme = document.get("components", {}).get("securitySchemes", {}).get("BearerAuth")
+if security_scheme != {"type": "http", "scheme": "bearer"}:
+    raise SystemExit(1)
+operation = document.get("paths", {}).get(path, {})
+method_key = method.lower()
+if method_key not in {str(key).lower() for key in operation}:
+    raise SystemExit(1)
+operation_doc = operation.get(method_key, {})
+security = operation_doc.get("security", [])
+if {"BearerAuth": []} not in security:
+    raise SystemExit(1)
+responses = operation_doc.get("responses", {})
+if "401" not in responses or "403" not in responses:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: %s %s %s\n' "$name" "$method" "$path"
+    return 0
+  fi
+  printf 'fail: %s %s %s\n' "$name" "$method" "$path"
+  failures=$((failures + 1))
+  return 1
+}
+
+run_openapi_capability_profile() {
+  local openapi_file
+  printf 'profile: openapi capability surface\n'
+  if ! acceptance_python_bin="$(detect_python)"; then
+    printf 'fail: openapi capability probe requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  openapi_file="$(mktemp)"
+  acceptance_openapi_file="$openapi_file"
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS -o "$openapi_file" \
+    "$base_url/openapi.json" 2>/dev/null; then
+    rm -f -- "$openapi_file"
+    printf 'fail: openapi capability surface /openapi.json\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
+  check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
+  check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post" || true
+  check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get" || true
+  check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post" || true
+  check_openapi_path "plugin package approval" "/api/v1/admin/plugins/{plugin_id}/package/approve" "post" || true
+  check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get" || true
+  check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get" || true
+  rm -f -- "$openapi_file"
+}
+
 run_lifecycle_profile() {
   local python_bin
   local idempotency_key
@@ -295,14 +361,17 @@ require_curl
 case "$profile" in
   codex)
     run_codex_profile
+    run_openapi_capability_profile || true
     run_lifecycle_profile || true
     ;;
   deepseek)
     run_deepseek_profile
+    run_openapi_capability_profile || true
     ;;
   all)
     run_codex_profile
     run_deepseek_profile
+    run_openapi_capability_profile || true
     run_lifecycle_profile || true
     ;;
 esac

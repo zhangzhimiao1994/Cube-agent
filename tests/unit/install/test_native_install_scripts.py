@@ -73,6 +73,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
     assert "run_lifecycle_profile" in command
+    assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
     assert "/health/live" in command
     assert "/health/ready" in command
@@ -92,6 +93,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"/api/v1/runs"' in command
     assert '"/api/v1/runs/$run_id"' in command
     assert '"/api/v1/runs/$run_id/events"' in command
+    assert 'check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post"' in command
+    assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
+    assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
+    assert 'securitySchemes", {}).get("BearerAuth")' in command
+    assert 'if "401" not in responses or "403" not in responses:' in command
+    assert 'check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get"' in command
+    assert 'check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get"' in command
+    assert 'check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 
