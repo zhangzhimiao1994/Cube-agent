@@ -618,6 +618,10 @@ $tls_directive
     reverse_proxy 127.0.0.1:$api_port
   }
 
+  handle /openapi.json {
+    reverse_proxy 127.0.0.1:$api_port
+  }
+
   handle /setup* {
     reverse_proxy 127.0.0.1:$api_port
   }

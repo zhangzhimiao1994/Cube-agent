@@ -311,6 +311,8 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "hostport=\"${public_url#http://}\"" not in installer
     assert "handle /setup*" in caddyfile
     assert "handle /setup*" in installer
+    assert "handle /openapi.json" in caddyfile
+    assert "handle /openapi.json" in installer
     assert "fix_native_web_permissions" in installer
     assert 'chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"' in installer
     assert 'chmod 0755 "$release"' in installer
