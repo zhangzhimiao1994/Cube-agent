@@ -1284,6 +1284,8 @@ class RunService:
         observed_events: list[RunEvent] = []
         scheduler_notice_payloads: list[dict[str, object]] = []
         lease_lost = False
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
@@ -1332,64 +1334,77 @@ class RunService:
                         run_id=run_id,
                         event=_event_at_sequence(started_event, run_id=run_id, sequence=sequence),
                     )
-            async for event in runtime.run(context):
-                async with await self._repository.run_transaction() as session, session.begin():
-                    locked = await self._repository.get_for_update(session, run_id)
-                    current_status = RunStatus(locked.status)
-                    if current_status is RunStatus.CANCELLED:
-                        await runtime.cancel()
-                        terminal = RunStatus.CANCELLED
-                        break
-                    if current_status is RunStatus.PAUSED:
-                        terminal = RunStatus.PAUSED
-                        break
-                    if current_status is RunStatus.WAITING_APPROVAL:
-                        terminal = RunStatus.WAITING_APPROVAL
-                        break
-                    if current_status in {
-                        RunStatus.COMPLETED,
-                        RunStatus.FAILED,
-                        RunStatus.CANCELLED,
-                    }:
-                        terminal = current_status
-                        break
-                    if current_status is RunStatus.RUNNING and not RunRepository.renew_worker_lease(
-                        locked,
-                        worker_id=self._worker_id,
-                        worker_lease_token=worker_lease_token,
-                        worker_lease_expires_at=self._worker_lease_expires_at(),
-                    ):
-                        _LOGGER.warning(
-                            "run_worker_lease_lost run_id=%s worker_id=%s",
-                            run_id,
-                            self._worker_id,
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_worker_lease(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    worker_lease_token=worker_lease_token,
+                    stop=heartbeat_stop,
+                    runtime_cancel=runtime.cancel,
+                )
+            )
+            try:
+                async for event in runtime.run(context):
+                    async with await self._repository.run_transaction() as session, session.begin():
+                        locked = await self._repository.get_for_update(session, run_id)
+                        current_status = RunStatus(locked.status)
+                        if current_status is RunStatus.CANCELLED:
+                            await runtime.cancel()
+                            terminal = RunStatus.CANCELLED
+                            break
+                        if current_status is RunStatus.PAUSED:
+                            terminal = RunStatus.PAUSED
+                            break
+                        if current_status is RunStatus.WAITING_APPROVAL:
+                            terminal = RunStatus.WAITING_APPROVAL
+                            break
+                        if current_status in {
+                            RunStatus.COMPLETED,
+                            RunStatus.FAILED,
+                            RunStatus.CANCELLED,
+                        }:
+                            terminal = current_status
+                            break
+                        if current_status is RunStatus.RUNNING and not RunRepository.renew_worker_lease(
+                            locked,
+                            worker_id=self._worker_id,
+                            worker_lease_token=worker_lease_token,
+                            worker_lease_expires_at=self._worker_lease_expires_at(),
+                        ):
+                            _LOGGER.warning(
+                                "run_worker_lease_lost run_id=%s worker_id=%s",
+                                run_id,
+                                self._worker_id,
+                            )
+                            lease_lost = True
+                            break
+                        sequence = await self._repository.next_event_sequence(session, run_id)
+                        event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
+                        await self._repository.persist_event(
+                            session,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            event=event,
                         )
-                        lease_lost = True
-                        break
-                    sequence = await self._repository.next_event_sequence(session, run_id)
-                    event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
-                    await self._repository.persist_event(
-                        session,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        event=event,
-                    )
-                    observed_events.append(event)
-                    observer_decision = monitor.observe(event)
-                    if observer_decision is not None:
-                        observer_decisions.append(observer_decision)
-                    if event.kind is EventKind.RUNTIME_COMPLETED:
-                        terminal = RunStatus.COMPLETED
-                    elif event.kind is EventKind.RUNTIME_CANCELLED:
-                        terminal = RunStatus.CANCELLED
-                    elif event.kind is EventKind.RUNTIME_FAILED:
-                        terminal = RunStatus.FAILED
-                    if terminal is not RunStatus.RUNNING:
-                        locked.status = terminal.value
-                        RunRepository.clear_worker_lease(locked)
-                        locked.version += 1
-                if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
-                    return await self._submitted_by_run_id(tenant_id, run_id)
+                        observed_events.append(event)
+                        observer_decision = monitor.observe(event)
+                        if observer_decision is not None:
+                            observer_decisions.append(observer_decision)
+                        if event.kind is EventKind.RUNTIME_COMPLETED:
+                            terminal = RunStatus.COMPLETED
+                        elif event.kind is EventKind.RUNTIME_CANCELLED:
+                            terminal = RunStatus.CANCELLED
+                        elif event.kind is EventKind.RUNTIME_FAILED:
+                            terminal = RunStatus.FAILED
+                        if terminal is not RunStatus.RUNNING:
+                            locked.status = terminal.value
+                            RunRepository.clear_worker_lease(locked)
+                            locked.version += 1
+                    if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
+                        return await self._submitted_by_run_id(tenant_id, run_id)
+            finally:
+                heartbeat_stop.set()
+                await self._await_worker_lease_heartbeat(heartbeat_task)
             if lease_lost:
                 return await self._submitted_by_run_id(tenant_id, run_id)
         except Exception as error:
@@ -1762,6 +1777,76 @@ class RunService:
                 continue
             recovered += 1
         return recovered
+
+    async def _heartbeat_worker_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        worker_lease_token: UUID,
+        stop: asyncio.Event,
+        runtime_cancel: Callable[[], Awaitable[None]],
+    ) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self._worker_lease_heartbeat_interval_seconds(),
+                )
+                return
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                return
+            try:
+                renewed = await self._repository.renew_active_worker_lease(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    worker_id=self._worker_id,
+                    worker_lease_token=worker_lease_token,
+                    worker_lease_expires_at=self._worker_lease_expires_at(),
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "run_worker_lease_heartbeat_failed run_id=%s worker_id=%s",
+                    run_id,
+                    self._worker_id,
+                )
+                continue
+            if renewed:
+                continue
+            _LOGGER.warning(
+                "run_worker_lease_heartbeat_lost run_id=%s worker_id=%s",
+                run_id,
+                self._worker_id,
+            )
+            try:
+                await runtime_cancel()
+            except Exception:
+                _LOGGER.exception(
+                    "run_worker_lease_heartbeat_cancel_failed run_id=%s worker_id=%s",
+                    run_id,
+                    self._worker_id,
+                )
+            return
+
+    async def _await_worker_lease_heartbeat(
+        self,
+        task: asyncio.Task[None] | None,
+    ) -> None:
+        if task is None:
+            return
+        results = await asyncio.gather(task, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                _LOGGER.exception(
+                    "run_worker_lease_heartbeat_task_failed error_type=%s",
+                    type(result).__name__,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
+    def _worker_lease_heartbeat_interval_seconds(self) -> float:
+        return max(0.1, min(10.0, self._run_worker_lease_seconds / 3))
 
     def _worker_lease_expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self._run_worker_lease_seconds)

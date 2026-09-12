@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -80,6 +81,8 @@ class ExecutableFakeRepository:
         self.event_log: list[RunEvent] = []
         self.artifacts: list[Artifact] = []
         self.conversation_context_calls: list[dict[str, object]] = []
+        self.lease_renewed = asyncio.Event()
+        self.lease_renewals: list[datetime] = []
 
     async def run_transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -114,6 +117,27 @@ class ExecutableFakeRepository:
         del session
         assert run_id == self.run_id
         return self.row
+
+    async def renew_active_worker_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        worker_id: str,
+        worker_lease_token: UUID,
+        worker_lease_expires_at: datetime,
+    ) -> bool:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        if self.row.status != RunStatus.RUNNING.value:
+            return False
+        if self.row.worker_id != worker_id or self.row.worker_lease_token != worker_lease_token:
+            return False
+        self.row.worker_lease_expires_at = worker_lease_expires_at
+        self.row.worker_heartbeat_at = datetime.now(UTC)
+        self.lease_renewals.append(worker_lease_expires_at)
+        self.lease_renewed.set()
+        return True
 
     async def persist_event(
         self,
@@ -415,6 +439,28 @@ class RuntimeCompletes:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RuntimeBlocksUntilReleased:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.started.set()
+        await self.release.wait()
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        self.release.set()
 
 
 class RuntimeRecordsRepairContextCompletes:
@@ -836,6 +882,31 @@ async def test_execute_drops_runtime_events_after_stale_worker_loses_terminal_ra
 
     assert submitted.status is RunStatus.COMPLETED
     assert repository.event_log == []
+
+
+@pytest.mark.asyncio
+async def test_execute_renews_worker_lease_while_runtime_is_waiting() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeBlocksUntilReleased()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        worker_id="worker-active",
+        run_worker_lease_seconds=1,
+    )
+    task = asyncio.create_task(service.execute(repository.run_id))
+
+    try:
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        await asyncio.wait_for(repository.lease_renewed.wait(), timeout=1)
+    finally:
+        runtime.release.set()
+        submitted = await task
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert repository.lease_renewals
 
 
 @pytest.mark.asyncio

@@ -751,6 +751,122 @@ async def test_running_recovery_refuses_unexpired_worker_lease() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_running_recovery_takeover_replaces_expired_worker_lease() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    stale_token = uuid4()
+    repository.row.worker_id = "worker-stale"
+    repository.row.worker_lease_token = stale_token
+    repository.row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    claimed = await repository.claim_for_execution(
+        cast(Any, _FakeTransaction()),
+        repository.run_id,
+        allow_running_recovery=True,
+        worker_id="worker-recovery",
+        worker_lease_token=repository.lease_token,
+        worker_lease_expires_at=repository.lease_expires_at,
+    )
+
+    assert not isinstance(claimed, RunRecord)
+    assert repository.row.worker_id == "worker-recovery"
+    assert repository.row.worker_lease_token == repository.lease_token
+    assert repository.row.worker_lease_token != stale_token
+    assert repository.row.worker_lease_expires_at == repository.lease_expires_at
+    assert repository.row.worker_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_renew_worker_lease_updates_expiry_and_heartbeat_for_matching_token() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    old_heartbeat = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
+    repository.row.worker_id = "worker-active"
+    repository.row.worker_lease_token = repository.lease_token
+    repository.row.worker_lease_expires_at = datetime(2026, 9, 12, 0, 1, tzinfo=UTC)
+    repository.row.worker_heartbeat_at = old_heartbeat
+    next_expiry = datetime(2026, 9, 12, 0, 2, tzinfo=UTC)
+    session = _CapabilityApprovalSession(repository.row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    renewed = await repository.renew_active_worker_lease(
+        tenant_id=repository.row.tenant_id,
+        run_id=repository.row.id,
+        worker_id="worker-active",
+        worker_lease_token=repository.lease_token,
+        worker_lease_expires_at=next_expiry,
+    )
+
+    assert renewed is True
+    assert repository.row.worker_lease_expires_at == next_expiry
+    assert repository.row.worker_heartbeat_at is not None
+    assert repository.row.worker_heartbeat_at > old_heartbeat
+
+
+@pytest.mark.asyncio
+async def test_renew_worker_lease_refuses_stale_worker_token_after_takeover() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    active_token = uuid4()
+    stale_token = uuid4()
+    current_expiry = datetime(2026, 9, 12, 0, 1, tzinfo=UTC)
+    repository.row.worker_id = "worker-recovery"
+    repository.row.worker_lease_token = active_token
+    repository.row.worker_lease_expires_at = current_expiry
+    repository.row.worker_heartbeat_at = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
+    session = _CapabilityApprovalSession(repository.row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    renewed = await repository.renew_active_worker_lease(
+        tenant_id=repository.row.tenant_id,
+        run_id=repository.row.id,
+        worker_id="worker-stale",
+        worker_lease_token=stale_token,
+        worker_lease_expires_at=datetime(2026, 9, 12, 0, 2, tzinfo=UTC),
+    )
+
+    assert renewed is False
+    assert repository.row.worker_id == "worker-recovery"
+    assert repository.row.worker_lease_token == active_token
+    assert repository.row.worker_lease_expires_at == current_expiry
+
+
+@pytest.mark.asyncio
+async def test_renew_worker_lease_refuses_non_running_status() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.PAUSED,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    current_expiry = datetime(2026, 9, 12, 0, 1, tzinfo=UTC)
+    repository.row.worker_id = "worker-active"
+    repository.row.worker_lease_token = repository.lease_token
+    repository.row.worker_lease_expires_at = current_expiry
+    session = _CapabilityApprovalSession(repository.row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    renewed = await repository.renew_active_worker_lease(
+        tenant_id=repository.row.tenant_id,
+        run_id=repository.row.id,
+        worker_id="worker-active",
+        worker_lease_token=repository.lease_token,
+        worker_lease_expires_at=datetime(2026, 9, 12, 0, 2, tzinfo=UTC),
+    )
+
+    assert renewed is False
+    assert repository.row.worker_lease_expires_at == current_expiry
+
+
 def test_running_for_recovery_requires_expired_worker_lease() -> None:
     repository = RunRepository(cast(Any, None))
     now = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)

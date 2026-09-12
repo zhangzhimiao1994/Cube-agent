@@ -714,6 +714,29 @@ class RunRepository:
             )
             return tuple(rows.all())
 
+    async def renew_active_worker_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        worker_id: str,
+        worker_lease_token: UUID,
+        worker_lease_expires_at: datetime,
+    ) -> bool:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None or RunStatus(row.status) is not RunStatus.RUNNING:
+                return False
+            if not self.renew_worker_lease(
+                row,
+                worker_id=worker_id,
+                worker_lease_token=worker_lease_token,
+                worker_lease_expires_at=worker_lease_expires_at,
+            ):
+                return False
+            await session.flush()
+            return True
+
     def _running_for_recovery_select(self, *, limit: int, now: datetime) -> Select[tuple[UUID]]:
         return (
             select(RunRow.id)

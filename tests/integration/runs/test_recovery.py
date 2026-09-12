@@ -160,6 +160,33 @@ class GatedTakeoverRuntime:
         raise AssertionError("not used")
 
 
+class BlockingRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.started.set()
+        await self.release.wait()
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+        raise AssertionError("not used")
+
+    async def cancel(self) -> None:
+        self.release.set()
+
+
 class FailingRuntime:
     mode = TaskMode.DISPATCH
 
@@ -590,6 +617,41 @@ async def test_expired_lease_takeover_drops_stale_worker_events_after_checkpoint
     assert [event["kind"] for event in events].count("checkpoint.saved") == 1
     assert [event["kind"] for event in events].count("runtime.completed") == 1
     assert [event["kind"] for event in events].count("tool.completed") == 0
+
+
+async def test_active_worker_heartbeat_renews_lease_and_prevents_recover_running_takeover(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = BlockingRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        worker_id="worker-active",
+        run_worker_lease_seconds=1,
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="long running worker should renew its lease",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="tenant-heartbeat-lease-key",
+    )
+
+    active_task = asyncio.create_task(service.execute(submitted.id))
+    try:
+        await asyncio.wait_for(runtime.started.wait(), timeout=5)
+        await asyncio.sleep(1.4)
+
+        candidates = await repository.running_for_recovery(limit=10, now=datetime.now(UTC))
+
+        assert submitted.id not in candidates
+    finally:
+        runtime.release.set()
+        await active_task
 
 
 async def test_recover_running_fails_safe_for_non_replayable_running_run(
