@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 
+from agent_hub.models.types import ModelCapability
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
     ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
@@ -18,7 +19,11 @@ from agent_hub.runtime.contracts import JsonValue
 _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MAX_BLOCKED_CONTRACT_IDS = 8
+_MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
+_MAX_REQUIRED_CAPABILITIES = 8
+_MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
 
 
 def self_repair_context_text(
@@ -73,6 +78,14 @@ def self_repair_context_text(
     )
     if blocked_contract_ids:
         payload["blocked_contract_ids"] = blocked_contract_ids
+    role_capability_requirements = (
+        _safe_role_capability_requirements(repair.get("role_capability_requirements"))
+        if routing_decision.get("source") == "self_repair"
+        and payload["recovery_strategy"] == _MODEL_CAPABILITY_RECOVERY_STRATEGY
+        else ()
+    )
+    if role_capability_requirements:
+        payload["role_capability_requirements"] = role_capability_requirements
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > _MAX_TOTAL_BYTES:
         encoded = encoded.encode("utf-8")[:_MAX_TOTAL_BYTES].decode(
@@ -109,10 +122,25 @@ def self_repair_recovery_plan_payload(
         max_chars=128,
     )
     if recovery_strategy != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
-        return None
+        if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
+            return None
+        payload: dict[str, JsonValue] = {
+            "schema_version": 1,
+            "status": "active",
+            "recovery_strategy": _MODEL_CAPABILITY_RECOVERY_STRATEGY,
+            "replan_scope": "model_capability_roles",
+            "reuse_completed_artifacts": True,
+            "automatic_execution": False,
+        }
+        role_capability_requirements = _safe_role_capability_requirements(
+            repair.get("role_capability_requirements"),
+        )
+        if role_capability_requirements:
+            payload["role_capability_requirements"] = role_capability_requirements
+        return payload
     if orchestration_recovery_hint != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
         return None
-    payload: dict[str, JsonValue] = {
+    payload = {
         "schema_version": 1,
         "status": "active",
         "recovery_strategy": ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
@@ -126,6 +154,38 @@ def self_repair_recovery_plan_payload(
     if blocked_contract_ids:
         payload["blocked_contract_ids"] = blocked_contract_ids
     return payload
+
+
+def self_repair_role_capability_requirements(
+    routing_decision: Mapping[str, JsonValue] | Mapping[str, object],
+) -> Mapping[str, frozenset[ModelCapability]]:
+    repair = routing_decision.get("self_repair_context")
+    if routing_decision.get("source") != "self_repair" or not isinstance(repair, Mapping):
+        return {}
+    if repair.get("source") != "self_repair":
+        return {}
+    recovery_strategy = _safe_enum_text(
+        repair.get("recovery_strategy"),
+        default="",
+        allowed=SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
+        max_chars=128,
+    )
+    if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
+        return {}
+    requirements: dict[str, frozenset[ModelCapability]] = {}
+    for item in _safe_role_capability_requirements(repair.get("role_capability_requirements")):
+        role_id = item.get("role_id")
+        capabilities = item.get("required_capabilities")
+        if not isinstance(role_id, str) or not isinstance(capabilities, tuple):
+            continue
+        parsed = frozenset(
+            ModelCapability(capability)
+            for capability in capabilities
+            if isinstance(capability, str)
+        )
+        if parsed:
+            requirements[role_id] = parsed
+    return requirements
 
 
 def _safe_text(value: object, default: str, max_chars: int) -> str:
@@ -170,4 +230,56 @@ def _safe_contract_ids(value: object) -> tuple[str, ...]:
     return tuple(safe)
 
 
-__all__ = ["self_repair_context_text", "self_repair_recovery_plan_payload"]
+def _safe_role_capability_requirements(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role_id = item.get("role_id")
+        if not isinstance(role_id, str):
+            continue
+        role_id = role_id.strip()
+        if _SAFE_ROLE_ID.fullmatch(role_id) is None:
+            continue
+        capabilities = _safe_model_capabilities(item.get("required_capabilities"))
+        if not capabilities:
+            continue
+        if any(existing.get("role_id") == role_id for existing in safe):
+            continue
+        safe.append(
+            {
+                "role_id": role_id,
+                "required_capabilities": capabilities,
+            }
+        )
+        if len(safe) >= _MAX_ROLE_CAPABILITY_REQUIREMENTS:
+            break
+    return tuple(safe)
+
+
+def _safe_model_capabilities(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        try:
+            capability = ModelCapability(item.strip())
+        except ValueError:
+            continue
+        if capability.value in safe:
+            continue
+        safe.append(capability.value)
+        if len(safe) >= _MAX_REQUIRED_CAPABILITIES:
+            break
+    return tuple(safe)
+
+
+__all__ = [
+    "self_repair_context_text",
+    "self_repair_recovery_plan_payload",
+    "self_repair_role_capability_requirements",
+]

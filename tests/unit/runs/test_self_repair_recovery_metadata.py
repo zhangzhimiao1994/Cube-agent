@@ -158,3 +158,60 @@ def test_inferred_blocked_contract_ids_drive_recovery_plan_payload() -> None:
     assert recovery_plan is not None
     assert recovery_plan["retry_blocked_contracts_only"] is True
     assert recovery_plan["blocked_contract_ids"] == ("draft-to-final_response",)
+
+
+def test_model_capability_reassignment_metadata_is_bounded_and_structured() -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": "model_capability_routing_unavailable",
+            "source_run_id": "run_1",
+            "source_event_sequence": 2,
+            "attempt": 1,
+            "max_attempts": 1,
+            "fingerprint": "fp",
+            "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+            "role_capability_requirements": (
+                {
+                    "role_id": "scheduler",
+                    "required_capabilities": (
+                        "text",
+                        "structured_output",
+                        "tool_calling",
+                        "secret://token",
+                    ),
+                },
+                {
+                    "role_id": "../unsafe",
+                    "required_capabilities": ("tool_calling",),
+                },
+            ),
+        }
+    )
+    assert repair_context["role_capability_requirements"] == (
+        {
+            "role_id": "scheduler",
+            "required_capabilities": (
+                "text",
+                "structured_output",
+                "tool_calling",
+            ),
+        },
+    )
+
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+
+    assert recovery_plan is not None
+    assert recovery_plan["replan_scope"] == "model_capability_roles"
+    assert recovery_plan["role_capability_requirements"] == (
+        {
+            "role_id": "scheduler",
+            "required_capabilities": (
+                "text",
+                "structured_output",
+                "tool_calling",
+            ),
+        },
+    )
+    assert "secret://token" not in repr(recovery_plan)

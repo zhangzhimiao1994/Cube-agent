@@ -25,6 +25,7 @@ from agent_hub.harness.types import (
     HarnessTaskRequirements,
     HermesContextHint,
 )
+from agent_hub.models.types import ModelCapability
 from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
@@ -52,7 +53,10 @@ _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MAX_BLOCKED_CONTRACT_IDS = 8
+_MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
+_MAX_REQUIRED_CAPABILITIES = 8
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
 
@@ -2166,6 +2170,11 @@ def _self_repair_execution_payload(
     blocked_contract_ids = _bounded_contract_ids(repair.get("blocked_contract_ids"))
     if blocked_contract_ids:
         payload["blocked_contract_ids"] = blocked_contract_ids
+    role_capability_requirements = _bounded_role_capability_requirements(
+        repair.get("role_capability_requirements"),
+    )
+    if role_capability_requirements:
+        payload["role_capability_requirements"] = role_capability_requirements
     return payload
 
 
@@ -2219,6 +2228,54 @@ def _bounded_contract_ids(value: object) -> tuple[str, ...]:
             continue
         safe.append(text)
         if len(safe) >= _MAX_BLOCKED_CONTRACT_IDS:
+            break
+    return tuple(safe)
+
+
+def _bounded_role_capability_requirements(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    safe: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role_id = item.get("role_id")
+        if not isinstance(role_id, str):
+            continue
+        role_id = role_id.strip()
+        if _SAFE_ROLE_ID.fullmatch(role_id) is None:
+            continue
+        required_capabilities = _bounded_model_capabilities(item.get("required_capabilities"))
+        if not required_capabilities:
+            continue
+        if any(existing.get("role_id") == role_id for existing in safe):
+            continue
+        safe.append(
+            {
+                "role_id": role_id,
+                "required_capabilities": required_capabilities,
+            }
+        )
+        if len(safe) >= _MAX_ROLE_CAPABILITY_REQUIREMENTS:
+            break
+    return tuple(safe)
+
+
+def _bounded_model_capabilities(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        try:
+            capability = ModelCapability(item.strip())
+        except ValueError:
+            continue
+        if capability.value in safe:
+            continue
+        safe.append(capability.value)
+        if len(safe) >= _MAX_REQUIRED_CAPABILITIES:
             break
     return tuple(safe)
 

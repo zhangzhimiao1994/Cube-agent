@@ -1253,6 +1253,79 @@ def test_repair_classification_handles_model_capability_routing_failure() -> Non
     assert "model capability unavailable" not in repr(proposal)
 
 
+def test_repair_classification_infers_model_capability_reassignment_intent() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_STARTED,
+                sequence=1,
+                run_id=run_id,
+                actor="main_agent",
+                step_id="main_agent_plan",
+                payload={
+                    "model_execution_plan": {
+                        "model_capability_negotiation": {
+                            "schema_version": 1,
+                            "items": (
+                                {
+                                    "role_id": "scheduler",
+                                    "logical_model": "main",
+                                    "required_capabilities": (
+                                        "text",
+                                        "structured_output",
+                                        "tool_calling",
+                                    ),
+                                    "missing_capabilities": ("tool_calling",),
+                                    "status": "missing_capability",
+                                },
+                                {
+                                    "role_id": "../unsafe",
+                                    "logical_model": "secret://model",
+                                    "required_capabilities": ("tool_calling",),
+                                    "missing_capabilities": ("tool_calling",),
+                                    "status": "missing_capability",
+                                },
+                            ),
+                        }
+                    }
+                },
+            ),
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=2,
+                run_id=run_id,
+                actor="scheduler",
+                step_id="scheduler_step",
+                reason="planned capability is unavailable",
+                payload={"error_code": "capability.planned_unavailable"},
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["recovery_strategy"] == "reassign_tool_role_to_capable_model_and_retry"
+    assert proposal["role_capability_requirements"] == (
+        {
+            "role_id": "scheduler",
+            "required_capabilities": (
+                "text",
+                "structured_output",
+                "tool_calling",
+            ),
+        },
+    )
+    assert "../unsafe" not in repr(proposal)
+    assert "secret://model" not in repr(proposal)
+
+
 def test_repair_classification_handles_planned_capability_unavailable() -> None:
     run_id = uuid4()
 
@@ -1636,6 +1709,20 @@ async def test_self_repair_execution_audit_allows_model_capability_recovery_stra
                 "failure_kind": "model_capability_routing_unavailable",
                 "repair_action": "draft_repair_proposal",
                 "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+                "role_capability_requirements": (
+                    {
+                        "role_id": "scheduler",
+                        "required_capabilities": (
+                            "text",
+                            "structured_output",
+                            "tool_calling",
+                        ),
+                    },
+                    {
+                        "role_id": "../unsafe",
+                        "required_capabilities": ("tool_calling",),
+                    },
+                ),
             },
         }
     )
@@ -1653,7 +1740,18 @@ async def test_self_repair_execution_audit_allows_model_capability_recovery_stra
         started.payload["recovery_strategy"]
         == "reassign_tool_role_to_capable_model_and_retry"
     )
+    assert started.payload["role_capability_requirements"] == (
+        {
+            "role_id": "scheduler",
+            "required_capabilities": (
+                "text",
+                "structured_output",
+                "tool_calling",
+            ),
+        },
+    )
     assert started.payload["failure_kind"] == "model_capability_routing_unavailable"
+    assert "../unsafe" not in repr(started.payload)
 
 
 @pytest.mark.asyncio

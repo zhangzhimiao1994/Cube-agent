@@ -2273,6 +2273,140 @@ async def test_config_backed_dispatch_runtime_routes_inventory_skill_tools_to_ca
 
 
 @pytest.mark.asyncio
+async def test_model_capability_self_repair_retry_reassigns_tool_role_to_capable_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "main_account",
+                                "max_concurrency": 20,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            }
+                        ]
+                    },
+                    "qwen_tools": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen3-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling", "structured_output"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "scheduler",
+                        "role": "Scheduler",
+                        "prompt": "Schedule events through a tool-capable role.",
+                        "model": "main",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Retry the scheduler role with a tool-capable model.",
+                routing_decision={
+                    "source": "self_repair",
+                    "selected_agent_ids": ("scheduler",),
+                    "main_agent_model": "main",
+                    "self_repair_context": {
+                        "source": "self_repair",
+                        "failure_kind": "model_capability_routing_unavailable",
+                        "repair_action": "draft_repair_proposal",
+                        "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+                        "role_capability_requirements": (
+                            {
+                                "role_id": "scheduler",
+                                "required_capabilities": (
+                                    "text",
+                                    "structured_output",
+                                    "tool_calling",
+                                ),
+                            },
+                        ),
+                    },
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    assert role_plan[0]["id"] == "scheduler"
+    assert role_plan[0]["logical_model"] == "qwen_tools"
+    model_execution_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["model_execution_plan"],
+    )
+    assignments = cast(
+        tuple[Mapping[str, JsonValue], ...],
+        model_execution_plan["role_model_assignments"],
+    )
+    assert {
+        assignment["role_id"]: assignment["logical_model"]
+        for assignment in assignments
+    }["scheduler"] == "qwen_tools"
+    negotiation = cast(
+        Mapping[str, JsonValue],
+        model_execution_plan["model_capability_negotiation"],
+    )
+    assert negotiation["missing_count"] == 0
+    items = cast(tuple[Mapping[str, JsonValue], ...], negotiation["items"])
+    scheduler_item = next(item for item in items if item["role_id"] == "scheduler")
+    assert scheduler_item == {
+        "role_id": "scheduler",
+        "logical_model": "qwen_tools",
+        "required_capabilities": (
+            "text",
+            "structured_output",
+            "tool_calling",
+        ),
+        "matched_capabilities": (
+            "text",
+            "structured_output",
+            "tool_calling",
+        ),
+        "missing_capabilities": (),
+        "status": "satisfied",
+    }
+
+
+@pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_constraint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

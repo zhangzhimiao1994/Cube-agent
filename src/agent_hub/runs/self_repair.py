@@ -11,6 +11,7 @@ from typing import Literal
 from uuid import UUID
 
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.models.types import ModelCapability
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
     RECOVERY_STRATEGY_BY_FAILURE_CATEGORY,
@@ -67,7 +68,11 @@ _SENSITIVE_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
+_SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _MAX_BLOCKED_CONTRACT_IDS = 8
+_MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
+_MAX_REQUIRED_CAPABILITIES = 8
+_MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -86,6 +91,7 @@ _REPAIR_PROPOSAL_FIELDS = frozenset(
         "fingerprint",
         "recovery_strategy",
         "orchestration_recovery_hint",
+        "role_capability_requirements",
     }
 )
 
@@ -124,6 +130,7 @@ class SelfRepairDecision:
     recovery_strategy: str | None = None
     orchestration_recovery_hint: str | None = None
     blocked_contract_ids: tuple[str, ...] = ()
+    role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = ()
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
         return SelfRepairDecision(
@@ -145,6 +152,7 @@ class SelfRepairDecision:
             recovery_strategy=self.recovery_strategy,
             orchestration_recovery_hint=self.orchestration_recovery_hint,
             blocked_contract_ids=self.blocked_contract_ids,
+            role_capability_requirements=self.role_capability_requirements,
         )
 
     def to_event(self, *, run_id: UUID, sequence: int) -> RunEvent:
@@ -171,6 +179,8 @@ class SelfRepairDecision:
             payload["recovery_strategy"] = self.recovery_strategy
         if self.orchestration_recovery_hint is not None:
             payload["orchestration_recovery_hint"] = self.orchestration_recovery_hint
+        if self.role_capability_requirements:
+            payload["role_capability_requirements"] = self.role_capability_requirements
         return RunEvent(kind=self.kind, sequence=sequence, run_id=run_id, payload=payload)
 
     def to_proposal(self, *, run_id: UUID) -> dict[str, object] | None:
@@ -201,6 +211,8 @@ class SelfRepairDecision:
             proposal["orchestration_recovery_hint"] = self.orchestration_recovery_hint
         if self.blocked_contract_ids:
             proposal["blocked_contract_ids"] = self.blocked_contract_ids
+        if self.role_capability_requirements:
+            proposal["role_capability_requirements"] = self.role_capability_requirements
         return proposal
 
 
@@ -229,6 +241,11 @@ def classify_terminal_run(
         if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY
         else ()
     )
+    role_capability_requirements = (
+        _model_capability_role_requirements(events)
+        if recovery_strategy == _MODEL_CAPABILITY_RECOVERY_STRATEGY
+        else ()
+    )
     fingerprint = _fingerprint(
         status=status,
         mode=mode,
@@ -251,6 +268,7 @@ def classify_terminal_run(
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
             blocked_contract_ids=blocked_contract_ids,
+            role_capability_requirements=role_capability_requirements,
         )
     if failure_category == "outcome_uncertain":
         return _skipped_decision(
@@ -268,6 +286,7 @@ def classify_terminal_run(
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
             blocked_contract_ids=blocked_contract_ids,
+            role_capability_requirements=role_capability_requirements,
         )
     return SelfRepairDecision(
         kind="repair.classified",
@@ -287,6 +306,7 @@ def classify_terminal_run(
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
         blocked_contract_ids=blocked_contract_ids,
+        role_capability_requirements=role_capability_requirements,
     )
 
 
@@ -306,6 +326,7 @@ def _skipped_decision(
     recovery_strategy: str | None = None,
     orchestration_recovery_hint: str | None = None,
     blocked_contract_ids: tuple[str, ...] = (),
+    role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = (),
 ) -> SelfRepairDecision:
     return SelfRepairDecision(
         kind="repair.skipped",
@@ -326,6 +347,7 @@ def _skipped_decision(
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
         blocked_contract_ids=blocked_contract_ids,
+        role_capability_requirements=role_capability_requirements,
     )
 
 
@@ -387,6 +409,11 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
     blocked_contract_ids = _safe_contract_ids(proposal.get("blocked_contract_ids"))
     if blocked_contract_ids:
         context["blocked_contract_ids"] = blocked_contract_ids
+    role_capability_requirements = _safe_role_capability_requirements(
+        proposal.get("role_capability_requirements"),
+    )
+    if role_capability_requirements:
+        context["role_capability_requirements"] = role_capability_requirements
     return context
 
 
@@ -481,6 +508,9 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
         return _safe_text(value, default="", max_chars=240)
     if key in {"source_run_id", "fingerprint"}:
         return _safe_text(value, default="", max_chars=96)
+    if key == "role_capability_requirements":
+        requirements = _safe_role_capability_requirements(value)
+        return requirements if requirements else None
     return None
 
 
@@ -574,12 +604,72 @@ def _blocked_contract_ids(events: Sequence[RunEvent]) -> tuple[str, ...]:
     return tuple(collected)
 
 
+def _model_capability_role_requirements(
+    events: Sequence[RunEvent],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    failed_role_ids = _failed_role_ids(events)
+    collected: list[Mapping[str, JsonValue]] = []
+    for event in reversed(events):
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        negotiation = plan.get("model_capability_negotiation")
+        if not isinstance(negotiation, Mapping):
+            continue
+        items = negotiation.get("items")
+        if not isinstance(items, Sequence) or isinstance(items, str | bytes):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("status") != "missing_capability":
+                continue
+            role_id = _safe_role_id(item.get("role_id"))
+            if role_id is None:
+                continue
+            if failed_role_ids and role_id not in failed_role_ids:
+                continue
+            required_capabilities = _safe_model_capabilities(
+                item.get("required_capabilities"),
+            )
+            if not required_capabilities:
+                required_capabilities = _safe_model_capabilities(
+                    item.get("missing_capabilities"),
+                )
+            if not required_capabilities:
+                continue
+            if any(existing.get("role_id") == role_id for existing in collected):
+                continue
+            collected.append(
+                {
+                    "role_id": role_id,
+                    "required_capabilities": required_capabilities,
+                }
+            )
+            if len(collected) >= _MAX_ROLE_CAPABILITY_REQUIREMENTS:
+                return tuple(collected)
+        if collected:
+            break
+    return tuple(collected)
+
+
 def _failed_step_ids(events: Sequence[RunEvent]) -> frozenset[str]:
     step_ids: set[str] = set()
     for event in events:
         if event.kind in _FAILURE_KINDS and event.step_id is not None:
             step_ids.add(event.step_id)
     return frozenset(step_ids)
+
+
+def _failed_role_ids(events: Sequence[RunEvent]) -> frozenset[str]:
+    role_ids: set[str] = set()
+    for event in events:
+        if event.kind not in _FAILURE_KINDS:
+            continue
+        role_id = _safe_role_id(event.actor)
+        if role_id is not None:
+            role_ids.add(role_id)
+    return frozenset(role_ids)
 
 
 def _safe_contract_ids(value: object) -> tuple[str, ...]:
@@ -596,6 +686,58 @@ def _safe_contract_ids(value: object) -> tuple[str, ...]:
             continue
         safe.append(text)
         if len(safe) >= _MAX_BLOCKED_CONTRACT_IDS:
+            break
+    return tuple(safe)
+
+
+def _safe_role_capability_requirements(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role_id = _safe_role_id(item.get("role_id"))
+        if role_id is None:
+            continue
+        required_capabilities = _safe_model_capabilities(item.get("required_capabilities"))
+        if not required_capabilities:
+            continue
+        if any(existing.get("role_id") == role_id for existing in safe):
+            continue
+        safe.append(
+            {
+                "role_id": role_id,
+                "required_capabilities": required_capabilities,
+            }
+        )
+        if len(safe) >= _MAX_ROLE_CAPABILITY_REQUIREMENTS:
+            break
+    return tuple(safe)
+
+
+def _safe_role_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if _SAFE_ROLE_ID.fullmatch(text) is not None else None
+
+
+def _safe_model_capabilities(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    safe: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        try:
+            capability = ModelCapability(item.strip())
+        except ValueError:
+            continue
+        if capability.value in safe:
+            continue
+        safe.append(capability.value)
+        if len(safe) >= _MAX_REQUIRED_CAPABILITIES:
             break
     return tuple(safe)
 
