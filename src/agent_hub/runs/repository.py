@@ -129,6 +129,20 @@ def _temporary_agent_approval_already_applied(
     )
 
 
+def _temporary_agent_revision_already_applied(
+    routing_decision: dict[str, object],
+    *,
+    decision_token: str,
+    feedback: str,
+) -> bool:
+    return (
+        routing_decision.get("approval_kind") == "temporary_agent_creation"
+        and routing_decision.get("decision_token") == decision_token
+        and routing_decision.get("temporary_agent_rejected") is True
+        and routing_decision.get("temporary_agent_feedback") == feedback
+    )
+
+
 class RunRepository:
     """Persist runs and normalized runtime events behind tenant boundaries."""
 
@@ -439,9 +453,15 @@ class RunRepository:
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
-            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
-                raise RunConflict("run is not waiting for temporary agent approval")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                if _temporary_agent_revision_already_applied(
+                    routing_decision,
+                    decision_token=decision_token,
+                    feedback=feedback,
+                ):
+                    return self._record(row)
+                raise RunConflict("run is not waiting for temporary agent approval")
             if routing_decision.get("approval_kind") != "temporary_agent_creation":
                 raise RunConflict("run is waiting for a different approval")
             if routing_decision.get("decision_token") != decision_token:

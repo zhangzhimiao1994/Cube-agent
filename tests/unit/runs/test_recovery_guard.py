@@ -382,6 +382,48 @@ async def test_repeated_temporary_agent_approval_returns_record_without_duplicat
 
 
 @pytest.mark.asyncio
+async def test_repeated_temporary_agent_revision_returns_record_without_duplicate_outbox_or_feedback() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request=(
+            "needs temporary specialist"
+            "\n\nUser feedback for temporary agent proposal: use a reviewer instead"
+        ),
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "temporary_agent_creation",
+            "decision_token": "temp-token",
+            "temporary_agent_rejected": True,
+            "temporary_agent_feedback": "use a reviewer instead",
+            "temporary_agents": [],
+            "workflow_adjustment_policy": "ask_before_apply",
+        },
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.revise_temporary_agent_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        decision_token="temp-token",
+        version=7,
+        feedback="use a reviewer instead",
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert row.request.count("User feedback for temporary agent proposal") == 1
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_accepted_self_repair_ignores_events_recorded_before_requeue() -> None:
     repository = _RecoveryBlockingRepository(
         status=RunStatus.QUEUED,
