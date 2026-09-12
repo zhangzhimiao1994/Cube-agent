@@ -73,9 +73,10 @@ class _AcceptSelfRepairSessionFactory:
 
 
 class _CapabilityApprovalSession(_FakeTransaction):
-    def __init__(self, row: _FakeRunRow, *, approved: bool) -> None:
+    def __init__(self, row: _FakeRunRow, *, approved: bool, rejected: bool = False) -> None:
         self._row = row
         self._approved = approved
+        self._rejected = rejected
         self.scalar_calls = 0
         self.added: list[object] = []
         self.statements: list[object] = []
@@ -85,7 +86,7 @@ class _CapabilityApprovalSession(_FakeTransaction):
         self.statements.append(statement)
         if self.scalar_calls == 1:
             return self._row
-        return uuid4() if self._approved else None
+        return uuid4() if self._approved or self._rejected else None
 
     async def execute(self, statement: object) -> None:
         self.statements.append(statement)
@@ -340,6 +341,36 @@ async def test_repeated_capability_approval_returns_record_without_duplicate_out
     )
 
     assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_capability_rejection_returns_cancelled_record() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="needs rejected tool",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=False, rejected=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.reject_capability_approval(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        approval_id="approval-1",
+        version=7,
+    )
+
+    assert record.status is RunStatus.CANCELLED
     assert record.version == 8
     assert session.added == []
 

@@ -889,6 +889,25 @@ class RunRepository:
             return any(row.payload.get("approval_scope") == approval_scope for row in rows)
 
     @staticmethod
+    async def _capability_approval_id_has_status(
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        status: str,
+    ) -> bool:
+        resolved_id = await session.scalar(
+            select(RunApprovalRow.id).where(
+                RunApprovalRow.tenant_id == tenant_id,
+                RunApprovalRow.run_id == run_id,
+                RunApprovalRow.approval_id == approval_id,
+                RunApprovalRow.status == status,
+            )
+        )
+        return resolved_id is not None
+
+    @staticmethod
     async def _capability_approval_id_is_approved(
         session: AsyncSession,
         *,
@@ -896,15 +915,13 @@ class RunRepository:
         run_id: UUID,
         approval_id: str,
     ) -> bool:
-        approved_id = await session.scalar(
-            select(RunApprovalRow.id).where(
-                RunApprovalRow.tenant_id == tenant_id,
-                RunApprovalRow.run_id == run_id,
-                RunApprovalRow.approval_id == approval_id,
-                RunApprovalRow.status == "approved",
-            )
+        return await RunRepository._capability_approval_id_has_status(
+            session,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            status="approved",
         )
-        return approved_id is not None
 
     async def approve_capability_and_enqueue(
         self,
@@ -982,6 +999,14 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                if await self._capability_approval_id_has_status(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    approval_id=approval_id,
+                    status="rejected",
+                ):
+                    return self._record(row)
                 raise RunConflict("run is not waiting for capability approval")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
             if routing_decision.get("approval_kind") != "capability_tool":
