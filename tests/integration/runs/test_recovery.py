@@ -383,6 +383,7 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert first.status is RunStatus.RUNNING
     duplicate_worker = await service.execute(submitted.id)
     duplicate_events = await service.events(tenant_id, submitted.id)
+    await _expire_worker_lease(repository, submitted.id)
 
     recovered = await service.recover(submitted.id)
     run = await service.get(tenant_id, submitted.id)
@@ -1362,8 +1363,9 @@ async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(
 ) -> None:
     tenant_id = uuid4()
     runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
     service = RunService(
-        RunRepository(run_session_factory),
+        repository,
         runtime_registry=RuntimeRegistry((runtime,)),
         router=None,
         task_queue=RecordingQueue([]),
@@ -1377,6 +1379,7 @@ async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(
     )
 
     first = await service.execute(submitted.id, crash_after_event_kind=EventKind.ARTIFACT_CREATED)
+    await _expire_worker_lease(repository, submitted.id)
     recovered = await service.recover(submitted.id)
     events = await service.events(tenant_id, submitted.id)
 
@@ -1719,8 +1722,9 @@ async def test_restore_exception_is_persisted_as_terminal_failure(
 ) -> None:
     tenant_id = uuid4()
     runtime = RestoreExplodingRuntime()
+    repository = RunRepository(run_session_factory)
     service = RunService(
-        RunRepository(run_session_factory),
+        repository,
         runtime_registry=RuntimeRegistry((runtime,)),
         router=None,
         task_queue=RecordingQueue([]),
@@ -1733,6 +1737,7 @@ async def test_restore_exception_is_persisted_as_terminal_failure(
         idempotency_key="client-request-9",
     )
     await service.execute(submitted.id, crash_after_event_kind=EventKind.CHECKPOINT_SAVED)
+    await _expire_worker_lease(repository, submitted.id)
 
     failed = await service.recover(submitted.id)
     duplicate_retry = await service.execute(submitted.id)
