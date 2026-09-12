@@ -38,7 +38,13 @@ from agent_hub.harness.types import HarnessPolicy, HarnessTaskRequirements
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.registry import NoCapableDeployment
-from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+)
 from agent_hub.multimodal.generation import MultimediaGenerationKind
 from agent_hub.multimodal.minimax import MiniMaxGeneratedVideo
 from agent_hub.multimodal.video_providers import TextToVideoProviderRouter
@@ -960,7 +966,7 @@ async def test_multimedia_executor_rejects_video_without_capacity_or_secret_look
                 api_protocol="openai_compatible",
                 upstream_model="deepseek-v4-flash",
                 logical_model="video_primary",
-                capabilities=["text"],
+                capabilities=[ModelCapability.TEXT],
                 credential_ref="secret://video-primary",
                 quota_scope="deepseek-account",
                 max_concurrency=1,
@@ -1009,7 +1015,7 @@ async def test_multimedia_executor_rejects_unknown_video_model_even_if_declared(
                 api_protocol="openai_compatible",
                 upstream_model="MiniMax-M3",
                 logical_model="video_primary",
-                capabilities=["text", "video_generation"],
+                capabilities=[ModelCapability.TEXT, ModelCapability.VIDEO_GENERATION],
                 credential_ref="secret://video-primary",
                 quota_scope="minimax-account",
                 max_concurrency=1,
@@ -1059,7 +1065,7 @@ async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests(
                 api_protocol="openai_compatible",
                 upstream_model="MiniMax-Hailuo-02",
                 logical_model="video_primary",
-                capabilities=["text", "video_generation"],
+                capabilities=[ModelCapability.TEXT, ModelCapability.VIDEO_GENERATION],
                 credential_ref="secret://main-agent",
                 quota_scope="minimax-account",
                 max_concurrency=1,
@@ -1116,7 +1122,7 @@ async def test_multimedia_executor_uses_minimax_video_client_for_hailuo_files(tm
                 api_protocol="openai_compatible",
                 upstream_model="MiniMax-Hailuo-02",
                 logical_model="video_primary",
-                capabilities=["video_generation"],
+                capabilities=[ModelCapability.VIDEO_GENERATION],
                 credential_ref="secret://main-agent",
                 quota_scope="minimax-account",
                 max_concurrency=1,
@@ -1198,7 +1204,7 @@ async def test_multimedia_executor_for_tenant_uses_scoped_models_and_secrets(
                     api_protocol="openai_compatible",
                     upstream_model="MiniMax-Hailuo-02",
                     logical_model="video_primary",
-                    capabilities=["video_generation"],
+                    capabilities=[ModelCapability.VIDEO_GENERATION],
                     credential_ref=f"secret://{self.tenant_id}",
                     quota_scope=f"minimax-{self.tenant_id}",
                     max_concurrency=1,
@@ -1259,7 +1265,7 @@ async def test_multimedia_executor_does_not_send_other_video_models_to_minimax(t
                 api_protocol="openai_compatible",
                 upstream_model="gen4-turbo",
                 logical_model="video_primary",
-                capabilities=["video_generation"],
+                capabilities=[ModelCapability.VIDEO_GENERATION],
                 credential_ref="secret://main-agent",
                 quota_scope="runway-account",
                 max_concurrency=1,
@@ -1465,7 +1471,7 @@ async def test_main_agent_mode_router_inherits_registered_model_capabilities() -
                 api_protocol="openai_compatible",
                 upstream_model="MiniMax-M3",
                 credential_ref="secret://main-agent",
-                capabilities=["text"],
+                capabilities=[ModelCapability.TEXT],
             )
         )
 
@@ -1477,7 +1483,7 @@ async def test_main_agent_mode_router_inherits_registered_model_capabilities() -
                 api_protocol="openai_compatible",
                 upstream_model="MiniMax-M3",
                 logical_model="minimax",
-                capabilities=["text", "structured_output", "tool_calling"],
+                capabilities=[ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT, ModelCapability.TOOL_CALLING],
                 credential_ref="secret://main-agent",
                 quota_scope="minimax-account",
                 max_concurrency=1,
@@ -1529,8 +1535,9 @@ async def test_main_agent_context_window_getter_reads_configured_model() -> None
                 api_protocol="openai_compatible",
                 upstream_model="deepseek-v4-flash",
                 credential_ref="secret://main-agent",
-                capabilities=["text"],
+                capabilities=[ModelCapability.TEXT],
             )
         )
 
     assert await _MainAgentContextWindowGetter(get_main_agent_config)() == 128_000
+
