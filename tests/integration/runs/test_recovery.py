@@ -430,6 +430,56 @@ async def test_recover_running_restores_recoverable_running_run(
     assert len(runtime.restored) == 1
 
 
+async def test_recover_refuses_running_run_with_unexpired_worker_lease(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
+    active_worker = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        worker_id="worker-active",
+        run_worker_lease_seconds=60,
+    )
+    recovery_worker = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        worker_id="worker-recovery",
+        run_worker_lease_seconds=60,
+    )
+    submitted = await active_worker.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="recover should not steal active lease",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="tenant-active-lease-key",
+    )
+
+    first = await active_worker.execute(
+        submitted.id,
+        crash_after_event_kind=EventKind.CHECKPOINT_SAVED,
+    )
+    recovered = await recovery_worker.recover(submitted.id)
+    run = await recovery_worker.get(tenant_id, submitted.id)
+    events = await recovery_worker.events(tenant_id, submitted.id)
+    async with run_session_factory() as session, session.begin():
+        row = await repository.get_for_update(session, submitted.id)
+        worker_id = row.worker_id
+
+    assert first.status is RunStatus.RUNNING
+    assert recovered.status is RunStatus.RUNNING
+    assert run.status is RunStatus.RUNNING
+    assert worker_id == "worker-active"
+    assert runtime.calls == 1
+    assert runtime.restored == []
+    assert sum(event["kind"] == "artifact.created" for event in events) == 1
+
+
 async def test_recover_running_fails_safe_for_non_replayable_running_run(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

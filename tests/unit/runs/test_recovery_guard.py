@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
@@ -10,6 +10,7 @@ from sqlalchemy.dialects import postgresql
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import (
+    RunAlreadyActive,
     RunRecord,
     RunRepository,
     _is_recovery_replayable_event_kind,
@@ -321,6 +322,28 @@ async def test_claim_for_execution_records_worker_lease() -> None:
     assert repository.row.worker_lease_token == repository.lease_token
     assert repository.row.worker_lease_expires_at == repository.lease_expires_at
     assert repository.row.worker_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_running_recovery_refuses_unexpired_worker_lease() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    repository.row.worker_id = "worker-active"
+    repository.row.worker_lease_token = uuid4()
+    repository.row.worker_lease_expires_at = datetime.now(UTC) + timedelta(seconds=60)
+
+    with pytest.raises(RunAlreadyActive):
+        await repository.claim_for_execution(
+            cast(Any, _FakeTransaction()),
+            repository.run_id,
+            allow_running_recovery=True,
+            worker_id="worker-recovery",
+            worker_lease_token=repository.lease_token,
+            worker_lease_expires_at=repository.lease_expires_at,
+        )
 
 
 def test_running_for_recovery_requires_expired_worker_lease() -> None:

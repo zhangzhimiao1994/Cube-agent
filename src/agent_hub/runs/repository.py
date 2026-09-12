@@ -564,6 +564,13 @@ class RunRepository:
             return self._record(row)
         if status is RunStatus.RUNNING and not allow_running_recovery:
             raise RunAlreadyActive("run is already active")
+        if (
+            status is RunStatus.RUNNING
+            and allow_running_recovery
+            and row.worker_lease_expires_at is not None
+            and row.worker_lease_expires_at > datetime.now(UTC)
+        ):
+            raise RunAlreadyActive("run is already active")
         if status not in {RunStatus.QUEUED, RunStatus.RETRYING, RunStatus.RUNNING}:
             raise RunConflict("run cannot be executed from its current state")
         row.status = RunStatus.RUNNING.value
