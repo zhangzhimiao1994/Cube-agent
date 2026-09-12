@@ -392,6 +392,15 @@ class ApprovalWaitingRepository(ExecutableFakeRepository):
         return row
 
 
+class CompletedBeforeRuntimeEventRepository(ExecutableFakeRepository):
+    async def get_for_update(self, session: FakeTransaction, run_id: UUID) -> FakeRunRow:
+        row = await super().get_for_update(session, run_id)
+        if row.status == RunStatus.RUNNING.value:
+            row.status = RunStatus.COMPLETED.value
+            row.version += 1
+        return row
+
+
 class RuntimeCompletes:
     mode = TaskMode.DISPATCH
 
@@ -417,6 +426,31 @@ class RuntimeRecordsRepairContextCompletes:
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         self.contexts.append(context)
         yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeYieldsStaleToolEvent:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.TOOL_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="tool",
+            tool_call_id="stale-tool",
+            tool_name="external_side_effect",
+            payload={"status": "completed"},
+        )
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=2, run_id=context.run_id)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise AssertionError("not used")
@@ -786,6 +820,22 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "routing_decision": {"source": "evolution", "evolution_run_id": "evolution_1"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_drops_runtime_events_after_stale_worker_loses_terminal_race() -> None:
+    repository = CompletedBeforeRuntimeEventRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeYieldsStaleToolEvent(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert repository.event_log == []
 
 
 @pytest.mark.asyncio

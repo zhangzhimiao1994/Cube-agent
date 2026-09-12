@@ -1346,6 +1346,13 @@ class RunService:
                     if current_status is RunStatus.WAITING_APPROVAL:
                         terminal = RunStatus.WAITING_APPROVAL
                         break
+                    if current_status in {
+                        RunStatus.COMPLETED,
+                        RunStatus.FAILED,
+                        RunStatus.CANCELLED,
+                    }:
+                        terminal = current_status
+                        break
                     if current_status is RunStatus.RUNNING and not RunRepository.renew_worker_lease(
                         locked,
                         worker_id=self._worker_id,
