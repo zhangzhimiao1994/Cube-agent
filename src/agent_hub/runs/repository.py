@@ -766,6 +766,8 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             current = RunStatus(row.status)
+            if current is status:
+                return self._record(row)
             if current in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
                 raise RunConflict("terminal run state is immutable")
             if status is RunStatus.PAUSED and current not in {RunStatus.QUEUED, RunStatus.RUNNING}:

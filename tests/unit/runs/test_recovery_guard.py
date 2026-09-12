@@ -556,6 +556,56 @@ async def test_repeated_resume_returns_queued_record_without_duplicate_outbox() 
 
 
 @pytest.mark.asyncio
+async def test_repeated_pause_returns_paused_record_without_version_bump() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="pause after network retry",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.PAUSED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.update_control_status(row.tenant_id, row.id, RunStatus.PAUSED)
+
+    assert record.status is RunStatus.PAUSED
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_returns_cancelled_record_without_version_bump() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="cancel after network retry",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.update_control_status(row.tenant_id, row.id, RunStatus.CANCELLED)
+
+    assert record.status is RunStatus.CANCELLED
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_temporary_agent_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(

@@ -103,7 +103,9 @@ class StubRunService:
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
     workspace_contexts: list[dict[str, object]] = field(default_factory=list)
+    paused: list[tuple[UUID, UUID]] = field(default_factory=list)
     resumed: list[tuple[UUID, UUID]] = field(default_factory=list)
+    cancelled: list[tuple[UUID, UUID]] = field(default_factory=list)
 
     async def submit(
         self,
@@ -455,7 +457,19 @@ class StubRunService:
         )
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
-        return await self.get(tenant_id, run_id)
+        self.paused.append((tenant_id, run_id))
+        summary = await self.get(tenant_id, run_id)
+        return RunSummary(
+            id=summary.id,
+            tenant_id=summary.tenant_id,
+            status=RunStatus.PAUSED,
+            mode=summary.mode,
+            version=summary.version,
+            request=summary.request,
+            completed_step_ids=summary.completed_step_ids,
+            artifact_ids=summary.artifact_ids,
+            usage_cost_usd=summary.usage_cost_usd,
+        )
 
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         self.resumed.append((tenant_id, run_id))
@@ -473,6 +487,7 @@ class StubRunService:
         )
 
     async def cancel(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
+        self.cancelled.append((tenant_id, run_id))
         summary = await self.get(tenant_id, run_id)
         return RunSummary(
             id=summary.id,
@@ -1446,6 +1461,34 @@ def test_repeated_resume_run_returns_queued_state() -> None:
     assert first.json()["status"] == "queued"
     assert second.json()["status"] == "queued"
     assert service.resumed == [(principal.tenant_id, run_id), (principal.tenant_id, run_id)]
+
+
+def test_repeated_pause_run_returns_paused_state() -> None:
+    client, service, principal = _client()
+    run_id = uuid4()
+
+    first = client.post(f"/api/v1/runs/{run_id}/pause", headers=bearer())
+    second = client.post(f"/api/v1/runs/{run_id}/pause", headers=bearer())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["status"] == "paused"
+    assert second.json()["status"] == "paused"
+    assert service.paused == [(principal.tenant_id, run_id), (principal.tenant_id, run_id)]
+
+
+def test_repeated_cancel_run_returns_cancelled_state() -> None:
+    client, service, principal = _client()
+    run_id = uuid4()
+
+    first = client.post(f"/api/v1/runs/{run_id}/cancel", headers=bearer())
+    second = client.post(f"/api/v1/runs/{run_id}/cancel", headers=bearer())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["status"] == "cancelled"
+    assert second.json()["status"] == "cancelled"
+    assert service.cancelled == [(principal.tenant_id, run_id), (principal.tenant_id, run_id)]
 
 
 def test_run_details_include_version_for_capability_approval() -> None:
