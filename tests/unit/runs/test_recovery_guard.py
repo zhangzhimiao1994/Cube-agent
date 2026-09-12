@@ -366,6 +366,43 @@ async def test_repeated_self_repair_accept_returns_record_without_duplicate_outb
 
 
 @pytest.mark.asyncio
+async def test_repeated_mode_choice_returns_record_without_duplicate_outbox() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="choose a mode",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "decision_token": "mode-token",
+            "selected_mode": TaskMode.DISPATCH.value,
+            "operator_note": "dispatch it",
+        },
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.choose_mode_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        mode=TaskMode.DISPATCH,
+        decision_token="mode-token",
+        version=7,
+        operator_note="dispatch it",
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert record.mode is TaskMode.DISPATCH
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_capability_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(
