@@ -2319,6 +2319,8 @@ async def test_blocked_contract_self_repair_preserves_unrelated_completed_branch
         for checkpoint in reversed(checkpoints)
         if checkpoint.state["phase"] == "completed"
     )
+    checkpoint_refs = cast(Mapping[str, Mapping[str, str]], completed_checkpoint.state["artifact_refs"])
+    preserved_side_note_id = checkpoint_refs["side_note"]["id"]
     restored_generation = RecordingGeneration()
     restored = CrewDispatchRuntime(
         RoleAwareGateway(),
@@ -2358,6 +2360,12 @@ async def test_blocked_contract_self_repair_preserves_unrelated_completed_branch
         "blocked_target",
         "final_response",
     ]
+    final_prompt = json.loads(restored_generation.prompts[-1][2])
+    final_sources = final_prompt["untrusted_source_artifacts"]
+    assert isinstance(final_sources, list)
+    assert {
+        source["artifact_review_packet"]["id"] for source in final_sources
+    } >= {preserved_side_note_id}
     started_steps = [
         event.step_id
         for event in events

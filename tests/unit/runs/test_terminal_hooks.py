@@ -279,6 +279,50 @@ class ExecutableFakeRepository:
         )
 
 
+class SelfRepairCheckpointRepository(ExecutableFakeRepository):
+    def __init__(self, *, routing_decision: dict[str, object]) -> None:
+        super().__init__(routing_decision=routing_decision)
+        self.checkpoint = RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type="test_dispatch",
+            runtime_version="1.0",
+            run_id=self.run_id,
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            state={"completed_steps": ("planner_step",)},
+        )
+
+    async def claim_for_execution(
+        self,
+        session: FakeTransaction,
+        run_id: UUID,
+        *,
+        allow_running_recovery: bool,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+        worker_lease_expires_at: datetime | None = None,
+    ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
+        claimed = await super().claim_for_execution(
+            session,
+            run_id,
+            allow_running_recovery=allow_running_recovery,
+            worker_id=worker_id,
+            worker_lease_token=worker_lease_token,
+            worker_lease_expires_at=worker_lease_expires_at,
+        )
+        if isinstance(claimed, RunRecord):
+            return claimed
+        row, _checkpoint = claimed
+        routing_decision = row.routing_decision or {}
+        checkpoint = (
+            self.checkpoint
+            if routing_decision.get("source") == "self_repair"
+            and routing_decision.get("self_repair_accepted") is True
+            else None
+        )
+        return row, checkpoint
+
+
 class RecoveredFailedRepository(ExecutableFakeRepository):
     async def claim_for_execution(
         self,
@@ -381,6 +425,15 @@ class RuntimeRecordsRepairContextCompletes:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RuntimeRecordsRestoredCheckpointCompletes(RuntimeRecordsRepairContextCompletes):
+    def __init__(self) -> None:
+        super().__init__()
+        self.restored_checkpoints: list[RuntimeCheckpoint] = []
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored_checkpoints.append(checkpoint)
 
 
 class RuntimeReportsCapacityPressure:
@@ -1667,6 +1720,76 @@ async def test_accepted_self_repair_run_records_bounded_execution_audit() -> Non
     assert repair_context["source"] == "self_repair"
     assert repair_context["automatic_execution"] is False
     assert repair_context["recovery_strategy"] == "switch_to_available_model_and_retry"
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_execute_restores_latest_checkpoint() -> None:
+    repository = SelfRepairCheckpointRepository(routing_decision={"source": "manual"})
+    failure_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    failed = await failure_service.execute(repository.run_id)
+    assert failed.decision_token is not None
+    await failure_service.accept_self_repair(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=repository.run_id,
+        decision_token=failed.decision_token,
+        version=failed.version,
+    )
+    repair_runtime = RuntimeRecordsRestoredCheckpointCompletes()
+    repair_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((repair_runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    repaired = await repair_service.execute(repository.run_id)
+
+    assert repaired.status is RunStatus.COMPLETED
+    assert repair_runtime.restored_checkpoints == [repository.checkpoint]
+    assert repair_runtime.contexts[0].checkpoint == repository.checkpoint
+    assert repair_runtime.contexts[0].routing_decision["self_repair_accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_accepted_self_repair_does_not_expose_stale_actionable_proposal() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    failure_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    failed = await failure_service.execute(repository.run_id)
+    assert failed.decision_token is not None
+    await failure_service.accept_self_repair(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=repository.run_id,
+        decision_token=failed.decision_token,
+        version=failed.version,
+    )
+    repair_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeRaises(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    repaired = await repair_service.execute(repository.run_id)
+
+    assert repaired.status is RunStatus.FAILED
+    assert repaired.decision_token is None
+    assert repaired.repair_proposal is None
+    repair_events = [
+        event.kind for event in repository.event_log if str(event.kind).startswith("repair.")
+    ]
+    assert repair_events[-2:] == ["repair.failed", "repair.skipped"]
 
 
 @pytest.mark.asyncio

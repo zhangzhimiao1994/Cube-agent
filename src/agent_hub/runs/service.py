@@ -2377,6 +2377,13 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     evolution_proposal = decision.get("evolution_proposal")
     openclaw_proposal = decision.get("openclaw_proposal")
     repair_proposal = decision.get("repair_proposal")
+    repair_proposal_is_actionable = not (
+        record.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+        and (
+            decision.get("source") == "self_repair"
+            or decision.get("self_repair_accepted") is True
+        )
+    )
     sandbox_profile, requested_permissions = _safe_submitted_workspace_policy(decision)
     waiting_for_decision = record.status in {
         RunStatus.WAITING_USER_MODE,
@@ -2385,6 +2392,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         record.status is RunStatus.FAILED
         and decision.get("approval_kind") == "self_repair"
         and isinstance(repair_proposal, dict)
+        and repair_proposal_is_actionable
     )
     return SubmittedRun(
         id=record.id,
@@ -2420,7 +2428,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         if isinstance(openclaw_proposal, dict)
         else None,
         repair_proposal=cast(dict[str, object], repair_proposal)
-        if isinstance(repair_proposal, dict)
+        if isinstance(repair_proposal, dict) and repair_proposal_is_actionable
         else None,
     )
 
