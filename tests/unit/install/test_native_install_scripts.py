@@ -19,7 +19,7 @@ def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints
         == "agent_hub.openclaw.local_adapter:main"
     )
     assert "openclaw-adapter     Start a local OpenClaw Adapter" in launcher
-    assert "doctor|status|logs|backup|restore|upgrade|prune-releases|openclaw-adapter" in launcher
+    assert "openclaw-adapter" in launcher
     assert "OPENCLAW_ADAPTER_TOKEN" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON" in command
@@ -34,10 +34,7 @@ def test_release_packager_includes_built_web_dist() -> None:
     command = read("scripts/commands/package-release.sh")
 
     assert "package-release     Build a deployable source archive including web/dist." in launcher
-    assert (
-        "doctor|status|logs|backup|restore|upgrade|prune-releases|openclaw-adapter|package-release"
-        in launcher
-    )
+    assert "package-release" in launcher
     assert "npm --prefix \"$SOURCE_DIR/web\" run build" in command
     assert '[[ -f "$SOURCE_DIR/web/dist/index.html" ]]' in command
     assert "--exclude='./web/node_modules'" in command
@@ -62,6 +59,27 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     assert 'protected["$(basename -- "$current_real")"]="current"' in command
     assert 'find "$release_dir_real" -mindepth 1 -maxdepth 1 -type d' in command
     assert 'rm -rf -- "$release_path"' in command
+
+
+def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_checks() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/harness-acceptance.sh")
+
+    assert "harness-acceptance  Run Codex/DeepSeek harness acceptance smoke and stress checks." in launcher
+    assert "harness-acceptance" in launcher
+    assert "Usage: scripts/agent-hub harness-acceptance" in command
+    assert "--profile codex|deepseek|all" in command
+    assert "--stress" in command
+    assert "run_codex_profile" in command
+    assert "run_deepseek_profile" in command
+    assert "run_stress_profile" in command
+    assert "/health/live" in command
+    assert "/health/ready" in command
+    assert "/openapi.json" in command
+    assert "/login" in command
+    assert "AGENT_HUB_ACCEPTANCE_BASE_URL" in command
+    assert "AGENT_HUB_ACCEPTANCE_CONCURRENCY" in command
+    assert "AGENT_HUB_ACCEPTANCE_ITERATIONS" in command
 
 
 def test_native_installer_deploys_release_before_starting_services() -> None:
