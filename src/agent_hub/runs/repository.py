@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -140,6 +141,22 @@ def _temporary_agent_revision_already_applied(
         and routing_decision.get("decision_token") == decision_token
         and routing_decision.get("temporary_agent_rejected") is True
         and routing_decision.get("temporary_agent_feedback") == feedback
+    )
+
+
+def _self_repair_decision_token_hash(decision_token: str) -> str:
+    return hashlib.sha256(decision_token.encode("utf-8")).hexdigest()
+
+
+def _self_repair_acceptance_already_applied(
+    routing_decision: dict[str, object],
+    decision_token: str,
+) -> bool:
+    return (
+        routing_decision.get("source") == "self_repair"
+        and routing_decision.get("self_repair_accepted") is True
+        and routing_decision.get("self_repair_decision_token_hash")
+        == _self_repair_decision_token_hash(decision_token)
     )
 
 
@@ -504,9 +521,11 @@ class RunRepository:
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
-            if RunStatus(row.status) is not RunStatus.FAILED:
-                raise RunConflict("run is not waiting for self repair")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if RunStatus(row.status) is not RunStatus.FAILED:
+                if _self_repair_acceptance_already_applied(routing_decision, decision_token):
+                    return self._record(row)
+                raise RunConflict("run is not waiting for self repair")
             if routing_decision.get("approval_kind") != "self_repair":
                 raise RunConflict("run is waiting for a different approval")
             if routing_decision.get("decision_token") != decision_token:
@@ -536,6 +555,9 @@ class RunRepository:
                     "self_repair_source_event_sequence": proposal.get("source_event_sequence"),
                     "self_repair_recovery_baseline_sequence": recovery_baseline_sequence,
                     "self_repair_fingerprint": proposal.get("fingerprint"),
+                    "self_repair_decision_token_hash": _self_repair_decision_token_hash(
+                        decision_token
+                    ),
                     "self_repair_context": repair_context_from_proposal(proposal),
                 }
             )

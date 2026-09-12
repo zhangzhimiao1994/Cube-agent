@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Self, cast
@@ -313,6 +314,55 @@ async def test_accept_self_repair_records_current_event_sequence_as_recovery_bas
     assert record.routing_decision is not None
     assert record.routing_decision["self_repair_accepted"] is True
     assert record.routing_decision["self_repair_recovery_baseline_sequence"] == 3
+    assert record.routing_decision["self_repair_decision_token_hash"] == hashlib.sha256(
+        b"repair-token"
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_repeated_self_repair_accept_returns_record_without_duplicate_outbox() -> None:
+    token_hash = hashlib.sha256(b"repair-token").hexdigest()
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="repair failed run",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "source": "self_repair",
+            "repair_proposal": {
+                "kind": "self_repair",
+                "attempt": 1,
+                "max_attempts": 1,
+                "fingerprint": "repair-fp",
+            },
+            "self_repair_accepted": True,
+            "self_repair_attempt": 1,
+            "self_repair_max_attempts": 1,
+            "self_repair_source_run_id": "source-run",
+            "self_repair_recovery_baseline_sequence": 3,
+            "self_repair_fingerprint": "repair-fp",
+            "self_repair_decision_token_hash": token_hash,
+        },
+    )
+    session = _AcceptSelfRepairSession(row)
+    repository = RunRepository(cast(Any, None))
+    repository._session_factory = cast(Any, lambda: session)
+
+    record = await repository.accept_self_repair_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        decision_token="repair-token",
+        version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert session.added == []
 
 
 @pytest.mark.asyncio
