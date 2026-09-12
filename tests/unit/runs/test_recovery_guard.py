@@ -227,7 +227,8 @@ def test_repair_started_is_recovery_replayable_observability() -> None:
     assert _is_recovery_replayable_event_kind("repair.started")
 
 
-def test_approval_resolved_is_recovery_replayable_observability() -> None:
+def test_approval_events_are_recovery_replayable_observability() -> None:
+    assert _is_recovery_replayable_event_kind(EventKind.APPROVAL_REQUESTED.value)
     assert _is_recovery_replayable_event_kind(EventKind.APPROVAL_RESOLVED.value)
 
 

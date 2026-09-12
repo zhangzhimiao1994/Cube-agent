@@ -34,6 +34,7 @@ from agent_hub.runtime.failure_reason import (
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
     {
+        EventKind.APPROVAL_REQUESTED.value,
         EventKind.APPROVAL_RESOLVED.value,
         "harness.started",
         "repair.started",
