@@ -11062,6 +11062,18 @@ def test_model_create_accepts_input_understanding_capabilities() -> None:
     assert response.json()["capabilities"] == ["audio", "text", "tool_calling", "vision"]
 
 
+def test_model_create_rejects_unknown_capabilities() -> None:
+    payload = {
+        **model_payload(),
+        "capabilities": ["text", "custom_vendor_magic"],
+    }
+
+    response = client().post("/api/v1/admin/models", headers=headers(), json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+
+
 def test_multimedia_generation_requires_feature_switch() -> None:
     response = client().post(
         "/api/v1/admin/multimedia/generate",

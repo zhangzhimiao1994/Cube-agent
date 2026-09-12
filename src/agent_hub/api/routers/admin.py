@@ -152,7 +152,7 @@ class ModelDeploymentRequest(BaseModel):
     )
     upstream_model: str = Field(min_length=1, max_length=512)
     logical_model: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    capabilities: list[str] = Field(min_length=1, max_length=8)
+    capabilities: list[ModelCapability] = Field(min_length=1, max_length=8)
     credential_ref: str = Field(min_length=1, max_length=128)
     quota_scope: str = Field(min_length=1, max_length=128)
     max_concurrency: int = Field(ge=1, le=1024)
@@ -8679,7 +8679,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             else "openai_compatible",
             upstream_model=parsed.model,
             logical_model=logical_model,
-            capabilities=sorted(parsed.capabilities),
+            capabilities=sorted(
+                (ModelCapability(capability) for capability in parsed.capabilities),
+                key=lambda capability: capability.value,
+            ),
             credential_ref=parsed.secret_ref,
             quota_scope=parsed.quota_scope_id,
             max_concurrency=parsed.max_concurrency,
@@ -9047,14 +9050,13 @@ def _safe_plugin_upload_filename(value: str | None) -> str:
 
 def _normalize_model_request_api_base(request: ModelDeploymentRequest) -> ModelDeploymentRequest:
     normalized = _normalized_model_api_base(request.api_protocol, request.api_base)
-    capabilities = [
-        capability.value
-        for capability in infer_model_capabilities(
+    capabilities = list(
+        infer_model_capabilities(
             provider=request.provider,
             upstream_model=request.upstream_model,
             declared=request.capabilities,
         )
-    ]
+    )
     if normalized == request.api_base and capabilities == request.capabilities:
         return request
     return request.model_copy(update={"api_base": normalized, "capabilities": capabilities})

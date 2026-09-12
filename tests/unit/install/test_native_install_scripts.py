@@ -72,11 +72,16 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--stress" in command
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
+    assert "check_health_json" in command
+    assert "check_prometheus_metrics" in command
+    assert "check_protected_boundary" in command
+    assert "check_openapi_model_capability_schema" in command
     assert "run_lifecycle_profile" in command
     assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
     assert "/health/live" in command
     assert "/health/ready" in command
+    assert "/metrics" in command
     assert "/openapi.json" in command
     assert "/login" in command
     assert "AGENT_HUB_ACCEPTANCE_BASE_URL" in command
@@ -90,6 +95,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--retry-delay SECONDS" in command
     assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in command
     assert "Authorization: Bearer" in command
+    assert "^agent_hub_runs_total( |[{])" in command
+    assert "^agent_hub_queue_depth( |[{])" in command
+    assert "^www-authenticate: Bearer" in command
     assert '"/api/v1/runs"' in command
     assert '"/api/v1/runs/$run_id"' in command
     assert '"/api/v1/runs/$run_id/events"' in command
@@ -99,9 +107,19 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'securitySchemes", {}).get("BearerAuth")' in command
     assert '"$acceptance_python_bin" - "$acceptance_openapi_file" "$path" "$method"' in command
     assert 'if "401" not in responses or "403" not in responses:' in command
+    assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command
+    assert 'check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post"' in command
+    assert 'check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get"' in command
+    assert 'check_openapi_path "model routing registry" "/api/v1/admin/models" "get"' in command
+    assert 'check_openapi_path "model routing create" "/api/v1/admin/models" "post"' in command
+    assert 'check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post"' in command
+    assert 'items != {"$ref": "#/components/schemas/ModelCapability"}' in command
     assert 'check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get"' in command
     assert 'check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get"' in command
+    assert 'check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post"' in command
     assert 'check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get"' in command
+    assert 'check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post"' in command
+    assert 'check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 

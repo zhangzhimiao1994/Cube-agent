@@ -159,10 +159,140 @@ check_url() {
   return 1
 }
 
+check_health_json() {
+  local name="$1"
+  local path="$2"
+  local python_bin
+  local response
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: %s %s requires python for JSON handling\n' "$name" "$path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    "$base_url$path" 2>/dev/null)"; then
+    printf 'fail: %s %s -> curl-error\n' "$name" "$path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os, sys; sys.exit(0 if json.loads(os.environ["ACCEPTANCE_RESPONSE"]).get("status") == "ok" else 1)'; then
+    printf 'ok: %s %s JSON status=ok\n' "$name" "$path"
+    return 0
+  fi
+  printf 'fail: %s %s JSON status!=ok\n' "$name" "$path" >&2
+  failures=$((failures + 1))
+  return 1
+}
+
+check_prometheus_metrics() {
+  local response_headers
+  local metrics_path="/metrics"
+  local temp_file
+  temp_file="$(mktemp)"
+  if ! response_headers="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS -D - -o "$temp_file" \
+    "$base_url$metrics_path" 2>/dev/null)"; then
+    rm -f -- "$temp_file"
+    printf 'fail: prometheus metrics %s -> curl-error\n' "$metrics_path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! printf '%s\n' "$response_headers" | grep -qi '^content-type: text/plain'; then
+    rm -f -- "$temp_file"
+    printf 'fail: prometheus metrics %s content-type is not text/plain\n' "$metrics_path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if grep -q '^# TYPE agent_hub_runs_total counter' "$temp_file" \
+    && grep -Eq '^agent_hub_runs_total( |[{])' "$temp_file" \
+    && grep -q '^# TYPE agent_hub_queue_depth gauge' "$temp_file" \
+    && grep -Eq '^agent_hub_queue_depth( |[{])' "$temp_file"; then
+    rm -f -- "$temp_file"
+    printf 'ok: prometheus metrics %s\n' "$metrics_path"
+    return 0
+  fi
+  rm -f -- "$temp_file"
+  printf 'fail: prometheus metrics %s missing core agent_hub metrics\n' "$metrics_path" >&2
+  failures=$((failures + 1))
+  return 1
+}
+
+check_protected_boundary() {
+  local name="$1"
+  local path="$2"
+  local status
+  local temp_headers
+  temp_headers="$(mktemp)"
+  if status="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -sS -D "$temp_headers" -o /dev/null -w '%{http_code}' \
+    "$base_url$path" 2>/dev/null)" && [[ "$status" == "401" ]]; then
+    if grep -qi '^www-authenticate: Bearer' "$temp_headers"; then
+      rm -f -- "$temp_headers"
+      printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
+      return 0
+    fi
+    rm -f -- "$temp_headers"
+    printf 'fail: %s %s expected WWW-Authenticate: Bearer\n' "$name" "$path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  rm -f -- "$temp_headers"
+  printf 'fail: %s %s expected 401 -> %s\n' "$name" "$path" "${status:-curl-error}" >&2
+  failures=$((failures + 1))
+  return 1
+}
+
+check_openapi_model_capability_schema() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+schemas = document.get("components", {}).get("schemas", {})
+capability_schema = schemas.get("ModelCapability", {})
+expected = [
+    "text",
+    "vision",
+    "audio",
+    "tool_calling",
+    "structured_output",
+    "image_generation",
+    "video_generation",
+    "audio_generation",
+]
+if capability_schema.get("enum") != expected:
+    raise SystemExit(1)
+request_schema = schemas.get("ModelDeploymentRequest", {})
+items = request_schema.get("properties", {}).get("capabilities", {}).get("items")
+if items != {"$ref": "#/components/schemas/ModelCapability"}:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: model capability enum schema\n'
+    return 0
+  fi
+  printf 'fail: model capability enum schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
   check_url "api live health" "/health/live" || true
   check_url "api readiness" "/health/ready" || true
+  check_health_json "api live health" "/health/live" || true
+  check_health_json "api readiness" "/health/ready" || true
+  check_prometheus_metrics || true
+  check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_url "openapi contract" "/openapi.json" || true
   check_url "management ui entry" "/login" || true
 }
@@ -172,6 +302,7 @@ run_deepseek_profile() {
   check_url "plugin-safe openapi projection" "/openapi.json" || true
   check_url "operator ui for plugin orchestration" "/login" || true
   check_url "runtime readiness boundary" "/health/ready" || true
+  check_prometheus_metrics || true
 }
 
 check_openapi_path() {
@@ -231,12 +362,21 @@ run_openapi_capability_profile() {
   fi
   check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
   check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
+  check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post" || true
   check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post" || true
+  check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post" || true
+  check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get" || true
+  check_openapi_path "model routing registry" "/api/v1/admin/models" "get" || true
+  check_openapi_path "model routing create" "/api/v1/admin/models" "post" || true
+  check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
+  check_openapi_model_capability_schema || true
   check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get" || true
   check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post" || true
   check_openapi_path "plugin package approval" "/api/v1/admin/plugins/{plugin_id}/package/approve" "post" || true
+  check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post" || true
   check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get" || true
   check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get" || true
+  check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post" || true
   rm -f -- "$openapi_file"
 }
 

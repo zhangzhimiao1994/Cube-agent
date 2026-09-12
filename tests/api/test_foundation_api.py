@@ -1484,6 +1484,25 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
                 }
 
 
+def test_openapi_describes_model_capabilities_as_fixed_enum() -> None:
+    schema = auth_client().get("/openapi.json").json()
+    capability_schema = schema["components"]["schemas"]["ModelCapability"]
+    assert capability_schema["enum"] == [
+        "text",
+        "vision",
+        "audio",
+        "tool_calling",
+        "structured_output",
+        "image_generation",
+        "video_generation",
+        "audio_generation",
+    ]
+
+    request_schema = schema["components"]["schemas"]["ModelDeploymentRequest"]
+    capabilities_items = request_schema["properties"]["capabilities"]["items"]
+    assert capabilities_items == {"$ref": "#/components/schemas/ModelCapability"}
+
+
 def proxy_auth_client(
     peer: str, trusted: list[str]
 ) -> tuple[TestClient, StubRateLimiter]:
