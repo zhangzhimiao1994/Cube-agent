@@ -103,6 +103,7 @@ class StubRunService:
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
     workspace_contexts: list[dict[str, object]] = field(default_factory=list)
+    resumed: list[tuple[UUID, UUID]] = field(default_factory=list)
 
     async def submit(
         self,
@@ -457,7 +458,19 @@ class StubRunService:
         return await self.get(tenant_id, run_id)
 
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
-        return await self.get(tenant_id, run_id)
+        self.resumed.append((tenant_id, run_id))
+        summary = await self.get(tenant_id, run_id)
+        return RunSummary(
+            id=summary.id,
+            tenant_id=summary.tenant_id,
+            status=RunStatus.QUEUED,
+            mode=summary.mode,
+            version=summary.version,
+            request=summary.request,
+            completed_step_ids=summary.completed_step_ids,
+            artifact_ids=summary.artifact_ids,
+            usage_cost_usd=summary.usage_cost_usd,
+        )
 
     async def cancel(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         summary = await self.get(tenant_id, run_id)
@@ -1419,6 +1432,20 @@ def test_viewer_can_read_but_cannot_create_or_control_runs() -> None:
     assert read.status_code == 200
     assert read.json()["version"] == 7
     assert cancel.status_code == 403
+
+
+def test_repeated_resume_run_returns_queued_state() -> None:
+    client, service, principal = _client()
+    run_id = uuid4()
+
+    first = client.post(f"/api/v1/runs/{run_id}/resume", headers=bearer())
+    second = client.post(f"/api/v1/runs/{run_id}/resume", headers=bearer())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["status"] == "queued"
+    assert second.json()["status"] == "queued"
+    assert service.resumed == [(principal.tenant_id, run_id), (principal.tenant_id, run_id)]
 
 
 def test_run_details_include_version_for_capability_approval() -> None:

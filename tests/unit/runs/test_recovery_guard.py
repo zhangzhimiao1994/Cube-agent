@@ -525,6 +525,37 @@ async def test_repeated_capability_rejection_resolution_returns_record() -> None
 
 
 @pytest.mark.asyncio
+async def test_repeated_resume_returns_queued_record_without_duplicate_outbox() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="resume after network retry",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.enqueue_existing_run(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        from_status=RunStatus.PAUSED,
+        to_status=RunStatus.QUEUED,
+        idempotency_suffix="resume",
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_temporary_agent_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(

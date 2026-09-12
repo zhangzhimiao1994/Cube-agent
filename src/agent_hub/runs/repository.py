@@ -615,7 +615,10 @@ class RunRepository:
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
-            if RunStatus(row.status) is not from_status:
+            current_status = RunStatus(row.status)
+            if current_status is to_status:
+                return self._record(row)
+            if current_status is not from_status:
                 raise RunConflict("run state conflict")
             row.status = to_status.value
             row.version += 1
