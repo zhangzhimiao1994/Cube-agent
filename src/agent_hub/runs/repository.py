@@ -1390,7 +1390,7 @@ class RunRepository:
     ) -> None:
         event = _event_with_failure_diagnostic(event)
         payload = event.to_payload()
-        await session.execute(
+        inserted_event_id = await session.scalar(
             insert(RunEventRow)
             .values(
                 id=uuid4(),
@@ -1401,7 +1401,10 @@ class RunRepository:
                 payload=payload,
             )
             .on_conflict_do_nothing(index_elements=[RunEventRow.run_id, RunEventRow.sequence])
+            .returning(RunEventRow.id)
         )
+        if inserted_event_id is None:
+            return
         if event.step_id is not None and event.kind is EventKind.STEP_COMPLETED:
             await self._persist_step(session, tenant_id, run_id, event)
         if event.artifact is not None:

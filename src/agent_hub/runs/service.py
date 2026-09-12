@@ -59,6 +59,7 @@ _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
+_TERMINAL_HOOK_NOTIFIED_KIND = "terminal.notified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1273,9 +1274,11 @@ class RunService:
                     claimed_record
                 )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
+                await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
                 return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
             if claimed_record.status in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
+                await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
             return _submitted(claimed_record)
 
         terminal = RunStatus.RUNNING
@@ -1461,7 +1464,7 @@ class RunService:
                 mode=failed.mode,
                 routing_decision=failed.routing_decision,
             )
-            await self._safe_notify_terminal_hooks(
+            await self._safe_notify_terminal_hooks_once(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
                 run_id=run_id,
@@ -1528,7 +1531,7 @@ class RunService:
                 routing_decision=routing_decision,
                 scheduler_notices=tuple(scheduler_notice_payloads),
             )
-            await self._safe_notify_terminal_hooks(
+            await self._safe_notify_terminal_hooks_once(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 run_id=run_id,
@@ -1900,6 +1903,91 @@ class RunService:
                     status.value,
                     type(error).__name__,
                 )
+
+    async def _safe_notify_terminal_hooks_once_for_record(self, record: RunRecord) -> None:
+        await self._safe_notify_terminal_hooks_once(
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            run_id=record.id,
+            status=record.status,
+            mode=record.mode,
+            routing_decision=record.routing_decision,
+        )
+
+    async def _safe_notify_terminal_hooks_once(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID | None,
+        run_id: UUID,
+        status: RunStatus,
+        mode: TaskMode | None,
+        routing_decision: dict[str, object] | None,
+    ) -> None:
+        if not self._terminal_run_hooks:
+            return
+        if await self._terminal_hooks_already_notified(tenant_id, run_id):
+            return
+        await self._safe_notify_terminal_hooks(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=run_id,
+            status=status,
+            mode=mode,
+            routing_decision=routing_decision,
+        )
+        await self._safe_record_terminal_hook_notification(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status=status,
+        )
+
+    async def _terminal_hooks_already_notified(self, tenant_id: UUID, run_id: UUID) -> bool:
+        events_source = getattr(self._repository, "events", None)
+        if not callable(events_source):
+            return False
+        try:
+            events = await events_source(tenant_id, run_id)
+        except Exception as error:
+            _LOGGER.exception(
+                "run_terminal_hook_marker_load_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
+            return False
+        return any(
+            isinstance(event, Mapping)
+            and event.get("kind") == _TERMINAL_HOOK_NOTIFIED_KIND
+            for event in events
+        )
+
+    async def _safe_record_terminal_hook_notification(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        status: RunStatus,
+    ) -> None:
+        try:
+            async with await self._repository.run_transaction() as session, session.begin():
+                sequence = await self._repository.next_event_sequence(session, run_id)
+                await self._repository.persist_event(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    event=RunEvent(
+                        kind=_TERMINAL_HOOK_NOTIFIED_KIND,
+                        sequence=sequence,
+                        run_id=run_id,
+                        payload={"status": status.value},
+                    ),
+                )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_terminal_hook_marker_record_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
 
     async def _conversation_artifacts(
         self,

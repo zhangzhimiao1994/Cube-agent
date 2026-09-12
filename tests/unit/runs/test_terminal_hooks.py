@@ -2218,6 +2218,41 @@ async def test_execute_backfills_hermes_outcome_for_terminal_run_after_crash() -
 
 
 @pytest.mark.asyncio
+async def test_execute_backfills_terminal_hooks_once_for_terminal_run_after_crash() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    hook = RecordingHook()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        terminal_run_hooks=(hook,),
+    )
+
+    interrupted = await service.execute(
+        repository.run_id,
+        crash_after_event_kind=EventKind.RUNTIME_COMPLETED,
+    )
+    recovered = await service.execute(repository.run_id)
+    duplicate_recovered = await service.execute(repository.run_id)
+
+    assert interrupted.status is RunStatus.COMPLETED
+    assert recovered.status is RunStatus.COMPLETED
+    assert duplicate_recovered.status is RunStatus.COMPLETED
+    assert hook.calls == [
+        {
+            "tenant_id": TENANT_ID,
+            "actor_id": ACTOR_ID,
+            "run_id": repository.run_id,
+            "status": RunStatus.COMPLETED,
+            "mode": TaskMode.DISPATCH,
+            "routing_decision": {"source": "manual"},
+        }
+    ]
+    assert [event.kind for event in repository.event_log].count("terminal.notified") == 1
+
+
+@pytest.mark.asyncio
 async def test_execute_records_hermes_outcome_when_cleared_conversation_has_no_context() -> None:
     repository = ExecutableFakeRepository(
         routing_decision={

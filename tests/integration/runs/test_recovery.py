@@ -12,7 +12,14 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import AdminResourceRow, RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
+from agent_hub.db.models import (
+    AdminResourceRow,
+    RunApprovalRow,
+    RunArtifactRow,
+    RunEventRow,
+    RunOutboxRow,
+    RunRow,
+)
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
@@ -2156,6 +2163,120 @@ async def test_duplicate_artifact_content_for_same_run_is_idempotent(
 
     artifacts = await repository.artifacts(tenant_id, submitted.id)
     assert len(artifacts) == 1
+
+
+async def test_duplicate_event_sequence_does_not_persist_second_artifact_side_effect(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="dedupe artifact side effects",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+    first_artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="worker-a",
+        content={"text": "first artifact"},
+    )
+    second_artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="worker-b",
+        content={"text": "second artifact"},
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=1,
+                run_id=submitted.id,
+                artifact=first_artifact,
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=1,
+                run_id=submitted.id,
+                artifact=second_artifact,
+            ),
+        )
+
+    artifacts = await repository.artifacts(tenant_id, submitted.id)
+
+    assert [artifact["id"] for artifact in artifacts] == [str(first_artifact.id)]
+
+
+async def test_duplicate_event_sequence_does_not_update_approval_side_effect(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="dedupe approval side effects",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_REQUESTED,
+                sequence=1,
+                run_id=submitted.id,
+                actor="operator",
+                approval_id="approval-duplicate-sequence",
+                action="tool_execute",
+                reason="requires_user_approval",
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_RESOLVED,
+                sequence=1,
+                run_id=submitted.id,
+                actor="operator",
+                approval_id="approval-duplicate-sequence",
+                decision="approved",
+            ),
+        )
+
+    async with run_session_factory() as session:
+        row = await session.scalar(
+            select(RunApprovalRow).where(
+                RunApprovalRow.run_id == submitted.id,
+                RunApprovalRow.approval_id == "approval-duplicate-sequence",
+            )
+        )
+
+    assert row is not None
+    assert row.status == "pending"
 
 
 async def test_public_events_sanitize_sensitive_persisted_payload_keys(
