@@ -520,6 +520,11 @@ run_deepseek_profile() {
   check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
   check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
   check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST" || true
+  check_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST" || true
+  check_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST" || true
+  check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST" || true
+  check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST" || true
+  check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST" || true
   check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest" || true
   check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
   check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
@@ -599,6 +604,11 @@ run_openapi_capability_profile() {
   check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post" || true
   check_openapi_path "plugin package approval" "/api/v1/admin/plugins/{plugin_id}/package/approve" "post" || true
   check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post" || true
+  check_openapi_path "plugin lifecycle start" "/api/v1/admin/plugins/{plugin_id}/start" "post" || true
+  check_openapi_path "plugin lifecycle enable" "/api/v1/admin/plugins/{plugin_id}/enable" "post" || true
+  check_openapi_path "plugin lifecycle disable" "/api/v1/admin/plugins/{plugin_id}/disable" "post" || true
+  check_openapi_path "plugin lifecycle stop" "/api/v1/admin/plugins/{plugin_id}/stop" "post" || true
+  check_openapi_path "plugin lifecycle reload" "/api/v1/admin/plugins/{plugin_id}/reload" "post" || true
   check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get" || true
   check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get" || true
   check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post" || true

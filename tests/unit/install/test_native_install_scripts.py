@@ -135,6 +135,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get"' in command
     assert 'check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get"' in command
     assert 'check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post"' in command
+    assert 'check_openapi_path "plugin lifecycle start" "/api/v1/admin/plugins/{plugin_id}/start" "post"' in command
+    assert 'check_openapi_path "plugin lifecycle enable" "/api/v1/admin/plugins/{plugin_id}/enable" "post"' in command
+    assert 'check_openapi_path "plugin lifecycle disable" "/api/v1/admin/plugins/{plugin_id}/disable" "post"' in command
+    assert 'check_openapi_path "plugin lifecycle stop" "/api/v1/admin/plugins/{plugin_id}/stop" "post"' in command
+    assert 'check_openapi_path "plugin lifecycle reload" "/api/v1/admin/plugins/{plugin_id}/reload" "post"' in command
     assert 'check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get"' in command
     assert 'check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post"' in command
     assert 'check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000"' in command
@@ -151,6 +156,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
     assert 'check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
     assert 'check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST"' in command
+    assert 'check_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST"' in command
+    assert 'check_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST"' in command
+    assert 'check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST"' in command
+    assert 'check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST"' in command
+    assert 'check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST"' in command
     assert 'check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest"' in command
     assert 'check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp"' in command
     assert 'check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command
