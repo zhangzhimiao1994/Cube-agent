@@ -27,11 +27,41 @@ _PLUGIN_PACKAGE_ACTIVATION_REASON_CODES = {
     "plugin package dependencies are not supported by this runtime": (
         "plugin_package_dependencies_unsupported"
     ),
+    "plugin package install mode is not supported for activation": (
+        "plugin_package_install_mode_unsupported"
+    ),
+    "adapter package requires plugin approval before activation": (
+        "plugin_package_approval_required"
+    ),
+    "plugin package SDK API version is not supported for activation": (
+        "plugin_package_sdk_api_unsupported"
+    ),
+    "plugin package runtime is not supported for activation": (
+        "plugin_package_runtime_unsupported"
+    ),
+    "plugin package isolation is not supported for activation": (
+        "plugin_package_isolation_unsupported"
+    ),
     "runtime-registered adapter package requires a registered adapter": (
         "plugin_package_adapter_unavailable"
     ),
     "runtime-registered adapter package requires a registered adapter descriptor": (
         "plugin_package_adapter_unavailable"
+    ),
+    "runtime-registered adapter package descriptor id does not match package adapter_id": (
+        "plugin_package_adapter_descriptor_mismatch"
+    ),
+    "runtime-registered adapter package isolation is not supported by adapter": (
+        "plugin_package_adapter_isolation_unsupported"
+    ),
+    "runtime-registered adapter packages must declare at least one capability": (
+        "plugin_package_capability_missing"
+    ),
+    "runtime-registered adapter packages must route capabilities through package adapter_id": (
+        "plugin_package_capability_adapter_mismatch"
+    ),
+    "runtime-registered adapter package capabilities must use package isolation": (
+        "plugin_package_capability_isolation_mismatch"
     ),
 }
 

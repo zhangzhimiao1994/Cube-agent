@@ -251,6 +251,76 @@ def test_plugin_manifest_source_maps_package_activation_reason_to_safe_token() -
     assert capability["availability_reason"] == "plugin_package_dependencies_unsupported"
 
 
+def test_plugin_manifest_source_maps_runtime_activation_block_reasons_to_safe_tokens() -> None:
+    cases = {
+        "plugin package install mode is not supported for activation": (
+            "plugin_package_install_mode_unsupported"
+        ),
+        "adapter package requires plugin approval before activation": (
+            "plugin_package_approval_required"
+        ),
+        "plugin package SDK API version is not supported for activation": (
+            "plugin_package_sdk_api_unsupported"
+        ),
+        "plugin package runtime is not supported for activation": (
+            "plugin_package_runtime_unsupported"
+        ),
+        "plugin package isolation is not supported for activation": (
+            "plugin_package_isolation_unsupported"
+        ),
+        "runtime-registered adapter package descriptor id does not match package adapter_id": (
+            "plugin_package_adapter_descriptor_mismatch"
+        ),
+        "runtime-registered adapter package isolation is not supported by adapter": (
+            "plugin_package_adapter_isolation_unsupported"
+        ),
+        "runtime-registered adapter packages must declare at least one capability": (
+            "plugin_package_capability_missing"
+        ),
+        "runtime-registered adapter packages must route capabilities through package adapter_id": (
+            "plugin_package_capability_adapter_mismatch"
+        ),
+        "runtime-registered adapter package capabilities must use package isolation": (
+            "plugin_package_capability_isolation_mismatch"
+        ),
+    }
+
+    for raw_reason, expected_reason in cases.items():
+        source = PluginConfigCapabilityManifestSource(
+            (
+                SimpleNamespace(
+                    id="calendar",
+                    enabled=True,
+                    status="running",
+                    health="healthy",
+                    package_metadata=SimpleNamespace(
+                        kind="adapter_package",
+                        activation_state="blocked_unsupported_runtime",
+                        activation_reason=raw_reason,
+                    ),
+                    capabilities=(
+                        SimpleNamespace(
+                            id="calendar.create_event",
+                            adapter="calendar_python",
+                            permission_class="calendar.write",
+                            sandbox_profile="local_process",
+                            replay_safe=False,
+                            aliases=(),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        capabilities = source.manifests()["capabilities"]
+        assert isinstance(capabilities, tuple)
+        capability = capabilities[0]
+        assert isinstance(capability, dict)
+
+        assert capability["available"] is False
+        assert capability["availability_reason"] == expected_reason
+
+
 def test_plugin_manifest_source_exposes_fail_closed_dependency_policy() -> None:
     source = PluginConfigCapabilityManifestSource(
         (
