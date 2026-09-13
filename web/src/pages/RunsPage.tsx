@@ -1481,6 +1481,7 @@ function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
     runId: run.id,
     proposal: run.schedule_proposal,
     createdScheduleId: null,
+    confirmed: false,
   };
 }
 
@@ -3471,6 +3472,7 @@ export function RunsPage() {
     runId: string;
     proposal: ScheduleProposal;
     createdScheduleId: string | null;
+    confirmed: boolean;
   } | null>(null);
   const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
   const [dismissedEvolutionApprovalRunIds, setDismissedEvolutionApprovalRunIds] = useState<string[]>([]);
@@ -3848,7 +3850,7 @@ export function RunsPage() {
         setOpenClawApproval(null);
         setRepairApproval(null);
         setDismissedScheduleApprovalRunIds((current) => current.filter((id) => id !== run.id));
-        setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
+        setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null, confirmed: false });
         setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
       } else if (run.evolution_proposal) {
         setModeSelection(null);
@@ -3987,6 +3989,7 @@ export function RunsPage() {
   const createScheduleFromProposal = useMutation({
     mutationFn: () => {
       if (!scheduleApproval) throw new Error("schedule approval is unavailable");
+      if (!scheduleApproval.confirmed) throw new Error("schedule approval requires explicit confirmation");
       return api.createSchedule(scheduleProposalCreatePayload(scheduleApproval.proposal));
     },
     onSuccess: async (schedule) => {
@@ -5131,14 +5134,32 @@ export function RunsPage() {
                     查看计划任务
                   </Link>
                 ) : (
-                  <div className="composer-card-actions">
-                    <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
-                      {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
-                    </button>
-                    <button type="button" className="secondary-action" disabled={createScheduleFromProposal.isPending} onClick={cancelScheduleApproval}>
-                      取消计划
-                    </button>
-                  </div>
+                  <>
+                    <label className="inline-check">
+                      <input
+                        type="checkbox"
+                        checked={scheduleApproval.confirmed}
+                        onChange={(event) =>
+                          setScheduleApproval((current) =>
+                            current ? { ...current, confirmed: event.target.checked } : current,
+                          )
+                        }
+                      />
+                      我确认这是计划任务，不作为普通对话继续
+                    </label>
+                    <div className="composer-card-actions">
+                      <button
+                        type="button"
+                        disabled={createScheduleFromProposal.isPending || !scheduleApproval.confirmed}
+                        onClick={() => createScheduleFromProposal.mutate()}
+                      >
+                        {createScheduleFromProposal.isPending ? "加入中..." : "确认加入计划"}
+                      </button>
+                      <button type="button" className="secondary-action" disabled={createScheduleFromProposal.isPending} onClick={cancelScheduleApproval}>
+                        取消计划
+                      </button>
+                    </div>
+                  </>
                 )}
               </aside>
             ) : null}

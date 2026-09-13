@@ -328,6 +328,16 @@ describe("ConfigPage", () => {
     expect(screen.getByText("启动器文件不可用，未注册本地进程适配器。")).not.toBeNull();
   });
 
+  it("anchors workflow configuration as a third-level system settings section", async () => {
+    render(<TestApp initialPath="/config?section=workflows" />);
+
+    expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
+    await waitFor(() => {
+      expect(document.querySelector('[data-nav-section="workflows"]')?.getAttribute("data-nav-active")).toBe("true");
+    });
+    expect(screen.getByRole("link", { name: "配置工作流" }).getAttribute("href")).toBe("/workflows");
+  });
+
   it.each([
     ["ready", "隔离启动器就绪，可注册本地进程适配器。"],
     ["disabled", "本地进程插件运行器未启用。"],

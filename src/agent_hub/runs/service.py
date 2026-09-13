@@ -3065,8 +3065,10 @@ def _openclaw_target(platform: str, target_type: str) -> str:
     return "operator-selected"
 
 
-_SCHEDULE_TRIGGER_RE = re.compile(
-    r"(定时|提醒|闹钟|日程|排程|计划任务|加入计划|列入计划|schedule|scheduled|remind|reminder|alarm)",
+_SCHEDULE_EXPLICIT_REQUEST_RE = re.compile(
+    r"((创建|新建|新增|保存|加入|列入|添加|设置|安排).{0,12}(计划任务|定时任务|日程|排程|提醒|闹钟)|"
+    r"(计划任务|定时任务|日程|排程|提醒|闹钟).{0,12}(创建|新建|新增|保存|加入|列入|添加|设置|安排)|"
+    r"((create|add|set\s+up)\s+(a\s+)?(scheduled\s+task|schedule|reminder|alarm)))",
     re.IGNORECASE,
 )
 _SCHEDULE_EXECUTION_RE = re.compile(
@@ -3173,6 +3175,8 @@ def _local_schedule_proposal(
 def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     if _SCHEDULE_NEGATION_RE.search(message):
         return False
+    if _SCHEDULE_EXPLICIT_REQUEST_RE.search(message) is None:
+        return False
     has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
         message, lowered
     )
@@ -3184,9 +3188,7 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         or any(token in message for token in ("今天", "明天", "后天"))
         or any(token in lowered for token in ("today", "tomorrow"))
     )
-    has_schedule_cue = (
-        _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence or has_specific_date
-    )
+    has_schedule_cue = has_recurrence or has_specific_date or _SCHEDULE_TIME_RE.search(message) is not None
     has_execution = bool(
         _SCHEDULE_EXECUTION_RE.search(message) or _SCHEDULE_REMINDER_ACTION_RE.search(message)
     )

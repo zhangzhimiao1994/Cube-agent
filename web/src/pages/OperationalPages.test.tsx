@@ -850,7 +850,7 @@ describe("operational management pages", () => {
               },
             });
           }
-          if (message.includes("每天9点提醒")) {
+          if (message.includes("创建计划任务") && message.includes("每天9点提醒")) {
             return jsonResponse({
               id: runId,
               tenant_id: "33333333-3333-4333-8333-333333333333",
@@ -2806,7 +2806,7 @@ describe("operational management pages", () => {
     expect(request?.body).not.toHaveProperty("vibe_coding", true);
   });
 
-  it("creates a schedule from a chat-detected plan after user confirmation", async () => {
+  it("keeps ordinary reminder-like chat as a normal interaction without schedule approval", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -2814,14 +2814,28 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
+    await waitFor(() => expect(screen.queryByRole("status", { name: "计划任务确认" })).toBeNull());
+    expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toBeUndefined();
+  });
+
+  it("creates a schedule from an explicit chat plan only after guarded confirmation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "创建计划任务：每天9点提醒我填写日报");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
     expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "加入计划" }));
+    expect((screen.getByRole("button", { name: "确认加入计划" }) as HTMLButtonElement).disabled).toBe(true);
+    await user.click(screen.getByLabelText("我确认这是计划任务，不作为普通对话继续"));
+    await user.click(screen.getByRole("button", { name: "确认加入计划" }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toMatchObject({
         body: {
           name: "chat-daily-schedule",
-          message: "每天9点提醒我填写日报",
+          message: "创建计划任务：每天9点提醒我填写日报",
           mode: "dispatch",
           workflow_id: "scheduled_task",
           kind: "cron",
@@ -2837,7 +2851,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
+    await user.type(screen.getByPlaceholderText(/输入消息/), "创建计划任务：每天9点提醒我填写日报");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();

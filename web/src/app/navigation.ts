@@ -57,7 +57,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     to: "/orchestration",
     label: "编排",
     eyebrow: "Agent Control",
-    description: "主 Agent、角色、工作流和 Hermes 学习都属于 Agent 编排控制层。",
+    description: "主 Agent、角色和 Hermes 学习属于 Agent 编排控制层；低频模板和自动执行入口收进系统设置。",
     tone: "green",
     modules: [
       {
@@ -77,24 +77,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         label: "Agent 角色",
         description: "管理导演、文案、剪辑师、经济分析师等可扩展角色。",
         permission: "agent:read",
-      },
-      {
-        to: "/workflows",
-        label: "工作流配置",
-        description: "配置任务类型、默认角色、执行步骤、交付物和分歧裁决规则。",
-        permission: "agent:read",
-        children: [
-          { to: "/workflows?section=list", label: "工作流列表", permission: "agent:read" },
-          { to: "/workflows?section=roles", label: "角色配置", permission: "agent:read" },
-          { to: "/workflows?section=execution", label: "执行策略", permission: "agent:read" },
-          { to: "/workflows?section=review", label: "审查/裁决规则", permission: "agent:read" },
-        ],
-      },
-      {
-        to: "/schedules",
-        label: "计划任务",
-        description: "按指定时间提交任务，可用于报表填写、提醒和需要 OpenClaw 审批的本机操作。",
-        permission: "run:create",
       },
       {
         to: "/hermes",
@@ -208,8 +190,15 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         to: "/config",
         label: "系统设置",
-        description: "配置默认模式、日志等级、工具审批、运行期调度和临时 Agent 策略。",
+        description: "配置默认模式、默认工作流、日志等级、工具审批、运行期调度和临时 Agent 策略。",
         permission: "config:read",
+        children: [
+          { to: "/config?section=runtime", label: "运行默认值", permission: "config:read" },
+          { to: "/workflows?section=list", label: "工作流配置", permission: "agent:read" },
+          { to: "/schedules", label: "计划任务", permission: "run:create" },
+          { to: "/config?section=safety", label: "安全与学习", permission: "config:read" },
+          { to: "/config?section=attachments", label: "附件存储", permission: "config:read" },
+        ],
       },
       {
         to: "/openclaw",

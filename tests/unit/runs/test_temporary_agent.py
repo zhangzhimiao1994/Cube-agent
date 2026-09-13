@@ -466,7 +466,7 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     submitted = await service.submit(
         tenant_id=tenant_id,
         actor_id=actor_id,
-        message="每天9点提醒我填写日报",
+        message="创建计划任务：每天9点提醒我填写日报",
         mode=TaskMode.AUTO,
     )
 
@@ -504,7 +504,7 @@ async def test_specific_date_action_returns_schedule_confirmation() -> None:
     submitted = await service.submit(
         tenant_id=tenant_id,
         actor_id=actor_id,
-        message="9月3号给我生成一个方案",
+        message="创建计划任务：9月3号给我生成一个方案",
         mode=TaskMode.AUTO,
     )
 
@@ -529,6 +529,8 @@ async def test_specific_date_action_returns_schedule_confirmation() -> None:
         "请给我一个每日学习计划，不要加入日程表",
         "计划任务存在问题，为什么普通问题也会被归类成任务？",
         "帮我看看计划任务功能应该怎么设计，不要直接创建。",
+        "每天9点提醒我填写日报",
+        "9月3号给我生成一个方案",
     ],
 )
 async def test_normal_planning_request_does_not_become_schedule_task(message: str) -> None:

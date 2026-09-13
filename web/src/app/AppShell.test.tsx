@@ -102,12 +102,29 @@ describe("AppShell presentation", () => {
     const moduleGrid = screen.getByRole("list", { name: "编排模块" });
     expect(within(moduleGrid).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
-    expect(within(moduleGrid).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /工作流配置/ })).toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /计划任务/ })).toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
 
     const drawer = screen.getByLabelText("编排二级导航");
     expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(drawer).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(drawer).queryByRole("link", { name: /工作流配置/ })).toBeNull();
+    expect(within(drawer).queryByRole("link", { name: /计划任务/ })).toBeNull();
+  });
+
+  it("keeps workflow configuration under system settings instead of orchestration navigation", async () => {
+    render(<TestApp initialPath="/system" />);
+
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
+    const systemModules = screen.getByRole("list", { name: "系统模块" });
+    expect(within(systemModules).getByRole("link", { name: /系统设置/ })).not.toBeNull();
+
+    const systemDrawer = screen.getByLabelText("系统二级导航");
+    expect(within(systemDrawer).getByRole("link", { name: /系统设置/ })).not.toBeNull();
+    expect(within(systemDrawer).getByRole("link", { name: "工作流配置" }).getAttribute("href")).toBe(
+      "/workflows?section=list",
+    );
+    expect(within(systemDrawer).getByRole("link", { name: "计划任务" }).getAttribute("href")).toBe("/schedules");
   });
 
   it("shows tertiary navigation under module drawers without adding top-level entries", async () => {
@@ -168,6 +185,7 @@ describe("AppShell presentation", () => {
     render(<TestApp initialPath="/workflows?section=review" />);
 
     expect(await screen.findByRole("heading", { name: "工作流配置" })).not.toBeNull();
+    expect(screen.getByLabelText("系统二级导航")).not.toBeNull();
     await waitFor(() => {
       expect(document.querySelector('[data-nav-section="review"]')?.getAttribute("data-nav-active")).toBe("true");
     });
@@ -224,7 +242,8 @@ describe("AppShell presentation", () => {
 
     expect(orchestrationTrigger.getAttribute("aria-expanded")).toBe("true");
     expect(within(mobileNavigation).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(mobileNavigation).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(mobileNavigation).queryByRole("link", { name: /工作流配置/ })).toBeNull();
+    expect(within(mobileNavigation).queryByRole("link", { name: /计划任务/ })).toBeNull();
 
     await user.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
 

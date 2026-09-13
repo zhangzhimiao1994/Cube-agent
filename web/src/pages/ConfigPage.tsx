@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { useNavSection } from "../app/navSections";
 import {
   ApiError,
   api,
@@ -81,6 +82,7 @@ function pluginPackageSubprocessStatusText(
 
 export function ConfigPage() {
   const queryClient = useQueryClient();
+  const { navTargetProps } = useNavSection();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
@@ -232,7 +234,7 @@ export function ConfigPage() {
         </article>
       </div>
 
-      <div className="settings-shortcuts">
+      <div {...navTargetProps("workflows", "settings-shortcuts")}>
         <Link className="settings-shortcut-card" to="/models">配置模型与 API Key</Link>
         <Link className="settings-shortcut-card" to="/openclaw">配置 OpenClaw</Link>
         <Link className="settings-shortcut-card" to="/agents">配置 Agent 角色</Link>
@@ -242,7 +244,7 @@ export function ConfigPage() {
       </div>
 
       <form onSubmit={submitSettings} aria-label="保存系统设置" className="settings-form">
-        <h3>运行默认值</h3>
+        <h3 {...navTargetProps("runtime")}>运行默认值</h3>
         <div className="form-grid">
           <label htmlFor="default-mode">
             默认运行模式
@@ -304,7 +306,7 @@ export function ConfigPage() {
           )}
         </fieldset>
 
-        <h3>安全与学习</h3>
+        <h3 {...navTargetProps("safety")}>安全与学习</h3>
         <fieldset>
           <legend>生产安全策略</legend>
           <label className="inline-check">
@@ -415,7 +417,7 @@ export function ConfigPage() {
           </select>
         </label>
 
-        <h3>附件存储</h3>
+        <h3 {...navTargetProps("attachments")}>附件存储</h3>
         <p className="field-help">
           网页上传、通道收到的文件和图片都会进入附件存储；请按服务器磁盘容量设置生命周期，避免附件长期堆积。
         </p>
