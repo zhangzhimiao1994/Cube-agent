@@ -62,3 +62,28 @@
   [[ "$output" == *"current must point inside release directory"* ]]
   [ -d "$root/releases/202601010000-release" ]
 }
+
+@test "verify-release accepts current release with revision" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  release="$root/releases/202601010000-release"
+  mkdir -p "$release"
+  echo abc123 > "$release/REVISION"
+  ln -s "$release" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub verify-release --expect-revision abc123 --skip-services
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ok: current release $release revision=abc123"* ]]
+}
+
+@test "verify-release refuses missing current revision" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  release="$root/releases/202601010000-release"
+  mkdir -p "$release"
+  ln -s "$release" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub verify-release --skip-services
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"current release REVISION file is missing"* ]]
+}

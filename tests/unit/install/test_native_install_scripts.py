@@ -48,7 +48,7 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     command = read("scripts/commands/prune-releases.sh")
 
     assert "prune-releases      Preview or remove old native release directories." in launcher
-    assert "doctor|status|logs|backup|restore|upgrade|prune-releases" in launcher
+    assert "doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release" in launcher
     assert 'keep="${AGENT_HUB_RELEASES_TO_KEEP:-2}"' in command
     assert "Usage: scripts/agent-hub prune-releases" in command
     assert "--install-root" in command
@@ -59,6 +59,23 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     assert 'protected["$(basename -- "$current_real")"]="current"' in command
     assert 'find "$release_dir_real" -mindepth 1 -maxdepth 1 -type d' in command
     assert 'rm -rf -- "$release_path"' in command
+
+
+def test_release_verifier_is_registered_and_checks_current_revision() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/verify-release.sh")
+
+    assert "verify-release      Verify native current release pointer and service state." in launcher
+    assert "verify-release" in launcher
+    assert "Usage: scripts/agent-hub verify-release" in command
+    assert "--expect-revision" in command
+    assert "--skip-services" in command
+    assert 'current_link="$install_root/current"' in command
+    assert 'current_real="$(readlink -f -- "$current_link")"' in command
+    assert 'die "current must point inside release directory' in command
+    assert 'die "current release REVISION file is missing' in command
+    assert 'die "current release revision mismatch' in command
+    assert "agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service" in command
 
 
 def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_checks() -> None:

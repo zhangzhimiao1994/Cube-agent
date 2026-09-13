@@ -16,6 +16,7 @@ Commands:
   restore             Restore a verified backup.
   upgrade             Upgrade with backup and readiness rollback.
   prune-releases      Preview or remove old native release directories.
+  verify-release      Verify native current release pointer and service state.
   harness-acceptance  Run Codex/DeepSeek harness acceptance smoke and stress checks.
   openclaw-adapter     Start a local OpenClaw Adapter.
   package-release     Build a deployable source archive including web/dist.
@@ -31,7 +32,7 @@ fi
 shift || true
 
 case "$command" in
-  doctor|status|logs|backup|restore|upgrade|prune-releases|harness-acceptance|openclaw-adapter|package-release)
+  doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|openclaw-adapter|package-release)
     exec "$COMMAND_DIR/$command.sh" "$@"
     ;;
   version)
