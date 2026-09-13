@@ -4,6 +4,7 @@ set -Eeuo pipefail
 base_url="${AGENT_HUB_ACCEPTANCE_BASE_URL:-http://127.0.0.1:8000}"
 profile="all"
 stress=0
+strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
 read_only=0
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
 iterations="${AGENT_HUB_ACCEPTANCE_ITERATIONS:-10}"
@@ -33,6 +34,7 @@ Options:
   --profile codex|deepseek|all|production-safe
                                  Acceptance profile to run. production-safe runs all profiles in read-only mode.
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
+  --strict-interaction-recovery  Run authenticated, non-mutating interaction recovery probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
   --stress                       Run bounded HTTP stress checks.
   --concurrency N                Stress workers. Defaults to AGENT_HUB_ACCEPTANCE_CONCURRENCY or 4.
   --iterations N                 Requests per worker. Defaults to AGENT_HUB_ACCEPTANCE_ITERATIONS or 10.
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stress)
       stress=1
+      shift
+      ;;
+    --strict-interaction-recovery)
+      strict_interaction_recovery=1
       shift
       ;;
     --read-only)
@@ -133,6 +139,14 @@ if ! positive_int "$concurrency" || ! positive_int "$iterations" || ! positive_i
   printf 'concurrency, iterations, and retries must be positive integers\n' >&2
   exit 2
 fi
+
+case "$strict_interaction_recovery" in
+  0|1) ;;
+  *)
+    printf 'AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY must be 0 or 1\n' >&2
+    exit 2
+    ;;
+esac
 
 require_curl() {
   if ! command -v curl >/dev/null 2>&1; then
@@ -477,6 +491,50 @@ PY
   return 1
 }
 
+check_openapi_task_mode_schema() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+expected_modes = ("auto", "direct", "dispatch", "discuss", "hybrid")
+with open(sys.argv[1], encoding="utf-8") as handle:
+    spec = json.load(handle)
+schemas = spec.get("components", {}).get("schemas", {})
+mode_schema = schemas.get("TaskMode", {})
+if tuple(mode_schema.get("enum", ())) != expected_modes:
+    raise SystemExit(1)
+
+create_mode = (
+    schemas.get("CreateRunRequest", {})
+    .get("properties", {})
+    .get("mode", {})
+)
+if create_mode.get("default") != "auto":
+    raise SystemExit(1)
+if create_mode.get("$ref") != "#/components/schemas/TaskMode":
+    all_of = create_mode.get("allOf")
+    if all_of != [{"$ref": "#/components/schemas/TaskMode"}]:
+        raise SystemExit(1)
+
+choose_mode = (
+    schemas.get("ChooseModeRequest", {})
+    .get("properties", {})
+    .get("mode", {})
+)
+if choose_mode.get("$ref") != "#/components/schemas/TaskMode":
+    all_of = choose_mode.get("allOf")
+    if all_of != [{"$ref": "#/components/schemas/TaskMode"}]:
+        raise SystemExit(1)
+PY
+  then
+    printf 'ok: task mode schema\n'
+    return 0
+  fi
+  printf 'fail: task mode schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_capability_manifest_failure_codes_schema() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -746,6 +804,275 @@ PY
   return 1
 }
 
+check_interaction_prevention_and_recovery() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: interaction prevention and last-resort recovery\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: interaction prevention and recovery requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from uuid import uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.models.gateway import ModelGatewayError, _fallback_reason, _retryable_model_failure
+from agent_hub.runs.observer import RunMonitor
+from agent_hub.runs.self_repair import (
+    SelfRepairPolicy,
+    classify_terminal_run,
+    repair_context_from_proposal,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+run_id = uuid4()
+
+empty_error = ModelGatewayError("model response text is empty")
+require(_retryable_model_failure(empty_error) is True, "empty response must be retryable")
+require(_fallback_reason(empty_error) == "empty_response", "empty response must trigger fallback")
+
+model_prevention = runtime_failure_diagnostic_from_reason(
+    "model gateway failed: model response text is empty"
+)
+require(model_prevention.get("retryable") is True, "empty response diagnostic retryable")
+require(model_prevention.get("error_code") == "model.empty_response", "empty response code")
+require("fallback" in str(model_prevention.get("suggested_action")), "empty response action")
+
+for reason, code, retryable in (
+    ("Plugin backend unavailable", "plugin.backend_unavailable", True),
+    ("Plugin credential unavailable", "plugin.credential_unavailable", False),
+    ("mcp_server_timeout", "mcp.server_timeout", True),
+    ("mcp_server_failed", "mcp.server_failed", True),
+):
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+    require(diagnostic.get("error_code") == code, f"{reason} code")
+    require(diagnostic.get("retryable") is retryable, f"{reason} retryable")
+    require(diagnostic.get("suggested_action"), f"{reason} suggested action")
+    require("runtime.failed" not in str(diagnostic), f"{reason} must not be generic")
+
+capacity_failure = RunEvent(
+    kind=EventKind.RUNTIME_FAILED,
+    sequence=1,
+    run_id=run_id,
+    reason="model gateway failed: model capacity queue timeout",
+)
+capacity_decision = RunMonitor().observe(capacity_failure)
+require(capacity_decision is not None, "capacity decision")
+require(capacity_decision.trigger == "model_capacity_pressure", "model_capacity_pressure")
+require(capacity_decision.action == "reschedule_or_reassign_model", "reschedule_or_reassign_model")
+require(
+    capacity_decision.recommendation == "switch_to_available_model_and_retry",
+    "switch_to_available_model_and_retry",
+)
+
+empty_failure = RunEvent(
+    kind=EventKind.RUNTIME_FAILED,
+    sequence=2,
+    run_id=run_id,
+    reason="model gateway failed: model response text is empty",
+)
+empty_monitor = RunMonitor()
+empty_decision = empty_monitor.observe(empty_failure)
+require(empty_decision is not None, "empty response decision")
+require(empty_decision.trigger == "empty_model_response", "empty_model_response")
+require(empty_decision.action == "retry_fallback_or_reassign_model", "retry_fallback_or_reassign_model")
+require(
+    empty_decision.recommendation == "retry_with_fallback_or_reassign_model",
+    "retry_with_fallback_or_reassign_model",
+)
+observer_event = empty_decision.to_event(run_id=run_id, sequence=3)
+repair = classify_terminal_run(
+    status=RunStatus.FAILED,
+    mode=TaskMode.AUTO,
+    routing_decision={"source": "manual"},
+    events=(empty_failure, observer_event),
+    policy=SelfRepairPolicy(requires_approval=True),
+)
+require(repair is not None, "repair decision")
+require(repair.kind == "repair.classified", "repair.classified")
+require(repair.failure_category == "empty_model_response", "repair failure category")
+require(repair.recovery_strategy == "retry_with_fallback_or_reassign_model", "repair strategy")
+require(repair.requires_approval is True, "requires_approval")
+require(repair.automatic_execution is False, "automatic_execution")
+
+proposal = repair.to_proposal(run_id=run_id)
+require(proposal is not None, "self_repair proposal")
+require(proposal.get("kind") == "self_repair", "self_repair")
+require(proposal.get("failure_kind") == "empty_model_response", "proposal failure kind")
+require(proposal.get("recovery_strategy") == "retry_with_fallback_or_reassign_model", "proposal strategy")
+repair_context = repair_context_from_proposal(proposal)
+require(repair_context.get("source") == "self_repair", "repair context source")
+require(repair_context.get("failure_kind") == "empty_model_response", "repair context failure kind")
+require(
+    repair_context.get("recovery_strategy") == "retry_with_fallback_or_reassign_model",
+    "repair context strategy",
+)
+require(repair_context.get("requires_approval") is True, "repair context requires approval")
+require(repair_context.get("automatic_execution") is False, "repair context automatic execution")
+PY
+  then
+    printf 'ok: interaction prevention and recovery\n'
+    return 0
+  fi
+  printf 'fail: interaction prevention and recovery\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
+check_multimode_interaction_matrix() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: multi-mode interaction matrix\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: multi-mode interaction matrix requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from uuid import uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.observer import RunMonitor
+from agent_hub.runs.self_repair import SelfRepairPolicy, classify_terminal_run
+from agent_hub.runs.service import (
+    _harness_task_requirements,
+    _local_main_agent_auto_mode,
+    _main_agent_adjusted_ready_mode,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+expected_modes = ("auto", "direct", "dispatch", "discuss", "hybrid")
+require(tuple(mode.value for mode in TaskMode) == expected_modes, "TaskMode enum drift")
+
+require(
+    _local_main_agent_auto_mode("请直接回答这个问题", ()) is TaskMode.DIRECT,
+    "auto direct routing",
+)
+require(
+    _local_main_agent_auto_mode("请调度执行并生成报告", ()) is TaskMode.DISPATCH,
+    "auto dispatch routing",
+)
+require(
+    _local_main_agent_auto_mode("先讨论优缺点再给结论", ()) is TaskMode.HYBRID,
+    "auto hybrid routing",
+)
+require(
+    _local_main_agent_auto_mode("请复核并争论观点", ()) is TaskMode.DISCUSS,
+    "auto discuss routing",
+)
+require(
+    _main_agent_adjusted_ready_mode(
+        TaskMode.DIRECT,
+        message="请调度执行并生成报告",
+        attachment_ids=(),
+    )
+    is TaskMode.DISPATCH,
+    "router direct adjusted to dispatch",
+)
+require(
+    _main_agent_adjusted_ready_mode(
+        TaskMode.DISPATCH,
+        message="请讨论这个执行方案",
+        attachment_ids=(),
+    )
+    is TaskMode.HYBRID,
+    "router dispatch plus discuss adjusted to hybrid",
+)
+
+requirements_by_mode = {}
+messages_by_mode = {
+    TaskMode.DIRECT: "请直接回答这个问题",
+    TaskMode.DISPATCH: "请调度执行并生成报告",
+    TaskMode.DISCUSS: "请复核并争论观点",
+    TaskMode.HYBRID: "先讨论方案风险再执行检查",
+}
+for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):
+    requirements = _harness_task_requirements(
+        message=messages_by_mode[mode],
+        mode=mode,
+        routing_decision={},
+    )
+    requirements_by_mode[mode] = requirements
+    require("text" in requirements.required_capabilities, f"{mode.value} text capability")
+    require(requirements.estimated_input_tokens > 0, f"{mode.value} token estimate")
+
+require(
+    "tool_calling" not in requirements_by_mode[TaskMode.DIRECT].required_capabilities,
+    "direct should stay simple unless tool use is requested",
+)
+require(
+    requirements_by_mode[TaskMode.DISPATCH].needs_reasoning is True,
+    "dispatch reasoning",
+)
+require(
+    requirements_by_mode[TaskMode.DISPATCH].needs_parallel_tool_calls is True,
+    "dispatch parallel tools",
+)
+require(
+    requirements_by_mode[TaskMode.DISCUSS].needs_reasoning is True,
+    "discuss reasoning",
+)
+require(
+    requirements_by_mode[TaskMode.HYBRID].needs_parallel_tool_calls is True,
+    "hybrid parallel tools",
+)
+
+for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):
+    run_id = uuid4()
+    failure = RunEvent(
+        kind=EventKind.RUNTIME_FAILED,
+        sequence=1,
+        run_id=run_id,
+        reason="model gateway failed: model response text is empty",
+    )
+    decision = RunMonitor().observe(failure)
+    require(decision is not None, f"{mode.value} observer decision")
+    require(decision.trigger == "empty_model_response", f"{mode.value} empty response")
+    repair = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=mode,
+        routing_decision={"source": "manual"},
+        events=(failure, decision.to_event(run_id=run_id, sequence=2)),
+        policy=SelfRepairPolicy(requires_approval=True),
+    )
+    require(repair is not None, f"{mode.value} repair decision")
+    require(repair.kind == "repair.classified", f"{mode.value} repair classified")
+    require(repair.failure_category == "empty_model_response", f"{mode.value} repair category")
+    require(
+        repair.recovery_strategy == "retry_with_fallback_or_reassign_model",
+        f"{mode.value} recovery strategy",
+    )
+    require(repair.automatic_execution is False, f"{mode.value} automatic execution")
+PY
+  then
+    printf 'ok: multi-mode interaction matrix\n'
+    return 0
+  fi
+  printf 'fail: multi-mode interaction matrix\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
   check_url "api health alias" "/health" || true
@@ -803,6 +1130,8 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
   check_runtime_failure_diagnostics || true
+  check_interaction_prevention_and_recovery || true
+  check_multimode_interaction_matrix || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
   check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true
@@ -910,6 +1239,7 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing registry" "/api/v1/admin/models" "get" || true
   check_openapi_path "model routing create" "/api/v1/admin/models" "post" || true
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
+  check_openapi_task_mode_schema || true
   check_openapi_model_capability_schema || true
   check_openapi_model_deployment_response_schema || true
   check_openapi_model_probe_response_schema || true
@@ -1047,6 +1377,65 @@ run_lifecycle_profile() {
   printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
 }
 
+run_strict_interaction_recovery_profile() {
+  local python_bin
+  local request_body
+  local response
+
+  printf 'profile: strict interaction recovery\n'
+  if [[ -z "$bearer_token" ]]; then
+    printf 'fail: strict interaction recovery requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: strict interaction recovery requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! request_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({"quota_scope": "harness_acceptance_strict", "desired_concurrency": 32}))
+PY
+  )"; then
+    printf 'fail: could not build strict model probe request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$request_body" \
+    "$base_url/api/v1/admin/models/probe" 2>/dev/null)"; then
+    printf 'fail: strict model probe interaction control /api/v1/admin/models/probe\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$response" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+recommended = payload.get("recommended_concurrency")
+warning = payload.get("warning")
+if not isinstance(recommended, int) or recommended < 1 or recommended > 32:
+    raise SystemExit(1)
+if not isinstance(warning, str) or not warning.strip():
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: strict model probe interaction control\n'
+    return 0
+  fi
+  printf 'fail: strict model probe interaction control invalid response\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 stress_worker() {
   local worker="$1"
   local path
@@ -1133,6 +1522,10 @@ esac
 
 if [[ "$stress" -eq 1 ]]; then
   run_stress_profile || true
+fi
+
+if [[ "$strict_interaction_recovery" -eq 1 ]]; then
+  run_strict_interaction_recovery_profile || true
 fi
 
 if [[ "$verify_release" -eq 1 ]]; then

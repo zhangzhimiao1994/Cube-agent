@@ -87,6 +87,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "Usage: scripts/agent-hub harness-acceptance" in command
     assert "--profile codex|deepseek|all|production-safe" in command
     assert "--stress" in command
+    assert "--strict-interaction-recovery" in command
     assert "--read-only" in command
     assert 'production-safe) profile="all"; read_only=1 ;;' in command
     assert 'codex|deepseek|all|production-safe) ;;' in command
@@ -100,10 +101,20 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_write_protected_boundary" in command
     assert "check_error_envelope" in command
     assert "check_runtime_failure_diagnostics" in command
+    assert "check_interaction_prevention_and_recovery" in command
+    assert "check_multimode_interaction_matrix" in command
     assert "check_openapi_safe_projection" in command
+    assert "check_openapi_task_mode_schema" in command
     assert "check_openapi_model_capability_schema" in command
     assert "run_lifecycle_profile" in command
     assert "skip: run lifecycle probe is disabled in read-only mode" in command
+    assert "run_strict_interaction_recovery_profile" in command
+    assert "AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY" in command
+    assert "profile: strict interaction recovery" in command
+    assert "fail: strict interaction recovery requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+    assert '"/api/v1/admin/models/probe"' in command
+    assert '"desired_concurrency": 32' in command
+    assert "ok: strict model probe interaction control" in command
     assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
     assert "for path in /health /health/live /health/ready /metrics /openapi.json /login; do" in command
@@ -162,6 +173,39 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin.credential_unavailable"' in command
     assert '"mcp.timeout"' in command
     assert '"mcp.server_failed"' in command
+    assert "profile: interaction prevention and last-resort recovery" in command
+    assert "fail: interaction prevention and recovery" in command
+    assert "ok: interaction prevention and recovery" in command
+    assert "RunMonitor" in command
+    assert "SelfRepairPolicy" in command
+    assert "repair_context_from_proposal" in command
+    assert '"model_capacity_pressure"' in command
+    assert '"reschedule_or_reassign_model"' in command
+    assert '"switch_to_available_model_and_retry"' in command
+    assert '"empty_model_response"' in command
+    assert '"retry_fallback_or_reassign_model"' in command
+    assert '"retry_with_fallback_or_reassign_model"' in command
+    assert '"repair.classified"' in command
+    assert '"self_repair"' in command
+    assert '"requires_approval"' in command
+    assert '"automatic_execution"' in command
+    assert '"plugin.backend_unavailable"' in command
+    assert '"mcp.server_timeout"' in command
+    assert "profile: multi-mode interaction matrix" in command
+    assert "ok: multi-mode interaction matrix" in command
+    assert "fail: multi-mode interaction matrix" in command
+    assert 'expected_modes = ("auto", "direct", "dispatch", "discuss", "hybrid")' in command
+    assert "_local_main_agent_auto_mode" in command
+    assert "_main_agent_adjusted_ready_mode" in command
+    assert "_harness_task_requirements" in command
+    assert "mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID)" in command
+    assert "TaskMode.DISPATCH" in command
+    assert "TaskMode.DISCUSS" in command
+    assert "TaskMode.HYBRID" in command
+    assert "TaskMode.DIRECT" in command
+    assert "ok: task mode schema" in command
+    assert "fail: task mode schema" in command
+    assert 'schemas.get("TaskMode", {})' in command
     assert 'check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found"' in command
     assert 'check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed"' in command
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command
