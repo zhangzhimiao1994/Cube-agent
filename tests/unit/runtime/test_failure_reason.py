@@ -279,6 +279,63 @@ def test_runtime_failure_diagnostic_classifies_plugin_adapter_unavailable() -> N
     assert "重新加载" in suggested_action
 
 
+@pytest.mark.parametrize(
+    ("reason", "error_category", "error_code", "retryable"),
+    [
+        (
+            "Plugin tool timed out",
+            "timeout",
+            "plugin.timeout",
+            True,
+        ),
+        (
+            "Plugin credential unavailable",
+            "credential_unavailable",
+            "plugin.credential_unavailable",
+            False,
+        ),
+        (
+            "Plugin arguments do not match input schema: invalid type",
+            "invalid_arguments",
+            "plugin.invalid_arguments",
+            False,
+        ),
+        (
+            "Plugin result does not match output schema: invalid type",
+            "invalid_result",
+            "plugin.invalid_result",
+            False,
+        ),
+        (
+            "Plugin backend unavailable",
+            "backend_unavailable",
+            "plugin.backend_unavailable",
+            True,
+        ),
+        (
+            "Plugin sandbox profile unsupported",
+            "sandbox_unsupported",
+            "plugin.sandbox_unsupported",
+            False,
+        ),
+    ],
+)
+def test_runtime_failure_diagnostic_classifies_plugin_runtime_failures(
+    reason: str,
+    error_category: str,
+    error_code: str,
+    retryable: bool,
+) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+
+    assert diagnostic["error_stage"] == "plugin_runtime"
+    assert diagnostic["error_category"] == error_category
+    assert diagnostic["error_code"] == error_code
+    assert diagnostic["retryable"] is retryable
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "插件" in suggested_action
+
+
 def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_non_retryable() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("capability outcome requires confirmation")
 

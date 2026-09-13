@@ -134,6 +134,22 @@ def runtime_failure_diagnostic_from_reason(
             retryable=False,
             suggested_action="工具执行被拒绝或失败；查看工具失败事件中的字段校验摘要，修正参数后重试。",
         )
+    lowered = normalized.lower()
+    if lowered in {
+        "plugin tool timed out",
+        "plugin credential unavailable",
+        "plugin backend unavailable",
+        "plugin sandbox profile unsupported",
+        "plugin result is invalid",
+        "plugin output schema is invalid",
+    }:
+        plugin_diagnostic = _plugin_runtime_diagnostic(
+            normalized,
+            lowered,
+            status_code=status_code,
+        )
+        if plugin_diagnostic is not None:
+            return plugin_diagnostic
     if not is_safe_failure_reason(normalized):
         normalized = "runtime_failed"
     if status_code is None:
@@ -179,6 +195,9 @@ def runtime_failure_diagnostic_from_reason(
             ),
             status_code=status_code,
         )
+    plugin_diagnostic = _plugin_runtime_diagnostic(normalized, lowered, status_code=status_code)
+    if plugin_diagnostic is not None:
+        return plugin_diagnostic
     if lowered == "capability outcome requires confirmation":
         return _base_diagnostic(
             normalized,
@@ -355,6 +374,78 @@ def runtime_failure_diagnostic_from_reason(
             suggested_action="任务运行超时；可缩小任务范围、降低并发或稍后重试。",
         )
     return diagnostic
+
+
+def _plugin_runtime_diagnostic(
+    reason: str,
+    lowered: str,
+    *,
+    status_code: int | None,
+) -> RuntimeFailureDiagnostic | None:
+    if lowered == "plugin tool timed out":
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="timeout",
+            error_code="plugin.timeout",
+            retryable=True,
+            suggested_action="插件执行超时；降低该插件输入规模或并发，必要时切换等价能力后重试。",
+            status_code=status_code,
+        )
+    if lowered == "plugin credential unavailable":
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="credential_unavailable",
+            error_code="plugin.credential_unavailable",
+            retryable=False,
+            suggested_action="插件凭证不可用；检查插件 secret 引用、凭证解析配置和租户授权后重试。",
+            status_code=status_code,
+        )
+    if lowered.startswith("plugin arguments do not match input schema"):
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="invalid_arguments",
+            error_code="plugin.invalid_arguments",
+            retryable=False,
+            suggested_action="插件入参不符合声明 schema；修正参数结构、类型或必填字段后重试。",
+            status_code=status_code,
+        )
+    if lowered.startswith("plugin result does not match output schema") or lowered in {
+        "plugin result is invalid",
+        "plugin output schema is invalid",
+    }:
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="invalid_result",
+            error_code="plugin.invalid_result",
+            retryable=False,
+            suggested_action="插件返回结果不符合声明契约；检查插件适配器输出、output schema 和版本兼容性。",
+            status_code=status_code,
+        )
+    if lowered == "plugin backend unavailable":
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="backend_unavailable",
+            error_code="plugin.backend_unavailable",
+            retryable=True,
+            suggested_action="插件后端不可用；检查插件服务健康、网络连通性和适配器状态，恢复后可重试。",
+            status_code=status_code,
+        )
+    if lowered == "plugin sandbox profile unsupported":
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="sandbox_unsupported",
+            error_code="plugin.sandbox_unsupported",
+            retryable=False,
+            suggested_action="插件 sandbox 配置不被当前运行时支持；调整插件隔离策略或启用对应适配器后重试。",
+            status_code=status_code,
+        )
+    return None
 
 
 def _model_gateway_diagnostic(
