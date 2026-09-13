@@ -133,13 +133,22 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post"' in command
     assert 'items != {"$ref": "#/components/schemas/ModelCapability"}' in command
     assert 'check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get"' in command
+    assert 'check_openapi_path "plugin registry list" "/api/v1/admin/plugins" "get"' in command
+    assert 'check_openapi_path "plugin registry upsert" "/api/v1/admin/plugins" "post"' in command
     assert 'check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get"' in command
+    assert 'check_openapi_path "plugin policy summary" "/api/v1/admin/plugins/policy-summary" "get"' in command
+    assert 'check_openapi_path "plugin policy review" "/api/v1/admin/plugins/policy-review" "post"' in command
+    assert 'check_openapi_path "plugin signing key list" "/api/v1/admin/plugins/signing-keys" "get"' in command
+    assert 'check_openapi_path "plugin signing key upsert" "/api/v1/admin/plugins/signing-keys" "post"' in command
+    assert 'check_openapi_path "plugin signing key delete" "/api/v1/admin/plugins/signing-keys/{key_id}" "delete"' in command
     assert 'check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post"' in command
     assert 'check_openapi_path "plugin lifecycle start" "/api/v1/admin/plugins/{plugin_id}/start" "post"' in command
     assert 'check_openapi_path "plugin lifecycle enable" "/api/v1/admin/plugins/{plugin_id}/enable" "post"' in command
     assert 'check_openapi_path "plugin lifecycle disable" "/api/v1/admin/plugins/{plugin_id}/disable" "post"' in command
     assert 'check_openapi_path "plugin lifecycle stop" "/api/v1/admin/plugins/{plugin_id}/stop" "post"' in command
     assert 'check_openapi_path "plugin lifecycle reload" "/api/v1/admin/plugins/{plugin_id}/reload" "post"' in command
+    assert 'check_openapi_path "plugin uninstall" "/api/v1/admin/plugins/{plugin_id}/uninstall" "post"' in command
+    assert 'check_openapi_path "plugin delete" "/api/v1/admin/plugins/{plugin_id}" "delete"' in command
     assert 'check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get"' in command
     assert 'check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post"' in command
     assert 'check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000"' in command
@@ -153,6 +162,13 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
     assert 'check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
     assert 'check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters"' in command
+    assert 'check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins"' in command
+    assert 'check_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST"' in command
+    assert 'check_protected_boundary "plugin policy summary requires bearer" "/api/v1/admin/plugins/policy-summary"' in command
+    assert 'check_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST"' in command
+    assert 'check_protected_boundary "plugin signing key list requires bearer" "/api/v1/admin/plugins/signing-keys"' in command
+    assert 'check_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST"' in command
+    assert 'check_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE"' in command
     assert 'check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
     assert 'check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
     assert 'check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST"' in command
@@ -161,6 +177,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST"' in command
     assert 'check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST"' in command
     assert 'check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST"' in command
+    assert 'check_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST"' in command
+    assert 'check_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE"' in command
     assert 'check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest"' in command
     assert 'check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp"' in command
     assert 'check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command

@@ -517,6 +517,13 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
+  check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
+  check_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true
+  check_protected_boundary "plugin policy summary requires bearer" "/api/v1/admin/plugins/policy-summary" || true
+  check_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST" || true
+  check_protected_boundary "plugin signing key list requires bearer" "/api/v1/admin/plugins/signing-keys" || true
+  check_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST" || true
+  check_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE" || true
   check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
   check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
   check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST" || true
@@ -525,6 +532,8 @@ run_deepseek_profile() {
   check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST" || true
   check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST" || true
   check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST" || true
+  check_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST" || true
+  check_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE" || true
   check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest" || true
   check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
   check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
@@ -601,6 +610,13 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
   check_openapi_model_capability_schema || true
   check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get" || true
+  check_openapi_path "plugin registry list" "/api/v1/admin/plugins" "get" || true
+  check_openapi_path "plugin registry upsert" "/api/v1/admin/plugins" "post" || true
+  check_openapi_path "plugin policy summary" "/api/v1/admin/plugins/policy-summary" "get" || true
+  check_openapi_path "plugin policy review" "/api/v1/admin/plugins/policy-review" "post" || true
+  check_openapi_path "plugin signing key list" "/api/v1/admin/plugins/signing-keys" "get" || true
+  check_openapi_path "plugin signing key upsert" "/api/v1/admin/plugins/signing-keys" "post" || true
+  check_openapi_path "plugin signing key delete" "/api/v1/admin/plugins/signing-keys/{key_id}" "delete" || true
   check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post" || true
   check_openapi_path "plugin package approval" "/api/v1/admin/plugins/{plugin_id}/package/approve" "post" || true
   check_openapi_path "plugin package rejection" "/api/v1/admin/plugins/{plugin_id}/package/reject" "post" || true
@@ -609,6 +625,8 @@ run_openapi_capability_profile() {
   check_openapi_path "plugin lifecycle disable" "/api/v1/admin/plugins/{plugin_id}/disable" "post" || true
   check_openapi_path "plugin lifecycle stop" "/api/v1/admin/plugins/{plugin_id}/stop" "post" || true
   check_openapi_path "plugin lifecycle reload" "/api/v1/admin/plugins/{plugin_id}/reload" "post" || true
+  check_openapi_path "plugin uninstall" "/api/v1/admin/plugins/{plugin_id}/uninstall" "post" || true
+  check_openapi_path "plugin delete" "/api/v1/admin/plugins/{plugin_id}" "delete" || true
   check_openapi_path "plugin capability manifest" "/api/v1/admin/capabilities/manifest" "get" || true
   check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get" || true
   check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post" || true
