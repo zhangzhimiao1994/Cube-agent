@@ -162,6 +162,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run control idempotency guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
     assert "repeated pause stays paused" in command
     assert "repeated resume stays queued" in command
+    assert "cancel_probe_run_id" in command
+    assert "cancel probe pause reaches paused" in command
     assert "repeated cancel stays cancelled" in command
     assert 'check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post"' in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command

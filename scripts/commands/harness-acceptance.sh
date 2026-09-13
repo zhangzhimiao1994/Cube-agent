@@ -1446,12 +1446,57 @@ PY
   return 1
 }
 
-run_control_idempotency_guard_profile() {
-  local python_bin
+create_control_idempotency_probe_run() {
+  local python_bin="$1"
+  local probe_name="$2"
   local request_body
   local response
-  local run_id
   local idempotency_key
+
+  if ! request_body="$(ACCEPTANCE_CONTROL_PROBE_NAME="$probe_name" "$python_bin" - <<'PY'
+import json
+import os
+
+probe_name = os.environ["ACCEPTANCE_CONTROL_PROBE_NAME"]
+print(json.dumps({
+    "message": f"Agent Hub run control idempotency acceptance probe: {probe_name}",
+    "mode": "direct",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build run control idempotency request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  idempotency_key="control-idempotency-$probe_name-$(date +%s)-$$"
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $idempotency_key" \
+    -d "$request_body" \
+    "$base_url/api/v1/runs" 2>/dev/null)"; then
+    printf 'fail: run control idempotency create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])'; then
+    printf 'fail: run control idempotency create response did not include id\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+}
+
+run_control_idempotency_guard_profile() {
+  local python_bin
+  local run_id
+  local cancel_probe_run_id
 
   printf 'profile: authenticated run control idempotency guard\n'
   if [[ "$read_only" -eq 1 ]]; then
@@ -1468,49 +1513,17 @@ run_control_idempotency_guard_profile() {
     return 1
   fi
 
-  if ! request_body="$("$python_bin" - <<'PY'
-import json
-
-print(json.dumps({
-    "message": "Agent Hub run control idempotency acceptance probe",
-    "mode": "direct",
-    "sandbox_profile": "none",
-    "requested_permissions": [],
-    "skip_evolution_proposal": True,
-}, ensure_ascii=False))
-PY
-  )"; then
-    printf 'fail: could not build run control idempotency request body\n' >&2
-    failures=$((failures + 1))
-    return 1
-  fi
-
-  idempotency_key="control-idempotency-$(date +%s)-$$"
-  if ! response="$(curl --noproxy '*' \
-    --connect-timeout "$connect_timeout" \
-    --max-time "$max_time" \
-    -fsS \
-    -H "Authorization: Bearer $bearer_token" \
-    -H "Content-Type: application/json" \
-    -H "Idempotency-Key: $idempotency_key" \
-    -d "$request_body" \
-    "$base_url/api/v1/runs" 2>/dev/null)"; then
-    printf 'fail: run control idempotency create /api/v1/runs\n' >&2
-    failures=$((failures + 1))
-    return 1
-  fi
-  if ! run_id="$(ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])')"; then
-    printf 'fail: run control idempotency create response did not include id\n' >&2
-    failures=$((failures + 1))
-    return 1
-  fi
+  run_id="$(create_control_idempotency_probe_run "$python_bin" "pause-resume")" || return 1
 
   post_run_control_expect_status "$python_bin" "$run_id" "pause" "paused" "initial pause reaches paused" || return 1
   post_run_control_expect_status "$python_bin" "$run_id" "pause" "paused" "repeated pause stays paused" || return 1
   post_run_control_expect_status "$python_bin" "$run_id" "resume" "queued" "initial resume reaches queued" || return 1
   post_run_control_expect_status "$python_bin" "$run_id" "resume" "queued" "repeated resume stays queued" || return 1
-  post_run_control_expect_status "$python_bin" "$run_id" "cancel" "cancelled" "initial cancel reaches cancelled" || return 1
-  post_run_control_expect_status "$python_bin" "$run_id" "cancel" "cancelled" "repeated cancel stays cancelled" || return 1
+
+  cancel_probe_run_id="$(create_control_idempotency_probe_run "$python_bin" "cancel")" || return 1
+  post_run_control_expect_status "$python_bin" "$cancel_probe_run_id" "pause" "paused" "cancel probe pause reaches paused" || return 1
+  post_run_control_expect_status "$python_bin" "$cancel_probe_run_id" "cancel" "cancelled" "initial cancel reaches cancelled" || return 1
+  post_run_control_expect_status "$python_bin" "$cancel_probe_run_id" "cancel" "cancelled" "repeated cancel stays cancelled" || return 1
 }
 
 run_schedule_interaction_guard_profile() {
