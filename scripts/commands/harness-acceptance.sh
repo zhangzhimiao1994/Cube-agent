@@ -1410,6 +1410,129 @@ run_lifecycle_profile() {
   printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
 }
 
+run_schedule_interaction_guard_profile() {
+  local python_bin
+  local ordinary_body
+  local explicit_body
+  local ordinary_response
+  local explicit_response
+  local runs_path="/api/v1/runs"
+
+  printf 'profile: authenticated schedule interaction guard\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: schedule interaction guard is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: schedule interaction guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: schedule interaction guard requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! ordinary_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({
+    "message": "设置提醒：每天9点提醒我填写日报",
+    "mode": "auto",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build ordinary schedule-like run body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! ordinary_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: schedule-guard-ordinary-$(date +%s)-$$" \
+    -d "$ordinary_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: schedule interaction ordinary run create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$ordinary_response" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+if payload.get("schedule_proposal") is not None:
+    raise SystemExit("ordinary reminder must not return schedule proposal")
+if payload.get("clarification_reason") == "schedule_requires_user_confirmation":
+    raise SystemExit("ordinary reminder must not request schedule confirmation")
+PY
+  then
+    printf 'ok: ordinary reminder must not return schedule proposal\n'
+  else
+    printf 'fail: ordinary reminder must not return schedule proposal\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! explicit_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({
+    "message": "创建计划任务：每天9点提醒我填写日报",
+    "mode": "auto",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build explicit schedule run body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! explicit_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: schedule-guard-explicit-$(date +%s)-$$" \
+    -d "$explicit_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: schedule interaction explicit run create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$explicit_response" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+proposal = payload.get("schedule_proposal")
+if payload.get("status") != "waiting_approval":
+    raise SystemExit("explicit schedule task must wait for approval")
+if payload.get("clarification_reason") != "schedule_requires_user_confirmation":
+    raise SystemExit("explicit schedule task must request schedule confirmation")
+if not isinstance(proposal, dict):
+    raise SystemExit("explicit schedule task must return schedule proposal")
+if proposal.get("kind") != "cron" or proposal.get("cron") != "0 9 * * *":
+    raise SystemExit("explicit schedule task proposal must preserve daily cron")
+PY
+  then
+    printf 'ok: explicit schedule task must return schedule proposal\n'
+    return 0
+  fi
+  printf 'fail: explicit schedule task must return schedule proposal\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_strict_interaction_recovery_profile() {
   local python_bin
   local request_body
@@ -1540,6 +1663,7 @@ case "$profile" in
     run_codex_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_schedule_interaction_guard_profile || true
     ;;
   deepseek)
     run_deepseek_profile
@@ -1550,6 +1674,7 @@ case "$profile" in
     run_deepseek_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_schedule_interaction_guard_profile || true
     ;;
 esac
 
