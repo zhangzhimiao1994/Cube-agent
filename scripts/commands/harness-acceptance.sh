@@ -1323,8 +1323,20 @@ builder_role = RoleAssignment(
     output_schema={"summary": "string"},
     model="main",
 )
+reviewer_role = RoleAssignment(
+    id="quality_reviewer",
+    role="Quality Reviewer",
+    purpose=RolePurpose.VERIFY,
+    mission="Review the staged ultra-large project delivery.",
+    must_answer=("Does each stage satisfy the approved acceptance matrix?",),
+    allowed_tools=(),
+    forbidden_actions=("Do not perform dangerous operations.",),
+    skills=(),
+    output_schema={"summary": "string"},
+    model="main",
+)
 dispatch_preflight_plan = _dispatch_plan(
-    (builder_role,),
+    (builder_role, reviewer_role),
     TaskContext(
         run_id=uuid4(),
         tenant_id=uuid4(),
@@ -1347,6 +1359,15 @@ require(
 require(
     dispatch_preflight_agents["builder"].output_schema.get("verification_evidence") == "string[]",
     "approved project preflight role schema exposes staged evidence",
+)
+require(
+    dispatch_preflight_steps["quality_reviewer_step"].depends_on == ("builder_step",),
+    "approved project preflight reviewer waits for staged implementation",
+)
+require(
+    dispatch_preflight_agents["quality_reviewer"].output_schema.get("acceptance_review")
+    == "string[]",
+    "approved project preflight reviewer schema exposes acceptance review",
 )
 require(
     any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in dispatch_preflight_plan.steps),
