@@ -225,26 +225,37 @@ check_prometheus_metrics() {
 check_protected_boundary() {
   local name="$1"
   local path="$2"
+  local method="${3:-GET}"
+  local body="${4:-{}}"
   local status
   local temp_headers
   temp_headers="$(mktemp)"
-  if status="$(curl --noproxy '*' \
-    --connect-timeout "$connect_timeout" \
-    --max-time "$max_time" \
-    -sS -D "$temp_headers" -o /dev/null -w '%{http_code}' \
-    "$base_url$path" 2>/dev/null)" && [[ "$status" == "401" ]]; then
+  local curl_args=(
+    --noproxy '*'
+    --connect-timeout "$connect_timeout"
+    --max-time "$max_time"
+    -sS
+    -X "$method"
+    -D "$temp_headers"
+    -o /dev/null
+    -w '%{http_code}'
+  )
+  if [[ "$method" != "GET" ]]; then
+    curl_args+=(-H 'content-type: application/json' --data "$body")
+  fi
+  if status="$(curl "${curl_args[@]}" "$base_url$path" 2>/dev/null)" && [[ "$status" == "401" ]]; then
     if grep -qi '^www-authenticate: Bearer' "$temp_headers"; then
       rm -f -- "$temp_headers"
-      printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
+      printf 'ok: %s %s %s -> %s\n' "$name" "$method" "$path" "$status"
       return 0
     fi
     rm -f -- "$temp_headers"
-    printf 'fail: %s %s expected WWW-Authenticate: Bearer\n' "$name" "$path" >&2
+    printf 'fail: %s %s %s expected WWW-Authenticate: Bearer\n' "$name" "$method" "$path" >&2
     failures=$((failures + 1))
     return 1
   fi
   rm -f -- "$temp_headers"
-  printf 'fail: %s %s expected 401 -> %s\n' "$name" "$path" "${status:-curl-error}" >&2
+  printf 'fail: %s %s %s expected 401 -> %s\n' "$name" "$method" "$path" "${status:-curl-error}" >&2
   failures=$((failures + 1))
   return 1
 }
@@ -479,6 +490,8 @@ run_codex_profile() {
   check_prometheus_metrics || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
+  check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST" || true
+  check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST" || true
   check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found" || true
   check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed" || true
   check_url "openapi contract" "/openapi.json" || true
@@ -492,7 +505,10 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
+  check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
+  check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
   check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
+  check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
 }
 
 check_openapi_path() {

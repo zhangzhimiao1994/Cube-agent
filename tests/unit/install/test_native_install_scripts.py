@@ -136,8 +136,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post"' in command
     assert 'check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000"' in command
     assert 'check_protected_boundary "model registry requires bearer" "/api/v1/admin/models"' in command
+    assert 'check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
+    assert 'check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
     assert 'check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters"' in command
+    assert 'check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
+    assert 'check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
     assert 'check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp"' in command
+    assert 'check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command
+    assert '-X "$method"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 
