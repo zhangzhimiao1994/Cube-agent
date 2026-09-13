@@ -164,6 +164,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "model routing create" "/api/v1/admin/models" "post"' in command
     assert 'check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post"' in command
     assert 'items != {"$ref": "#/components/schemas/ModelCapability"}' in command
+    assert "check_openapi_capability_manifest_failure_codes_schema" in command
+    assert 'schemas.get("CapabilityManifestItemResponse", {})' in command
+    assert 'failure_codes.get("maxItems") != 32' in command
     assert 'check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post"' in command
     assert 'check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get"' in command
     assert 'check_openapi_path "admin config draft save" "/api/v1/admin/config/draft" "put"' in command

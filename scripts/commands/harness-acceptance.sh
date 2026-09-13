@@ -373,6 +373,36 @@ PY
   return 1
 }
 
+check_openapi_capability_manifest_failure_codes_schema() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+schemas = document.get("components", {}).get("schemas", {})
+item_schema = schemas.get("CapabilityManifestItemResponse", {})
+failure_codes = item_schema.get("properties", {}).get("failure_codes")
+if not isinstance(failure_codes, dict):
+    raise SystemExit(1)
+if failure_codes.get("type") != "array":
+    raise SystemExit(1)
+if failure_codes.get("maxItems") != 32:
+    raise SystemExit(1)
+items = failure_codes.get("items")
+if not isinstance(items, dict) or items.get("type") != "string":
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: capability manifest failure codes schema\n'
+    return 0
+  fi
+  printf 'fail: capability manifest failure codes schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_safe_projection() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -736,6 +766,7 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing create" "/api/v1/admin/models" "post" || true
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
   check_openapi_model_capability_schema || true
+  check_openapi_capability_manifest_failure_codes_schema || true
   check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post" || true
   check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get" || true
   check_openapi_path "admin config draft save" "/api/v1/admin/config/draft" "put" || true
