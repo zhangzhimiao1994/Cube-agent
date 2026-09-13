@@ -489,6 +489,9 @@ run_codex_profile() {
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
+  check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true
+  check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details" || true
+  check_protected_boundary "run artifact download requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download" || true
   check_protected_boundary "run create requires bearer" "/api/v1/runs" "POST" || true
   check_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST" || true
   check_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST" || true
@@ -513,6 +516,8 @@ run_deepseek_profile() {
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
   check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
+  check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST" || true
+  check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest" || true
   check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
   check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
 }

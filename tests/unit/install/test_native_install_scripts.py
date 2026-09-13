@@ -135,12 +135,17 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "mcp server registry" "/api/v1/admin/mcp" "get"' in command
     assert 'check_openapi_path "mcp server upsert" "/api/v1/admin/mcp" "post"' in command
     assert 'check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000"' in command
+    assert 'check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events"' in command
+    assert 'check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details"' in command
+    assert 'check_protected_boundary "run artifact download requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download"' in command
     assert 'check_protected_boundary "model registry requires bearer" "/api/v1/admin/models"' in command
     assert 'check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
     assert 'check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
     assert 'check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters"' in command
     assert 'check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
     assert 'check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
+    assert 'check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST"' in command
+    assert 'check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest"' in command
     assert 'check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp"' in command
     assert 'check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command
     assert '-X "$method"' in command
