@@ -166,6 +166,19 @@ def runtime_failure_diagnostic_from_reason(
             ),
             status_code=status_code,
         )
+    if "plugin_package_adapter_unavailable" in lowered:
+        return _base_diagnostic(
+            normalized,
+            error_stage="plugin_runtime",
+            error_category="adapter_unavailable",
+            error_code="plugin.adapter_unavailable",
+            retryable=False,
+            suggested_action=(
+                "插件能力已注册但插件适配器不可用；请检查插件运行时适配器注册状态，"
+                "重新加载插件/MCP 能力清单，或切换到仍可用的等价能力后再重试。"
+            ),
+            status_code=status_code,
+        )
     if lowered == "capability outcome requires confirmation":
         return _base_diagnostic(
             normalized,

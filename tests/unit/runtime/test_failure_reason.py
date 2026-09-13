@@ -262,6 +262,23 @@ def test_runtime_failure_diagnostic_classifies_planned_capability_unavailable() 
     assert "重新规划" in suggested_action
 
 
+def test_runtime_failure_diagnostic_classifies_plugin_adapter_unavailable() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "Plugin tool unavailable: plugin_package_adapter_unavailable"
+    )
+
+    assert diagnostic["error_summary"] == (
+        "Plugin tool unavailable: plugin_package_adapter_unavailable"
+    )
+    assert diagnostic["error_stage"] == "plugin_runtime"
+    assert diagnostic["error_category"] == "adapter_unavailable"
+    assert diagnostic["error_code"] == "plugin.adapter_unavailable"
+    assert diagnostic["retryable"] is False
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "插件适配器" in suggested_action
+    assert "重新加载" in suggested_action
+
+
 def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_non_retryable() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("capability outcome requires confirmation")
 
