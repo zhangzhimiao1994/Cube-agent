@@ -123,6 +123,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_ACCEPTANCE_RUN_MESSAGE" in command
     assert "--retries N" in command
     assert "--retry-delay SECONDS" in command
+    assert "--verify-release" in command
+    assert "--install-root DIR" in command
+    assert "--expect-revision SHA" in command
+    assert 'expect_revision="${AGENT_HUB_ACCEPTANCE_EXPECT_REVISION:-}"' in command
+    assert 'verify_release=1' in command
+    assert "run_release_verification_profile" in command
+    assert 'args=(verify-release --install-root "$install_root")' in command
+    assert 'args+=(--expect-revision "$expect_revision")' in command
     assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in command
     assert "Authorization: Bearer" in command
     assert "^agent_hub_runs_total( |[{])" in command

@@ -13,6 +13,9 @@ retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
 retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
 bearer_token="${AGENT_HUB_ACCEPTANCE_BEARER_TOKEN:-}"
 run_message="${AGENT_HUB_ACCEPTANCE_RUN_MESSAGE:-Agent Hub harness acceptance run lifecycle probe}"
+verify_release=0
+install_root="${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
+expect_revision="${AGENT_HUB_ACCEPTANCE_EXPECT_REVISION:-}"
 failures=0
 
 usage() {
@@ -37,6 +40,9 @@ Options:
   --max-time SECONDS             Curl total request timeout. Defaults to 20.
   --retries N                    Attempts per smoke URL. Defaults to AGENT_HUB_ACCEPTANCE_RETRIES or 3.
   --retry-delay SECONDS          Delay between URL attempts. Defaults to AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS or 2.
+  --verify-release               Also verify native current release pointer, REVISION, and service state.
+  --install-root DIR             Native install root for --verify-release. Defaults to AGENT_HUB_INSTALL_ROOT or /opt/agent-hub.
+  --expect-revision SHA          Require current release REVISION to match SHA. Also enables --verify-release.
   --help                         Show this help.
 EOF
 }
@@ -81,6 +87,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --retry-delay)
       retry_delay="${2:?missing value for --retry-delay}"
+      shift 2
+      ;;
+    --verify-release)
+      verify_release=1
+      shift
+      ;;
+    --install-root)
+      install_root="${2:?missing value for --install-root}"
+      shift 2
+      ;;
+    --expect-revision)
+      expect_revision="${2:?missing revision}"
+      verify_release=1
       shift 2
       ;;
     --help)
@@ -982,6 +1001,24 @@ run_stress_profile() {
   return 1
 }
 
+run_release_verification_profile() {
+  local script_dir
+  local launcher
+  local args=(verify-release --install-root "$install_root")
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  launcher="$script_dir/../agent-hub"
+  printf 'profile: native release verification\n'
+  if [[ -n "$expect_revision" ]]; then
+    args+=(--expect-revision "$expect_revision")
+  fi
+  if "$launcher" "${args[@]}"; then
+    return 0
+  fi
+  printf 'fail: native release verification\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 require_curl
 if [[ "$read_only" -eq 1 ]]; then
   printf 'mode: read-only\n'
@@ -1009,6 +1046,10 @@ esac
 
 if [[ "$stress" -eq 1 ]]; then
   run_stress_profile || true
+fi
+
+if [[ "$verify_release" -eq 1 ]]; then
+  run_release_verification_profile || true
 fi
 
 if [[ "$failures" -gt 0 ]]; then
