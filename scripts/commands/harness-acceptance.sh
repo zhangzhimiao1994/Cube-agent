@@ -844,6 +844,11 @@ run_stress_profile() {
 }
 
 require_curl
+if [[ "$read_only" -eq 1 ]]; then
+  printf 'mode: read-only\n'
+else
+  printf 'mode: write-probes-enabled\n'
+fi
 
 case "$profile" in
   codex)

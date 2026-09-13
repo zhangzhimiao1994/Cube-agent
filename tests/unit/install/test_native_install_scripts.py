@@ -73,6 +73,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--read-only" in command
     assert 'production-safe) profile="all"; read_only=1 ;;' in command
     assert 'codex|deepseek|all|production-safe) ;;' in command
+    assert "mode: read-only" in command
+    assert "mode: write-probes-enabled" in command
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
     assert "check_health_json" in command
