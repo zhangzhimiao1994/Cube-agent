@@ -1351,6 +1351,20 @@ require(
     dispatch_preflight_steps["builder_step"].depends_on == ("project_preflight_step",),
     "approved project preflight dispatch stage gates implementation",
 )
+require(
+    "Use the project_preflight_step output as the implementation contract"
+    in dispatch_preflight_steps["builder_step"].task,
+    "approved project preflight implementation consumes preflight contract",
+)
+require(
+    "verification evidence for each stage" in dispatch_preflight_steps["builder_step"].task,
+    "approved project preflight implementation requires staged evidence",
+)
+require(
+    "stage-by-stage implementation status"
+    in dispatch_preflight_steps["final_response_step"].task,
+    "approved project preflight final response reports staged status",
+)
 
 for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):
     run_id = uuid4()

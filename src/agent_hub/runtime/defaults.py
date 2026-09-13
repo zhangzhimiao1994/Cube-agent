@@ -1066,6 +1066,27 @@ def _software_final_guidance(context: TaskContext) -> str:
     )
 
 
+def _project_preflight_implementation_guidance(preflight_context: str) -> str:
+    if not preflight_context:
+        return ""
+    return (
+        "Project preflight implementation contract: Use the project_preflight_step output "
+        "as the implementation contract. Break the work into stage-by-stage implementation "
+        "slices, preserve the approved architecture boundaries, and return verification "
+        "evidence for each stage before delivery. "
+    )
+
+
+def _project_preflight_final_guidance(preflight_context: str) -> str:
+    if not preflight_context:
+        return ""
+    return (
+        "For the approved project preflight: Use the project_preflight_step output as the "
+        "implementation contract, and summarize the architecture plan, graph path, "
+        "stage-by-stage implementation status, verification evidence, and unresolved risks. "
+    )
+
+
 def _project_preflight_tools(
     context: TaskContext,
     *,
@@ -1162,6 +1183,8 @@ def _dispatch_plan(
                     "summary": "string",
                     "plan_path": "string",
                     "graph_path": "string",
+                    "stage_contracts": "string[]",
+                    "acceptance_matrix": "string[]",
                     "verification": "string[]",
                 },
             )
@@ -1235,6 +1258,7 @@ def _dispatch_plan(
                 f"User task: {request_text}\n"
                 f"{memory_guidance}"
                 f"{preflight_guidance}"
+                f"{_project_preflight_implementation_guidance(preflight_context)}"
                 f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
@@ -1260,6 +1284,7 @@ def _dispatch_plan(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
             f"{preflight_guidance}"
+            f"{_project_preflight_final_guidance(preflight_context)}"
             f"{_software_final_guidance(context)}"
             "Resolve conflicts explicitly and state any user decision required."
         ),

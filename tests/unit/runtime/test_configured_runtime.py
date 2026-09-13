@@ -4569,6 +4569,8 @@ def test_dispatch_plan_includes_approved_project_preflight_context_in_steps() ->
     assert any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in plan.steps)
     assert any("project.preflight_architecture" in step.task for step in plan.steps)
     assert any("staged implementation" in step.task for step in plan.steps)
+    assert "Use the project_preflight_step output as the implementation contract" in plan.final_step.task
+    assert "stage-by-stage implementation status" in plan.final_step.task
 
 
 def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() -> None:
@@ -4626,12 +4628,23 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
     assert "PROJECT_ARCHITECTURE_PLAN.md" in steps["project_preflight_step"].task
     assert "architecture-map.html" in steps["project_preflight_step"].task
     assert steps["builder_step"].depends_on == ("project_preflight_step",)
+    assert (
+        "Use the project_preflight_step output as the implementation contract"
+        in steps["builder_step"].task
+    )
+    assert "stage-by-stage implementation slices" in steps["builder_step"].task
+    assert "verification evidence for each stage" in steps["builder_step"].task
     assert steps["quality_reviewer_step"].depends_on == ("builder_step",)
+    assert (
+        "Use the project_preflight_step output as the implementation contract"
+        in steps["quality_reviewer_step"].task
+    )
     assert steps["final_response_step"].depends_on == (
         "project_preflight_step",
         "builder_step",
         "quality_reviewer_step",
     )
+    assert "stage-by-stage implementation status" in steps["final_response_step"].task
 
 
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
