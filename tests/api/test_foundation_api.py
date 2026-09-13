@@ -1444,10 +1444,10 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
         ("/api/v1/config/drafts", "post"): True,
         ("/api/v1/config/drafts/{revision_id}/publish", "post"): True,
         ("/api/v1/config/history/{version}/rollback", "post"): True,
-        ("/api/v1/config/current", "get"): False,
-        ("/api/v1/config/history", "get"): False,
-        ("/api/v1/config/history/{version}", "get"): False,
-        ("/api/v1/config/diff", "get"): False,
+        ("/api/v1/config/current", "get"): True,
+        ("/api/v1/config/history", "get"): True,
+        ("/api/v1/config/history/{version}", "get"): True,
+        ("/api/v1/config/diff", "get"): True,
     }
     for (path, method), expects_forbidden in config_403_matrix.items():
         assert ("403" in schema["paths"][path][method]["responses"]) is expects_forbidden
