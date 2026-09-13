@@ -229,6 +229,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "approved project preflight context enters direct prompt" in command
     assert "approved project preflight context enters dispatch plan" in command
     assert "approved project preflight explicit dispatch stage" in command
+    assert "approved project preflight role schema exposes staged status" in command
+    assert "approved project preflight role schema exposes staged evidence" in command
     assert "approved project preflight dispatch stage gates implementation" in command
     assert "approved project preflight implementation consumes preflight contract" in command
     assert "approved project preflight implementation requires staged evidence" in command

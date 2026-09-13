@@ -1335,9 +1335,18 @@ dispatch_preflight_plan = _dispatch_plan(
     max_parallelism=1,
 )
 dispatch_preflight_steps = {step.id: step for step in dispatch_preflight_plan.steps}
+dispatch_preflight_agents = {agent.id: agent for agent in dispatch_preflight_plan.agents}
 require(
     dispatch_preflight_steps["project_preflight_step"].agent == "project_preflight_architect",
     "approved project preflight explicit dispatch stage",
+)
+require(
+    dispatch_preflight_agents["builder"].output_schema.get("stage_status") == "string[]",
+    "approved project preflight role schema exposes staged status",
+)
+require(
+    dispatch_preflight_agents["builder"].output_schema.get("verification_evidence") == "string[]",
+    "approved project preflight role schema exposes staged evidence",
 )
 require(
     any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in dispatch_preflight_plan.steps),

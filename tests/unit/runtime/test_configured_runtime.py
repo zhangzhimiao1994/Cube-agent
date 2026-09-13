@@ -4623,7 +4623,15 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
 
     plan = _dispatch_plan(roles, context, max_parallelism=2)
 
+    agents = {agent.id: agent for agent in plan.agents}
     steps = {step.id: step for step in plan.steps}
+    assert agents["builder"].output_schema["stage_status"] == "string[]"
+    assert agents["builder"].output_schema["verification_evidence"] == "string[]"
+    assert agents["builder"].output_schema["remaining_risks"] == "string[]"
+    assert agents["quality_reviewer"].output_schema["stage_status"] == "string[]"
+    assert agents["quality_reviewer"].output_schema["verification_evidence"] == "string[]"
+    assert agents["quality_reviewer"].output_schema["remaining_risks"] == "string[]"
+    assert agents["quality_reviewer"].output_schema["acceptance_review"] == "string[]"
     assert steps["project_preflight_step"].agent == "project_preflight_architect"
     assert "PROJECT_ARCHITECTURE_PLAN.md" in steps["project_preflight_step"].task
     assert "architecture-map.html" in steps["project_preflight_step"].task

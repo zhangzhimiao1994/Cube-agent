@@ -1087,6 +1087,22 @@ def _project_preflight_final_guidance(preflight_context: str) -> str:
     )
 
 
+def _project_preflight_role_output_schema(
+    role: RoleAssignment,
+    *,
+    preflight_context: str,
+) -> dict[str, str]:
+    output_schema = dict(role.output_schema)
+    if not preflight_context:
+        return output_schema
+    output_schema.setdefault("stage_status", "string[]")
+    output_schema.setdefault("verification_evidence", "string[]")
+    output_schema.setdefault("remaining_risks", "string[]")
+    if _is_post_product_role(role):
+        output_schema.setdefault("acceptance_review", "string[]")
+    return output_schema
+
+
 def _project_preflight_tools(
     context: TaskContext,
     *,
@@ -1157,7 +1173,10 @@ def _dispatch_plan(
             goal=role.mission,
             logical_model=role.model,
             allowed_tools=role_tools_by_id[role.id],
-            output_schema=dict(role.output_schema),
+            output_schema=_project_preflight_role_output_schema(
+                role,
+                preflight_context=preflight_context,
+            ),
         )
         for role in selected_roles
     ]
