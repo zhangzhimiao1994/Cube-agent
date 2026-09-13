@@ -219,6 +219,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"model_capacity_pressure"' in command
     assert '"reschedule_or_reassign_model"' in command
     assert '"switch_to_available_model_and_retry"' in command
+    assert '"model.provider_rate_limited"' in command
+    assert '"provider 429 must trigger model switch"' in command
+    assert '"provider 429 repair strategy"' in command
     assert '"empty_model_response"' in command
     assert '"retry_fallback_or_reassign_model"' in command
     assert '"retry_with_fallback_or_reassign_model"' in command

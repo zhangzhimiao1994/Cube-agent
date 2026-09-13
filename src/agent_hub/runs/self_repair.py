@@ -43,6 +43,7 @@ _CAPACITY_MARKERS = frozenset(
         "model capacity backend failed",
         "model capacity backend unavailable",
         "capacity unavailable",
+        "status=429",
         "status_code=429",
         "http 429",
     }

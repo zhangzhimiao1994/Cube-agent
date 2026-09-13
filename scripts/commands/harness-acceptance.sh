@@ -914,6 +914,7 @@ from uuid import uuid4
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.gateway import ModelGatewayError, _fallback_reason, _retryable_model_failure
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.runs.observer import RunMonitor
 from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
@@ -975,6 +976,17 @@ require(model_prevention.get("retryable") is True, "empty response diagnostic re
 require(model_prevention.get("error_code") == "model.empty_response", "empty response code")
 require("fallback" in str(model_prevention.get("suggested_action")), "empty response action")
 
+provider_rate_limit = ModelTransportError("safe provider rate limit", status_code=429)
+require(_retryable_model_failure(provider_rate_limit) is True, "provider 429 must be retryable")
+provider_rate_limit_diagnostic = runtime_failure_diagnostic_from_reason(
+    "model gateway failed: model response failed (status=429)"
+)
+require(
+    provider_rate_limit_diagnostic.get("error_code") == "model.provider_rate_limited",
+    "provider 429 diagnostic code",
+)
+require(provider_rate_limit_diagnostic.get("retryable") is True, "provider 429 diagnostic retryable")
+
 for reason, code, retryable in (
     ("Plugin backend unavailable", "plugin.backend_unavailable", True),
     ("Plugin credential unavailable", "plugin.credential_unavailable", False),
@@ -1000,6 +1012,40 @@ require(capacity_decision.action == "reschedule_or_reassign_model", "reschedule_
 require(
     capacity_decision.recommendation == "switch_to_available_model_and_retry",
     "switch_to_available_model_and_retry",
+)
+
+provider_rate_limit_failure = RunEvent(
+    kind=EventKind.RUNTIME_FAILED,
+    sequence=4,
+    run_id=run_id,
+    reason="model gateway failed: model response failed (status=429)",
+)
+provider_rate_limit_monitor = RunMonitor()
+provider_rate_limit_decision = provider_rate_limit_monitor.observe(provider_rate_limit_failure)
+require(provider_rate_limit_decision is not None, "provider 429 decision")
+require(
+    provider_rate_limit_decision.trigger == "model_capacity_pressure",
+    "provider 429 must trigger model switch",
+)
+require(
+    provider_rate_limit_decision.recommendation == "switch_to_available_model_and_retry",
+    "provider 429 recommendation",
+)
+provider_rate_limit_repair = classify_terminal_run(
+    status=RunStatus.FAILED,
+    mode=TaskMode.AUTO,
+    routing_decision={"source": "manual"},
+    events=(
+        provider_rate_limit_failure,
+        provider_rate_limit_decision.to_event(run_id=run_id, sequence=5),
+    ),
+    policy=SelfRepairPolicy(requires_approval=True),
+)
+require(provider_rate_limit_repair is not None, "provider 429 repair decision")
+require(provider_rate_limit_repair.failure_category == "capacity_pressure", "provider 429 repair category")
+require(
+    provider_rate_limit_repair.recovery_strategy == "switch_to_available_model_and_retry",
+    "provider 429 repair strategy",
 )
 
 empty_failure = RunEvent(
