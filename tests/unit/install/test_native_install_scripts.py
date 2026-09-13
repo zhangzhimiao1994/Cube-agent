@@ -125,6 +125,21 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command
     assert 'check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post"' in command
     assert 'check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get"' in command
+    assert 'check_openapi_path "config validate" "/api/v1/config/validate" "post"' in command
+    assert 'check_openapi_path "config draft create" "/api/v1/config/drafts" "post"' in command
+    assert 'check_openapi_path "config draft publish" "/api/v1/config/drafts/{revision_id}/publish" "post"' in command
+    assert 'check_openapi_path "config current" "/api/v1/config/current" "get"' in command
+    assert 'check_openapi_path "config history" "/api/v1/config/history" "get"' in command
+    assert 'check_openapi_path "config version" "/api/v1/config/history/{version}" "get"' in command
+    assert 'check_openapi_path "config diff" "/api/v1/config/diff" "get"' in command
+    assert 'check_openapi_path "config rollback" "/api/v1/config/history/{version}/rollback" "post"' in command
+    assert 'check_openapi_path "user list" "/api/v1/users" "get"' in command
+    assert 'check_openapi_path "user create" "/api/v1/users" "post"' in command
+    assert 'check_openapi_path "user update" "/api/v1/users/{user_id}" "patch"' in command
+    assert 'check_openapi_path "user role" "/api/v1/users/{user_id}/role" "patch"' in command
+    assert 'check_openapi_path "user disabled" "/api/v1/users/{user_id}/disabled" "patch"' in command
+    assert 'check_openapi_path "user password" "/api/v1/users/{user_id}/password" "patch"' in command
+    assert 'check_openapi_path "user delete" "/api/v1/users/{user_id}" "delete"' in command
     assert 'check_openapi_path "workspace file list" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files" "get"' in command
     assert 'check_openapi_path "workspace file download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files/download" "get"' in command
     assert 'check_openapi_path "workspace bundle download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/bundle/download" "get"' in command
@@ -189,6 +204,20 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST"' in command
     assert 'check_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST"' in command
     assert 'check_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST"' in command
+    assert 'check_protected_boundary "auth me requires bearer" "/api/v1/auth/me"' in command
+    assert 'check_protected_boundary "config current requires bearer" "/api/v1/config/current"' in command
+    assert 'check_protected_boundary "config history requires bearer" "/api/v1/config/history"' in command
+    assert 'check_protected_boundary "config version requires bearer" "/api/v1/config/history/1"' in command
+    assert 'check_protected_boundary "config diff requires bearer" "/api/v1/config/diff?from_version=1&to_version=2"' in command
+    assert 'check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST"' in command
+    assert 'check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST"' in command
+    assert 'check_protected_boundary "user list requires bearer" "/api/v1/users"' in command
+    assert 'check_protected_boundary "user create requires bearer" "/api/v1/users" "POST"' in command
+    assert 'check_protected_boundary "user update requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "PATCH"' in command
+    assert 'check_protected_boundary "user role requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/role" "PATCH"' in command
+    assert 'check_protected_boundary "user disabled requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/disabled" "PATCH"' in command
+    assert 'check_protected_boundary "user password requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/password" "PATCH"' in command
+    assert 'check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 

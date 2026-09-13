@@ -501,6 +501,20 @@ run_codex_profile() {
   check_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST" || true
   check_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST" || true
   check_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST" || true
+  check_protected_boundary "auth me requires bearer" "/api/v1/auth/me" || true
+  check_protected_boundary "config current requires bearer" "/api/v1/config/current" || true
+  check_protected_boundary "config history requires bearer" "/api/v1/config/history" || true
+  check_protected_boundary "config version requires bearer" "/api/v1/config/history/1" || true
+  check_protected_boundary "config diff requires bearer" "/api/v1/config/diff?from_version=1&to_version=2" || true
+  check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST" || true
+  check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST" || true
+  check_protected_boundary "user list requires bearer" "/api/v1/users" || true
+  check_protected_boundary "user create requires bearer" "/api/v1/users" "POST" '{"username":"probe-user","password":"ProbePassword123!","role":"operator"}' || true
+  check_protected_boundary "user update requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "PATCH" '{"disabled":true}' || true
+  check_protected_boundary "user role requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/role" "PATCH" '{"role":"operator"}' || true
+  check_protected_boundary "user disabled requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/disabled" "PATCH" '{"disabled":true}' || true
+  check_protected_boundary "user password requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/password" "PATCH" '{"password":"ProbePassword123!"}' || true
+  check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE" || true
   check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
   check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST" || true
   check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST" || true
@@ -602,6 +616,21 @@ run_openapi_capability_profile() {
   check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post" || true
   check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post" || true
   check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get" || true
+  check_openapi_path "config validate" "/api/v1/config/validate" "post" || true
+  check_openapi_path "config draft create" "/api/v1/config/drafts" "post" || true
+  check_openapi_path "config draft publish" "/api/v1/config/drafts/{revision_id}/publish" "post" || true
+  check_openapi_path "config current" "/api/v1/config/current" "get" || true
+  check_openapi_path "config history" "/api/v1/config/history" "get" || true
+  check_openapi_path "config version" "/api/v1/config/history/{version}" "get" || true
+  check_openapi_path "config diff" "/api/v1/config/diff" "get" || true
+  check_openapi_path "config rollback" "/api/v1/config/history/{version}/rollback" "post" || true
+  check_openapi_path "user list" "/api/v1/users" "get" || true
+  check_openapi_path "user create" "/api/v1/users" "post" || true
+  check_openapi_path "user update" "/api/v1/users/{user_id}" "patch" || true
+  check_openapi_path "user role" "/api/v1/users/{user_id}/role" "patch" || true
+  check_openapi_path "user disabled" "/api/v1/users/{user_id}/disabled" "patch" || true
+  check_openapi_path "user password" "/api/v1/users/{user_id}/password" "patch" || true
+  check_openapi_path "user delete" "/api/v1/users/{user_id}" "delete" || true
   check_openapi_path "workspace file list" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files" "get" || true
   check_openapi_path "workspace file download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files/download" "get" || true
   check_openapi_path "workspace bundle download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/bundle/download" "get" || true

@@ -140,7 +140,7 @@ async def publish_draft(
 @router.get(
     "/current",
     response_model=ConfigRevisionResponse,
-    responses=error_responses(404),
+    responses=error_responses(403, 404),
 )
 async def current_config(
     service: Annotated[ConfigurationService, Depends(_config_service)],
@@ -157,7 +157,7 @@ async def current_config(
 @router.get(
     "/history",
     response_model=ConfigHistoryResponse,
-    responses=error_responses(422),
+    responses=error_responses(403, 422),
 )
 async def config_history(
     service: Annotated[ConfigurationService, Depends(_config_service)],
@@ -180,7 +180,7 @@ async def config_history(
 @router.get(
     "/history/{version}",
     response_model=ConfigRevisionResponse,
-    responses=error_responses(404, 422),
+    responses=error_responses(403, 404, 422),
 )
 async def config_version(
     version: int,
@@ -200,7 +200,7 @@ async def config_version(
 @router.get(
     "/diff",
     response_model=ConfigDiffResponse,
-    responses=error_responses(404, 422),
+    responses=error_responses(403, 404, 422),
 )
 async def config_diff(
     service: Annotated[ConfigurationService, Depends(_config_service)],
