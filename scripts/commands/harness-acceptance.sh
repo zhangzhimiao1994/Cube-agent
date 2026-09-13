@@ -827,6 +827,7 @@ from agent_hub.runs.self_repair import (
     classify_terminal_run,
     repair_context_from_proposal,
 )
+from agent_hub.runs.service import _looks_like_schedule_intent
 from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 
@@ -837,6 +838,38 @@ def require(value, label):
 
 
 run_id = uuid4()
+
+for message in (
+    "每天9点提醒我填写日报",
+    "设置提醒：每天9点提醒我填写日报",
+    "创建提醒：每天9点提醒我填写日报",
+    "设置闹钟：每天9点填写日报",
+    "create reminder every day at 9am to fill daily report",
+):
+    require(
+        _looks_like_schedule_intent(message, message.lower()) is False,
+        "ordinary schedule-like reminders must stay chat",
+    )
+
+for message in (
+    "帮我设计计划任务创建规则：每天9点提醒我填写日报",
+    "讨论一下怎么创建计划任务，每天9点提醒我填写日报",
+    "review scheduled task design: create reminder every day at 9am",
+):
+    require(
+        _looks_like_schedule_intent(message, message.lower()) is False,
+        "schedule feature discussion must stay chat",
+    )
+
+for message in (
+    "创建计划任务：每天9点提醒我填写日报",
+    "创建计划任务：9月3号给我生成一个方案",
+    "create scheduled task every day at 9am to fill daily report",
+):
+    require(
+        _looks_like_schedule_intent(message, message.lower()) is True,
+        "explicit schedule task creation must still propose",
+    )
 
 empty_error = ModelGatewayError("model response text is empty")
 require(_retryable_model_failure(empty_error) is True, "empty response must be retryable")

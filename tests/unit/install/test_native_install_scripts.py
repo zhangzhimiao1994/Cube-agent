@@ -191,6 +191,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"automatic_execution"' in command
     assert '"plugin.backend_unavailable"' in command
     assert '"mcp.server_timeout"' in command
+    assert "_looks_like_schedule_intent" in command
+    assert "ordinary schedule-like reminders must stay chat" in command
+    assert "schedule feature discussion must stay chat" in command
+    assert "explicit schedule task creation must still propose" in command
     assert "profile: multi-mode interaction matrix" in command
     assert "ok: multi-mode interaction matrix" in command
     assert "fail: multi-mode interaction matrix" in command
