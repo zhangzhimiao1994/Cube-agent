@@ -160,6 +160,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: authenticated run control idempotency guard" in command
     assert "run control idempotency guard is disabled in read-only mode" in command
     assert "run control idempotency guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+    assert "profile: authenticated run create idempotency replay guard" in command
+    assert "run create idempotency replay guard is disabled in read-only mode" in command
+    assert (
+        "run create idempotency replay guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN"
+        in command
+    )
+    assert "first create response did not include id" in command
+    assert "replayed create returned original run id" in command
     assert "repeated pause stays paused" in command
     assert "repeated resume stays queued" in command
     assert "cancel_probe_run_id" in command

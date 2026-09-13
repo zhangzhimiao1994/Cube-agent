@@ -1460,6 +1460,96 @@ run_lifecycle_profile() {
   printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
 }
 
+run_create_idempotency_replay_guard_profile() {
+  local python_bin
+  local request_body
+  local first_response
+  local replay_response
+  local first_run_id
+  local replay_run_id
+  local idempotency_key
+  local runs_path="/api/v1/runs"
+
+  printf 'profile: authenticated run create idempotency replay guard\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: run create idempotency replay guard is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: run create idempotency replay guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: run create idempotency replay guard requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! request_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({
+    "message": "Agent Hub run create idempotency replay acceptance probe",
+    "mode": "direct",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build run create idempotency replay request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  idempotency_key="create-replay-$(date +%s)-$$"
+  if ! first_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $idempotency_key" \
+    -d "$request_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: run create idempotency first create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! replay_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $idempotency_key" \
+    -d "$request_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: run create idempotency replay create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! first_run_id="$(ACCEPTANCE_RESPONSE="$first_response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])')"; then
+    printf 'fail: first create response did not include id\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! replay_run_id="$(ACCEPTANCE_RESPONSE="$replay_response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])')"; then
+    printf 'fail: replayed create response did not include id\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$first_run_id" != "$replay_run_id" ]]; then
+    printf 'fail: replayed create returned different run id first=%s replay=%s\n' \
+      "$first_run_id" "$replay_run_id" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  printf 'ok: replayed create returned original run id run_id=%s\n' "$first_run_id"
+}
+
 post_run_control_expect_status() {
   local python_bin="$1"
   local run_id="$2"
@@ -1829,6 +1919,7 @@ case "$profile" in
     run_codex_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_create_idempotency_replay_guard_profile || true
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     ;;
@@ -1841,6 +1932,7 @@ case "$profile" in
     run_deepseek_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_create_idempotency_replay_guard_profile || true
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     ;;
