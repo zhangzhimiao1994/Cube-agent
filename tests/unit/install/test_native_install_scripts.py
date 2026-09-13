@@ -82,6 +82,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_protected_boundary" in command
     assert "check_write_protected_boundary" in command
     assert "check_error_envelope" in command
+    assert "check_runtime_failure_diagnostics" in command
     assert "check_openapi_safe_projection" in command
     assert "check_openapi_model_capability_schema" in command
     assert "run_lifecycle_profile" in command
@@ -131,6 +132,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"checkpoint_state"' in command
     assert '"provider_metadata"' in command
     assert "fail: run detail schema safe projection" in command
+    assert "fail: runtime failure diagnostics" in command
+    assert '"plugin.timeout"' in command
+    assert '"plugin.credential_unavailable"' in command
+    assert '"mcp.timeout"' in command
+    assert '"mcp.server_failed"' in command
     assert 'check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found"' in command
     assert 'check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed"' in command
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command

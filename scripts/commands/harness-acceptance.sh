@@ -505,6 +505,72 @@ PY
   return 1
 }
 
+check_runtime_failure_diagnostics() {
+  local python_bin
+  local script_dir
+  local source_dir
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: runtime failure diagnostics requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
+
+cases = [
+    ("Plugin tool timed out", "plugin_runtime", "timeout", "plugin.timeout", True),
+    (
+        "Plugin credential unavailable",
+        "plugin_runtime",
+        "credential_unavailable",
+        "plugin.credential_unavailable",
+        False,
+    ),
+    (
+        "Plugin arguments do not match input schema: invalid type",
+        "plugin_runtime",
+        "invalid_arguments",
+        "plugin.invalid_arguments",
+        False,
+    ),
+    (
+        "Plugin result does not match output schema: invalid type",
+        "plugin_runtime",
+        "invalid_result",
+        "plugin.invalid_result",
+        False,
+    ),
+    ("Plugin backend unavailable", "plugin_runtime", "backend_unavailable", "plugin.backend_unavailable", True),
+    ("Plugin sandbox profile unsupported", "plugin_runtime", "sandbox_unsupported", "plugin.sandbox_unsupported", False),
+    ("MCP tool unavailable", "mcp_runtime", "tool_unavailable", "mcp.tool_unavailable", False),
+    ("MCP tool timed out", "mcp_runtime", "timeout", "mcp.timeout", True),
+    ("mcp_server_not_discovered", "mcp_runtime", "server_not_discovered", "mcp.server_not_discovered", False),
+    ("mcp_server_timeout", "mcp_runtime", "server_timeout", "mcp.server_timeout", True),
+    ("mcp_server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
+]
+
+for reason, stage, category, code, retryable in cases:
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+    if diagnostic.get("error_stage") != stage:
+        raise SystemExit(1)
+    if diagnostic.get("error_category") != category:
+        raise SystemExit(1)
+    if diagnostic.get("error_code") != code:
+        raise SystemExit(1)
+    if diagnostic.get("retryable") is not retryable:
+        raise SystemExit(1)
+PY
+  then
+    printf 'ok: runtime failure diagnostics\n'
+    return 0
+  fi
+  printf 'fail: runtime failure diagnostics\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
   check_url "api health alias" "/health" || true
@@ -561,6 +627,7 @@ run_deepseek_profile() {
   check_url "operator ui for plugin orchestration" "/login" || true
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
+  check_runtime_failure_diagnostics || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
   check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true
