@@ -633,6 +633,36 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing create" "/api/v1/admin/models" "post" || true
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
   check_openapi_model_capability_schema || true
+  check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post" || true
+  check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get" || true
+  check_openapi_path "admin config draft save" "/api/v1/admin/config/draft" "put" || true
+  check_openapi_path "admin config draft diff" "/api/v1/admin/config/diff" "post" || true
+  check_openapi_path "admin config publish" "/api/v1/admin/config/publish" "post" || true
+  check_openapi_path "admin config rollback" "/api/v1/admin/config/rollback/{version}" "post" || true
+  check_openapi_path "admin agents list" "/api/v1/admin/agents" "get" || true
+  check_openapi_path "admin agent upsert" "/api/v1/admin/agents" "post" || true
+  check_openapi_path "admin agent delete" "/api/v1/admin/agents/{agent_id}" "delete" || true
+  check_openapi_path "admin workflows list" "/api/v1/admin/workflows" "get" || true
+  check_openapi_path "admin workflow upsert" "/api/v1/admin/workflows" "post" || true
+  check_openapi_path "admin workflow delete" "/api/v1/admin/workflows/{workflow_id}" "delete" || true
+  check_openapi_path "admin settings get" "/api/v1/admin/settings" "get" || true
+  check_openapi_path "admin settings update" "/api/v1/admin/settings" "put" || true
+  check_openapi_path "admin main agent get" "/api/v1/admin/main-agent" "get" || true
+  check_openapi_path "admin main agent update" "/api/v1/admin/main-agent" "put" || true
+  check_openapi_path "admin runs list" "/api/v1/admin/runs" "get" || true
+  check_openapi_path "admin run detail" "/api/v1/admin/runs/{run_id}" "get" || true
+  check_openapi_path "admin run artifact download" "/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download" "get" || true
+  check_openapi_path "admin run debug" "/api/v1/admin/runs/{run_id}/debug" "get" || true
+  check_openapi_path "admin run pause" "/api/v1/admin/runs/{run_id}/pause" "post" || true
+  check_openapi_path "admin run resume" "/api/v1/admin/runs/{run_id}/resume" "post" || true
+  check_openapi_path "admin run cancel" "/api/v1/admin/runs/{run_id}/cancel" "post" || true
+  check_openapi_path "admin run delete" "/api/v1/admin/runs/{run_id}" "delete" || true
+  check_openapi_path "admin skills list" "/api/v1/admin/skills" "get" || true
+  check_openapi_path "admin skill upload" "/api/v1/admin/skills" "post" || true
+  check_openapi_path "admin skill archive upload" "/api/v1/admin/skills/upload" "post" || true
+  check_openapi_path "admin skill version activate" "/api/v1/admin/skills/{skill_id}/versions/{version_id}/activate" "post" || true
+  check_openapi_path "admin skill approve" "/api/v1/admin/skills/{skill_id}/approve" "post" || true
+  check_openapi_path "admin skill delete" "/api/v1/admin/skills/{skill_id}" "delete" || true
   check_openapi_path "plugin adapters" "/api/v1/admin/plugins/adapters" "get" || true
   check_openapi_path "plugin registry list" "/api/v1/admin/plugins" "get" || true
   check_openapi_path "plugin registry upsert" "/api/v1/admin/plugins" "post" || true
