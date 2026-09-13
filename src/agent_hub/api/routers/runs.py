@@ -899,7 +899,15 @@ async def create_run(
     request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=90,
+            pattern=r"^[A-Za-z0-9._:-]+$",
+        ),
+    ] = None,
 ) -> SubmittedRunResponse:
     if body.vibe_coding and not await _vibe_coding_enabled(request):
         raise PublicAPIError(

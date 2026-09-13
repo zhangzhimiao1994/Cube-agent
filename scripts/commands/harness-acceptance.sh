@@ -560,14 +560,19 @@ if header.get("required") is True:
 schema = header.get("schema", {})
 if not isinstance(schema, dict):
     raise SystemExit(1)
-if schema.get("type") == "string":
-    raise SystemExit(0)
+string_schema = schema if schema.get("type") == "string" else None
 any_of = schema.get("anyOf")
-if isinstance(any_of, list) and any(
-    isinstance(item, dict) and item.get("type") == "string" for item in any_of
-):
-    raise SystemExit(0)
-raise SystemExit(1)
+if string_schema is None and isinstance(any_of, list):
+    for item in any_of:
+        if isinstance(item, dict) and item.get("type") == "string":
+            string_schema = item
+            break
+if not isinstance(string_schema, dict):
+    raise SystemExit(1)
+if string_schema.get("maxLength") != 90:
+    raise SystemExit(1)
+if string_schema.get("pattern") != "^[A-Za-z0-9._:-]+$":
+    raise SystemExit(1)
 PY
   then
     printf 'ok: run create idempotency header schema\n'

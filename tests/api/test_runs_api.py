@@ -560,6 +560,19 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
     assert service.enqueue_count == 0
 
 
+def test_run_submission_rejects_unsafe_idempotency_key_before_service_call() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers={**bearer(), "Idempotency-Key": "x" * 91},
+        json={"message": "safe task", "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
 def test_run_submission_records_user_conversation_audit_event() -> None:
     settings_service = StubSettingsService()
     client, service, principal = _client(settings_service=settings_service)

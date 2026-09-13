@@ -169,6 +169,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_openapi_run_create_idempotency_header" in command
     assert "ok: run create idempotency header schema" in command
     assert "fail: run create idempotency header schema" in command
+    assert 'string_schema.get("maxLength") != 90' in command
+    assert 'string_schema.get("pattern") != "^[A-Za-z0-9._:-]+$"' in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
     assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
     assert 'securitySchemes", {}).get("BearerAuth")' in command
