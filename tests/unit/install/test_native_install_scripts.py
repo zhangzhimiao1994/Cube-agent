@@ -207,6 +207,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin.credential_unavailable"' in command
     assert '"mcp.timeout"' in command
     assert '"mcp.server_failed"' in command
+    assert "PluginConfigCapabilityManifestSource" in command
+    assert '"plugin_package_adapter_unavailable"' in command
+    assert '"plugin_package_capability_isolation_mismatch"' in command
     assert "profile: interaction prevention and last-resort recovery" in command
     assert "fail: interaction prevention and recovery" in command
     assert "ok: interaction prevention and recovery" in command

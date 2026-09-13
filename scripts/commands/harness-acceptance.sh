@@ -759,6 +759,8 @@ check_runtime_failure_diagnostics() {
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.defaults import _capability_inventory_payload
+from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
+from types import SimpleNamespace
 
 cases = [
     ("Plugin tool timed out", "plugin_runtime", "timeout", "plugin.timeout", True),
@@ -842,6 +844,49 @@ failure_codes = items[0].get("failure_codes")
 expected_codes = ("plugin.timeout", *(f"plugin.failure_{index}" for index in range(31)))
 if failure_codes != expected_codes:
     raise SystemExit(1)
+
+activation_reason_cases = (
+    (
+        "runtime-registered adapter package requires a registered adapter",
+        "plugin_package_adapter_unavailable",
+    ),
+    (
+        "runtime-registered adapter package capabilities must use package isolation",
+        "plugin_package_capability_isolation_mismatch",
+    ),
+)
+for raw_reason, expected_reason in activation_reason_cases:
+    source = PluginConfigCapabilityManifestSource((
+        SimpleNamespace(
+            id="calendar",
+            enabled=True,
+            status="running",
+            health="healthy",
+            package_metadata=SimpleNamespace(
+                kind="adapter_package",
+                activation_state="blocked_unsupported_runtime",
+                activation_reason=raw_reason,
+            ),
+            capabilities=(
+                SimpleNamespace(
+                    id="calendar.create_event",
+                    adapter="calendar_python",
+                    permission_class="calendar.write",
+                    sandbox_profile="local_process",
+                    replay_safe=False,
+                    aliases=(),
+                ),
+            ),
+        ),
+    ))
+    capabilities = source.manifests()["capabilities"]
+    capability = capabilities[0]
+    if capability.get("available") is not False:
+        raise SystemExit(1)
+    if capability.get("availability_reason") != expected_reason:
+        raise SystemExit(1)
+    if raw_reason in str(capability):
+        raise SystemExit(1)
 PY
   then
     printf 'ok: runtime failure diagnostics\n'
