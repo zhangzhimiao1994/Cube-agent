@@ -4,6 +4,7 @@ set -Eeuo pipefail
 base_url="${AGENT_HUB_ACCEPTANCE_BASE_URL:-http://127.0.0.1:8000}"
 profile="all"
 stress=0
+read_only=0
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
 iterations="${AGENT_HUB_ACCEPTANCE_ITERATIONS:-10}"
 connect_timeout="${AGENT_HUB_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS:-5}"
@@ -27,6 +28,7 @@ create/read/events lifecycle probe against /api/v1/runs.
 Options:
   --base-url URL                 Base URL to test.
   --profile codex|deepseek|all   Acceptance profile to run.
+  --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
   --stress                       Run bounded HTTP stress checks.
   --concurrency N                Stress workers. Defaults to AGENT_HUB_ACCEPTANCE_CONCURRENCY or 4.
   --iterations N                 Requests per worker. Defaults to AGENT_HUB_ACCEPTANCE_ITERATIONS or 10.
@@ -50,6 +52,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stress)
       stress=1
+      shift
+      ;;
+    --read-only)
+      read_only=1
       shift
       ;;
     --concurrency)
@@ -264,6 +270,15 @@ check_protected_boundary() {
   printf 'fail: %s %s %s expected 401 -> %s\n' "$name" "$method" "$path" "${status:-curl-error}" >&2
   failures=$((failures + 1))
   return 1
+}
+
+check_write_protected_boundary() {
+  local name="$1"
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: %s disabled by read-only mode\n' "$name"
+    return 0
+  fi
+  check_protected_boundary "$@"
 }
 
 check_error_envelope() {
@@ -501,24 +516,34 @@ run_codex_profile() {
   check_protected_boundary "workspace file list requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files" || true
   check_protected_boundary "workspace file download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files/download?path=artifact.txt" || true
   check_protected_boundary "workspace bundle download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/bundle/download" || true
-  check_protected_boundary "run create requires bearer" "/api/v1/runs" "POST" || true
-  check_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST" || true
-  check_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST" || true
-  check_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST" || true
-  check_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST" || true
-  check_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST" || true
+  check_write_protected_boundary "run create requires bearer" "/api/v1/runs" "POST" || true
+  check_write_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST" || true
+  check_write_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST" || true
+  check_write_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST" || true
+  check_write_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST" || true
+  check_write_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST" || true
   check_protected_boundary "auth me requires bearer" "/api/v1/auth/me" || true
   check_protected_boundary "config current requires bearer" "/api/v1/config/current" || true
   check_protected_boundary "config history requires bearer" "/api/v1/config/history" || true
   check_protected_boundary "config version requires bearer" "/api/v1/config/history/1" || true
   check_protected_boundary "config diff requires bearer" "/api/v1/config/diff?from_version=1&to_version=2" || true
-  check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST" || true
-  check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST" || true
+  check_write_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST" || true
+  check_write_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST" || true
   check_protected_boundary "user list requires bearer" "/api/v1/users" || true
-  check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE" || true
+  check_write_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE" || true
   check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
-  check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST" || true
-  check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST" || true
+  check_write_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST" || true
+  check_write_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST" || true
+  check_protected_boundary "admin secret read requires bearer" "/api/v1/admin/secrets/probe" || true
+  check_protected_boundary "admin agents list requires bearer" "/api/v1/admin/agents" || true
+  check_protected_boundary "admin workflows list requires bearer" "/api/v1/admin/workflows" || true
+  check_protected_boundary "admin settings get requires bearer" "/api/v1/admin/settings" || true
+  check_protected_boundary "admin main agent get requires bearer" "/api/v1/admin/main-agent" || true
+  check_protected_boundary "admin runs list requires bearer" "/api/v1/admin/runs" || true
+  check_protected_boundary "admin run detail requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000" || true
+  check_protected_boundary "admin run artifact download requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download" || true
+  check_protected_boundary "admin run debug requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/debug" || true
+  check_protected_boundary "admin skills list requires bearer" "/api/v1/admin/skills" || true
   check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found" || true
   check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed" || true
   check_url "openapi contract" "/openapi.json" || true
@@ -533,25 +558,25 @@ run_deepseek_profile() {
   check_prometheus_metrics || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
-  check_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true
+  check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true
   check_protected_boundary "plugin policy summary requires bearer" "/api/v1/admin/plugins/policy-summary" || true
-  check_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST" || true
+  check_write_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST" || true
   check_protected_boundary "plugin signing key list requires bearer" "/api/v1/admin/plugins/signing-keys" || true
-  check_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST" || true
-  check_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE" || true
-  check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
-  check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
-  check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST" || true
-  check_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST" || true
-  check_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST" || true
-  check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST" || true
-  check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST" || true
-  check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST" || true
-  check_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST" || true
-  check_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE" || true
+  check_write_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST" || true
+  check_write_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE" || true
+  check_write_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST" || true
+  check_write_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST" || true
+  check_write_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST" || true
+  check_write_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST" || true
+  check_write_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST" || true
+  check_write_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST" || true
+  check_write_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST" || true
+  check_write_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST" || true
+  check_write_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST" || true
+  check_write_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE" || true
   check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest" || true
   check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp" || true
-  check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
+  check_write_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST" || true
 }
 
 check_openapi_path() {
@@ -704,6 +729,10 @@ run_lifecycle_profile() {
   local events_path
 
   printf 'profile: authenticated run lifecycle\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: run lifecycle probe is disabled in read-only mode\n'
+    return 0
+  fi
   if [[ -z "$bearer_token" ]]; then
     printf 'skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
     return 0

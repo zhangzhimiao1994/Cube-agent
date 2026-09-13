@@ -70,15 +70,18 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "Usage: scripts/agent-hub harness-acceptance" in command
     assert "--profile codex|deepseek|all" in command
     assert "--stress" in command
+    assert "--read-only" in command
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
     assert "check_health_json" in command
     assert "check_prometheus_metrics" in command
     assert "check_protected_boundary" in command
+    assert "check_write_protected_boundary" in command
     assert "check_error_envelope" in command
     assert "check_openapi_safe_projection" in command
     assert "check_openapi_model_capability_schema" in command
     assert "run_lifecycle_profile" in command
+    assert "skip: run lifecycle probe is disabled in read-only mode" in command
     assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
     assert "for path in /health /health/live /health/ready /metrics /openapi.json /login; do" in command
@@ -208,45 +211,55 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "workspace file download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files/download?path=artifact.txt"' in command
     assert 'check_protected_boundary "workspace bundle download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/bundle/download"' in command
     assert 'check_protected_boundary "model registry requires bearer" "/api/v1/admin/models"' in command
-    assert 'check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
-    assert 'check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
+    assert 'check_write_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
+    assert 'check_write_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
+    assert 'check_protected_boundary "admin secret read requires bearer" "/api/v1/admin/secrets/probe"' in command
+    assert 'check_protected_boundary "admin agents list requires bearer" "/api/v1/admin/agents"' in command
+    assert 'check_protected_boundary "admin workflows list requires bearer" "/api/v1/admin/workflows"' in command
+    assert 'check_protected_boundary "admin settings get requires bearer" "/api/v1/admin/settings"' in command
+    assert 'check_protected_boundary "admin main agent get requires bearer" "/api/v1/admin/main-agent"' in command
+    assert 'check_protected_boundary "admin runs list requires bearer" "/api/v1/admin/runs"' in command
+    assert 'check_protected_boundary "admin run detail requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000"' in command
+    assert 'check_protected_boundary "admin run artifact download requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download"' in command
+    assert 'check_protected_boundary "admin run debug requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/debug"' in command
+    assert 'check_protected_boundary "admin skills list requires bearer" "/api/v1/admin/skills"' in command
     assert 'check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters"' in command
     assert 'check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins"' in command
-    assert 'check_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST"' in command
+    assert 'check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST"' in command
     assert 'check_protected_boundary "plugin policy summary requires bearer" "/api/v1/admin/plugins/policy-summary"' in command
-    assert 'check_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST"' in command
+    assert 'check_write_protected_boundary "plugin policy review requires bearer" "/api/v1/admin/plugins/policy-review" "POST"' in command
     assert 'check_protected_boundary "plugin signing key list requires bearer" "/api/v1/admin/plugins/signing-keys"' in command
-    assert 'check_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST"' in command
-    assert 'check_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE"' in command
-    assert 'check_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
-    assert 'check_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
-    assert 'check_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST"' in command
-    assert 'check_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST"' in command
-    assert 'check_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST"' in command
-    assert 'check_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST"' in command
-    assert 'check_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST"' in command
-    assert 'check_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST"' in command
-    assert 'check_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST"' in command
-    assert 'check_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE"' in command
+    assert 'check_write_protected_boundary "plugin signing key upsert requires bearer" "/api/v1/admin/plugins/signing-keys" "POST"' in command
+    assert 'check_write_protected_boundary "plugin signing key delete requires bearer" "/api/v1/admin/plugins/signing-keys/probe-key" "DELETE"' in command
+    assert 'check_write_protected_boundary "plugin install requires bearer" "/api/v1/admin/plugins/install" "POST"' in command
+    assert 'check_write_protected_boundary "plugin package approval requires bearer" "/api/v1/admin/plugins/probe/package/approve" "POST"' in command
+    assert 'check_write_protected_boundary "plugin package rejection requires bearer" "/api/v1/admin/plugins/probe/package/reject" "POST"' in command
+    assert 'check_write_protected_boundary "plugin lifecycle start requires bearer" "/api/v1/admin/plugins/probe/start" "POST"' in command
+    assert 'check_write_protected_boundary "plugin lifecycle enable requires bearer" "/api/v1/admin/plugins/probe/enable" "POST"' in command
+    assert 'check_write_protected_boundary "plugin lifecycle disable requires bearer" "/api/v1/admin/plugins/probe/disable" "POST"' in command
+    assert 'check_write_protected_boundary "plugin lifecycle stop requires bearer" "/api/v1/admin/plugins/probe/stop" "POST"' in command
+    assert 'check_write_protected_boundary "plugin lifecycle reload requires bearer" "/api/v1/admin/plugins/probe/reload" "POST"' in command
+    assert 'check_write_protected_boundary "plugin uninstall requires bearer" "/api/v1/admin/plugins/probe/uninstall" "POST"' in command
+    assert 'check_write_protected_boundary "plugin delete requires bearer" "/api/v1/admin/plugins/probe" "DELETE"' in command
     assert 'check_protected_boundary "plugin capability manifest requires bearer" "/api/v1/admin/capabilities/manifest"' in command
     assert 'check_protected_boundary "mcp registry requires bearer" "/api/v1/admin/mcp"' in command
-    assert 'check_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command
+    assert 'check_write_protected_boundary "mcp upsert requires bearer" "/api/v1/admin/mcp" "POST"' in command
     assert '-X "$method"' in command
-    assert 'check_protected_boundary "run create requires bearer" "/api/v1/runs" "POST"' in command
-    assert 'check_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST"' in command
-    assert 'check_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST"' in command
-    assert 'check_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST"' in command
-    assert 'check_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST"' in command
-    assert 'check_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST"' in command
+    assert 'check_write_protected_boundary "run create requires bearer" "/api/v1/runs" "POST"' in command
+    assert 'check_write_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST"' in command
+    assert 'check_write_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST"' in command
+    assert 'check_write_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST"' in command
+    assert 'check_write_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST"' in command
+    assert 'check_write_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST"' in command
     assert 'check_protected_boundary "auth me requires bearer" "/api/v1/auth/me"' in command
     assert 'check_protected_boundary "config current requires bearer" "/api/v1/config/current"' in command
     assert 'check_protected_boundary "config history requires bearer" "/api/v1/config/history"' in command
     assert 'check_protected_boundary "config version requires bearer" "/api/v1/config/history/1"' in command
     assert 'check_protected_boundary "config diff requires bearer" "/api/v1/config/diff?from_version=1&to_version=2"' in command
-    assert 'check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST"' in command
-    assert 'check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST"' in command
+    assert 'check_write_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST"' in command
+    assert 'check_write_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST"' in command
     assert 'check_protected_boundary "user list requires bearer" "/api/v1/users"' in command
-    assert 'check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE"' in command
+    assert 'check_write_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 
 
