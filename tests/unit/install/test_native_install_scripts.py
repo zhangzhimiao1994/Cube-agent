@@ -196,6 +196,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"saturation_policy": ("string", None)' in command
     assert '"queue_timeout_seconds": ("integer", 1)' in command
     assert 'fallback.get("anyOf")' in command
+    assert "check_openapi_model_probe_response_schema" in command
+    assert 'schemas.get("ProbeResponse", {})' in command
+    assert '"recommended_concurrency": ("integer", None)' in command
+    assert '"warning": ("string", None)' in command
     assert "check_openapi_capability_manifest_failure_codes_schema" in command
     assert 'schemas.get("CapabilityManifestItemResponse", {})' in command
     assert 'failure_codes.get("maxItems") != 32' in command

@@ -444,6 +444,39 @@ PY
   return 1
 }
 
+check_openapi_model_probe_response_schema() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+schemas = document.get("components", {}).get("schemas", {})
+schema = schemas.get("ProbeResponse", {})
+properties = schema.get("properties", {})
+expected = {
+    "recommended_concurrency": ("integer", None),
+    "warning": ("string", None),
+}
+for name, (expected_type, minimum) in expected.items():
+    prop = properties.get(name)
+    if not isinstance(prop, dict):
+        raise SystemExit(1)
+    if prop.get("type") != expected_type:
+        raise SystemExit(1)
+    if minimum is not None and prop.get("minimum") != minimum:
+        raise SystemExit(1)
+PY
+  then
+    printf 'ok: model probe response schema\n'
+    return 0
+  fi
+  printf 'fail: model probe response schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_capability_manifest_failure_codes_schema() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -879,6 +912,7 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
   check_openapi_model_capability_schema || true
   check_openapi_model_deployment_response_schema || true
+  check_openapi_model_probe_response_schema || true
   check_openapi_capability_manifest_failure_codes_schema || true
   check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post" || true
   check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get" || true
