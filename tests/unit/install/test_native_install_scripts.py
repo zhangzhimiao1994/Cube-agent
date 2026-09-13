@@ -128,6 +128,17 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_ACCEPTANCE_BASE_URL" in command
     assert "AGENT_HUB_ACCEPTANCE_CONCURRENCY" in command
     assert "AGENT_HUB_ACCEPTANCE_ITERATIONS" in command
+    assert "AGENT_HUB_ACCEPTANCE_STRESS_PROFILE" in command
+    assert "--stress-profile smoke|standard|heavy|endurance|custom" in command
+    assert 'stress_profile="${AGENT_HUB_ACCEPTANCE_STRESS_PROFILE:-custom}"' in command
+    assert 'smoke) stress=1; set_stress_defaults 4 5 ;;' in command
+    assert 'standard) stress=1; set_stress_defaults 8 10 ;;' in command
+    assert 'heavy) stress=1; set_stress_defaults 16 20 ;;' in command
+    assert 'endurance) stress=1; set_stress_defaults 32 50 ;;' in command
+    assert 'custom) ;;' in command
+    assert "invalid --stress-profile" in command
+    assert 'concurrency_explicit=1' in command
+    assert 'iterations_explicit=1' in command
     assert "AGENT_HUB_ACCEPTANCE_RETRIES" in command
     assert "AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command

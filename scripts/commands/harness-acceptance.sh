@@ -6,8 +6,17 @@ profile="all"
 stress=0
 strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
 read_only=0
+stress_profile="${AGENT_HUB_ACCEPTANCE_STRESS_PROFILE:-custom}"
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
 iterations="${AGENT_HUB_ACCEPTANCE_ITERATIONS:-10}"
+concurrency_explicit=0
+iterations_explicit=0
+if [[ -n "${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-}" ]]; then
+  concurrency_explicit=1
+fi
+if [[ -n "${AGENT_HUB_ACCEPTANCE_ITERATIONS:-}" ]]; then
+  iterations_explicit=1
+fi
 connect_timeout="${AGENT_HUB_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS:-5}"
 max_time="${AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS:-20}"
 retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
@@ -36,6 +45,10 @@ Options:
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
   --strict-interaction-recovery  Run authenticated, non-mutating interaction recovery probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
   --stress                       Run bounded HTTP stress checks.
+  --stress-profile smoke|standard|heavy|endurance|custom
+                                 Run a named stress scale. Defaults to AGENT_HUB_ACCEPTANCE_STRESS_PROFILE or custom.
+                                 smoke=4x5, standard=8x10, heavy=16x20, endurance=32x50.
+                                 Named profiles enable --stress. Explicit concurrency/iterations override profile defaults.
   --concurrency N                Stress workers. Defaults to AGENT_HUB_ACCEPTANCE_CONCURRENCY or 4.
   --iterations N                 Requests per worker. Defaults to AGENT_HUB_ACCEPTANCE_ITERATIONS or 10.
   --connect-timeout SECONDS      Curl connect timeout. Defaults to 5.
@@ -63,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       stress=1
       shift
       ;;
+    --stress-profile)
+      stress_profile="${2:?missing value for --stress-profile}"
+      shift 2
+      ;;
     --strict-interaction-recovery)
       strict_interaction_recovery=1
       shift
@@ -73,10 +90,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --concurrency)
       concurrency="${2:?missing value for --concurrency}"
+      concurrency_explicit=1
       shift 2
       ;;
     --iterations)
       iterations="${2:?missing value for --iterations}"
+      iterations_explicit=1
       shift 2
       ;;
     --connect-timeout)
@@ -134,6 +153,29 @@ esac
 positive_int() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
+
+set_stress_defaults() {
+  local default_concurrency="$1"
+  local default_iterations="$2"
+  if [[ "$concurrency_explicit" -eq 0 ]]; then
+    concurrency="$default_concurrency"
+  fi
+  if [[ "$iterations_explicit" -eq 0 ]]; then
+    iterations="$default_iterations"
+  fi
+}
+
+case "$stress_profile" in
+  smoke) stress=1; set_stress_defaults 4 5 ;;
+  standard) stress=1; set_stress_defaults 8 10 ;;
+  heavy) stress=1; set_stress_defaults 16 20 ;;
+  endurance) stress=1; set_stress_defaults 32 50 ;;
+  custom) ;;
+  *)
+    printf 'invalid --stress-profile: %s\n' "$stress_profile" >&2
+    exit 2
+    ;;
+esac
 
 if ! positive_int "$concurrency" || ! positive_int "$iterations" || ! positive_int "$retries"; then
   printf 'concurrency, iterations, and retries must be positive integers\n' >&2
@@ -2390,7 +2432,7 @@ run_stress_profile() {
   local pids=()
   local worker
   local failed=0
-  printf 'profile: bounded stress concurrency=%s iterations=%s\n' "$concurrency" "$iterations"
+  printf 'profile: bounded stress scale=%s concurrency=%s iterations=%s\n' "$stress_profile" "$concurrency" "$iterations"
   for ((worker = 1; worker <= concurrency; worker += 1)); do
     stress_worker "$worker" &
     pids+=("$!")
