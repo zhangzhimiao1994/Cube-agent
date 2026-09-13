@@ -226,6 +226,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "PROJECT_ARCHITECTURE_PLAN.md" in command
     assert "architecture-map.html" in command
     assert "约束和技能规则读取" in command
+    assert "approved project preflight context enters direct prompt" in command
+    assert "approved project preflight context enters dispatch plan" in command
+    assert "PROJECT_PREFLIGHT_CONTEXT" in command
+    assert "project_preflight_context_text" in command
     assert "profile: interaction prevention and last-resort recovery" in command
     assert "fail: interaction prevention and recovery" in command
     assert "ok: interaction prevention and recovery" in command

@@ -1155,7 +1155,11 @@ from agent_hub.runs.service import (
     _local_main_agent_auto_mode,
     _main_agent_adjusted_ready_mode,
 )
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
+from agent_hub.runtime.defaults import _dispatch_plan
+from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.project_preflight_context import project_preflight_context_text
+from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
 
 
 def require(value, label):
@@ -1266,6 +1270,77 @@ require(
 require(
     mega_project_requirements.prefers_prefix_cache is True,
     "ultra-large project prefix cache",
+)
+approved_preflight_routing = {
+    "project_preflight_approved": True,
+    "project_preflight_proposal": {
+        "kind": "project_architecture_preflight",
+        "capability": "project.preflight_architecture",
+        "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+        "graph_path": "architecture-map.html",
+        "requires_constraints_and_skills_reading": True,
+    },
+}
+approved_preflight_context = project_preflight_context_text(approved_preflight_routing)
+require(
+    "PROJECT_PREFLIGHT_CONTEXT" in approved_preflight_context,
+    "approved project preflight context formats",
+)
+require(
+    "constraints and skill rules" in approved_preflight_context,
+    "approved project preflight context requires constraints reading",
+)
+direct_preflight_prompt = DirectRuntime(object(), logical_model="main")._build_prompt(
+    TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request=mega_project_message,
+        routing_decision=approved_preflight_routing,
+    )
+)
+require(direct_preflight_prompt.messages is not None, "approved project preflight direct prompt")
+direct_preflight_serialized = "\n".join(
+    str(message.content) for message in direct_preflight_prompt.messages
+)
+require(
+    "PROJECT_PREFLIGHT_CONTEXT" in direct_preflight_serialized,
+    "approved project preflight context enters direct prompt",
+)
+require(
+    "project.preflight_architecture" in direct_preflight_serialized,
+    "approved project preflight direct prompt capability",
+)
+builder_role = RoleAssignment(
+    id="builder",
+    role="Builder",
+    purpose=RolePurpose.EXECUTE,
+    mission="Build the approved ultra-large project.",
+    must_answer=("What was implemented?",),
+    allowed_tools=(),
+    forbidden_actions=("Do not perform dangerous operations.",),
+    skills=(),
+    output_schema={"summary": "string"},
+    model="main",
+)
+dispatch_preflight_plan = _dispatch_plan(
+    (builder_role,),
+    TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISPATCH,
+        request=mega_project_message,
+        routing_decision=approved_preflight_routing,
+    ),
+    max_parallelism=1,
+)
+require(
+    any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in dispatch_preflight_plan.steps),
+    "approved project preflight context enters dispatch plan",
+)
+require(
+    any("staged implementation" in step.task for step in dispatch_preflight_plan.steps),
+    "approved project preflight dispatch plan staged implementation",
 )
 
 for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):
