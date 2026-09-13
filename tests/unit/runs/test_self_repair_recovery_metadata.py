@@ -233,10 +233,15 @@ def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
         routing_decision={"source": "manual"},
         events=(
             RunEvent(
-                kind=EventKind.RUNTIME_FAILED,
+                kind=EventKind.STEP_FAILED,
                 sequence=1,
                 run_id=run_id,
-                reason="model gateway failed: model response text is empty",
+                step_id="final_response",
+                reason="blocked contract chain needs one bounded replay",
+                payload={
+                    "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                    "blocked_contract_ids": ("draft-to-final_response",),
+                },
             ),
         ),
         policy=SelfRepairPolicy(requires_approval=False),
@@ -256,6 +261,7 @@ def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
     routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
     recovery_plan = self_repair_recovery_plan_payload(routing_decision)
     assert recovery_plan is not None
+    assert recovery_plan["replan_scope"] == "blocked_contract_chain"
     assert recovery_plan["automatic_execution"] is True
     audit_payload = _self_repair_execution_payload(
         routing_decision,
