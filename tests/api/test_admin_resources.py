@@ -65,6 +65,7 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.app import _submit_scheduled_task, create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.capabilities.tools.registry import PLUGIN_RUNTIME_FAILURE_CODES
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
@@ -86,6 +87,7 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationResult,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
+from agent_hub.mcp.manifest import MCP_RUNTIME_FAILURE_CODES
 from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_cache_signature_payload_sha256,
     plugin_package_dependency_lock,
@@ -3230,6 +3232,8 @@ def test_routing_details_redacts_sensitive_harness_profile_values() -> None:
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
+PLUGIN_FAILURE_CODES = list(PLUGIN_RUNTIME_FAILURE_CODES)
+MCP_FAILURE_CODES = list(MCP_RUNTIME_FAILURE_CODES)
 ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
 SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -3951,6 +3955,7 @@ def test_capability_manifest_endpoint_includes_saved_mcp_config_tools() -> None:
         "policy_effect": "inherit",
         "available": False,
         "availability_reason": "mcp_server_not_discovered",
+        "failure_codes": MCP_FAILURE_CODES,
         "replay_safe": False,
         "aliases": [],
         "input_schema": None,
@@ -9251,6 +9256,7 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "policy_effect": "require_approval",
         "available": True,
         "availability_reason": None,
+        "failure_codes": PLUGIN_FAILURE_CODES,
         "replay_safe": False,
         "aliases": ["search_web"],
         "input_schema": None,

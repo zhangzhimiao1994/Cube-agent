@@ -1238,13 +1238,16 @@ class CapabilityManifestItemResponse(BaseModel):
     availability_reason: str | None = None
     replay_safe: bool
     aliases: list[str] = Field(default_factory=list, max_length=128)
+    failure_codes: list[str] = Field(default_factory=list, max_length=32)
     input_schema: dict[str, JsonValue] | None = None
     output_schema: dict[str, JsonValue] | None = None
     package_dependency_lock: CapabilityManifestPackageDependencyLockResponse | None = None
 
     @model_serializer(mode="wrap")
-    def serialize_without_empty_dependency_lock(self, handler: Any) -> dict[str, Any]:
+    def serialize_without_empty_optional_fields(self, handler: Any) -> dict[str, Any]:
         data = cast(dict[str, Any], handler(self))
+        if not self.failure_codes:
+            data.pop("failure_codes", None)
         if self.package_dependency_lock is None:
             data.pop("package_dependency_lock", None)
         return data
