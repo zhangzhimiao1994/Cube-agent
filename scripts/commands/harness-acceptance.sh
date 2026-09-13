@@ -1956,6 +1956,151 @@ PY
   return 1
 }
 
+run_project_preflight_approval_guard_profile() {
+  local python_bin
+  local request_body
+  local response
+  local parsed
+  local run_id
+  local decision_token
+  local version
+  local approval_body
+  local approval_response
+  local runs_path="/api/v1/runs"
+
+  printf 'profile: authenticated project preflight approval guard\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: project preflight approval guard is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: project preflight approval guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: project preflight approval guard requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! request_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({
+    "message": "需要构建一个大型项目，从需求拆解、架构设计、分阶段实现到生产结果全部完成",
+    "mode": "auto",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build project preflight run body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: project-preflight-guard-$(date +%s)-$$" \
+    -d "$request_body" \
+    "$base_url$runs_path" 2>/dev/null)"; then
+    printf 'fail: project preflight run create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! parsed="$(ACCEPTANCE_RESPONSE="$response" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+proposal = payload.get("project_preflight_proposal")
+if payload.get("status") != "waiting_approval":
+    raise SystemExit("project preflight run must wait for approval")
+if payload.get("clarification_reason") != "project_preflight_requires_user_approval":
+    raise SystemExit("project preflight run must expose approval reason")
+if payload.get("mode") != "hybrid":
+    raise SystemExit("project preflight run must use hybrid mode")
+if not isinstance(proposal, dict):
+    raise SystemExit("project preflight run must return proposal")
+if proposal.get("kind") != "project_architecture_preflight":
+    raise SystemExit("project preflight proposal kind mismatch")
+if proposal.get("capability") != "project.preflight_architecture":
+    raise SystemExit("project preflight proposal capability mismatch")
+if proposal.get("requires_constraints_and_skills_reading") is not True:
+    raise SystemExit("project preflight proposal must require constraints reading")
+if proposal.get("plan_path") != "PROJECT_ARCHITECTURE_PLAN.md":
+    raise SystemExit("project preflight proposal plan path mismatch")
+if proposal.get("graph_path") != "architecture-map.html":
+    raise SystemExit("project preflight proposal graph path mismatch")
+print("\t".join([payload["id"], payload["decision_token"], str(payload["version"])]))
+PY
+  )"; then
+    printf 'fail: project preflight run must wait for approval\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  IFS=$'\t' read -r run_id decision_token version <<< "$parsed"
+  printf 'ok: project preflight proposal must require constraints reading\n'
+
+  if ! approval_body="$(ACCEPTANCE_DECISION_TOKEN="$decision_token" ACCEPTANCE_VERSION="$version" "$python_bin" - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "decision_token": os.environ["ACCEPTANCE_DECISION_TOKEN"],
+    "version": int(os.environ["ACCEPTANCE_VERSION"]),
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build project preflight approval body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! approval_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -X POST \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$approval_body" \
+    "$base_url/api/v1/runs/$run_id/approve-project-preflight" 2>/dev/null)"; then
+    printf 'fail: project preflight approval /api/v1/runs/%s/approve-project-preflight\n' "$run_id" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$approval_response" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+if payload.get("status") != "queued":
+    raise SystemExit("project preflight approval enqueues planned run")
+if payload.get("mode") != "hybrid":
+    raise SystemExit("project preflight approval must preserve hybrid mode")
+PY
+  then
+    printf 'ok: project preflight approval enqueues planned run\n'
+  else
+    printf 'fail: project preflight approval enqueues planned run\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  post_run_control_expect_status \
+    "$python_bin" \
+    "$run_id" \
+    "cancel" \
+    "cancelled" \
+    "project preflight guard cleanup cancel reaches cancelled" || return 1
+}
+
 run_strict_interaction_recovery_profile() {
   local python_bin
   local request_body
@@ -2089,6 +2234,7 @@ case "$profile" in
     run_create_idempotency_replay_guard_profile || true
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
+    run_project_preflight_approval_guard_profile || true
     ;;
   deepseek)
     run_deepseek_profile
@@ -2102,6 +2248,7 @@ case "$profile" in
     run_create_idempotency_replay_guard_profile || true
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
+    run_project_preflight_approval_guard_profile || true
     ;;
 esac
 

@@ -162,6 +162,16 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ordinary reminder must not return schedule proposal" in command
     assert "explicit schedule task must return schedule proposal" in command
     assert "schedule interaction guard is disabled in read-only mode" in command
+    assert "profile: authenticated project preflight approval guard" in command
+    assert "project preflight approval guard is disabled in read-only mode" in command
+    assert (
+        "project preflight approval guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN"
+        in command
+    )
+    assert "project preflight run must wait for approval" in command
+    assert "project preflight proposal must require constraints reading" in command
+    assert "project preflight approval enqueues planned run" in command
+    assert '"$base_url/api/v1/runs/$run_id/approve-project-preflight"' in command
     assert "profile: authenticated run control idempotency guard" in command
     assert "run control idempotency guard is disabled in read-only mode" in command
     assert "run control idempotency guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
