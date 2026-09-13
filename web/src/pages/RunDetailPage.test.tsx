@@ -705,6 +705,13 @@ describe("RunDetailPage", () => {
         role_count: 2,
         capability_count: 3,
         inventory_count: 4,
+        failure_code_count: 3,
+        failure_code_counts: {
+          "mcp.server_failed": 1,
+          "plugin.invalid_arguments": 1,
+          "plugin.timeout": 2,
+          "plugin.secret_token": 1,
+        },
         truncated: true,
       },
       events: [
@@ -769,9 +776,14 @@ describe("RunDetailPage", () => {
     expect(within(summary).getByText("能力协商")).not.toBeNull();
     expect(within(summary).getByText("3 个角色，满足 1，缺口 1，缺 tool_calling 1，未知 1，已截断")).not.toBeNull();
     expect(within(summary).getByText("能力执行边界")).not.toBeNull();
-    expect(within(summary).getByText("2 个角色，3 项能力，库存 4，已截断")).not.toBeNull();
+    expect(
+      within(summary).getByText(
+        "2 个角色，3 项能力，库存 4，失败码 3，mcp.server_failed 1，plugin.invalid_arguments 1，plugin.timeout 2，已截断",
+      ),
+    ).not.toBeNull();
     expect(within(summary).getByText("已记录能力协商")).not.toBeNull();
     expect(screen.queryByText("sk_secret")).toBeNull();
+    expect(screen.queryByText("plugin.secret_token")).toBeNull();
     expect(screen.queryByText("token_leak")).toBeNull();
     expect(screen.queryByText("model-internal.example.invalid")).toBeNull();
     expect(screen.queryByText("tenant-private-quota")).toBeNull();

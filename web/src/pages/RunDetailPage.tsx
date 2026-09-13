@@ -79,6 +79,9 @@ type CapabilityExecutionSummary = {
   roleCount: number;
   capabilityCount: number;
   inventoryCount: number;
+  failureCodeCount: number;
+  failureCodeCounts: Record<string, number>;
+  failureCodeLabel: string;
   truncated: boolean;
 };
 
@@ -1117,10 +1120,14 @@ function capabilityExecutionSummaryFromApi(
   if (summary.role_count === 0 && summary.capability_count === 0 && summary.inventory_count === 0) {
     return null;
   }
+  const failureCodeCounts = safeFailureCodeCounts(summary.failure_code_counts);
   return {
     roleCount: summary.role_count,
     capabilityCount: summary.capability_count,
     inventoryCount: summary.inventory_count,
+    failureCodeCount: summary.failure_code_count,
+    failureCodeCounts,
+    failureCodeLabel: failureCodeCountsLabel(failureCodeCounts),
     truncated: summary.truncated,
   };
 }
@@ -1276,6 +1283,26 @@ function modelCapabilityCountsLabel(counts: Record<string, number>) {
   return parts.join("，");
 }
 
+function safeFailureCodeCounts(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const counts: Record<string, number> = {};
+  Object.entries(value as Record<string, unknown>).forEach(([code, count]) => {
+    if (!/^[a-z0-9][a-z0-9_.-]{0,127}$/.test(code)) return;
+    if (code.includes("token") || code.includes("secret")) return;
+    if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) return;
+    if (!counts[code] && Object.keys(counts).length >= 16) return;
+    counts[code] = count;
+  });
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function failureCodeCountsLabel(counts: Record<string, number>) {
+  return Object.entries(counts)
+    .filter(([, count]) => count > 0)
+    .map(([code, count]) => `${code} ${count}`)
+    .join("，");
+}
+
 function modelCapabilityNegotiationLabel(summary: ModelCapabilityNegotiationSummary) {
   const parts = [
     `${summary.roleCount} 个角色`,
@@ -1294,6 +1321,8 @@ function capabilityExecutionLabel(summary: CapabilityExecutionSummary) {
     `${summary.capabilityCount} 项能力`,
     `库存 ${summary.inventoryCount}`,
   ];
+  if (summary.failureCodeCount > 0) parts.push(`失败码 ${summary.failureCodeCount}`);
+  if (summary.failureCodeLabel) parts.push(summary.failureCodeLabel);
   if (summary.truncated) parts.push("已截断");
   return parts.join("，");
 }

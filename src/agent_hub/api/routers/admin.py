@@ -435,6 +435,8 @@ class CapabilityExecutionSummaryResponse(BaseModel):
     role_count: int = Field(default=0, ge=0)
     capability_count: int = Field(default=0, ge=0)
     inventory_count: int = Field(default=0, ge=0)
+    failure_code_count: int = Field(default=0, ge=0)
+    failure_code_counts: dict[str, int] = Field(default_factory=dict, max_length=16)
     truncated: bool = False
 
 
@@ -9530,21 +9532,41 @@ def _capability_execution_summary_from_run_events(
 
     inventory_count = 0
     inventory_truncated = False
+    failure_code_counts: dict[str, int] = {}
+    failure_code_truncated = False
     inventory = latest.get("capability_inventory")
     if isinstance(inventory, Mapping):
         inventory_items = inventory.get("items")
         if isinstance(inventory_items, list | tuple):
             inventory_count = len(inventory_items)
+            for item in inventory_items:
+                if not isinstance(item, Mapping):
+                    continue
+                for failure_code in _model_outcome_string_list(item.get("failure_codes")):
+                    if (
+                        failure_code not in failure_code_counts
+                        and len(failure_code_counts) >= 16
+                    ):
+                        failure_code_truncated = True
+                        continue
+                    failure_code_counts[failure_code] = (
+                        failure_code_counts.get(failure_code, 0) + 1
+                    )
         inventory_truncated = inventory.get("truncated") is True
 
     if role_count == 0 and capability_count == 0 and inventory_count == 0:
         return None
+    sorted_failure_code_counts = dict(sorted(failure_code_counts.items()))
     return CapabilityExecutionSummaryResponse(
         permission_boundary="runtime_capability_gateway",
         role_count=role_count,
         capability_count=capability_count,
         inventory_count=inventory_count,
-        truncated=latest.get("truncated") is True or inventory_truncated,
+        failure_code_count=len(sorted_failure_code_counts),
+        failure_code_counts=sorted_failure_code_counts,
+        truncated=latest.get("truncated") is True
+        or inventory_truncated
+        or failure_code_truncated,
     )
 
 
@@ -10836,6 +10858,9 @@ def _event_payload(value: object) -> dict[str, JsonValue]:
         if key_text == "model_execution_plan":
             payload[key_text] = _model_execution_plan_event_payload(item)
             continue
+        if key_text == "capability_execution_plan":
+            payload[key_text] = _capability_execution_plan_event_payload(item)
+            continue
         payload[key_text] = _safe_event_detail(item, key=key_text)
     return payload
 
@@ -10855,8 +10880,75 @@ def _model_execution_plan_event_payload(value: object) -> JsonValue:
             if summary is not None:
                 payload[key_text] = cast(JsonValue, summary.model_dump(mode="json"))
             continue
+        if key_text == "capability_execution_plan":
+            payload[key_text] = _capability_execution_plan_event_payload(item)
+            continue
         payload[key_text] = _safe_event_detail(item, key=key_text, depth=1)
     return payload
+
+
+def _capability_execution_plan_event_payload(value: object) -> JsonValue:
+    if not isinstance(value, Mapping):
+        return _safe_event_detail(value, key="capability_execution_plan")
+    payload: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text == "capability_inventory":
+            payload[key_text] = _capability_inventory_event_payload(item)
+            continue
+        payload[key_text] = _safe_event_detail(item, key=key_text, depth=1)
+    return payload
+
+
+def _capability_inventory_event_payload(value: object) -> JsonValue:
+    if not isinstance(value, Mapping):
+        return _safe_event_detail(value, key="capability_inventory")
+    payload: dict[str, JsonValue] = {}
+    schema_version = value.get("schema_version")
+    if type(schema_version) is int:
+        payload["schema_version"] = schema_version
+    items = value.get("items")
+    if isinstance(items, list | tuple):
+        payload["items"] = tuple(
+            item
+            for raw_item in items[:96]
+            if (item := _capability_inventory_item_event_payload(raw_item)) is not None
+        )
+    payload["truncated"] = value.get("truncated") is True
+    return payload
+
+
+def _capability_inventory_item_event_payload(value: object) -> Mapping[str, JsonValue] | None:
+    if not isinstance(value, Mapping):
+        return None
+    item_id = _model_outcome_string(value.get("id"))
+    if item_id is None:
+        return None
+    item: dict[str, JsonValue] = {"id": item_id}
+    for key in (
+        "kind",
+        "adapter",
+        "permission_class",
+        "sandbox_profile",
+        "policy_effect",
+        "availability_reason",
+    ):
+        text = _model_outcome_string(value.get(key))
+        if text is not None:
+            item[key] = text
+    available = value.get("available")
+    if type(available) is bool:
+        item["available"] = available
+    replay_safe = value.get("replay_safe")
+    if type(replay_safe) is bool:
+        item["replay_safe"] = replay_safe
+    aliases = _model_outcome_string_list(value.get("aliases"))
+    if aliases:
+        item["aliases"] = aliases[:16]
+    failure_codes = _model_outcome_string_list(value.get("failure_codes"))
+    if failure_codes:
+        item["failure_codes"] = failure_codes[:32]
+    return item
 
 
 _SAFE_RUNTIME_RECOVERED_PAYLOAD_KEYS = frozenset(

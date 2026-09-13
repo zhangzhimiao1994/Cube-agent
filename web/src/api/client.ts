@@ -762,6 +762,8 @@ const CapabilityExecutionSummarySchema = z.object({
   role_count: z.number().int().nonnegative().default(0),
   capability_count: z.number().int().nonnegative().default(0),
   inventory_count: z.number().int().nonnegative().default(0),
+  failure_code_count: z.number().int().nonnegative().default(0),
+  failure_code_counts: z.record(z.string(), z.number().int().nonnegative()).default({}),
   truncated: z.boolean().default(false),
 });
 

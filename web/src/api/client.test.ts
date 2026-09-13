@@ -415,6 +415,12 @@ describe("api client transport", () => {
             role_count: 2,
             capability_count: 3,
             inventory_count: 4,
+            failure_code_count: 3,
+            failure_code_counts: {
+              "mcp.server_failed": 1,
+              "plugin.invalid_arguments": 1,
+              "plugin.timeout": 2,
+            },
             truncated: true,
           },
         }),
@@ -482,6 +488,12 @@ describe("api client transport", () => {
       role_count: 2,
       capability_count: 3,
       inventory_count: 4,
+      failure_code_count: 3,
+      failure_code_counts: {
+        "mcp.server_failed": 1,
+        "plugin.invalid_arguments": 1,
+        "plugin.timeout": 2,
+      },
       truncated: true,
     });
   });

@@ -781,8 +781,20 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                 "capability_inventory": {
                                     "schema_version": 1,
                                     "items": (
-                                        {"id": "docx-private"},
-                                        {"id": "filesystem.read_file"},
+                                        {
+                                            "id": "docx-private",
+                                            "failure_codes": (
+                                                "plugin.timeout",
+                                                "plugin.invalid_arguments",
+                                            ),
+                                        },
+                                        {
+                                            "id": "filesystem.read_file",
+                                            "failure_codes": (
+                                                "plugin.timeout",
+                                                "mcp.server_failed",
+                                            ),
+                                        },
                                     ),
                                     "truncated": True,
                                 },
@@ -817,6 +829,15 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert response.status_code == 200
     body = response.json()
     model_execution_plan = body["events"][0]["payload"]["model_execution_plan"]
+    capability_inventory = model_execution_plan["capability_execution_plan"]["capability_inventory"]
+    assert capability_inventory["items"][0]["failure_codes"] == [
+        "plugin.timeout",
+        "plugin.invalid_arguments",
+    ]
+    assert capability_inventory["items"][1]["failure_codes"] == [
+        "plugin.timeout",
+        "mcp.server_failed",
+    ]
     assert model_execution_plan["orchestration_handoffs"] == {
         "schema_version": 1,
         "items": [
@@ -885,6 +906,12 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         "role_count": 2,
         "capability_count": 2,
         "inventory_count": 2,
+        "failure_code_count": 3,
+        "failure_code_counts": {
+            "mcp.server_failed": 1,
+            "plugin.invalid_arguments": 1,
+            "plugin.timeout": 2,
+        },
         "truncated": True,
     }
     assert body["self_repair_recovery_summary"] == {
