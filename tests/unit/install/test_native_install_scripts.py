@@ -37,10 +37,10 @@ def test_release_packager_includes_built_web_dist() -> None:
     assert "package-release" in launcher
     assert "npm --prefix \"$SOURCE_DIR/web\" run build" in command
     assert '[[ -f "$SOURCE_DIR/web/dist/index.html" ]]' in command
-    assert "--exclude='./web/node_modules'" in command
-    assert "--exclude='./.tmp'" in command
-    assert "--exclude='./web/dist'" not in command
-    assert 'tar -cf "$output"' in command
+    assert 'git -C "$SOURCE_DIR" archive --format=tar HEAD' in command
+    assert 'tar -xf - -C "$staging_dir"' in command
+    assert 'cp -a "$SOURCE_DIR/web/dist/." "$staging_dir/web/dist/"' in command
+    assert 'tar -cf "$output" -C "$staging_dir" .' in command
 
 
 def test_release_pruner_is_registered_and_protects_current_release() -> None:

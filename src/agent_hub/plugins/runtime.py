@@ -647,6 +647,9 @@ class RuntimePluginService:
         await self.ensure_tenant_loaded(tenant_id)
         target = self._available_plugin_capability(tenant_id, name)
         if target is None:
+            reason = self._unavailable_plugin_capability_reason(tenant_id, name)
+            if reason is not None:
+                raise RuntimeCapabilityError(f"Plugin tool unavailable: {reason}")
             raise RuntimeCapabilityError("Plugin tool unavailable")
         plugin, capability = target
         context = PluginInvocationContext(
@@ -738,6 +741,41 @@ class RuntimePluginService:
             for capability in plugin.capabilities:
                 if capability.id == name or name in capability.aliases:
                     return plugin, capability
+        return None
+
+    def _unavailable_plugin_capability_reason(
+        self,
+        tenant_id: UUID,
+        name: str,
+    ) -> str | None:
+        plugins = self._plugins_for_tenant(tenant_id)
+        if plugins is None:
+            return None
+        manifest = PluginConfigCapabilityManifestSource(
+            cast(
+                Any,
+                _plugins_with_runtime_activation(
+                    plugins,
+                    self._adapters,
+                    dependency_policy=self._dependency_policy,
+                ),
+            ),
+            dependency_policy=self._dependency_policy,
+        ).manifests()
+        capabilities = manifest.get("capabilities")
+        if not isinstance(capabilities, tuple | list):
+            return None
+        for item in capabilities:
+            if not isinstance(item, Mapping):
+                continue
+            aliases = item.get("aliases")
+            matches_alias = isinstance(aliases, tuple | list) and name in aliases
+            if item.get("id") != name and not matches_alias:
+                continue
+            reason = item.get("availability_reason")
+            if type(reason) is str and reason.strip():
+                return reason
+            return None
         return None
 
     async def _record_invocation_audit(

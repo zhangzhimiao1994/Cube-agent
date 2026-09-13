@@ -2767,7 +2767,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_without_
     assert capabilities["calendar.create_event"]["availability_reason"] == (
         "plugin_package_adapter_unavailable"
     )
-    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable") as error:
         await service.invoke(
             tenant_id=TENANT_ID,
             user_id=TENANT_ID,
@@ -2777,6 +2777,7 @@ async def test_runtime_plugin_service_blocks_runtime_registered_package_without_
             arguments={"title": "review"},
             idempotency_key="invoke-1",
         )
+    assert "plugin_package_adapter_unavailable" in str(error.value)
 
 
 async def test_runtime_plugin_service_refreshes_stale_runtime_registered_trust() -> None:

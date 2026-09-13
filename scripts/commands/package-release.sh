@@ -44,17 +44,15 @@ if ! [[ -f "$SOURCE_DIR/web/dist/index.html" ]]; then
 fi
 
 mkdir -p "$(dirname -- "$output")"
-tar -cf "$output" \
-  --exclude='./.git' \
-  --exclude='./.venv' \
-  --exclude='./.litellm-venv' \
-  --exclude='./.worktrees' \
-  --exclude='./.tmp' \
-  --exclude='./.pytest_cache' \
-  --exclude='./.mypy_cache' \
-  --exclude='./.ruff_cache' \
-  --exclude='./.uv-cache' \
-  --exclude='./node_modules' \
-  --exclude='./web/node_modules' \
-  --exclude='./web/test-results' \
-  -C "$SOURCE_DIR" .
+tmp_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$tmp_dir"
+}
+trap cleanup EXIT
+
+staging_dir="$tmp_dir/source"
+mkdir -p "$staging_dir/web/dist"
+git -C "$SOURCE_DIR" archive --format=tar HEAD | tar -xf - -C "$staging_dir"
+cp -a "$SOURCE_DIR/web/dist/." "$staging_dir/web/dist/"
+
+tar -cf "$output" -C "$staging_dir" .
