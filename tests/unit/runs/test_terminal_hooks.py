@@ -1731,6 +1731,34 @@ def test_self_repair_policy_has_no_automatic_execution_knob_in_foundation_slice(
 
 
 @pytest.mark.asyncio
+async def test_execute_auto_accepts_self_repair_when_policy_does_not_require_approval() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        self_repair_policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.decision_token is None
+    assert submitted.repair_proposal is not None
+    repair = next(event for event in repository.event_log if event.kind == "repair.classified")
+    assert repair.payload["requires_approval"] is False
+    assert repair.payload["automatic_execution"] is True
+    assert repository.row.routing_decision is not None
+    assert repository.row.routing_decision["source"] == "self_repair"
+    assert repository.row.routing_decision["self_repair_accepted"] is True
+    repair_context = repository.row.routing_decision["self_repair_context"]
+    assert isinstance(repair_context, dict)
+    assert repair_context["requires_approval"] is False
+    assert repair_context["automatic_execution"] is True
+
+
+@pytest.mark.asyncio
 async def test_execute_skips_any_uncertain_failure_without_auto_repair() -> None:
     repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
     service = RunService(

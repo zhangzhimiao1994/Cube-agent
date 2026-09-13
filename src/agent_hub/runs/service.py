@@ -1529,6 +1529,13 @@ class RunService:
                 events=(*observed_events, failure_event),
                 repair_decision=repair_decision,
             )
+            auto_repair = await self._safe_auto_accept_self_repair_if_allowed(
+                tenant_id=failed.tenant_id,
+                run_id=run_id,
+                decision=repair_decision,
+            )
+            if auto_repair is not None:
+                return auto_repair
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
@@ -1594,6 +1601,13 @@ class RunService:
                 events=tuple(observed_events),
                 repair_decision=repair_decision,
             )
+            auto_repair = await self._safe_auto_accept_self_repair_if_allowed(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                decision=repair_decision,
+            )
+            if auto_repair is not None:
+                return auto_repair
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
                 tenant_id=tenant_id,
@@ -1757,6 +1771,41 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
+
+    async def _safe_auto_accept_self_repair_if_allowed(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision: SelfRepairDecision | None,
+    ) -> SubmittedRun | None:
+        if (
+            decision is None
+            or decision.kind != "repair.classified"
+            or decision.requires_approval
+            or not decision.automatic_execution
+        ):
+            return None
+        try:
+            submitted = await self._submitted_by_run_id(tenant_id, run_id)
+            if submitted.decision_token is None or not _repair_proposal_is_auto_executable(
+                submitted.repair_proposal
+            ):
+                return None
+            record = await self._repository.accept_self_repair_and_enqueue(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                decision_token=submitted.decision_token,
+                version=submitted.version,
+            )
+            return _submitted(record)
+        except Exception as error:
+            _LOGGER.exception(
+                "run_self_repair_auto_accept_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
+            return None
 
     async def _safe_record_empty_response_closure_artifact(
         self,
@@ -2726,6 +2775,15 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         repair_proposal=cast(dict[str, object], repair_proposal)
         if isinstance(repair_proposal, dict) and repair_proposal_is_actionable
         else None,
+    )
+
+
+def _repair_proposal_is_auto_executable(proposal: Mapping[str, object] | None) -> bool:
+    return (
+        isinstance(proposal, Mapping)
+        and proposal.get("kind") == "self_repair"
+        and proposal.get("requires_approval") is False
+        and proposal.get("automatic_execution") is True
     )
 
 
