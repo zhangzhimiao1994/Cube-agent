@@ -27,6 +27,16 @@ const workspaceBundleDownloadable = {
   ...downloadable,
   download_url: "/api/v1/workspaces/projects/project/sessions/session/bundle/download",
 };
+const architectureMapDownloadable = {
+  ...downloadable,
+  id: "artifact-map",
+  kind: "project_architecture_graph",
+  title: "架构图谱",
+  filename: "architecture-map.html",
+  mime_type: "text/html",
+  size_bytes: 4096,
+  download_url: "/api/v1/runs/run-1/artifacts/artifact-map/download",
+};
 
 describe("ArtifactFileCard", () => {
   beforeEach(() => {
@@ -131,6 +141,40 @@ describe("ArtifactFileCard", () => {
         }),
       );
       expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("opens architecture graph HTML artifacts in a browser tab", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["<html>graph</html>"], { type: "text/html" }), {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    const objectUrl = "blob:architecture-map";
+    const openMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("open", openMock);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => objectUrl),
+      revokeObjectURL: vi.fn(),
+    });
+
+    render(<ArtifactFileCard artifact={architectureMapDownloadable} />);
+    expect(screen.getByText("架构图谱")).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "打开 architecture-map.html" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/api\/v1\/runs\/run-1\/artifacts\/artifact-map\/download\?_=/),
+        expect.objectContaining({
+          cache: "no-store",
+          credentials: "include",
+          headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
+        }),
+      );
+      expect(openMock).toHaveBeenCalledWith(objectUrl, "_blank", "noopener,noreferrer");
     });
   });
 

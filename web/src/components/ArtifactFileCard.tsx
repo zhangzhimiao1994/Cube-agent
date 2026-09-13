@@ -33,6 +33,19 @@ export function artifactFileName(artifact: FileLike) {
   return artifact.filename?.trim() || artifact.title || artifact.path || artifact.id || "download";
 }
 
+function isArchitectureGraphArtifact(artifact: FileLike) {
+  const filename = artifactFileName(artifact).toLowerCase();
+  const title = artifact.title?.toLowerCase() ?? "";
+  const kind = artifact.kind?.toLowerCase() ?? "";
+  const mimeType = artifact.mime_type?.toLowerCase() ?? "";
+  return (
+    filename === "architecture-map.html" ||
+    kind === "project_architecture_graph" ||
+    title.includes("架构图谱") ||
+    (mimeType === "text/html" && filename.includes("architecture"))
+  );
+}
+
 export function formatFileSize(sizeBytes: number | null | undefined) {
   if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes < 0) return "";
   if (sizeBytes < 1024) return `${sizeBytes} B`;
@@ -54,18 +67,25 @@ export function ArtifactFileCard({
   compact?: boolean;
 }) {
   const [downloading, setDownloading] = useState(false);
+  const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const filename = artifactFileName(artifact);
   const size = formatFileSize(artifact.size_bytes);
   const mimeType = artifact.mime_type?.trim();
   const checksum = artifact.sha256?.trim();
-  const meta = [artifact.kind, size, mimeType].filter(Boolean);
+  const architectureGraph = isArchitectureGraphArtifact(artifact);
+  const kindLabel = architectureGraph ? "架构图谱" : artifact.kind;
+  const meta = [kindLabel, size, mimeType].filter(Boolean);
+
+  async function fetchArtifactBlob() {
+    return api.downloadGeneratedArtifact(artifact.download_url);
+  }
 
   async function handleDownload() {
     setDownloading(true);
     setError(null);
     try {
-      const blob = await api.downloadGeneratedArtifact(artifact.download_url);
+      const blob = await fetchArtifactBlob();
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
@@ -82,10 +102,25 @@ export function ArtifactFileCard({
     }
   }
 
+  async function handleOpen() {
+    setOpening(true);
+    setError(null);
+    try {
+      const blob = await fetchArtifactBlob();
+      const objectUrl = URL.createObjectURL(blob);
+      window.open(objectUrl, "_blank", "noopener,noreferrer");
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    } catch (caught) {
+      setError(formatApiError(caught, "图谱打开失败"));
+    } finally {
+      setOpening(false);
+    }
+  }
+
   return (
     <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}`}>
       <span className="artifact-file-icon" aria-hidden="true">
-        FILE
+        {architectureGraph ? "MAP" : "FILE"}
       </span>
       <div className="artifact-file-main">
         <strong>{filename}</strong>
@@ -106,6 +141,16 @@ export function ArtifactFileCard({
       >
         {downloading ? "下载中" : "下载"}
       </button>
+      {architectureGraph ? (
+        <button
+          type="button"
+          disabled={opening}
+          onClick={() => void handleOpen()}
+          aria-label={`打开 ${filename}`}
+        >
+          {opening ? "打开中" : "打开"}
+        </button>
+      ) : null}
       {error ? <small role="alert">{error}</small> : null}
     </div>
   );
