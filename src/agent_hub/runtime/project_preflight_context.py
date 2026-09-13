@@ -41,12 +41,12 @@ def project_preflight_context_text(
         "requires_constraints_and_skills_reading": (
             proposal.get("requires_constraints_and_skills_reading") is True
         ),
-        "implementation_stage_output_fields": [
+        "implementation_stage_output_fields": (
             "stage_status",
             "verification_evidence",
             "remaining_risks",
-        ],
-        "review_stage_output_fields": ["acceptance_review"],
+        ),
+        "review_stage_output_fields": ("acceptance_review",),
     }
     summary = _safe_text(proposal.get("summary"), _MAX_SUMMARY_CHARS)
     if summary:
