@@ -63,6 +63,7 @@ from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.project_preflight_context import project_preflight_context_text
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
@@ -1126,6 +1127,12 @@ def _dispatch_plan(
         if hermes_context
         else ""
     )
+    preflight_context = project_preflight_context_text(context.routing_decision)
+    preflight_guidance = (
+        f"\nProject preflight guidance:\n{preflight_context}\n"
+        if preflight_context
+        else ""
+    )
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
@@ -1147,6 +1154,7 @@ def _dispatch_plan(
                 f"Role mission: {role.mission}\n"
                 f"User task: {request_text}\n"
                 f"{memory_guidance}"
+                f"{preflight_guidance}"
                 f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
@@ -1167,6 +1175,7 @@ def _dispatch_plan(
         task=(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
+            f"{preflight_guidance}"
             f"{_software_final_guidance(context)}"
             "Resolve conflicts explicitly and state any user decision required."
         ),

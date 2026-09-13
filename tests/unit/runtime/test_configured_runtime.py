@@ -4530,6 +4530,47 @@ def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
     assert any("reviewer 超时时先压缩上下文再分块审查" in step.task for step in plan.steps)
 
 
+def test_dispatch_plan_includes_approved_project_preflight_context_in_steps() -> None:
+    role = RoleAssignment(
+        id="builder",
+        role="Builder",
+        purpose=RolePurpose.EXECUTE,
+        mission="Build the approved large project.",
+        must_answer=("What was implemented?",),
+        allowed_tools=(),
+        forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="main",
+    )
+    routing_decision: dict[str, JsonValue] = {
+        "project_preflight_approved": True,
+        "project_preflight_proposal": {
+            "kind": "project_architecture_preflight",
+            "capability": "project.preflight_architecture",
+            "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+            "graph_path": "architecture-map.html",
+            "requires_constraints_and_skills_reading": True,
+        },
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="构建一个超大型项目。",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision=routing_decision,
+    )
+
+    plan = _dispatch_plan((role,), context, max_parallelism=1)
+
+    assert any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in plan.steps)
+    assert any("project.preflight_architecture" in step.task for step in plan.steps)
+    assert any("staged implementation" in step.task for step in plan.steps)
+
+
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
     roles = (
         RoleAssignment(

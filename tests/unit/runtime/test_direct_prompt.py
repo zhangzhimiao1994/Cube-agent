@@ -109,3 +109,35 @@ def test_direct_prompt_includes_bounded_self_repair_context() -> None:
     assert "SELF_REPAIR_CONTEXT" in serialized
     assert "只执行一次受控修复" in serialized
     assert "do not bypass approvals" in serialized
+
+
+def test_direct_prompt_includes_approved_project_preflight_context() -> None:
+    routing_decision: dict[str, JsonValue] = {
+        "project_preflight_approved": True,
+        "project_preflight_proposal": {
+            "kind": "project_architecture_preflight",
+            "capability": "project.preflight_architecture",
+            "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+            "graph_path": "architecture-map.html",
+            "requires_constraints_and_skills_reading": True,
+        },
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="构建大型项目",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision=routing_decision,
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    prompt = runtime._build_prompt(context)
+
+    assert prompt.messages is not None
+    serialized = "\n".join(cast(str, message.content) for message in prompt.messages)
+    assert "PROJECT_PREFLIGHT_CONTEXT" in serialized
+    assert "project.preflight_architecture" in serialized
+    assert "staged implementation" in serialized
