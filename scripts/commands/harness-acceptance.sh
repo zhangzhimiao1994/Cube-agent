@@ -1298,6 +1298,16 @@ require(
     "constraints and skill rules" in approved_preflight_context,
     "approved project preflight context requires constraints reading",
 )
+require(
+    "stage_status" in approved_preflight_context
+    and "verification_evidence" in approved_preflight_context
+    and "remaining_risks" in approved_preflight_context,
+    "approved project preflight context exposes implementation stage fields",
+)
+require(
+    "acceptance_review" in approved_preflight_context,
+    "approved project preflight context exposes review stage fields",
+)
 direct_preflight_prompt = DirectRuntime(object(), logical_model="main")._build_prompt(
     TaskContext(
         run_id=uuid4(),

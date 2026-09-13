@@ -41,6 +41,12 @@ def project_preflight_context_text(
         "requires_constraints_and_skills_reading": (
             proposal.get("requires_constraints_and_skills_reading") is True
         ),
+        "implementation_stage_output_fields": [
+            "stage_status",
+            "verification_evidence",
+            "remaining_risks",
+        ],
+        "review_stage_output_fields": ["acceptance_review"],
     }
     summary = _safe_text(proposal.get("summary"), _MAX_SUMMARY_CHARS)
     if summary:
@@ -59,7 +65,8 @@ def project_preflight_context_text(
         "First read applicable constraints and skill rules, then use "
         "project.preflight_architecture when available to create or update "
         "PROJECT_ARCHITECTURE_PLAN.md and architecture-map.html before staged implementation. "
-        "Keep implementation staged, verified, and within existing approval boundaries. "
+        "Keep implementation staged, verified, structured with stage evidence fields, "
+        "and within existing approval boundaries. "
         f"{encoded}"
         "</PROJECT_PREFLIGHT_CONTEXT>"
     )

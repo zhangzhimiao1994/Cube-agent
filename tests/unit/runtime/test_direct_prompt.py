@@ -141,3 +141,6 @@ def test_direct_prompt_includes_approved_project_preflight_context() -> None:
     assert "PROJECT_PREFLIGHT_CONTEXT" in serialized
     assert "project.preflight_architecture" in serialized
     assert "staged implementation" in serialized
+    assert "stage_status" in serialized
+    assert "verification_evidence" in serialized
+    assert "acceptance_review" in serialized

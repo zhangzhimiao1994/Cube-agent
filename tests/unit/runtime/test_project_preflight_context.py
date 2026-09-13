@@ -23,6 +23,10 @@ def test_project_preflight_context_formats_approved_guidance() -> None:
     assert "architecture-map.html" in text
     assert "constraints and skill rules" in text
     assert "staged implementation" in text
+    assert "stage_status" in text
+    assert "verification_evidence" in text
+    assert "remaining_risks" in text
+    assert "acceptance_review" in text
 
 
 def test_project_preflight_context_ignores_unapproved_payloads() -> None:
