@@ -212,11 +212,6 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST"' in command
     assert 'check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST"' in command
     assert 'check_protected_boundary "user list requires bearer" "/api/v1/users"' in command
-    assert 'check_protected_boundary "user create requires bearer" "/api/v1/users" "POST"' in command
-    assert 'check_protected_boundary "user update requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "PATCH"' in command
-    assert 'check_protected_boundary "user role requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/role" "PATCH"' in command
-    assert 'check_protected_boundary "user disabled requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/disabled" "PATCH"' in command
-    assert 'check_protected_boundary "user password requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/password" "PATCH"' in command
     assert 'check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
 

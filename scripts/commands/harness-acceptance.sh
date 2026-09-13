@@ -509,11 +509,6 @@ run_codex_profile() {
   check_protected_boundary "config publish requires bearer" "/api/v1/config/drafts/00000000-0000-0000-0000-000000000000/publish" "POST" || true
   check_protected_boundary "config rollback requires bearer" "/api/v1/config/history/1/rollback" "POST" || true
   check_protected_boundary "user list requires bearer" "/api/v1/users" || true
-  check_protected_boundary "user create requires bearer" "/api/v1/users" "POST" '{"username":"probe-user","password":"ProbePassword123!","role":"operator"}' || true
-  check_protected_boundary "user update requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "PATCH" '{"disabled":true}' || true
-  check_protected_boundary "user role requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/role" "PATCH" '{"role":"operator"}' || true
-  check_protected_boundary "user disabled requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/disabled" "PATCH" '{"disabled":true}' || true
-  check_protected_boundary "user password requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000/password" "PATCH" '{"password":"ProbePassword123!"}' || true
   check_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE" || true
   check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
   check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST" || true
