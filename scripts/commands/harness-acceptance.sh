@@ -492,6 +492,9 @@ run_codex_profile() {
   check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true
   check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details" || true
   check_protected_boundary "run artifact download requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download" || true
+  check_protected_boundary "workspace file list requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files" || true
+  check_protected_boundary "workspace file download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files/download?path=artifact.txt" || true
+  check_protected_boundary "workspace bundle download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/bundle/download" || true
   check_protected_boundary "run create requires bearer" "/api/v1/runs" "POST" || true
   check_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST" || true
   check_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST" || true
@@ -585,6 +588,9 @@ run_openapi_capability_profile() {
   check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post" || true
   check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post" || true
   check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get" || true
+  check_openapi_path "workspace file list" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files" "get" || true
+  check_openapi_path "workspace file download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files/download" "get" || true
+  check_openapi_path "workspace bundle download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/bundle/download" "get" || true
   check_openapi_path "model routing registry" "/api/v1/admin/models" "get" || true
   check_openapi_path "model routing create" "/api/v1/admin/models" "post" || true
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true

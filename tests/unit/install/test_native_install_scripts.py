@@ -125,6 +125,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command
     assert 'check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post"' in command
     assert 'check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get"' in command
+    assert 'check_openapi_path "workspace file list" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files" "get"' in command
+    assert 'check_openapi_path "workspace file download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/files/download" "get"' in command
+    assert 'check_openapi_path "workspace bundle download" "/api/v1/workspaces/projects/{project_id}/sessions/{session_id}/bundle/download" "get"' in command
     assert 'check_openapi_path "model routing registry" "/api/v1/admin/models" "get"' in command
     assert 'check_openapi_path "model routing create" "/api/v1/admin/models" "post"' in command
     assert 'check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post"' in command
@@ -138,6 +141,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events"' in command
     assert 'check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details"' in command
     assert 'check_protected_boundary "run artifact download requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download"' in command
+    assert 'check_protected_boundary "workspace file list requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files"' in command
+    assert 'check_protected_boundary "workspace file download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/files/download?path=artifact.txt"' in command
+    assert 'check_protected_boundary "workspace bundle download requires bearer" "/api/v1/workspaces/projects/probe-project/sessions/probe-session/bundle/download"' in command
     assert 'check_protected_boundary "model registry requires bearer" "/api/v1/admin/models"' in command
     assert 'check_protected_boundary "model create requires bearer" "/api/v1/admin/models" "POST"' in command
     assert 'check_protected_boundary "model probe requires bearer" "/api/v1/admin/models/probe" "POST"' in command
