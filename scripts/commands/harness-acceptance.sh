@@ -548,6 +548,7 @@ check_runtime_failure_diagnostics() {
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
+from agent_hub.runtime.defaults import _capability_inventory_payload
 
 cases = [
     ("Plugin tool timed out", "plugin_runtime", "timeout", "plugin.timeout", True),
@@ -591,6 +592,46 @@ for reason, stage, category, code, retryable in cases:
         raise SystemExit(1)
     if diagnostic.get("retryable") is not retryable:
         raise SystemExit(1)
+
+
+class CapabilityGateway:
+    def capability_manifest(self, tenant_id):
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "calendar.create_event",
+                    "kind": "plugin",
+                    "adapter": "plugin_registry",
+                    "permission_class": "plugin.use",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "inherit",
+                    "available": True,
+                    "availability_reason": None,
+                    "failure_codes": (
+                        "plugin.timeout",
+                        "bad code",
+                        "plugin.secret_token",
+                        *(f"plugin.failure_{index}" for index in range(40)),
+                    ),
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+            ),
+        }
+
+
+inventory = _capability_inventory_payload(None, capability_gateway=CapabilityGateway())
+if inventory is not None:
+    raise SystemExit(1)
+inventory = _capability_inventory_payload("tenant-probe", capability_gateway=CapabilityGateway())
+items = inventory.get("items") if isinstance(inventory, dict) else None
+if not isinstance(items, tuple) or len(items) != 1:
+    raise SystemExit(1)
+failure_codes = items[0].get("failure_codes")
+expected_codes = ("plugin.timeout", *(f"plugin.failure_{index}" for index in range(31)))
+if failure_codes != expected_codes:
+    raise SystemExit(1)
 PY
   then
     printf 'ok: runtime failure diagnostics\n'

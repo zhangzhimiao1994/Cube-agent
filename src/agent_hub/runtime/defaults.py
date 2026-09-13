@@ -122,6 +122,7 @@ _DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
 }
 _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
+_MAX_CAPABILITY_INVENTORY_FAILURE_CODES = 32
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
 _MAX_ORCHESTRATION_HANDOFFS = 12
 _ORCHESTRATION_CONTRACT_READY_STATUS = "done"
@@ -2552,7 +2553,12 @@ def _capability_inventory_item(raw_item: object) -> Mapping[str, JsonValue] | No
         for alias in _tool_names(raw_item.get("aliases"))
         if _is_safe_inventory_token(alias, max_length=128)
     )[:_MAX_CAPABILITY_INVENTORY_ALIASES]
-    return {
+    failure_codes = tuple(
+        failure_code
+        for failure_code in _tool_names(raw_item.get("failure_codes"))
+        if _is_safe_inventory_token(failure_code, max_length=128)
+    )[:_MAX_CAPABILITY_INVENTORY_FAILURE_CODES]
+    item: dict[str, JsonValue] = {
         "id": item_id,
         "kind": _inventory_token(raw_item.get("kind"), "unknown", max_length=64),
         "adapter": _inventory_token(raw_item.get("adapter"), "unknown", max_length=128),
@@ -2579,6 +2585,9 @@ def _capability_inventory_item(raw_item: object) -> Mapping[str, JsonValue] | No
         "replay_safe": raw_item.get("replay_safe") is True,
         "aliases": aliases,
     }
+    if failure_codes:
+        item["failure_codes"] = failure_codes
+    return item
 
 
 def _inventory_token(value: object, default: str, *, max_length: int) -> str:

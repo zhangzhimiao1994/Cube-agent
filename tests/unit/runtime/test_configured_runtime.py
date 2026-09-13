@@ -134,6 +134,10 @@ class ManifestCapabilityGateway(FakeCapabilityAvailability):
                     "sandbox_profile": "systemd_skill_sandbox",
                     "available": True,
                     "availability_reason": None,
+                    "failure_codes": (
+                        "plugin.timeout",
+                        "plugin.schema_validation_failed",
+                    ),
                     "replay_safe": False,
                     "aliases": (),
                 },
@@ -145,6 +149,7 @@ class ManifestCapabilityGateway(FakeCapabilityAvailability):
                     "sandbox_profile": "mcp_stdio",
                     "available": False,
                     "availability_reason": "mcp_server_not_discovered",
+                    "failure_codes": ("mcp.server_failed",),
                     "replay_safe": False,
                     "aliases": (),
                 },
@@ -3157,6 +3162,10 @@ async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
                 "policy_effect": "inherit",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": (
+                    "plugin.timeout",
+                    "plugin.schema_validation_failed",
+                ),
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -3169,6 +3178,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
                 "policy_effect": "inherit",
                 "available": False,
                 "availability_reason": "mcp_server_not_discovered",
+                "failure_codes": ("mcp.server_failed",),
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -3355,6 +3365,45 @@ async def test_config_backed_dispatch_runtime_bounds_capability_inventory(
     assert "bad tool" not in {item["id"] for item in items}
 
 
+def test_capability_inventory_payload_bounds_failure_codes() -> None:
+    inventory = _capability_inventory_payload(
+        TENANT_ID,
+        capability_gateway=BadManifestCapabilityGateway(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "plugin.safe_tool",
+                        "kind": "plugin",
+                        "adapter": "plugin_registry",
+                        "permission_class": "plugin.use",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "failure_codes": (
+                            "plugin.timeout",
+                            "bad code",
+                            "secret.token",
+                            *(f"plugin.failure_{index}" for index in range(40)),
+                        ),
+                        "replay_safe": False,
+                        "aliases": (),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert inventory is not None
+    items = cast(tuple[Mapping[str, JsonValue], ...], inventory["items"])
+    failure_codes = tuple(cast(tuple[str, ...], items[0]["failure_codes"]))
+    assert len(failure_codes) == 32
+    assert failure_codes[0] == "plugin.timeout"
+    assert failure_codes[-1] == "plugin.failure_30"
+    assert "bad code" not in failure_codes
+    assert "secret.token" not in failure_codes
+
+
 @pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_bounds_invalid_inventory_scan(
     monkeypatch: pytest.MonkeyPatch,
@@ -3463,6 +3512,11 @@ def test_capability_inventory_payload_sanitizes_manifest_tokens() -> None:
                         "sandbox_profile": "token_sandbox",
                         "available": True,
                         "availability_reason": "bearer_token",
+                        "failure_codes": (
+                            "plugin.timeout",
+                            "bad code",
+                            "plugin.secret_token",
+                        ),
                         "replay_safe": False,
                         "aliases": ("safe_alias", "secret_alias"),
                     },
@@ -3483,6 +3537,7 @@ def test_capability_inventory_payload_sanitizes_manifest_tokens() -> None:
             "policy_effect": "inherit",
             "available": True,
             "availability_reason": None,
+            "failure_codes": ("plugin.timeout",),
             "replay_safe": False,
             "aliases": ("safe_alias",),
         },
