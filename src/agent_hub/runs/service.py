@@ -3066,9 +3066,18 @@ def _openclaw_target(platform: str, target_type: str) -> str:
 
 
 _SCHEDULE_EXPLICIT_REQUEST_RE = re.compile(
-    r"((创建|新建|新增|保存|加入|列入|添加|设置|安排).{0,12}(计划任务|定时任务|日程|排程|提醒|闹钟)|"
-    r"(计划任务|定时任务|日程|排程|提醒|闹钟).{0,12}(创建|新建|新增|保存|加入|列入|添加|设置|安排)|"
-    r"((create|add|set\s+up)\s+(a\s+)?(scheduled\s+task|schedule|reminder|alarm)))",
+    r"((创建|新建|新增|保存|加入|列入|添加|设置|安排).{0,12}(计划任务|定时任务|日程任务|排程任务)|"
+    r"(计划任务|定时任务|日程任务|排程任务).{0,12}(创建|新建|新增|保存|加入|列入|添加|设置|安排)|"
+    r"((create|add|set\s+up)\s+(a\s+)?(scheduled\s+task|schedule\s+task)))",
+    re.IGNORECASE,
+)
+_SCHEDULE_META_DISCUSSION_RE = re.compile(
+    r"((怎么|如何|为什么|为何|是否|能不能|可不可以|讨论|分析|设计|规则|文档|说明|解释|检查|评估).{0,20}"
+    r"(计划任务|定时任务|日程任务|排程任务)|"
+    r"(计划任务|定时任务|日程任务|排程任务).{0,20}"
+    r"(怎么|如何|为什么|为何|是否|能不能|可不可以|讨论|分析|设计|规则|文档|说明|解释|检查|评估)|"
+    r"((how|why|whether|discuss|design|explain|document|evaluate|review).{0,24}"
+    r"(scheduled\s+task|schedule\s+task)))",
     re.IGNORECASE,
 )
 _SCHEDULE_EXECUTION_RE = re.compile(
@@ -3174,6 +3183,8 @@ def _local_schedule_proposal(
 
 def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     if _SCHEDULE_NEGATION_RE.search(message):
+        return False
+    if _SCHEDULE_META_DISCUSSION_RE.search(message):
         return False
     if _SCHEDULE_EXPLICIT_REQUEST_RE.search(message) is None:
         return False

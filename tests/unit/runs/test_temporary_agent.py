@@ -531,6 +531,13 @@ async def test_specific_date_action_returns_schedule_confirmation() -> None:
         "帮我看看计划任务功能应该怎么设计，不要直接创建。",
         "每天9点提醒我填写日报",
         "9月3号给我生成一个方案",
+        "设置提醒：每天9点提醒我填写日报",
+        "创建提醒：每天9点提醒我填写日报",
+        "设置闹钟：每天9点填写日报",
+        "create reminder every day at 9am to fill daily report",
+        "帮我设计计划任务创建规则：每天9点提醒我填写日报",
+        "讨论一下怎么创建计划任务，每天9点提醒我填写日报",
+        "review scheduled task design: create reminder every day at 9am",
     ],
 )
 async def test_normal_planning_request_does_not_become_schedule_task(message: str) -> None:

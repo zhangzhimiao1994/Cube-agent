@@ -2811,10 +2811,17 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-
-    await waitFor(() => expect(screen.queryByRole("status", { name: "计划任务确认" })).toBeNull());
+    const input = screen.getByPlaceholderText(/输入消息/);
+    for (const message of [
+      "每天9点提醒我填写日报",
+      "设置提醒：每天9点提醒我填写日报",
+      "帮我设计计划任务创建规则：每天9点提醒我填写日报",
+    ]) {
+      await user.clear(input);
+      await user.type(input, message);
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(screen.queryByRole("status", { name: "计划任务确认" })).toBeNull());
+    }
     expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toBeUndefined();
   });
 
