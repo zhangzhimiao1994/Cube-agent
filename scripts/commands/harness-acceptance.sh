@@ -1198,6 +1198,10 @@ run_codex_profile() {
   check_protected_boundary "admin run artifact download requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/artifacts/00000000-0000-0000-0000-000000000000/download" || true
   check_protected_boundary "admin run debug requires bearer" "/api/v1/admin/runs/00000000-0000-0000-0000-000000000000/debug" || true
   check_protected_boundary "admin skills list requires bearer" "/api/v1/admin/skills" || true
+  check_protected_boundary "admin schedule list requires bearer" "/api/v1/admin/schedules" || true
+  check_write_protected_boundary "admin schedule create requires bearer" "/api/v1/admin/schedules" "POST" || true
+  check_write_protected_boundary "admin schedule tick requires bearer" "/api/v1/admin/schedules/tick" "POST" || true
+  check_write_protected_boundary "admin schedule delete requires bearer" "/api/v1/admin/schedules/00000000-0000-0000-0000-000000000000" "DELETE" || true
   check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found" || true
   check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed" || true
   check_url "openapi contract" "/openapi.json" || true
@@ -1351,6 +1355,10 @@ run_openapi_capability_profile() {
   check_openapi_path "admin run resume" "/api/v1/admin/runs/{run_id}/resume" "post" || true
   check_openapi_path "admin run cancel" "/api/v1/admin/runs/{run_id}/cancel" "post" || true
   check_openapi_path "admin run delete" "/api/v1/admin/runs/{run_id}" "delete" || true
+  check_openapi_path "admin schedule list" "/api/v1/admin/schedules" "get" || true
+  check_openapi_path "admin schedule create" "/api/v1/admin/schedules" "post" || true
+  check_openapi_path "admin schedule tick" "/api/v1/admin/schedules/tick" "post" || true
+  check_openapi_path "admin schedule delete" "/api/v1/admin/schedules/{schedule_id}" "delete" || true
   check_openapi_path "admin skills list" "/api/v1/admin/skills" "get" || true
   check_openapi_path "admin skill upload" "/api/v1/admin/skills" "post" || true
   check_openapi_path "admin skill archive upload" "/api/v1/admin/skills/upload" "post" || true

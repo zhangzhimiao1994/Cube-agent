@@ -154,6 +154,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"/api/v1/runs/$run_id"' in command
     assert '"/api/v1/runs/$run_id/events"' in command
     assert "run lifecycle cleanup cancel reaches cancelled" in command
+    assert 'check_protected_boundary "admin schedule list requires bearer" "/api/v1/admin/schedules"' in command
+    assert 'check_write_protected_boundary "admin schedule create requires bearer" "/api/v1/admin/schedules" "POST"' in command
+    assert 'check_write_protected_boundary "admin schedule tick requires bearer" "/api/v1/admin/schedules/tick" "POST"' in command
+    assert 'check_write_protected_boundary "admin schedule delete requires bearer" "/api/v1/admin/schedules/00000000-0000-0000-0000-000000000000" "DELETE"' in command
     assert "profile: authenticated schedule interaction guard" in command
     assert "ordinary reminder must not return schedule proposal" in command
     assert "explicit schedule task must return schedule proposal" in command
@@ -181,6 +185,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'string_schema.get("maxLength") != 90' in command
     assert 'string_schema.get("pattern") != "^[A-Za-z0-9._:-]+$"' in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
+    assert 'check_openapi_path "admin schedule list" "/api/v1/admin/schedules" "get"' in command
+    assert 'check_openapi_path "admin schedule create" "/api/v1/admin/schedules" "post"' in command
+    assert 'check_openapi_path "admin schedule tick" "/api/v1/admin/schedules/tick" "post"' in command
+    assert 'check_openapi_path "admin schedule delete" "/api/v1/admin/schedules/{schedule_id}" "delete"' in command
     assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
     assert 'securitySchemes", {}).get("BearerAuth")' in command
     assert '"$acceptance_python_bin" - "$acceptance_openapi_file" "$path" "$method"' in command
