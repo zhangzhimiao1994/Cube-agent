@@ -773,7 +773,7 @@ stress_worker() {
   local path
   local index
   for ((index = 1; index <= iterations; index += 1)); do
-    for path in /health /health/live /health/ready /openapi.json /login; do
+    for path in /health /health/live /health/ready /metrics /openapi.json /login; do
       curl --noproxy '*' \
         --connect-timeout "$connect_timeout" \
         --max-time "$max_time" \

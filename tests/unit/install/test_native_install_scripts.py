@@ -81,6 +81,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_lifecycle_profile" in command
     assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
+    assert "for path in /health /health/live /health/ready /metrics /openapi.json /login; do" in command
     assert "/health/live" in command
     assert "/health/ready" in command
     assert 'check_url "api health alias" "/health"' in command
