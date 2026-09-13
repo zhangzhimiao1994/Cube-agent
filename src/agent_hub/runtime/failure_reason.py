@@ -198,6 +198,9 @@ def runtime_failure_diagnostic_from_reason(
     plugin_diagnostic = _plugin_runtime_diagnostic(normalized, lowered, status_code=status_code)
     if plugin_diagnostic is not None:
         return plugin_diagnostic
+    mcp_diagnostic = _mcp_runtime_diagnostic(normalized, lowered, status_code=status_code)
+    if mcp_diagnostic is not None:
+        return mcp_diagnostic
     if lowered == "capability outcome requires confirmation":
         return _base_diagnostic(
             normalized,
@@ -443,6 +446,65 @@ def _plugin_runtime_diagnostic(
             error_code="plugin.sandbox_unsupported",
             retryable=False,
             suggested_action="插件 sandbox 配置不被当前运行时支持；调整插件隔离策略或启用对应适配器后重试。",
+            status_code=status_code,
+        )
+    return None
+
+
+def _mcp_runtime_diagnostic(
+    reason: str,
+    lowered: str,
+    *,
+    status_code: int | None,
+) -> RuntimeFailureDiagnostic | None:
+    if lowered == "mcp tool unavailable":
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="tool_unavailable",
+            error_code="mcp.tool_unavailable",
+            retryable=False,
+            suggested_action="MCP 工具当前不可用；检查 MCP server 发现状态、工具 allowlist 和运行时 reload 后重试。",
+            status_code=status_code,
+        )
+    if lowered == "mcp tool timed out":
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="timeout",
+            error_code="mcp.timeout",
+            retryable=True,
+            suggested_action="MCP 工具调用超时；检查 MCP server 健康、网络/stdio 连接和请求规模，恢复后可重试。",
+            status_code=status_code,
+        )
+    if lowered == "mcp_server_not_discovered":
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_not_discovered",
+            error_code="mcp.server_not_discovered",
+            retryable=False,
+            suggested_action="MCP server 已配置但尚未完成工具发现；检查 server 启动、发现协议和 allowlist 配置后 reload。",
+            status_code=status_code,
+        )
+    if lowered == "mcp_server_timeout":
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_timeout",
+            error_code="mcp.server_timeout",
+            retryable=True,
+            suggested_action="MCP server 健康检查或工具发现超时；检查连接、降低负载或恢复服务后重试。",
+            status_code=status_code,
+        )
+    if lowered in {"mcp_server_failed", "mcp_server_unavailable"}:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_failed",
+            error_code="mcp.server_failed",
+            retryable=True,
+            suggested_action="MCP server 不健康或不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
             status_code=status_code,
         )
     return None

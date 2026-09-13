@@ -336,6 +336,32 @@ def test_runtime_failure_diagnostic_classifies_plugin_runtime_failures(
     assert "插件" in suggested_action
 
 
+@pytest.mark.parametrize(
+    ("reason", "error_category", "error_code", "retryable"),
+    [
+        ("MCP tool unavailable", "tool_unavailable", "mcp.tool_unavailable", False),
+        ("MCP tool timed out", "timeout", "mcp.timeout", True),
+        ("mcp_server_not_discovered", "server_not_discovered", "mcp.server_not_discovered", False),
+        ("mcp_server_timeout", "server_timeout", "mcp.server_timeout", True),
+        ("mcp_server_failed", "server_failed", "mcp.server_failed", True),
+    ],
+)
+def test_runtime_failure_diagnostic_classifies_mcp_runtime_failures(
+    reason: str,
+    error_category: str,
+    error_code: str,
+    retryable: bool,
+) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+
+    assert diagnostic["error_stage"] == "mcp_runtime"
+    assert diagnostic["error_category"] == error_category
+    assert diagnostic["error_code"] == error_code
+    assert diagnostic["retryable"] is retryable
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "MCP" in suggested_action
+
+
 def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_non_retryable() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("capability outcome requires confirmation")
 
