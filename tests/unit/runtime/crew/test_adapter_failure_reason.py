@@ -2902,6 +2902,37 @@ def test_artifact_review_packet_payload_exposes_bounded_preview_without_full_con
     assert "metadata" not in packet
 
 
+def test_artifact_review_packet_payload_extracts_staged_preflight_fields() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="builder",
+        content={
+            "text": json.dumps(
+                {
+                    "summary": "done",
+                    "stage_status": ["stage 1 complete"],
+                    "verification_evidence": ["unit test passed"],
+                    "remaining_risks": ["needs live token probe"],
+                    "acceptance_review": ["approved"],
+                },
+                ensure_ascii=False,
+            )
+        },
+    )
+
+    payload = _artifact_review_packet_payload(artifact)
+
+    packet = payload["artifact_review_packet"]
+    assert isinstance(packet, Mapping)
+    assert packet["staged_preflight_fields"] == {
+        "stage_status": ("stage 1 complete",),
+        "verification_evidence": ("unit test passed",),
+        "remaining_risks": ("needs live token probe",),
+        "acceptance_review": ("approved",),
+    }
+
+
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:
     original_text = "长文本" * 1_000
     artifact = Artifact(

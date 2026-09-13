@@ -537,6 +537,9 @@ def _artifact_review_packet_payload(
         "content_sha256": artifact.content_sha256,
         "content_keys": tuple(sorted(artifact.content)),
     }
+    staged_fields = _staged_preflight_fields(artifact)
+    if staged_fields:
+        packet["staged_preflight_fields"] = staged_fields
     if preview is not None:
         packet["preview"] = preview
     else:
@@ -545,6 +548,35 @@ def _artifact_review_packet_payload(
             max_text_bytes=512,
         )
     return {"artifact_review_packet": packet}
+
+
+_STAGED_PREFLIGHT_FIELD_NAMES = (
+    "stage_status",
+    "verification_evidence",
+    "remaining_risks",
+    "acceptance_review",
+)
+
+
+def _staged_preflight_fields(artifact: Artifact) -> dict[str, tuple[str, ...]]:
+    text = artifact.content.get("text")
+    if type(text) is not str:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    fields: dict[str, tuple[str, ...]] = {}
+    for field_name in _STAGED_PREFLIGHT_FIELD_NAMES:
+        value = payload.get(field_name)
+        if not isinstance(value, list):
+            continue
+        items = tuple(item for item in value if isinstance(item, str) and item.strip())
+        if items:
+            fields[field_name] = items[:8]
+    return fields
 
 
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:

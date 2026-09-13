@@ -1153,6 +1153,7 @@ check_multimode_interaction_matrix() {
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import json
 from uuid import uuid4
 
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -1163,7 +1164,8 @@ from agent_hub.runs.service import (
     _local_main_agent_auto_mode,
     _main_agent_adjusted_ready_mode,
 )
-from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext
+from agent_hub.runtime.crew.adapter import _artifact_review_packet_payload
 from agent_hub.runtime.defaults import _dispatch_plan
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
@@ -1307,6 +1309,36 @@ require(
 require(
     "acceptance_review" in approved_preflight_context,
     "approved project preflight context exposes review stage fields",
+)
+staged_packet = _artifact_review_packet_payload(
+    Artifact(
+        id=uuid4(),
+        type="text",
+        producer="builder",
+        content={
+            "text": json.dumps(
+                {
+                    "stage_status": ["implementation complete"],
+                    "verification_evidence": ["harness passed"],
+                    "remaining_risks": ["tokened probe pending"],
+                    "acceptance_review": ["accepted"],
+                },
+                ensure_ascii=False,
+            )
+        },
+    )
+)
+staged_packet_body = staged_packet.get("artifact_review_packet")
+require(isinstance(staged_packet_body, dict), "approved project preflight review packet body")
+staged_fields = staged_packet_body.get("staged_preflight_fields")
+require(isinstance(staged_fields, dict), "approved project preflight review packet staged fields")
+require(
+    staged_fields.get("stage_status") == ("implementation complete",),
+    "approved project preflight review packet exposes staged status",
+)
+require(
+    staged_fields.get("acceptance_review") == ("accepted",),
+    "approved project preflight review packet exposes acceptance review",
 )
 direct_preflight_prompt = DirectRuntime(object(), logical_model="main")._build_prompt(
     TaskContext(
