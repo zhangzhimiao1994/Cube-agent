@@ -2409,6 +2409,10 @@ def _self_repair_execution_payload(
         attempt,
         3,
     )
+    requires_approval = repair.get("requires_approval") is not False
+    automatic_execution = (
+        repair.get("automatic_execution") is True and requires_approval is False
+    )
     payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "source": "self_repair",
@@ -2438,8 +2442,8 @@ def _self_repair_execution_payload(
         ),
         "attempt": attempt,
         "max_attempts": max_attempts,
-        "requires_approval": True,
-        "automatic_execution": False,
+        "requires_approval": requires_approval,
+        "automatic_execution": automatic_execution,
     }
     recovery_strategy = _bounded_optional_enum_text(
         repair.get("recovery_strategy"),

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from agent_hub.domain.runs import RunStatus
+from uuid import uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
     SAFE_SELF_REPAIR_FAILURE_KINDS,
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
-from agent_hub.runs.self_repair import repair_context_from_proposal
+from agent_hub.runs.self_repair import (
+    SelfRepairPolicy,
+    classify_terminal_run,
+    repair_context_from_proposal,
+    repair_proposal_projection,
+)
 from agent_hub.runs.service import _self_repair_execution_payload
+from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.self_repair_context import (
     self_repair_context_text,
     self_repair_recovery_plan_payload,
@@ -215,3 +223,57 @@ def test_model_capability_reassignment_metadata_is_bounded_and_structured() -> N
         },
     )
     assert "secret://token" not in repr(recovery_plan)
+
+
+def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=run_id,
+                reason="model gateway failed: model response text is empty",
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    assert decision is not None
+    assert decision.requires_approval is False
+    assert decision.automatic_execution is True
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["requires_approval"] is False
+    assert proposal["automatic_execution"] is True
+
+    repair_context = repair_context_from_proposal(proposal)
+    assert repair_context["requires_approval"] is False
+    assert repair_context["automatic_execution"] is True
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+    assert recovery_plan is not None
+    assert recovery_plan["automatic_execution"] is True
+    audit_payload = _self_repair_execution_payload(
+        routing_decision,
+        status=RunStatus.RUNNING,
+    )
+    assert audit_payload["requires_approval"] is False
+    assert audit_payload["automatic_execution"] is True
+
+
+def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -> None:
+    projected = repair_proposal_projection(
+        {
+            "kind": "self_repair",
+            "requires_approval": True,
+            "automatic_execution": True,
+        }
+    )
+
+    assert projected is not None
+    assert projected["requires_approval"] is True
+    assert projected["automatic_execution"] is False

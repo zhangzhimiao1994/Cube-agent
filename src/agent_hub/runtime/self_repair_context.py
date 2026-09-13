@@ -121,6 +121,7 @@ def self_repair_recovery_plan_payload(
         allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
         max_chars=128,
     )
+    automatic_execution = _safe_automatic_execution(repair)
     if recovery_strategy != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
         if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
             return None
@@ -130,7 +131,7 @@ def self_repair_recovery_plan_payload(
             "recovery_strategy": _MODEL_CAPABILITY_RECOVERY_STRATEGY,
             "replan_scope": "model_capability_roles",
             "reuse_completed_artifacts": True,
-            "automatic_execution": False,
+            "automatic_execution": automatic_execution,
         }
         role_capability_requirements = _safe_role_capability_requirements(
             repair.get("role_capability_requirements"),
@@ -148,7 +149,7 @@ def self_repair_recovery_plan_payload(
         "replan_scope": "blocked_contract_chain",
         "reuse_completed_artifacts": True,
         "retry_blocked_contracts_only": True,
-        "automatic_execution": False,
+        "automatic_execution": automatic_execution,
     }
     blocked_contract_ids = _safe_contract_ids(repair.get("blocked_contract_ids"))
     if blocked_contract_ids:
@@ -193,6 +194,10 @@ def _safe_text(value: object, default: str, max_chars: int) -> str:
         return default
     text = " ".join(value.split())[:max_chars]
     return text or default
+
+
+def _safe_automatic_execution(repair: Mapping[str, object]) -> bool:
+    return repair.get("automatic_execution") is True and repair.get("requires_approval") is False
 
 
 def _safe_enum_text(

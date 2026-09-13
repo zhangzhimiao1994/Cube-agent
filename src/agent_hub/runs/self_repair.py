@@ -187,10 +187,15 @@ class SelfRepairDecision:
     def to_proposal(self, *, run_id: UUID) -> dict[str, object] | None:
         if self.kind != "repair.classified":
             return None
+        automatic_execution = self.automatic_execution and not self.requires_approval
         proposal: dict[str, object] = {
             "kind": "self_repair",
             "title": "受控自修复建议",
-            "summary": "运行失败已分类，可在审批后创建一次受控修复重试。",
+            "summary": (
+                "运行失败已分类，可自动创建一次受控修复重试。"
+                if automatic_execution
+                else "运行失败已分类，可在审批后创建一次受控修复重试。"
+            ),
             "repair_action": self.action,
             "failure_kind": self.failure_category,
             "source_run_id": str(run_id),
@@ -203,7 +208,7 @@ class SelfRepairDecision:
             ),
             "requires_approval": self.requires_approval,
             "replay_safe": False,
-            "automatic_execution": False,
+            "automatic_execution": automatic_execution,
             "fingerprint": self.fingerprint,
         }
         if self.recovery_strategy is not None:
@@ -301,7 +306,7 @@ def classify_terminal_run(
         fingerprint=fingerprint,
         failure_category=failure_category,
         requires_approval=policy.requires_approval,
-        automatic_execution=False,
+        automatic_execution=not policy.requires_approval,
         attempt=1,
         max_attempts=policy.max_attempts,
         recovery_strategy=recovery_strategy,
@@ -363,6 +368,10 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         minimum=attempt,
         maximum=3,
     )
+    requires_approval = proposal.get("requires_approval") is not False
+    automatic_execution = (
+        proposal.get("automatic_execution") is True and requires_approval is False
+    )
     context: dict[str, object] = {
         "schema_version": 1,
         "source": "self_repair",
@@ -392,8 +401,8 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
             ),
             max_chars=240,
         ),
-        "requires_approval": True,
-        "automatic_execution": False,
+        "requires_approval": requires_approval,
+        "automatic_execution": automatic_execution,
     }
     recovery_strategy = _safe_optional_text(
         proposal.get("recovery_strategy"),
@@ -430,6 +439,8 @@ def repair_proposal_projection(proposal: Mapping[str, object] | None) -> dict[st
         converted = _repair_proposal_projection_value(key, value)
         if converted is not None:
             safe[key] = converted
+    if safe.get("automatic_execution") is True and safe.get("requires_approval") is not False:
+        safe["automatic_execution"] = False
     return safe or None
 
 
@@ -492,7 +503,7 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
             allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
         )
     if key == "automatic_execution":
-        return False
+        return value if type(value) is bool else None
     if key in {"requires_approval", "replay_safe"}:
         return value if type(value) is bool else None
     if key in {"attempt", "max_attempts"}:
