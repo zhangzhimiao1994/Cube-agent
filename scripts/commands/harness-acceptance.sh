@@ -1410,6 +1410,109 @@ run_lifecycle_profile() {
   printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
 }
 
+post_run_control_expect_status() {
+  local python_bin="$1"
+  local run_id="$2"
+  local action="$3"
+  local expected_status="$4"
+  local label="$5"
+  local response
+
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -X POST \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/runs/$run_id/$action" 2>/dev/null)"; then
+    printf 'fail: %s /api/v1/runs/%s/%s\n' "$label" "$run_id" "$action" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$response" ACCEPTANCE_EXPECTED_STATUS="$expected_status" "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+if payload.get("status") != os.environ["ACCEPTANCE_EXPECTED_STATUS"]:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: %s\n' "$label"
+    return 0
+  fi
+  printf 'fail: %s expected status=%s\n' "$label" "$expected_status" >&2
+  failures=$((failures + 1))
+  return 1
+}
+
+run_control_idempotency_guard_profile() {
+  local python_bin
+  local request_body
+  local response
+  local run_id
+  local idempotency_key
+
+  printf 'profile: authenticated run control idempotency guard\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: run control idempotency guard is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: run control idempotency guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: run control idempotency guard requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! request_body="$("$python_bin" - <<'PY'
+import json
+
+print(json.dumps({
+    "message": "Agent Hub run control idempotency acceptance probe",
+    "mode": "direct",
+    "sandbox_profile": "none",
+    "requested_permissions": [],
+    "skip_evolution_proposal": True,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build run control idempotency request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  idempotency_key="control-idempotency-$(date +%s)-$$"
+  if ! response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -H "Idempotency-Key: $idempotency_key" \
+    -d "$request_body" \
+    "$base_url/api/v1/runs" 2>/dev/null)"; then
+    printf 'fail: run control idempotency create /api/v1/runs\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! run_id="$(ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os; print(json.loads(os.environ["ACCEPTANCE_RESPONSE"])["id"])')"; then
+    printf 'fail: run control idempotency create response did not include id\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  post_run_control_expect_status "$python_bin" "$run_id" "pause" "paused" "initial pause reaches paused" || return 1
+  post_run_control_expect_status "$python_bin" "$run_id" "pause" "paused" "repeated pause stays paused" || return 1
+  post_run_control_expect_status "$python_bin" "$run_id" "resume" "queued" "initial resume reaches queued" || return 1
+  post_run_control_expect_status "$python_bin" "$run_id" "resume" "queued" "repeated resume stays queued" || return 1
+  post_run_control_expect_status "$python_bin" "$run_id" "cancel" "cancelled" "initial cancel reaches cancelled" || return 1
+  post_run_control_expect_status "$python_bin" "$run_id" "cancel" "cancelled" "repeated cancel stays cancelled" || return 1
+}
+
 run_schedule_interaction_guard_profile() {
   local python_bin
   local ordinary_body
@@ -1663,6 +1766,7 @@ case "$profile" in
     run_codex_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     ;;
   deepseek)
@@ -1674,6 +1778,7 @@ case "$profile" in
     run_deepseek_profile
     run_openapi_capability_profile || true
     run_lifecycle_profile || true
+    run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     ;;
 esac

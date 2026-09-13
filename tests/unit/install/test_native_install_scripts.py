@@ -157,6 +157,12 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ordinary reminder must not return schedule proposal" in command
     assert "explicit schedule task must return schedule proposal" in command
     assert "schedule interaction guard is disabled in read-only mode" in command
+    assert "profile: authenticated run control idempotency guard" in command
+    assert "run control idempotency guard is disabled in read-only mode" in command
+    assert "run control idempotency guard requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+    assert "repeated pause stays paused" in command
+    assert "repeated resume stays queued" in command
+    assert "repeated cancel stays cancelled" in command
     assert 'check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post"' in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
     assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
