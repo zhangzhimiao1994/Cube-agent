@@ -249,6 +249,57 @@ check_protected_boundary() {
   return 1
 }
 
+check_error_envelope() {
+  local name="$1"
+  local path="$2"
+  local method="$3"
+  local expected_status="$4"
+  local expected_code="$5"
+  local python_bin
+  local response
+  local status
+  local temp_body
+  temp_body="$(mktemp)"
+  if ! python_bin="$(detect_python)"; then
+    rm -f -- "$temp_body"
+    printf 'fail: %s %s requires python for JSON handling\n' "$name" "$path" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  status="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -sS -X "$method" -o "$temp_body" -w '%{http_code}' \
+    "$base_url$path" 2>/dev/null || true)"
+  response="$(cat "$temp_body")"
+  rm -f -- "$temp_body"
+  if [[ "$status" != "$expected_status" ]]; then
+    printf 'fail: %s %s expected %s -> %s\n' "$name" "$path" "$expected_status" "${status:-curl-error}" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$response" ACCEPTANCE_ERROR_CODE="$expected_code" "$python_bin" - <<'PY'
+import json
+import os
+import sys
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+error = payload.get("error", {})
+if error.get("code") != os.environ["ACCEPTANCE_ERROR_CODE"]:
+    raise SystemExit(1)
+message = error.get("message")
+if not isinstance(message, str) or not message:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
+    return 0
+  fi
+  printf 'fail: %s %s invalid error envelope\n' "$name" "$path" >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_model_capability_schema() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -326,6 +377,8 @@ run_codex_profile() {
   check_prometheus_metrics || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "model registry requires bearer" "/api/v1/admin/models" || true
+  check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found" || true
+  check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed" || true
   check_url "openapi contract" "/openapi.json" || true
   check_url "management ui entry" "/login" || true
 }
