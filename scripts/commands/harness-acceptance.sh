@@ -1324,6 +1324,7 @@ run_codex_profile() {
   check_write_protected_boundary "run pause requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/pause" "POST" || true
   check_write_protected_boundary "run resume requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/resume" "POST" || true
   check_write_protected_boundary "run cancel requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/cancel" "POST" || true
+  check_write_protected_boundary "run project preflight approval requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-project-preflight" "POST" || true
   check_write_protected_boundary "run capability approve requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/approve-capability" "POST" || true
   check_write_protected_boundary "run capability reject requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/reject-capability" "POST" || true
   check_protected_boundary "auth me requires bearer" "/api/v1/auth/me" || true
@@ -1452,6 +1453,7 @@ run_openapi_capability_profile() {
   check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
   check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
   check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post" || true
+  check_openapi_path "run project preflight approval" "/api/v1/runs/{run_id}/approve-project-preflight" "post" || true
   check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post" || true
   check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post" || true
   check_openapi_path "run detail projection" "/api/v1/runs/{run_id}/details" "get" || true

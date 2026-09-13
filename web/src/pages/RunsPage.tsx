@@ -70,6 +70,7 @@ type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
+type ProjectPreflightProposal = NonNullable<SubmittedRun["project_preflight_proposal"]>;
 type RepairProposal = NonNullable<SubmittedRun["repair_proposal"]>;
 type CapabilityApproval = {
   runId: string;
@@ -1503,6 +1504,18 @@ function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
   };
 }
 
+function projectPreflightApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "waiting_approval" || !run.decision_token || !run.project_preflight_proposal) {
+    return null;
+  }
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: runDetailVersion(run),
+    proposal: run.project_preflight_proposal,
+  };
+}
+
 function repairApprovalFromSubmittedRun(run: SubmittedRun) {
   if (run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
   return {
@@ -1633,6 +1646,16 @@ function scheduleProposalCreatePayload(proposal: ScheduleProposal) {
     metadata: proposal.metadata,
   };
 }
+
+function projectPreflightProposalBody(proposal: ProjectPreflightProposal) {
+  return [
+    proposal.summary,
+    `预检能力：${proposal.capability}`,
+    `计划文件：${proposal.plan_path}；图谱：${proposal.graph_path}。`,
+    "批准后主 Agent 会按该预检方向继续执行，不会跳过约束和技能规则读取。",
+  ].join("\n\n");
+}
+
 function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
   const model = proposal.model ? `模型：${proposal.model}` : "模型：主 Agent 自动选择";
   return [
@@ -1775,6 +1798,16 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             role: "assistant" as const,
             title: "OpenClaw 操作确认",
             body: openClawProposalBody(detail.openclaw_proposal),
+          },
+        ]
+      : []),
+    ...(detail.status === "waiting_approval" && detail.project_preflight_proposal
+      ? [
+          {
+            id: `${detail.id}-project-preflight-approval`,
+            role: "assistant" as const,
+            title: detail.project_preflight_proposal.title,
+            body: projectPreflightProposalBody(detail.project_preflight_proposal),
           },
         ]
       : []),
@@ -3486,6 +3519,12 @@ export function RunsPage() {
     proposal: OpenClawProposal;
     createdOperationId: string | null;
   } | null>(null);
+  const [projectPreflightApproval, setProjectPreflightApproval] = useState<{
+    runId: string;
+    decisionToken: string;
+    version: number;
+    proposal: ProjectPreflightProposal;
+  } | null>(null);
   const [repairApproval, setRepairApproval] = useState<{
     runId: string;
     decisionToken: string;
@@ -3612,6 +3651,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setProjectPreflightApproval(null);
       setRepairApproval(null);
       setCapabilityApproval(null);
       setTemporaryApproval((current) =>
@@ -3629,6 +3669,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setProjectPreflightApproval(null);
       setRepairApproval(null);
       setCapabilityApproval(null);
       setScheduleApproval((current) =>
@@ -3641,6 +3682,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setScheduleApproval(null);
       setOpenClawApproval(null);
+      setProjectPreflightApproval(null);
       setRepairApproval(null);
       setCapabilityApproval(null);
       setEvolutionApproval((current) =>
@@ -3653,6 +3695,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setScheduleApproval(null);
       setEvolutionApproval(null);
+      setProjectPreflightApproval(null);
       setRepairApproval(null);
       setCapabilityApproval(null);
       setOpenClawApproval((current) =>
@@ -3666,6 +3709,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setProjectPreflightApproval(null);
       setCapabilityApproval(null);
       setRepairApproval((current) =>
         current &&
@@ -3676,6 +3720,26 @@ export function RunsPage() {
           : proposedRepair,
       );
     }
+    const proposedProjectPreflight = projectPreflightApprovalFromRunDetail(selectedRun.data);
+    if (proposedProjectPreflight) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setEvolutionApproval(null);
+      setOpenClawApproval(null);
+      setRepairApproval(null);
+      setCapabilityApproval(null);
+      setProjectPreflightApproval((current) =>
+        current &&
+        current.runId === proposedProjectPreflight.runId &&
+        current.version === proposedProjectPreflight.version &&
+        current.decisionToken === proposedProjectPreflight.decisionToken
+          ? current
+          : proposedProjectPreflight,
+      );
+    } else if (selectedRun.data && projectPreflightApproval?.runId === selectedRun.data.id) {
+      setProjectPreflightApproval(null);
+    }
     const proposedCapabilityApproval = capabilityApprovalFromRunDetail(selectedRun.data);
     if (proposedCapabilityApproval) {
       setModeSelection(null);
@@ -3684,6 +3748,7 @@ export function RunsPage() {
       setEvolutionApproval(null);
       setOpenClawApproval(null);
       setRepairApproval(null);
+      setProjectPreflightApproval(null);
       setCapabilityApproval((current) =>
         current &&
         current.runId === proposedCapabilityApproval.runId &&
@@ -3695,7 +3760,7 @@ export function RunsPage() {
     } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
+  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -3811,6 +3876,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setModeSelection(null);
         setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
         const continued = await api.chooseMode(run.id, {
@@ -3833,6 +3899,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(repair);
         setSubmitNotice("运行失败已生成受控自修复建议，需要确认后才会重新排队。");
       } else if (run.openclaw_proposal) {
@@ -3840,14 +3907,30 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setEvolutionApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setOpenClawApproval({ runId: run.id, proposal: run.openclaw_proposal, createdOperationId: null });
         setSubmitNotice("主 Agent 已识别为 OpenClaw 操作请求，请到 OpenClaw 管理页确认权限和执行边界。");
+      } else if (run.project_preflight_proposal && run.decision_token) {
+        setModeSelection(null);
+        setTemporaryApproval(null);
+        setScheduleApproval(null);
+        setEvolutionApproval(null);
+        setOpenClawApproval(null);
+        setRepairApproval(null);
+        setProjectPreflightApproval({
+          runId: run.id,
+          decisionToken: run.decision_token,
+          version: run.version,
+          proposal: run.project_preflight_proposal,
+        });
+        setSubmitNotice("主 Agent 已生成超大型项目预检计划，请确认后再开始执行。");
       } else if (run.schedule_proposal) {
         setModeSelection(null);
         setTemporaryApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setDismissedScheduleApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null, confirmed: false });
@@ -3857,6 +3940,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setDismissedEvolutionApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setEvolutionApproval({ runId: run.id, proposal: run.evolution_proposal, createdEvolutionId: null });
@@ -3866,6 +3950,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setTemporaryApproval({
           runId: run.id,
@@ -3881,6 +3966,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
@@ -3889,6 +3975,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setProjectPreflightApproval(null);
         setRepairApproval(null);
         setModeSelection(null);
         setSubmitNotice(override?.successNotice ?? explainActualMode(run));
@@ -3944,6 +4031,21 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setRepairApproval(null);
       setSubmitNotice("已接受受控自修复，这次运行已重新排队。");
+      await refreshRunSurfaces(run);
+    },
+  });
+
+  const approveProjectPreflight = useMutation({
+    mutationFn: () => {
+      if (!projectPreflightApproval) throw new Error("project preflight approval is unavailable");
+      return api.approveProjectPreflight(projectPreflightApproval.runId, {
+        decision_token: projectPreflightApproval.decisionToken,
+        version: projectPreflightApproval.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setProjectPreflightApproval(null);
+      setSubmitNotice("已批准项目架构预检，主 Agent 已按计划进入执行队列。");
       await refreshRunSurfaces(run);
     },
   });
@@ -4464,6 +4566,9 @@ export function RunsPage() {
     !!scheduleApproval && messages.some((item) => item.id === `${scheduleApproval.runId}-schedule-approval`);
   const openClawApprovalVisibleInMessages =
     !!openClawApproval && messages.some((item) => item.id === `${openClawApproval.runId}-openclaw-approval`);
+  const projectPreflightApprovalVisibleInMessages =
+    !!projectPreflightApproval &&
+    messages.some((item) => item.id === `${projectPreflightApproval.runId}-project-preflight-approval`);
   const repairApprovalVisibleInMessages =
     !!repairApproval && messages.some((item) => item.id === `${repairApproval.runId}-repair-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
@@ -4962,6 +5067,13 @@ export function RunsPage() {
                 <p>{openClawProposalBody(openClawApproval.proposal)}</p>
               </article>
             ) : null}
+            {projectPreflightApproval && !projectPreflightApprovalVisibleInMessages ? (
+              <article className="chat-message assistant" aria-label="项目架构预检确认">
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
+                <h3>{projectPreflightApproval.proposal.title}</h3>
+                <p>{projectPreflightProposalBody(projectPreflightApproval.proposal)}</p>
+              </article>
+            ) : null}
             {repairApproval && !repairApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="自修复文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
@@ -5075,6 +5187,9 @@ export function RunsPage() {
             {acceptSelfRepair.isError ? (
               <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p>
             ) : null}
+            {approveProjectPreflight.isError ? (
+              <p role="alert">{formatApiError(approveProjectPreflight.error, "项目预检确认失败")}</p>
+            ) : null}
             {approveCapability.isError ? (
               <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p>
             ) : null}
@@ -5091,6 +5206,19 @@ export function RunsPage() {
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
                 <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
                   {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
+                </button>
+              </aside>
+            ) : null}
+            {projectPreflightApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="项目架构预检确认">
+                <div>
+                  <span className="eyebrow">项目预检待确认</span>
+                  <strong>{projectPreflightApproval.proposal.title}</strong>
+                  <small>{projectPreflightApproval.proposal.summary}</small>
+                </div>
+                <p>{projectPreflightProposalBody(projectPreflightApproval.proposal)}</p>
+                <button type="button" disabled={approveProjectPreflight.isPending} onClick={() => approveProjectPreflight.mutate()}>
+                  {approveProjectPreflight.isPending ? "排队中..." : "批准并开始执行"}
                 </button>
               </aside>
             ) : null}

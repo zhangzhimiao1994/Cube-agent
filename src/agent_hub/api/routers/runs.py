@@ -132,6 +132,16 @@ class RunServiceProtocol(Protocol):
         version: int,
     ) -> SubmittedRun: ...
 
+    async def approve_project_preflight(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
     async def approve_capability(
         self,
         *,
@@ -285,6 +295,11 @@ class AcceptSelfRepairRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class ProjectPreflightApprovalRequest(BaseModel):
+    decision_token: str = Field(min_length=32, max_length=160)
+    version: int = Field(ge=1)
+
+
 class CapabilityApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -313,6 +328,7 @@ class SubmittedRunResponse(BaseModel):
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
     openclaw_proposal: dict[str, object] | None = None
+    project_preflight_proposal: dict[str, object] | None = None
     repair_proposal: dict[str, object] | None = None
 
     @classmethod
@@ -338,6 +354,7 @@ class SubmittedRunResponse(BaseModel):
             schedule_proposal=run.schedule_proposal,
             evolution_proposal=run.evolution_proposal,
             openclaw_proposal=run.openclaw_proposal,
+            project_preflight_proposal=run.project_preflight_proposal,
             repair_proposal=_repair_proposal_response(run.repair_proposal),
         )
 
@@ -1075,6 +1092,39 @@ async def accept_self_repair(
 ) -> SubmittedRunResponse:
     try:
         submitted = await service.accept_self_repair(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            decision_token=body.decision_token,
+            version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/approve-project-preflight",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def approve_project_preflight(
+    run_id: UUID,
+    body: ProjectPreflightApprovalRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.approve_project_preflight(
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
             run_id=run_id,

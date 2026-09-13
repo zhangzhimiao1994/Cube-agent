@@ -595,6 +595,21 @@ const OpenClawProposalSchema = z.object({
   summary: z.string(),
   metadata: z.record(z.string(), z.string()),
 });
+const ProjectPreflightProposalSchema = z.object({
+  kind: z.literal("project_architecture_preflight"),
+  title: z.string(),
+  request: z.string(),
+  mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
+  project_id: z.string(),
+  workspace_session_id: z.string(),
+  capability: z.literal("project.preflight_architecture"),
+  plan_path: z.string(),
+  graph_path: z.string(),
+  requires_constraints_and_skills_reading: z.boolean(),
+  approval_policy: z.enum(["ask_before_execute"]),
+  summary: z.string(),
+  metadata: z.record(z.string(), z.string()),
+});
 const RepairProposalSchema = z.object({
   kind: z.literal("self_repair"),
   title: z.string(),
@@ -634,6 +649,7 @@ const SubmittedRunSchema = z.object({
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
+  project_preflight_proposal: ProjectPreflightProposalSchema.nullable().optional(),
   repair_proposal: RepairProposalSchema.nullable().optional(),
 });
 
@@ -822,6 +838,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
+  project_preflight_proposal: ProjectPreflightProposalSchema.nullable().optional(),
   repair_proposal: RepairProposalSchema.nullable().optional(),
 });
 
@@ -2064,6 +2081,16 @@ export const api = {
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/accept-repair`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  approveProjectPreflight(
+    id: string,
+    payload: { decision_token: string; version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/approve-project-preflight`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

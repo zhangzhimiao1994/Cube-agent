@@ -84,6 +84,7 @@ class SubmittedRun:
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
     openclaw_proposal: dict[str, object] | None = None
+    project_preflight_proposal: dict[str, object] | None = None
     repair_proposal: dict[str, object] | None = None
 
 
@@ -244,6 +245,38 @@ class OpenClawProposal:
             "summary": self.summary,
             "metadata": {
                 "source": "chat_openclaw_proposal",
+                "requires_user_confirmation": "true",
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectPreflightProposal:
+    title: str
+    request: str
+    mode: TaskMode
+    project_id: str
+    workspace_session_id: str
+    plan_path: str
+    graph_path: str
+    summary: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": "project_architecture_preflight",
+            "title": self.title,
+            "request": self.request,
+            "mode": self.mode.value,
+            "project_id": self.project_id,
+            "workspace_session_id": self.workspace_session_id,
+            "capability": "project.preflight_architecture",
+            "plan_path": self.plan_path,
+            "graph_path": self.graph_path,
+            "requires_constraints_and_skills_reading": True,
+            "approval_policy": "ask_before_execute",
+            "summary": self.summary,
+            "metadata": {
+                "source": "chat_project_preflight_proposal",
                 "requires_user_confirmation": "true",
             },
         }
@@ -497,6 +530,28 @@ class RunService:
                 proposal=openclaw_proposal,
                 idempotency_key=idempotency_key,
                 operator_selection=operator_selection,
+            )
+        project_preflight_proposal = _local_project_preflight_proposal(
+            message=message,
+            mode=TaskMode.HYBRID if mode is TaskMode.AUTO else mode,
+            project_id=workspace.project_id,
+            workspace_session_id=workspace.session_id,
+        )
+        if project_preflight_proposal is not None:
+            return await self._create_project_preflight_approval_run(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                actor_role=actor_role,
+                message=message,
+                mode=project_preflight_proposal.mode,
+                proposal=project_preflight_proposal,
+                idempotency_key=idempotency_key,
+                operator_selection={
+                    "reason": "main_agent_local_resolution",
+                    "main_agent_selected_mode": project_preflight_proposal.mode.value,
+                    "mode_source": "project_preflight",
+                    **operator_selection,
+                },
             )
         if mode is TaskMode.AUTO:
             explicit_mode = _explicit_conversation_mode_switch(message)
@@ -1039,6 +1094,24 @@ class RunService:
     ) -> SubmittedRun:
         del actor_id
         record = await self._repository.accept_self_repair_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            decision_token=decision_token,
+            version=version,
+        )
+        return _submitted(record)
+
+    async def approve_project_preflight(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        record = await self._repository.approve_project_preflight_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
             decision_token=decision_token,
@@ -2238,6 +2311,39 @@ class RunService:
         )
         return _submitted(record)
 
+    async def _create_project_preflight_approval_run(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        actor_role: Role | None,
+        message: str,
+        mode: TaskMode,
+        proposal: ProjectPreflightProposal,
+        idempotency_key: str | None,
+        operator_selection: dict[str, object],
+    ) -> SubmittedRun:
+        token = _decision_token()
+        proposal_payload = proposal.to_payload()
+        record = await self._repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            request=message,
+            mode=mode,
+            status=RunStatus.WAITING_APPROVAL,
+            idempotency_key=idempotency_key,
+            routing_decision={
+                **operator_selection,
+                "reason": "project_preflight_requires_user_approval",
+                "decision_token": token,
+                "approval_kind": "project_preflight",
+                "project_preflight_proposal": proposal_payload,
+            },
+            enqueue=False,
+        )
+        return _submitted(record)
+
     async def _safe_record_hermes_outcome(
         self,
         *,
@@ -2558,6 +2664,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     schedule_proposal = decision.get("schedule_proposal")
     evolution_proposal = decision.get("evolution_proposal")
     openclaw_proposal = decision.get("openclaw_proposal")
+    project_preflight_proposal = decision.get("project_preflight_proposal")
     repair_proposal = decision.get("repair_proposal")
     repair_proposal_is_actionable = not (
         record.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
@@ -2608,6 +2715,9 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         else None,
         openclaw_proposal=cast(dict[str, object], openclaw_proposal)
         if isinstance(openclaw_proposal, dict)
+        else None,
+        project_preflight_proposal=cast(dict[str, object], project_preflight_proposal)
+        if isinstance(project_preflight_proposal, dict)
         else None,
         repair_proposal=cast(dict[str, object], repair_proposal)
         if isinstance(repair_proposal, dict) and repair_proposal_is_actionable
@@ -3052,6 +3162,32 @@ def _local_openclaw_proposal(
         operation_text=message.strip(),
         source_conversation_id=conversation_id,
         summary="Main Agent detected an OpenClaw computer/server operation request. Confirm target, permissions, and risk before creating the controlled operation.",
+    )
+
+
+def _local_project_preflight_proposal(
+    *,
+    message: str,
+    mode: TaskMode,
+    project_id: str,
+    workspace_session_id: str,
+) -> ProjectPreflightProposal | None:
+    if mode not in {TaskMode.AUTO, TaskMode.DISPATCH, TaskMode.HYBRID}:
+        return None
+    if not _message_suggests_ultra_large_project(message):
+        return None
+    return ProjectPreflightProposal(
+        title="超大型项目架构预检",
+        request=message.strip(),
+        mode=TaskMode.HYBRID,
+        project_id=project_id,
+        workspace_session_id=workspace_session_id,
+        plan_path="PROJECT_ARCHITECTURE_PLAN.md",
+        graph_path="architecture-map.html",
+        summary=(
+            "先读取项目约束和技能规则，生成架构方向、阶段计划、验收矩阵和浏览器图谱；"
+            "用户批准后再进入分阶段实现。"
+        ),
     )
 
 

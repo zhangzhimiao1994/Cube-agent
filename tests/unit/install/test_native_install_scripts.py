@@ -185,6 +185,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'string_schema.get("maxLength") != 90' in command
     assert 'string_schema.get("pattern") != "^[A-Za-z0-9._:-]+$"' in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
+    assert 'check_openapi_path "run project preflight approval" "/api/v1/runs/{run_id}/approve-project-preflight" "post"' in command
     assert 'check_openapi_path "admin schedule list" "/api/v1/admin/schedules" "get"' in command
     assert 'check_openapi_path "admin schedule create" "/api/v1/admin/schedules" "post"' in command
     assert 'check_openapi_path "admin schedule tick" "/api/v1/admin/schedules/tick" "post"' in command
@@ -211,6 +212,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin_package_adapter_unavailable"' in command
     assert '"plugin_package_capability_isolation_mismatch"' in command
     assert '"project.preflight_architecture"' in command
+    assert "run project preflight approval requires bearer" in command
     assert "PROJECT_ARCHITECTURE_PLAN.md" in command
     assert "architecture-map.html" in command
     assert "约束和技能规则读取" in command

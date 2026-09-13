@@ -144,6 +144,17 @@ def _temporary_agent_revision_already_applied(
     )
 
 
+def _project_preflight_approval_already_applied(
+    routing_decision: dict[str, object],
+    decision_token: str,
+) -> bool:
+    return (
+        routing_decision.get("approval_kind") == "project_preflight"
+        and routing_decision.get("decision_token") == decision_token
+        and routing_decision.get("project_preflight_approved") is True
+    )
+
+
 def _self_repair_decision_token_hash(decision_token: str) -> str:
     return hashlib.sha256(decision_token.encode("utf-8")).hexdigest()
 
@@ -527,6 +538,52 @@ class RunRepository:
                     run_id=run_id,
                     task_name="agent_hub.runs.execute",
                     idempotency_key=f"{tenant_id}:{run_id}:temporary-agent-revision:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
+    async def approve_project_preflight_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                if _project_preflight_approval_already_applied(routing_decision, decision_token):
+                    return self._record(row)
+                raise RunConflict("run is not waiting for project preflight approval")
+            if routing_decision.get("approval_kind") != "project_preflight":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("decision_token") != decision_token:
+                raise RunConflict("project preflight approval token is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            proposal = routing_decision.get("project_preflight_proposal")
+            if not isinstance(proposal, dict) or proposal.get("kind") != "project_architecture_preflight":
+                raise RunConflict("project preflight proposal is invalid")
+            row.routing_decision = {
+                **routing_decision,
+                "project_preflight_approved": True,
+            }
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:project-preflight:{version}",
                     payload={"run_id": str(run_id)},
                 )
             )

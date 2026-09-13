@@ -203,6 +203,44 @@ class FakeRepository:
         self.outbox.append((run_id, f"{tenant_id}:{run_id}:temporary-agent-revision:{version}"))
         return updated
 
+    async def approve_project_preflight_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> RunRecord:
+        record = self.records.get(run_id)
+        if record is None or record.tenant_id != tenant_id:
+            raise RunNotFound("run was not found")
+        if record.status is not RunStatus.WAITING_APPROVAL:
+            raise RunConflict("run is not waiting for project preflight approval")
+        decision = dict(record.routing_decision or {})
+        if decision.get("approval_kind") != "project_preflight":
+            raise RunConflict("run is waiting for a different approval")
+        if decision.get("decision_token") != decision_token:
+            raise RunConflict("project preflight approval token is invalid")
+        if record.version != version:
+            raise RunConflict("run version is stale")
+        updated = RunRecord(
+            id=record.id,
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            request=record.request,
+            mode=record.mode,
+            status=RunStatus.QUEUED,
+            version=record.version + 1,
+            created_at=record.created_at,
+            routing_decision={
+                **decision,
+                "project_preflight_approved": True,
+            },
+        )
+        self.records[run_id] = updated
+        self.outbox.append((run_id, f"{tenant_id}:{run_id}:project-preflight:{version}"))
+        return updated
+
 
 class FakeTemporaryAgentPolicy:
     async def propose(
@@ -821,6 +859,82 @@ async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -
     assert routing is not None
     assert routing["reason"] == "main_agent_local_resolution"
     assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+@pytest.mark.asyncio
+async def test_ultra_large_project_requires_preflight_approval_before_queueing() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message=(
+            "添加超大型项目架构和构建能力，从需求拆解、架构搭建、分阶段实现、"
+            "严格验收测试到最终生产结果都要稳定完成"
+        ),
+        mode=TaskMode.AUTO,
+        project_id="cube-agent",
+        workspace_session_id="conv-mega-project",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.HYBRID
+    assert submitted.clarification_reason == "project_preflight_requires_user_approval"
+    assert submitted.project_preflight_proposal is not None
+    assert submitted.project_preflight_proposal["capability"] == "project.preflight_architecture"
+    assert submitted.project_preflight_proposal["plan_path"] == "PROJECT_ARCHITECTURE_PLAN.md"
+    assert submitted.project_preflight_proposal["graph_path"] == "architecture-map.html"
+    assert submitted.project_preflight_proposal["requires_constraints_and_skills_reading"] is True
+    assert repository.outbox == []
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["approval_kind"] == "project_preflight"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["project_preflight_proposal"] == submitted.project_preflight_proposal
+
+
+@pytest.mark.asyncio
+async def test_project_preflight_approval_enqueues_the_planned_run() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="需要构建一个大型项目，从架构设计到生产结果全部完成",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.decision_token is not None
+    approved = await service.approve_project_preflight(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=submitted.id,
+        decision_token=submitted.decision_token,
+        version=submitted.version,
+    )
+
+    assert approved.status is RunStatus.QUEUED
+    assert approved.mode is TaskMode.HYBRID
+    assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}:project-preflight:1")]
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["project_preflight_approved"] is True
 
 
 @pytest.mark.asyncio

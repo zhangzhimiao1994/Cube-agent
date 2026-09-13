@@ -485,6 +485,7 @@ class RunDetailResponse(RunListItem):
     schedule_proposal: dict[str, JsonValue] | None = None
     evolution_proposal: dict[str, JsonValue] | None = None
     openclaw_proposal: dict[str, JsonValue] | None = None
+    project_preflight_proposal: dict[str, JsonValue] | None = None
     repair_proposal: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
@@ -6382,6 +6383,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             schedule_proposal=_schedule_proposal(record.routing_decision),
             evolution_proposal=_evolution_proposal(record.routing_decision),
             openclaw_proposal=_openclaw_proposal(record.routing_decision),
+            project_preflight_proposal=_project_preflight_proposal(record.routing_decision),
             repair_proposal=_repair_proposal(record.routing_decision),
         )
 
@@ -11593,6 +11595,18 @@ def _openclaw_proposal(
     if routing_decision is None:
         return None
     proposal = routing_decision.get("openclaw_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    safe = _safe_proposal_json_mapping(proposal)
+    return safe or None
+
+
+def _project_preflight_proposal(
+    routing_decision: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if routing_decision is None:
+        return None
+    proposal = routing_decision.get("project_preflight_proposal")
     if not isinstance(proposal, dict):
         return None
     safe = _safe_proposal_json_mapping(proposal)
