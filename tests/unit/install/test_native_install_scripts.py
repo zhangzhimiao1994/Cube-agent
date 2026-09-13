@@ -68,9 +68,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "harness-acceptance  Run Codex/DeepSeek harness acceptance smoke and stress checks." in launcher
     assert "harness-acceptance" in launcher
     assert "Usage: scripts/agent-hub harness-acceptance" in command
-    assert "--profile codex|deepseek|all" in command
+    assert "--profile codex|deepseek|all|production-safe" in command
     assert "--stress" in command
     assert "--read-only" in command
+    assert 'production-safe) profile="all"; read_only=1 ;;' in command
+    assert 'codex|deepseek|all|production-safe) ;;' in command
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
     assert "check_health_json" in command

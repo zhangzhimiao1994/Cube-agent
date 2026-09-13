@@ -27,7 +27,8 @@ create/read/events lifecycle probe against /api/v1/runs.
 
 Options:
   --base-url URL                 Base URL to test.
-  --profile codex|deepseek|all   Acceptance profile to run.
+  --profile codex|deepseek|all|production-safe
+                                 Acceptance profile to run. production-safe runs all profiles in read-only mode.
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
   --stress                       Run bounded HTTP stress checks.
   --concurrency N                Stress workers. Defaults to AGENT_HUB_ACCEPTANCE_CONCURRENCY or 4.
@@ -94,11 +95,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$profile" in
-  codex|deepseek|all) ;;
+  codex|deepseek|all|production-safe) ;;
   *)
     printf 'invalid --profile: %s\n' "$profile" >&2
     exit 2
     ;;
+esac
+
+case "$profile" in
+  production-safe) profile="all"; read_only=1 ;;
 esac
 
 positive_int() {
