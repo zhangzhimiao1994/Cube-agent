@@ -1457,7 +1457,14 @@ run_lifecycle_profile() {
     return 1
   fi
 
-  printf 'ok: run lifecycle create/read/events run_id=%s\n' "$run_id"
+  post_run_control_expect_status \
+    "$python_bin" \
+    "$run_id" \
+    "cancel" \
+    "cancelled" \
+    "run lifecycle cleanup cancel reaches cancelled" || return 1
+
+  printf 'ok: run lifecycle create/read/events/cleanup run_id=%s\n' "$run_id"
 }
 
 run_create_idempotency_replay_guard_profile() {

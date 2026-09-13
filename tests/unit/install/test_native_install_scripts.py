@@ -153,6 +153,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"/api/v1/runs"' in command
     assert '"/api/v1/runs/$run_id"' in command
     assert '"/api/v1/runs/$run_id/events"' in command
+    assert "run lifecycle cleanup cancel reaches cancelled" in command
     assert "profile: authenticated schedule interaction guard" in command
     assert "ordinary reminder must not return schedule proposal" in command
     assert "explicit schedule task must return schedule proposal" in command
