@@ -166,6 +166,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "cancel probe pause reaches paused" in command
     assert "repeated cancel stays cancelled" in command
     assert 'check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post"' in command
+    assert "check_openapi_run_create_idempotency_header" in command
+    assert "ok: run create idempotency header schema" in command
+    assert "fail: run create idempotency header schema" in command
     assert 'check_openapi_path "run capability approval" "/api/v1/runs/{run_id}/approve-capability" "post"' in command
     assert 'check_openapi_path "plugin package install" "/api/v1/admin/plugins/install" "post"' in command
     assert 'securitySchemes", {}).get("BearerAuth")' in command

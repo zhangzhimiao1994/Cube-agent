@@ -535,6 +535,49 @@ PY
   return 1
 }
 
+check_openapi_run_create_idempotency_header() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+operation = document.get("paths", {}).get("/api/v1/runs", {}).get("post", {})
+parameters = operation.get("parameters", [])
+header = None
+for item in parameters:
+    if (
+        isinstance(item, dict)
+        and str(item.get("name", "")).lower() == "idempotency-key"
+        and item.get("in") == "header"
+    ):
+        header = item
+        break
+if not isinstance(header, dict):
+    raise SystemExit(1)
+if header.get("required") is True:
+    raise SystemExit(1)
+schema = header.get("schema", {})
+if not isinstance(schema, dict):
+    raise SystemExit(1)
+if schema.get("type") == "string":
+    raise SystemExit(0)
+any_of = schema.get("anyOf")
+if isinstance(any_of, list) and any(
+    isinstance(item, dict) and item.get("type") == "string" for item in any_of
+):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    printf 'ok: run create idempotency header schema\n'
+    return 0
+  fi
+  printf 'fail: run create idempotency header schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_capability_manifest_failure_codes_schema() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -1245,6 +1288,8 @@ run_openapi_capability_profile() {
   fi
   check_openapi_safe_projection || true
   check_openapi_schema_safe_projection || true
+  check_openapi_path "run create" "/api/v1/runs" "post" || true
+  check_openapi_run_create_idempotency_header || true
   check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
   check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
   check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post" || true
