@@ -114,6 +114,12 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"password_hash"' in command
     assert '"chain_of_thought"' in command
     assert "fail: openapi safe projection" in command
+    assert 'check_openapi_schema_safe_projection' in command
+    assert '"RunSummaryResponse"' in command
+    assert '"RunDetailResponse"' in command
+    assert '"checkpoint_state"' in command
+    assert '"provider_metadata"' in command
+    assert "fail: run detail schema safe projection" in command
     assert 'check_error_envelope "missing api route envelope" "/api/missing-acceptance-probe" "GET" "404" "not_found"' in command
     assert 'check_error_envelope "method not allowed envelope" "/health/live" "POST" "405" "method_not_allowed"' in command
     assert 'check_openapi_path "run reject capability" "/api/v1/runs/{run_id}/reject-capability" "post"' in command

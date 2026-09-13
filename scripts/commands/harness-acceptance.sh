@@ -368,6 +368,106 @@ PY
   return 1
 }
 
+check_openapi_schema_safe_projection() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+schemas = document.get("components", {}).get("schemas", {})
+forbidden = (
+    "password_hash",
+    "code_hash",
+    "ciphertext",
+    "nonce",
+    "private_key",
+    "secret_key_hash",
+    "encrypted_secret",
+    "chain_of_thought",
+    "hidden_reasoning",
+    "checkpoint_state",
+    "state_sha256",
+    "lease_id",
+    "quota_scope_id",
+    "outbox",
+    "provider_metadata",
+    "traceback",
+    "api_base",
+)
+
+
+def resolve_ref(ref):
+    prefix = "#/components/schemas/"
+    if not isinstance(ref, str) or not ref.startswith(prefix):
+        return None
+    return ref.removeprefix(prefix)
+
+
+def collect_schema(name, seen):
+    if name in seen:
+        return {}
+    seen.add(name)
+    schema = schemas.get(name)
+    if not isinstance(schema, dict):
+        raise SystemExit(1)
+    collected = {name: schema}
+    stack = [schema]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            ref_name = resolve_ref(current.get("$ref"))
+            if ref_name and ref_name not in seen:
+                seen.add(ref_name)
+                ref_schema = schemas.get(ref_name)
+                if not isinstance(ref_schema, dict):
+                    raise SystemExit(1)
+                collected[ref_name] = ref_schema
+                stack.append(ref_schema)
+            for value in current.values():
+                stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return collected
+
+
+target_schemas = {}
+for schema_name in (
+    "RunSummaryResponse",
+    "RunDetailResponse",
+    "RunEventResponse",
+    "RunArtifactResponse",
+):
+    target_schemas.update(collect_schema(schema_name, set()))
+serialized = json.dumps(target_schemas, ensure_ascii=False).lower()
+for sensitive in forbidden:
+    if sensitive in serialized:
+        raise SystemExit(1)
+details_responses = (
+    document.get("paths", {})
+    .get("/api/v1/runs/{run_id}/details", {})
+    .get("get", {})
+    .get("responses", {})
+)
+details_schema = (
+    details_responses.get("200", {})
+    .get("content", {})
+    .get("application/json", {})
+    .get("schema", {})
+)
+if details_schema != {"$ref": "#/components/schemas/RunSummaryResponse"}:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: run detail schema safe projection\n'
+    return 0
+  fi
+  printf 'fail: run detail schema safe projection\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
   check_url "api health alias" "/health" || true
@@ -451,6 +551,7 @@ run_openapi_capability_profile() {
     return 1
   fi
   check_openapi_safe_projection || true
+  check_openapi_schema_safe_projection || true
   check_openapi_path "run pause control" "/api/v1/runs/{run_id}/pause" "post" || true
   check_openapi_path "run resume control" "/api/v1/runs/{run_id}/resume" "post" || true
   check_openapi_path "run cancel control" "/api/v1/runs/{run_id}/cancel" "post" || true
