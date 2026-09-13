@@ -1303,8 +1303,13 @@ require(
 require(
     "stage_status" in approved_preflight_context
     and "verification_evidence" in approved_preflight_context
-    and "remaining_risks" in approved_preflight_context,
+    and "remaining_risks" in approved_preflight_context
+    and "stage_repair_actions" in approved_preflight_context,
     "approved project preflight context exposes implementation stage fields",
+)
+require(
+    "diagnose failed stages" in approved_preflight_context,
+    "approved project preflight context requires bounded stage repair",
 )
 require(
     "acceptance_review" in approved_preflight_context,
@@ -1322,6 +1327,7 @@ staged_packet = _artifact_review_packet_payload(
                     "verification_evidence": ["harness passed"],
                     "remaining_risks": ["tokened probe pending"],
                     "acceptance_review": ["accepted"],
+                    "stage_repair_actions": ["fixed failing build stage"],
                 },
                 ensure_ascii=False,
             )
@@ -1339,6 +1345,10 @@ require(
 require(
     staged_fields.get("acceptance_review") == ("accepted",),
     "approved project preflight review packet exposes acceptance review",
+)
+require(
+    staged_fields.get("stage_repair_actions") == ("fixed failing build stage",),
+    "approved project preflight review packet exposes stage repair actions",
 )
 direct_preflight_prompt = DirectRuntime(object(), logical_model="main")._build_prompt(
     TaskContext(
@@ -1411,6 +1421,10 @@ require(
     "approved project preflight role schema exposes staged evidence",
 )
 require(
+    dispatch_preflight_agents["builder"].output_schema.get("stage_repair_actions") == "string[]",
+    "approved project preflight role schema exposes staged repair actions",
+)
+require(
     dispatch_preflight_steps["quality_reviewer_step"].depends_on == ("builder_step",),
     "approved project preflight reviewer waits for staged implementation",
 )
@@ -1441,9 +1455,21 @@ require(
     "approved project preflight implementation requires staged evidence",
 )
 require(
+    "diagnose failed stages before escalating" in dispatch_preflight_steps["builder_step"].task,
+    "approved project preflight implementation diagnoses failed stages",
+)
+require(
+    "record stage_repair_actions" in dispatch_preflight_steps["builder_step"].task,
+    "approved project preflight implementation records stage repair actions",
+)
+require(
     "stage-by-stage implementation status"
     in dispatch_preflight_steps["final_response_step"].task,
     "approved project preflight final response reports staged status",
+)
+require(
+    "self-repair actions" in dispatch_preflight_steps["final_response_step"].task,
+    "approved project preflight final response reports repair actions",
 )
 
 for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):

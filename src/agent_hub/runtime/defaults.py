@@ -1073,7 +1073,9 @@ def _project_preflight_implementation_guidance(preflight_context: str) -> str:
         "Project preflight implementation contract: Use the project_preflight_step output "
         "as the implementation contract. Break the work into stage-by-stage implementation "
         "slices, preserve the approved architecture boundaries, and return verification "
-        "evidence for each stage before delivery. "
+        "evidence for each stage before delivery. If a stage fails, diagnose failed stages "
+        "before escalating, apply a bounded repair inside the approved architecture, rerun "
+        "verification, and record stage_repair_actions with the evidence. "
     )
 
 
@@ -1083,7 +1085,8 @@ def _project_preflight_final_guidance(preflight_context: str) -> str:
     return (
         "For the approved project preflight: Use the project_preflight_step output as the "
         "implementation contract, and summarize the architecture plan, graph path, "
-        "stage-by-stage implementation status, verification evidence, and unresolved risks. "
+        "stage-by-stage implementation status, verification evidence, self-repair actions, "
+        "and unresolved risks. "
     )
 
 
@@ -1098,6 +1101,7 @@ def _project_preflight_role_output_schema(
     output_schema.setdefault("stage_status", "string[]")
     output_schema.setdefault("verification_evidence", "string[]")
     output_schema.setdefault("remaining_risks", "string[]")
+    output_schema.setdefault("stage_repair_actions", "string[]")
     if _is_post_product_role(role):
         output_schema.setdefault("acceptance_review", "string[]")
     return output_schema

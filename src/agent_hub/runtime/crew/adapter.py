@@ -555,6 +555,7 @@ _STAGED_PREFLIGHT_FIELD_NAMES = (
     "verification_evidence",
     "remaining_risks",
     "acceptance_review",
+    "stage_repair_actions",
 )
 
 

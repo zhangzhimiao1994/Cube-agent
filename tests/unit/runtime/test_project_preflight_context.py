@@ -26,7 +26,9 @@ def test_project_preflight_context_formats_approved_guidance() -> None:
     assert "stage_status" in text
     assert "verification_evidence" in text
     assert "remaining_risks" in text
+    assert "stage_repair_actions" in text
     assert "acceptance_review" in text
+    assert "diagnose failed stages" in text
 
 
 def test_project_preflight_context_ignores_unapproved_payloads() -> None:

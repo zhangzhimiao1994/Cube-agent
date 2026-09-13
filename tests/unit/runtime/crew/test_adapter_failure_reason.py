@@ -2915,6 +2915,7 @@ def test_artifact_review_packet_payload_extracts_staged_preflight_fields() -> No
                     "verification_evidence": ["unit test passed"],
                     "remaining_risks": ["needs live token probe"],
                     "acceptance_review": ["approved"],
+                    "stage_repair_actions": ["fixed failing build stage"],
                 },
                 ensure_ascii=False,
             )
@@ -2930,6 +2931,7 @@ def test_artifact_review_packet_payload_extracts_staged_preflight_fields() -> No
         "verification_evidence": ("unit test passed",),
         "remaining_risks": ("needs live token probe",),
         "acceptance_review": ("approved",),
+        "stage_repair_actions": ("fixed failing build stage",),
     }
 
 

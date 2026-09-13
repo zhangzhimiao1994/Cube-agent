@@ -4628,9 +4628,11 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
     assert agents["builder"].output_schema["stage_status"] == "string[]"
     assert agents["builder"].output_schema["verification_evidence"] == "string[]"
     assert agents["builder"].output_schema["remaining_risks"] == "string[]"
+    assert agents["builder"].output_schema["stage_repair_actions"] == "string[]"
     assert agents["quality_reviewer"].output_schema["stage_status"] == "string[]"
     assert agents["quality_reviewer"].output_schema["verification_evidence"] == "string[]"
     assert agents["quality_reviewer"].output_schema["remaining_risks"] == "string[]"
+    assert agents["quality_reviewer"].output_schema["stage_repair_actions"] == "string[]"
     assert agents["quality_reviewer"].output_schema["acceptance_review"] == "string[]"
     assert steps["project_preflight_step"].agent == "project_preflight_architect"
     assert "PROJECT_ARCHITECTURE_PLAN.md" in steps["project_preflight_step"].task
@@ -4642,6 +4644,8 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
     )
     assert "stage-by-stage implementation slices" in steps["builder_step"].task
     assert "verification evidence for each stage" in steps["builder_step"].task
+    assert "diagnose failed stages before escalating" in steps["builder_step"].task
+    assert "record stage_repair_actions" in steps["builder_step"].task
     assert steps["quality_reviewer_step"].depends_on == ("builder_step",)
     assert (
         "Use the project_preflight_step output as the implementation contract"
@@ -4653,6 +4657,7 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
         "quality_reviewer_step",
     )
     assert "stage-by-stage implementation status" in steps["final_response_step"].task
+    assert "self-repair actions" in steps["final_response_step"].task
 
 
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:

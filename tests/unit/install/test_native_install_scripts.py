@@ -236,6 +236,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "approved project preflight context exposes review stage fields" in command
     assert "approved project preflight review packet exposes staged status" in command
     assert "approved project preflight review packet exposes acceptance review" in command
+    assert "approved project preflight review packet exposes stage repair actions" in command
+    assert "approved project preflight context requires bounded stage repair" in command
+    assert "approved project preflight role schema exposes staged repair actions" in command
+    assert "approved project preflight final response reports repair actions" in command
     assert "approved project preflight explicit dispatch stage" in command
     assert "approved project preflight role schema exposes staged status" in command
     assert "approved project preflight role schema exposes staged evidence" in command

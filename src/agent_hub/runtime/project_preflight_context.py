@@ -45,6 +45,7 @@ def project_preflight_context_text(
             "stage_status",
             "verification_evidence",
             "remaining_risks",
+            "stage_repair_actions",
         ),
         "review_stage_output_fields": ("acceptance_review",),
     }
@@ -66,7 +67,8 @@ def project_preflight_context_text(
         "project.preflight_architecture when available to create or update "
         "PROJECT_ARCHITECTURE_PLAN.md and architecture-map.html before staged implementation. "
         "Keep implementation staged, verified, structured with stage evidence fields, "
-        "and within existing approval boundaries. "
+        "diagnose failed stages before escalating, repair within approved boundaries, "
+        "rerun verification, record stage_repair_actions, and stay within existing approval boundaries. "
         f"{encoded}"
         "</PROJECT_PREFLIGHT_CONTEXT>"
     )
