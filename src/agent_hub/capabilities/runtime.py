@@ -30,6 +30,7 @@ from agent_hub.files.generated import (
     safe_generated_filename,
 )
 from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.project_preflight import build_project_preflight_files
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
@@ -37,6 +38,7 @@ from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
+_PROJECT_PREFLIGHT_TOOL = "project.preflight_architecture"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
@@ -46,6 +48,7 @@ _DOTTED_BUILT_INS = frozenset({
     "workspace.read",
     _DOCX_TOOL,
     _PPTX_TOOL,
+    _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
 })
 _REPLAY_SAFE = frozenset({
@@ -57,6 +60,7 @@ _REPLAY_SAFE = frozenset({
     "workspace.read",
     _DOCX_TOOL,
     _PPTX_TOOL,
+    _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
 })
 _BUILTIN_ALIASES = {
@@ -67,6 +71,7 @@ _MANIFEST_BUILTINS = (
     "calculator.evaluate",
     _DOCX_TOOL,
     _PPTX_TOOL,
+    _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
     "read_context",
     "workspace.read",
@@ -209,6 +214,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_docx(tenant_id, run_id, arguments)
         if normalized_name == _PPTX_TOOL:
             return self._execute_generate_pptx(tenant_id, run_id, arguments)
+        if normalized_name == _PROJECT_PREFLIGHT_TOOL:
+            return self._execute_project_preflight(tenant_id, arguments)
         if normalized_name == _PROJECT_ZIP_TOOL:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         return await self._execute_skill(
@@ -371,6 +378,54 @@ class RuntimeCapabilityGateway:
             result["workspace_files"] = workspace_files
         return result
 
+    def _execute_project_preflight(
+        self,
+        tenant_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        if self._project_workspace_store is None:
+            raise RuntimeCapabilityError("project workspace store is not configured")
+        project_id = _optional_string(arguments, "project_id")
+        session_id = _optional_string(arguments, "workspace_session_id")
+        if project_id is None or session_id is None:
+            raise RuntimeCapabilityError("project preflight requires project_id and workspace_session_id")
+        files = build_project_preflight_files(
+            title=_optional_string(arguments, "title") or "Project Architecture Preflight",
+            request=_required_string(arguments, "request"),
+        )
+        workspace_files = tuple(
+            cast(
+                Mapping[str, JsonValue],
+                self._project_workspace_store.write_bytes(
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    session_id=session_id,
+                    relative_path=path,
+                    data=data,
+                    mime_type=_workspace_mime_type(path),
+                ).to_public_dict(),
+            )
+            for path, data in sorted(files.items())
+        )
+        return {
+            "summary": "Generated project architecture preflight plan and browser map.",
+            "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+            "graph_path": "architecture-map.html",
+            "plan_download_url": _workspace_file_download_url(
+                self._project_workspace_store,
+                project_id,
+                session_id,
+                "PROJECT_ARCHITECTURE_PLAN.md",
+            ),
+            "graph_download_url": _workspace_file_download_url(
+                self._project_workspace_store,
+                project_id,
+                session_id,
+                "architecture-map.html",
+            ),
+            "workspace_files": workspace_files,
+        }
+
     def _copy_project_files_to_workspace(
         self,
         tenant_id: UUID,
@@ -477,6 +532,8 @@ class RuntimeCapabilityGateway:
     def _builtin_availability_reason(self, name: str) -> str | None:
         if name == "workspace.read" and self._workspace_root is None:
             return "workspace_root_not_configured"
+        if name == _PROJECT_PREFLIGHT_TOOL and self._project_workspace_store is None:
+            return "project_workspace_store_not_configured"
         if name in {_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL} and (
             self._generated_file_store is None
         ):
@@ -715,6 +772,8 @@ def _builtin_sandbox_profile(name: str) -> str:
         return "in_process"
     if name == "workspace.read":
         return "workspace_read"
+    if name == _PROJECT_PREFLIGHT_TOOL:
+        return "project_workspace_store"
     return "generated_artifact_store"
 
 
@@ -871,6 +930,17 @@ def _workspace_mime_type(path: str) -> str:
     if lowered.endswith(".py"):
         return "text/x-python"
     return "text/plain"
+
+
+def _workspace_file_download_url(
+    store: ProjectWorkspaceStore,
+    project_id: str,
+    session_id: str,
+    path: str,
+) -> str:
+    bundle_url = store.bundle_download_url(project_id, session_id)
+    base_url = bundle_url.rsplit("/bundle/download", 1)[0]
+    return f"{base_url}/files/download?path={path}"
 
 
 def _file_result(

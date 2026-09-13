@@ -2814,6 +2814,8 @@ def _message_suggests_tool_use(message: str) -> bool:
 
 def _message_suggests_long_running(message: str) -> bool:
     text = message.casefold()
+    if _message_suggests_ultra_large_project(message):
+        return True
     markers = (
         "部署",
         "端到端",
@@ -2832,6 +2834,8 @@ def _message_suggests_long_running(message: str) -> bool:
 
 def _message_suggests_sandbox(message: str) -> bool:
     text = message.casefold()
+    if _message_suggests_ultra_large_project(message):
+        return True
     markers = ("部署", "执行", "运行", "shell", "终端", "sandbox", "deploy", "execute", "run")
     return any(marker in text for marker in markers)
 
@@ -2854,8 +2858,40 @@ def _message_suggests_sensitive_context(message: str) -> bool:
 
 def _message_suggests_large_context(message: str) -> bool:
     text = message.casefold()
+    if _message_suggests_ultra_large_project(message):
+        return True
     markers = ("大上下文", "长上下文", "全仓", "整个仓库", "large context", "long context")
     return any(marker in text for marker in markers)
+
+
+def _message_suggests_ultra_large_project(message: str) -> bool:
+    text = message.casefold()
+    scale_markers = (
+        "超大型项目",
+        "大型项目",
+        "完整项目",
+        "整个项目",
+        "production result",
+        "large project",
+        "full project",
+    )
+    architecture_markers = (
+        "架构",
+        "架构搭建",
+        "系统设计",
+        "需求拆解",
+        "分阶段",
+        "构建",
+        "生产结果",
+        "architecture",
+        "system design",
+        "requirements breakdown",
+        "milestone",
+        "build",
+    )
+    return any(marker in text for marker in scale_markers) and any(
+        marker in text for marker in architecture_markers
+    )
 
 
 _EVOLUTION_EXPLICIT_ACTION_RE = re.compile(
@@ -3644,6 +3680,8 @@ def _main_agent_adjusted_ready_mode(
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
     text = message.lower()
+    if _message_suggests_ultra_large_project(message):
+        return TaskMode.HYBRID
     execution_markers = (
         "文案",
         "脚本",

@@ -603,6 +603,7 @@ def test_runtime_gateway_is_available_matches_builtin_manifest_availability(
     assert gateway.is_available(TENANT_ID, "read_context") is True
     assert gateway.is_available(TENANT_ID, "document.generate_docx") is False
     assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is False
+    assert gateway.is_available(TENANT_ID, "project.preflight_architecture") is False
     assert gateway.is_available(TENANT_ID, "project.generate_zip") is False
     assert gateway.is_available(TENANT_ID, "workspace.read") is False
     assert gateway.is_available(TENANT_ID, "workspace_read") is False
@@ -657,6 +658,17 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "sandbox_profile": "generated_artifact_store",
                 "available": True,
                 "availability_reason": None,
+                "replay_safe": True,
+                "aliases": (),
+            },
+            {
+                "id": "project.preflight_architecture",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "project_workspace_store",
+                "available": False,
+                "availability_reason": "project_workspace_store_not_configured",
                 "replay_safe": True,
                 "aliases": (),
             },
@@ -755,6 +767,17 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "sandbox_profile": "generated_artifact_store",
             "available": False,
             "availability_reason": "generated_artifact_store_not_configured",
+            "replay_safe": True,
+            "aliases": (),
+        },
+        {
+            "id": "project.preflight_architecture",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "file.create",
+            "sandbox_profile": "project_workspace_store",
+            "available": False,
+            "availability_reason": "project_workspace_store_not_configured",
             "replay_safe": True,
             "aliases": (),
         },
@@ -1294,6 +1317,7 @@ def test_runtime_gateway_capability_manifest_skips_bad_registry_sources(
         "calculator.evaluate",
         "document.generate_docx",
         "presentation.generate_pptx",
+        "project.preflight_architecture",
         "project.generate_zip",
         "read_context",
         "workspace.read",

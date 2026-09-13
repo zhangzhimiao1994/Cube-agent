@@ -759,7 +759,11 @@ check_runtime_failure_diagnostics() {
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.defaults import _capability_inventory_payload
-from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
+from agent_hub.capabilities.tools.registry import (
+    PluginConfigCapabilityManifestSource,
+    create_builtin_tool_registry,
+)
+from agent_hub.project_preflight import build_project_preflight_files
 from types import SimpleNamespace
 
 cases = [
@@ -843,6 +847,32 @@ if not isinstance(items, tuple) or len(items) != 1:
 failure_codes = items[0].get("failure_codes")
 expected_codes = ("plugin.timeout", *(f"plugin.failure_{index}" for index in range(31)))
 if failure_codes != expected_codes:
+    raise SystemExit(1)
+
+preflight_files = build_project_preflight_files(
+    title="超大型 Agent 项目",
+    request="添加超大型项目架构和构建能力，读取约束和技能规则，生成计划 MD 文件和浏览器链接图谱。",
+)
+if set(preflight_files) != {"PROJECT_ARCHITECTURE_PLAN.md", "architecture-map.html"}:
+    raise SystemExit(1)
+preflight_plan = preflight_files["PROJECT_ARCHITECTURE_PLAN.md"].decode()
+preflight_graph = preflight_files["architecture-map.html"].decode()
+if "约束和技能规则读取" not in preflight_plan:
+    raise SystemExit(1)
+if "约束读取" not in preflight_graph:
+    raise SystemExit(1)
+builtin_registry = create_builtin_tool_registry()
+builtin_capabilities = builtin_registry.manifests().get("capabilities")
+if not isinstance(builtin_capabilities, tuple):
+    raise SystemExit(1)
+preflight_capability = [
+    item
+    for item in builtin_capabilities
+    if isinstance(item, dict) and item.get("id") == "project.preflight_architecture"
+]
+if len(preflight_capability) != 1:
+    raise SystemExit(1)
+if preflight_capability[0].get("replay_safe") is not True:
     raise SystemExit(1)
 
 activation_reason_cases = (
@@ -1148,6 +1178,14 @@ require(
     _local_main_agent_auto_mode("先讨论优缺点再给结论", ()) is TaskMode.HYBRID,
     "auto hybrid routing",
 )
+mega_project_message = (
+    "添加超大型项目架构和构建能力，从需求拆解、架构搭建、分阶段实现、"
+    "严格验收测试到最终生产结果都要稳定完成"
+)
+require(
+    _local_main_agent_auto_mode(mega_project_message, ()) is TaskMode.HYBRID,
+    "ultra-large project auto routing",
+)
 require(
     _local_main_agent_auto_mode("请复核并争论观点", ()) is TaskMode.DISCUSS,
     "auto discuss routing",
@@ -1207,6 +1245,27 @@ require(
 require(
     requirements_by_mode[TaskMode.HYBRID].needs_parallel_tool_calls is True,
     "hybrid parallel tools",
+)
+mega_project_requirements = _harness_task_requirements(
+    message=mega_project_message,
+    mode=TaskMode.HYBRID,
+    routing_decision={},
+)
+require(
+    mega_project_requirements.needs_long_running is True,
+    "ultra-large project long running",
+)
+require(
+    mega_project_requirements.needs_parallel_tool_calls is True,
+    "ultra-large project parallel tools",
+)
+require(
+    mega_project_requirements.requires_sandbox is True,
+    "ultra-large project sandbox",
+)
+require(
+    mega_project_requirements.prefers_prefix_cache is True,
+    "ultra-large project prefix cache",
 )
 
 for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):

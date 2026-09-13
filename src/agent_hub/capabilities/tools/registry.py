@@ -283,6 +283,15 @@ def create_builtin_tool_registry() -> ToolRegistry:
         replay_safe=True,
     )
     registry.register(
+        "project.preflight_architecture",
+        object(),
+        kind="builtin",
+        adapter="runtime_builtin",
+        permission_class="file.create",
+        sandbox_profile="project_workspace_store",
+        replay_safe=True,
+    )
+    registry.register(
         "project.generate_zip",
         object(),
         kind="builtin",
@@ -305,7 +314,7 @@ def create_builtin_tool_registry() -> ToolRegistry:
 
 
 def _policy_effect(value: object) -> str:
-    if value in {"inherit", "allow", "require_approval", "deny"}:
+    if isinstance(value, str) and value in {"inherit", "allow", "require_approval", "deny"}:
         return value
     return "inherit"
 

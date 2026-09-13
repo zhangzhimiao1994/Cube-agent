@@ -210,6 +210,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "PluginConfigCapabilityManifestSource" in command
     assert '"plugin_package_adapter_unavailable"' in command
     assert '"plugin_package_capability_isolation_mismatch"' in command
+    assert '"project.preflight_architecture"' in command
+    assert "PROJECT_ARCHITECTURE_PLAN.md" in command
+    assert "architecture-map.html" in command
+    assert "约束和技能规则读取" in command
     assert "profile: interaction prevention and last-resort recovery" in command
     assert "fail: interaction prevention and recovery" in command
     assert "ok: interaction prevention and recovery" in command
@@ -238,6 +242,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: multi-mode interaction matrix" in command
     assert "ok: multi-mode interaction matrix" in command
     assert "fail: multi-mode interaction matrix" in command
+    assert "ultra-large project auto routing" in command
+    assert "ultra-large project long running" in command
+    assert "ultra-large project sandbox" in command
+    assert "ultra-large project prefix cache" in command
     assert 'expected_modes = ("auto", "direct", "dispatch", "discuss", "hybrid")' in command
     assert "_local_main_agent_auto_mode" in command
     assert "_main_agent_adjusted_ready_mode" in command

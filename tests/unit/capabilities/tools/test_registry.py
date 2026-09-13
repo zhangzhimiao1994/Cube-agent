@@ -36,6 +36,7 @@ def test_registry_registers_builtin_tool_names() -> None:
         "http.read",
         "presentation.generate_pptx",
         "project.generate_zip",
+        "project.preflight_architecture",
         "workspace.read",
     )
 
@@ -97,6 +98,15 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
                 "sandbox_profile": "generated_artifact_store",
+                "replay_safe": True,
+                "aliases": (),
+            },
+            {
+                "id": "project.preflight_architecture",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "project_workspace_store",
                 "replay_safe": True,
                 "aliases": (),
             },
