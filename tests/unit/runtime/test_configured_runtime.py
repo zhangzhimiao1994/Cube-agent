@@ -4571,6 +4571,69 @@ def test_dispatch_plan_includes_approved_project_preflight_context_in_steps() ->
     assert any("staged implementation" in step.task for step in plan.steps)
 
 
+def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() -> None:
+    roles = (
+        RoleAssignment(
+            id="builder",
+            role="Builder",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the approved large project.",
+            must_answer=("What was implemented?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="quality_reviewer",
+            role="Quality Reviewer",
+            purpose=RolePurpose.VERIFY,
+            mission="Review the completed project.",
+            must_answer=("Does the implementation pass review?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+    routing_decision: dict[str, JsonValue] = {
+        "project_preflight_approved": True,
+        "project_preflight_proposal": {
+            "kind": "project_architecture_preflight",
+            "capability": "project.preflight_architecture",
+            "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+            "graph_path": "architecture-map.html",
+            "requires_constraints_and_skills_reading": True,
+        },
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="构建一个超大型项目。",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision=routing_decision,
+    )
+
+    plan = _dispatch_plan(roles, context, max_parallelism=2)
+
+    steps = {step.id: step for step in plan.steps}
+    assert steps["project_preflight_step"].agent == "project_preflight_architect"
+    assert "PROJECT_ARCHITECTURE_PLAN.md" in steps["project_preflight_step"].task
+    assert "architecture-map.html" in steps["project_preflight_step"].task
+    assert steps["builder_step"].depends_on == ("project_preflight_step",)
+    assert steps["quality_reviewer_step"].depends_on == ("builder_step",)
+    assert steps["final_response_step"].depends_on == (
+        "project_preflight_step",
+        "builder_step",
+        "quality_reviewer_step",
+    )
+
+
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
     roles = (
         RoleAssignment(

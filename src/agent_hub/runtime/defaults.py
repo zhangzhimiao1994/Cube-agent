@@ -211,6 +211,9 @@ _MODEL_CAPABILITY_TRAIT_ALIASES: Mapping[str, ModelCapability] = {
     "video_generation": ModelCapability.VIDEO_GENERATION,
     "audio_generation": ModelCapability.AUDIO_GENERATION,
 }
+_PROJECT_PREFLIGHT_AGENT_ID = "project_preflight_architect"
+_PROJECT_PREFLIGHT_STEP_ID = "project_preflight_step"
+_PROJECT_PREFLIGHT_CAPABILITY = "project.preflight_architecture"
 
 
 class UnavailableRuntime:
@@ -1063,6 +1066,26 @@ def _software_final_guidance(context: TaskContext) -> str:
     )
 
 
+def _project_preflight_tools(
+    context: TaskContext,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> tuple[str, ...]:
+    if not project_preflight_context_text(context.routing_decision):
+        return ()
+    proposal = context.routing_decision.get("project_preflight_proposal")
+    if not isinstance(proposal, Mapping):
+        return ()
+    if proposal.get("capability") != _PROJECT_PREFLIGHT_CAPABILITY:
+        return ()
+    if not _is_replay_safe_capability(
+        _PROJECT_PREFLIGHT_CAPABILITY,
+        capability_gateway=capability_gateway,
+    ):
+        return ()
+    return (_PROJECT_PREFLIGHT_CAPABILITY,)
+
+
 def _dispatch_plan(
     roles: tuple[RoleAssignment, ...],
     context: TaskContext,
@@ -1091,6 +1114,13 @@ def _dispatch_plan(
         context,
         capability_gateway=capability_gateway,
     )
+    preflight_context = project_preflight_context_text(context.routing_decision)
+    preflight_tools = (
+        _project_preflight_tools(context, capability_gateway=capability_gateway)
+        if preflight_context
+        else ()
+    )
+    plan_allowed_tools = tuple(dict.fromkeys((*plan_allowed_tools, *preflight_tools)))
     role_tools_by_id = {
         role.id: _role_allowed_tools(
             role,
@@ -1110,6 +1140,32 @@ def _dispatch_plan(
         )
         for role in selected_roles
     ]
+    preflight_agent_id = _PROJECT_PREFLIGHT_AGENT_ID
+    if preflight_context:
+        existing_agent_ids = {agent.id for agent in agents}
+        suffix = 2
+        while preflight_agent_id in existing_agent_ids:
+            preflight_agent_id = f"{_PROJECT_PREFLIGHT_AGENT_ID}_{suffix}"
+            suffix += 1
+        agents.append(
+            AgentSpec(
+                id=preflight_agent_id,
+                role="Project Preflight Architect",
+                goal=(
+                    "Read applicable project constraints and skill rules, create or update "
+                    "the approved architecture plan and graph, and hand the staged execution "
+                    "basis to the implementation roles."
+                ),
+                logical_model=selected_roles[0].model,
+                allowed_tools=preflight_tools,
+                output_schema={
+                    "summary": "string",
+                    "plan_path": "string",
+                    "graph_path": "string",
+                    "verification": "string[]",
+                },
+            )
+        )
     if not any(agent.id == "final_synthesizer" for agent in agents):
         agents.append(
             AgentSpec(
@@ -1127,7 +1183,6 @@ def _dispatch_plan(
         if hermes_context
         else ""
     )
-    preflight_context = project_preflight_context_text(context.routing_decision)
     preflight_guidance = (
         f"\nProject preflight guidance:\n{preflight_context}\n"
         if preflight_context
@@ -1146,6 +1201,31 @@ def _dispatch_plan(
     producer_step_ids = tuple(
         f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
     )
+    preflight_dependencies = (_PROJECT_PREFLIGHT_STEP_ID,) if preflight_context else ()
+    preflight_steps = (
+        (
+            DispatchStep(
+                id=_PROJECT_PREFLIGHT_STEP_ID,
+                agent=preflight_agent_id,
+                task=(
+                    "Architecture preflight stage for the approved ultra-large project.\n"
+                    f"User task: {request_text}\n"
+                    f"{preflight_guidance}"
+                    "Read applicable constraints and skill rules first. Create or update "
+                    "PROJECT_ARCHITECTURE_PLAN.md and architecture-map.html before any "
+                    "implementation step proceeds. Return only the staged plan basis, "
+                    "artifact paths, verification evidence, and remaining risks."
+                ),
+                depends_on=(),
+                tools=preflight_tools,
+                token_budget=role_token_budget,
+                timeout_seconds=producer_step_timeout,
+                cost_budget_usd=Decimal(0),
+            ),
+        )
+        if preflight_context
+        else ()
+    )
     role_steps = tuple(
         DispatchStep(
             id=f"{role.id}_step",
@@ -1158,7 +1238,11 @@ def _dispatch_plan(
                 f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
-            depends_on=producer_step_ids if _is_post_product_role(role) else (),
+            depends_on=(
+                producer_step_ids
+                if _is_post_product_role(role) and producer_step_ids
+                else preflight_dependencies
+            ),
             tools=role_tools_by_id[role.id],
             token_budget=role_token_budget,
             timeout_seconds=(
@@ -1168,7 +1252,7 @@ def _dispatch_plan(
         )
         for role in selected_roles
     )
-    final_dependencies = tuple(step.id for step in role_steps)
+    final_dependencies = tuple(step.id for step in (*preflight_steps, *role_steps))
     final_step = DispatchStep(
         id="final_response_step",
         agent="final_synthesizer",
@@ -1188,7 +1272,7 @@ def _dispatch_plan(
     )
     return DispatchPlan(
         agents=tuple(agents),
-        steps=(*role_steps, final_step),
+        steps=(*preflight_steps, *role_steps, final_step),
         allowed_tools=plan_allowed_tools,
         max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
         total_token_budget=context.token_budget,

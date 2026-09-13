@@ -1334,6 +1334,11 @@ dispatch_preflight_plan = _dispatch_plan(
     ),
     max_parallelism=1,
 )
+dispatch_preflight_steps = {step.id: step for step in dispatch_preflight_plan.steps}
+require(
+    dispatch_preflight_steps["project_preflight_step"].agent == "project_preflight_architect",
+    "approved project preflight explicit dispatch stage",
+)
 require(
     any("PROJECT_PREFLIGHT_CONTEXT" in step.task for step in dispatch_preflight_plan.steps),
     "approved project preflight context enters dispatch plan",
@@ -1341,6 +1346,10 @@ require(
 require(
     any("staged implementation" in step.task for step in dispatch_preflight_plan.steps),
     "approved project preflight dispatch plan staged implementation",
+)
+require(
+    dispatch_preflight_steps["builder_step"].depends_on == ("project_preflight_step",),
+    "approved project preflight dispatch stage gates implementation",
 )
 
 for mode in (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID):
