@@ -1276,7 +1276,9 @@ def _dispatch_plan(
         allowed_tools=plan_allowed_tools,
         max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
         total_token_budget=context.token_budget,
-        total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
+        total_timeout_seconds=sum(
+            step.timeout_seconds for step in (*preflight_steps, *role_steps, final_step)
+        ),
         total_cost_usd=Decimal(0),
     )
 
