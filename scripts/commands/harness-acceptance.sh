@@ -403,6 +403,44 @@ PY
   return 1
 }
 
+check_openapi_capability_execution_summary_failure_codes_schema() {
+  if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
+import json
+import sys
+
+openapi_file = sys.argv[1]
+with open(openapi_file, encoding="utf-8") as handle:
+    document = json.load(handle)
+schemas = document.get("components", {}).get("schemas", {})
+summary_schema = schemas.get("CapabilityExecutionSummaryResponse", {})
+properties = summary_schema.get("properties", {})
+failure_code_count = properties.get("failure_code_count")
+if not isinstance(failure_code_count, dict):
+    raise SystemExit(1)
+if failure_code_count.get("type") != "integer":
+    raise SystemExit(1)
+if failure_code_count.get("minimum") != 0:
+    raise SystemExit(1)
+failure_code_counts = properties.get("failure_code_counts")
+if not isinstance(failure_code_counts, dict):
+    raise SystemExit(1)
+if failure_code_counts.get("type") != "object":
+    raise SystemExit(1)
+additional = failure_code_counts.get("additionalProperties")
+if not isinstance(additional, dict) or additional.get("type") != "integer":
+    raise SystemExit(1)
+if additional.get("minimum") != 0:
+    raise SystemExit(1)
+PY
+  then
+    printf 'ok: capability execution summary failure codes schema\n'
+    return 0
+  fi
+  printf 'fail: capability execution summary failure codes schema\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_openapi_safe_projection() {
   if "$acceptance_python_bin" - "$acceptance_openapi_file" <<'PY'
 import json
@@ -808,6 +846,7 @@ run_openapi_capability_profile() {
   check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post" || true
   check_openapi_model_capability_schema || true
   check_openapi_capability_manifest_failure_codes_schema || true
+  check_openapi_capability_execution_summary_failure_codes_schema || true
   check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post" || true
   check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get" || true
   check_openapi_path "admin config draft save" "/api/v1/admin/config/draft" "put" || true
