@@ -100,7 +100,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in command
     assert "Authorization: Bearer" in command
     assert "^agent_hub_runs_total( |[{])" in command
+    assert "^agent_hub_model_429_total( |[{])" in command
     assert "^agent_hub_queue_depth( |[{])" in command
+    assert "^agent_hub_scheduler_lag_seconds( |[{])" in command
+    assert "^agent_hub_model_capacity_wait_seconds( |[{])" in command
     assert "^www-authenticate: Bearer" in command
     assert '"/api/v1/runs"' in command
     assert '"/api/v1/runs/$run_id"' in command

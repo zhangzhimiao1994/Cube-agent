@@ -210,8 +210,14 @@ check_prometheus_metrics() {
   fi
   if grep -q '^# TYPE agent_hub_runs_total counter' "$temp_file" \
     && grep -Eq '^agent_hub_runs_total( |[{])' "$temp_file" \
+    && grep -q '^# TYPE agent_hub_model_429_total counter' "$temp_file" \
+    && grep -Eq '^agent_hub_model_429_total( |[{])' "$temp_file" \
     && grep -q '^# TYPE agent_hub_queue_depth gauge' "$temp_file" \
-    && grep -Eq '^agent_hub_queue_depth( |[{])' "$temp_file"; then
+    && grep -Eq '^agent_hub_queue_depth( |[{])' "$temp_file" \
+    && grep -q '^# TYPE agent_hub_scheduler_lag_seconds gauge' "$temp_file" \
+    && grep -Eq '^agent_hub_scheduler_lag_seconds( |[{])' "$temp_file" \
+    && grep -q '^# TYPE agent_hub_model_capacity_wait_seconds gauge' "$temp_file" \
+    && grep -Eq '^agent_hub_model_capacity_wait_seconds( |[{])' "$temp_file"; then
     rm -f -- "$temp_file"
     printf 'ok: prometheus metrics %s\n' "$metrics_path"
     return 0
