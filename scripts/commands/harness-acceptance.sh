@@ -861,11 +861,15 @@ if "约束和技能规则读取" not in preflight_plan:
     raise SystemExit(1)
 if "实现阶段执行契约" not in preflight_plan:
     raise SystemExit(1)
+if "阶段自修复闭环" not in preflight_plan or "`stage_repair_actions`" not in preflight_plan:
+    raise SystemExit(1)
 if "阶段验收和风险回收" not in preflight_plan:
     raise SystemExit(1)
 if "约束读取" not in preflight_graph:
     raise SystemExit(1)
 if "阶段契约" not in preflight_graph:
+    raise SystemExit(1)
+if "自修复闭环" not in preflight_graph:
     raise SystemExit(1)
 if "风险回收" not in preflight_graph:
     raise SystemExit(1)

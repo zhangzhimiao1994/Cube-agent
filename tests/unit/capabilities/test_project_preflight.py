@@ -60,8 +60,11 @@ async def test_project_preflight_capability_writes_plan_and_graph_workspace_file
     plan = (generated_dir / "PROJECT_ARCHITECTURE_PLAN.md").read_text(encoding="utf-8")
     graph = (generated_dir / "architecture-map.html").read_text(encoding="utf-8")
     assert "## 实现阶段执行契约" in plan
+    assert "## 阶段自修复闭环" in plan
+    assert "`stage_repair_actions`" in plan
     assert "## 阶段验收和风险回收" in plan
     assert "阶段契约" in graph
+    assert "自修复闭环" in graph
     assert "风险回收" in graph
     assert plan_download_url.endswith(
         f"{workspace_download_prefix}?path=PROJECT_ARCHITECTURE_PLAN.md"
