@@ -17,14 +17,18 @@ def test_project_preflight_generates_architecture_plan_and_graph() -> None:
     assert "## 架构方向" in plan
     assert "## 约束和技能规则读取" in plan
     assert "## 阶段计划" in plan
+    assert "## 实现阶段执行契约" in plan
     assert "## 验收矩阵" in plan
+    assert "## 阶段验收和风险回收" in plan
     assert "## 审批口径" in plan
     assert "## 生产结果" in plan
     assert "需求拆解" in graph
     assert "约束读取" in graph
     assert "架构方向" in graph
     assert "计划 MD" in graph
+    assert "阶段契约" in graph
     assert "实现阶段" in graph
     assert "验收测试" in graph
+    assert "风险回收" in graph
     assert "生产部署" in graph
     assert "自恢复" in graph
