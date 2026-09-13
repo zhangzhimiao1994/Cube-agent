@@ -859,7 +859,15 @@ preflight_plan = preflight_files["PROJECT_ARCHITECTURE_PLAN.md"].decode()
 preflight_graph = preflight_files["architecture-map.html"].decode()
 if "约束和技能规则读取" not in preflight_plan:
     raise SystemExit(1)
+if "实现阶段执行契约" not in preflight_plan:
+    raise SystemExit(1)
+if "阶段验收和风险回收" not in preflight_plan:
+    raise SystemExit(1)
 if "约束读取" not in preflight_graph:
+    raise SystemExit(1)
+if "阶段契约" not in preflight_graph:
+    raise SystemExit(1)
+if "风险回收" not in preflight_graph:
     raise SystemExit(1)
 builtin_registry = create_builtin_tool_registry()
 builtin_capabilities = builtin_registry.manifests().get("capabilities")

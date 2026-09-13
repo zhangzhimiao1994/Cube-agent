@@ -226,6 +226,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "PROJECT_ARCHITECTURE_PLAN.md" in command
     assert "architecture-map.html" in command
     assert "约束和技能规则读取" in command
+    assert "实现阶段执行契约" in command
+    assert "阶段验收和风险回收" in command
+    assert "阶段契约" in command
+    assert "风险回收" in command
     assert "approved project preflight context enters direct prompt" in command
     assert "approved project preflight context enters dispatch plan" in command
     assert "approved project preflight explicit dispatch stage" in command
