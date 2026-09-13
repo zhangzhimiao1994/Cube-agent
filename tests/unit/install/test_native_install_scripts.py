@@ -189,6 +189,13 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_openapi_path "model routing create" "/api/v1/admin/models" "post"' in command
     assert 'check_openapi_path "model routing probe" "/api/v1/admin/models/probe" "post"' in command
     assert 'items != {"$ref": "#/components/schemas/ModelCapability"}' in command
+    assert "check_openapi_model_deployment_response_schema" in command
+    assert 'schemas.get("ModelDeploymentResponse", {})' in command
+    assert '"target_utilization": ("number", 0.1)' in command
+    assert '"effective_slots": ("integer", None)' in command
+    assert '"saturation_policy": ("string", None)' in command
+    assert '"queue_timeout_seconds": ("integer", 1)' in command
+    assert 'fallback.get("anyOf")' in command
     assert "check_openapi_capability_manifest_failure_codes_schema" in command
     assert 'schemas.get("CapabilityManifestItemResponse", {})' in command
     assert 'failure_codes.get("maxItems") != 32' in command
