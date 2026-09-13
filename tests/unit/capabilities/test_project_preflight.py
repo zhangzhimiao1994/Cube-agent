@@ -48,7 +48,15 @@ async def test_project_preflight_capability_writes_plan_and_graph_workspace_file
     graph_download_url = result["graph_download_url"]
     assert isinstance(plan_download_url, str)
     assert isinstance(graph_download_url, str)
-    generated_dir = tmp_path / "workspaces" / "mofang-agent" / "conv-preflight"
+    generated_dir = (
+        tmp_path
+        / "workspaces"
+        / str(tenant_id)
+        / "projects"
+        / "mofang-agent"
+        / "sessions"
+        / "conv-preflight"
+    )
     plan = (generated_dir / "PROJECT_ARCHITECTURE_PLAN.md").read_text(encoding="utf-8")
     graph = (generated_dir / "architecture-map.html").read_text(encoding="utf-8")
     assert "## 实现阶段执行契约" in plan
