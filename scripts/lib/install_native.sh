@@ -614,6 +614,10 @@ $tls_directive
     reverse_proxy 127.0.0.1:$api_port
   }
 
+  handle /health {
+    reverse_proxy 127.0.0.1:$api_port
+  }
+
   handle /health/* {
     reverse_proxy 127.0.0.1:$api_port
   }

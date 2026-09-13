@@ -1428,6 +1428,7 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
         "BearerAuth": {"type": "http", "scheme": "bearer"}
     }
 
+    assert "security" not in schema["paths"]["/health"]["get"]
     assert "security" not in schema["paths"]["/health/live"]["get"]
     assert "security" not in schema["paths"]["/api/v1/setup"]["post"]
     assert "security" not in schema["paths"]["/api/v1/auth/login"]["post"]
@@ -1451,11 +1452,16 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
     for (path, method), expects_forbidden in config_403_matrix.items():
         assert ("403" in schema["paths"][path][method]["responses"]) is expects_forbidden
 
-    for path in ("/health/live", "/health/ready"):
+    for path in ("/health", "/health/live", "/health/ready"):
         assert schema["paths"][path]["get"]["responses"]["200"]["content"][
             "application/json"
         ]["schema"] == {"$ref": "#/components/schemas/HealthResponse"}
 
+    assert set(schema["paths"]["/health"]["get"]["responses"]) == {
+        "200",
+        "405",
+        "500",
+    }
     assert set(schema["paths"]["/health/live"]["get"]["responses"]) == {
         "200",
         "405",

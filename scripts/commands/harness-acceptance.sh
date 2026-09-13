@@ -178,7 +178,7 @@ check_health_json() {
     failures=$((failures + 1))
     return 1
   fi
-  if ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os, sys; sys.exit(0 if json.loads(os.environ["ACCEPTANCE_RESPONSE"]).get("status") == "ok" else 1)'; then
+  if ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os, sys; sys.exit(0 if json.loads(os.environ["ACCEPTANCE_RESPONSE"]).get("status") == "ok" else 1)' 2>/dev/null; then
     printf 'ok: %s %s JSON status=ok\n' "$name" "$path"
     return 0
   fi
@@ -370,8 +370,10 @@ PY
 
 run_codex_profile() {
   printf 'profile: codex harness stability\n'
+  check_url "api health alias" "/health" || true
   check_url "api live health" "/health/live" || true
   check_url "api readiness" "/health/ready" || true
+  check_health_json "api health alias" "/health" || true
   check_health_json "api live health" "/health/live" || true
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
@@ -549,7 +551,7 @@ stress_worker() {
   local path
   local index
   for ((index = 1; index <= iterations; index += 1)); do
-    for path in /health/live /health/ready /openapi.json /login; do
+    for path in /health /health/live /health/ready /openapi.json /login; do
       curl --noproxy '*' \
         --connect-timeout "$connect_timeout" \
         --max-time "$max_time" \

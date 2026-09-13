@@ -83,6 +83,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_stress_profile" in command
     assert "/health/live" in command
     assert "/health/ready" in command
+    assert 'check_url "api health alias" "/health"' in command
+    assert 'check_health_json "api health alias" "/health"' in command
     assert "/metrics" in command
     assert "/openapi.json" in command
     assert "/login" in command
@@ -339,6 +341,8 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "hostport=\"${public_url#http://}\"" not in installer
     assert "handle /setup*" in caddyfile
     assert "handle /setup*" in installer
+    assert "handle /health {" in caddyfile
+    assert "handle /health {" in installer
     assert "handle /openapi.json" in caddyfile
     assert "handle /openapi.json" in installer
     assert "fix_native_web_permissions" in installer
