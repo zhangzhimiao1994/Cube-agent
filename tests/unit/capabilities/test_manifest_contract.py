@@ -24,6 +24,13 @@ def test_capability_manifest_item_applies_defaults_and_preserves_schemas() -> No
                 "properties": {"query": {"type": "string"}},
             },
             "output_schema": {"type": "object"},
+            "failure_codes": (
+                "plugin.timeout",
+                "bad code",
+                "mcp.server_failed",
+                "token.leak",
+                "x" * 129,
+            ),
         },
         seen_ids,
         seen_names,
@@ -45,6 +52,7 @@ def test_capability_manifest_item_applies_defaults_and_preserves_schemas() -> No
             "properties": {"query": {"type": "string"}},
         },
         "output_schema": {"type": "object"},
+        "failure_codes": ("plugin.timeout", "mcp.server_failed"),
     }
 
 

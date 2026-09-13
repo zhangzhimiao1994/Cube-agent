@@ -64,6 +64,15 @@ _PLUGIN_PACKAGE_ACTIVATION_REASON_CODES = {
         "plugin_package_capability_isolation_mismatch"
     ),
 }
+PLUGIN_RUNTIME_FAILURE_CODES: tuple[str, ...] = (
+    "plugin.adapter_unavailable",
+    "plugin.timeout",
+    "plugin.credential_unavailable",
+    "plugin.invalid_arguments",
+    "plugin.invalid_result",
+    "plugin.backend_unavailable",
+    "plugin.sandbox_unsupported",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +219,7 @@ class PluginConfigCapabilityManifestSource:
                     "policy_effect": _policy_effect(getattr(capability, "policy_effect", None)),
                     "available": available,
                     "availability_reason": reason,
+                    "failure_codes": PLUGIN_RUNTIME_FAILURE_CODES,
                     "replay_safe": capability.replay_safe is True,
                     "aliases": tuple(capability.aliases),
                 }

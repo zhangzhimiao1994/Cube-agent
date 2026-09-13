@@ -28,6 +28,13 @@ TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
 SECRET_ID = UUID("33333333-3333-4333-8333-333333333333")
 RUN_ID = UUID("44444444-4444-4444-8444-444444444444")
+MCP_FAILURE_CODES = (
+    "mcp.tool_unavailable",
+    "mcp.timeout",
+    "mcp.server_not_discovered",
+    "mcp.server_timeout",
+    "mcp.server_failed",
+)
 
 
 class NoopRunRepository:
@@ -102,6 +109,7 @@ def test_mcp_config_manifest_source_projects_allowed_tools() -> None:
                 "sandbox_profile": "mcp_stdio",
                 "available": False,
                 "availability_reason": "mcp_server_failed",
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -113,6 +121,7 @@ def test_mcp_config_manifest_source_projects_allowed_tools() -> None:
                 "sandbox_profile": "mcp_remote",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -124,6 +133,7 @@ def test_mcp_config_manifest_source_projects_allowed_tools() -> None:
                 "sandbox_profile": "mcp_remote",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -151,6 +161,7 @@ def test_mcp_config_manifest_source_skips_unsafe_or_empty_entries() -> None:
                 "sandbox_profile": "mcp_remote",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -170,6 +181,7 @@ def test_mcp_config_manifest_source_treats_configured_as_not_discovered() -> Non
     assert capability["id"] == "files.read_file"
     assert capability["available"] is False
     assert capability["availability_reason"] == "mcp_server_not_discovered"
+    assert capability["failure_codes"] == MCP_FAILURE_CODES
 
 
 def test_mcp_snapshot_manifest_source_projects_discovered_tools_for_tenant() -> None:
@@ -237,6 +249,7 @@ def test_mcp_snapshot_manifest_source_projects_discovered_tools_for_tenant() -> 
                 "sandbox_profile": "mcp_stdio",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             },
@@ -248,6 +261,7 @@ def test_mcp_snapshot_manifest_source_projects_discovered_tools_for_tenant() -> 
                 "sandbox_profile": "mcp_remote",
                 "available": True,
                 "availability_reason": None,
+                "failure_codes": MCP_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
                 "input_schema": {
@@ -292,6 +306,7 @@ def test_mcp_snapshot_manifest_source_marks_unhealthy_snapshot_tools_unavailable
     assert capability["id"] == "search.web_search"
     assert capability["available"] is False
     assert capability["availability_reason"] == "mcp_server_timeout"
+    assert capability["failure_codes"] == MCP_FAILURE_CODES
 
 
 def test_mcp_snapshot_manifest_source_skips_unsafe_discovered_tool_names() -> None:

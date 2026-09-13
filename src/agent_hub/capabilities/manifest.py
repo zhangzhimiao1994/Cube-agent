@@ -69,6 +69,9 @@ def project_capability_manifest_item(
         "replay_safe": raw_item.get("replay_safe") is True,
         "aliases": aliases,
     }
+    failure_codes = _manifest_failure_codes(raw_item.get("failure_codes"))
+    if failure_codes:
+        item["failure_codes"] = failure_codes
     input_schema = raw_item.get("input_schema")
     if isinstance(input_schema, Mapping):
         projected = _project_schema(input_schema)
@@ -95,6 +98,22 @@ def _manifest_aliases(value: object) -> tuple[str, ...] | None:
     if len(set(aliases)) != len(aliases):
         return None
     return cast(tuple[str, ...], aliases)
+
+
+def _manifest_failure_codes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    codes: list[str] = []
+    for item in value:
+        if len(codes) >= 32:
+            break
+        if not is_safe_manifest_name(item):
+            continue
+        lowered = item.lower()
+        if "token" in lowered or "secret" in lowered:
+            continue
+        codes.append(cast(str, item))
+    return tuple(dict.fromkeys(codes))
 
 
 def _string_or_default(value: object, default: str) -> str:

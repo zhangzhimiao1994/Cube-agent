@@ -11,6 +11,13 @@ from agent_hub.mcp.types import McpInvocationResult, McpToolSchema, McpTransport
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
+MCP_FAILURE_CODES = (
+    "mcp.tool_unavailable",
+    "mcp.timeout",
+    "mcp.server_not_discovered",
+    "mcp.server_timeout",
+    "mcp.server_failed",
+)
 
 
 class FakeAdminService:
@@ -120,6 +127,7 @@ async def test_runtime_mcp_service_discovers_saved_servers_for_manifest_source()
             "sandbox_profile": "mcp_remote",
             "available": True,
             "availability_reason": None,
+            "failure_codes": MCP_FAILURE_CODES,
             "replay_safe": False,
             "aliases": (),
         },
@@ -189,6 +197,7 @@ async def test_runtime_mcp_service_skips_malformed_projection_config() -> None:
             "sandbox_profile": "mcp_remote",
             "available": True,
             "availability_reason": None,
+            "failure_codes": MCP_FAILURE_CODES,
             "replay_safe": False,
             "aliases": (),
         },

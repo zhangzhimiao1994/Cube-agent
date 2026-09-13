@@ -9,6 +9,13 @@ from agent_hub.mcp.types import McpGenerationSnapshot, McpServerDefinition
 from agent_hub.runtime.contracts import JsonValue
 
 _SAFE_MCP_CAPABILITY_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+MCP_RUNTIME_FAILURE_CODES: tuple[str, ...] = (
+    "mcp.tool_unavailable",
+    "mcp.timeout",
+    "mcp.server_not_discovered",
+    "mcp.server_timeout",
+    "mcp.server_failed",
+)
 
 
 class McpManifestServer(Protocol):
@@ -58,6 +65,7 @@ class McpConfigCapabilityManifestSource:
                         "availability_reason": None
                         if available
                         else _availability_reason(server.health),
+                        "failure_codes": MCP_RUNTIME_FAILURE_CODES,
                         "replay_safe": False,
                         "aliases": (),
                     }
@@ -107,6 +115,7 @@ class McpSnapshotCapabilityManifestSource:
                 "sandbox_profile": _sandbox_profile(str(server.transport)),
                 "available": available,
                 "availability_reason": None if available else _availability_reason(health),
+                "failure_codes": MCP_RUNTIME_FAILURE_CODES,
                 "replay_safe": False,
                 "aliases": (),
             }
