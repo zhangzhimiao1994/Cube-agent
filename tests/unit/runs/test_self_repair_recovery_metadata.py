@@ -237,6 +237,7 @@ def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
                 sequence=1,
                 run_id=run_id,
                 step_id="final_response",
+                actor="final_response",
                 reason="blocked contract chain needs one bounded replay",
                 payload={
                     "orchestration_recovery_hint": "retry_blocked_contract_chain",
