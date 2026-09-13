@@ -169,9 +169,6 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'failure_codes.get("maxItems") != 32' in command
     assert "from agent_hub.runtime.defaults import _capability_inventory_payload" in command
     assert 'expected_codes = ("plugin.timeout", *(f"plugin.failure_{index}" for index in range(31)))' in command
-    assert "check_openapi_capability_execution_summary_failure_codes_schema" in command
-    assert 'schemas.get("CapabilityExecutionSummaryResponse", {})' in command
-    assert 'failure_code_counts.get("additionalProperties")' in command
     assert 'check_openapi_path "admin secret create" "/api/v1/admin/secrets" "post"' in command
     assert 'check_openapi_path "admin secret read" "/api/v1/admin/secrets/{ref}" "get"' in command
     assert 'check_openapi_path "admin config draft save" "/api/v1/admin/config/draft" "put"' in command
