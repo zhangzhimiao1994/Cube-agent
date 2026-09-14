@@ -147,6 +147,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_authenticated_project_scale_execution_profile" in command
     assert "profile: authenticated project scale execution runner" in command
     assert "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE" in command
+    assert "AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES" in command
+    assert "AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS" in command
     assert "skip: authenticated project scale execution runner is disabled in read-only mode" in command
     assert (
         "skip: authenticated project scale execution runner requires "
@@ -159,7 +161,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "agent_hub.harness.project_scale_runner" in command
     assert "--base-url \"$base_url\"" in command
     assert "--execute" in command
-    assert "--wait-seconds \"$project_scale_wait_seconds\"" in command
+    assert "IFS=',' read -r -a scale_values <<< \"$project_scale_scales\"" in command
+    assert "args+=(--scale \"$value\")" in command
+    assert "IFS=',' read -r -a flow_values <<< \"$project_scale_flows\"" in command
+    assert "args+=(--flow \"$value\")" in command
+    assert "args+=(--wait-seconds \"$project_scale_wait_seconds\")" in command
     assert "--poll-interval \"$project_scale_poll_interval\"" in command
     assert "ok: authenticated project scale execution runner" in command
     assert "check_interaction_prevention_and_recovery" in command

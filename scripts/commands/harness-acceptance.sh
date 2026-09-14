@@ -6,8 +6,8 @@ profile="all"
 stress=0
 strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
 project_scale_execute_profile="${AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE:-0}"
-project_scale_scale="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALE:-small}"
-project_scale_flow="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct}"
+project_scale_scales="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES:-${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALE:-small}}"
+project_scale_flows="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS:-${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct}}"
 project_scale_wait_seconds="${AGENT_HUB_PROJECT_SCALE_WAIT_SECONDS:-120}"
 project_scale_poll_interval="${AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS:-2}"
 read_only=0
@@ -2071,6 +2071,10 @@ run_authenticated_project_scale_execution_profile() {
   local script_dir
   local source_dir
   local output
+  local args
+  local scale_values
+  local flow_values
+  local value
 
   printf 'profile: authenticated project scale execution runner\n'
   if [[ "$read_only" -eq 1 ]]; then
@@ -2093,27 +2097,40 @@ run_authenticated_project_scale_execution_profile() {
 
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  args=(
+    -m agent_hub.harness.project_scale_runner
+    --execute
+    --base-url "$base_url"
+  )
+  IFS=',' read -r -a scale_values <<< "$project_scale_scales"
+  for value in "${scale_values[@]}"; do
+    if [[ -n "$value" ]]; then
+      args+=(--scale "$value")
+    fi
+  done
+  IFS=',' read -r -a flow_values <<< "$project_scale_flows"
+  for value in "${flow_values[@]}"; do
+    if [[ -n "$value" ]]; then
+      args+=(--flow "$value")
+    fi
+  done
+  args+=(--wait-seconds "$project_scale_wait_seconds")
+  args+=(--poll-interval "$project_scale_poll_interval")
+  args+=(--json)
   if ! output="$(
     PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
       AGENT_HUB_ACCEPTANCE_BEARER_TOKEN="$bearer_token" \
-      "$python_bin" -m agent_hub.harness.project_scale_runner \
-      --execute \
-      --base-url "$base_url" \
-      --scale "$project_scale_scale" \
-      --flow "$project_scale_flow" \
-      --wait-seconds "$project_scale_wait_seconds" \
-      --poll-interval "$project_scale_poll_interval" \
-      --json 2>&1
+      "$python_bin" "${args[@]}" 2>&1
   )"; then
-    printf 'fail: authenticated project scale execution runner scale=%s flow=%s\n' \
-      "$project_scale_scale" "$project_scale_flow" >&2
+    printf 'fail: authenticated project scale execution runner scales=%s flows=%s\n' \
+      "$project_scale_scales" "$project_scale_flows" >&2
     printf '%s\n' "$output" >&2
     failures=$((failures + 1))
     return 1
   fi
   printf '%s\n' "$output"
-  printf 'ok: authenticated project scale execution runner scale=%s flow=%s\n' \
-    "$project_scale_scale" "$project_scale_flow"
+  printf 'ok: authenticated project scale execution runner scales=%s flows=%s\n' \
+    "$project_scale_scales" "$project_scale_flows"
 }
 
 check_multimode_interaction_matrix() {
