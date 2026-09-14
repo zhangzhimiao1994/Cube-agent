@@ -14,6 +14,7 @@ ProjectScaleFlow = Literal[
     "self_repair",
     "artifact_production",
 ]
+ProjectScaleRunMode = Literal["direct", "dispatch", "hybrid"]
 
 PROJECT_SCALE_TIERS: tuple[ProjectScaleTier, ...] = ("small", "medium", "large", "ultra")
 PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
@@ -44,6 +45,16 @@ _LONG_RUNNING_SCALES = frozenset({"large", "ultra"})
 _PREFLIGHT_SCALES = frozenset({"large", "ultra"})
 _FAILURE_FLOWS = frozenset({"model_failure", "self_repair"})
 _ARTIFACT_FLOWS = frozenset({"artifact_production", "plugin", "multi_agent"})
+_FLOW_RUN_MODES: dict[ProjectScaleFlow, ProjectScaleRunMode] = {
+    "direct": "direct",
+    "dispatch": "dispatch",
+    "hybrid": "hybrid",
+    "multi_agent": "dispatch",
+    "plugin": "dispatch",
+    "model_failure": "hybrid",
+    "self_repair": "hybrid",
+    "artifact_production": "hybrid",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +69,12 @@ class ProjectScaleCase:
     @property
     def id(self) -> str:
         return f"{self.scale}:{self.flow}"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectScaleRunRequest:
+    case_id: str
+    body: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +143,21 @@ def describe_project_scale_matrix(matrix: ProjectScaleMatrix | None = None) -> s
     )
 
 
+def build_project_scale_run_request(case: ProjectScaleCase) -> ProjectScaleRunRequest:
+    mode = _FLOW_RUN_MODES[case.flow]
+    session_id = f"project-scale-{case.scale}-{case.flow}"
+    body: dict[str, object] = {
+        "message": _fixture_message(case),
+        "mode": mode,
+        "project_id": "project-scale-acceptance",
+        "workspace_session_id": session_id,
+        "sandbox_profile": "workspace_write",
+        "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
+        "skip_evolution_proposal": True,
+    }
+    return ProjectScaleRunRequest(case_id=case.id, body=body)
+
+
 def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectScaleCase:
     focus = ["interaction_stability", "final_result"]
     if scale in _LONG_RUNNING_SCALES:
@@ -146,6 +178,21 @@ def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectSc
     )
 
 
+def _fixture_message(case: ProjectScaleCase) -> str:
+    scale_label = {
+        "small": "small project",
+        "medium": "medium project",
+        "large": "large project",
+        "ultra": "ultra-large project",
+    }[case.scale]
+    return (
+        f"Project-scale acceptance fixture: build a {scale_label} for scale={case.scale} "
+        f"and flow={case.flow}. Read constraints first, keep interaction stable, use the "
+        "approved workspace, produce final artifacts, record verification evidence, and "
+        "diagnose and repair failures instead of silently degrading."
+    )
+
+
 __all__ = [
     "PROJECT_SCALE_CLEANUP_ACTIONS",
     "PROJECT_SCALE_FLOW_KINDS",
@@ -154,6 +201,9 @@ __all__ = [
     "ProjectScaleCase",
     "ProjectScaleFlow",
     "ProjectScaleMatrix",
+    "ProjectScaleRunMode",
+    "ProjectScaleRunRequest",
     "ProjectScaleTier",
+    "build_project_scale_run_request",
     "describe_project_scale_matrix",
 ]

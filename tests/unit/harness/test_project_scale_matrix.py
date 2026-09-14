@@ -2,6 +2,7 @@ from agent_hub.harness.project_scale import (
     PROJECT_SCALE_FLOW_KINDS,
     PROJECT_SCALE_TIERS,
     ProjectScaleMatrix,
+    build_project_scale_run_request,
 )
 
 
@@ -41,3 +42,39 @@ def test_project_scale_matrix_marks_large_profiles_as_explicit_server_runs() -> 
     assert all(case.requires_explicit_server_profile for case in ultra_cases)
     assert any(case.expected_preflight for case in ultra_cases)
     assert any("self_repair" in case.validation_focus for case in ultra_cases)
+
+
+def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
+    matrix = ProjectScaleMatrix.default()
+
+    for case in matrix.cases:
+        request = build_project_scale_run_request(case)
+        body = request.body
+        assert request.case_id == case.id
+        assert body["project_id"] == "project-scale-acceptance"
+        assert body["workspace_session_id"] == f"project-scale-{case.scale}-{case.flow}"
+        assert body["sandbox_profile"] == "workspace_write"
+        assert body["requested_permissions"] == [
+            "workspace.read",
+            "workspace.write",
+            "command.run",
+        ]
+        assert body["skip_evolution_proposal"] is True
+        assert case.scale in body["message"]
+        assert case.flow in body["message"]
+
+
+def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
+    cases = {case.id: case for case in ProjectScaleMatrix.default().cases}
+
+    assert build_project_scale_run_request(cases["small:direct"]).body["mode"] == "direct"
+    assert build_project_scale_run_request(cases["small:dispatch"]).body["mode"] == "dispatch"
+    assert build_project_scale_run_request(cases["small:hybrid"]).body["mode"] == "hybrid"
+    assert build_project_scale_run_request(cases["small:multi_agent"]).body["mode"] == "dispatch"
+    assert build_project_scale_run_request(cases["small:plugin"]).body["mode"] == "dispatch"
+    assert build_project_scale_run_request(cases["small:model_failure"]).body["mode"] == "hybrid"
+    assert build_project_scale_run_request(cases["small:self_repair"]).body["mode"] == "hybrid"
+    assert (
+        build_project_scale_run_request(cases["small:artifact_production"]).body["mode"]
+        == "hybrid"
+    )
