@@ -565,6 +565,7 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     assert "--wait-seconds SECONDS" in command
     assert "--poll-interval SECONDS" in command
     assert "--output PATH" in command
+    assert "--execution-id ID" in command
     assert "--json" in command
     assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
 

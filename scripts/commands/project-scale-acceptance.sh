@@ -19,6 +19,7 @@ Common options:
   --wait-seconds SECONDS               Wait for terminal run status before evidence checks.
   --poll-interval SECONDS              Poll interval while waiting for terminal run status.
   --output PATH                        Write the JSON plan or execution report to PATH.
+  --execution-id ID                    Scope execution idempotency keys; generated automatically for --execute.
   --help                               Show Python runner help.
 EOF
 }

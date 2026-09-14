@@ -149,6 +149,7 @@ def execute_project_scale_plan(
     *,
     wait_seconds: float = 0,
     poll_interval_seconds: float = 2,
+    execution_id: str | None = None,
 ) -> ProjectScaleExecutionReport:
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
@@ -170,7 +171,11 @@ def execute_project_scale_plan(
                 "POST",
                 "/api/v1/runs",
                 body=run_request.body,
-                idempotency_key=_idempotency_key(run_request.case_id, index),
+                idempotency_key=_idempotency_key(
+                    run_request.case_id,
+                    index,
+                    execution_id=execution_id,
+                ),
             )
             if not isinstance(response, dict):
                 raise TypeError("run create returned non-object JSON")
@@ -273,6 +278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=os.environ.get("AGENT_HUB_PROJECT_SCALE_REPORT_PATH"),
         help="Write the JSON plan or execution report to this path.",
     )
+    parser.add_argument(
+        "--execution-id",
+        default=os.environ.get("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID"),
+        help="Scope execution idempotency keys; generated automatically for --execute.",
+    )
     parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
 
@@ -295,6 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             UrllibAcceptanceClient(base_url=args.base_url, bearer_token=token, timeout=args.timeout),
             wait_seconds=args.wait_seconds,
             poll_interval_seconds=args.poll_interval,
+            execution_id=args.execution_id or _default_execution_id(),
         )
         payload = report.to_payload()
     else:
@@ -334,9 +345,24 @@ def _workspace_bundle_path(body: dict[str, object]) -> str:
     )
 
 
-def _idempotency_key(case_id: str, index: int) -> str:
+def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = None) -> str:
     safe_case = case_id.replace(":", "-").replace("_", "-")
-    return f"project-scale-{safe_case}-{index}"
+    key = f"project-scale-{safe_case}-{index}"
+    if execution_id is not None:
+        key = f"{key}-{_safe_idempotency_token(execution_id)}"
+    return key[:90]
+
+
+def _default_execution_id() -> str:
+    return _safe_idempotency_token(f"{int(time.time())}-{os.getpid()}")
+
+
+def _safe_idempotency_token(value: str) -> str:
+    safe = "".join(
+        character if character.isalnum() or character in "._:-" else "-"
+        for character in value.strip()
+    ).strip("-")
+    return (safe or "run")[:48]
 
 
 def _case_requires_project_preflight(case_id: str) -> bool:

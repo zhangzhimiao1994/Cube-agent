@@ -99,6 +99,20 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     ]
 
 
+def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])
+
+    report = execute_project_scale_plan(plan, client, execution_id="acceptance-20260914")
+
+    assert report.ok is True
+    assert client.calls[0] == (
+        "POST",
+        "/api/v1/runs",
+        "project-scale-small-direct-0-acceptance-20260914",
+    )
+
+
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)
