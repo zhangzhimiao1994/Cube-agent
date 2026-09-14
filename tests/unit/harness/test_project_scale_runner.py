@@ -133,6 +133,23 @@ def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -
     assert ("POST", "/api/v1/runs/run-small-direct/cancel", None) in client.calls
 
 
+def test_execute_project_scale_plan_rejects_detail_scope_mismatch() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        details_run_id="run-stale-direct",
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert report.results[0].run_id == "run-small-direct"
+    assert report.results[0].errors == (
+        "run details scope mismatch: id expected run-small-direct got run-stale-direct",
+    )
+
+
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)
@@ -218,6 +235,7 @@ class FakeAcceptanceClient:
         events: list[dict[str, object]] | None = None,
         response_project_id: str | None = None,
         response_session_id: str | None = None,
+        details_run_id: str | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -230,6 +248,7 @@ class FakeAcceptanceClient:
         self.events = events or [{"kind": "run.created"}]
         self.response_project_id = response_project_id
         self.response_session_id = response_session_id
+        self.details_run_id = details_run_id
         self.calls: list[tuple[str, str, str | None]] = []
 
     def request_json(
@@ -263,7 +282,7 @@ class FakeAcceptanceClient:
             return {"id": self.run_id, "status": self.statuses[0]}
         if path == f"/api/v1/runs/{self.run_id}/details":
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
-            return {"id": self.run_id, "status": status, "artifacts": self.artifacts}
+            return {"id": self.details_run_id or self.run_id, "status": status, "artifacts": self.artifacts}
         if path == f"/api/v1/runs/{self.run_id}/events":
             return list(self.events)
         if path == f"/api/v1/runs/{self.run_id}/cancel":

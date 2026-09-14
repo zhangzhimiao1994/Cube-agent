@@ -202,6 +202,7 @@ def execute_project_scale_plan(
                 details = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
                 evidence["run_details"] = isinstance(details, dict)
                 if isinstance(details, dict):
+                    _validate_run_details_scope(details, run_id)
                     status = _string_value(details.get("status")) or status
                     evidence["final_artifacts"] = _has_final_artifacts(details)
                 if _is_terminal_status(status):
@@ -355,6 +356,13 @@ def _validate_run_submission_scope(response: dict[str, object], body: dict[str, 
         if actual != expected:
             got = actual if isinstance(actual, str) and actual else "missing"
             raise RuntimeError(f"run scope mismatch: {field} expected {expected} got {got}")
+
+
+def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None:
+    actual = details.get("id")
+    if actual != run_id:
+        got = actual if isinstance(actual, str) and actual else "missing"
+        raise RuntimeError(f"run details scope mismatch: id expected {run_id} got {got}")
 
 
 def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = None) -> str:
