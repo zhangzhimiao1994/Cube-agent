@@ -1419,6 +1419,122 @@ PY
   return 1
 }
 
+check_self_repair_failure_injection_matrix() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: self-repair failure injection matrix\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: self-repair failure injection matrix requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from uuid import uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.self_repair import (
+    SelfRepairPolicy,
+    classify_terminal_run,
+    repair_context_from_proposal,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+def classify(events, expected_category, expected_strategy):
+    run_id = uuid4()
+    normalized_events = tuple(
+        event if event.run_id == run_id else event.model_copy(update={"run_id": run_id})
+        for event in events
+    )
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"source": "manual"},
+        events=normalized_events,
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+    require(decision is not None, f"{expected_category} decision")
+    require(decision.kind == "repair.classified", f"{expected_category} classified")
+    require(decision.failure_category == expected_category, f"{expected_category} category")
+    require(decision.recovery_strategy == expected_strategy, f"{expected_category} strategy")
+    require(decision.requires_approval is False, f"{expected_category} approval")
+    require(decision.automatic_execution is True, f"{expected_category} automatic")
+    proposal = decision.to_proposal(run_id=run_id)
+    require(proposal is not None, f"{expected_category} proposal")
+    require(proposal.get("failure_kind") == expected_category, f"{expected_category} proposal kind")
+    require(proposal.get("recovery_strategy") == expected_strategy, f"{expected_category} proposal strategy")
+    context = repair_context_from_proposal(proposal)
+    require(context.get("failure_kind") == expected_category, f"{expected_category} context kind")
+    require(context.get("recovery_strategy") == expected_strategy, f"{expected_category} context strategy")
+    serialized = repr({"proposal": proposal, "context": context})
+    require("secret://token" not in serialized, f"{expected_category} secret redaction")
+    require("Authorization: Bearer" not in serialized, f"{expected_category} auth redaction")
+
+
+base_run_id = uuid4()
+cases = (
+    (
+        (
+            RunEvent(
+                kind=EventKind.TOOL_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                tool_name="filesystem.read_file",
+                reason="tool failed after timeout secret://token",
+            ),
+        ),
+        "tool_failure", "repair_tool_invocation_after_permission_check",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                step_id="builder_step",
+                actor="builder",
+                reason="step crashed after context compaction Authorization: Bearer token",
+            ),
+        ),
+        "step_failure", "retry_failed_step_after_context_compaction",
+    ),
+    (
+        (),
+        "missing_failure_event", "manual_review_missing_failure_event",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                reason="runtime recovery blocked after checkpoint restore",
+            ),
+        ),
+        "runtime_recovery_blocked", "manual_review_recovery_checkpoint",
+    ),
+)
+
+for events, category, strategy in cases:
+    classify(events, category, strategy)
+PY
+  then
+    printf 'ok: self-repair failure injection matrix\n'
+    return 0
+  fi
+  printf 'fail: self-repair failure injection matrix\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_running_recovery_contract() {
   local python_bin
   local script_dir
@@ -2785,6 +2901,7 @@ run_codex_profile() {
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
   check_running_recovery_contract || true
+  check_self_repair_failure_injection_matrix || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true
   check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details" || true

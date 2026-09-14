@@ -406,6 +406,12 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ordinary schedule-like reminders must stay chat" in command
     assert "schedule feature discussion must stay chat" in command
     assert "explicit schedule task creation must still propose" in command
+    assert "check_self_repair_failure_injection_matrix" in command
+    assert "profile: self-repair failure injection matrix" in command
+    assert '"tool_failure", "repair_tool_invocation_after_permission_check"' in command
+    assert '"step_failure", "retry_failed_step_after_context_compaction"' in command
+    assert '"missing_failure_event", "manual_review_missing_failure_event"' in command
+    assert "ok: self-repair failure injection matrix" in command
     assert "profile: multi-mode interaction matrix" in command
     assert "ok: multi-mode interaction matrix" in command
     assert "fail: multi-mode interaction matrix" in command
