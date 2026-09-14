@@ -2973,7 +2973,7 @@ describe("operational management pages", () => {
     expect(within(card).getByText(/runtime_failure/)).not.toBeNull();
     expect(within(card).getByText(/第 1\/1 次/)).not.toBeNull();
     expect(within(card).getByText(/只执行一次受控修复/)).not.toBeNull();
-    expect(within(card).getByText(/switch_to_available_model_and_retry/)).not.toBeNull();
+    expect(within(card).getByText(/切换到有容量的同类模型/)).not.toBeNull();
     expect(within(card).getByText(/retry_blocked_contract_chain/)).not.toBeNull();
     expect(within(card).getByText(/不会自动执行/)).not.toBeNull();
   });
