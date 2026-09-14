@@ -459,6 +459,26 @@ function displayToolOperation(kind: string) {
   return TOOL_OPERATION_LABELS[kind] ?? kind;
 }
 
+function displayDetailToolName(toolName: string | null | undefined, operationKind?: string | null) {
+  const operationLabel = operationKind ? displayToolOperation(operationKind) : "";
+  if (operationLabel && operationLabel !== operationKind && operationLabel !== "工具") return operationLabel;
+  const text = safeDiagnosticIdentifier(toolName, "工具");
+  const normalized = text.toLowerCase().replace(/[.\s-]+/g, "_");
+  if (
+    normalized.includes("run_safe_command") ||
+    normalized.includes("command") ||
+    normalized.includes("terminal") ||
+    normalized.includes("shell") ||
+    normalized.includes("exec")
+  ) {
+    return "终端";
+  }
+  if (normalized.includes("edit") || normalized.includes("write") || normalized.includes("patch")) return "文件编辑";
+  if (normalized.includes("read") || normalized.includes("context") || normalized.includes("workspace")) return "文件读取";
+  if (normalized.includes("browser") || normalized.includes("click") || normalized.includes("screen")) return "浏览器";
+  return text;
+}
+
 function displayDetailActor(actor: string | null | undefined) {
   if (!actor) return "";
   if (actor === "main_agent" || actor === "main") return "主 Agent";
@@ -717,7 +737,7 @@ function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefin
   if (event.actor) rows.push({ label: "执行者", value: displayDetailActor(event.actor) });
   if (event.participants.length > 0) rows.push({ label: "参与者", value: event.participants.join("、") });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
-  if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
+  if (event.tool_name) rows.push({ label: "工具", value: displayDetailToolName(event.tool_name, payloadString(event.payload, "operation_kind")) });
   if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
   if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
   if (safeDiagnosticIdentifier(event.action, "")) {
@@ -846,7 +866,7 @@ function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[
           `事件 #${event.sequence}`,
           displayDetailActor(event.actor),
           event.step_id ? `步骤 ${event.step_id}` : "",
-          event.tool_name && event.kind.startsWith("tool.") ? `工具 ${event.tool_name}` : "",
+          event.tool_name && event.kind.startsWith("tool.") ? `工具 ${displayDetailToolName(event.tool_name, payloadString(event.payload, "operation_kind"))}` : "",
         ].filter(Boolean),
         rows: eventDetailRows(event, artifact),
         createdAt: event.created_at,
@@ -918,7 +938,7 @@ function safeDetailEventSummary(event: RunEvent) {
   }
   if (event.kind === "model.reasoning_delta") return "模型正在分析";
   if (event.kind === "model.text_delta") return "模型正在生成";
-  if (event.kind.startsWith("tool.")) return `${event.tool_name ?? "工具"} ${event.kind.replace("tool.", "")}`;
+  if (event.kind.startsWith("tool.")) return `${displayDetailToolName(event.tool_name, payloadString(event.payload, "operation_kind"))} ${event.kind.replace("tool.", "")}`;
   if (event.kind.startsWith("approval.")) {
     return safeDiagnosticIdentifier(event.action, "") || safeDiagnosticIdentifier(event.decision, "") || "等待确认";
   }
@@ -1554,7 +1574,7 @@ function detailDiagnosticFromApi(
   return {
     id: `${runId}-api-diagnostic-${diagnostic.sequence}-${index}`,
     label,
-    title: diagnostic.tool_name || diagnostic.logical_model || diagnostic.action || actor || label,
+    title: diagnostic.tool_name ? displayDetailToolName(diagnostic.tool_name) : diagnostic.logical_model || diagnostic.action || actor || label,
     detail: detail || "已记录结构化故障摘要",
     recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
     meta: [
@@ -1630,7 +1650,10 @@ function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic
   const diagnostics: DetailFailureDiagnostic[] = [];
   detail.events.forEach((event) => {
     if (event.kind === "tool.failed") {
-      const toolName = safeDiagnosticIdentifier(event.tool_name, safeDiagnosticIdentifier(event.payload.name, "工具"));
+      const toolName = displayDetailToolName(
+        safeDiagnosticIdentifier(event.tool_name, safeDiagnosticIdentifier(event.payload.name, "工具")),
+        payloadString(event.payload, "operation_kind"),
+      );
       const failureKind = safeDiagnosticFailureKind(event.payload.failure_kind);
       const exitCode = payloadDisplayValue(event.payload.exit_code);
       const outputBytes = payloadDisplayValue(event.payload.output_bytes);
@@ -1730,7 +1753,10 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       id: `${detail.id}-intent-replay-${key}`,
       label: "回放意图",
       title: replayLabel,
-      detail: safeDiagnosticIdentifier(finalEvent.tool_name, safeDiagnosticIdentifier(finalEvent.payload.name, "工具调用")),
+      detail: displayDetailToolName(
+        safeDiagnosticIdentifier(finalEvent.tool_name, safeDiagnosticIdentifier(finalEvent.payload.name, "工具调用")),
+        operationKind,
+      ),
       meta: [displayToolOperation(operationKind), displayToolStatus(payloadString(finalEvent.payload, "status") ?? finalEvent.kind.replace("tool.", ""))],
       tone: replayLabel === "不可回放" ? "replay" : "done",
     });
@@ -2519,7 +2545,7 @@ export function RunDetailPage() {
           <ul className="compact-list">
             {toolLifecycles.map((item) => (
               <li key={item.key}>
-                <strong>{item.toolName}</strong>
+                <strong>{displayDetailToolName(item.toolName, item.operationKind)}</strong>
                 <span>{displayToolStatus(item.status)}</span>
                 <span>{displayToolOperation(item.operationKind)}</span>
                 {item.stepId ? <small>步骤 {item.stepId}</small> : null}

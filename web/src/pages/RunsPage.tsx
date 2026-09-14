@@ -745,6 +745,20 @@ function toolOperationLabel(toolName: string) {
   return "使用工具";
 }
 
+function toolDisplayName(event: RunDetail["events"][number]) {
+  const toolName = toolEventName(event);
+  const operation = toolOperationLabel(toolName);
+  return operation === "使用工具" ? toolName : operation;
+}
+
+function toolSummaryWithDisplay(event: RunDetail["events"][number], suffix = "") {
+  const toolName = toolEventName(event);
+  const operation = toolOperationLabel(toolName);
+  const displayName = toolDisplayName(event);
+  const detail = displayName === operation ? "" : `：${displayName}`;
+  return `${operation}${suffix}${detail}`;
+}
+
 function toolStatusLabel(event: RunDetail["events"][number]) {
   if (event.kind === "tool.requested") return "请求";
   if (event.kind === "tool.started") return "开始";
@@ -778,7 +792,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (participants || payloadParticipants) rows.push({ label: "参与者", value: participants ?? payloadParticipants ?? "" });
   const participantModels = displayPayloadParticipantModels(event.payload, agentNames);
   if (participantModels) rows.push({ label: "模型分配", value: participantModels });
-  if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
+  if (event.tool_name) rows.push({ label: "工具", value: toolDisplayName(event) });
   if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
@@ -1194,14 +1208,13 @@ function failureDiagnosticsForRun(detail: RunDetail, agentNames: Map<string, str
 
   detail.events.forEach((event) => {
     if (event.kind === "tool.failed") {
-      const toolName = toolEventName(event);
       const failureKind = formatEventPayloadValue(event.payload.failure_kind);
       const exitCode = formatEventPayloadValue(event.payload.exit_code);
       const outputBytes = formatEventPayloadValue(event.payload.output_bytes);
       pushUniqueDiagnostic(diagnostics, {
         id: `${detail.id}-diagnostic-tool-${toolLifecycleKey(event)}`,
         label: "工具执行失败",
-        title: toolName,
+        title: toolDisplayName(event),
         detail: [
           failureKind ? `失败类型 ${failureKind}` : "工具调用未完成",
           exitCode ? `退出码 ${exitCode}` : "",
@@ -1338,7 +1351,7 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
       id: `${detail.id}-intent-replay-${key}`,
       label: "回放意图",
       title: replayLabel,
-      detail: toolEventName(finalEvent),
+      detail: toolDisplayName(finalEvent),
       meta: [toolOperationLabel(toolEventName(finalEvent)), toolLifecycleStatusText(finalEvent)].filter(Boolean),
       tone: replayLabel === "不可回放" ? "replay" : "done",
     });
@@ -1923,12 +1936,11 @@ function isWrappedToolFailureEvent(event: RunDetail["events"][number], events: R
 }
 
 function toolFailureSummary(event: RunDetail["events"][number]) {
-  const toolName = toolEventName(event);
   const failureKind = formatEventPayloadValue(event.payload.failure_kind);
   const exitCode = formatEventPayloadValue(event.payload.exit_code);
   const outputBytes = formatEventPayloadValue(event.payload.output_bytes);
   return [
-    `${toolOperationLabel(toolName)}失败：${toolName}`,
+    toolSummaryWithDisplay(event, "失败"),
     failureKind ? `失败类型 ${failureKind}` : "",
     exitCode ? `退出码 ${exitCode}` : "",
     outputBytes ? `输出 ${outputBytes} 字节` : "",
@@ -2513,19 +2525,17 @@ function eventSummaryText(
   }
   if (event.kind === "tool.requested") {
     const requestedTool = formatEventPayloadValue(event.payload.name) || event.tool_name || "工具";
-    return `工具请求：${conciseProcessText(requestedTool, "工具")}`;
+    const requestedDisplay = toolOperationLabel(requestedTool) === "使用工具" ? requestedTool : toolOperationLabel(requestedTool);
+    return `工具请求：${conciseProcessText(requestedDisplay, "工具")}`;
   }
   if (event.kind === "tool.started") {
-    const toolName = toolEventName(event);
-    return `${subject} ${toolOperationLabel(toolName)}：${toolName}`;
+    return `${subject} ${toolSummaryWithDisplay(event)}`;
   }
   if (event.kind === "tool.completed") {
-    const toolName = toolEventName(event);
-    return `${subject} ${toolOperationLabel(toolName)}完成：${toolName}`;
+    return `${subject} ${toolSummaryWithDisplay(event, "完成")}`;
   }
   if (event.kind === "tool.failed") {
-    const toolName = toolEventName(event);
-    return `${subject} ${toolOperationLabel(toolName)}失败：${toolName}`;
+    return `${subject} ${toolSummaryWithDisplay(event, "失败")}`;
   }
   if (event.kind === "step.started") {
     return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;

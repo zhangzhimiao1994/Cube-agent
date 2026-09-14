@@ -1706,8 +1706,7 @@ describe("operational management pages", () => {
     expect(screen.getByRole("heading", { name: "派单式" })).not.toBeNull();
     const toolSection = screen.getByRole("region", { name: "工具链路" });
     expect(toolSection).not.toBeNull();
-    expect(within(toolSection).getByText("run_safe_command")).not.toBeNull();
-    expect(within(toolSection).getByText("终端")).not.toBeNull();
+    expect(within(toolSection).getAllByText("终端").length).toBeGreaterThan(0);
     expect(within(toolSection).getByText("退出码 1")).not.toBeNull();
     expect(within(toolSection).getByText("审批 approval_terminal")).not.toBeNull();
     expect(within(toolSection).getByText("不可回放")).not.toBeNull();
@@ -1936,7 +1935,7 @@ describe("operational management pages", () => {
     expect(within(diagnostics).getByText("工具执行失败")).not.toBeNull();
     expect(within(diagnostics).getAllByText("模型链路失败")).toHaveLength(2);
     expect(within(diagnostics).getByText("等待人工确认")).not.toBeNull();
-    expect(within(diagnostics).getByText("工具")).not.toBeNull();
+    expect(within(diagnostics).getByText("终端")).not.toBeNull();
     expect(within(diagnostics).getAllByText("模型链路")).toHaveLength(2);
     expect(within(diagnostics).getByText(/审批 approval_retry_terminal/)).not.toBeNull();
     expect(diagnostics.textContent).not.toContain("private-token");
@@ -3643,9 +3642,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const toolCard = within(stream).getByRole("button", {
-      name: /工具请求：workspace_read/,
-    });
+    const toolCard = within(stream).getByRole("button", { name: /工具请求：读取文件/ });
     expect(toolCard).not.toBeNull();
     expect(within(stream).queryByText("README.md")).toBeNull();
     await user.click(toolCard);
@@ -3695,9 +3692,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const toolCard = within(stream).getByRole("button", {
-      name: /工具请求：workspace_read/,
-    });
+    const toolCard = within(stream).getByRole("button", { name: /工具请求：读取文件/ });
     await user.click(toolCard);
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
@@ -3871,12 +3866,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const completedCard = within(stream).getByRole("button", {
-      name: /文案生成 运行终端完成：run_safe_command/,
-    });
-    const failedCard = within(stream).getByRole("button", {
-      name: /文案生成 编辑文件失败：edit_file/,
-    });
+    const completedCard = within(stream).getByRole("button", { name: /文案生成 运行终端完成/ });
+    const failedCard = within(stream).getByRole("button", { name: /文案生成 编辑文件失败/ });
     expect(within(stream).queryByText("cat secret-token.txt")).toBeNull();
     expect(within(stream).queryByText("terminal output contained sk-secret123")).toBeNull();
     expect(within(stream).queryByText("private terminal output")).toBeNull();
@@ -4952,10 +4943,11 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const toolCards = within(stream).getAllByRole("button", { name: /run_safe_command/ });
+    const toolCards = within(stream).getAllByRole("button", { name: /运行终端失败/ });
 
     expect(toolCards).toHaveLength(1);
     expect(toolCards[0].textContent).toContain("运行终端失败");
+    expect(stream.textContent).not.toContain("run_safe_command");
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
 
@@ -5027,7 +5019,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
-    expect(within(stream).getAllByText(/运行终端失败：run_safe_command/).length).toBeGreaterThan(0);
+    expect(within(stream).getAllByText(/运行终端失败/).length).toBeGreaterThan(0);
+    expect(stream.textContent).not.toContain("run_safe_command");
     expect(within(stream).getAllByText(/原始命令和输出已隐藏/).length).toBeGreaterThan(0);
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
@@ -5077,7 +5070,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
-    expect(within(stream).getAllByRole("button", { name: /run_safe_command/ })).toHaveLength(1);
+    expect(within(stream).getAllByRole("button", { name: /运行终端/ })).toHaveLength(1);
+    expect(stream.textContent).not.toContain("run_safe_command");
     expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
   });
 
