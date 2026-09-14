@@ -1586,6 +1586,92 @@ async def test_fallback_must_satisfy_request_capabilities() -> None:
     assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
 
 
+async def test_capability_unavailable_primary_uses_capable_fallback_model() -> None:
+    primary = deployment("primary-key")
+    backup = deployment(
+        "backup-key",
+        "backup",
+        capabilities=frozenset({ModelCapability.TEXT, ModelCapability.TOOL_CALLING}),
+    )
+    capacity = CapacityStub([lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    completion = await gateway.complete_with_context(
+        request(required=frozenset({ModelCapability.TOOL_CALLING}))
+    )
+
+    assert completion.response.text == "ok"
+    assert completion.deployment_id == "backup-key"
+    assert completion.logical_model == "backup"
+    assert completion.fallback_used is True
+    assert completion.fallback_from_logical_model == "primary"
+    assert completion.fallback_reason == "capability_unavailable"
+    assert completion.attempted_logical_models == ("primary", "backup")
+    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    assert acquire_events == [
+        (
+            "acquire",
+            ("backup-key",),
+            5.0,
+            ConservativeTokenEstimator().estimate(
+                request(required=frozenset({ModelCapability.TOOL_CALLING}))
+            ),
+        )
+    ]
+
+
+async def test_streaming_gateway_reports_capability_fallback_before_backup_output() -> None:
+    primary = deployment("primary-key", provider_model="deepseek/deepseek-chat")
+    backup = deployment(
+        "backup-key",
+        "backup",
+        provider_model="openai/gpt-5",
+        capabilities=frozenset({ModelCapability.TEXT, ModelCapability.TOOL_CALLING}),
+    )
+    capacity = CapacityStub([lease("backup-key")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [{"choices": [{"delta": {"content": "backup answer"}}]}],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        monotonic=monotonic([46.0, 46.3]),
+    )
+
+    events = [
+        event
+        async for event in gateway.stream_openai_compatible_events(
+            request(required=frozenset({ModelCapability.TOOL_CALLING}))
+        )
+    ]
+
+    assert [(event.kind, dict(event.payload)) for event in events] == [
+        (
+            "model.fallback",
+            {
+                "schema_version": 1,
+                "phase": "attempted",
+                "from_logical_model": "primary",
+                "to_logical_model": "backup",
+                "reason": "capability_unavailable",
+                "attempted_logical_models": ("primary", "backup"),
+            },
+        ),
+        ("model.text_delta", {"text": "backup answer"}),
+    ]
+    assert [call[0].id for call in transport.stream_calls] == ["backup-key"]
+
+
 async def test_queue_full_tries_fallback_model_when_available() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")

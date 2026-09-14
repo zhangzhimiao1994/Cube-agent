@@ -107,6 +107,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: running recovery guard" in command
     assert "check_model_capability_recovery_contract" in command
     assert "profile: model capability recovery" in command
+    assert "capability_unavailable" in command
+    assert "primary must not be invoked without capability" in command
     assert "ok: model capability recovery" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command

@@ -1348,9 +1348,21 @@ check_model_capability_recovery_contract() {
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.models.capacity import CapacityLease
+from agent_hub.models.gateway import ModelGateway
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
 from agent_hub.runs.observer import RunMonitor
 from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
@@ -1369,6 +1381,101 @@ def require(value, label):
     if not value:
         raise SystemExit(label)
 
+
+class CapacityStub:
+    def __init__(self):
+        self.configured = ()
+        self.acquire_calls = []
+        self.records = []
+
+    def validate_configuration(self, deployments):
+        self.configured = tuple(deployments)
+
+    async def initialize(self):
+        return None
+
+    async def acquire(self, candidates, wait_timeout, *, estimated_tokens):
+        self.acquire_calls.append(
+            (tuple(candidate.id for candidate in candidates), wait_timeout, estimated_tokens)
+        )
+        selected = candidates[0]
+        return CapacityLease(
+            id=str(uuid4()),
+            deployment_id=selected.id,
+            quota_scope_id=selected.quota_scope_id,
+            expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            renew_after_seconds=1,
+        )
+
+    async def release(self, lease):
+        return True
+
+    async def renew(self, lease):
+        return lease
+
+    async def record_outcome(self, quota_scope_id, *, status_code, latency_seconds, succeeded):
+        self.records.append((quota_scope_id, status_code, succeeded))
+
+
+class SecretStub:
+    async def resolve(self, secret_ref):
+        return "safe-key"
+
+
+class TransportStub:
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, deployment, request, api_key):
+        del request, api_key
+        self.calls.append(deployment.id)
+        return ModelResponse(text="ok")
+
+
+async def verify_gateway_capability_fallback():
+    primary = Deployment(
+        id="primary_model",
+        logical_model="primary",
+        provider_model="deepseek/deepseek-chat",
+        secret_ref="secret://primary",
+        quota_scope_id="scope_primary",
+        capabilities=frozenset({ModelCapability.TEXT}),
+    )
+    backup = Deployment(
+        id="backup_model",
+        logical_model="backup",
+        provider_model="openai/gpt-5",
+        secret_ref="secret://backup",
+        quota_scope_id="scope_backup",
+        capabilities=frozenset({ModelCapability.TEXT, ModelCapability.TOOL_CALLING}),
+    )
+    capacity = CapacityStub()
+    transport = TransportStub()
+    gateway = ModelGateway(
+        ModelRegistry((primary, backup)),
+        capacity,
+        SecretStub(),
+        transport,
+        fallbacks={"primary": "backup"},
+    )
+    completion = await gateway.complete_with_context(
+        ModelRequest(
+            logical_model="primary",
+            messages=(ModelMessage(role="user", content="needs a tool"),),
+            required_capabilities=frozenset({ModelCapability.TOOL_CALLING}),
+        )
+    )
+    require(completion.deployment_id == "backup_model", "capable fallback deployment")
+    require(completion.logical_model == "backup", "capable fallback logical model")
+    require(completion.fallback_used is True, "capability fallback used")
+    require(completion.fallback_from_logical_model == "primary", "capability fallback source")
+    require(completion.fallback_reason == "capability_unavailable", "capability fallback reason")
+    require(completion.attempted_logical_models == ("primary", "backup"), "capability attempts")
+    require(transport.calls == ["backup_model"], "primary must not be invoked without capability")
+    require(capacity.acquire_calls[0][0] == ("backup_model",), "capacity only sees capable fallback")
+
+
+asyncio.run(verify_gateway_capability_fallback())
 
 run_id = uuid4()
 failure = RunEvent(

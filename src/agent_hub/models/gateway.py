@@ -325,18 +325,12 @@ class ModelGateway:
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
-        models = self._fallback_chain(request.logical_model, request.allow_fallback)
-        candidate_groups: list[tuple[str, tuple[Deployment, ...]]] = []
-        for logical_model in models:
-            try:
-                candidates = self._registry.candidates(
-                    logical_model, request.required_capabilities
-                )
-            except NoCapableDeployment:
-                if logical_model == request.logical_model:
-                    raise
-                break
-            candidate_groups.append((logical_model, candidates))
+        (
+            candidate_groups,
+            attempted_logical_models,
+            fallback_from_logical_model,
+            fallback_reason,
+        ) = self._capable_candidate_groups(request)
         relevant_deployments = tuple(
             deployment
             for _logical_model, candidates in candidate_groups
@@ -345,9 +339,6 @@ class ModelGateway:
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         last_retryable_error: BaseException | None = None
-        attempted_logical_models: list[str] = []
-        fallback_from_logical_model: str | None = None
-        fallback_reason: str | None = None
         for logical_model, candidates in candidate_groups:
             attempted_logical_models.append(logical_model)
             try:
@@ -409,19 +400,13 @@ class ModelGateway:
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
-        models = self._fallback_chain(request.logical_model, request.allow_fallback)
-        candidate_groups: list[tuple[str, tuple[Deployment, ...]]] = []
         last_retryable_error: BaseException | None = None
-        for logical_model in models:
-            try:
-                candidates = self._registry.candidates(
-                    logical_model, request.required_capabilities
-                )
-            except NoCapableDeployment:
-                if logical_model == request.logical_model:
-                    raise
-                break
-            candidate_groups.append((logical_model, candidates))
+        (
+            candidate_groups,
+            attempted_logical_models,
+            fallback_from_logical_model,
+            fallback_reason,
+        ) = self._capable_candidate_groups(request)
         relevant_deployments = tuple(
             deployment
             for _logical_model, candidates in candidate_groups
@@ -429,9 +414,6 @@ class ModelGateway:
         )
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
-        attempted_logical_models: list[str] = []
-        fallback_from_logical_model: str | None = None
-        fallback_reason: str | None = None
         for logical_model, candidates in candidate_groups:
             attempted_logical_models.append(logical_model)
             if (
@@ -498,6 +480,42 @@ class ModelGateway:
         if last_retryable_error is not None:
             raise last_retryable_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
+
+    def _capable_candidate_groups(
+        self, request: ModelRequest
+    ) -> tuple[
+        list[tuple[str, tuple[Deployment, ...]]],
+        list[str],
+        str | None,
+        str | None,
+    ]:
+        candidate_groups: list[tuple[str, tuple[Deployment, ...]]] = []
+        skipped_before_first_capable: list[str] = []
+        first_capability_error: NoCapableDeployment | None = None
+        for logical_model in self._fallback_chain(request.logical_model, request.allow_fallback):
+            try:
+                candidates = self._registry.candidates(
+                    logical_model, request.required_capabilities
+                )
+            except NoCapableDeployment as error:
+                if first_capability_error is None:
+                    first_capability_error = error
+                if not candidate_groups:
+                    skipped_before_first_capable.append(logical_model)
+                continue
+            candidate_groups.append((logical_model, candidates))
+        if not candidate_groups:
+            if first_capability_error is not None:
+                raise first_capability_error
+            raise CapacityUnavailable("model capacity unavailable")
+        if skipped_before_first_capable:
+            return (
+                candidate_groups,
+                skipped_before_first_capable,
+                skipped_before_first_capable[0],
+                "capability_unavailable",
+            )
+        return candidate_groups, [], None, None
 
     def _stream_fallback_event(
         self,
