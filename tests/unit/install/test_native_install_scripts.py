@@ -142,6 +142,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: project scale execution runner" in command
     assert "--wait-seconds" in command
     assert "--poll-interval" in command
+    assert "project-scale-runner.XXXXXX" in command
+    assert "--output \"$report_file\"" in command
+    assert "rm -f -- \"$report_file\"" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command
     assert "ok: project scale execution runner" in command
     assert "run_authenticated_project_scale_execution_profile" in command

@@ -2019,6 +2019,8 @@ check_project_scale_runner_contract() {
   local source_dir
   local help_output
   local dry_run_output
+  local report_file
+  local report_output
   local execute_output
   local execute_status
 
@@ -2035,7 +2037,7 @@ check_project_scale_runner_contract() {
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$help_output" != *"--execute"* || "$help_output" != *"--wait-seconds"* || "$help_output" != *"--poll-interval"* ]]; then
+  if [[ "$help_output" != *"--execute"* || "$help_output" != *"--wait-seconds"* || "$help_output" != *"--poll-interval"* || "$help_output" != *"--output"* ]]; then
     printf 'fail: project scale execution runner help missing execute/wait options\n' >&2
     failures=$((failures + 1))
     return 1
@@ -2047,6 +2049,26 @@ check_project_scale_runner_contract() {
   fi
   if [[ "$dry_run_output" != *'"dry_run": true'* || "$dry_run_output" != *'"case_id": "small:self_repair"'* ]]; then
     printf 'fail: project scale execution runner dry-run payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! report_file="$(mktemp /tmp/project-scale-runner.XXXXXX)"; then
+    printf 'fail: project scale execution runner report file setup\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
+    "$python_bin" -m agent_hub.harness.project_scale_runner \
+    --scale small --flow direct --json --output "$report_file" >/dev/null 2>&1; then
+    rm -f -- "$report_file"
+    printf 'fail: project scale execution runner report output\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  report_output="$(cat -- "$report_file" 2>/dev/null || true)"
+  rm -f -- "$report_file"
+  if [[ "$report_output" != *'"dry_run": true'* || "$report_output" != *'"case_id": "small:direct"'* ]]; then
+    printf 'fail: project scale execution runner report payload\n' >&2
     failures=$((failures + 1))
     return 1
   fi
