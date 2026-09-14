@@ -1482,6 +1482,20 @@ export function formatApiErrorDetailValue(key: string, value: string | number | 
   return String(value);
 }
 
+const API_ERROR_CODE_LABELS: Record<string, string> = {
+  model_unavailable: "模型不可用",
+  service_unavailable: "服务暂不可用",
+  invalid_credentials: "账号或密码无效",
+  invalid_bootstrap: "初始化码无效",
+  permission_denied: "权限不足",
+  not_found: "资源不存在",
+  request_failed: "请求失败",
+};
+
+function formatApiErrorCode(code: string): string {
+  return API_ERROR_CODE_LABELS[code] ?? code;
+}
+
 function formatApiErrorDetails(details: ApiErrorDetails | null): string {
   if (!details) return "";
   return API_ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
@@ -1495,7 +1509,7 @@ export function formatApiError(error: unknown, fallback: string): string {
   if (!(error instanceof ApiError)) {
     return error instanceof Error && error.message ? `${fallback}: ${error.message}` : fallback;
   }
-  const parts = [error.code, `HTTP ${error.status}`];
+  const parts = [formatApiErrorCode(error.code), `HTTP ${error.status}`];
   if (error.errorId) parts.push(`error ${error.errorId}`);
   const details = formatApiErrorDetails(error.details);
   if (details) parts.push(`details ${details}`);

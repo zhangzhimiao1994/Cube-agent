@@ -8053,7 +8053,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "会话列表加载失败: database is not ready (service_unavailable, HTTP 503, error err_123)",
+      "会话列表加载失败: database is not ready (服务暂不可用, HTTP 503, error err_123)",
     );
   });
 });

@@ -144,7 +144,7 @@ describe("LoginPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "创建管理员" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "初始化失败: invalid bootstrap code (invalid_bootstrap, HTTP 401)",
+      "初始化失败: invalid bootstrap code (初始化码无效, HTTP 401)",
     );
   });
 

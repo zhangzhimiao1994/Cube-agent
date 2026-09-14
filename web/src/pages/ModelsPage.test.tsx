@@ -329,7 +329,8 @@ describe("ModelsPage", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("model availability check failed: status=401");
-    expect(alert.textContent).toContain("model_unavailable");
+    expect(alert.textContent).toContain("模型不可用");
+    expect(alert.textContent).not.toContain("model_unavailable");
     expect(alert.textContent).toContain("模型配置错误日志");
     expect(alert.textContent).toContain("HTTP 状态");
     expect(alert.textContent).toContain("401");
