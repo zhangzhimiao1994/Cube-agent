@@ -1200,6 +1200,7 @@ check_running_recovery_contract() {
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import cast
@@ -1210,6 +1211,8 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService, SubmittedRun
 from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
+
+logging.getLogger("agent_hub.runs.service").setLevel(logging.CRITICAL)
 
 
 def require(value, label):
