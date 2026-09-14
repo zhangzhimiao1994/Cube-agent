@@ -1576,6 +1576,47 @@ cases = (
 
 for events, category, strategy in cases:
     classify(events, category, strategy)
+
+credential_run_id = uuid4()
+credential_repair = classify_terminal_run(
+    status=RunStatus.FAILED,
+    mode=TaskMode.HYBRID,
+    routing_decision={"source": "manual"},
+    events=(
+        RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=1,
+            run_id=credential_run_id,
+            reason="Plugin credential unavailable secret://plugin-token",
+        ),
+    ),
+    policy=SelfRepairPolicy(requires_approval=False),
+)
+require(credential_repair is not None, "plugin credential unavailable decision")
+require(
+    credential_repair.failure_category == "plugin_credential_unavailable",
+    "plugin credential unavailable category",
+)
+require(
+    credential_repair.recovery_strategy == "manual_review_plugin_credentials",
+    "plugin credential unavailable strategy",
+)
+require(credential_repair.requires_approval is True, "plugin credential unavailable approval")
+require(
+    credential_repair.automatic_execution is False,
+    "plugin credential unavailable must not auto execute",
+)
+credential_proposal = credential_repair.to_proposal(run_id=credential_run_id)
+require(credential_proposal is not None, "plugin credential unavailable proposal")
+require(
+    credential_proposal.get("requires_approval") is True,
+    "plugin credential unavailable proposal approval",
+)
+require(
+    credential_proposal.get("automatic_execution") is False,
+    "plugin credential unavailable proposal automatic",
+)
+require("secret://plugin-token" not in repr(credential_proposal), "plugin credential secret redaction")
 PY
   then
     printf 'ok: self-repair failure injection matrix\n'

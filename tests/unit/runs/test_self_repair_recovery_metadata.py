@@ -287,6 +287,35 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
     assert projected["automatic_execution"] is False
 
 
+def test_non_retryable_plugin_credential_failure_forces_manual_repair_approval() -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=run_id,
+                reason="Plugin credential unavailable secret://plugin-token",
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "plugin_credential_unavailable"
+    assert decision.recovery_strategy == "manual_review_plugin_credentials"
+    assert decision.requires_approval is True
+    assert decision.automatic_execution is False
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["requires_approval"] is True
+    assert proposal["automatic_execution"] is False
+    assert "secret://plugin-token" not in repr(proposal)
+
+
 def test_self_repair_failure_injection_matrix_classifies_common_failures() -> None:
     base_run_id = uuid4()
     cases = (

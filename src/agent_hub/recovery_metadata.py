@@ -9,6 +9,7 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
         "capacity_pressure": "switch_to_available_model_and_retry",
         "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
         "plugin_runtime_unavailable": "repair_plugin_endpoint_or_adapter_and_retry",
+        "plugin_credential_unavailable": "manual_review_plugin_credentials",
         "mcp_runtime_unavailable": "repair_mcp_server_or_adapter_and_retry",
         "empty_model_response": "retry_with_fallback_or_reassign_model",
         "runtime_recovery_blocked": "manual_review_recovery_checkpoint",

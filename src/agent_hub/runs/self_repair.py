@@ -71,6 +71,12 @@ _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
         "plugin endpoint unavailable",
     }
 )
+_PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "plugin.credential_unavailable",
+        "plugin credential unavailable",
+    }
+)
 _MCP_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
     {
         "mcp.server_failed",
@@ -90,6 +96,11 @@ _MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
 _MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
+_MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
+    {
+        "plugin_credential_unavailable",
+    }
+)
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -258,6 +269,9 @@ def classify_terminal_run(
         events=events,
         orchestration_recovery_hint=orchestration_recovery_hint,
     )
+    requires_approval = policy.requires_approval or _requires_manual_repair_approval(
+        failure_category,
+    )
     blocked_contract_ids = (
         _blocked_contract_ids(events)
         if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY
@@ -283,7 +297,7 @@ def classify_terminal_run(
             source_sequence=source_sequence,
             fingerprint=fingerprint,
             failure_category=failure_category,
-            requires_approval=policy.requires_approval,
+            requires_approval=requires_approval,
             attempt=1,
             max_attempts=policy.max_attempts,
             skip_reason="recursive_self_repair",
@@ -300,7 +314,7 @@ def classify_terminal_run(
             source_sequence=source_sequence,
             fingerprint=fingerprint,
             failure_category=failure_category,
-            requires_approval=policy.requires_approval,
+            requires_approval=requires_approval,
             attempt=1,
             max_attempts=policy.max_attempts,
             skip_reason="side_effect_outcome_uncertain",
@@ -321,8 +335,8 @@ def classify_terminal_run(
         source_sequence=source_sequence,
         fingerprint=fingerprint,
         failure_category=failure_category,
-        requires_approval=policy.requires_approval,
-        automatic_execution=not policy.requires_approval,
+        requires_approval=requires_approval,
+        automatic_execution=not requires_approval,
         attempt=1,
         max_attempts=policy.max_attempts,
         recovery_strategy=recovery_strategy,
@@ -474,6 +488,8 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         return "检查工具角色的模型能力要求，将工具角色改派给支持工具调用的模型后再受控重试。"
     if failure_category == "plugin_runtime_unavailable":
         return "检查插件端点、适配器健康状态和网络连通性，修正可恢复配置后只重试受影响的插件调用。"
+    if failure_category == "plugin_credential_unavailable":
+        return "停止自动重试，检查插件凭据配置、授权边界和轮换状态，凭据修正并审批后再继续。"
     if failure_category == "mcp_runtime_unavailable":
         return "检查 MCP 服务进程、连接和适配器状态，修正可恢复问题后只重试受影响的 MCP 调用。"
     if failure_category == "tool_failure":
@@ -568,6 +584,10 @@ def _recovery_strategy(
         if hinted_strategy is not None:
             return hinted_strategy
     return RECOVERY_STRATEGY_BY_FAILURE_CATEGORY.get(failure_category)
+
+
+def _requires_manual_repair_approval(failure_category: str) -> bool:
+    return failure_category in _MANUAL_APPROVAL_FAILURE_CATEGORIES
 
 
 def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
@@ -807,6 +827,8 @@ def _failure_category(event: RunEvent) -> str:
         return "empty_model_response"
     if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
         return "model_capability_routing_unavailable"
+    if _contains_marker(text, _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS):
+        return "plugin_credential_unavailable"
     if _contains_marker(text, _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS):
         return "plugin_runtime_unavailable"
     if _contains_marker(text, _MCP_RUNTIME_UNAVAILABLE_MARKERS):
