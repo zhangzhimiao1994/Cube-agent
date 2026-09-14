@@ -46,9 +46,12 @@ class ProjectScaleCaseResult:
             "run_events",
             "terminal_status",
             "final_artifacts",
+            "project_preflight_approval",
             "workspace_bundle",
             "cleanup_cancel",
         )
+        if not _case_requires_project_preflight(self.case_id):
+            required = tuple(key for key in required if key != "project_preflight_approval")
         if "self_repair" in self.case_id or "model_failure" in self.case_id:
             required = (*required, "self_repair_trace")
         return not self.errors and all(self.evidence.get(key) is True for key in required)
@@ -155,6 +158,7 @@ def execute_project_scale_plan(
             "terminal_status": False,
             "final_artifacts": False,
             "self_repair_trace": False,
+            "project_preflight_approval": False,
             "workspace_bundle": False,
             "cleanup_cancel": False,
         }
@@ -175,6 +179,17 @@ def execute_project_scale_plan(
                 raise RuntimeError("run create response missing id")
             run_id = raw_run_id
             status = _string_value(response.get("status"))
+            if _case_requires_project_preflight(run_request.case_id):
+                approval_body = _project_preflight_approval_body(response)
+                approval = client.request_json(
+                    "POST",
+                    f"/api/v1/runs/{quote(run_id)}/approve-project-preflight",
+                    body=approval_body,
+                )
+                if not isinstance(approval, dict):
+                    raise TypeError("project preflight approval returned non-object JSON")
+                evidence["project_preflight_approval"] = True
+                status = _string_value(approval.get("status")) or status
 
             deadline = time.monotonic() + max(wait_seconds, 0)
             while True:
@@ -322,6 +337,23 @@ def _workspace_bundle_path(body: dict[str, object]) -> str:
 def _idempotency_key(case_id: str, index: int) -> str:
     safe_case = case_id.replace(":", "-").replace("_", "-")
     return f"project-scale-{safe_case}-{index}"
+
+
+def _case_requires_project_preflight(case_id: str) -> bool:
+    scale, _, _flow = case_id.partition(":")
+    return scale in {"large", "ultra"}
+
+
+def _project_preflight_approval_body(response: dict[str, object]) -> dict[str, object]:
+    if response.get("status") != "waiting_approval":
+        raise RuntimeError("project preflight run did not wait for approval")
+    token = response.get("decision_token")
+    version = response.get("version")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("project preflight run missing decision_token")
+    if not isinstance(version, int) or version <= 0:
+        raise RuntimeError("project preflight run missing version")
+    return {"decision_token": token, "version": version}
 
 
 def _string_value(value: object) -> str | None:
