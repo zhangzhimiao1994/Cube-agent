@@ -3946,20 +3946,41 @@ PY
   return 1
 }
 
+stress_request() {
+  local worker="$1"
+  local index="$2"
+  local path="$3"
+  local attempt
+  local status=""
+  local last_status="curl-error"
+  for ((attempt = 1; attempt <= retries; attempt += 1)); do
+    if status="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS -o /dev/null \
+      -w '%{http_code}' \
+      "$base_url$path" 2>/dev/null)" && [[ "$status" == 2* ]]; then
+      return 0
+    fi
+    last_status="${status:-curl-error}"
+    if ((attempt < retries)); then
+      printf 'stress-retry: worker=%s iteration=%s path=%s attempt=%s status=%s\n' \
+        "$worker" "$index" "$path" "$attempt" "$last_status" >&2
+      sleep "$retry_delay"
+    fi
+  done
+  printf 'stress-fail: worker=%s iteration=%s path=%s attempts=%s last_status=%s\n' \
+    "$worker" "$index" "$path" "$retries" "$last_status" >&2
+  return 1
+}
+
 stress_worker() {
   local worker="$1"
   local path
   local index
   for ((index = 1; index <= iterations; index += 1)); do
     for path in /health /health/live /health/ready /metrics /openapi.json /login; do
-      curl --noproxy '*' \
-        --connect-timeout "$connect_timeout" \
-        --max-time "$max_time" \
-        -fsS -o /dev/null \
-        "$base_url$path" 2>/dev/null || {
-          printf 'stress-fail: worker=%s iteration=%s path=%s\n' "$worker" "$index" "$path" >&2
-          return 1
-        }
+      stress_request "$worker" "$index" "$path" || return 1
     done
   done
 }

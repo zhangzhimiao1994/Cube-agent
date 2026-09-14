@@ -219,6 +219,15 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: strict model probe interaction control" in command
     assert "run_openapi_capability_profile" in command
     assert "run_stress_profile" in command
+    assert "stress_request()" in command
+    stress_request = command[
+        command.index("stress_request()") : command.index("stress_worker()")
+    ]
+    assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in stress_request
+    assert "local status" in stress_request
+    assert 'printf \'stress-retry: worker=%s iteration=%s path=%s attempt=%s status=%s\\n\'' in stress_request
+    assert 'printf \'stress-fail: worker=%s iteration=%s path=%s attempts=%s last_status=%s\\n\'' in stress_request
+    assert 'stress_request "$worker" "$index" "$path"' in command
     assert "for path in /health /health/live /health/ready /metrics /openapi.json /login; do" in command
     assert "/health/live" in command
     assert "/health/ready" in command
