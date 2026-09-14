@@ -1335,6 +1335,167 @@ PY
   return 1
 }
 
+check_model_capability_recovery_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: model capability recovery\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: model capability recovery requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from uuid import uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.observer import RunMonitor
+from agent_hub.runs.self_repair import (
+    SelfRepairPolicy,
+    classify_terminal_run,
+    repair_context_from_proposal,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.self_repair_context import (
+    self_repair_context_text,
+    self_repair_recovery_plan_payload,
+    self_repair_role_capability_requirements,
+)
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+run_id = uuid4()
+failure = RunEvent(
+    kind=EventKind.STEP_FAILED,
+    sequence=2,
+    run_id=run_id,
+    actor="scheduler",
+    step_id="scheduler_step",
+    reason="planned capability is unavailable",
+    payload={"error_code": "capability.planned_unavailable"},
+)
+observer = RunMonitor().observe(failure)
+require(observer is not None, "model capability observer decision")
+require(observer.trigger == "model_capability_routing_unavailable", "observer trigger")
+require(observer.action == "reassign_tool_role_to_capable_model", "observer action")
+require(
+    observer.recommendation == "reassign_tool_role_to_capable_model_and_retry",
+    "observer recommendation",
+)
+observer_event = observer.to_event(run_id=run_id, sequence=3)
+
+negotiation = RunEvent(
+    kind=EventKind.STEP_STARTED,
+    sequence=1,
+    run_id=run_id,
+    actor="main_agent",
+    step_id="main_agent_plan",
+    payload={
+        "model_execution_plan": {
+            "model_capability_negotiation": {
+                "schema_version": 1,
+                "items": (
+                    {
+                        "role_id": "scheduler",
+                        "logical_model": "main",
+                        "required_capabilities": (
+                            "text",
+                            "structured_output",
+                            "tool_calling",
+                        ),
+                        "missing_capabilities": ("tool_calling",),
+                        "status": "missing_capability",
+                    },
+                    {
+                        "role_id": "../unsafe",
+                        "logical_model": "secret://model",
+                        "required_capabilities": ("tool_calling",),
+                        "missing_capabilities": ("tool_calling",),
+                        "status": "missing_capability",
+                    },
+                ),
+            }
+        }
+    },
+)
+repair = classify_terminal_run(
+    status=RunStatus.FAILED,
+    mode=TaskMode.DISPATCH,
+    routing_decision={"source": "manual"},
+    events=(negotiation, failure, observer_event),
+    policy=SelfRepairPolicy(requires_approval=False),
+)
+require(repair is not None, "model capability repair")
+require(repair.failure_category == "model_capability_routing_unavailable", "repair category")
+require(
+    repair.recovery_strategy == "reassign_tool_role_to_capable_model_and_retry",
+    "repair strategy",
+)
+require(repair.requires_approval is False, "repair approval policy")
+require(repair.automatic_execution is True, "repair automatic execution")
+
+proposal = repair.to_proposal(run_id=run_id)
+require(proposal is not None, "repair proposal")
+require(proposal.get("failure_kind") == "model_capability_routing_unavailable", "proposal failure kind")
+require(
+    proposal.get("recovery_strategy") == "reassign_tool_role_to_capable_model_and_retry",
+    "proposal recovery strategy",
+)
+require(
+    proposal.get("role_capability_requirements")
+    == (
+        {
+            "role_id": "scheduler",
+            "required_capabilities": (
+                "text",
+                "structured_output",
+                "tool_calling",
+            ),
+        },
+    ),
+    "bounded role requirements",
+)
+serialized_proposal = repr(proposal)
+require("../unsafe" not in serialized_proposal, "unsafe role must be filtered")
+require("secret://model" not in serialized_proposal, "unsafe model must be filtered")
+require("planned capability is unavailable" not in serialized_proposal, "raw failure must be filtered")
+
+routing_decision = {
+    "source": "self_repair",
+    "self_repair_context": repair_context_from_proposal(proposal),
+}
+context = self_repair_context_text(routing_decision)
+require("reassign_tool_role_to_capable_model_and_retry" in context, "context strategy")
+require("../unsafe" not in context and "secret://model" not in context, "context redaction")
+
+plan = self_repair_recovery_plan_payload(routing_decision)
+require(plan is not None, "recovery plan")
+require(plan["replan_scope"] == "model_capability_roles", "replan scope")
+require(plan["reuse_completed_artifacts"] is True, "reuse completed artifacts")
+require(plan["automatic_execution"] is True, "automatic execution")
+require(
+    plan["role_capability_requirements"] == proposal["role_capability_requirements"],
+    "plan role requirements",
+)
+requirements = self_repair_role_capability_requirements(routing_decision)
+require("scheduler" in requirements, "parsed role requirements")
+require("tool_calling" in {capability.value for capability in requirements["scheduler"]}, "tool capability")
+PY
+  then
+    printf 'ok: model capability recovery\n'
+    return 0
+  fi
+  printf 'fail: model capability recovery\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -1766,6 +1927,7 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
   check_runtime_failure_diagnostics || true
+  check_model_capability_recovery_contract || true
   check_interaction_prevention_and_recovery || true
   check_multimode_interaction_matrix || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
