@@ -1755,6 +1755,194 @@ PY
   return 1
 }
 
+check_model_fallback_capacity_pressure_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: model fallback capacity pressure\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: model fallback capacity pressure requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+from agent_hub.models.capacity import CapacityLease
+from agent_hub.models.gateway import ModelGateway
+from agent_hub.models.litellm_client import ModelTransportError
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.types import Deployment, ModelMessage, ModelRequest, ModelResponse
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+class CapacityStub:
+    def __init__(self):
+        self.acquire_calls = []
+        self.records = []
+
+    def validate_configuration(self, deployments):
+        self.configured = tuple(deployments)
+
+    async def initialize(self):
+        return None
+
+    async def acquire(self, candidates, wait_timeout, *, estimated_tokens):
+        del wait_timeout, estimated_tokens
+        self.acquire_calls.append(tuple(candidate.id for candidate in candidates))
+        selected = candidates[0]
+        return CapacityLease(
+            id=str(uuid4()),
+            deployment_id=selected.id,
+            quota_scope_id=selected.quota_scope_id,
+            expires_at=datetime.now(UTC) + timedelta(seconds=30),
+            renew_after_seconds=1,
+        )
+
+    async def release(self, lease):
+        return True
+
+    async def renew(self, lease):
+        return lease
+
+    async def record_outcome(self, quota_scope_id, *, status_code, latency_seconds, succeeded):
+        del latency_seconds
+        self.records.append((quota_scope_id, status_code, succeeded))
+
+
+class SecretStub:
+    async def resolve(self, secret_ref):
+        del secret_ref
+        return "safe-key"
+
+
+class AsyncChunkStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        chunk = self._chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FallbackTransport:
+    def __init__(self):
+        self.complete_calls = []
+        self.stream_calls = []
+        self.streams = []
+
+    async def complete(self, deployment, request, api_key):
+        del request, api_key
+        self.complete_calls.append(deployment.id)
+        if deployment.id == "primary_model":
+            raise ModelTransportError("provider rate limited", status_code=429)
+        return ModelResponse(text="backup ok")
+
+    def stream_openai_compatible_chunks(self, deployment, request, api_key):
+        del request, api_key
+        self.stream_calls.append(deployment.id)
+        if deployment.id == "primary_model":
+            stream = AsyncChunkStream(
+                [ModelTransportError("provider rate limited", status_code=429)]
+            )
+        else:
+            stream = AsyncChunkStream(
+                [{"choices": [{"delta": {"content": "backup answer"}}]}]
+            )
+        self.streams.append(stream)
+        return stream
+
+
+async def main():
+    primary = Deployment(
+        id="primary_model",
+        logical_model="primary",
+        provider_model="deepseek/deepseek-chat",
+        secret_ref="secret://primary",
+        quota_scope_id="scope_primary",
+    )
+    backup = Deployment(
+        id="backup_model",
+        logical_model="backup",
+        provider_model="openai/gpt-5",
+        secret_ref="secret://backup",
+        quota_scope_id="scope_backup",
+    )
+    request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="hello"),),
+    )
+
+    completion_capacity = CapacityStub()
+    completion_transport = FallbackTransport()
+    completion_gateway = ModelGateway(
+        ModelRegistry((primary, backup)),
+        completion_capacity,
+        SecretStub(),
+        completion_transport,
+        fallbacks={"primary": "backup"},
+    )
+    completion = await completion_gateway.complete_with_context(request)
+    require(completion.deployment_id == "backup_model", "completion fallback deployment")
+    require(completion.fallback_used is True, "completion fallback used")
+    require(
+        completion.fallback_reason == "capacity_pressure",
+        "completion fallback must expose capacity pressure",
+    )
+    require(
+        completion.attempted_logical_models == ("primary", "backup"),
+        "completion fallback attempts",
+    )
+
+    streaming_capacity = CapacityStub()
+    streaming_transport = FallbackTransport()
+    streaming_gateway = ModelGateway(
+        ModelRegistry((primary, backup)),
+        streaming_capacity,
+        SecretStub(),
+        streaming_transport,
+        fallbacks={"primary": "backup"},
+    )
+    events = [event async for event in streaming_gateway.stream_openai_compatible_events(request)]
+    require(events[0].kind == "model.fallback", "streaming fallback event")
+    require(
+        events[0].payload["reason"] == "capacity_pressure",
+        "streaming fallback must expose capacity pressure",
+    )
+    require(events[1].kind == "model.text_delta", "streaming fallback text")
+    require(streaming_transport.stream_calls == ["primary_model", "backup_model"], "stream calls")
+
+
+asyncio.run(main())
+PY
+  then
+    printf 'ok: model fallback capacity pressure\n'
+    return 0
+  fi
+  printf 'fail: model fallback capacity pressure\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -2188,6 +2376,7 @@ run_deepseek_profile() {
   check_runtime_failure_diagnostics || true
   check_model_capability_recovery_contract || true
   check_model_selection_policy_contract || true
+  check_model_fallback_capacity_pressure_contract || true
   check_interaction_prevention_and_recovery || true
   check_multimode_interaction_matrix || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
