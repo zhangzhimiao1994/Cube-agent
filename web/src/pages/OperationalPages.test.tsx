@@ -1818,7 +1818,10 @@ describe("operational management pages", () => {
     expect(within(intentRegion).getByText("修复意图")).not.toBeNull();
     expect(within(intentRegion).getAllByText("不可回放").length).toBeGreaterThan(0);
     expect(within(intentRegion).getAllByText("retry_terminal").length).toBeGreaterThan(0);
-    expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
+    expect(within(intentRegion).getByText("切换模型后重试")).not.toBeNull();
+    expect(within(intentRegion).getByText("模型调用超时")).not.toBeNull();
+    expect(intentRegion.textContent).not.toContain("switch_model");
+    expect(intentRegion.textContent).not.toContain("model_timeout");
     expect(intentRegion.textContent).not.toContain("private-token");
     expect(intentRegion.textContent).not.toContain("private output");
   });

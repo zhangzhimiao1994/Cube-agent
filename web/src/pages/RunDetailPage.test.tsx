@@ -996,6 +996,83 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("retry_blocked_contract_chain")).toBeNull();
   });
 
+  it("labels repair intent metadata without exposing raw repair codes", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 2,
+          kind: "self_repair.proposed",
+          message: "self_repair.proposed",
+          created_at: "2026-08-20T00:00:02Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "repair",
+          action: "retry_with_fallback",
+          decision: null,
+          payload: {
+            repair_action: "switch_model",
+            failure_kind: "model_timeout",
+            requires_approval: true,
+            replay_safe: false,
+          },
+        },
+        {
+          sequence: 3,
+          kind: "repair.started",
+          message: "repair.started",
+          created_at: "2026-08-20T00:00:03Z",
+          actor: null,
+          participants: [],
+          tool_name: null,
+          step_id: "repair",
+          action: null,
+          decision: null,
+          payload: {
+            repair_action: "draft_repair_proposal",
+            failure_kind: "runtime_failure",
+            status: "running",
+            attempt: 1,
+            max_attempts: 1,
+            requires_approval: true,
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const intents = await screen.findByLabelText("执行意图");
+    expect(within(intents).getByText("切换模型后重试")).not.toBeNull();
+    expect(within(intents).getByText("生成受控修复提案")).not.toBeNull();
+    expect(within(intents).getByText("模型调用超时")).not.toBeNull();
+    expect(within(intents).getByText("运行阶段失败")).not.toBeNull();
+    expect(intents.textContent).not.toContain("switch_model");
+    expect(intents.textContent).not.toContain("model_timeout");
+    expect(intents.textContent).not.toContain("runtime_failure");
+    expect(screen.queryByText("switch_model")).toBeNull();
+    expect(screen.queryByText("model_timeout")).toBeNull();
+  });
+
   it("summarizes blocked orchestration contracts without expanding contract details", async () => {
     const detailedRun: RunDetail = {
       ...runDetail,
