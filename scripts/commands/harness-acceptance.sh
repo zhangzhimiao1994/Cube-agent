@@ -1644,6 +1644,117 @@ PY
   return 1
 }
 
+check_model_selection_policy_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: model selection policy\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: model selection policy requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from decimal import Decimal
+
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.routing_policy import (
+    ModelSelectionPolicyError,
+    model_selection_policy_from_decision,
+    rank_deployments_for_selection,
+)
+from agent_hub.models.types import Deployment
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+cheap = Deployment(
+    id="z_cheap",
+    logical_model="main",
+    provider_model="deepseek/deepseek-chat",
+    input_per_million_usd=Decimal("0.2"),
+    output_per_million_usd=Decimal("0.8"),
+)
+expensive = Deployment(
+    id="m_expensive",
+    logical_model="main",
+    provider_model="openai/gpt-5.6-sol",
+    input_per_million_usd=Decimal("2.0"),
+    output_per_million_usd=Decimal("8.0"),
+)
+unpriced = Deployment(id="a_unpriced", logical_model="main")
+standard = Deployment(id="main_standard", logical_model="main", weight=100)
+preferred = Deployment(id="main_preferred", logical_model="main", weight=250)
+
+configured = (expensive, cheap, unpriced)
+require(model_selection_policy_from_decision({}) == "configured", "default model selection")
+require(
+    rank_deployments_for_selection(configured, "configured") == configured,
+    "configured policy must preserve configured deployment order",
+)
+
+low_cost_policy = model_selection_policy_from_decision(
+    {"harness_policy": {"model_selection": "low_cost"}}
+)
+low_cost_ranked = rank_deployments_for_selection(configured, low_cost_policy)
+require(
+    tuple(deployment.id for deployment in low_cost_ranked)
+    == ("z_cheap", "m_expensive", "a_unpriced"),
+    "low_cost policy must prefer cheaper priced deployment",
+)
+
+high_quality_policy = model_selection_policy_from_decision(
+    {"harness_policy": {"model_selection": "high_quality"}}
+)
+high_quality_ranked = rank_deployments_for_selection(
+    (standard, preferred),
+    high_quality_policy,
+)
+require(
+    tuple(deployment.id for deployment in high_quality_ranked)
+    == ("main_preferred", "main_standard"),
+    "high_quality policy must prefer higher weight deployment",
+)
+
+try:
+    model_selection_policy_from_decision({"harness_policy": {"model_selection": "fastest"}})
+except ModelSelectionPolicyError:
+    pass
+else:
+    raise SystemExit("invalid model selection policy must fail closed")
+
+default_registry = ModelRegistry(low_cost_ranked)
+require(
+    tuple(deployment.id for deployment in default_registry.deployments)
+    == ("a_unpriced", "m_expensive", "z_cheap"),
+    "registry default id order must remain deterministic",
+)
+policy_registry = ModelRegistry(low_cost_ranked, preserve_order=True)
+require(
+    tuple(deployment.id for deployment in policy_registry.deployments)
+    == ("z_cheap", "m_expensive", "a_unpriced"),
+    "preserve_order=True must retain policy-ranked deployments",
+)
+require(
+    tuple(deployment.id for deployment in policy_registry.candidates("main"))[0]
+    == "z_cheap",
+    "policy-ranked candidate must remain first",
+)
+PY
+  then
+    printf 'ok: model selection policy\n'
+    return 0
+  fi
+  printf 'fail: model selection policy\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -2076,6 +2187,7 @@ run_deepseek_profile() {
   check_prometheus_metrics || true
   check_runtime_failure_diagnostics || true
   check_model_capability_recovery_contract || true
+  check_model_selection_policy_contract || true
   check_interaction_prevention_and_recovery || true
   check_multimode_interaction_matrix || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
