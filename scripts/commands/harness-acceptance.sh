@@ -1441,6 +1441,7 @@ from agent_hub.runs.self_repair import (
     repair_context_from_proposal,
 )
 from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
 
 
 def require(value, label):
@@ -1487,6 +1488,8 @@ cases = (
                 kind=EventKind.TOOL_FAILED,
                 sequence=1,
                 run_id=base_run_id,
+                actor="tool_runner",
+                tool_call_id="call_read_file",
                 tool_name="filesystem.read_file",
                 reason="tool failed after timeout secret://token",
             ),
@@ -1516,7 +1519,7 @@ cases = (
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=1,
                 run_id=base_run_id,
-                reason="runtime recovery blocked after checkpoint restore",
+                reason=RECOVERY_BLOCKED_FAILURE_REASON,
             ),
         ),
         "runtime_recovery_blocked", "manual_review_recovery_checkpoint",

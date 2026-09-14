@@ -17,6 +17,7 @@ from agent_hub.runs.self_repair import (
 )
 from agent_hub.runs.service import _self_repair_execution_payload
 from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
 from agent_hub.runtime.self_repair_context import (
     self_repair_context_text,
     self_repair_recovery_plan_payload,
@@ -284,3 +285,85 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
     assert projected is not None
     assert projected["requires_approval"] is True
     assert projected["automatic_execution"] is False
+
+
+def test_self_repair_failure_injection_matrix_classifies_common_failures() -> None:
+    base_run_id = uuid4()
+    cases = (
+        (
+            (
+                RunEvent(
+                    kind=EventKind.TOOL_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    actor="tool_runner",
+                    tool_call_id="call_read_file",
+                    tool_name="filesystem.read_file",
+                    reason="tool failed after timeout secret://token",
+                ),
+            ),
+            "tool_failure",
+            "repair_tool_invocation_after_permission_check",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.STEP_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    step_id="builder_step",
+                    actor="builder",
+                    reason="step crashed after context compaction Authorization: Bearer token",
+                ),
+            ),
+            "step_failure",
+            "retry_failed_step_after_context_compaction",
+        ),
+        (
+            (),
+            "missing_failure_event",
+            "manual_review_missing_failure_event",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason=RECOVERY_BLOCKED_FAILURE_REASON,
+                ),
+            ),
+            "runtime_recovery_blocked",
+            "manual_review_recovery_checkpoint",
+        ),
+    )
+
+    for events, expected_category, expected_strategy in cases:
+        run_id = uuid4()
+        normalized_events = tuple(
+            event.model_copy(update={"run_id": run_id}) for event in events
+        )
+        decision = classify_terminal_run(
+            status=RunStatus.FAILED,
+            mode=TaskMode.HYBRID,
+            routing_decision={"source": "manual"},
+            events=normalized_events,
+            policy=SelfRepairPolicy(requires_approval=False),
+        )
+
+        assert decision is not None
+        assert decision.kind == "repair.classified"
+        assert decision.failure_category == expected_category
+        assert decision.recovery_strategy == expected_strategy
+        assert decision.requires_approval is False
+        assert decision.automatic_execution is True
+        proposal = decision.to_proposal(run_id=run_id)
+        assert proposal is not None
+        assert proposal["failure_kind"] == expected_category
+        assert proposal["recovery_strategy"] == expected_strategy
+        context = repair_context_from_proposal(proposal)
+        assert context["failure_kind"] == expected_category
+        assert context["recovery_strategy"] == expected_strategy
+        serialized = repr({"proposal": proposal, "context": context})
+        assert "secret://token" not in serialized
+        assert "Authorization: Bearer" not in serialized
