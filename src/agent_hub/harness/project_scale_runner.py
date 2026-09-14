@@ -190,6 +190,8 @@ def execute_project_scale_plan(
                     break
                 if poll_interval_seconds > 0:
                     time.sleep(poll_interval_seconds)
+            if evidence["terminal_status"] and status != "completed":
+                errors.append(f"terminal_status: {status or 'unknown'}")
 
             events = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
             evidence["run_events"] = isinstance(events, list)

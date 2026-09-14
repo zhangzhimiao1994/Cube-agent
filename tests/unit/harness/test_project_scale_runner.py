@@ -114,6 +114,19 @@ def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup()
     assert report.results[0].errors == ("workspace_bundle: workspace bundle unavailable",)
 
 
+def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    result = report.results[0]
+    assert result.status == "failed"
+    assert result.evidence["terminal_status"] is True
+    assert result.errors == ("terminal_status: failed",)
+
+
 def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("self_repair",), execute=True)
     client = FakeAcceptanceClient(
