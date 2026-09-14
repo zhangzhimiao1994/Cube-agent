@@ -313,6 +313,12 @@ def test_runtime_failure_diagnostic_classifies_plugin_adapter_unavailable() -> N
             True,
         ),
         (
+            "Plugin endpoint unavailable",
+            "endpoint_unavailable",
+            "plugin.endpoint_unavailable",
+            True,
+        ),
+        (
             "Plugin sandbox profile unsupported",
             "sandbox_unsupported",
             "plugin.sandbox_unsupported",

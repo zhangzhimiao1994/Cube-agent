@@ -438,6 +438,16 @@ def _plugin_runtime_diagnostic(
             suggested_action="插件后端不可用；检查插件服务健康、网络连通性和适配器状态，恢复后可重试。",
             status_code=status_code,
         )
+    if lowered == "plugin endpoint unavailable":
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="endpoint_unavailable",
+            error_code="plugin.endpoint_unavailable",
+            retryable=True,
+            suggested_action="插件端点不可用；检查 endpoint_url、域名 allowlist 和插件服务网络状态，恢复后可重试。",
+            status_code=status_code,
+        )
     if lowered == "plugin sandbox profile unsupported":
         return _base_diagnostic(
             reason,

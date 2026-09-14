@@ -71,6 +71,7 @@ PLUGIN_RUNTIME_FAILURE_CODES: tuple[str, ...] = (
     "plugin.invalid_arguments",
     "plugin.invalid_result",
     "plugin.backend_unavailable",
+    "plugin.endpoint_unavailable",
     "plugin.sandbox_unsupported",
 )
 

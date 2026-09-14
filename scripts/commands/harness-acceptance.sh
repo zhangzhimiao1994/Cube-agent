@@ -1083,6 +1083,13 @@ cases = [
         False,
     ),
     ("Plugin backend unavailable", "plugin_runtime", "backend_unavailable", "plugin.backend_unavailable", True),
+    (
+        "Plugin endpoint unavailable",
+        "plugin_runtime",
+        "endpoint_unavailable",
+        "plugin.endpoint_unavailable",
+        True,
+    ),
     ("Plugin sandbox profile unsupported", "plugin_runtime", "sandbox_unsupported", "plugin.sandbox_unsupported", False),
     ("MCP tool unavailable", "mcp_runtime", "tool_unavailable", "mcp.tool_unavailable", False),
     ("MCP tool timed out", "mcp_runtime", "timeout", "mcp.timeout", True),
