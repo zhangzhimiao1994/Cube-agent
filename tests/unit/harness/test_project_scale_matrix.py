@@ -60,8 +60,10 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
             "command.run",
         ]
         assert body["skip_evolution_proposal"] is True
-        assert case.scale in body["message"]
-        assert case.flow in body["message"]
+        message = body["message"]
+        assert isinstance(message, str)
+        assert case.scale in message
+        assert case.flow in message
 
 
 def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
