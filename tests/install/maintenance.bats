@@ -51,6 +51,28 @@
   [ -d "$root/releases/202601030000-new" ]
 }
 
+@test "prune-releases preserves runtime releases referenced by current venv links" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  runtime="$root/releases/202601010000-runtime"
+  old="$root/releases/202601020000-old"
+  current="$root/releases/202601030000-current"
+  newest="$root/releases/202601040000-newest"
+  mkdir -p "$runtime/.venv/bin" "$runtime/.litellm-venv/bin" "$old" "$current" "$newest"
+  touch "$runtime/.venv/bin/python" "$runtime/.litellm-venv/bin/python"
+  ln -s "$runtime/.venv" "$current/.venv"
+  ln -s "$runtime/.litellm-venv" "$current/.litellm-venv"
+  ln -s "$current" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub prune-releases --keep 1 --execute
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"keep $runtime reason=current-runtime:.venv"* ]]
+  [ -d "$runtime" ]
+  [ ! -e "$old" ]
+  [ -d "$current" ]
+  [ -d "$newest" ]
+}
+
 @test "prune-releases refuses to run when current is outside releases" {
   root="$BATS_TEST_TMPDIR/agent-hub"
   mkdir -p "$root/releases/202601010000-release" "$root/outside"

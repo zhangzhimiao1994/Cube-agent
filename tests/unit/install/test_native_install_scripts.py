@@ -57,6 +57,9 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     assert '"$release_dir_real"/*)' in command
     assert 'die "current must point inside release directory' in command
     assert 'protected["$(basename -- "$current_real")"]="current"' in command
+    assert 'protect_runtime_release ".venv"' in command
+    assert 'protect_runtime_release ".litellm-venv"' in command
+    assert 'protected["$(basename -- "$runtime_release_real")"]="current-runtime:$runtime_name"' in command
     assert 'find "$release_dir_real" -mindepth 1 -maxdepth 1 -type d' in command
     assert 'rm -rf -- "$release_path"' in command
 

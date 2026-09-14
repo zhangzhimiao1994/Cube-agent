@@ -91,6 +91,38 @@ printf 'mode=%s keep=%s release_dir=%s current=%s\n' \
 declare -A protected=()
 protected["$(basename -- "$current_real")"]="current"
 
+protect_runtime_release() {
+  local runtime_name="$1"
+  local runtime_path="$current_real/$runtime_name"
+  local runtime_real
+  local runtime_relative
+  local runtime_release_name
+  local runtime_release_real
+
+  if [[ ! -e "$runtime_path" && ! -L "$runtime_path" ]]; then
+    return 0
+  fi
+
+  runtime_real="$(readlink -f -- "$runtime_path")"
+  case "$runtime_real" in
+    "$release_dir_real"/*)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  runtime_relative="${runtime_real#"$release_dir_real"/}"
+  runtime_release_name="${runtime_relative%%/*}"
+  runtime_release_real="$release_dir_real/$runtime_release_name"
+  if [[ -d "$runtime_release_real" && -z "${protected[$runtime_release_name]:-}" ]]; then
+    protected["$(basename -- "$runtime_release_real")"]="current-runtime:$runtime_name"
+  fi
+}
+
+protect_runtime_release ".venv"
+protect_runtime_release ".litellm-venv"
+
 recent_count=0
 for release_name in "${releases[@]}"; do
   if [[ "$recent_count" -ge "$keep" ]]; then
