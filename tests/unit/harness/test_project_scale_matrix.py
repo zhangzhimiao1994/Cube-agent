@@ -2,6 +2,7 @@ from agent_hub.harness.project_scale import (
     PROJECT_SCALE_FLOW_KINDS,
     PROJECT_SCALE_TIERS,
     ProjectScaleMatrix,
+    build_project_scale_run_plan,
     build_project_scale_run_request,
 )
 
@@ -80,3 +81,53 @@ def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
         build_project_scale_run_request(cases["small:artifact_production"]).body["mode"]
         == "hybrid"
     )
+
+
+def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None:
+    plan = build_project_scale_run_plan()
+
+    assert plan.dry_run is True
+    assert plan.execute is False
+    assert plan.case_count == 32
+    assert plan.requires_bearer_token is True
+    assert plan.required_evidence == (
+        "run_details",
+        "run_events",
+        "workspace_bundle",
+        "final_artifacts",
+        "self_repair_trace",
+        "release_health",
+    )
+    assert plan.cleanup_actions == (
+        "cancel_or_archive_probe_runs",
+        "delete_workspace",
+        "remove_release_packages",
+    )
+    assert plan.requests[0].body["workspace_session_id"] == "project-scale-small-direct"
+
+
+def test_project_scale_run_plan_filters_scale_and_flow() -> None:
+    plan = build_project_scale_run_plan(scales=("ultra",), flows=("self_repair", "plugin"))
+
+    assert plan.case_count == 2
+    assert [request.case_id for request in plan.requests] == [
+        "ultra:plugin",
+        "ultra:self_repair",
+    ]
+    assert all(request.body["project_id"] == "project-scale-acceptance" for request in plan.requests)
+
+
+def test_project_scale_run_plan_rejects_unknown_filters() -> None:
+    try:
+        build_project_scale_run_plan(scales=("tiny",))
+    except ValueError as error:
+        assert "unknown project scale" in str(error)
+    else:
+        raise AssertionError("unknown scale was accepted")
+
+    try:
+        build_project_scale_run_plan(flows=("manual",))
+    except ValueError as error:
+        assert "unknown project scale flow" in str(error)
+    else:
+        raise AssertionError("unknown flow was accepted")

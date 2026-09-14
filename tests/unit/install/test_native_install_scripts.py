@@ -266,6 +266,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin.credential_unavailable"' in command
     assert '"mcp.timeout"' in command
     assert '"mcp.server_failed"' in command
+
     assert "PluginConfigCapabilityManifestSource" in command
     assert '"plugin_package_adapter_unavailable"' in command
     assert '"plugin_package_capability_isolation_mismatch"' in command
@@ -503,6 +504,22 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'check_protected_boundary "user list requires bearer" "/api/v1/users"' in command
     assert 'check_write_protected_boundary "user delete requires bearer" "/api/v1/users/00000000-0000-0000-0000-000000000000" "DELETE"' in command
     assert "skip: run lifecycle probe requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+
+
+def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/project-scale-acceptance.sh")
+
+    assert "project-scale-acceptance" in launcher
+    assert "Run project-scale acceptance fixture planning and execution." in launcher
+    assert (
+        "doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|package-release"
+        in launcher
+    )
+    assert "Usage: scripts/agent-hub project-scale-acceptance" in command
+    assert "python -m agent_hub.harness.project_scale_runner" in command
+    assert "--json" in command
+    assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
 
 
 def test_native_installer_deploys_release_before_starting_services() -> None:

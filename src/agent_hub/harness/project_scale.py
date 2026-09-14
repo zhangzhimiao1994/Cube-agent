@@ -78,6 +78,37 @@ class ProjectScaleRunRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectScaleRunPlan:
+    requests: tuple[ProjectScaleRunRequest, ...]
+    required_evidence: tuple[str, ...] = PROJECT_SCALE_REQUIRED_EVIDENCE
+    cleanup_actions: tuple[str, ...] = PROJECT_SCALE_CLEANUP_ACTIONS
+    dry_run: bool = True
+    execute: bool = False
+    requires_bearer_token: bool = True
+
+    @property
+    def case_count(self) -> int:
+        return len(self.requests)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "dry_run": self.dry_run,
+            "execute": self.execute,
+            "requires_bearer_token": self.requires_bearer_token,
+            "case_count": self.case_count,
+            "required_evidence": list(self.required_evidence),
+            "cleanup_actions": list(self.cleanup_actions),
+            "requests": [
+                {
+                    "case_id": request.case_id,
+                    "body": dict(request.body),
+                }
+                for request in self.requests
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectScaleMatrix:
     cases: tuple[ProjectScaleCase, ...]
     required_evidence: tuple[str, ...] = PROJECT_SCALE_REQUIRED_EVIDENCE
@@ -158,6 +189,34 @@ def build_project_scale_run_request(case: ProjectScaleCase) -> ProjectScaleRunRe
     return ProjectScaleRunRequest(case_id=case.id, body=body)
 
 
+def build_project_scale_run_plan(
+    *,
+    scales: tuple[str, ...] | None = None,
+    flows: tuple[str, ...] | None = None,
+    execute: bool = False,
+) -> ProjectScaleRunPlan:
+    selected_scales = _validated_filter(
+        values=scales,
+        allowed=PROJECT_SCALE_TIERS,
+        label="project scale",
+    )
+    selected_flows = _validated_filter(
+        values=flows,
+        allowed=PROJECT_SCALE_FLOW_KINDS,
+        label="project scale flow",
+    )
+    requests = tuple(
+        build_project_scale_run_request(case)
+        for case in ProjectScaleMatrix.default().cases
+        if case.scale in selected_scales and case.flow in selected_flows
+    )
+    return ProjectScaleRunPlan(
+        requests=requests,
+        dry_run=not execute,
+        execute=execute,
+    )
+
+
 def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectScaleCase:
     focus = ["interaction_stability", "final_result"]
     if scale in _LONG_RUNNING_SCALES:
@@ -176,6 +235,23 @@ def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectSc
         expected_preflight=scale in _PREFLIGHT_SCALES,
         validation_focus=tuple(dict.fromkeys(focus)),
     )
+
+
+def _validated_filter(
+    *,
+    values: tuple[str, ...] | None,
+    allowed: tuple[str, ...],
+    label: str,
+) -> tuple[str, ...]:
+    if values is None:
+        return allowed
+    selected = tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
+    unknown = tuple(value for value in selected if value not in allowed)
+    if unknown:
+        raise ValueError(f"unknown {label}: {', '.join(unknown)}")
+    if not selected:
+        raise ValueError(f"{label} filter must not be empty")
+    return selected
 
 
 def _fixture_message(case: ProjectScaleCase) -> str:
@@ -202,8 +278,10 @@ __all__ = [
     "ProjectScaleFlow",
     "ProjectScaleMatrix",
     "ProjectScaleRunMode",
+    "ProjectScaleRunPlan",
     "ProjectScaleRunRequest",
     "ProjectScaleTier",
+    "build_project_scale_run_plan",
     "build_project_scale_run_request",
     "describe_project_scale_matrix",
 ]
