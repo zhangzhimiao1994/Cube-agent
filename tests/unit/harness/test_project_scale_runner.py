@@ -161,6 +161,23 @@ def test_execute_project_scale_plan_requires_non_empty_event_stream() -> None:
     assert report.results[0].errors == ("run_events: empty event stream",)
 
 
+def test_execute_project_scale_plan_rejects_event_scope_mismatch_when_present() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "run.created", "run_id": "run-stale-direct"}],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert report.results[0].run_id == "run-small-direct"
+    assert report.results[0].errors == (
+        "run events scope mismatch: run_id expected run-small-direct got run-stale-direct",
+    )
+
+
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)

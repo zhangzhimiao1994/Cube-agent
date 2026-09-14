@@ -218,6 +218,7 @@ def execute_project_scale_plan(
             events = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
             if isinstance(events, list) and events:
                 evidence["run_events"] = True
+                errors.extend(_validate_run_events_scope(events, run_id))
             elif isinstance(events, list):
                 errors.append("run_events: empty event stream")
             else:
@@ -368,6 +369,31 @@ def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None
     if actual != run_id:
         got = actual if isinstance(actual, str) and actual else "missing"
         raise RuntimeError(f"run details scope mismatch: id expected {run_id} got {got}")
+
+
+def _validate_run_events_scope(events: list[object], run_id: str) -> list[str]:
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        field, actual = _event_run_reference(event)
+        if actual is None:
+            continue
+        if actual != run_id:
+            return [f"run events scope mismatch: {field} expected {run_id} got {actual}"]
+    return []
+
+
+def _event_run_reference(event: dict[object, object]) -> tuple[str, str | None]:
+    for field in ("run_id", "runId"):
+        value = event.get(field)
+        if isinstance(value, str) and value:
+            return field, value
+    run = event.get("run")
+    if isinstance(run, dict):
+        value = run.get("id")
+        if isinstance(value, str) and value:
+            return "run.id", value
+    return "run_id", None
 
 
 def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = None) -> str:
