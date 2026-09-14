@@ -12,7 +12,7 @@ import {
   hasArtifactDownload,
   type DownloadableFile,
 } from "../components/ArtifactFileCard";
-import { repairActionLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
+import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -1258,7 +1258,7 @@ function runFailureDiagnosticFromApi(
   const statusCode = diagnostic.status_code ? `status=${diagnostic.status_code}` : "";
   const reason = diagnosticDisplayReason(diagnostic);
   const detail = [
-    diagnostic.failure_kind,
+    repairFailureKindLabel(diagnostic.failure_kind),
     statusCode,
     reason,
   ]
@@ -1274,9 +1274,9 @@ function runFailureDiagnosticFromApi(
     meta: [
       actor,
       diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
-      diagnostic.error_code ? `错误码 ${diagnostic.error_code}` : "",
+      diagnostic.error_code ? `错误码 ${repairErrorCodeLabel(diagnostic.error_code)}` : "",
       typeof diagnostic.retryable === "boolean" ? `可重试 ${diagnostic.retryable ? "是" : "否"}` : "",
-      diagnostic.error_category ? `类型 ${diagnostic.error_category}` : "",
+      diagnostic.error_category ? `类型 ${repairFailureKindLabel(diagnostic.error_category)}` : "",
       diagnostic.step_id ? `步骤 ${diagnostic.step_id}` : "",
       diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
       diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
@@ -1865,7 +1865,7 @@ function failureSummaryForChat(detail: RunDetail) {
   if (diagnostic) {
     const parts = [
       `原因：${diagnosticChatReason(diagnostic)}`,
-      diagnostic.error_code ? `错误码：${diagnostic.error_code}` : null,
+      diagnostic.error_code ? `错误码：${repairErrorCodeLabel(diagnostic.error_code)}` : null,
       diagnostic.error_stage ? `位置：${diagnostic.error_stage}` : null,
       typeof diagnostic.retryable === "boolean" ? `可重试：${diagnostic.retryable ? "是" : "否"}` : null,
       diagnostic.recommendation ? `建议：${diagnostic.recommendation}` : null,

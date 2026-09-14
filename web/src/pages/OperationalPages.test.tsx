@@ -1972,7 +1972,8 @@ describe("operational management pages", () => {
     const diagnostics = await screen.findByRole("region", { name: "故障诊断" });
     expect(within(diagnostics).getByText("模型链路失败")).not.toBeNull();
     expect(within(diagnostics).getAllByText(/模型返回了空内容/).length).toBeGreaterThan(0);
-    expect(within(diagnostics).getByText(/错误码 model\.empty_response/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/错误码 模型空响应/)).not.toBeNull();
+    expect(diagnostics.textContent).not.toContain("model.empty_response");
     expect(within(diagnostics).getByText(/位置 model_response/)).not.toBeNull();
     expect(within(diagnostics).getByText(/可重试 是/)).not.toBeNull();
     expect(within(diagnostics).getByText(/压缩输入和历史上下文/)).not.toBeNull();
@@ -3284,7 +3285,8 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText("运行失败")).not.toBeNull();
     expect(within(stream).getByText(/原因：模型返回了空内容/)).not.toBeNull();
-    expect(within(stream).getByText(/错误码：model\.empty_response/)).not.toBeNull();
+    expect(within(stream).getByText(/错误码：模型空响应/)).not.toBeNull();
+    expect(stream.textContent).not.toContain("model.empty_response");
     expect(within(stream).getByText(/位置：model_response/)).not.toBeNull();
     expect(within(stream).getByText(/可重试：是/)).not.toBeNull();
     expect(within(stream).getByText(/压缩输入和历史上下文/)).not.toBeNull();
@@ -5351,7 +5353,8 @@ describe("operational management pages", () => {
     expect(within(diagnostics).getByText("工具执行失败")).not.toBeNull();
     expect(within(diagnostics).getByText("模型链路失败")).not.toBeNull();
     expect(within(diagnostics).getByText("等待人工确认")).not.toBeNull();
-    expect(within(diagnostics).getByText(/network_timeout/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/网络超时/)).not.toBeNull();
+    expect(diagnostics.textContent).not.toContain("network_timeout");
     expect(within(diagnostics).getByText(/status=401/)).not.toBeNull();
     expect(within(diagnostics).getByText(/检查工具权限、参数和运行环境/)).not.toBeNull();
     expect(within(diagnostics).getByText(/检查模型配置、API Key、上游状态码和限流/)).not.toBeNull();

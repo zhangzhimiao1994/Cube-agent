@@ -66,6 +66,18 @@ const REPAIR_ACTION_LABELS: Record<string, string> = {
   manual_review: "人工复核后继续",
 };
 
+const REPAIR_ERROR_CODE_LABELS: Record<string, string> = {
+  "model.empty_response": "模型空响应",
+  "runtime.failed": "运行失败",
+  "step.failed": "执行步骤失败",
+  "tool.failed": "工具执行失败",
+  "plugin.endpoint_unavailable": "插件端点不可用",
+  "mcp.server_not_discovered": "MCP 服务未发现",
+  "mcp.server_timeout": "MCP 服务超时",
+  "mcp.server_failed": "MCP 服务失败",
+  temporary_failure: "临时故障",
+};
+
 export function repairRecoveryStrategyLabel(strategy: string | undefined | null) {
   if (!strategy) return "";
   return REPAIR_RECOVERY_STRATEGY_LABELS[strategy] ?? strategy;
@@ -79,4 +91,9 @@ export function repairFailureKindLabel(kind: string | undefined | null) {
 export function repairActionLabel(action: string | undefined | null) {
   if (!action) return "";
   return REPAIR_ACTION_LABELS[action] ?? action;
+}
+
+export function repairErrorCodeLabel(code: string | undefined | null) {
+  if (!code) return "";
+  return REPAIR_ERROR_CODE_LABELS[code] ?? repairFailureKindLabel(code);
 }

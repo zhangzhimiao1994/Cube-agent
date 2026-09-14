@@ -5,7 +5,7 @@ import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
 import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
-import { repairActionLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
+import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MODEL_CAPABILITY_LABELS: Record<string, string> = {
@@ -1555,9 +1555,9 @@ function detailDiagnosticFromApi(
     meta: [
       actor,
       diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
-      diagnostic.error_code ? `错误码 ${diagnostic.error_code}` : "",
+      diagnostic.error_code ? `错误码 ${repairErrorCodeLabel(diagnostic.error_code)}` : "",
       typeof diagnostic.retryable === "boolean" ? `可重试 ${diagnostic.retryable ? "是" : "否"}` : "",
-      diagnostic.error_category ? `类型 ${diagnostic.error_category}` : "",
+      diagnostic.error_category ? `类型 ${repairFailureKindLabel(diagnostic.error_category)}` : "",
       diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
       diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
       `#${diagnostic.sequence}`,
