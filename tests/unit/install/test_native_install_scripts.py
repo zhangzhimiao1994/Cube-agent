@@ -119,6 +119,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_model_fallback_capacity_pressure_contract" in command
     assert "profile: model fallback capacity pressure" in command
     assert 'logging.getLogger("agent_hub.models.gateway").setLevel(logging.CRITICAL)' in command
+    capacity_pressure_profile = command[
+        command.index("profile: model fallback capacity pressure") :
+        command.index("ok: model fallback capacity pressure")
+    ]
+    assert "import logging" in capacity_pressure_profile
+    assert capacity_pressure_profile.index("import logging") < capacity_pressure_profile.index(
+        'logging.getLogger("agent_hub.models.gateway").setLevel(logging.CRITICAL)'
+    )
     assert "completion fallback must expose capacity pressure" in command
     assert "streaming fallback must expose capacity pressure" in command
     assert "ok: model fallback capacity pressure" in command

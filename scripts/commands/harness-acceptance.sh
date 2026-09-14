@@ -1390,7 +1390,6 @@ check_model_capability_recovery_contract() {
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 import asyncio
-import logging
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -1768,8 +1767,9 @@ check_model_fallback_capacity_pressure_contract() {
   fi
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
-  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
