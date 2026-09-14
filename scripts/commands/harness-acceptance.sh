@@ -28,6 +28,9 @@ max_time="${AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS:-20}"
 retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
 retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
 bearer_token="${AGENT_HUB_ACCEPTANCE_BEARER_TOKEN:-}"
+acceptance_login_username="${AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME:-}"
+acceptance_login_password="${AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD:-}"
+acceptance_login_tenant_id="${AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID:-}"
 run_message="${AGENT_HUB_ACCEPTANCE_RUN_MESSAGE:-Agent Hub harness acceptance run lifecycle probe}"
 verify_release=0
 install_root="${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
@@ -43,6 +46,11 @@ stability and DeepSeek-style pluggable harness goals.
 
 Set AGENT_HUB_ACCEPTANCE_BEARER_TOKEN to also run an authenticated
 create/read/events lifecycle probe against /api/v1/runs.
+Alternatively set AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME and
+AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD to acquire a short-lived bearer token
+through /api/v1/auth/login for authenticated acceptance probes. Set
+AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID when the target tenant is not the
+configured bootstrap tenant.
 Set AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE=1 with a bearer token to run
 the authenticated bounded project-scale execution runner.
 
@@ -227,6 +235,95 @@ detect_python() {
     return 0
   fi
   return 1
+}
+
+resolve_acceptance_bearer_token() {
+  local python_bin
+  local login_body_file
+  local login_response_file
+  local login_path="/api/v1/auth/login"
+  local login_status
+  local acquired_token
+
+  if [[ -n "$bearer_token" ]]; then
+    return 0
+  fi
+  if [[ -z "$acceptance_login_username" && -z "$acceptance_login_password" && -z "$acceptance_login_tenant_id" ]]; then
+    return 0
+  fi
+  if [[ -z "$acceptance_login_username" || -z "$acceptance_login_password" ]]; then
+    printf 'fail: acceptance login requires AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME and AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: acceptance login requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  login_body_file="$(mktemp)"
+  login_response_file="$(mktemp)"
+  if ! AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME="$acceptance_login_username" \
+    AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD="$acceptance_login_password" \
+    AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID="$acceptance_login_tenant_id" \
+    "$python_bin" - "$login_body_file" <<'PY'
+import json
+import os
+import sys
+
+body = {
+    "username": os.environ["AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME"],
+    "password": os.environ["AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD"],
+}
+tenant_id = os.environ.get("AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID", "")
+if tenant_id:
+    body["tenant_id"] = tenant_id
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(body, handle, ensure_ascii=False)
+PY
+  then
+    rm -f -- "$login_body_file" "$login_response_file"
+    printf 'fail: could not build acceptance login request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  login_status="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -sS \
+    -H "Content-Type: application/json" \
+    --data-binary "@$login_body_file" \
+    -o "$login_response_file" \
+    -w '%{http_code}' \
+    "$base_url$login_path" 2>/dev/null || true)"
+  rm -f -- "$login_body_file"
+  if [[ "$login_status" != "200" ]]; then
+    rm -f -- "$login_response_file"
+    printf 'fail: acceptance login /api/v1/auth/login -> %s\n' "${login_status:-curl-error}" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! acquired_token="$(ACCEPTANCE_LOGIN_RESPONSE_FILE="$login_response_file" "$python_bin" - <<'PY'
+import json
+import os
+
+with open(os.environ["ACCEPTANCE_LOGIN_RESPONSE_FILE"], encoding="utf-8") as handle:
+    payload = json.load(handle)
+token = payload.get("access_token")
+if not isinstance(token, str) or not token:
+    raise SystemExit(1)
+print(token)
+PY
+  )"; then
+    rm -f -- "$login_response_file"
+    printf 'fail: acceptance login response missing access_token\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  rm -f -- "$login_response_file"
+  bearer_token="$acquired_token"
+  acquired_token=""
+  printf 'ok: acceptance login token acquired\n'
 }
 
 check_url() {
@@ -3457,6 +3554,7 @@ run_release_verification_profile() {
 }
 
 require_curl
+resolve_acceptance_bearer_token || true
 if [[ "$read_only" -eq 1 ]]; then
   printf 'mode: read-only\n'
 else

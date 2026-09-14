@@ -222,6 +222,13 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--verify-release" in command
     assert "--install-root DIR" in command
     assert "--expect-revision SHA" in command
+    assert "AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME" in command
+    assert "AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD" in command
+    assert "AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID" in command
+    assert "resolve_acceptance_bearer_token" in command
+    assert '"/api/v1/auth/login"' in command
+    assert '"access_token"' in command
+    assert "ok: acceptance login token acquired" in command
     assert 'expect_revision="${AGENT_HUB_ACCEPTANCE_EXPECT_REVISION:-}"' in command
     assert 'verify_release=1' in command
     assert "run_release_verification_profile" in command
