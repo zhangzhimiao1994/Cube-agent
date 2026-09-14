@@ -1390,6 +1390,7 @@ check_model_capability_recovery_contract() {
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -1777,6 +1778,8 @@ from agent_hub.models.gateway import ModelGateway
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import Deployment, ModelMessage, ModelRequest, ModelResponse
+
+logging.getLogger("agent_hub.models.gateway").setLevel(logging.CRITICAL)
 
 
 def require(value, label):
