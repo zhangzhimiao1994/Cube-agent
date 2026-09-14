@@ -1483,10 +1483,12 @@ export function formatApiErrorDetailValue(key: string, value: string | number | 
 }
 
 const API_ERROR_CODE_LABELS: Record<string, string> = {
+  model_check_failed: "模型检测失败",
   model_unavailable: "模型不可用",
   service_unavailable: "服务暂不可用",
   invalid_credentials: "账号或密码无效",
   invalid_bootstrap: "初始化码无效",
+  invalid_error_response: "错误响应格式无效",
   permission_denied: "权限不足",
   not_found: "资源不存在",
   request_failed: "请求失败",

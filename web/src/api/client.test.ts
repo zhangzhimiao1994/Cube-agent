@@ -22,7 +22,8 @@ describe("formatApiError", () => {
     const formatted = formatApiError(error, "模型测试失败");
 
     expect(formatted).toContain("模型测试失败: model transport failed");
-    expect(formatted).toContain("model_check_failed");
+    expect(formatted).toContain("模型检测失败");
+    expect(formatted).not.toContain("model_check_failed");
     expect(formatted).toContain("HTTP 503");
     expect(formatted).toContain("error err-123");
     expect(formatted).toContain("logical_model=main_agent");
@@ -32,6 +33,15 @@ describe("formatApiError", () => {
     expect(formatted).toContain("hint=Check model config and rate limits.");
     expect(formatted).not.toContain("secret://private-key");
     expect(formatted).not.toContain("private stack");
+  });
+
+  it("labels invalid backend response error codes", () => {
+    const error = new ApiError("invalid backend response", 502, "invalid_error_response");
+
+    const formatted = formatApiError(error, "请求失败");
+
+    expect(formatted).toContain("错误响应格式无效");
+    expect(formatted).not.toContain("invalid_error_response");
   });
 });
 
