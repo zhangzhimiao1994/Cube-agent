@@ -16,6 +16,8 @@ Common options:
                                        Limit to one flow; repeatable.
   --json                               Print machine-readable JSON.
   --execute                            Execute real server probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
+  --wait-seconds SECONDS               Wait for terminal run status before evidence checks.
+  --poll-interval SECONDS              Poll interval while waiting for terminal run status.
   --help                               Show Python runner help.
 EOF
 }

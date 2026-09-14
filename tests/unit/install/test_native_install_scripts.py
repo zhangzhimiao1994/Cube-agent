@@ -144,6 +144,24 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--poll-interval" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command
     assert "ok: project scale execution runner" in command
+    assert "run_authenticated_project_scale_execution_profile" in command
+    assert "profile: authenticated project scale execution runner" in command
+    assert "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE" in command
+    assert "skip: authenticated project scale execution runner is disabled in read-only mode" in command
+    assert (
+        "skip: authenticated project scale execution runner requires "
+        "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE=1" in command
+    )
+    assert (
+        "skip: authenticated project scale execution runner requires "
+        "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+    )
+    assert "agent_hub.harness.project_scale_runner" in command
+    assert "--base-url \"$base_url\"" in command
+    assert "--execute" in command
+    assert "--wait-seconds \"$project_scale_wait_seconds\"" in command
+    assert "--poll-interval \"$project_scale_poll_interval\"" in command
+    assert "ok: authenticated project scale execution runner" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command
     assert "check_openapi_safe_projection" in command
@@ -524,6 +542,8 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     )
     assert "Usage: scripts/agent-hub project-scale-acceptance" in command
     assert "python -m agent_hub.harness.project_scale_runner" in command
+    assert "--wait-seconds SECONDS" in command
+    assert "--poll-interval SECONDS" in command
     assert "--json" in command
     assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
 

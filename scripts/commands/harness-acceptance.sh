@@ -5,6 +5,11 @@ base_url="${AGENT_HUB_ACCEPTANCE_BASE_URL:-http://127.0.0.1:8000}"
 profile="all"
 stress=0
 strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
+project_scale_execute_profile="${AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE:-0}"
+project_scale_scale="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALE:-small}"
+project_scale_flow="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct}"
+project_scale_wait_seconds="${AGENT_HUB_PROJECT_SCALE_WAIT_SECONDS:-120}"
+project_scale_poll_interval="${AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS:-2}"
 read_only=0
 stress_profile="${AGENT_HUB_ACCEPTANCE_STRESS_PROFILE:-custom}"
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
@@ -37,6 +42,8 @@ stability and DeepSeek-style pluggable harness goals.
 
 Set AGENT_HUB_ACCEPTANCE_BEARER_TOKEN to also run an authenticated
 create/read/events lifecycle probe against /api/v1/runs.
+Set AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE=1 with a bearer token to run
+the authenticated bounded project-scale execution runner.
 
 Options:
   --base-url URL                 Base URL to test.
@@ -2059,6 +2066,56 @@ check_project_scale_runner_contract() {
   printf 'ok: project scale execution runner\n'
 }
 
+run_authenticated_project_scale_execution_profile() {
+  local python_bin
+  local script_dir
+  local source_dir
+  local output
+
+  printf 'profile: authenticated project scale execution runner\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: authenticated project scale execution runner is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ "$project_scale_execute_profile" != "1" ]]; then
+    printf 'skip: authenticated project scale execution runner requires AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE=1\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: authenticated project scale execution runner requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: authenticated project scale execution runner requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if ! output="$(
+    PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
+      AGENT_HUB_ACCEPTANCE_BEARER_TOKEN="$bearer_token" \
+      "$python_bin" -m agent_hub.harness.project_scale_runner \
+      --execute \
+      --base-url "$base_url" \
+      --scale "$project_scale_scale" \
+      --flow "$project_scale_flow" \
+      --wait-seconds "$project_scale_wait_seconds" \
+      --poll-interval "$project_scale_poll_interval" \
+      --json 2>&1
+  )"; then
+    printf 'fail: authenticated project scale execution runner scale=%s flow=%s\n' \
+      "$project_scale_scale" "$project_scale_flow" >&2
+    printf '%s\n' "$output" >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  printf '%s\n' "$output"
+  printf 'ok: authenticated project scale execution runner scale=%s flow=%s\n' \
+    "$project_scale_scale" "$project_scale_flow"
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -3364,10 +3421,12 @@ case "$profile" in
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     run_project_preflight_approval_guard_profile || true
+    run_authenticated_project_scale_execution_profile || true
     ;;
   deepseek)
     run_deepseek_profile
     run_openapi_capability_profile || true
+    run_authenticated_project_scale_execution_profile || true
     ;;
   all)
     run_codex_profile
@@ -3378,6 +3437,7 @@ case "$profile" in
     run_control_idempotency_guard_profile || true
     run_schedule_interaction_guard_profile || true
     run_project_preflight_approval_guard_profile || true
+    run_authenticated_project_scale_execution_profile || true
     ;;
 esac
 
