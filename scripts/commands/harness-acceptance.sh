@@ -1946,6 +1946,65 @@ PY
   return 1
 }
 
+check_project_scale_matrix_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: project scale acceptance matrix\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: project scale acceptance matrix requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+from agent_hub.harness.project_scale import (
+    PROJECT_SCALE_FLOW_KINDS,
+    PROJECT_SCALE_TIERS,
+    ProjectScaleMatrix,
+    describe_project_scale_matrix,
+)
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+matrix = ProjectScaleMatrix.default()
+matrix.validate()
+summary = describe_project_scale_matrix(matrix)
+require("small,medium,large,ultra" in summary, "project scale tiers")
+require(
+    "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production"
+    in summary,
+    "project scale flows",
+)
+require("workspace_bundle" in summary, "project scale evidence")
+require("cancel_or_archive_probe_runs" in summary, "project scale cleanup")
+require(matrix.case_count == len(PROJECT_SCALE_TIERS) * len(PROJECT_SCALE_FLOW_KINDS), "case count")
+require(matrix.requires_isolated_workspace is True, "isolated workspace")
+for case in matrix.cases:
+    require(case.requires_bearer_token is True, f"{case.id} bearer token")
+    if case.scale in {"large", "ultra"}:
+        require(case.requires_explicit_server_profile is True, f"{case.id} explicit server profile")
+        require(case.expected_preflight is True, f"{case.id} preflight")
+require(
+    any(case.flow == "self_repair" and "self_repair" in case.validation_focus for case in matrix.cases),
+    "self repair focus",
+)
+print(summary)
+PY
+  then
+    printf 'ok: project scale acceptance matrix\n'
+    return 0
+  fi
+  printf 'fail: project scale acceptance matrix\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -2382,6 +2441,7 @@ run_deepseek_profile() {
   check_model_fallback_capacity_pressure_contract || true
   check_interaction_prevention_and_recovery || true
   check_multimode_interaction_matrix || true
+  check_project_scale_matrix_contract || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
   check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true

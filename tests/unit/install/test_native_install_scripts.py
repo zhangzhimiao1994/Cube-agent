@@ -130,6 +130,14 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "completion fallback must expose capacity pressure" in command
     assert "streaming fallback must expose capacity pressure" in command
     assert "ok: model fallback capacity pressure" in command
+    assert "check_project_scale_matrix_contract" in command
+    assert "profile: project scale acceptance matrix" in command
+    assert "describe_project_scale_matrix" in command
+    assert "small,medium,large,ultra" in command
+    assert "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production" in command
+    assert "workspace_bundle" in command
+    assert "cancel_or_archive_probe_runs" in command
+    assert "ok: project scale acceptance matrix" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command
     assert "check_openapi_safe_projection" in command
