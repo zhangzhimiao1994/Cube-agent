@@ -85,6 +85,8 @@ def test_release_verifier_is_registered_and_checks_current_revision() -> None:
         in command
     )
     assert 'require_file "$current_real/web/dist/index.html" "current release Web UI index is missing"' in command
+    assert 'require_readable_by_caddy "$current_real/web/dist/index.html"' in command
+    assert '"current release Web UI index is not readable"' in command
     assert 'require_executable "$current_real/scripts/agent-hub" "current release agent-hub launcher is missing"' in command
     assert "agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service" in command
 

@@ -35,6 +35,23 @@ require_file() {
   fi
 }
 
+readable_by_caddy() {
+  local path="$1"
+  if id caddy >/dev/null 2>&1 && [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
+    runuser -u caddy -- test -r "$path"
+    return $?
+  fi
+  test -r "$path"
+}
+
+require_readable_by_caddy() {
+  local path="$1"
+  local message="$2"
+  if ! readable_by_caddy "$path"; then
+    die "$message: $path"
+  fi
+}
+
 while (($#)); do
   case "$1" in
     --install-root)
@@ -107,6 +124,7 @@ require_executable "$current_real/.litellm-venv/bin/python" "current release Lit
 printf 'ok: current release runtime python entrypoints are executable\n'
 
 require_file "$current_real/web/dist/index.html" "current release Web UI index is missing"
+require_readable_by_caddy "$current_real/web/dist/index.html" "current release Web UI index is not readable"
 require_executable "$current_real/scripts/agent-hub" "current release agent-hub launcher is missing"
 printf 'ok: current release Web UI and launcher entrypoints are present\n'
 
