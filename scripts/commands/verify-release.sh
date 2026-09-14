@@ -27,6 +27,14 @@ require_executable() {
   fi
 }
 
+require_file() {
+  local path="$1"
+  local message="$2"
+  if [[ ! -f "$path" ]]; then
+    die "$message: $path"
+  fi
+}
+
 while (($#)); do
   case "$1" in
     --install-root)
@@ -97,6 +105,10 @@ printf 'ok: current release %s revision=%s\n' "$current_real" "$revision"
 require_executable "$current_real/.venv/bin/python" "current release API python is missing"
 require_executable "$current_real/.litellm-venv/bin/python" "current release LiteLLM python is missing"
 printf 'ok: current release runtime python entrypoints are executable\n'
+
+require_file "$current_real/web/dist/index.html" "current release Web UI index is missing"
+require_executable "$current_real/scripts/agent-hub" "current release agent-hub launcher is missing"
+printf 'ok: current release Web UI and launcher entrypoints are present\n'
 
 if [[ "$check_services" -eq 1 ]]; then
   if command -v systemctl >/dev/null 2>&1; then

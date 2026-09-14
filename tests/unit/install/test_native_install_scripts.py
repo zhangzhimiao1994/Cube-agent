@@ -81,6 +81,8 @@ def test_release_verifier_is_registered_and_checks_current_revision() -> None:
         '"current release LiteLLM python is missing"'
         in command
     )
+    assert 'require_file "$current_real/web/dist/index.html" "current release Web UI index is missing"' in command
+    assert 'require_executable "$current_real/scripts/agent-hub" "current release agent-hub launcher is missing"' in command
     assert "agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service" in command
 
 
