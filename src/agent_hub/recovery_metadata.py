@@ -8,6 +8,7 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
     {
         "capacity_pressure": "switch_to_available_model_and_retry",
         "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
+        "plugin_runtime_unavailable": "repair_plugin_endpoint_or_adapter_and_retry",
         "empty_model_response": "retry_with_fallback_or_reassign_model",
         "runtime_recovery_blocked": "manual_review_recovery_checkpoint",
         "runtime_failure": "preserve_outputs_and_retry_scope",
@@ -30,6 +31,7 @@ SAFE_OBSERVER_RECOMMENDATIONS = frozenset(
         "pause_for_scheduler_review",
         "preserve_outputs_and_retry_scope",
         "reassign_tool_role_to_capable_model_and_retry",
+        "repair_plugin_endpoint_or_adapter_and_retry",
         "watch_retry_budget_before_requeue",
         "compact_context_before_next_model_call",
     }

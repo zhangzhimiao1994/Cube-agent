@@ -63,6 +63,14 @@ _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
         "planned capability is unavailable",
     }
 )
+_PLUGIN_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "plugin.backend_unavailable",
+        "plugin.endpoint_unavailable",
+        "plugin backend unavailable",
+        "plugin endpoint unavailable",
+    }
+)
 _RECOVERY_BLOCKED_MARKERS = frozenset({RECOVERY_BLOCKED_FAILURE_REASON})
 _SENSITIVE_TEXT_PATTERN = re.compile(
     r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
@@ -456,6 +464,8 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         )
     if failure_category == "model_capability_routing_unavailable":
         return "检查工具角色的模型能力要求，将工具角色改派给支持工具调用的模型后再受控重试。"
+    if failure_category == "plugin_runtime_unavailable":
+        return "检查插件端点、适配器健康状态和网络连通性，修正可恢复配置后只重试受影响的插件调用。"
     if failure_category == "tool_failure":
         return "先检查工具权限、参数和产物状态，只执行可审计的最小修复步骤。"
     if failure_category == "step_failure":
@@ -787,6 +797,8 @@ def _failure_category(event: RunEvent) -> str:
         return "empty_model_response"
     if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
         return "model_capability_routing_unavailable"
+    if _contains_marker(text, _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS):
+        return "plugin_runtime_unavailable"
     if _contains_marker(text, _RECOVERY_BLOCKED_MARKERS):
         return "runtime_recovery_blocked"
     if _contains_marker(text, _CAPACITY_MARKERS):

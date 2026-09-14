@@ -1331,6 +1331,7 @@ require(provider_rate_limit_diagnostic.get("retryable") is True, "provider 429 d
 
 for reason, code, retryable in (
     ("Plugin backend unavailable", "plugin.backend_unavailable", True),
+    ("Plugin endpoint unavailable", "plugin.endpoint_unavailable", True),
     ("Plugin credential unavailable", "plugin.credential_unavailable", False),
     ("mcp_server_timeout", "mcp.server_timeout", True),
     ("mcp_server_failed", "mcp.server_failed", True),
@@ -1548,6 +1549,17 @@ cases = (
             ),
         ),
         "runtime_recovery_blocked", "manual_review_recovery_checkpoint",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                reason="Plugin endpoint unavailable",
+            ),
+        ),
+        "plugin_runtime_unavailable", "repair_plugin_endpoint_or_adapter_and_retry",
     ),
 )
 
