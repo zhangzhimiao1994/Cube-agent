@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal, cast
 
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.models.types import Deployment
 
 FallbackExecutionPolicy = Literal["configured", "disabled"]
+ModelSelectionPolicy = Literal["configured", "low_cost", "high_quality"]
 
 
 class DeploymentRoutingConstraintError(RuntimeError):
@@ -16,6 +18,10 @@ class DeploymentRoutingConstraintError(RuntimeError):
 
 class FallbackExecutionPolicyError(RuntimeError):
     """Stable failure for invalid harness fallback execution policy."""
+
+
+class ModelSelectionPolicyError(RuntimeError):
+    """Stable failure for invalid harness model selection policy."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,12 +125,55 @@ def fallback_execution_policy_from_decision(
     raise FallbackExecutionPolicyError("invalid fallback execution policy")
 
 
+def model_selection_policy_from_decision(
+    routing_decision: object | None,
+) -> ModelSelectionPolicy:
+    if not isinstance(routing_decision, Mapping):
+        return "configured"
+    raw_policy = routing_decision.get("harness_policy")
+    if raw_policy is None:
+        return "configured"
+    if not isinstance(raw_policy, Mapping):
+        raise ModelSelectionPolicyError("invalid model selection policy")
+    value = raw_policy.get("model_selection")
+    if value is None:
+        return "configured"
+    if isinstance(value, str) and value in {"configured", "low_cost", "high_quality"}:
+        return cast(ModelSelectionPolicy, value)
+    raise ModelSelectionPolicyError("invalid model selection policy")
+
+
+def rank_deployments_for_selection(
+    deployments: tuple[Deployment, ...],
+    policy: ModelSelectionPolicy,
+) -> tuple[Deployment, ...]:
+    if policy == "configured":
+        return deployments
+    if policy == "low_cost":
+        return tuple(sorted(deployments, key=_low_cost_sort_key))
+    if policy == "high_quality":
+        return tuple(sorted(deployments, key=lambda deployment: (-deployment.weight, deployment.id)))
+    raise ModelSelectionPolicyError("invalid model selection policy")
+
+
+def _low_cost_sort_key(deployment: Deployment) -> tuple[bool, Decimal, str]:
+    input_price = deployment.input_per_million_usd
+    output_price = deployment.output_per_million_usd
+    if input_price is None or output_price is None:
+        return True, Decimal(0), deployment.id
+    return False, input_price + output_price, deployment.id
+
+
 __all__ = [
     "DeploymentRoutingConstraint",
     "DeploymentRoutingConstraintError",
     "FallbackExecutionPolicy",
     "FallbackExecutionPolicyError",
+    "ModelSelectionPolicy",
+    "ModelSelectionPolicyError",
     "constrain_deployments_for_routing",
     "deployment_routing_constraint_from_decision",
     "fallback_execution_policy_from_decision",
+    "model_selection_policy_from_decision",
+    "rank_deployments_for_selection",
 ]

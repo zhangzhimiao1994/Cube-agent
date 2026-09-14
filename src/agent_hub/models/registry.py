@@ -17,8 +17,12 @@ class NoCapableDeployment(LookupError):
 class ModelRegistry:
     """Deterministic logical-model lookup without capacity or health policy."""
 
-    def __init__(self, deployments: Iterable[Deployment]) -> None:
-        ordered = tuple(sorted(deployments, key=lambda deployment: deployment.id))
+    def __init__(self, deployments: Iterable[Deployment], *, preserve_order: bool = False) -> None:
+        ordered = (
+            tuple(deployments)
+            if preserve_order
+            else tuple(sorted(deployments, key=lambda deployment: deployment.id))
+        )
         seen: set[str] = set()
         grouped: defaultdict[str, list[Deployment]] = defaultdict(list)
         for deployment in ordered:

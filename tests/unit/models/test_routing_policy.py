@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.models.routing_policy import (
     DeploymentRoutingConstraint,
     DeploymentRoutingConstraintError,
+    ModelSelectionPolicyError,
     constrain_deployments_for_routing,
     deployment_routing_constraint_from_decision,
+    model_selection_policy_from_decision,
+    rank_deployments_for_selection,
 )
 from agent_hub.models.types import Deployment
 
@@ -181,3 +186,61 @@ def test_constrain_deployments_fails_closed_when_selected_deployment_is_missing(
         match="harness model selection is unavailable",
     ):
         constrain_deployments_for_routing(deployments(), constraint)
+
+
+def test_model_selection_policy_defaults_to_configured_order() -> None:
+    candidates = deployments()
+
+    assert model_selection_policy_from_decision({}) == "configured"
+    assert rank_deployments_for_selection(candidates, "configured") == candidates
+
+
+def test_low_cost_model_selection_prefers_priced_cheaper_deployment() -> None:
+    expensive = Deployment(
+        id="main_expensive",
+        logical_model="main",
+        provider_model="openai/gpt-5.6-sol",
+        input_per_million_usd=Decimal("2.0"),
+        output_per_million_usd=Decimal("8.0"),
+    )
+    unpriced = Deployment(id="main_unpriced", logical_model="main")
+    cheap = Deployment(
+        id="main_cheap",
+        logical_model="main",
+        provider_model="deepseek/deepseek-chat",
+        input_per_million_usd=Decimal("0.2"),
+        output_per_million_usd=Decimal("0.8"),
+    )
+    policy = model_selection_policy_from_decision(
+        {"harness_policy": {"model_selection": "low_cost"}}
+    )
+
+    ranked = rank_deployments_for_selection((expensive, unpriced, cheap), policy)
+
+    assert tuple(deployment.id for deployment in ranked) == (
+        "main_cheap",
+        "main_expensive",
+        "main_unpriced",
+    )
+
+
+def test_high_quality_model_selection_prefers_higher_weight() -> None:
+    standard = Deployment(id="main_standard", logical_model="main", weight=100)
+    preferred = Deployment(id="main_preferred", logical_model="main", weight=250)
+    policy = model_selection_policy_from_decision(
+        {"harness_policy": {"model_selection": "high_quality"}}
+    )
+
+    ranked = rank_deployments_for_selection((standard, preferred), policy)
+
+    assert tuple(deployment.id for deployment in ranked) == (
+        "main_preferred",
+        "main_standard",
+    )
+
+
+def test_model_selection_policy_rejects_unknown_values() -> None:
+    with pytest.raises(ModelSelectionPolicyError, match="invalid model selection policy"):
+        model_selection_policy_from_decision(
+            {"harness_policy": {"model_selection": "fastest"}}
+        )

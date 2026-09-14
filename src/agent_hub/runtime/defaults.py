@@ -35,9 +35,12 @@ from agent_hub.models.routing_policy import (
     DeploymentRoutingConstraintError,
     FallbackExecutionPolicy,
     FallbackExecutionPolicyError,
+    ModelSelectionPolicyError,
     constrain_deployments_for_routing,
     deployment_routing_constraint_from_decision,
     fallback_execution_policy_from_decision,
+    model_selection_policy_from_decision,
+    rank_deployments_for_selection,
 )
 from agent_hub.models.types import (
     Deployment,
@@ -998,15 +1001,19 @@ async def _gateway_for_config(
     deployments = _deployments(config)
     try:
         fallback_policy = fallback_execution_policy_from_decision(routing_decision)
+        selection_policy = model_selection_policy_from_decision(routing_decision)
     except FallbackExecutionPolicyError as error:
+        raise HarnessModelSelectionError(str(error)) from error
+    except ModelSelectionPolicyError as error:
         raise HarnessModelSelectionError(str(error)) from error
     deployment_constraint = _deployment_routing_constraint(config, routing_decision)
     deployments = _constrained_deployments_for_harness_decision(
         deployments,
         deployment_constraint,
     )
+    deployments = rank_deployments_for_selection(deployments, selection_policy)
     gateway = ModelGateway(
-        ModelRegistry(deployments),
+        ModelRegistry(deployments, preserve_order=True),
         await capacity_factory(tenant_id, deployments),
         TenantSecretResolver(secret_service, tenant_id),
         transport,

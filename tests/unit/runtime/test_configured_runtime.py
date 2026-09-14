@@ -3,6 +3,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import ClassVar, cast
 from uuid import UUID, uuid4
@@ -531,6 +532,73 @@ async def test_config_backed_direct_runtime_uses_harness_selected_logical_model(
     deployment, request, _api_key = transport.calls[0]
     assert deployment.provider_model == "deepseek/deepseek-chat"
     assert request.logical_model == "research"
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_applies_low_cost_model_selection_policy() -> None:
+    transport = FakeTransport()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://expensive",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "input_per_million_usd": "2.0",
+                                "output_per_million_usd": "8.0",
+                                "capabilities": ["text"],
+                            },
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://cheap",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "input_per_million_usd": "0.2",
+                                "output_per_million_usd": "0.8",
+                                "capabilities": ["text"],
+                            },
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="summarize this cheaply",
+                routing_decision={
+                    "harness_policy": {"model_selection": "low_cost"},
+                },
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    deployment, _request, _api_key = transport.calls[0]
+    assert deployment.provider_model == "deepseek/deepseek-chat"
+    assert deployment.input_per_million_usd == Decimal("0.2")
 
 
 @pytest.mark.asyncio
