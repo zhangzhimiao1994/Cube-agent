@@ -216,7 +216,12 @@ def execute_project_scale_plan(
                 errors.append(f"terminal_status: {status or 'unknown'}")
 
             events = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
-            evidence["run_events"] = isinstance(events, list)
+            if isinstance(events, list) and events:
+                evidence["run_events"] = True
+            elif isinstance(events, list):
+                errors.append("run_events: empty event stream")
+            else:
+                errors.append("run_events: returned non-list JSON")
             evidence["self_repair_trace"] = _has_self_repair_trace(events)
 
             try:

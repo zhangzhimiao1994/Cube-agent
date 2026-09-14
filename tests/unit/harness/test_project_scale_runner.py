@@ -150,6 +150,17 @@ def test_execute_project_scale_plan_rejects_detail_scope_mismatch() -> None:
     )
 
 
+def test_execute_project_scale_plan_requires_non_empty_event_stream() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}], events=[])
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert report.results[0].evidence["run_events"] is False
+    assert report.results[0].errors == ("run_events: empty event stream",)
+
+
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)
@@ -245,7 +256,7 @@ class FakeAcceptanceClient:
         self.decision_version = decision_version
         self.statuses = list(statuses or (status,))
         self.artifacts = artifacts or []
-        self.events = events or [{"kind": "run.created"}]
+        self.events = [{"kind": "run.created"}] if events is None else events
         self.response_project_id = response_project_id
         self.response_session_id = response_session_id
         self.details_run_id = details_run_id
