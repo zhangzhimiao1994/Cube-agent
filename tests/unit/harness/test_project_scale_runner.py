@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import execute_project_scale_plan
@@ -29,6 +30,26 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
     )
     assert "run_events" in payload["required_evidence"]
     assert "delete_workspace" in payload["cleanup_actions"]
+
+
+def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:
+    output_path = tmp_path / "project-scale-report.json"
+
+    result = run_project_scale_runner(
+        "--scale",
+        "small",
+        "--flow",
+        "direct",
+        "--json",
+        "--output",
+        str(output_path),
+    )
+
+    assert result.returncode == 0
+    stdout_payload = json.loads(result.stdout)
+    file_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert file_payload == stdout_payload
+    assert file_payload["requests"][0]["case_id"] == "small:direct"
 
 
 def test_project_scale_runner_rejects_execute_without_token() -> None:

@@ -10,6 +10,7 @@ project_scale_scales="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES:-${AGENT_HUB_PROJ
 project_scale_flows="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS:-${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct}}"
 project_scale_wait_seconds="${AGENT_HUB_PROJECT_SCALE_WAIT_SECONDS:-120}"
 project_scale_poll_interval="${AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS:-2}"
+project_scale_report_path="${AGENT_HUB_PROJECT_SCALE_REPORT_PATH:-}"
 read_only=0
 stress_profile="${AGENT_HUB_ACCEPTANCE_STRESS_PROFILE:-custom}"
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
@@ -2116,6 +2117,9 @@ run_authenticated_project_scale_execution_profile() {
   done
   args+=(--wait-seconds "$project_scale_wait_seconds")
   args+=(--poll-interval "$project_scale_poll_interval")
+  if [[ -n "$project_scale_report_path" ]]; then
+    args+=(--output "$project_scale_report_path")
+  fi
   args+=(--json)
   if ! output="$(
     PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \

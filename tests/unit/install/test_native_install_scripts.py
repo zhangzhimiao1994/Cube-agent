@@ -149,6 +149,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS" in command
+    assert "AGENT_HUB_PROJECT_SCALE_REPORT_PATH" in command
     assert "skip: authenticated project scale execution runner is disabled in read-only mode" in command
     assert (
         "skip: authenticated project scale execution runner requires "
@@ -167,6 +168,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "args+=(--flow \"$value\")" in command
     assert "args+=(--wait-seconds \"$project_scale_wait_seconds\")" in command
     assert "--poll-interval \"$project_scale_poll_interval\"" in command
+    assert "args+=(--output \"$project_scale_report_path\")" in command
     assert "ok: authenticated project scale execution runner" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command
@@ -550,6 +552,7 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     assert "python -m agent_hub.harness.project_scale_runner" in command
     assert "--wait-seconds SECONDS" in command
     assert "--poll-interval SECONDS" in command
+    assert "--output PATH" in command
     assert "--json" in command
     assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
 

@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
@@ -250,6 +251,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=float(os.environ.get("AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS", "2")),
     )
+    parser.add_argument(
+        "--output",
+        default=os.environ.get("AGENT_HUB_PROJECT_SCALE_REPORT_PATH"),
+        help="Write the JSON plan or execution report to this path.",
+    )
     parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
 
@@ -276,6 +282,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = report.to_payload()
     else:
         payload = plan.to_payload()
+    if args.output:
+        Path(args.output).write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if args.json_output:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:

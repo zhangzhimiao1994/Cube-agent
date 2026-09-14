@@ -18,6 +18,7 @@ Common options:
   --execute                            Execute real server probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
   --wait-seconds SECONDS               Wait for terminal run status before evidence checks.
   --poll-interval SECONDS              Poll interval while waiting for terminal run status.
+  --output PATH                        Write the JSON plan or execution report to PATH.
   --help                               Show Python runner help.
 EOF
 }
