@@ -411,6 +411,11 @@ function safeDiagnosticFailureKind(value: unknown) {
   return text && /^[A-Za-z0-9_.-]+$/.test(text) ? repairFailureKindLabel(text) : "";
 }
 
+function safeDiagnosticActionLabel(value: unknown, fallback = "") {
+  const text = safeDiagnosticIdentifier(value, "");
+  return text ? repairActionLabel(text) : fallback;
+}
+
 function displayRunStatus(status: string) {
   return RUN_STATUS_LABELS[status] ?? status;
 }
@@ -716,7 +721,7 @@ function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefin
   if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
   if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
   if (safeDiagnosticIdentifier(event.action, "")) {
-    rows.push({ label: "动作", value: isRepairIntentEvent(event) ? repairActionLabel(event.action) : safeDiagnosticIdentifier(event.action, "") });
+    rows.push({ label: "动作", value: safeDiagnosticActionLabel(event.action) });
   }
   if (safeDiagnosticIdentifier(event.decision, "")) rows.push({ label: "决策", value: safeDiagnosticIdentifier(event.decision, "") });
   if (event.summary?.trim()) rows.push({ label: "安全摘要", value: event.summary.trim() });
@@ -1577,9 +1582,9 @@ function pendingApprovalDiagnostics(detail: RunDetail): DetailFailureDiagnostic[
   return approvalStateFromEvents(detail.events).pending.map((event) => ({
     id: `${detail.id}-diagnostic-approval-${event.approval_id ?? event.sequence}`,
     label: "等待人工确认",
-    title: safeDiagnosticIdentifier(event.action, "需要确认"),
+    title: safeDiagnosticActionLabel(event.action, "需要确认"),
     detail:
-      safeDiagnosticIdentifier(event.action, "") ||
+      safeDiagnosticActionLabel(event.action) ||
       safeDiagnosticIdentifier(event.payload.decision, "") ||
       safeDiagnosticIdentifier(event.payload.status, "") ||
       "需要确认后继续",
@@ -1738,7 +1743,7 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       label: "审批意图",
       title: "等待确认",
       detail:
-        safeDiagnosticIdentifier(event.action, "") ||
+        safeDiagnosticActionLabel(event.action) ||
         safeIntentIdentifier(event, ["decision", "status"]) ||
         "需要确认后继续",
       meta: [
@@ -1772,7 +1777,7 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
         label: "重试意图",
         title: "准备重试",
         detail:
-          safeDiagnosticIdentifier(event.action, "") ||
+          safeDiagnosticActionLabel(event.action) ||
           repairFailureKindLabel(safeIntentIdentifier(event, ["failure_kind"])) ||
           safeIntentIdentifier(event, ["status"]) ||
           "失败后重试",

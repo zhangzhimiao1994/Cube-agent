@@ -1066,6 +1066,12 @@ function safeIntentValue(event: RunEvent, keys: string[]) {
   return "";
 }
 
+function safeActionLabel(value: unknown) {
+  const text = formatEventPayloadValue(value);
+  if (!text || text.length > 80) return "";
+  return /^[A-Za-z0-9_.:/@-]+$/.test(text) ? repairActionLabel(text) : "";
+}
+
 function replaySafetyLabel(value: unknown) {
   if (value === false || value === "false") return "不可回放";
   if (value === true || value === "true") return "可回放";
@@ -1107,7 +1113,7 @@ function isRepairIntentEvent(event: RunEvent) {
 }
 
 function eventIntentDetail(event: RunEvent, fallback: string) {
-  return event.action || safeIntentValue(event, SAFE_INTENT_PAYLOAD_KEYS) || fallback;
+  return safeActionLabel(event.action) || safeIntentValue(event, SAFE_INTENT_PAYLOAD_KEYS) || fallback;
 }
 
 function eventFailureStatus(event: RunEvent) {
@@ -1165,7 +1171,7 @@ function pendingApprovalDiagnostics(
   return approvalStateFromEvents(detail.events).pending.map((event) => ({
       id: `${detail.id}-diagnostic-approval-${event.approval_id ?? event.sequence}`,
       label: "等待人工确认" as const,
-      title: event.action || "需要确认",
+      title: safeActionLabel(event.action) || "需要确认",
       detail: eventIntentDetail(event, "需要确认后继续"),
       recommendation: "处理审批或拒绝高风险动作，再继续执行。",
       meta: [
@@ -1385,7 +1391,7 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
     }
     if (isRepairIntentEvent(event)) {
       const rawRepairAction = safeIntentValue(event, ["repair_action", "repair_kind", "remediation_action"]);
-      const repairAction = repairActionLabel(rawRepairAction) || event.action || "修复方案";
+      const repairAction = repairActionLabel(rawRepairAction) || safeActionLabel(event.action) || "修复方案";
       const failureKind = repairFailureKindLabel(safeIntentValue(event, ["failure_kind"]));
       pushUniqueIntent(intents, {
         id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
@@ -2554,10 +2560,14 @@ function eventSummaryText(
     return `${subject} 失败：${conciseProcessText(readableMessage || outputSignal, "执行失败")}`;
   }
   if (event.kind === "approval.requested") {
-    return `等待确认：${conciseProcessText(event.action || safeIntentValue(event, ["operation_kind", "status"]), "需要你确认后继续")}`;
+    return `等待确认：${conciseProcessText(safeActionLabel(event.action) || safeIntentValue(event, ["operation_kind", "status"]), "需要你确认后继续")}`;
   }
   if (event.kind === "step.retrying") {
-    const retrySignal = event.action || safeIntentValue(event, ["attempt", "failure_kind", "status"]) || "失败后重试";
+    const retrySignal =
+      safeActionLabel(event.action) ||
+      repairFailureKindLabel(safeIntentValue(event, ["failure_kind"])) ||
+      safeIntentValue(event, ["attempt", "status"]) ||
+      "失败后重试";
     return `${subject} 重试：${conciseProcessText(retrySignal, "失败后重试")}`;
   }
   if (isRepairIntentEvent(event)) {
@@ -2565,7 +2575,7 @@ function eventSummaryText(
       repairActionLabel(safeIntentValue(event, ["repair_action", "repair_kind"])) ||
       repairFailureKindLabel(safeIntentValue(event, ["failure_kind"])) ||
       safeIntentValue(event, ["status"]) ||
-      event.action ||
+      safeActionLabel(event.action) ||
       "准备修复";
     const status = repairStatusLabel(event);
     return `修复意图：${conciseProcessText(`${repairSignal} ${status}`, "准备修复")}`;

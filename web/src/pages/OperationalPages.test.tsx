@@ -1817,7 +1817,8 @@ describe("operational management pages", () => {
     expect(within(intentRegion).getByText("审批意图")).not.toBeNull();
     expect(within(intentRegion).getByText("修复意图")).not.toBeNull();
     expect(within(intentRegion).getAllByText("不可回放").length).toBeGreaterThan(0);
-    expect(within(intentRegion).getAllByText("retry_terminal").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getAllByText("重试终端步骤").length).toBeGreaterThan(0);
+    expect(within(intentRegion).queryByText("retry_terminal")).toBeNull();
     expect(within(intentRegion).getByText("切换模型后重试")).not.toBeNull();
     expect(within(intentRegion).getByText("模型调用超时")).not.toBeNull();
     expect(intentRegion.textContent).not.toContain("switch_model");
@@ -4699,7 +4700,8 @@ describe("operational management pages", () => {
     expect(within(intentRegion).getByText("审批意图")).not.toBeNull();
     expect(within(intentRegion).getByText("重试意图")).not.toBeNull();
     expect(within(intentRegion).getByText("回放意图")).not.toBeNull();
-    expect(within(intentRegion).getAllByText("retry_terminal").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getAllByText("重试终端步骤").length).toBeGreaterThan(0);
+    expect(within(intentRegion).queryByText("retry_terminal")).toBeNull();
     expect(within(intentRegion).getAllByText("不可回放").length).toBeGreaterThan(0);
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
@@ -4877,7 +4879,8 @@ describe("operational management pages", () => {
     const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
 
     expect(within(intentRegion).getByText("重试意图")).not.toBeNull();
-    expect(within(intentRegion).getByText("retry_terminal")).not.toBeNull();
+    expect(within(intentRegion).getByText("重试终端步骤")).not.toBeNull();
+    expect(within(intentRegion).queryByText("retry_terminal")).toBeNull();
     expect(within(intentRegion).queryByText("需要确认")).toBeNull();
     expect(within(intentRegion).queryByText("修复意图")).toBeNull();
     expect(stream.textContent).not.toContain("private-token");
