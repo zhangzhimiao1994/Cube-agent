@@ -514,7 +514,12 @@ def property_type_matches(prop, expected_type):
     if prop.get("type") == expected_type:
         return True
     any_of = prop.get("anyOf")
-    return isinstance(any_of, list) and {"type": expected_type} in any_of
+    if not isinstance(any_of, list):
+        return False
+    return any(
+        isinstance(branch, dict) and branch.get("type") == expected_type
+        for branch in any_of
+    )
 
 def property_minimum_matches(prop, expected_type, minimum):
     if minimum is None:
