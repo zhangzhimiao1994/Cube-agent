@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
@@ -287,7 +289,46 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
     assert projected["automatic_execution"] is False
 
 
-def test_non_retryable_plugin_credential_failure_forces_manual_repair_approval() -> None:
+@pytest.mark.parametrize(
+    ("reason", "expected_category", "expected_strategy"),
+    [
+        (
+            "Plugin credential unavailable secret://plugin-token",
+            "plugin_credential_unavailable",
+            "manual_review_plugin_credentials",
+        ),
+        (
+            "Plugin arguments do not match input schema: invalid type secret://plugin-token",
+            "plugin_invalid_arguments",
+            "manual_review_plugin_arguments",
+        ),
+        (
+            "Plugin result does not match output schema: invalid type secret://plugin-token",
+            "plugin_invalid_result",
+            "manual_review_plugin_result_contract",
+        ),
+        (
+            "Plugin sandbox profile unsupported secret://plugin-token",
+            "plugin_sandbox_unsupported",
+            "manual_review_plugin_sandbox",
+        ),
+        (
+            "MCP tool unavailable secret://plugin-token",
+            "mcp_tool_unavailable",
+            "manual_review_mcp_configuration",
+        ),
+        (
+            "mcp_server_not_discovered secret://plugin-token",
+            "mcp_server_not_discovered",
+            "manual_review_mcp_configuration",
+        ),
+    ],
+)
+def test_non_retryable_plugin_and_mcp_failures_force_manual_repair_approval(
+    reason: str,
+    expected_category: str,
+    expected_strategy: str,
+) -> None:
     run_id = uuid4()
     decision = classify_terminal_run(
         status=RunStatus.FAILED,
@@ -298,15 +339,15 @@ def test_non_retryable_plugin_credential_failure_forces_manual_repair_approval()
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=1,
                 run_id=run_id,
-                reason="Plugin credential unavailable secret://plugin-token",
+                reason=reason,
             ),
         ),
         policy=SelfRepairPolicy(requires_approval=False),
     )
 
     assert decision is not None
-    assert decision.failure_category == "plugin_credential_unavailable"
-    assert decision.recovery_strategy == "manual_review_plugin_credentials"
+    assert decision.failure_category == expected_category
+    assert decision.recovery_strategy == expected_strategy
     assert decision.requires_approval is True
     assert decision.automatic_execution is False
     proposal = decision.to_proposal(run_id=run_id)
@@ -383,7 +424,31 @@ def test_self_repair_failure_injection_matrix_classifies_common_failures() -> No
                     kind=EventKind.RUNTIME_FAILED,
                     sequence=1,
                     run_id=base_run_id,
+                    reason="Plugin tool timed out",
+                ),
+            ),
+            "plugin_runtime_unavailable",
+            "repair_plugin_endpoint_or_adapter_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
                     reason="mcp_server_timeout",
+                ),
+            ),
+            "mcp_runtime_unavailable",
+            "repair_mcp_server_or_adapter_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason="MCP tool timed out",
                 ),
             ),
             "mcp_runtime_unavailable",

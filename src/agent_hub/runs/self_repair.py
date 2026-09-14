@@ -69,6 +69,7 @@ _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
         "plugin.endpoint_unavailable",
         "plugin backend unavailable",
         "plugin endpoint unavailable",
+        "plugin tool timed out",
     }
 )
 _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS = frozenset(
@@ -77,12 +78,45 @@ _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS = frozenset(
         "plugin credential unavailable",
     }
 )
+_PLUGIN_INVALID_ARGUMENTS_MARKERS = frozenset(
+    {
+        "plugin.invalid_arguments",
+        "plugin arguments do not match input schema",
+    }
+)
+_PLUGIN_INVALID_RESULT_MARKERS = frozenset(
+    {
+        "plugin.invalid_result",
+        "plugin result does not match output schema",
+        "plugin result is invalid",
+        "plugin output schema is invalid",
+    }
+)
+_PLUGIN_SANDBOX_UNSUPPORTED_MARKERS = frozenset(
+    {
+        "plugin.sandbox_unsupported",
+        "plugin sandbox profile unsupported",
+    }
+)
 _MCP_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
     {
         "mcp.server_failed",
         "mcp.server_timeout",
         "mcp_server_failed",
         "mcp_server_timeout",
+        "mcp tool timed out",
+    }
+)
+_MCP_TOOL_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "mcp.tool_unavailable",
+        "mcp tool unavailable",
+    }
+)
+_MCP_SERVER_NOT_DISCOVERED_MARKERS = frozenset(
+    {
+        "mcp.server_not_discovered",
+        "mcp_server_not_discovered",
     }
 )
 _RECOVERY_BLOCKED_MARKERS = frozenset({RECOVERY_BLOCKED_FAILURE_REASON})
@@ -99,6 +133,11 @@ _MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_r
 _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
     {
         "plugin_credential_unavailable",
+        "plugin_invalid_arguments",
+        "plugin_invalid_result",
+        "plugin_sandbox_unsupported",
+        "mcp_tool_unavailable",
+        "mcp_server_not_discovered",
     }
 )
 _REPAIR_PROPOSAL_FIELDS = frozenset(
@@ -490,8 +529,16 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         return "检查插件端点、适配器健康状态和网络连通性，修正可恢复配置后只重试受影响的插件调用。"
     if failure_category == "plugin_credential_unavailable":
         return "停止自动重试，检查插件凭据配置、授权边界和轮换状态，凭据修正并审批后再继续。"
+    if failure_category == "plugin_invalid_arguments":
+        return "停止自动重试，检查插件入参 schema、参数结构和调用计划，修正契约后再审批继续。"
+    if failure_category == "plugin_invalid_result":
+        return "停止自动重试，检查插件输出契约、适配器版本和 output schema，修正后再审批继续。"
+    if failure_category == "plugin_sandbox_unsupported":
+        return "停止自动重试，检查插件隔离策略、运行时支持和 host adapter 配置，修正后再审批继续。"
     if failure_category == "mcp_runtime_unavailable":
         return "检查 MCP 服务进程、连接和适配器状态，修正可恢复问题后只重试受影响的 MCP 调用。"
+    if failure_category in {"mcp_tool_unavailable", "mcp_server_not_discovered"}:
+        return "停止自动重试，检查 MCP server 发现状态、工具 allowlist 和运行时 reload 配置，修正后再审批继续。"
     if failure_category == "tool_failure":
         return "先检查工具权限、参数和产物状态，只执行可审计的最小修复步骤。"
     if failure_category == "step_failure":
@@ -829,6 +876,16 @@ def _failure_category(event: RunEvent) -> str:
         return "model_capability_routing_unavailable"
     if _contains_marker(text, _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS):
         return "plugin_credential_unavailable"
+    if _contains_marker(text, _PLUGIN_INVALID_ARGUMENTS_MARKERS):
+        return "plugin_invalid_arguments"
+    if _contains_marker(text, _PLUGIN_INVALID_RESULT_MARKERS):
+        return "plugin_invalid_result"
+    if _contains_marker(text, _PLUGIN_SANDBOX_UNSUPPORTED_MARKERS):
+        return "plugin_sandbox_unsupported"
+    if _contains_marker(text, _MCP_TOOL_UNAVAILABLE_MARKERS):
+        return "mcp_tool_unavailable"
+    if _contains_marker(text, _MCP_SERVER_NOT_DISCOVERED_MARKERS):
+        return "mcp_server_not_discovered"
     if _contains_marker(text, _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS):
         return "plugin_runtime_unavailable"
     if _contains_marker(text, _MCP_RUNTIME_UNAVAILABLE_MARKERS):

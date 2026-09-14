@@ -1567,7 +1567,29 @@ cases = (
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=1,
                 run_id=base_run_id,
+                reason="Plugin tool timed out",
+            ),
+        ),
+        "plugin_runtime_unavailable", "repair_plugin_endpoint_or_adapter_and_retry",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
                 reason="mcp_server_timeout",
+            ),
+        ),
+        "mcp_runtime_unavailable", "repair_mcp_server_or_adapter_and_retry",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                reason="MCP tool timed out",
             ),
         ),
         "mcp_runtime_unavailable", "repair_mcp_server_or_adapter_and_retry",
@@ -1577,46 +1599,65 @@ cases = (
 for events, category, strategy in cases:
     classify(events, category, strategy)
 
-credential_run_id = uuid4()
-credential_repair = classify_terminal_run(
-    status=RunStatus.FAILED,
-    mode=TaskMode.HYBRID,
-    routing_decision={"source": "manual"},
-    events=(
-        RunEvent(
-            kind=EventKind.RUNTIME_FAILED,
-            sequence=1,
-            run_id=credential_run_id,
-            reason="Plugin credential unavailable secret://plugin-token",
-        ),
+manual_cases = (
+    (
+        "Plugin credential unavailable secret://plugin-token",
+        "plugin_credential_unavailable",
+        "manual_review_plugin_credentials",
     ),
-    policy=SelfRepairPolicy(requires_approval=False),
+    (
+        "Plugin arguments do not match input schema: invalid type secret://plugin-token",
+        "plugin_invalid_arguments",
+        "manual_review_plugin_arguments",
+    ),
+    (
+        "Plugin result does not match output schema: invalid type secret://plugin-token",
+        "plugin_invalid_result",
+        "manual_review_plugin_result_contract",
+    ),
+    (
+        "Plugin sandbox profile unsupported secret://plugin-token",
+        "plugin_sandbox_unsupported",
+        "manual_review_plugin_sandbox",
+    ),
+    (
+        "MCP tool unavailable secret://plugin-token",
+        "mcp_tool_unavailable",
+        "manual_review_mcp_configuration",
+    ),
+    (
+        "mcp_server_not_discovered secret://plugin-token",
+        "mcp_server_not_discovered",
+        "manual_review_mcp_configuration",
+    ),
 )
-require(credential_repair is not None, "plugin credential unavailable decision")
-require(
-    credential_repair.failure_category == "plugin_credential_unavailable",
-    "plugin credential unavailable category",
-)
-require(
-    credential_repair.recovery_strategy == "manual_review_plugin_credentials",
-    "plugin credential unavailable strategy",
-)
-require(credential_repair.requires_approval is True, "plugin credential unavailable approval")
-require(
-    credential_repair.automatic_execution is False,
-    "plugin credential unavailable must not auto execute",
-)
-credential_proposal = credential_repair.to_proposal(run_id=credential_run_id)
-require(credential_proposal is not None, "plugin credential unavailable proposal")
-require(
-    credential_proposal.get("requires_approval") is True,
-    "plugin credential unavailable proposal approval",
-)
-require(
-    credential_proposal.get("automatic_execution") is False,
-    "plugin credential unavailable proposal automatic",
-)
-require("secret://plugin-token" not in repr(credential_proposal), "plugin credential secret redaction")
+
+for reason, category, strategy in manual_cases:
+    manual_run_id = uuid4()
+    manual_repair = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=manual_run_id,
+                reason=reason,
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+    require(manual_repair is not None, f"{category} decision")
+    require(manual_repair.failure_category == category, f"{category} category")
+    require(manual_repair.recovery_strategy == strategy, f"{category} strategy")
+    require(manual_repair.requires_approval is True, f"{category} approval")
+    require(manual_repair.automatic_execution is False, f"{category} must not auto execute")
+    manual_proposal = manual_repair.to_proposal(run_id=manual_run_id)
+    require(manual_proposal is not None, f"{category} proposal")
+    require(manual_proposal.get("requires_approval") is True, f"{category} proposal approval")
+    require(manual_proposal.get("automatic_execution") is False, f"{category} proposal automatic")
+    require("secret://plugin-token" not in repr(manual_proposal), f"{category} secret redaction")
 PY
   then
     printf 'ok: self-repair failure injection matrix\n'
