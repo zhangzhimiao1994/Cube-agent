@@ -1585,6 +1585,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+from agent_hub.api.routers.admin import RunDetailResponse, _admin_run_event
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import ModelGateway
@@ -1826,6 +1827,61 @@ require(
 requirements = self_repair_role_capability_requirements(routing_decision)
 require("scheduler" in requirements, "parsed role requirements")
 require("tool_calling" in {capability.value for capability in requirements["scheduler"]}, "tool capability")
+
+admin_event = _admin_run_event(
+    {
+        "sequence": 4,
+        "kind": "step.started",
+        "message": "model capability self-repair summary",
+        "created_at": datetime.now(UTC),
+        "actor": "main_agent",
+        "step_id": "self_repair_plan",
+        "payload": {
+            "model_execution_plan": {
+                "self_repair_recovery": {
+                    **plan,
+                    "credential_ref": "credential-private",
+                    "api_base": "https://internal.example.invalid",
+                    "raw_plan": {"token": "secret://repair-token"},
+                },
+            },
+        },
+    }
+)
+detail = RunDetailResponse(
+    id=run_id,
+    status="running",
+    mode="dispatch",
+    request="verify model capability self-repair summary",
+    created_at=datetime.now(UTC),
+    queue_wait_ms=0,
+    capacity_wait_ms=0,
+    cost_usd="0",
+    events=[admin_event],
+    artifacts=[],
+    explicit_details={},
+)
+projection = detail.model_dump(mode="json")
+summary = projection.get("self_repair_recovery_summary")
+require(isinstance(summary, dict), "model capability self-repair summary")
+require(
+    summary.get("recovery_strategy") == "reassign_tool_role_to_capable_model_and_retry",
+    "summary recovery strategy",
+)
+require(summary.get("replan_scope") == "model_capability_roles", "summary replan scope")
+require(summary.get("automatic_execution") is True, "summary automatic execution")
+require(summary.get("role_capability_requirement_count") == 1, "summary role count")
+require(summary.get("required_capability_count") == 3, "summary capability count")
+require(
+    projection["events"][0]["payload"]["model_execution_plan"]["self_repair_recovery"]
+    == summary,
+    "event summary projection",
+)
+serialized_projection = repr(projection)
+require("credential-private" not in serialized_projection, "unsafe repair internals must be filtered")
+require("internal.example.invalid" not in serialized_projection, "unsafe repair internals must be filtered")
+require("secret://repair-token" not in serialized_projection, "unsafe repair internals must be filtered")
+require("raw_plan" not in serialized_projection, "unsafe repair internals must be filtered")
 PY
   then
     printf 'ok: model capability recovery\n'

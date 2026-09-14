@@ -127,6 +127,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: model capability recovery" in command
     assert "capability_unavailable" in command
     assert "primary must not be invoked without capability" in command
+    assert "RunDetailResponse" in command
+    assert "model capability self-repair summary" in command
+    assert "role_capability_requirement_count" in command
+    assert "required_capability_count" in command
+    assert "unsafe repair internals must be filtered" in command
     assert "ok: model capability recovery" in command
     assert "check_model_selection_policy_contract" in command
     assert "profile: model selection policy" in command
