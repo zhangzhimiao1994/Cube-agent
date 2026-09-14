@@ -172,6 +172,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: project scale execution runner" in command
     assert "run_authenticated_project_scale_execution_profile" in command
     assert "profile: authenticated project scale execution runner" in command
+    assert "check_acceptance_credential_readiness" in command
+    assert "profile: acceptance credential readiness" in command
+    assert "ok: acceptance credential readiness bearer_token=set" in command
+    assert "ok: acceptance credential readiness login_credentials=set" in command
+    assert "skip: acceptance credential readiness no bearer or login credentials configured" in command
     assert "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS" in command
@@ -185,7 +190,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     )
     assert (
         "skip: authenticated project scale execution runner requires "
-        "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
+        "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or acceptance login credentials" in command
     )
     assert "agent_hub.harness.project_scale_runner" in command
     assert "--base-url \"$base_url\"" in command

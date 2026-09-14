@@ -31,6 +31,7 @@ retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
 ready_timeout="${AGENT_HUB_ACCEPTANCE_READY_TIMEOUT_SECONDS:-45}"
 ready_poll_interval="${AGENT_HUB_ACCEPTANCE_READY_POLL_INTERVAL_SECONDS:-2}"
 bearer_token="${AGENT_HUB_ACCEPTANCE_BEARER_TOKEN:-}"
+configured_bearer_token="$bearer_token"
 acceptance_login_username="${AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME:-}"
 acceptance_login_password="${AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD:-}"
 acceptance_login_tenant_id="${AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID:-}"
@@ -348,6 +349,23 @@ PY
   bearer_token="$acquired_token"
   acquired_token=""
   printf 'ok: acceptance login token acquired\n'
+}
+
+check_acceptance_credential_readiness() {
+  printf 'profile: acceptance credential readiness\n'
+  if [[ -n "$configured_bearer_token" ]]; then
+    printf 'ok: acceptance credential readiness bearer_token=set\n'
+    return 0
+  fi
+  if [[ -n "$acceptance_login_username" && -n "$acceptance_login_password" && -n "$bearer_token" ]]; then
+    printf 'ok: acceptance credential readiness login_credentials=set bearer_token=acquired\n'
+    return 0
+  fi
+  if [[ -n "$acceptance_login_username" || -n "$acceptance_login_password" || -n "$acceptance_login_tenant_id" ]]; then
+    printf 'skip: acceptance credential readiness login credentials configured but bearer unavailable\n'
+    return 0
+  fi
+  printf 'skip: acceptance credential readiness no bearer or login credentials configured\n'
 }
 
 check_url() {
@@ -2468,7 +2486,7 @@ run_authenticated_project_scale_execution_profile() {
     return 0
   fi
   if [[ -z "$bearer_token" ]]; then
-    printf 'skip: authenticated project scale execution runner requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN\n'
+    printf 'skip: authenticated project scale execution runner requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or acceptance login credentials\n'
     return 0
   fi
   if ! python_bin="$(detect_python)"; then
@@ -3818,6 +3836,7 @@ run_release_verification_profile() {
 
 require_curl
 resolve_acceptance_bearer_token || true
+check_acceptance_credential_readiness || true
 if [[ "$read_only" -eq 1 ]]; then
   printf 'mode: read-only\n'
 else
