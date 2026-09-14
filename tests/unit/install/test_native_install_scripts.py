@@ -223,6 +223,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert 'iterations_explicit=1' in command
     assert "AGENT_HUB_ACCEPTANCE_RETRIES" in command
     assert "AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS" in command
+    assert "AGENT_HUB_ACCEPTANCE_READY_TIMEOUT_SECONDS" in command
+    assert "AGENT_HUB_ACCEPTANCE_READY_POLL_INTERVAL_SECONDS" in command
+    assert "wait_for_readiness" in command
+    assert "profile: readiness warmup" in command
+    assert 'wait_for_readiness || true' in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN" in command
     assert "AGENT_HUB_ACCEPTANCE_RUN_MESSAGE" in command
     assert "--retries N" in command

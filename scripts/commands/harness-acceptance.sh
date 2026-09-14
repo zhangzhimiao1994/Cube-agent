@@ -27,6 +27,8 @@ connect_timeout="${AGENT_HUB_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS:-5}"
 max_time="${AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS:-20}"
 retries="${AGENT_HUB_ACCEPTANCE_RETRIES:-3}"
 retry_delay="${AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS:-2}"
+ready_timeout="${AGENT_HUB_ACCEPTANCE_READY_TIMEOUT_SECONDS:-45}"
+ready_poll_interval="${AGENT_HUB_ACCEPTANCE_READY_POLL_INTERVAL_SECONDS:-2}"
 bearer_token="${AGENT_HUB_ACCEPTANCE_BEARER_TOKEN:-}"
 acceptance_login_username="${AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME:-}"
 acceptance_login_password="${AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD:-}"
@@ -71,6 +73,8 @@ Options:
   --max-time SECONDS             Curl total request timeout. Defaults to 20.
   --retries N                    Attempts per smoke URL. Defaults to AGENT_HUB_ACCEPTANCE_RETRIES or 3.
   --retry-delay SECONDS          Delay between URL attempts. Defaults to AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS or 2.
+  Set AGENT_HUB_ACCEPTANCE_READY_TIMEOUT_SECONDS and
+  AGENT_HUB_ACCEPTANCE_READY_POLL_INTERVAL_SECONDS to tune startup readiness warmup.
   --verify-release               Also verify native current release pointer, REVISION, and service state.
   --install-root DIR             Native install root for --verify-release. Defaults to AGENT_HUB_INSTALL_ROOT or /opt/agent-hub.
   --expect-revision SHA          Require current release REVISION to match SHA. Also enables --verify-release.
@@ -193,8 +197,12 @@ case "$stress_profile" in
     ;;
 esac
 
-if ! positive_int "$concurrency" || ! positive_int "$iterations" || ! positive_int "$retries"; then
-  printf 'concurrency, iterations, and retries must be positive integers\n' >&2
+if ! positive_int "$concurrency" \
+  || ! positive_int "$iterations" \
+  || ! positive_int "$retries" \
+  || ! positive_int "$ready_timeout" \
+  || ! positive_int "$ready_poll_interval"; then
+  printf 'concurrency, iterations, retries, and readiness warmup values must be positive integers\n' >&2
   exit 2
 fi
 
@@ -376,6 +384,29 @@ check_health_json() {
   printf 'fail: %s %s JSON status!=ok\n' "$name" "$path" >&2
   failures=$((failures + 1))
   return 1
+}
+
+wait_for_readiness() {
+  local status=""
+  local started="$SECONDS"
+  printf 'profile: readiness warmup\n'
+  while true; do
+    status="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -sS -o /dev/null -w '%{http_code}' \
+      "$base_url/health/ready" 2>/dev/null || true)"
+    if [[ "$status" == "200" ]]; then
+      printf 'ok: readiness warmup /health/ready -> %s\n' "$status"
+      return 0
+    fi
+    if ((SECONDS - started >= ready_timeout)); then
+      printf 'fail: readiness warmup /health/ready -> %s\n' "${status:-curl-error}" >&2
+      failures=$((failures + 1))
+      return 1
+    fi
+    sleep "$ready_poll_interval"
+  done
 }
 
 check_prometheus_metrics() {
@@ -3560,6 +3591,7 @@ if [[ "$read_only" -eq 1 ]]; then
 else
   printf 'mode: write-probes-enabled\n'
 fi
+wait_for_readiness || true
 
 case "$profile" in
   codex)
