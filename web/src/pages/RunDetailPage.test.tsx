@@ -250,6 +250,26 @@ describe("RunDetailPage", () => {
           step_id: "unassigned-cleanup",
           artifact: null,
         },
+        {
+          ...runDetail.events[0],
+          sequence: 6,
+          kind: "step.failed",
+          message: "qa failed",
+          summary: "qa 子 Agent 检查失败",
+          actor: "qa",
+          step_id: "qa-review",
+          artifact: null,
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 7,
+          kind: "dispatch.queued",
+          message: "planner queued",
+          summary: "planner 子 Agent 已安排",
+          actor: "planner",
+          step_id: "planner-queued",
+          artifact: null,
+        },
       ],
       artifacts: [],
     };
@@ -276,8 +296,11 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     const workbenchButton = within(processSummary).getByRole("button", { name: /Agent 工作席/ });
     expect(within(processSummary).getAllByRole("button")).toHaveLength(1);
-    expect(workbenchButton.textContent).toContain("4 个 Agent");
-    expect(workbenchButton.textContent).toContain("3 已下班");
+    expect(workbenchButton.textContent).toContain("6 个 Agent");
+    expect(workbenchButton.textContent).toContain("1 异常");
+    expect(workbenchButton.textContent).toContain("1 工作中");
+    expect(workbenchButton.textContent).toContain("3 已完成");
+    expect(workbenchButton.textContent).toContain("1 已安排");
     expect(workbenchButton.textContent).not.toContain("critic 子 Agent 已下班");
     expect(within(processSummary).queryByText("reviewer 子 Agent 调度")).toBeNull();
     expect(within(processSummary).queryByText("critic 子 Agent 已下班")).toBeNull();

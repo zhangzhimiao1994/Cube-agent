@@ -904,19 +904,57 @@ function detailWorkbenchAgentCount(cards: DetailProcessCard[]) {
   return actors.size;
 }
 
-function detailWorkbenchCompletedCount(cards: DetailProcessCard[]) {
-  const completedAgents = new Set<string>();
+type DetailWorkbenchStatus = "异常" | "工作中" | "已完成" | "已安排";
+
+function detailWorkbenchCardStatus(card: DetailProcessCard): DetailWorkbenchStatus {
+  const kind = card.sourceKind ?? "";
+  if (kind.endsWith(".failed") || kind === "runtime.failed") return "异常";
+  if (
+    [
+      "runtime.started",
+      "dispatch.started",
+      "discussion.started",
+      "decision.started",
+      "step.started",
+      "step.retrying",
+      "model.started",
+      "model.text_delta",
+      "tool.requested",
+      "tool.started",
+    ].includes(kind)
+  ) {
+    return "工作中";
+  }
+  if (
+    kind.endsWith(".completed") ||
+    kind === "artifact.created" ||
+    kind === "message.created" ||
+    kind === "approval.resolved"
+  ) {
+    return "已完成";
+  }
+  return "已安排";
+}
+
+function detailWorkbenchStatusCounts(cards: DetailProcessCard[]) {
+  const statusByAgent = new Map<string, DetailWorkbenchStatus>();
+  const priority: Record<DetailWorkbenchStatus, number> = {
+    "异常": 4,
+    "工作中": 3,
+    "已完成": 2,
+    "已安排": 1,
+  };
   cards.forEach((card) => {
-    if (
-      card.sourceKind !== "artifact.created" &&
-      card.sourceKind !== "message.created" &&
-      card.sourceKind !== "runtime.completed"
-    ) {
-      return;
-    }
-    completedAgents.add(detailWorkbenchCardIdentity(card));
+    const identity = detailWorkbenchCardIdentity(card);
+    const status = detailWorkbenchCardStatus(card);
+    const current = statusByAgent.get(identity);
+    if (!current || priority[status] > priority[current]) statusByAgent.set(identity, status);
   });
-  return completedAgents.size;
+  const statuses: DetailWorkbenchStatus[] = ["异常", "工作中", "已完成", "已安排"];
+  return statuses.flatMap((status) => {
+    const count = [...statusByAgent.values()].filter((value) => value === status).length;
+    return count > 0 ? [`${count} ${status}`] : [];
+  });
 }
 
 function isGenericEventMessage(event: RunEvent) {
@@ -2067,7 +2105,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
   if (cards.length === 0) return null;
   const workbenchId = "run-detail-agent-workbench";
   const agentCount = detailWorkbenchAgentCount(cards);
-  const completedCount = detailWorkbenchCompletedCount(cards);
+  const statusSummary = detailWorkbenchStatusCounts(cards);
   return (
     <section className="run-detail-process-summary" aria-label="Agent 集群动作">
       <div className="run-failure-diagnostics-header">
@@ -2089,7 +2127,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
           <span aria-hidden="true">⌘</span>
           <strong>Agent 工作席</strong>
           <small className="agent-workbench-meta">
-            {agentCount} 个 Agent · {completedCount} 已下班
+            {[`${agentCount} 个 Agent`, ...statusSummary].join(" · ")}
           </small>
         </button>
       </div>
