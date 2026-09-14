@@ -1208,7 +1208,7 @@ function failureDiagnosticsForRun(detail: RunDetail, agentNames: Map<string, str
 
   detail.events.forEach((event) => {
     if (event.kind === "tool.failed") {
-      const failureKind = formatEventPayloadValue(event.payload.failure_kind);
+      const failureKind = repairFailureKindLabel(formatEventPayloadValue(event.payload.failure_kind));
       const exitCode = formatEventPayloadValue(event.payload.exit_code);
       const outputBytes = formatEventPayloadValue(event.payload.output_bytes);
       pushUniqueDiagnostic(diagnostics, {
@@ -1936,7 +1936,7 @@ function isWrappedToolFailureEvent(event: RunDetail["events"][number], events: R
 }
 
 function toolFailureSummary(event: RunDetail["events"][number]) {
-  const failureKind = formatEventPayloadValue(event.payload.failure_kind);
+  const failureKind = repairFailureKindLabel(formatEventPayloadValue(event.payload.failure_kind));
   const exitCode = formatEventPayloadValue(event.payload.exit_code);
   const outputBytes = formatEventPayloadValue(event.payload.output_bytes);
   return [

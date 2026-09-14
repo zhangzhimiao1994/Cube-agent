@@ -3868,6 +3868,8 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const completedCard = within(stream).getByRole("button", { name: /文案生成 运行终端完成/ });
     const failedCard = within(stream).getByRole("button", { name: /文案生成 编辑文件失败/ });
+    expect(within(stream).getAllByText(/请求参数无效/).length).toBeGreaterThan(0);
+    expect(stream.textContent).not.toContain("invalid_request");
     expect(within(stream).queryByText("cat secret-token.txt")).toBeNull();
     expect(within(stream).queryByText("terminal output contained sk-secret123")).toBeNull();
     expect(within(stream).queryByText("private terminal output")).toBeNull();
@@ -4947,7 +4949,9 @@ describe("operational management pages", () => {
 
     expect(toolCards).toHaveLength(1);
     expect(toolCards[0].textContent).toContain("运行终端失败");
+    expect(stream.textContent).toContain("能力调用失败");
     expect(stream.textContent).not.toContain("run_safe_command");
+    expect(stream.textContent).not.toContain("capability_failed");
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
 
