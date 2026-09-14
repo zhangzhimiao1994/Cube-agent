@@ -2005,6 +2005,60 @@ PY
   return 1
 }
 
+check_project_scale_runner_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  local help_output
+  local dry_run_output
+  local execute_output
+  local execute_status
+
+  printf 'profile: project scale execution runner\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: project scale execution runner requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if ! help_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" -m agent_hub.harness.project_scale_runner --help 2>&1)"; then
+    printf 'fail: project scale execution runner help\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$help_output" != *"--execute"* || "$help_output" != *"--wait-seconds"* || "$help_output" != *"--poll-interval"* ]]; then
+    printf 'fail: project scale execution runner help missing execute/wait options\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! dry_run_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" -m agent_hub.harness.project_scale_runner --scale small --flow self_repair --json 2>&1)"; then
+    printf 'fail: project scale execution runner dry-run\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$dry_run_output" != *'"dry_run": true'* || "$dry_run_output" != *'"case_id": "small:self_repair"'* ]]; then
+    printf 'fail: project scale execution runner dry-run payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  set +e
+  execute_output="$(
+    env -u AGENT_HUB_ACCEPTANCE_BEARER_TOKEN \
+      PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
+      "$python_bin" -m agent_hub.harness.project_scale_runner \
+      --execute --scale small --flow direct --wait-seconds 1 --poll-interval 0 --json 2>&1
+  )"
+  execute_status=$?
+  set -e
+  if [[ "$execute_status" -ne 2 || "$execute_output" != *"AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute"* ]]; then
+    printf 'fail: project scale execution runner execute token gate\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  printf 'ok: project scale execution runner\n'
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -2442,6 +2496,7 @@ run_deepseek_profile() {
   check_interaction_prevention_and_recovery || true
   check_multimode_interaction_matrix || true
   check_project_scale_matrix_contract || true
+  check_project_scale_runner_contract || true
   check_protected_boundary "plugin adapters require bearer" "/api/v1/admin/plugins/adapters" || true
   check_protected_boundary "plugin registry list requires bearer" "/api/v1/admin/plugins" || true
   check_write_protected_boundary "plugin registry upsert requires bearer" "/api/v1/admin/plugins" "POST" || true

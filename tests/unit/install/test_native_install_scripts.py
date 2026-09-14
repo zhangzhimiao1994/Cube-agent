@@ -138,6 +138,12 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "workspace_bundle" in command
     assert "cancel_or_archive_probe_runs" in command
     assert "ok: project scale acceptance matrix" in command
+    assert "check_project_scale_runner_contract" in command
+    assert "profile: project scale execution runner" in command
+    assert "--wait-seconds" in command
+    assert "--poll-interval" in command
+    assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command
+    assert "ok: project scale execution runner" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command
     assert "check_openapi_safe_projection" in command
