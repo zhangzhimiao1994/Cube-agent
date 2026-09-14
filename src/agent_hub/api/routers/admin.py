@@ -36,6 +36,7 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from sqlalchemy import delete, select
@@ -124,6 +125,7 @@ from agent_hub.skills.scanner import SkillScanner, SkillScanReport
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
 _LOGGER = logging.getLogger(__name__)
+_MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
 _MODEL_CHECK_STATUS_RE = re.compile(r"\bstatus[=_: ](?P<status>[1-5][0-9]{2})\b")
 _MODEL_CHECK_HINT = (
     "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。"
@@ -466,12 +468,28 @@ class SelfRepairRecoverySummaryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["active"] = "active"
-    recovery_strategy: Literal["retry_blocked_contract_chain_after_replanning"]
-    orchestration_recovery_hint: Literal["retry_blocked_contract_chain"]
-    replan_scope: Literal["blocked_contract_chain"]
+    recovery_strategy: Literal[
+        "retry_blocked_contract_chain_after_replanning",
+        "reassign_tool_role_to_capable_model_and_retry",
+    ]
+    orchestration_recovery_hint: Literal["retry_blocked_contract_chain"] | None = None
+    replan_scope: Literal["blocked_contract_chain", "model_capability_roles"]
     reuse_completed_artifacts: bool
-    retry_blocked_contracts_only: bool
+    retry_blocked_contracts_only: bool = False
     automatic_execution: bool = False
+    role_capability_requirement_count: int = Field(default=0, ge=0)
+    required_capability_count: int = Field(default=0, ge=0)
+
+    @model_serializer(mode="wrap")
+    def serialize(
+        self,
+        handler: Callable[[SelfRepairRecoverySummaryResponse], dict[str, object]],
+    ) -> dict[str, object]:
+        data = handler(self)
+        if self.replan_scope != "model_capability_roles":
+            data.pop("role_capability_requirement_count", None)
+            data.pop("required_capability_count", None)
+        return data
 
 
 class RunDetailResponse(RunListItem):
@@ -9620,26 +9638,96 @@ def _self_repair_recovery_summary_from_mapping(
         return None
     if latest.get("status") != "active":
         return None
-    if latest.get("recovery_strategy") != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+    recovery_strategy = latest.get("recovery_strategy")
+    if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+        if latest.get("orchestration_recovery_hint") != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
+            return None
+        if latest.get("replan_scope") != "blocked_contract_chain":
+            return None
+        return SelfRepairRecoverySummaryResponse(
+            recovery_strategy=cast(
+                Literal["retry_blocked_contract_chain_after_replanning"],
+                ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
+            ),
+            orchestration_recovery_hint=cast(
+                Literal["retry_blocked_contract_chain"],
+                ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+            ),
+            replan_scope="blocked_contract_chain",
+            reuse_completed_artifacts=latest.get("reuse_completed_artifacts") is True,
+            retry_blocked_contracts_only=latest.get("retry_blocked_contracts_only") is True,
+            automatic_execution=False,
+        )
+    if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
         return None
-    if latest.get("orchestration_recovery_hint") != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
+    if latest.get("replan_scope") != "model_capability_roles":
         return None
-    if latest.get("replan_scope") != "blocked_contract_chain":
-        return None
-    return SelfRepairRecoverySummaryResponse(
-        recovery_strategy=cast(
-            Literal["retry_blocked_contract_chain_after_replanning"],
-            ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
-        ),
-        orchestration_recovery_hint=cast(
-            Literal["retry_blocked_contract_chain"],
-            ORCHESTRATION_CONTRACT_RECOVERY_HINT,
-        ),
-        replan_scope="blocked_contract_chain",
-        reuse_completed_artifacts=latest.get("reuse_completed_artifacts") is True,
-        retry_blocked_contracts_only=latest.get("retry_blocked_contracts_only") is True,
-        automatic_execution=False,
+    role_count, capability_count = _model_capability_recovery_requirement_counts(
+        latest.get("role_capability_requirements")
     )
+    if role_count == 0 and capability_count == 0:
+        role_count = _model_capability_recovery_count(
+            latest.get("role_capability_requirement_count")
+        )
+        capability_count = _model_capability_recovery_count(
+            latest.get("required_capability_count")
+        )
+    return SelfRepairRecoverySummaryResponse(
+        recovery_strategy="reassign_tool_role_to_capable_model_and_retry",
+        replan_scope="model_capability_roles",
+        reuse_completed_artifacts=latest.get("reuse_completed_artifacts") is True,
+        automatic_execution=latest.get("automatic_execution") is True,
+        role_capability_requirement_count=role_count,
+        required_capability_count=capability_count,
+    )
+
+
+def _model_capability_recovery_count(value: object) -> int:
+    return min(value, 8) if type(value) is int and value > 0 else 0
+
+
+def _model_capability_recovery_requirement_counts(value: object) -> tuple[int, int]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return (0, 0)
+    role_count = 0
+    capability_count = 0
+    seen_roles: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        role_id = item.get("role_id")
+        if not isinstance(role_id, str):
+            continue
+        role_id = role_id.strip()
+        if not role_id or role_id in seen_roles:
+            continue
+        capabilities = _model_capability_recovery_capabilities(
+            item.get("required_capabilities")
+        )
+        if not capabilities:
+            continue
+        seen_roles.add(role_id)
+        role_count += 1
+        capability_count += len(capabilities)
+        if role_count >= 8:
+            break
+    return (role_count, capability_count)
+
+
+def _model_capability_recovery_capabilities(value: object) -> frozenset[ModelCapability]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return frozenset()
+    capabilities: set[ModelCapability] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        try:
+            capabilities.add(ModelCapability(item.strip()))
+        except ValueError:
+            continue
+        if len(capabilities) >= 8:
+            break
+    return frozenset(capabilities)
 
 
 def _runtime_recovery_summary_from_run_events(

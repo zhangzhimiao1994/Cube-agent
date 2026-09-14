@@ -949,6 +949,104 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert "raw-private-contract" not in serialized
 
 
+def test_admin_run_detail_reports_model_capability_self_repair_recovery_summary() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="running",
+        mode="dispatch",
+        request="repair model capability routing",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "step.started",
+                    "message": "main_agent_plan",
+                    "created_at": now,
+                    "actor": "main_agent",
+                    "step_id": "main_agent_plan",
+                    "payload": {
+                        "model_execution_plan": {
+                            "schema_version": 1,
+                            "self_repair_recovery": {
+                                "schema_version": 1,
+                                "status": "active",
+                                "recovery_strategy": (
+                                    "reassign_tool_role_to_capable_model_and_retry"
+                                ),
+                                "replan_scope": "model_capability_roles",
+                                "reuse_completed_artifacts": True,
+                                "automatic_execution": True,
+                                "requires_approval": False,
+                                "role_capability_requirements": (
+                                    {
+                                        "role_id": "planner",
+                                        "required_capabilities": (
+                                            "text",
+                                            "structured_output",
+                                        ),
+                                    },
+                                    {
+                                        "role_id": "tool_executor",
+                                        "required_capabilities": (
+                                            "tool_calling",
+                                            "structured_output",
+                                            "not-a-capability",
+                                        ),
+                                    },
+                                    {
+                                        "role_id": "token_leak",
+                                        "required_capabilities": ("vision",),
+                                        "credential_ref": "credential-private",
+                                    },
+                                ),
+                                "credential_ref": "credential-private",
+                                "api_base": "https://internal.example.invalid",
+                                "raw_plan": {"secret": "secret://repair-token"},
+                            },
+                        },
+                    },
+                }
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    expected_summary = {
+        "status": "active",
+        "recovery_strategy": "reassign_tool_role_to_capable_model_and_retry",
+        "orchestration_recovery_hint": None,
+        "replan_scope": "model_capability_roles",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": False,
+        "automatic_execution": True,
+        "role_capability_requirement_count": 3,
+        "required_capability_count": 5,
+    }
+    assert body["self_repair_recovery_summary"] == expected_summary
+    assert (
+        body["events"][0]["payload"]["model_execution_plan"]["self_repair_recovery"]
+        == expected_summary
+    )
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert "credential-private" not in serialized
+    assert "internal.example.invalid" not in serialized
+    assert "repair-token" not in serialized
+    assert "raw_plan" not in serialized
+
+
 def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses() -> None:
     now = datetime.now(UTC)
     protocol_plan = {
