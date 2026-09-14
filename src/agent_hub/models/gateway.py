@@ -152,6 +152,8 @@ def _retryable_model_failure(error: BaseException) -> bool:
 
 def _fallback_reason(error: BaseException) -> str:
     if isinstance(error, ModelTransportError):
+        if error.status_code == 429:
+            return "capacity_pressure"
         return "transport_retryable"
     if isinstance(error, ModelGatewayError) and str(error) in {
         "model response text is empty",

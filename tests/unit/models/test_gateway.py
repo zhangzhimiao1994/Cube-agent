@@ -544,7 +544,7 @@ async def test_streaming_gateway_falls_back_when_primary_fails_before_first_even
                 "phase": "attempted",
                 "from_logical_model": "primary",
                 "to_logical_model": "backup",
-                "reason": "transport_retryable",
+                "reason": "capacity_pressure",
                 "attempted_logical_models": ("primary", "backup"),
             },
         ),
@@ -638,7 +638,7 @@ async def test_streaming_gateway_reports_each_multihop_fallback_source_and_reaso
                 "phase": "attempted",
                 "from_logical_model": "primary",
                 "to_logical_model": "backup",
-                "reason": "transport_retryable",
+                "reason": "capacity_pressure",
                 "attempted_logical_models": ("primary", "backup"),
             },
         ),
@@ -1016,7 +1016,7 @@ async def test_transport_failure_tries_fallback_model_when_available() -> None:
     assert completion.deployment_id == "backup-key"
     assert completion.fallback_used is True
     assert completion.fallback_from_logical_model == "primary"
-    assert completion.fallback_reason == "transport_retryable"
+    assert completion.fallback_reason == "capacity_pressure"
     assert completion.attempted_logical_models == ("primary", "backup")
     assert [record[3] for record in capacity.records] == [False, True]
     transport_events = [
