@@ -781,7 +781,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
-  if (event.action) rows.push({ label: "动作", value: event.action });
+  if (event.action) rows.push({ label: "动作", value: repairScopedActionLabel(event, event.action) });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
   const safeSummary = eventSafeSummary(event);
   if (safeSummary) rows.push({ label: "安全摘要", value: safeSummary });
@@ -798,7 +798,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
     if (isTool && RAW_TOOL_PAYLOAD_KEYS.has(key)) return;
     if (isIntentEventWithRestrictedPayload(event) && INTENT_RAW_PAYLOAD_KEYS.has(key)) return;
     if (isModelDelta && key === "text") return;
-    const formatted = formatEventPayloadValue(value);
+    const formatted = formatEventPayloadDisplayValue(key, value);
     if (formatted) {
       rows.push({ label: eventPayloadLabel(key), value: formatted });
     }
@@ -1375,7 +1375,7 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
         detail: eventIntentDetail(event, "失败后重试"),
         meta: [
           safeIntentValue(event, ["attempt"]) ? `第 ${safeIntentValue(event, ["attempt"])} 次` : "",
-          safeIntentValue(event, ["failure_kind", "status"]),
+          repairFailureKindLabel(safeIntentValue(event, ["failure_kind"])) || safeIntentValue(event, ["status"]),
           replaySafetyLabel(event.payload.replay_safe),
         ].filter(Boolean),
         tone: "retry",
@@ -1383,16 +1383,18 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
       return;
     }
     if (isRepairIntentEvent(event)) {
-      const repairAction = safeIntentValue(event, ["repair_action", "repair_kind", "remediation_action"]) || event.action || "修复方案";
+      const rawRepairAction = safeIntentValue(event, ["repair_action", "repair_kind", "remediation_action"]);
+      const repairAction = repairActionLabel(rawRepairAction) || event.action || "修复方案";
+      const failureKind = repairFailureKindLabel(safeIntentValue(event, ["failure_kind"]));
       pushUniqueIntent(intents, {
         id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
         label: "修复意图",
         title: repairAction,
-        detail: event.action && event.action !== repairAction ? event.action : repairStatusLabel(event),
+        detail: event.action && event.action !== rawRepairAction ? event.action : repairStatusLabel(event),
         meta: [
           repairAttemptLabel(event),
           isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
-          safeIntentValue(event, ["failure_kind"]),
+          failureKind,
           replaySafetyLabel(event.payload.replay_safe),
           displayEventParticipants(event.participants, agentNames) ?? "",
         ].filter(Boolean),
@@ -1578,7 +1580,51 @@ const REPAIR_RECOVERY_STRATEGY_LABELS: Record<string, string> = {
   retry_failed_step_after_context_compaction: "压缩上下文后只重试失败步骤",
   repair_tool_invocation_after_permission_check: "检查工具权限和参数后执行最小修复重试",
   compact_context_before_next_model_call: "下次模型调用前压缩上下文",
+  retry_blocked_contract_chain: "重规划被阻塞的角色交接链路后重试",
   retry_blocked_contract_chain_after_replanning: "重规划被阻塞的角色交接链路后重试",
+};
+
+const REPAIR_FAILURE_KIND_LABELS: Record<string, string> = {
+  runtime_failure: "运行阶段失败",
+  step_failure: "执行步骤失败",
+  tool_failure: "工具调用失败",
+  model_timeout: "模型调用超时",
+  model_rate_limited: "模型限流",
+  model_provider_unavailable: "模型服务暂不可用",
+  model_provider_transient_failed: "模型服务临时失败",
+  model_capability_missing: "模型缺少所需能力",
+  model_credential_unavailable: "模型凭据不可用",
+  model_quota_or_billing_unavailable: "模型额度或账单不可用",
+  model_deployment_unavailable: "模型部署不可用",
+  model_request_contract_invalid: "模型请求契约无效",
+  plugin_runtime_unavailable: "插件运行时不可用",
+  plugin_credential_unavailable: "插件凭据不可用",
+  plugin_arguments_invalid: "插件参数无效",
+  plugin_result_contract_invalid: "插件结果契约无效",
+  plugin_sandbox_unavailable: "插件沙箱不可用",
+  mcp_runtime_unavailable: "MCP 服务不可用",
+  mcp_configuration_invalid: "MCP 配置不可用",
+  missing_failure_event: "缺少失败事件",
+  empty_response: "模型返回空响应",
+  nonzero_exit: "命令非零退出",
+  capability_failed: "能力调用失败",
+  invalid_request: "请求参数无效",
+  selector_missing: "选择器缺失",
+  network_timeout: "网络超时",
+};
+
+const REPAIR_ACTION_LABELS: Record<string, string> = {
+  draft_repair_proposal: "生成受控修复提案",
+  switch_model: "切换模型后重试",
+  switch_to_available_model: "切换到可用模型",
+  retry_with_fallback: "启用备用路径后重试",
+  retry_with_fallback_or_reassign_model: "启用备用模型或改派角色后重试",
+  reassign_tool_role_to_capable_model: "改派工具角色给具备能力的模型",
+  repair_plugin_endpoint_or_adapter: "修复插件端点或适配器",
+  repair_mcp_server_or_adapter: "修复 MCP 服务或适配器",
+  preserve_outputs_and_retry_scope: "保留已有产物并缩小重试范围",
+  retry_failed_step_after_context_compaction: "压缩上下文后重试失败步骤",
+  manual_review: "人工复核后继续",
 };
 
 function repairRecoveryStrategyLabel(strategy: string | undefined) {
@@ -1586,15 +1632,55 @@ function repairRecoveryStrategyLabel(strategy: string | undefined) {
   return REPAIR_RECOVERY_STRATEGY_LABELS[strategy] ?? strategy;
 }
 
+function repairFailureKindLabel(kind: string | undefined | null) {
+  if (!kind) return "";
+  return REPAIR_FAILURE_KIND_LABELS[kind] ?? kind;
+}
+
+function repairActionLabel(action: string | undefined | null) {
+  if (!action) return "";
+  return REPAIR_ACTION_LABELS[action] ?? action;
+}
+
+function repairScopedActionLabel(event: RunEvent, action: string) {
+  if (!isRepairIntentEvent(event)) return action;
+  return repairActionLabel(action);
+}
+
+function formatEventPayloadDisplayValue(key: string, value: unknown) {
+  if (key === "repair_action" || key === "repair_kind" || key === "remediation_action") {
+    return repairActionLabel(formatEventPayloadValue(value));
+  }
+  if (key === "failure_kind") {
+    return repairFailureKindLabel(formatEventPayloadValue(value));
+  }
+  if (key === "recovery_strategy" || key === "orchestration_recovery_hint") {
+    return repairRecoveryStrategyLabel(formatEventPayloadValue(value));
+  }
+  if (key === "requires_approval") {
+    const formatted = formatEventPayloadValue(value);
+    if (!formatted) return "";
+    return isPayloadFlagTrue(value) ? "需要确认" : "不需要确认";
+  }
+  if (key === "automatic_execution") {
+    const formatted = formatEventPayloadValue(value);
+    if (!formatted) return "";
+    return isPayloadFlagTrue(value) ? "自动执行" : "等待确认";
+  }
+  return formatEventPayloadValue(value);
+}
+
 function repairProposalBody(proposal: RepairProposal) {
   return [
     proposal.summary,
-    `失败类型：${proposal.failure_kind}`,
-    `修复动作：${proposal.repair_action}`,
+    `失败类型：${repairFailureKindLabel(proposal.failure_kind)}`,
+    `修复动作：${repairActionLabel(proposal.repair_action)}`,
     `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
     proposal.instruction ? `受控指令：${proposal.instruction}` : "",
     proposal.recovery_strategy ? `恢复策略：${repairRecoveryStrategyLabel(proposal.recovery_strategy)}` : "",
-    proposal.orchestration_recovery_hint ? `角色交接恢复：${proposal.orchestration_recovery_hint}` : "",
+    proposal.orchestration_recovery_hint
+      ? `角色交接恢复：${repairRecoveryStrategyLabel(proposal.orchestration_recovery_hint)}`
+      : "",
     proposal.automatic_execution
       ? "该修复提案标记为自动执行。"
       : "不会自动执行；只有确认后才会重新排队一次。",
@@ -2557,7 +2643,12 @@ function eventSummaryText(
     return `${subject} 重试：${conciseProcessText(retrySignal, "失败后重试")}`;
   }
   if (isRepairIntentEvent(event)) {
-    const repairSignal = safeIntentValue(event, ["repair_action", "repair_kind", "failure_kind", "status"]) || event.action || "准备修复";
+    const repairSignal =
+      repairActionLabel(safeIntentValue(event, ["repair_action", "repair_kind"])) ||
+      repairFailureKindLabel(safeIntentValue(event, ["failure_kind"])) ||
+      safeIntentValue(event, ["status"]) ||
+      event.action ||
+      "准备修复";
     const status = repairStatusLabel(event);
     return `修复意图：${conciseProcessText(`${repairSignal} ${status}`, "准备修复")}`;
   }

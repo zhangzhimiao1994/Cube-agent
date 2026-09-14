@@ -2970,11 +2970,12 @@ describe("operational management pages", () => {
 
     const card = await screen.findByRole("status", { name: "自修复确认" });
     expect(within(card).getByText("受控自修复建议")).not.toBeNull();
-    expect(within(card).getByText(/runtime_failure/)).not.toBeNull();
+    expect(within(card).getByText(/运行阶段失败/)).not.toBeNull();
+    expect(within(card).getByText(/生成受控修复提案/)).not.toBeNull();
     expect(within(card).getByText(/第 1\/1 次/)).not.toBeNull();
     expect(within(card).getByText(/只执行一次受控修复/)).not.toBeNull();
     expect(within(card).getByText(/切换到有容量的同类模型/)).not.toBeNull();
-    expect(within(card).getByText(/retry_blocked_contract_chain/)).not.toBeNull();
+    expect(within(card).getByText(/重规划被阻塞的角色交接链路/)).not.toBeNull();
     expect(within(card).getByText(/不会自动执行/)).not.toBeNull();
   });
   it("accepts a self-repair proposal with the run decision token", async () => {
@@ -4794,19 +4795,23 @@ describe("operational management pages", () => {
     const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
 
     expect(within(intentRegion).getAllByText("修复意图").length).toBeGreaterThanOrEqual(3);
-    expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
+    expect(within(intentRegion).getByText("切换模型后重试")).not.toBeNull();
     expect(within(intentRegion).getAllByText("需要确认").length).toBeGreaterThan(0);
     expect(within(intentRegion).getAllByText("第 1/1 次").length).toBeGreaterThan(0);
     expect(within(intentRegion).getByText("修复已开始")).not.toBeNull();
     expect(within(intentRegion).getByText("修复已完成")).not.toBeNull();
+    expect(stream.textContent).not.toContain("switch_model");
+    expect(stream.textContent).not.toContain("model_timeout");
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
 
-    await user.click(within(stream).getByRole("button", { name: /修复意图：switch_model/ }));
+    await user.click(within(stream).getByRole("button", { name: /修复意图：切换模型后重试/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     const decisionDetail = await openProcessDetailGroup(user, drawer, "决策");
     expect(within(decisionDetail).getByText("修复动作")).not.toBeNull();
-    expect(within(decisionDetail).getByText("switch_model")).not.toBeNull();
+    expect(within(decisionDetail).getByText("切换模型后重试")).not.toBeNull();
+    expect(decisionDetail.textContent).not.toContain("switch_model");
+    expect(decisionDetail.textContent).not.toContain("model_timeout");
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
     expect(decisionDetail.textContent).not.toContain("private-token");
@@ -4952,7 +4957,8 @@ describe("operational management pages", () => {
     expect(within(blockerDetail).getByText("状态流")).not.toBeNull();
     expect(within(blockerDetail).getAllByText("开始，失败").length).toBeGreaterThan(0);
     expect(within(blockerDetail).getByText("失败类型")).not.toBeNull();
-    expect(within(blockerDetail).getAllByText("capability_failed").length).toBeGreaterThan(0);
+    expect(within(blockerDetail).getAllByText("能力调用失败").length).toBeGreaterThan(0);
+    expect(blockerDetail.textContent).not.toContain("capability_failed");
     expect(within(blockerDetail).getByText("退出码")).not.toBeNull();
     expect(within(blockerDetail).getAllByText("1").length).toBeGreaterThan(0);
     expect(drawer.textContent).not.toContain("private-token");
