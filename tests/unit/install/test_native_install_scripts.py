@@ -235,6 +235,12 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_ACCEPTANCE_RETRY_DELAY_SECONDS" in command
     assert "AGENT_HUB_ACCEPTANCE_READY_TIMEOUT_SECONDS" in command
     assert "AGENT_HUB_ACCEPTANCE_READY_POLL_INTERVAL_SECONDS" in command
+    assert "AGENT_HUB_ACCEPTANCE_PUBLIC_URL" in command
+    assert "--public-url URL" in command
+    assert "run_public_entrypoint_profile" in command
+    assert "profile: public entrypoint" in command
+    assert 'check_public_url "public management ui entry" "/login"' in command
+    assert 'check_public_url "public readiness boundary" "/health/ready"' in command
     assert "wait_for_readiness" in command
     assert "profile: readiness warmup" in command
     assert 'wait_for_readiness || true' in command

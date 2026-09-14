@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 base_url="${AGENT_HUB_ACCEPTANCE_BASE_URL:-http://127.0.0.1:8000}"
+public_url="${AGENT_HUB_ACCEPTANCE_PUBLIC_URL:-}"
 profile="all"
 stress=0
 strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
@@ -58,6 +59,7 @@ the authenticated bounded project-scale execution runner.
 
 Options:
   --base-url URL                 Base URL to test.
+  --public-url URL               Optional public/Caddy URL to test for /login and /health/ready.
   --profile codex|deepseek|all|production-safe
                                  Acceptance profile to run. production-safe runs all profiles in read-only mode.
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
@@ -86,6 +88,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url)
       base_url="${2:?missing value for --base-url}"
+      shift 2
+      ;;
+    --public-url)
+      public_url="${2:?missing value for --public-url}"
       shift 2
       ;;
     --profile)
@@ -169,6 +175,16 @@ esac
 case "$profile" in
   production-safe) profile="all"; read_only=1 ;;
 esac
+
+if [[ -n "$public_url" ]]; then
+  case "$public_url" in
+    http://*|https://*) public_url="${public_url%/}" ;;
+    *)
+      printf 'invalid --public-url: %s\n' "$public_url" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 positive_int() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
@@ -356,6 +372,39 @@ check_url() {
   printf 'fail: %s %s -> %s\n' "$name" "$path" "${status:-curl-error}"
   failures=$((failures + 1))
   return 1
+}
+
+check_public_url() {
+  local name="$1"
+  local path="$2"
+  local expected="${3:-200}"
+  local attempt
+  local status
+  for ((attempt = 1; attempt <= retries; attempt += 1)); do
+    if status="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS -o /dev/null -w '%{http_code}' \
+      "$public_url$path" 2>/dev/null)" && [[ "$status" == "$expected" ]]; then
+      printf 'ok: %s %s -> %s\n' "$name" "$path" "$status"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$retries" ]]; then
+      sleep "$retry_delay"
+    fi
+  done
+  printf 'fail: %s %s -> %s\n' "$name" "$path" "${status:-curl-error}"
+  failures=$((failures + 1))
+  return 1
+}
+
+run_public_entrypoint_profile() {
+  if [[ -z "$public_url" ]]; then
+    return 0
+  fi
+  printf 'profile: public entrypoint\n'
+  check_public_url "public management ui entry" "/login"
+  check_public_url "public readiness boundary" "/health/ready"
 }
 
 check_health_json() {
@@ -3599,6 +3648,7 @@ else
   printf 'mode: write-probes-enabled\n'
 fi
 wait_for_readiness || true
+run_public_entrypoint_profile || true
 
 case "$profile" in
   codex)
