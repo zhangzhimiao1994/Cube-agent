@@ -353,6 +353,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"queue_timeout_seconds": ("integer", 1)' in command
     assert 'fallback.get("anyOf")' in command
     assert "check_openapi_model_probe_response_schema" in command
+    assert 'schemas.get("ProbeRequest", {})' in command
+    assert '"desired_concurrency": ("integer", 1)' in command
+    assert '"target_utilization": ("number", 0.1)' in command
+    assert '"reserved_capacity": ("integer", 0)' in command
     assert 'schemas.get("ProbeResponse", {})' in command
     assert '"recommended_concurrency": ("integer", None)' in command
     assert '"warning": ("string", None)' in command

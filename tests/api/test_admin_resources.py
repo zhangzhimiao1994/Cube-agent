@@ -11420,6 +11420,37 @@ def test_probe_returns_non_saturating_recommendation() -> None:
     assert "explicitly" in response.json()["warning"]
 
 
+def test_probe_uses_safe_capacity_policy_inputs_for_recommendation() -> None:
+    response = client().post(
+        "/api/v1/admin/models/probe",
+        headers=headers(),
+        json={
+            "quota_scope": "deepseek_account_1",
+            "desired_concurrency": 16,
+            "target_utilization": 0.75,
+            "reserved_capacity": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["recommended_concurrency"] == 12
+    assert "safe operational limit" in response.json()["warning"]
+
+
+def test_probe_rejects_reserved_capacity_that_exhausts_desired_concurrency() -> None:
+    response = client().post(
+        "/api/v1/admin/models/probe",
+        headers=headers(),
+        json={
+            "quota_scope": "deepseek_account_1",
+            "desired_concurrency": 4,
+            "reserved_capacity": 4,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_draft_diff_publish_conflict_and_rollback() -> None:
     api = client()
 

@@ -197,6 +197,17 @@ class ProbeRequest(BaseModel):
 
     quota_scope: str = Field(min_length=1, max_length=128)
     desired_concurrency: int = Field(ge=1, le=1024)
+    target_utilization: float | None = Field(default=None, ge=0.1, le=0.95)
+    reserved_capacity: int | None = Field(default=None, ge=0, le=1024)
+
+    @model_validator(mode="after")
+    def reserved_capacity_below_desired_concurrency(self) -> ProbeRequest:
+        if (
+            self.reserved_capacity is not None
+            and self.reserved_capacity >= self.desired_concurrency
+        ):
+            raise ValueError("reserved_capacity must be below desired_concurrency")
+        return self
 
 
 class ProbeResponse(BaseModel):
@@ -5060,10 +5071,25 @@ class InMemoryAdminResourceService:
         return self.secret_values[ref]
 
     async def probe_concurrency(self, request: ProbeRequest) -> ProbeResponse:
-        recommended = max(1, min(request.desired_concurrency, 8))
+        uses_capacity_policy = (
+            request.target_utilization is not None or request.reserved_capacity is not None
+        )
+        if uses_capacity_policy:
+            recommended = safe_operational_limit(
+                request.desired_concurrency,
+                request.target_utilization if request.target_utilization is not None else 0.8,
+                request.reserved_capacity if request.reserved_capacity is not None else 0,
+            )
+            warning = (
+                "recommended concurrency uses the safe operational limit; "
+                "same provider account keys may share quota; save explicitly to apply"
+            )
+        else:
+            recommended = max(1, min(request.desired_concurrency, 8))
+            warning = "same provider account keys may share quota; save explicitly to apply"
         return ProbeResponse(
             recommended_concurrency=recommended,
-            warning="same provider account keys may share quota; save explicitly to apply",
+            warning=warning,
         )
 
     async def save_draft(self, request: DraftRequest) -> PublishResponse:

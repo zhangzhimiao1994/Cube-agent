@@ -509,17 +509,40 @@ openapi_file = sys.argv[1]
 with open(openapi_file, encoding="utf-8") as handle:
     document = json.load(handle)
 schemas = document.get("components", {}).get("schemas", {})
-schema = schemas.get("ProbeResponse", {})
-properties = schema.get("properties", {})
-expected = {
+
+def property_type_matches(prop, expected_type):
+    if prop.get("type") == expected_type:
+        return True
+    any_of = prop.get("anyOf")
+    return isinstance(any_of, list) and {"type": expected_type} in any_of
+
+request_schema = schemas.get("ProbeRequest", {})
+request_properties = request_schema.get("properties", {})
+request_expected = {
+    "desired_concurrency": ("integer", 1),
+    "target_utilization": ("number", 0.1),
+    "reserved_capacity": ("integer", 0),
+}
+for name, (expected_type, minimum) in request_expected.items():
+    prop = request_properties.get(name)
+    if not isinstance(prop, dict):
+        raise SystemExit(1)
+    if not property_type_matches(prop, expected_type):
+        raise SystemExit(1)
+    if minimum is not None and prop.get("minimum") != minimum:
+        raise SystemExit(1)
+
+response_schema = schemas.get("ProbeResponse", {})
+response_properties = response_schema.get("properties", {})
+response_expected = {
     "recommended_concurrency": ("integer", None),
     "warning": ("string", None),
 }
-for name, (expected_type, minimum) in expected.items():
-    prop = properties.get(name)
+for name, (expected_type, minimum) in response_expected.items():
+    prop = response_properties.get(name)
     if not isinstance(prop, dict):
         raise SystemExit(1)
-    if prop.get("type") != expected_type:
+    if not property_type_matches(prop, expected_type):
         raise SystemExit(1)
     if minimum is not None and prop.get("minimum") != minimum:
         raise SystemExit(1)
