@@ -1186,6 +1186,152 @@ PY
   return 1
 }
 
+check_running_recovery_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: running recovery guard\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: running recovery guard requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import datetime
+from typing import cast
+from uuid import UUID, uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.service import RunService, SubmittedRun
+from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.registry import RuntimeRegistry
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+class RecoverableRunRepository:
+    def __init__(self, candidates: tuple[UUID, ...]) -> None:
+        self._candidates = candidates
+
+    async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
+        del now
+        return self._candidates[:limit]
+
+
+class RecoverRunningService(RunService):
+    def __init__(
+        self,
+        *,
+        recoverable_run_repository: RecoverableRunRepository,
+        recovered: list[UUID],
+        failing_run_id: UUID,
+        active_run_id: UUID | None = None,
+    ) -> None:
+        super().__init__(
+            cast(RunRepository, recoverable_run_repository),
+            runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+            router=None,
+            task_queue=UnusedQueue(),
+        )
+        self._recovered = recovered
+        self._failing_run_id = failing_run_id
+        self._active_run_id = active_run_id
+
+    async def recover(self, run_id: UUID) -> SubmittedRun:
+        if run_id == self._failing_run_id:
+            raise RuntimeError("synthetic recovery failure")
+        if run_id == self._active_run_id:
+            return SubmittedRun(
+                id=run_id,
+                tenant_id=uuid4(),
+                status=RunStatus.RUNNING,
+                mode=TaskMode.DISPATCH,
+                decision_token=None,
+                version=1,
+            )
+        self._recovered.append(run_id)
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=uuid4(),
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=1,
+        )
+
+
+class UnusedRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        del context
+        raise AssertionError("recover_running should call the patched recover method")
+        yield  # pragma: no cover
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+        raise AssertionError("not used")
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class UnusedQueue:
+    async def enqueue_run(self, run_id: UUID, *, idempotency_key: str) -> None:
+        del run_id, idempotency_key
+        raise AssertionError("not used")
+
+
+async def main() -> None:
+    recovered: list[UUID] = []
+    first = uuid4()
+    second = uuid4()
+    third = uuid4()
+    service = RecoverRunningService(
+        recoverable_run_repository=RecoverableRunRepository((first, second, third)),
+        recovered=recovered,
+        failing_run_id=second,
+    )
+    count = await service.recover_running(limit=10)
+    require(count == 2, "recover_running must continue after one candidate fails")
+    require(recovered == [first, third], "failed candidate must not stop later recovery")
+
+    recovered = []
+    active = uuid4()
+    stale = uuid4()
+    service = RecoverRunningService(
+        recoverable_run_repository=RecoverableRunRepository((active, stale)),
+        recovered=recovered,
+        failing_run_id=uuid4(),
+        active_run_id=active,
+    )
+    count = await service.recover_running(limit=10)
+    require(count == 1, "active race must not count as recovered")
+    require(recovered == [stale], "stale candidate must still recover")
+
+
+asyncio.run(main())
+PY
+  then
+    printf 'ok: running recovery guard\n'
+    return 0
+  fi
+  printf 'fail: running recovery guard\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -1563,6 +1709,7 @@ run_codex_profile() {
   check_health_json "api live health" "/health/live" || true
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
+  check_running_recovery_contract || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true
   check_protected_boundary "run details requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/details" || true

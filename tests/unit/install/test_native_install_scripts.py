@@ -101,6 +101,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "check_write_protected_boundary" in command
     assert "check_error_envelope" in command
     assert "check_runtime_failure_diagnostics" in command
+    assert "check_running_recovery_contract" in command
+    assert "profile: running recovery guard" in command
+    assert "ok: running recovery guard" in command
     assert "check_interaction_prevention_and_recovery" in command
     assert "check_multimode_interaction_matrix" in command
     assert "check_openapi_safe_projection" in command
