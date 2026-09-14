@@ -348,6 +348,18 @@ def test_self_repair_failure_injection_matrix_classifies_common_failures() -> No
             "plugin_runtime_unavailable",
             "repair_plugin_endpoint_or_adapter_and_retry",
         ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason="mcp_server_timeout",
+                ),
+            ),
+            "mcp_runtime_unavailable",
+            "repair_mcp_server_or_adapter_and_retry",
+        ),
     )
 
     for events, expected_category, expected_strategy in cases:
