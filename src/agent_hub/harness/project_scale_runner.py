@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -12,6 +13,8 @@ from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 from agent_hub.harness.project_scale import ProjectScaleRunPlan, build_project_scale_run_plan
+
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 class AcceptanceClient(Protocol):
@@ -37,7 +40,17 @@ class ProjectScaleCaseResult:
 
     @property
     def ok(self) -> bool:
-        return not self.errors and all(self.evidence.values())
+        required: tuple[str, ...] = (
+            "run_details",
+            "run_events",
+            "terminal_status",
+            "final_artifacts",
+            "workspace_bundle",
+            "cleanup_cancel",
+        )
+        if "self_repair" in self.case_id or "model_failure" in self.case_id:
+            required = (*required, "self_repair_trace")
+        return not self.errors and all(self.evidence.get(key) is True for key in required)
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -129,12 +142,18 @@ class UrllibAcceptanceClient:
 def execute_project_scale_plan(
     plan: ProjectScaleRunPlan,
     client: AcceptanceClient,
+    *,
+    wait_seconds: float = 0,
+    poll_interval_seconds: float = 2,
 ) -> ProjectScaleExecutionReport:
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
         evidence = {
             "run_details": False,
             "run_events": False,
+            "terminal_status": False,
+            "final_artifacts": False,
+            "self_repair_trace": False,
             "workspace_bundle": False,
             "cleanup_cancel": False,
         }
@@ -156,13 +175,24 @@ def execute_project_scale_plan(
             run_id = raw_run_id
             status = _string_value(response.get("status"))
 
-            details = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
-            evidence["run_details"] = isinstance(details, dict)
-            if isinstance(details, dict):
-                status = _string_value(details.get("status")) or status
+            deadline = time.monotonic() + max(wait_seconds, 0)
+            while True:
+                details = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
+                evidence["run_details"] = isinstance(details, dict)
+                if isinstance(details, dict):
+                    status = _string_value(details.get("status")) or status
+                    evidence["final_artifacts"] = _has_final_artifacts(details)
+                if _is_terminal_status(status):
+                    evidence["terminal_status"] = True
+                    break
+                if wait_seconds <= 0 or time.monotonic() >= deadline:
+                    break
+                if poll_interval_seconds > 0:
+                    time.sleep(poll_interval_seconds)
 
             events = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
             evidence["run_events"] = isinstance(events, list)
+            evidence["self_repair_trace"] = _has_self_repair_trace(events)
 
             try:
                 client.request_bytes("GET", _workspace_bundle_path(run_request.body))
@@ -173,11 +203,14 @@ def execute_project_scale_plan(
             errors.append(str(error))
         finally:
             if run_id is not None:
-                try:
-                    cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")
-                    evidence["cleanup_cancel"] = isinstance(cleanup, dict)
-                except Exception as error:  # noqa: BLE001 - cleanup failure is evidence.
-                    errors.append(f"cleanup_cancel: {error}")
+                if _is_terminal_status(status):
+                    evidence["cleanup_cancel"] = True
+                else:
+                    try:
+                        cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")
+                        evidence["cleanup_cancel"] = isinstance(cleanup, dict)
+                    except Exception as error:  # noqa: BLE001 - cleanup failure is evidence.
+                        errors.append(f"cleanup_cancel: {error}")
         results.append(
             ProjectScaleCaseResult(
                 case_id=run_request.case_id,
@@ -207,6 +240,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=float(os.environ.get("AGENT_HUB_ACCEPTANCE_MAX_TIME_SECONDS", "20")),
     )
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=float(os.environ.get("AGENT_HUB_PROJECT_SCALE_WAIT_SECONDS", "0")),
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=float(os.environ.get("AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS", "2")),
+    )
     parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
 
@@ -227,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = execute_project_scale_plan(
             plan,
             UrllibAcceptanceClient(base_url=args.base_url, bearer_token=token, timeout=args.timeout),
+            wait_seconds=args.wait_seconds,
+            poll_interval_seconds=args.poll_interval,
         )
         payload = report.to_payload()
     else:
@@ -268,6 +313,27 @@ def _idempotency_key(case_id: str, index: int) -> str:
 
 def _string_value(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _is_terminal_status(status: str | None) -> bool:
+    return status in _TERMINAL_STATUSES
+
+
+def _has_final_artifacts(details: dict[str, object]) -> bool:
+    artifacts = details.get("artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        return True
+    final_artifacts = details.get("final_artifacts")
+    if isinstance(final_artifacts, list) and final_artifacts:
+        return True
+    artifact_count = details.get("artifact_count")
+    return isinstance(artifact_count, int) and artifact_count > 0
+
+
+def _has_self_repair_trace(events: dict[str, object] | list[object]) -> bool:
+    if not isinstance(events, list):
+        return False
+    return any("repair" in json.dumps(event, ensure_ascii=False).lower() for event in events)
 
 
 if __name__ == "__main__":  # pragma: no cover
