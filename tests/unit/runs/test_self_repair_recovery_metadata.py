@@ -293,6 +293,31 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
     ("reason", "expected_category", "expected_strategy"),
     [
         (
+            "model.provider_auth_failed secret://model-token",
+            "model_credential_unavailable",
+            "manual_review_model_credentials",
+        ),
+        (
+            "model credential resolution failed secret://model-token",
+            "model_credential_unavailable",
+            "manual_review_model_credentials",
+        ),
+        (
+            "model.provider_quota_or_billing_failed secret://model-token",
+            "model_quota_or_billing_unavailable",
+            "manual_review_model_quota_or_billing",
+        ),
+        (
+            "model.provider_model_not_found secret://model-token",
+            "model_deployment_unavailable",
+            "manual_review_model_deployment",
+        ),
+        (
+            "model.provider_bad_request secret://model-token",
+            "model_request_contract_invalid",
+            "manual_review_model_request_contract",
+        ),
+        (
             "Plugin credential unavailable secret://plugin-token",
             "plugin_credential_unavailable",
             "manual_review_plugin_credentials",
@@ -324,7 +349,7 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
         ),
     ],
 )
-def test_non_retryable_plugin_and_mcp_failures_force_manual_repair_approval(
+def test_non_retryable_model_plugin_and_mcp_failures_force_manual_repair_approval(
     reason: str,
     expected_category: str,
     expected_strategy: str,

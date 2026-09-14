@@ -1601,6 +1601,31 @@ for events, category, strategy in cases:
 
 manual_cases = (
     (
+        "model.provider_auth_failed secret://model-token",
+        "model_credential_unavailable",
+        "manual_review_model_credentials",
+    ),
+    (
+        "model credential resolution failed secret://model-token",
+        "model_credential_unavailable",
+        "manual_review_model_credentials",
+    ),
+    (
+        "model.provider_quota_or_billing_failed secret://model-token",
+        "model_quota_or_billing_unavailable",
+        "manual_review_model_quota_or_billing",
+    ),
+    (
+        "model.provider_model_not_found secret://model-token",
+        "model_deployment_unavailable",
+        "manual_review_model_deployment",
+    ),
+    (
+        "model.provider_bad_request secret://model-token",
+        "model_request_contract_invalid",
+        "manual_review_model_request_contract",
+    ),
+    (
         "Plugin credential unavailable secret://plugin-token",
         "plugin_credential_unavailable",
         "manual_review_plugin_credentials",
@@ -1658,6 +1683,7 @@ for reason, category, strategy in manual_cases:
     require(manual_proposal.get("requires_approval") is True, f"{category} proposal approval")
     require(manual_proposal.get("automatic_execution") is False, f"{category} proposal automatic")
     require("secret://plugin-token" not in repr(manual_proposal), f"{category} secret redaction")
+    require("secret://model-token" not in repr(manual_proposal), f"{category} model secret redaction")
 PY
   then
     printf 'ok: self-repair failure injection matrix\n'

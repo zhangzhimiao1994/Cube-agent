@@ -63,6 +63,36 @@ _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
         "planned capability is unavailable",
     }
 )
+_MODEL_CREDENTIAL_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "model.provider_auth_failed",
+        "model credential resolution failed",
+        "model configuration failed",
+        "model provider authentication failed",
+    }
+)
+_MODEL_QUOTA_OR_BILLING_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "model.provider_quota_or_billing_failed",
+        "quota_or_billing",
+        "model quota or billing",
+    }
+)
+_MODEL_DEPLOYMENT_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "model.provider_model_not_found",
+        "no capable deployment",
+        "model deployment unavailable",
+        "model not found",
+    }
+)
+_MODEL_REQUEST_CONTRACT_INVALID_MARKERS = frozenset(
+    {
+        "model.provider_bad_request",
+        "model request contract invalid",
+        "model bad request",
+    }
+)
 _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
     {
         "plugin.backend_unavailable",
@@ -132,6 +162,10 @@ _MAX_REQUIRED_CAPABILITIES = 8
 _MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
 _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
     {
+        "model_credential_unavailable",
+        "model_quota_or_billing_unavailable",
+        "model_deployment_unavailable",
+        "model_request_contract_invalid",
         "plugin_credential_unavailable",
         "plugin_invalid_arguments",
         "plugin_invalid_result",
@@ -525,6 +559,14 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         )
     if failure_category == "model_capability_routing_unavailable":
         return "检查工具角色的模型能力要求，将工具角色改派给支持工具调用的模型后再受控重试。"
+    if failure_category == "model_credential_unavailable":
+        return "停止自动重试，检查模型供应商凭据、API Base、权限和密钥轮换状态，修正并审批后再继续。"
+    if failure_category == "model_quota_or_billing_unavailable":
+        return "停止自动重试，检查模型供应商余额、额度、账单和组织权限，修正并审批后再继续。"
+    if failure_category == "model_deployment_unavailable":
+        return "停止自动重试，检查模型名、部署绑定、供应商端点和能力路由配置，修正并审批后再继续。"
+    if failure_category == "model_request_contract_invalid":
+        return "停止自动重试，检查模型请求参数、上下文限制、工具 schema 和供应商兼容性，修正契约后再审批继续。"
     if failure_category == "plugin_runtime_unavailable":
         return "检查插件端点、适配器健康状态和网络连通性，修正可恢复配置后只重试受影响的插件调用。"
     if failure_category == "plugin_credential_unavailable":
@@ -874,6 +916,14 @@ def _failure_category(event: RunEvent) -> str:
         return "empty_model_response"
     if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
         return "model_capability_routing_unavailable"
+    if _contains_marker(text, _MODEL_CREDENTIAL_UNAVAILABLE_MARKERS):
+        return "model_credential_unavailable"
+    if _contains_marker(text, _MODEL_QUOTA_OR_BILLING_UNAVAILABLE_MARKERS):
+        return "model_quota_or_billing_unavailable"
+    if _contains_marker(text, _MODEL_DEPLOYMENT_UNAVAILABLE_MARKERS):
+        return "model_deployment_unavailable"
+    if _contains_marker(text, _MODEL_REQUEST_CONTRACT_INVALID_MARKERS):
+        return "model_request_contract_invalid"
     if _contains_marker(text, _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS):
         return "plugin_credential_unavailable"
     if _contains_marker(text, _PLUGIN_INVALID_ARGUMENTS_MARKERS):

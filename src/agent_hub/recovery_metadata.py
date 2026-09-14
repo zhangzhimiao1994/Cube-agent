@@ -8,6 +8,10 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
     {
         "capacity_pressure": "switch_to_available_model_and_retry",
         "model_capability_routing_unavailable": "reassign_tool_role_to_capable_model_and_retry",
+        "model_credential_unavailable": "manual_review_model_credentials",
+        "model_quota_or_billing_unavailable": "manual_review_model_quota_or_billing",
+        "model_deployment_unavailable": "manual_review_model_deployment",
+        "model_request_contract_invalid": "manual_review_model_request_contract",
         "plugin_runtime_unavailable": "repair_plugin_endpoint_or_adapter_and_retry",
         "plugin_credential_unavailable": "manual_review_plugin_credentials",
         "plugin_invalid_arguments": "manual_review_plugin_arguments",
