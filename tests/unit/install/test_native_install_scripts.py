@@ -150,6 +150,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS" in command
     assert "AGENT_HUB_PROJECT_SCALE_REPORT_PATH" in command
+    assert "mktemp /tmp/agent-hub-project-scale-report.XXXXXX" in command
+    assert "project-scale execution report: %s" in command
     assert "skip: authenticated project scale execution runner is disabled in read-only mode" in command
     assert (
         "skip: authenticated project scale execution runner requires "

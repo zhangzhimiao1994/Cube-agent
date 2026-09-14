@@ -2098,6 +2098,14 @@ run_authenticated_project_scale_execution_profile() {
 
   script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if [[ -z "$project_scale_report_path" ]]; then
+    if ! project_scale_report_path="$(mktemp /tmp/agent-hub-project-scale-report.XXXXXX)"; then
+      printf 'fail: authenticated project scale execution runner could not create report path\n' >&2
+      failures=$((failures + 1))
+      return 1
+    fi
+  fi
+  printf 'project-scale execution report: %s\n' "$project_scale_report_path"
   args=(
     -m agent_hub.harness.project_scale_runner
     --execute
