@@ -4164,6 +4164,80 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
   });
 
+  it("compresses long agent workbench traces until the operator expands them", async () => {
+    const user = userEvent.setup();
+    const longTraceEvents = [
+      {
+        sequence: 1,
+        kind: "step.started",
+        message: "step.started",
+        created_at: conversationCreatedAt,
+        actor: "main_agent",
+        participants: [],
+        tool_name: null,
+        step_id: "main_agent_plan",
+        action: null,
+        decision: null,
+        payload: {
+          mode: "dispatch",
+          main_agent_model: "main",
+          logical_model: "main",
+          roles: [{ id: "writer", role: "写手", purpose: "execute", logical_model: "qwen-max", tools: [] }],
+          steps: Array.from({ length: 16 }, (_, index) => ({
+            id: `writer-step-${String(index + 1).padStart(2, "0")}`,
+            agent: "writer",
+            depends_on: [],
+            final_synthesizer: index === 15,
+            tools: [],
+          })),
+        },
+      },
+      ...Array.from({ length: 16 }, (_, index) => ({
+        sequence: index + 2,
+        kind: "step.completed",
+        message: `阶段 ${String(index + 1).padStart(2, "0")} 完成`,
+        created_at: `2026-08-07T00:00:${String(index + 1).padStart(2, "0")}Z`,
+        actor: "writer",
+        participants: [],
+        tool_name: null,
+        step_id: `writer-step-${String(index + 1).padStart(2, "0")}`,
+        action: null,
+        decision: null,
+        payload: {
+          result: `阶段 ${String(index + 1).padStart(2, "0")} 完成`,
+        },
+      })),
+    ];
+    const longTraceRunDetail = {
+      ...runDetail,
+      mode: "dispatch",
+      events: longTraceEvents,
+      artifacts: [],
+    };
+    visibleRunListItem = { ...runListItem, mode: "dispatch" };
+    visibleRunDetail = longTraceRunDetail;
+    visibleConversationRuns = [longTraceRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /Agent 工作席/ }));
+    const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const actions = within(workbenchDrawer).getByRole("region", { name: "重点摘要" });
+    const writerCard = within(workbenchDrawer).getByText("writer").closest(".agent-workbench-agent-card") as HTMLElement;
+
+    expect(within(actions).getByText(/已折叠 \d+ 个较早关键动作/)).not.toBeNull();
+    expect(within(actions).queryByText(/阶段 01 完成/)).toBeNull();
+    expect(within(actions).getByText(/阶段 16 完成/)).not.toBeNull();
+    expect(within(writerCard).getByText(/已折叠 \d+ 条较早活动/)).not.toBeNull();
+    expect(within(writerCard).queryByText(/阶段 01 完成/)).toBeNull();
+
+    await user.click(within(actions).getByRole("button", { name: /显示全部关键动作/ }));
+    expect(within(actions).getByText(/阶段 01 完成/)).not.toBeNull();
+  });
+
   it("uses backend safe timeline summaries instead of raw event payload text", async () => {
     const user = userEvent.setup();
     const summarizedRunDetail = {

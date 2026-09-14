@@ -2284,6 +2284,18 @@ article:hover {
   font-weight: 800;
 }
 
+.agent-workbench-actions-header .secondary-action {
+  min-height: 2rem;
+  padding: 0.32rem 0.58rem;
+  white-space: nowrap;
+}
+
+.agent-workbench-compressed-note {
+  color: var(--muted);
+  font-weight: 850;
+  margin: 0;
+}
+
 .agent-workbench-detail .agent-cluster-actions {
   padding-left: 0;
 }

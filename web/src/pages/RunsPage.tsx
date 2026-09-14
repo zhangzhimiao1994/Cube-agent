@@ -860,6 +860,16 @@ type TaskChainStep = {
   dependsOn: string[];
 };
 
+const WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
+const WORKBENCH_AGENT_ACTIVITY_PREVIEW_LIMIT = 5;
+
+function recentPreview<T>(items: T[], limit: number, expanded = false) {
+  if (expanded || items.length <= limit) {
+    return { visible: items, hiddenCount: 0 };
+  }
+  return { visible: items.slice(-limit), hiddenCount: items.length - limit };
+}
+
 type RunExecutionIntent = {
   id: string;
   label: "审批意图" | "重试意图" | "回放意图" | "修复意图";
@@ -975,9 +985,7 @@ function agentWorkbenchMeta(cards: AgentDispatchCard[]) {
 }
 
 function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[]) {
-  return items
-    .filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)))
-    .slice(0, 3);
+  return items.filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)));
 }
 
 function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): TaskChainStep[] {
@@ -2957,6 +2965,8 @@ function AgentWorkbenchDrawer({
   onClose: () => void;
   onOpen: (target: ProcessDetailTarget) => void;
 }) {
+  const [showAllActions, setShowAllActions] = useState(false);
+  const actionPreview = recentPreview(items, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -2980,6 +2990,7 @@ function AgentWorkbenchDrawer({
           <div className="agent-workbench-list">
             {dispatchCards.map((card) => {
               const activityItems = agentActivityItems(card, items);
+              const activityPreview = recentPreview(activityItems, WORKBENCH_AGENT_ACTIVITY_PREVIEW_LIMIT);
               return (
                 <article key={card.id} className={`agent-workbench-agent-card status-${card.status}`}>
                   <div className="agent-workbench-agent-header">
@@ -2998,8 +3009,13 @@ function AgentWorkbenchDrawer({
                   {activityItems.length > 0 ? (
                     <div className="agent-workbench-activity">
                       <small>活动轨迹</small>
+                      {activityPreview.hiddenCount > 0 ? (
+                        <small className="agent-workbench-compressed-note">
+                          已折叠 {activityPreview.hiddenCount} 条较早活动
+                        </small>
+                      ) : null}
                       <ul>
-                        {activityItems.map((item) => (
+                        {activityPreview.visible.map((item) => (
                           <li key={item.id}>{item.message}</li>
                         ))}
                       </ul>
@@ -3035,9 +3051,17 @@ function AgentWorkbenchDrawer({
               <div className="agent-workbench-actions-header">
                 <strong>重点摘要</strong>
                 <small>{items.length} 个关键动作</small>
+                {items.length > WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                    {showAllActions ? "收起关键动作" : "显示全部关键动作"}
+                  </button>
+                ) : null}
               </div>
+              {actionPreview.hiddenCount > 0 ? (
+                <p className="agent-workbench-compressed-note">已折叠 {actionPreview.hiddenCount} 个较早关键动作</p>
+              ) : null}
               <div className="agent-cluster-actions">
-                {items.map((item) => (
+                {actionPreview.visible.map((item) => (
                   <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
                     <span aria-hidden="true">›</span>
                     <small className="process-card-badge">{item.badge}</small>
