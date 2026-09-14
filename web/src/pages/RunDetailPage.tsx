@@ -177,6 +177,15 @@ type DownloadableArtifact = RunArtifact & {
   download_url: string;
 };
 
+const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
+
+function recentPreview<T>(items: T[], limit: number, expanded = false) {
+  if (expanded || items.length <= limit) {
+    return { visible: items, hiddenCount: 0 };
+  }
+  return { visible: items.slice(-limit), hiddenCount: items.length - limit };
+}
+
 type ApprovalState = {
   pending: RunEvent[];
   resolved: RunEvent[];
@@ -2023,6 +2032,8 @@ function DetailProcessDrawer({
   onClose: () => void;
   onSelectCard: (card: DetailProcessCard) => void;
 }) {
+  const [showAllActions, setShowAllActions] = useState(false);
+  const actionPreview = recentPreview(cards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -2048,9 +2059,19 @@ function DetailProcessDrawer({
             <div className="agent-workbench-actions-header">
               <strong>调度动作</strong>
               <small>{cards.length} 条</small>
+              {cards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                  {showAllActions ? "收起调度动作" : "显示全部调度动作"}
+                </button>
+              ) : null}
             </div>
+            {actionPreview.hiddenCount > 0 ? (
+              <p className="agent-workbench-compressed-note">
+                已折叠 {actionPreview.hiddenCount} 个较早调度动作
+              </p>
+            ) : null}
             <div className="agent-cluster-actions" aria-label="Agent 工作席动作">
-              {cards.map((card) => (
+              {actionPreview.visible.map((card) => (
                 <button
                   key={card.id}
                   type="button"

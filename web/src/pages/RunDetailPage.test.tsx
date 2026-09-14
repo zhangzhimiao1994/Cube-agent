@@ -317,6 +317,63 @@ describe("RunDetailPage", () => {
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
   });
 
+  it("compresses long run detail workbench action lists until expanded", async () => {
+    const user = userEvent.setup();
+    const longActionRun: RunDetail = {
+      ...runDetail,
+      events: Array.from({ length: 16 }, (_, index) => {
+        const sequence = index + 1;
+        return {
+          ...runDetail.events[0],
+          sequence,
+          kind: "step.started",
+          message: `worker step ${sequence}`,
+          summary: `worker 第 ${sequence.toString().padStart(2, "0")} 步处理`,
+          actor: "worker",
+          step_id: `worker-step-${sequence}`,
+          artifact: null,
+          payload: {},
+        };
+      }),
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(longActionRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(drawer).getByText("已折叠 4 个较早调度动作")).not.toBeNull();
+    expect(within(workbenchActions).queryByRole("button", { name: /worker 第 01 步处理/ })).toBeNull();
+    expect(within(workbenchActions).getByRole("button", { name: /worker 第 05 步处理/ })).not.toBeNull();
+    expect(within(workbenchActions).getByRole("button", { name: /worker 第 16 步处理/ })).not.toBeNull();
+
+    await user.click(within(drawer).getByRole("button", { name: "显示全部调度动作" }));
+
+    expect(within(drawer).queryByText("已折叠 4 个较早调度动作")).toBeNull();
+    expect(within(workbenchActions).getByRole("button", { name: /worker 第 01 步处理/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: "收起调度动作" })).not.toBeNull();
+  });
+
   it("renders run detail events in sequence order when backend payload arrives out of order", async () => {
     const outOfOrderDetail: RunDetail = {
       ...runDetail,
