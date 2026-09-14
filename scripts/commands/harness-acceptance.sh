@@ -363,25 +363,32 @@ check_health_json() {
   local path="$2"
   local python_bin
   local response
+  local attempt
+  local last_status="curl-error"
   if ! python_bin="$(detect_python)"; then
     printf 'fail: %s %s requires python for JSON handling\n' "$name" "$path" >&2
     failures=$((failures + 1))
     return 1
   fi
-  if ! response="$(curl --noproxy '*' \
-    --connect-timeout "$connect_timeout" \
-    --max-time "$max_time" \
-    -fsS \
-    "$base_url$path" 2>/dev/null)"; then
-    printf 'fail: %s %s -> curl-error\n' "$name" "$path" >&2
-    failures=$((failures + 1))
-    return 1
-  fi
-  if ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os, sys; sys.exit(0 if json.loads(os.environ["ACCEPTANCE_RESPONSE"]).get("status") == "ok" else 1)' 2>/dev/null; then
-    printf 'ok: %s %s JSON status=ok\n' "$name" "$path"
-    return 0
-  fi
-  printf 'fail: %s %s JSON status!=ok\n' "$name" "$path" >&2
+  for ((attempt = 1; attempt <= retries; attempt += 1)); do
+    if response="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS \
+      "$base_url$path" 2>/dev/null)"; then
+      if ACCEPTANCE_RESPONSE="$response" "$python_bin" -c 'import json, os, sys; sys.exit(0 if json.loads(os.environ["ACCEPTANCE_RESPONSE"]).get("status") == "ok" else 1)' 2>/dev/null; then
+        printf 'ok: %s %s JSON status=ok\n' "$name" "$path"
+        return 0
+      fi
+      last_status="JSON status!=ok"
+    else
+      last_status="curl-error"
+    fi
+    if [[ "$attempt" -lt "$retries" ]]; then
+      sleep "$retry_delay"
+    fi
+  done
+  printf 'fail: %s %s %s\n' "$name" "$path" "$last_status" >&2
   failures=$((failures + 1))
   return 1
 }

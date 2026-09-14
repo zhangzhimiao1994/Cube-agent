@@ -104,6 +104,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_codex_profile" in command
     assert "run_deepseek_profile" in command
     assert "check_health_json" in command
+    health_json_check = command[
+        command.index("check_health_json()") : command.index("check_prometheus_metrics()")
+    ]
+    assert "for ((attempt = 1; attempt <= retries; attempt += 1))" in health_json_check
+    assert 'sleep "$retry_delay"' in health_json_check
     assert "check_prometheus_metrics" in command
     assert "check_protected_boundary" in command
     assert "check_write_protected_boundary" in command
