@@ -19,6 +19,14 @@ state when systemctl is available.
 EOF
 }
 
+require_executable() {
+  local path="$1"
+  local message="$2"
+  if [[ ! -x "$path" ]]; then
+    die "$message: $path"
+  fi
+}
+
 while (($#)); do
   case "$1" in
     --install-root)
@@ -85,6 +93,10 @@ if [[ -n "$expect_revision" && "$revision" != "$expect_revision" ]]; then
 fi
 
 printf 'ok: current release %s revision=%s\n' "$current_real" "$revision"
+
+require_executable "$current_real/.venv/bin/python" "current release API python is missing"
+require_executable "$current_real/.litellm-venv/bin/python" "current release LiteLLM python is missing"
+printf 'ok: current release runtime python entrypoints are executable\n'
 
 if [[ "$check_services" -eq 1 ]]; then
   if command -v systemctl >/dev/null 2>&1; then

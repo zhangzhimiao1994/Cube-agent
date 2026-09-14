@@ -75,6 +75,12 @@ def test_release_verifier_is_registered_and_checks_current_revision() -> None:
     assert 'die "current must point inside release directory' in command
     assert 'die "current release REVISION file is missing' in command
     assert 'die "current release revision mismatch' in command
+    assert 'require_executable "$current_real/.venv/bin/python" "current release API python is missing"' in command
+    assert (
+        'require_executable "$current_real/.litellm-venv/bin/python" '
+        '"current release LiteLLM python is missing"'
+        in command
+    )
     assert "agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service" in command
 
 
