@@ -66,14 +66,17 @@
 @test "verify-release accepts current release with revision" {
   root="$BATS_TEST_TMPDIR/agent-hub"
   release="$root/releases/202601010000-release"
-  mkdir -p "$release"
+  mkdir -p "$release/.venv/bin" "$release/.litellm-venv/bin"
   echo abc123 > "$release/REVISION"
+  touch "$release/.venv/bin/python" "$release/.litellm-venv/bin/python"
+  chmod +x "$release/.venv/bin/python" "$release/.litellm-venv/bin/python"
   ln -s "$release" "$root/current"
 
   run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub verify-release --expect-revision abc123 --skip-services
 
   [ "$status" -eq 0 ]
   [[ "$output" == *"ok: current release $release revision=abc123"* ]]
+  [[ "$output" == *"ok: current release runtime python entrypoints are executable"* ]]
 }
 
 @test "verify-release refuses missing current revision" {
@@ -86,4 +89,17 @@
 
   [ "$status" -ne 0 ]
   [[ "$output" == *"current release REVISION file is missing"* ]]
+}
+
+@test "verify-release refuses missing runtime entrypoints" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  release="$root/releases/202601010000-release"
+  mkdir -p "$release"
+  echo abc123 > "$release/REVISION"
+  ln -s "$release" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub verify-release --skip-services
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"current release API python is missing"* ]]
 }
