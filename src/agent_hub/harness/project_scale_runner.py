@@ -184,6 +184,7 @@ def execute_project_scale_plan(
                 raise RuntimeError("run create response missing id")
             run_id = raw_run_id
             status = _string_value(response.get("status"))
+            _validate_run_submission_scope(response, run_request.body)
             if _case_requires_project_preflight(run_request.case_id):
                 approval_body = _project_preflight_approval_body(response)
                 approval = client.request_json(
@@ -343,6 +344,17 @@ def _workspace_bundle_path(body: dict[str, object]) -> str:
         f"/api/v1/workspaces/projects/{quote(project_id, safe='')}/"
         f"sessions/{quote(session_id, safe='')}/bundle/download"
     )
+
+
+def _validate_run_submission_scope(response: dict[str, object], body: dict[str, object]) -> None:
+    for field in ("project_id", "workspace_session_id"):
+        expected = body.get(field)
+        actual = response.get(field)
+        if not isinstance(expected, str) or not expected:
+            raise RuntimeError(f"run request missing {field}")
+        if actual != expected:
+            got = actual if isinstance(actual, str) and actual else "missing"
+            raise RuntimeError(f"run scope mismatch: {field} expected {expected} got {got}")
 
 
 def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = None) -> str:

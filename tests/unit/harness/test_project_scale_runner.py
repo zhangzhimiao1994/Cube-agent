@@ -113,6 +113,26 @@ def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> N
     )
 
 
+def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        response_project_id="project-scale-acceptance",
+        response_session_id="project-scale-stale-direct",
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert report.results[0].run_id == "run-small-direct"
+    assert report.results[0].errors == (
+        (
+            "run scope mismatch: workspace_session_id expected project-scale-small-direct "
+            "got project-scale-stale-direct"
+        ),
+    )
+    assert ("POST", "/api/v1/runs/run-small-direct/cancel", None) in client.calls
+
+
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)
@@ -196,6 +216,8 @@ class FakeAcceptanceClient:
         statuses: tuple[str, ...] | None = None,
         artifacts: list[dict[str, object]] | None = None,
         events: list[dict[str, object]] | None = None,
+        response_project_id: str | None = None,
+        response_session_id: str | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -206,6 +228,8 @@ class FakeAcceptanceClient:
         self.statuses = list(statuses or (status,))
         self.artifacts = artifacts or []
         self.events = events or [{"kind": "run.created"}]
+        self.response_project_id = response_project_id
+        self.response_session_id = response_session_id
         self.calls: list[tuple[str, str, str | None]] = []
 
     def request_json(
@@ -223,6 +247,8 @@ class FakeAcceptanceClient:
             response: dict[str, object] = {
                 "id": self.run_id,
                 "status": self.create_status or self.statuses[0],
+                "project_id": self.response_project_id or body["project_id"],
+                "workspace_session_id": self.response_session_id or body["workspace_session_id"],
             }
             if self.decision_token is not None:
                 response["decision_token"] = self.decision_token
