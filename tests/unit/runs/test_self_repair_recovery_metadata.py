@@ -437,6 +437,42 @@ def test_self_repair_failure_injection_matrix_classifies_common_failures() -> No
                     kind=EventKind.RUNTIME_FAILED,
                     sequence=1,
                     run_id=base_run_id,
+                    reason="model.provider_rate_limited",
+                ),
+            ),
+            "capacity_pressure",
+            "switch_to_available_model_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason="model.provider_unavailable",
+                ),
+            ),
+            "capacity_pressure",
+            "switch_to_available_model_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason="model.provider_transient_failed",
+                ),
+            ),
+            "capacity_pressure",
+            "switch_to_available_model_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
                     reason="Plugin endpoint unavailable",
                 ),
             ),
