@@ -516,6 +516,19 @@ def property_type_matches(prop, expected_type):
     any_of = prop.get("anyOf")
     return isinstance(any_of, list) and {"type": expected_type} in any_of
 
+def property_minimum_matches(prop, expected_type, minimum):
+    if minimum is None:
+        return True
+    if prop.get("type") == expected_type:
+        return prop.get("minimum") == minimum
+    any_of = prop.get("anyOf")
+    if not isinstance(any_of, list):
+        return False
+    for branch in any_of:
+        if isinstance(branch, dict) and branch.get("type") == expected_type:
+            return branch.get("minimum") == minimum
+    return False
+
 request_schema = schemas.get("ProbeRequest", {})
 request_properties = request_schema.get("properties", {})
 request_expected = {
@@ -529,7 +542,7 @@ for name, (expected_type, minimum) in request_expected.items():
         raise SystemExit(1)
     if not property_type_matches(prop, expected_type):
         raise SystemExit(1)
-    if minimum is not None and prop.get("minimum") != minimum:
+    if not property_minimum_matches(prop, expected_type, minimum):
         raise SystemExit(1)
 
 response_schema = schemas.get("ProbeResponse", {})
@@ -544,7 +557,7 @@ for name, (expected_type, minimum) in response_expected.items():
         raise SystemExit(1)
     if not property_type_matches(prop, expected_type):
         raise SystemExit(1)
-    if minimum is not None and prop.get("minimum") != minimum:
+    if not property_minimum_matches(prop, expected_type, minimum):
         raise SystemExit(1)
 PY
   then

@@ -357,6 +357,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"desired_concurrency": ("integer", 1)' in command
     assert '"target_utilization": ("number", 0.1)' in command
     assert '"reserved_capacity": ("integer", 0)' in command
+    assert "property_minimum_matches" in command
+    assert 'branch.get("minimum") == minimum' in command
     assert 'schemas.get("ProbeResponse", {})' in command
     assert '"recommended_concurrency": ("integer", None)' in command
     assert '"warning": ("string", None)' in command
