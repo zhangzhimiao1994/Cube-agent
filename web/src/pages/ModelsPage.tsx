@@ -1,7 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { API_ERROR_DETAIL_DISPLAY_KEYS, ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
+import {
+  API_ERROR_DETAIL_DISPLAY_KEYS,
+  ApiError,
+  api,
+  formatApiError,
+  formatApiErrorDetailValue,
+  type ModelDeployment,
+} from "../api/client";
 import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -529,7 +536,7 @@ function modelErrorDiagnostics(error: unknown) {
     return [{
       key,
       label: MODEL_ERROR_LABELS[key] ?? key,
-      value: String(value),
+      value: formatApiErrorDetailValue(key, value),
     }];
   });
 }

@@ -88,6 +88,7 @@ describe("ModelsPage", () => {
                     logical_model: "main",
                     upstream_model: "deepseek-v4-flash",
                     status_code: "401",
+                    failure_kind: "model_credential_unavailable",
                     reason: "provider returned status=401",
                     credential_ref: "secret://private-model",
                     traceback: "private-token stack",
@@ -332,6 +333,8 @@ describe("ModelsPage", () => {
     expect(alert.textContent).toContain("模型配置错误日志");
     expect(alert.textContent).toContain("HTTP 状态");
     expect(alert.textContent).toContain("401");
+    expect(alert.textContent).toContain("模型凭据不可用");
+    expect(alert.textContent).not.toContain("model_credential_unavailable");
     expect(alert.textContent).toContain("检查 API Key 是否有效");
     expect(alert.textContent).not.toContain("https://api.deepseek.com/v1");
     expect(alert.textContent).not.toContain("provider returned status=401");

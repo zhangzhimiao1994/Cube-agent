@@ -2,7 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { API_ERROR_DETAIL_DISPLAY_KEYS, ApiError, api, formatApiError, type MainAgentConfig } from "../api/client";
+import {
+  API_ERROR_DETAIL_DISPLAY_KEYS,
+  ApiError,
+  api,
+  formatApiError,
+  formatApiErrorDetailValue,
+  type MainAgentConfig,
+} from "../api/client";
 import { useNavSection } from "../app/navSections";
 
 type ApiProtocol = "openai_compatible" | "anthropic_messages";
@@ -259,7 +266,7 @@ function modelErrorDiagnostics(error: unknown) {
     return [{
       key,
       label: MODEL_ERROR_LABELS[key] ?? key,
-      value: String(value),
+      value: formatApiErrorDetailValue(key, value),
     }];
   });
 }

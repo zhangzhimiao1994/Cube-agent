@@ -1446,12 +1446,48 @@ export const API_ERROR_DETAIL_DISPLAY_KEYS = [
   "hint",
 ] as const;
 
+const API_ERROR_FAILURE_KIND_LABELS: Record<string, string> = {
+  runtime_failure: "运行阶段失败",
+  step_failure: "执行步骤失败",
+  tool_failure: "工具调用失败",
+  model_timeout: "模型调用超时",
+  model_rate_limited: "模型限流",
+  model_provider_unavailable: "模型服务暂不可用",
+  model_provider_transient_failed: "模型服务临时失败",
+  model_capability_missing: "模型缺少所需能力",
+  model_credential_unavailable: "模型凭据不可用",
+  model_quota_or_billing_unavailable: "模型额度或账单不可用",
+  model_deployment_unavailable: "模型部署不可用",
+  model_request_contract_invalid: "模型请求契约无效",
+  plugin_runtime_unavailable: "插件运行时不可用",
+  plugin_credential_unavailable: "插件凭据不可用",
+  plugin_arguments_invalid: "插件参数无效",
+  plugin_result_contract_invalid: "插件结果契约无效",
+  plugin_sandbox_unavailable: "插件沙箱不可用",
+  mcp_runtime_unavailable: "MCP 服务不可用",
+  mcp_configuration_invalid: "MCP 配置不可用",
+  missing_failure_event: "缺少失败事件",
+  empty_response: "模型返回空响应",
+  nonzero_exit: "命令非零退出",
+  capability_failed: "能力调用失败",
+  invalid_request: "请求参数无效",
+  selector_missing: "选择器缺失",
+  network_timeout: "网络超时",
+};
+
+export function formatApiErrorDetailValue(key: string, value: string | number | boolean | null): string {
+  if (key === "failure_kind" && typeof value === "string") {
+    return API_ERROR_FAILURE_KIND_LABELS[value] ?? value;
+  }
+  return String(value);
+}
+
 function formatApiErrorDetails(details: ApiErrorDetails | null): string {
   if (!details) return "";
   return API_ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
     const value = details[key];
     if (value === null || typeof value === "undefined" || value === "") return [];
-    return [`${key}=${String(value)}`];
+    return [`${key}=${formatApiErrorDetailValue(key, value)}`];
   }).join(", ");
 }
 
