@@ -144,6 +144,7 @@ _MCP_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
         "mcp.server_timeout",
         "mcp_server_failed",
         "mcp_server_timeout",
+        "mcp.timeout",
         "mcp tool timed out",
     }
 )

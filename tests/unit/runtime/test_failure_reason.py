@@ -351,10 +351,15 @@ def test_runtime_failure_diagnostic_classifies_plugin_runtime_failures(
 @pytest.mark.parametrize(
     ("reason", "error_category", "error_code", "retryable"),
     [
+        ("mcp.tool_unavailable", "tool_unavailable", "mcp.tool_unavailable", False),
         ("MCP tool unavailable", "tool_unavailable", "mcp.tool_unavailable", False),
+        ("mcp.timeout", "timeout", "mcp.timeout", True),
         ("MCP tool timed out", "timeout", "mcp.timeout", True),
+        ("mcp.server_not_discovered", "server_not_discovered", "mcp.server_not_discovered", False),
         ("mcp_server_not_discovered", "server_not_discovered", "mcp.server_not_discovered", False),
+        ("mcp.server_timeout", "server_timeout", "mcp.server_timeout", True),
         ("mcp_server_timeout", "server_timeout", "mcp.server_timeout", True),
+        ("mcp.server_failed", "server_failed", "mcp.server_failed", True),
         ("mcp_server_failed", "server_failed", "mcp.server_failed", True),
     ],
 )

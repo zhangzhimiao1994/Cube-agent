@@ -1092,10 +1092,15 @@ cases = [
         True,
     ),
     ("Plugin sandbox profile unsupported", "plugin_runtime", "sandbox_unsupported", "plugin.sandbox_unsupported", False),
+    ("mcp.tool_unavailable", "mcp_runtime", "tool_unavailable", "mcp.tool_unavailable", False),
     ("MCP tool unavailable", "mcp_runtime", "tool_unavailable", "mcp.tool_unavailable", False),
+    ("mcp.timeout", "mcp_runtime", "timeout", "mcp.timeout", True),
     ("MCP tool timed out", "mcp_runtime", "timeout", "mcp.timeout", True),
+    ("mcp.server_not_discovered", "mcp_runtime", "server_not_discovered", "mcp.server_not_discovered", False),
     ("mcp_server_not_discovered", "mcp_runtime", "server_not_discovered", "mcp.server_not_discovered", False),
+    ("mcp.server_timeout", "mcp_runtime", "server_timeout", "mcp.server_timeout", True),
     ("mcp_server_timeout", "mcp_runtime", "server_timeout", "mcp.server_timeout", True),
+    ("mcp.server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
     ("mcp_server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
 ]
 
@@ -1609,6 +1614,17 @@ cases = (
             ),
         ),
         "plugin_runtime_unavailable", "repair_plugin_endpoint_or_adapter_and_retry",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                reason="mcp.timeout",
+            ),
+        ),
+        "mcp_runtime_unavailable", "repair_mcp_server_or_adapter_and_retry",
     ),
     (
         (

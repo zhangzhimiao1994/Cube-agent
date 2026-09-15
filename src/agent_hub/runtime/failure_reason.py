@@ -469,7 +469,7 @@ def _mcp_runtime_diagnostic(
     *,
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic | None:
-    if lowered == "mcp tool unavailable":
+    if lowered in {"mcp tool unavailable", "mcp.tool_unavailable"}:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",
@@ -479,7 +479,7 @@ def _mcp_runtime_diagnostic(
             suggested_action="MCP 工具当前不可用；检查 MCP server 发现状态、工具 allowlist 和运行时 reload 后重试。",
             status_code=status_code,
         )
-    if lowered == "mcp tool timed out":
+    if lowered in {"mcp tool timed out", "mcp.timeout"}:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",
@@ -489,7 +489,7 @@ def _mcp_runtime_diagnostic(
             suggested_action="MCP 工具调用超时；检查 MCP server 健康、网络/stdio 连接和请求规模，恢复后可重试。",
             status_code=status_code,
         )
-    if lowered == "mcp_server_not_discovered":
+    if lowered in {"mcp_server_not_discovered", "mcp.server_not_discovered"}:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",
@@ -499,7 +499,7 @@ def _mcp_runtime_diagnostic(
             suggested_action="MCP server 已配置但尚未完成工具发现；检查 server 启动、发现协议和 allowlist 配置后 reload。",
             status_code=status_code,
         )
-    if lowered == "mcp_server_timeout":
+    if lowered in {"mcp_server_timeout", "mcp.server_timeout"}:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",
@@ -509,7 +509,12 @@ def _mcp_runtime_diagnostic(
             suggested_action="MCP server 健康检查或工具发现超时；检查连接、降低负载或恢复服务后重试。",
             status_code=status_code,
         )
-    if lowered in {"mcp_server_failed", "mcp_server_unavailable"}:
+    if lowered in {
+        "mcp_server_failed",
+        "mcp_server_unavailable",
+        "mcp.server_failed",
+        "mcp.server_unavailable",
+    }:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",

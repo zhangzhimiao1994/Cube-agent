@@ -372,7 +372,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin.timeout"' in command
     assert '"plugin.credential_unavailable"' in command
     assert '"plugin.endpoint_unavailable"' in command
+    assert '"mcp.tool_unavailable"' in command
     assert '"mcp.timeout"' in command
+    assert '"mcp.server_not_discovered"' in command
+    assert '"mcp.server_timeout"' in command
     assert '"mcp.server_failed"' in command
 
     assert "PluginConfigCapabilityManifestSource" in command
