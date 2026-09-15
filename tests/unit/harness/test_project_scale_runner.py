@@ -7,6 +7,7 @@ from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     execute_project_scale_plan,
+    format_project_scale_result_line,
 )
 
 
@@ -281,6 +282,30 @@ def test_project_scale_execution_payload_lists_missing_evidence() -> None:
         "self_repair_trace",
     ]
     assert payload["missing_evidence"] == ["final_artifacts", "self_repair_trace"]
+
+
+def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> None:
+    result = ProjectScaleCaseResult(
+        case_id="ultra:self_repair",
+        run_id="run-ultra-self-repair",
+        status="failed",
+        evidence={
+            "run_details": True,
+            "run_events": True,
+            "terminal_status": True,
+            "project_preflight_approval": True,
+            "workspace_bundle": True,
+            "cleanup_cancel": True,
+        },
+        errors=("terminal_status: failed",),
+    )
+
+    line = format_project_scale_result_line(result)
+
+    assert line == (
+        "ultra:self_repair run_id=run-ultra-self-repair ok=false "
+        "missing=final_artifacts,self_repair_trace errors=1"
+    )
 
 
 class FakeAcceptanceClient:

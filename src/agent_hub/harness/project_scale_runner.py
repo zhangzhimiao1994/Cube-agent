@@ -339,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.execute:
             print(f"project-scale execution cases={report.case_count} ok={str(report.ok).lower()}")
             for result in report.results:
-                print(f"{result.case_id} run_id={result.run_id or '-'} ok={str(result.ok).lower()}")
+                print(format_project_scale_result_line(result))
         else:
             print(
                 f"project-scale plan cases={plan.case_count} "
@@ -348,6 +348,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             for request in plan.requests:
                 print(request.case_id)
     return 0 if (not args.execute or report.ok) else 1
+
+
+def format_project_scale_result_line(result: ProjectScaleCaseResult) -> str:
+    parts = [
+        result.case_id,
+        f"run_id={result.run_id or '-'}",
+        f"ok={str(result.ok).lower()}",
+    ]
+    if result.missing_evidence:
+        parts.append(f"missing={','.join(result.missing_evidence)}")
+    if result.errors:
+        parts.append(f"errors={len(result.errors)}")
+    return " ".join(parts)
 
 
 def _workspace_bundle_path(body: dict[str, object]) -> str:
