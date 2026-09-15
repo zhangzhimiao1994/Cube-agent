@@ -8,6 +8,16 @@ SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
 ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(
     ("http_read", "in_process", "local_process")
 )
+PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES: tuple[str, ...] = (
+    "plugin.adapter_unavailable",
+    "plugin.timeout",
+    "plugin.credential_unavailable",
+    "plugin.invalid_arguments",
+    "plugin.invalid_result",
+    "plugin.backend_unavailable",
+    "plugin.endpoint_unavailable",
+    "plugin.sandbox_unsupported",
+)
 
 
 def http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
@@ -70,6 +80,7 @@ def http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
             "type": "object",
             "additionalProperties": True,
         },
+        "failure_codes": PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES,
     }
 
 
@@ -121,6 +132,7 @@ def adapter_descriptor_with_contract(
 
 __all__ = [
     "ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES",
+    "PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES",
     "SUPPORTED_PLUGIN_SANDBOX_PROFILES",
     "adapter_capability_contract",
     "adapter_declared_sandbox_profiles",

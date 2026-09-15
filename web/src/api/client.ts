@@ -1244,6 +1244,7 @@ const PluginAdapterDescriptorSchema = z.object({
     declared_sandbox_profiles: [],
     runtime_sandbox_profiles: [],
   }),
+  failure_codes: z.array(z.string()).default([]),
 });
 
 export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSchema>;

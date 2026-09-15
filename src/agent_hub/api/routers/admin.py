@@ -1228,6 +1228,7 @@ class PluginAdapterDescriptorResponse(BaseModel):
     capability_contract: PluginAdapterCapabilityContractResponse = Field(
         default_factory=PluginAdapterCapabilityContractResponse,
     )
+    failure_codes: list[str] = Field(default_factory=list, max_length=32)
 
     @field_validator("resource_schema", "capability_schema", "argument_schema")
     @classmethod

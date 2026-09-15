@@ -10280,6 +10280,7 @@ def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> 
         "declared_sandbox_profiles": [],
         "runtime_sandbox_profiles": ["remote_connector"],
     }
+    assert descriptors["http_json"]["failure_codes"] == PLUGIN_FAILURE_CODES
     assert "credential_ref" in descriptors["http_json"]["resource_schema"]["properties"]
     assert "Authorization" not in response.text
 

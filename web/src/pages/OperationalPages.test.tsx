@@ -537,6 +537,7 @@ const pluginAdapterDescriptors: PluginAdapterDescriptor[] = [
       declared_sandbox_profiles: ["http_read"],
       runtime_sandbox_profiles: ["http_read", "remote_connector"],
     },
+    failure_codes: ["plugin.timeout", "plugin.endpoint_unavailable"],
   },
   {
     id: "workflow",
@@ -570,6 +571,7 @@ const pluginAdapterDescriptors: PluginAdapterDescriptor[] = [
       declared_sandbox_profiles: ["in_process"],
       runtime_sandbox_profiles: ["remote_connector"],
     },
+    failure_codes: ["plugin.adapter_unavailable"],
   },
 ];
 

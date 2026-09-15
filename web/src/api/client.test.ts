@@ -949,6 +949,7 @@ describe("api client transport", () => {
           declared_sandbox_profiles: ["http_read", "local_process"],
           runtime_sandbox_profiles: ["http_read", "remote_connector"],
         },
+        failure_codes: ["plugin.timeout", "plugin.endpoint_unavailable"],
       },
     ];
     const fetchMock = vi.fn().mockResolvedValue(

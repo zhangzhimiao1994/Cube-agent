@@ -34,6 +34,7 @@ from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifest
 from agent_hub.capabilities.types import PolicyEffect
 from agent_hub.plugins.contracts import (
     ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES,
+    PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES,
     SUPPORTED_PLUGIN_SANDBOX_PROFILES,
     adapter_declared_sandbox_profiles,
     adapter_descriptor_with_contract,
@@ -1254,6 +1255,7 @@ def _package_adapter_descriptor(adapter_id: str) -> Mapping[str, JsonValue]:
             "additionalProperties": True,
         },
         "argument_schema": {"type": "object", "additionalProperties": True},
+        "failure_codes": PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES,
     }
 
 
