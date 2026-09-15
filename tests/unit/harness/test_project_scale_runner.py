@@ -334,6 +334,12 @@ def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> No
             "workspace_bundle": True,
             "cleanup_cancel": True,
         },
+        validation_focus=(
+            "interaction_stability",
+            "final_result",
+            "self_repair",
+            "project_preflight_approval",
+        ),
         errors=("terminal_status: failed",),
     )
 
@@ -341,6 +347,7 @@ def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> No
 
     assert line == (
         "ultra:self_repair run_id=run-ultra-self-repair ok=false "
+        "focus=interaction_stability,final_result,self_repair,project_preflight_approval "
         "missing=final_artifacts,self_repair_trace errors=1"
     )
 

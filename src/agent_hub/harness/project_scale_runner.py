@@ -359,6 +359,8 @@ def format_project_scale_result_line(result: ProjectScaleCaseResult) -> str:
         f"run_id={result.run_id or '-'}",
         f"ok={str(result.ok).lower()}",
     ]
+    if result.validation_focus:
+        parts.append(f"focus={','.join(result.validation_focus)}")
     if result.missing_evidence:
         parts.append(f"missing={','.join(result.missing_evidence)}")
     if result.errors:
