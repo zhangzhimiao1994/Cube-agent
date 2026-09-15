@@ -2827,7 +2827,7 @@ PY
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,deliverable_quality=2,agent_standard_verification=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
+  if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,deliverable_quality=2,agent_standard_verification=2,discussion_trace=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
     printf 'fail: project scale execution report failure summary payload\n' >&2
     failures=$((failures + 1))
     return 1
