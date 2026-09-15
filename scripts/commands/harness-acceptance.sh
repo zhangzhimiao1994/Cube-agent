@@ -2574,6 +2574,7 @@ check_project_scale_runner_contract() {
   local report_file
   local report_output
   local text_line_output
+  local focus_output
   local execute_output
   local execute_status
 
@@ -2656,6 +2657,41 @@ PY
   fi
   if [[ "$text_line_output" != "ultra:self_repair run_id=run-ultra-self-repair ok=false missing=final_artifacts,self_repair_trace errors=1" ]]; then
     printf 'fail: project scale execution runner text diagnostic payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! focus_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+from agent_hub.harness.project_scale_runner import ProjectScaleCaseResult
+
+payload = ProjectScaleCaseResult(
+    case_id="small:capability_validation",
+    run_id="run-small-capability-validation",
+    status="completed",
+    evidence={
+        "run_details": True,
+        "run_events": True,
+        "terminal_status": True,
+        "final_artifacts": True,
+        "workspace_bundle": True,
+        "cleanup_cancel": True,
+    },
+    validation_focus=(
+        "interaction_stability",
+        "final_result",
+        "capability_matrix",
+        "mode_control",
+        "no_silent_downgrade",
+    ),
+).to_payload()
+print(",".join(payload["validation_focus"]))
+PY
+  )"; then
+    printf 'fail: project scale execution result validation focus\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$focus_output" != "interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade" ]]; then
+    printf 'fail: project scale execution result validation focus payload\n' >&2
     failures=$((failures + 1))
     return 1
   fi

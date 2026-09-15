@@ -37,6 +37,7 @@ class ProjectScaleCaseResult:
     run_id: str | None
     status: str | None
     evidence: dict[str, bool]
+    validation_focus: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
     @property
@@ -70,6 +71,7 @@ class ProjectScaleCaseResult:
             "run_id": self.run_id,
             "status": self.status,
             "ok": self.ok,
+            "validation_focus": list(self.validation_focus),
             "required_evidence": list(self.required_evidence),
             "missing_evidence": list(self.missing_evidence),
             "evidence": dict(self.evidence),
@@ -258,6 +260,7 @@ def execute_project_scale_plan(
                 run_id=run_id,
                 status=status,
                 evidence=evidence,
+                validation_focus=run_request.validation_focus,
                 errors=tuple(errors),
             )
         )

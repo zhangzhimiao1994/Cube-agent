@@ -174,6 +174,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "rm -f -- \"$report_file\"" in command
     assert "validation_focus" in command
     assert "capability_matrix" in command
+    assert "execution result validation focus" in command
     assert "format_project_scale_result_line" in command
     assert "missing=final_artifacts,self_repair_trace errors=1" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command

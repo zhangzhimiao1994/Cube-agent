@@ -103,6 +103,30 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     ]
 
 
+def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("small",),
+        flows=("capability_validation",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-capability-validation",
+        session_id="project-scale-small-capability_validation",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.to_payload()["results"][0]["validation_focus"] == [
+        "interaction_stability",
+        "final_result",
+        "capability_matrix",
+        "mode_control",
+        "no_silent_downgrade",
+    ]
+
+
 def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])
