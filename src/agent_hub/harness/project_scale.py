@@ -34,6 +34,7 @@ PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "run_events",
     "workspace_bundle",
     "final_artifacts",
+    "deliverable_quality",
     "project_preflight_approval",
     "self_repair_trace",
     "release_health",

@@ -5,8 +5,10 @@ import json
 import os
 import sys
 import time
-from collections.abc import Sequence
+import zipfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -16,6 +18,30 @@ from urllib.request import Request, urlopen
 from agent_hub.harness.project_scale import ProjectScaleRunPlan, build_project_scale_run_plan
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_QUALITY_KEYS = frozenset(
+    {
+        "requirements_satisfied",
+        "build_passed",
+        "tests_passed",
+        "interactive_checks_passed",
+        "no_placeholders",
+        "artifact_integrity",
+    }
+)
+_QUALITY_PAYLOAD_KEYS = (
+    "deliverable_quality",
+    "project_quality",
+    "quality_gate",
+    "acceptance",
+)
+_PLACEHOLDER_MARKERS = (
+    "lorem ipsum",
+    "placeholder project",
+    "coming soon",
+    "not implemented",
+    "mock only",
+    "stub only",
+)
 
 
 class AcceptanceClient(Protocol):
@@ -47,6 +73,7 @@ class ProjectScaleCaseResult:
             "run_events",
             "terminal_status",
             "final_artifacts",
+            "deliverable_quality",
             "project_preflight_approval",
             "workspace_bundle",
             "cleanup_cancel",
@@ -164,6 +191,14 @@ class UrllibAcceptanceClient:
             raise RuntimeError(f"{method} {path} failed: {error.reason}") from error
 
 
+@dataclass(frozen=True, slots=True)
+class _RunObservation:
+    status: str | None
+    details: dict[str, object] | None
+    events: list[object] | None
+    workspace_bundle: bytes | None
+
+
 def execute_project_scale_plan(
     plan: ProjectScaleRunPlan,
     client: AcceptanceClient,
@@ -179,6 +214,8 @@ def execute_project_scale_plan(
             "run_events": False,
             "terminal_status": False,
             "final_artifacts": False,
+            "deliverable_quality": False,
+            "deliverable_repair_trace": False,
             "self_repair_trace": False,
             "project_preflight_approval": False,
             "workspace_bundle": False,
@@ -218,39 +255,75 @@ def execute_project_scale_plan(
                 evidence["project_preflight_approval"] = True
                 status = _string_value(approval.get("status")) or status
 
-            deadline = time.monotonic() + max(wait_seconds, 0)
-            while True:
-                details = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
-                evidence["run_details"] = isinstance(details, dict)
-                if isinstance(details, dict):
-                    _validate_run_details_scope(details, run_id)
-                    status = _string_value(details.get("status")) or status
-                    evidence["final_artifacts"] = _has_final_artifacts(details)
-                if _is_terminal_status(status):
-                    evidence["terminal_status"] = True
-                    break
-                if wait_seconds <= 0 or time.monotonic() >= deadline:
-                    break
-                if poll_interval_seconds > 0:
-                    time.sleep(poll_interval_seconds)
+            observation = _collect_run_observation(
+                client,
+                run_id=run_id,
+                body=run_request.body,
+                wait_seconds=wait_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                current_status=status,
+                evidence=evidence,
+                errors=errors,
+            )
+            status = observation.status
             if evidence["terminal_status"] and status != "completed":
                 errors.append(f"terminal_status: {status or 'unknown'}")
 
-            events = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
-            if isinstance(events, list) and events:
-                evidence["run_events"] = True
-                errors.extend(_validate_run_events_scope(events, run_id))
-            elif isinstance(events, list):
-                errors.append("run_events: empty event stream")
-            else:
-                errors.append("run_events: returned non-list JSON")
-            evidence["self_repair_trace"] = _has_self_repair_trace(events)
-
-            try:
-                client.request_bytes("GET", _workspace_bundle_path(run_request.body))
-                evidence["workspace_bundle"] = True
-            except Exception as error:  # noqa: BLE001 - acceptance reports must continue cleanup.
-                errors.append(f"workspace_bundle: {error}")
+            evidence["self_repair_trace"] = _has_self_repair_trace(observation.events)
+            evidence["deliverable_quality"] = _has_deliverable_quality(
+                observation.details,
+                observation.events,
+                observation.workspace_bundle,
+            )
+            if _should_attempt_deliverable_repair(status=status, evidence=evidence):
+                repair_response = client.request_json(
+                    "POST",
+                    "/api/v1/runs",
+                    body=_deliverable_repair_body(run_request.body, run_request.case_id),
+                    idempotency_key=_deliverable_repair_idempotency_key(
+                        run_request.case_id,
+                        index,
+                        execution_id=execution_id,
+                    ),
+                )
+                if not isinstance(repair_response, dict):
+                    raise TypeError("deliverable repair returned non-object JSON")
+                _validate_run_submission_scope(repair_response, run_request.body)
+                repair_run_id = repair_response.get("id")
+                if not isinstance(repair_run_id, str) or not repair_run_id:
+                    raise RuntimeError("deliverable repair response missing id")
+                evidence["deliverable_repair_trace"] = True
+                run_id = repair_run_id
+                status = _string_value(repair_response.get("status")) or status
+                repair_observation = _collect_run_observation(
+                    client,
+                    run_id=run_id,
+                    body=run_request.body,
+                    wait_seconds=wait_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                    current_status=status,
+                    evidence=evidence,
+                    errors=errors,
+                )
+                status = repair_observation.status
+                if evidence["terminal_status"] and status != "completed":
+                    errors.append(f"terminal_status: {status or 'unknown'}")
+                evidence["self_repair_trace"] = (
+                    evidence["self_repair_trace"]
+                    or _has_self_repair_trace(repair_observation.events)
+                    or _has_deliverable_repair_trace(repair_observation.events)
+                )
+                evidence["deliverable_quality"] = _has_deliverable_quality(
+                    repair_observation.details,
+                    repair_observation.events,
+                    repair_observation.workspace_bundle,
+                )
+            if (
+                evidence["workspace_bundle"]
+                and evidence["final_artifacts"]
+                and not evidence["deliverable_quality"]
+            ):
+                errors.append("deliverable_quality: project deliverable failed quality gate")
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -406,6 +479,64 @@ def _workspace_bundle_path(body: dict[str, object]) -> str:
     )
 
 
+def _collect_run_observation(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    body: dict[str, object],
+    wait_seconds: float,
+    poll_interval_seconds: float,
+    current_status: str | None,
+    evidence: dict[str, bool],
+    errors: list[str],
+) -> _RunObservation:
+    status = current_status
+    details: dict[str, object] | None = None
+    events: list[object] | None = None
+    workspace_bundle: bytes | None = None
+
+    deadline = time.monotonic() + max(wait_seconds, 0)
+    while True:
+        details_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
+        evidence["run_details"] = isinstance(details_response, dict)
+        if isinstance(details_response, dict):
+            details = details_response
+            _validate_run_details_scope(details, run_id)
+            status = _string_value(details.get("status")) or status
+            evidence["final_artifacts"] = _has_final_artifacts(details)
+        if _is_terminal_status(status):
+            evidence["terminal_status"] = True
+            break
+        if wait_seconds <= 0 or time.monotonic() >= deadline:
+            break
+        if poll_interval_seconds > 0:
+            time.sleep(poll_interval_seconds)
+
+    events_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
+    if isinstance(events_response, list) and events_response:
+        events = events_response
+        evidence["run_events"] = True
+        errors.extend(_validate_run_events_scope(events_response, run_id))
+    elif isinstance(events_response, list):
+        events = events_response
+        errors.append("run_events: empty event stream")
+    else:
+        errors.append("run_events: returned non-list JSON")
+
+    try:
+        workspace_bundle = client.request_bytes("GET", _workspace_bundle_path(body))
+        evidence["workspace_bundle"] = True
+    except Exception as error:  # noqa: BLE001 - acceptance reports must continue cleanup.
+        errors.append(f"workspace_bundle: {error}")
+
+    return _RunObservation(
+        status=status,
+        details=details,
+        events=events,
+        workspace_bundle=workspace_bundle,
+    )
+
+
 def _validate_run_submission_scope(response: dict[str, object], body: dict[str, object]) -> None:
     for field in ("project_id", "workspace_session_id"):
         expected = body.get(field)
@@ -457,6 +588,34 @@ def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = Non
     return key[:90]
 
 
+def _deliverable_repair_idempotency_key(
+    case_id: str,
+    index: int,
+    *,
+    execution_id: str | None = None,
+) -> str:
+    return f"{_idempotency_key(case_id, index, execution_id=execution_id)}-deliverable-repair"[:90]
+
+
+def _deliverable_repair_body(
+    body: dict[str, object],
+    case_id: str,
+) -> dict[str, object]:
+    repair_body = dict(body)
+    original_message = body.get("message")
+    repair_body["message"] = (
+        f"Project-scale deliverable repair for {case_id}: the previous generated project "
+        "failed acceptance quality. Diagnose the mismatches against the original request, "
+        "repair the implementation in the same workspace, rerun build/test/interaction checks, "
+        "remove placeholders or stub-only output, and record deliverable_quality with "
+        "requirements_satisfied, build_passed, tests_passed, interactive_checks_passed, "
+        "no_placeholders, and artifact_integrity all true. Original request:\n"
+        f"{original_message if isinstance(original_message, str) else ''}"
+    )
+    repair_body["skip_evolution_proposal"] = True
+    return repair_body
+
+
 def _default_execution_id() -> str:
     return _safe_idempotency_token(f"{int(time.time())}-{os.getpid()}")
 
@@ -505,7 +664,163 @@ def _has_final_artifacts(details: dict[str, object]) -> bool:
     return isinstance(artifact_count, int) and artifact_count > 0
 
 
-def _has_self_repair_trace(events: dict[str, object] | list[object]) -> bool:
+def _has_deliverable_quality(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    workspace_bundle: bytes | None,
+) -> bool:
+    return _has_quality_payload(details, events) and _workspace_bundle_has_project_quality(
+        workspace_bundle
+    )
+
+
+def _has_quality_payload(details: dict[str, object] | None, events: list[object] | None) -> bool:
+    if details is not None and _mapping_has_quality_payload(details):
+        return True
+    if events is None:
+        return False
+    return any(isinstance(event, dict) and _mapping_has_quality_payload(event) for event in events)
+
+
+def _mapping_has_quality_payload(mapping: Mapping[str, object]) -> bool:
+    for key in _QUALITY_PAYLOAD_KEYS:
+        value = mapping.get(key)
+        if _quality_payload_passes(value):
+            return True
+        payload = mapping.get("payload")
+        if isinstance(payload, Mapping) and _quality_payload_passes(payload.get(key)):
+            return True
+    return False
+
+
+def _quality_payload_passes(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return all(value.get(key) is True for key in _QUALITY_KEYS)
+
+
+def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> bool:
+    if not workspace_bundle:
+        return False
+    try:
+        with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+            names = tuple(name for name in archive.namelist() if not name.endswith("/"))
+            lowered = tuple(name.lower() for name in names)
+            if not lowered:
+                return False
+            text = _workspace_bundle_text(archive, names)
+            package_json = _read_bundle_file(archive, names, "package.json")
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+    return (
+        _bundle_has_requirement_document(lowered)
+        and _bundle_has_source_files(lowered)
+        and _bundle_has_verification_path_or_script(lowered, package_json)
+        and not any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS)
+    )
+
+
+def _workspace_bundle_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:
+    chunks: list[str] = []
+    for name in names:
+        if not _is_text_candidate(name):
+            continue
+        try:
+            chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
+        except (KeyError, RuntimeError, OSError):
+            continue
+    return "\n".join(chunks)
+
+
+def _read_bundle_file(archive: zipfile.ZipFile, names: Sequence[str], filename: str) -> str:
+    for name in names:
+        if name.lower().rsplit("/", 1)[-1] != filename:
+            continue
+        try:
+            return archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000]
+        except (KeyError, RuntimeError, OSError):
+            return ""
+    return ""
+
+
+def _is_text_candidate(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith(
+        (
+            ".css",
+            ".html",
+            ".js",
+            ".json",
+            ".jsx",
+            ".md",
+            ".py",
+            ".ts",
+            ".tsx",
+            ".txt",
+            ".yaml",
+            ".yml",
+        )
+    )
+
+
+def _bundle_has_requirement_document(lowered_names: Sequence[str]) -> bool:
+    basenames = {name.rsplit("/", 1)[-1] for name in lowered_names}
+    return bool(
+        basenames
+        & {
+            "readme.md",
+            "project_requirements.md",
+            "requirements.md",
+            "spec.md",
+            "acceptance.md",
+        }
+    )
+
+
+def _bundle_has_source_files(lowered_names: Sequence[str]) -> bool:
+    return any(
+        name.startswith(("src/", "app/", "pages/"))
+        or name.endswith(("/main.py", "/main.ts", "/main.tsx", "/index.html"))
+        or name in {"main.py", "index.html", "package.json"}
+        for name in lowered_names
+    )
+
+
+def _bundle_has_verification_path_or_script(
+    lowered_names: Sequence[str],
+    package_json: str,
+) -> bool:
+    has_test_path = any(
+        name.startswith(("tests/", "test/")) or "/tests/" in name or name.endswith(".test.ts")
+        for name in lowered_names
+    )
+    if has_test_path:
+        return True
+    try:
+        package = json.loads(package_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    scripts = package.get("scripts") if isinstance(package, dict) else None
+    return isinstance(scripts, dict) and bool({"build", "test"} <= set(scripts))
+
+
+def _should_attempt_deliverable_repair(*, status: str | None, evidence: dict[str, bool]) -> bool:
+    return (
+        status == "completed"
+        and evidence.get("final_artifacts") is True
+        and evidence.get("workspace_bundle") is True
+        and evidence.get("deliverable_quality") is not True
+    )
+
+
+def _has_deliverable_repair_trace(events: list[object] | None) -> bool:
+    if not isinstance(events, list):
+        return False
+    return any("deliverable.repair" in json.dumps(event, ensure_ascii=False).lower() for event in events)
+
+
+def _has_self_repair_trace(events: object) -> bool:
     if not isinstance(events, list):
         return False
     return any("repair" in json.dumps(event, ensure_ascii=False).lower() for event in events)

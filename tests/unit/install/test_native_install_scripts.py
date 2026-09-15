@@ -163,6 +163,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
         in command
     )
     assert "workspace_bundle" in command
+    assert "deliverable_quality" in command
     assert "cancel_or_archive_probe_runs" in command
     assert "ok: project scale acceptance matrix" in command
     assert "check_project_scale_runner_contract" in command

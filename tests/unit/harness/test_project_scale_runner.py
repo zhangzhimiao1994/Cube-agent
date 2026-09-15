@@ -1,6 +1,8 @@
 import json
 import subprocess
 import sys
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import cast
 
@@ -98,6 +100,8 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         "run_events": True,
         "terminal_status": True,
         "final_artifacts": True,
+        "deliverable_quality": True,
+        "deliverable_repair_trace": False,
         "self_repair_trace": False,
         "project_preflight_approval": False,
         "workspace_bundle": True,
@@ -153,6 +157,7 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
                     "run_events": True,
                     "terminal_status": True,
                     "final_artifacts": False,
+                    "deliverable_quality": False,
                     "workspace_bundle": True,
                     "cleanup_cancel": True,
                 },
@@ -168,6 +173,7 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
                     "terminal_status": True,
                     "project_preflight_approval": True,
                     "workspace_bundle": False,
+                    "deliverable_quality": False,
                     "cleanup_cancel": True,
                 },
                 validation_focus=(
@@ -189,6 +195,7 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
     assert payload["failed_cases"] == ["medium:artifact_production", "ultra:self_repair"]
     assert payload["missing_evidence_summary"] == {
         "final_artifacts": 2,
+        "deliverable_quality": 2,
         "workspace_bundle": 1,
         "self_repair_trace": 1,
     }
@@ -215,6 +222,32 @@ def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> N
         "/api/v1/runs",
         "project-scale-small-direct-0-acceptance-20260914",
     )
+
+
+def test_execute_project_scale_plan_repairs_failed_deliverable_quality() -> None:
+    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert report.results[0].run_id == "run-medium-artifact-repair"
+    assert report.results[0].evidence["final_artifacts"] is True
+    assert report.results[0].evidence["workspace_bundle"] is True
+    assert report.results[0].evidence["deliverable_quality"] is True
+    assert report.results[0].evidence["deliverable_repair_trace"] is True
+    assert report.results[0].missing_evidence == ()
+    assert (
+        "POST",
+        "/api/v1/runs",
+        "project-scale-medium-artifact-production-0-deliverable-repair",
+    ) in client.calls
 
 
 def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -> None:
@@ -361,6 +394,7 @@ def test_project_scale_execution_payload_lists_missing_evidence() -> None:
             "run_events": True,
             "terminal_status": True,
             "final_artifacts": False,
+            "deliverable_quality": False,
             "self_repair_trace": False,
             "project_preflight_approval": True,
             "workspace_bundle": True,
@@ -376,12 +410,17 @@ def test_project_scale_execution_payload_lists_missing_evidence() -> None:
         "run_events",
         "terminal_status",
         "final_artifacts",
+        "deliverable_quality",
         "project_preflight_approval",
         "workspace_bundle",
         "cleanup_cancel",
         "self_repair_trace",
     ]
-    assert payload["missing_evidence"] == ["final_artifacts", "self_repair_trace"]
+    assert payload["missing_evidence"] == [
+        "final_artifacts",
+        "deliverable_quality",
+        "self_repair_trace",
+    ]
 
 
 def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> None:
@@ -395,6 +434,7 @@ def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> No
             "terminal_status": True,
             "project_preflight_approval": True,
             "workspace_bundle": True,
+            "deliverable_quality": True,
             "cleanup_cancel": True,
         },
         validation_focus=(
@@ -432,6 +472,8 @@ class FakeAcceptanceClient:
         response_project_id: str | None = None,
         response_session_id: str | None = None,
         details_run_id: str | None = None,
+        deliverable_quality: bool = True,
+        deliverable_quality_sequence: tuple[bool, ...] | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -445,6 +487,10 @@ class FakeAcceptanceClient:
         self.response_project_id = response_project_id
         self.response_session_id = response_session_id
         self.details_run_id = details_run_id
+        self.deliverable_quality = deliverable_quality
+        self.deliverable_quality_sequence = list(deliverable_quality_sequence or ())
+        self.current_deliverable_quality = deliverable_quality
+        self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
 
     def request_json(
@@ -459,8 +505,10 @@ class FakeAcceptanceClient:
         if method == "POST" and path == "/api/v1/runs":
             assert body is not None
             assert body["workspace_session_id"] == self.session_id
+            is_repair = "deliverable-repair" in (idempotency_key or "")
+            run_id = self.repair_run_id if is_repair else self.run_id
             response: dict[str, object] = {
-                "id": self.run_id,
+                "id": run_id,
                 "status": self.create_status or self.statuses[0],
                 "project_id": self.response_project_id or body["project_id"],
                 "workspace_session_id": self.response_session_id or body["workspace_session_id"],
@@ -476,12 +524,43 @@ class FakeAcceptanceClient:
                 "version": self.decision_version,
             }
             return {"id": self.run_id, "status": self.statuses[0]}
-        if path == f"/api/v1/runs/{self.run_id}/details":
+        if path in {
+            f"/api/v1/runs/{self.run_id}/details",
+            f"/api/v1/runs/{self.repair_run_id}/details",
+        }:
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
-            return {"id": self.details_run_id or self.run_id, "status": status, "artifacts": self.artifacts}
-        if path == f"/api/v1/runs/{self.run_id}/events":
-            return list(self.events)
-        if path == f"/api/v1/runs/{self.run_id}/cancel":
+            if path == f"/api/v1/runs/{self.repair_run_id}/details":
+                details_run_id = self.repair_run_id
+            else:
+                details_run_id = self.details_run_id or self.run_id
+            deliverable_quality = self._next_deliverable_quality()
+            details_response: dict[str, object] = {
+                "id": details_run_id,
+                "status": status,
+                "artifacts": self.artifacts,
+            }
+            if deliverable_quality:
+                details_response["deliverable_quality"] = {
+                    "requirements_satisfied": True,
+                    "build_passed": True,
+                    "tests_passed": True,
+                    "interactive_checks_passed": True,
+                    "no_placeholders": True,
+                    "artifact_integrity": True,
+                }
+            return details_response
+        if path in {
+            f"/api/v1/runs/{self.run_id}/events",
+            f"/api/v1/runs/{self.repair_run_id}/events",
+        }:
+            events = list(self.events)
+            if path == f"/api/v1/runs/{self.repair_run_id}/events":
+                events.append({"kind": "deliverable.repair.completed", "run_id": self.repair_run_id})
+            return events
+        if path in {
+            f"/api/v1/runs/{self.run_id}/cancel",
+            f"/api/v1/runs/{self.repair_run_id}/cancel",
+        }:
             return {"id": self.run_id, "status": "cancelled"}
         raise AssertionError(f"unexpected JSON request {method} {path}")
 
@@ -489,4 +568,32 @@ class FakeAcceptanceClient:
         self.calls.append((method, path, None))
         if self.fail_bundle:
             raise RuntimeError("workspace bundle unavailable")
-        return b"PK\x03\x04"
+        if not self.current_deliverable_quality:
+            return _project_bundle({"README.md": "placeholder project"})
+        return _project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "package.json": json.dumps(
+                    {"scripts": {"build": "vite build", "test": "vitest run"}},
+                    sort_keys=True,
+                ),
+                "src/main.ts": "export const status = 'ready';\n",
+                "tests/app.test.ts": "import { status } from '../src/main';\n",
+            }
+        )
+
+    def _next_deliverable_quality(self) -> bool:
+        if self.deliverable_quality_sequence:
+            self.current_deliverable_quality = self.deliverable_quality_sequence.pop(0)
+        else:
+            self.current_deliverable_quality = self.deliverable_quality
+        return self.current_deliverable_quality
+
+
+def _project_bundle(files: dict[str, str]) -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()

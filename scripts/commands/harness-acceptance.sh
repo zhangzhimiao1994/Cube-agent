@@ -2578,6 +2578,7 @@ require(
     "project scale flows",
 )
 require("workspace_bundle" in summary, "project scale evidence")
+require("deliverable_quality" in summary, "project scale quality evidence")
 require("cancel_or_archive_probe_runs" in summary, "project scale cleanup")
 require(matrix.case_count == len(PROJECT_SCALE_TIERS) * len(PROJECT_SCALE_FLOW_KINDS), "case count")
 require(matrix.requires_isolated_workspace is True, "isolated workspace")
@@ -2692,6 +2693,7 @@ result = ProjectScaleCaseResult(
         "terminal_status": True,
         "project_preflight_approval": True,
         "workspace_bundle": True,
+        "deliverable_quality": True,
         "cleanup_cancel": True,
     },
     validation_focus=(
@@ -2727,6 +2729,7 @@ payload = ProjectScaleCaseResult(
         "terminal_status": True,
         "final_artifacts": True,
         "workspace_bundle": True,
+        "deliverable_quality": True,
         "cleanup_cancel": True,
     },
     validation_focus=(
@@ -2766,6 +2769,7 @@ payload = ProjectScaleExecutionReport(
                 "run_events": True,
                 "terminal_status": True,
                 "final_artifacts": False,
+                "deliverable_quality": False,
                 "workspace_bundle": True,
                 "cleanup_cancel": True,
             },
@@ -2781,6 +2785,7 @@ payload = ProjectScaleExecutionReport(
                 "terminal_status": True,
                 "project_preflight_approval": True,
                 "workspace_bundle": False,
+                "deliverable_quality": False,
                 "cleanup_cancel": True,
             },
             validation_focus=(
@@ -2811,7 +2816,7 @@ PY
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
+  if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,deliverable_quality=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
     printf 'fail: project scale execution report failure summary payload\n' >&2
     failures=$((failures + 1))
     return 1
