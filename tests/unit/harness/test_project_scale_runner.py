@@ -7,6 +7,7 @@ from typing import cast
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
+    ProjectScaleExecutionReport,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
@@ -137,6 +138,68 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
         "capability_matrix",
         "mode_control",
         "no_silent_downgrade",
+    ]
+
+
+def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -> None:
+    report = ProjectScaleExecutionReport(
+        results=(
+            ProjectScaleCaseResult(
+                case_id="medium:artifact_production",
+                run_id="run-medium-artifact",
+                status="completed",
+                evidence={
+                    "run_details": True,
+                    "run_events": True,
+                    "terminal_status": True,
+                    "final_artifacts": False,
+                    "workspace_bundle": True,
+                    "cleanup_cancel": True,
+                },
+                validation_focus=("interaction_stability", "final_result", "artifact_integrity"),
+            ),
+            ProjectScaleCaseResult(
+                case_id="ultra:self_repair",
+                run_id="run-ultra-self-repair",
+                status="failed",
+                evidence={
+                    "run_details": True,
+                    "run_events": True,
+                    "terminal_status": True,
+                    "project_preflight_approval": True,
+                    "workspace_bundle": False,
+                    "cleanup_cancel": True,
+                },
+                validation_focus=(
+                    "interaction_stability",
+                    "final_result",
+                    "long_running_control",
+                    "project_preflight",
+                    "fault_injection",
+                    "self_repair",
+                ),
+                errors=("terminal_status: failed",),
+            ),
+        )
+    )
+
+    payload = report.to_payload()
+
+    assert payload["failed_case_count"] == 2
+    assert payload["failed_cases"] == ["medium:artifact_production", "ultra:self_repair"]
+    assert payload["missing_evidence_summary"] == {
+        "final_artifacts": 2,
+        "workspace_bundle": 1,
+        "self_repair_trace": 1,
+    }
+    assert payload["failed_validation_focus"] == [
+        "interaction_stability",
+        "final_result",
+        "artifact_integrity",
+        "long_running_control",
+        "project_preflight",
+        "fault_injection",
+        "self_repair",
     ]
 
 

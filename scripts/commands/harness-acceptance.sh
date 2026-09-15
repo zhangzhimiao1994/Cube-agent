@@ -2576,6 +2576,7 @@ check_project_scale_runner_contract() {
   local report_output
   local text_line_output
   local focus_output
+  local summary_output
   local execute_output
   local execute_status
 
@@ -2709,6 +2710,73 @@ PY
   fi
   if [[ "$focus_output" != "interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade" ]]; then
     printf 'fail: project scale execution result validation focus payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! summary_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+from agent_hub.harness.project_scale_runner import (
+    ProjectScaleCaseResult,
+    ProjectScaleExecutionReport,
+)
+
+payload = ProjectScaleExecutionReport(
+    results=(
+        ProjectScaleCaseResult(
+            case_id="medium:artifact_production",
+            run_id="run-medium-artifact",
+            status="completed",
+            evidence={
+                "run_details": True,
+                "run_events": True,
+                "terminal_status": True,
+                "final_artifacts": False,
+                "workspace_bundle": True,
+                "cleanup_cancel": True,
+            },
+            validation_focus=("interaction_stability", "final_result", "artifact_integrity"),
+        ),
+        ProjectScaleCaseResult(
+            case_id="ultra:self_repair",
+            run_id="run-ultra-self-repair",
+            status="failed",
+            evidence={
+                "run_details": True,
+                "run_events": True,
+                "terminal_status": True,
+                "project_preflight_approval": True,
+                "workspace_bundle": False,
+                "cleanup_cancel": True,
+            },
+            validation_focus=(
+                "interaction_stability",
+                "final_result",
+                "long_running_control",
+                "project_preflight",
+                "fault_injection",
+                "self_repair",
+            ),
+            errors=("terminal_status: failed",),
+        ),
+    )
+).to_payload()
+print(
+    "|".join(
+        (
+            str(payload["failed_case_count"]),
+            ",".join(payload["failed_cases"]),
+            ",".join(f"{key}={value}" for key, value in payload["missing_evidence_summary"].items()),
+            ",".join(payload["failed_validation_focus"]),
+        )
+    )
+)
+PY
+  )"; then
+    printf 'fail: project scale execution report failure summary\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
+    printf 'fail: project scale execution report failure summary payload\n' >&2
     failures=$((failures + 1))
     return 1
   fi

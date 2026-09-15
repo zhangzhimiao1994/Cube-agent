@@ -91,12 +91,21 @@ class ProjectScaleExecutionReport:
     def ok(self) -> bool:
         return all(result.ok for result in self.results)
 
+    @property
+    def failed_results(self) -> tuple[ProjectScaleCaseResult, ...]:
+        return tuple(result for result in self.results if not result.ok)
+
     def to_payload(self) -> dict[str, object]:
+        failed_results = self.failed_results
         return {
             "execute": True,
             "dry_run": False,
             "ok": self.ok,
             "case_count": self.case_count,
+            "failed_case_count": len(failed_results),
+            "failed_cases": [result.case_id for result in failed_results],
+            "missing_evidence_summary": _summarize_missing_evidence(failed_results),
+            "failed_validation_focus": _summarize_validation_focus(failed_results),
             "results": [result.to_payload() for result in self.results],
         }
 
@@ -366,6 +375,22 @@ def format_project_scale_result_line(result: ProjectScaleCaseResult) -> str:
     if result.errors:
         parts.append(f"errors={len(result.errors)}")
     return " ".join(parts)
+
+
+def _summarize_missing_evidence(results: Sequence[ProjectScaleCaseResult]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for result in results:
+        for evidence in result.missing_evidence:
+            summary[evidence] = summary.get(evidence, 0) + 1
+    return summary
+
+
+def _summarize_validation_focus(results: Sequence[ProjectScaleCaseResult]) -> list[str]:
+    focus: dict[str, None] = {}
+    for result in results:
+        for item in result.validation_focus:
+            focus.setdefault(item, None)
+    return list(focus)
 
 
 def _workspace_bundle_path(body: dict[str, object]) -> str:
