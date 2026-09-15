@@ -8,7 +8,6 @@ def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
-
 def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints() -> None:
     pyproject = tomllib.loads(read("pyproject.toml"))
     launcher = read("scripts/agent-hub")
@@ -125,6 +124,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: running recovery guard" in command
     assert "check_approval_resume_crash_recovery_contract" in command
     assert "profile: approval resume crash recovery guard" in command
+    assert "approval-resume recovery must recover every expired approved run" in command
+    assert "approval-resume recovery must ignore active worker race" in command
+    assert "approval-resume recovery must keep approval rows one per run" in command
+    assert "approval-resume recovery must keep outbox rows one per run" in command
+    assert "ok: approval resume crash recovery guard recovered=2 active_race=ignored repeated_sweeps=2" in command
     assert "approval-resume recovery must complete without duplicate approval" in command
     assert "approval-resume recovery must not duplicate outbox submission" in command
     assert "ok: approval resume crash recovery guard" in command

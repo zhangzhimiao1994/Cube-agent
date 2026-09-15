@@ -1950,11 +1950,12 @@ def require(value, label):
 
 
 class ApprovalResumeRecoveryRepository:
-    def __init__(self, run_id: UUID) -> None:
-        self._run_id = run_id
-        self.remaining_candidates = [run_id]
-        self.approval_rows = 1
-        self.outbox_rows = 1
+    def __init__(self, expired_run_ids: tuple[UUID, ...], active_run_id: UUID) -> None:
+        self.expired_run_ids = expired_run_ids
+        self.active_run_id = active_run_id
+        self.remaining_candidates = [*expired_run_ids, active_run_id]
+        self.approval_rows_by_run = {run_id: 1 for run_id in expired_run_ids}
+        self.outbox_rows_by_run = {run_id: 1 for run_id in expired_run_ids}
 
     async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
         del now
@@ -1972,21 +1973,40 @@ class ApprovalResumeRecoveryService(RunService):
             task_queue=UnusedQueue(),
         )
         self._repository_probe = repository
-        self.restored_checkpoint_ids = [uuid4()]
-        self.resume_checkpoint_id = uuid4()
-        self.recover_calls = 0
+        self.initial_checkpoint_ids_by_run = {
+            run_id: uuid4() for run_id in repository.expired_run_ids
+        }
+        self.resume_checkpoint_ids_by_run = {
+            run_id: uuid4() for run_id in repository.expired_run_ids
+        }
+        self.restored_checkpoint_ids_by_run = {
+            run_id: [checkpoint_id]
+            for run_id, checkpoint_id in self.initial_checkpoint_ids_by_run.items()
+        }
+        self.recover_calls: list[UUID] = []
 
     async def recover(self, run_id: UUID) -> SubmittedRun:
-        self.recover_calls += 1
+        self.recover_calls.append(run_id)
+        if run_id == self._repository_probe.active_run_id:
+            return SubmittedRun(
+                id=run_id,
+                tenant_id=uuid4(),
+                status=RunStatus.RUNNING,
+                mode=TaskMode.DISPATCH,
+                decision_token=None,
+                version=2,
+            )
         require(
-            self._repository_probe.approval_rows == 1,
+            self._repository_probe.approval_rows_by_run.get(run_id) == 1,
             "approval-resume recovery must complete without duplicate approval",
         )
         require(
-            self._repository_probe.outbox_rows == 1,
+            self._repository_probe.outbox_rows_by_run.get(run_id) == 1,
             "approval-resume recovery must not duplicate outbox submission",
         )
-        self.restored_checkpoint_ids.append(self.resume_checkpoint_id)
+        self.restored_checkpoint_ids_by_run[run_id].append(
+            self.resume_checkpoint_ids_by_run[run_id]
+        )
         return SubmittedRun(
             id=run_id,
             tenant_id=uuid4(),
@@ -2023,26 +2043,46 @@ class UnusedQueue:
 
 
 async def main() -> None:
-    run_id = uuid4()
-    repository = ApprovalResumeRecoveryRepository(run_id)
+    first_run_id = uuid4()
+    second_run_id = uuid4()
+    active_run_id = uuid4()
+    expired_run_ids = (first_run_id, second_run_id)
+    repository = ApprovalResumeRecoveryRepository(expired_run_ids, active_run_id)
     service = ApprovalResumeRecoveryService(repository)
 
     recovered = await service.recover_running(limit=10)
     duplicate_recovered = await service.recover_running(limit=10)
 
-    require(recovered == 1, "approval-resume recovery must recover one expired run")
-    require(duplicate_recovered == 0, "approval-resume recovery must not recover twice")
-    require(service.recover_calls == 1, "approval-resume recovery must call recover once")
     require(
-        len(service.restored_checkpoint_ids) == 2,
+        recovered == len(expired_run_ids),
+        "approval-resume recovery must recover every expired approved run",
+    )
+    require(duplicate_recovered == 0, "approval-resume recovery must not recover twice")
+    require(
+        service.recover_calls == [*expired_run_ids, active_run_id],
+        "approval-resume recovery must ignore active worker race",
+    )
+    require(
+        all(
+            len(service.restored_checkpoint_ids_by_run[run_id]) == 2
+            for run_id in expired_run_ids
+        ),
         "approval-resume recovery must restore initial and resumed checkpoints",
     )
     require(
-        repository.approval_rows == 1,
+        all(repository.approval_rows_by_run[run_id] == 1 for run_id in expired_run_ids),
+        "approval-resume recovery must keep approval rows one per run",
+    )
+    require(
+        all(repository.outbox_rows_by_run[run_id] == 1 for run_id in expired_run_ids),
+        "approval-resume recovery must keep outbox rows one per run",
+    )
+    require(
+        all(repository.approval_rows_by_run[run_id] == 1 for run_id in expired_run_ids),
         "approval-resume recovery must complete without duplicate approval",
     )
     require(
-        repository.outbox_rows == 1,
+        all(repository.outbox_rows_by_run[run_id] == 1 for run_id in expired_run_ids),
         "approval-resume recovery must not duplicate outbox submission",
     )
 
@@ -2050,7 +2090,7 @@ async def main() -> None:
 asyncio.run(main())
 PY
   then
-    printf 'ok: approval resume crash recovery guard\n'
+    printf 'ok: approval resume crash recovery guard recovered=2 active_race=ignored repeated_sweeps=2\n'
     return 0
   fi
   printf 'fail: approval resume crash recovery guard\n' >&2
