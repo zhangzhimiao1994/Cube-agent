@@ -4,7 +4,10 @@ import sys
 from pathlib import Path
 
 from agent_hub.harness.project_scale import build_project_scale_run_plan
-from agent_hub.harness.project_scale_runner import execute_project_scale_plan
+from agent_hub.harness.project_scale_runner import (
+    ProjectScaleCaseResult,
+    execute_project_scale_plan,
+)
 
 
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
@@ -245,6 +248,39 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     assert report.results[0].evidence["final_artifacts"] is True
     assert report.results[0].evidence["self_repair_trace"] is True
     assert client.calls.count(("GET", "/api/v1/runs/run-small-self-repair/details", None)) == 2
+
+
+def test_project_scale_execution_payload_lists_missing_evidence() -> None:
+    result = ProjectScaleCaseResult(
+        case_id="ultra:self_repair",
+        run_id="run-ultra-self-repair",
+        status="completed",
+        evidence={
+            "run_details": True,
+            "run_events": True,
+            "terminal_status": True,
+            "final_artifacts": False,
+            "self_repair_trace": False,
+            "project_preflight_approval": True,
+            "workspace_bundle": True,
+            "cleanup_cancel": True,
+        },
+    )
+
+    payload = result.to_payload()
+
+    assert payload["ok"] is False
+    assert payload["required_evidence"] == [
+        "run_details",
+        "run_events",
+        "terminal_status",
+        "final_artifacts",
+        "project_preflight_approval",
+        "workspace_bundle",
+        "cleanup_cancel",
+        "self_repair_trace",
+    ]
+    assert payload["missing_evidence"] == ["final_artifacts", "self_repair_trace"]
 
 
 class FakeAcceptanceClient:

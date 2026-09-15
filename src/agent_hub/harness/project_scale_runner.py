@@ -40,7 +40,7 @@ class ProjectScaleCaseResult:
     errors: tuple[str, ...] = ()
 
     @property
-    def ok(self) -> bool:
+    def required_evidence(self) -> tuple[str, ...]:
         required: tuple[str, ...] = (
             "run_details",
             "run_events",
@@ -54,7 +54,15 @@ class ProjectScaleCaseResult:
             required = tuple(key for key in required if key != "project_preflight_approval")
         if "self_repair" in self.case_id or "model_failure" in self.case_id:
             required = (*required, "self_repair_trace")
-        return not self.errors and all(self.evidence.get(key) is True for key in required)
+        return required
+
+    @property
+    def missing_evidence(self) -> tuple[str, ...]:
+        return tuple(key for key in self.required_evidence if self.evidence.get(key) is not True)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors and not self.missing_evidence
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -62,6 +70,8 @@ class ProjectScaleCaseResult:
             "run_id": self.run_id,
             "status": self.status,
             "ok": self.ok,
+            "required_evidence": list(self.required_evidence),
+            "missing_evidence": list(self.missing_evidence),
             "evidence": dict(self.evidence),
             "errors": list(self.errors),
         }
