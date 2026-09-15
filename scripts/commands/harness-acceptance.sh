@@ -1281,6 +1281,10 @@ for message in (
     "创建提醒：每天9点提醒我填写日报",
     "设置闹钟：每天9点填写日报",
     "create reminder every day at 9am to fill daily report",
+    "项目每完成一个较大的功能，罗列任务计划和完成情况。",
+    "以后罗列清单之后，不要停止任务，一边开展任务，一边罗列",
+    "不打断任务，给我罗列一下当前计划完成情况，然后罗列之后继续任务",
+    "完成之后按流程继续就行了，不用再问我",
 ):
     require(
         _looks_like_schedule_intent(message, message.lower()) is False,

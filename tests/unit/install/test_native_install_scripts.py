@@ -179,6 +179,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: acceptance credential readiness bearer_token=set" in command
     assert "ok: acceptance credential readiness login_credentials=set" in command
     assert "skip: acceptance credential readiness no bearer or login credentials configured" in command
+    assert "项目每完成一个较大的功能，罗列任务计划和完成情况。" in command
+    assert "以后罗列清单之后，不要停止任务，一边开展任务，一边罗列" in command
+    assert "不打断任务，给我罗列一下当前计划完成情况，然后罗列之后继续任务" in command
+    assert "完成之后按流程继续就行了，不用再问我" in command
     assert "AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES" in command
     assert "AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS" in command
