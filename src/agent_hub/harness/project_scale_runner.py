@@ -47,6 +47,23 @@ _AGENT_STANDARD_PAYLOAD_KEYS = (
     "codex_claude_verification",
     "verification_standard",
 )
+_DISCUSSION_TRACE_PAYLOAD_KEYS = (
+    "discussion_trace",
+    "dispatch_discussion_trace",
+    "coordination_trace",
+)
+_DISCUSSION_TRACE_FLOWS = frozenset(
+    {
+        "dispatch",
+        "hybrid",
+        "multi_agent",
+        "plugin",
+        "model_failure",
+        "self_repair",
+        "artifact_production",
+        "capability_validation",
+    }
+)
 _PLACEHOLDER_MARKERS = (
     "lorem ipsum",
     "placeholder project",
@@ -94,6 +111,8 @@ class ProjectScaleCaseResult:
         )
         if not _case_requires_project_preflight(self.case_id):
             required = tuple(key for key in required if key != "project_preflight_approval")
+        if _case_requires_discussion_trace(self.case_id):
+            required = (*required, "discussion_trace")
         if "self_repair" in self.case_id or "model_failure" in self.case_id:
             required = (*required, "self_repair_trace")
         return required
@@ -236,6 +255,7 @@ def execute_project_scale_plan(
             "final_artifacts": False,
             "deliverable_quality": False,
             "agent_standard_verification": False,
+            "discussion_trace": False,
             "deliverable_repair_trace": False,
             "self_repair_trace": False,
             "project_preflight_approval": False,
@@ -319,7 +339,17 @@ def execute_project_scale_plan(
                 observation.workspace_bundle,
             )
             evidence["agent_standard_verification"] = agent_standard_verification.passed
-            if _should_attempt_deliverable_repair(status=status, evidence=evidence):
+            discussion_trace = _evaluate_discussion_trace(
+                observation.details,
+                observation.events,
+                case_id=run_request.case_id,
+            )
+            evidence["discussion_trace"] = discussion_trace.passed
+            if _should_attempt_deliverable_repair(
+                status=status,
+                evidence=evidence,
+                case_id=run_request.case_id,
+            ):
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
@@ -329,6 +359,7 @@ def execute_project_scale_plan(
                         failed_reasons=(
                             *deliverable_quality.reasons,
                             *agent_standard_verification.reasons,
+                            *discussion_trace.reasons,
                         ),
                     ),
                     idempotency_key=_deliverable_repair_idempotency_key(
@@ -392,18 +423,33 @@ def execute_project_scale_plan(
                     repair_observation.workspace_bundle,
                 )
                 evidence["agent_standard_verification"] = agent_standard_verification.passed
+                discussion_trace = _evaluate_discussion_trace(
+                    repair_observation.details,
+                    repair_observation.events,
+                    case_id=run_request.case_id,
+                )
+                evidence["discussion_trace"] = discussion_trace.passed
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
                 and (
                     not evidence["deliverable_quality"]
                     or not evidence["agent_standard_verification"]
+                    or (
+                        _case_requires_discussion_trace(run_request.case_id)
+                        and not evidence["discussion_trace"]
+                    )
                 )
             ):
                 if not evidence["deliverable_quality"]:
                     errors.extend(deliverable_quality.reasons)
                 if not evidence["agent_standard_verification"]:
                     errors.extend(agent_standard_verification.reasons)
+                if (
+                    _case_requires_discussion_trace(run_request.case_id)
+                    and not evidence["discussion_trace"]
+                ):
+                    errors.extend(discussion_trace.reasons)
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -724,7 +770,10 @@ def _deliverable_repair_body(
         "no_placeholders, and artifact_integrity all true. Also record "
         "agent_standard_verification with constraints_read, plan_before_implementation, "
         "reproducible_verification, and root_cause_repair all true, and keep implementation "
-        f"plan plus verification notes in the workspace.{reason_text} Original request:\n"
+        "plan plus verification notes in the workspace. When the run uses dispatch, hybrid, "
+        "multi-agent, discussion, or repair coordination, record discussion_trace with "
+        "participants, member statements, disagreements, verification steps, and final decision "
+        f"so the workbench can show the scheduling debate.{reason_text} Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
     repair_body["skip_evolution_proposal"] = True
@@ -756,6 +805,11 @@ def _safe_idempotency_token(value: str) -> str:
 def _case_requires_project_preflight(case_id: str) -> bool:
     scale, _, _flow = case_id.partition(":")
     return scale in {"large", "ultra"}
+
+
+def _case_requires_discussion_trace(case_id: str) -> bool:
+    _scale, _, flow = case_id.partition(":")
+    return flow in _DISCUSSION_TRACE_FLOWS
 
 
 def _project_preflight_approval_body(response: dict[str, object]) -> dict[str, object]:
@@ -831,6 +885,22 @@ def _evaluate_agent_standard_verification(
     return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
 
 
+def _evaluate_discussion_trace(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    *,
+    case_id: str,
+) -> _EvidenceCheck:
+    if not _case_requires_discussion_trace(case_id):
+        return _EvidenceCheck(passed=False, reasons=())
+    if _has_discussion_trace_payload(details, events):
+        return _EvidenceCheck(passed=True, reasons=())
+    return _EvidenceCheck(
+        passed=False,
+        reasons=("discussion_trace: missing hybrid/discussion process evidence",),
+    )
+
+
 def _has_quality_payload(details: dict[str, object] | None, events: list[object] | None) -> bool:
     if details is not None and _mapping_has_quality_payload(details):
         return True
@@ -874,6 +944,31 @@ def _mapping_has_agent_standard_payload(mapping: Mapping[str, object]) -> bool:
     return False
 
 
+def _has_discussion_trace_payload(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+) -> bool:
+    if details is not None and _mapping_has_discussion_trace_payload(details):
+        return True
+    if events is None:
+        return False
+    return any(
+        isinstance(event, dict) and _mapping_has_discussion_trace_payload(event)
+        for event in events
+    )
+
+
+def _mapping_has_discussion_trace_payload(mapping: Mapping[str, object]) -> bool:
+    for key in _DISCUSSION_TRACE_PAYLOAD_KEYS:
+        value = mapping.get(key)
+        if _discussion_trace_payload_passes(value):
+            return True
+        payload = mapping.get("payload")
+        if isinstance(payload, Mapping) and _discussion_trace_payload_passes(payload.get(key)):
+            return True
+    return False
+
+
 def _agent_standard_payload_passes(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -884,6 +979,38 @@ def _quality_payload_passes(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
     return all(value.get(key) is True for key in _QUALITY_KEYS)
+
+
+def _discussion_trace_payload_passes(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        _non_empty_sequence(value.get("participants"))
+        and _non_empty_sequence(value.get("member_statements"))
+        and _has_present_field(value, ("disagreements", "disagreement_summary"))
+        and _non_empty_sequence(value.get("verification_steps"))
+        and _non_empty_text(value.get("final_decision"))
+    )
+
+
+def _non_empty_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes) and bool(value)
+
+
+def _non_empty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _has_present_field(mapping: Mapping[str, object], keys: Sequence[str]) -> bool:
+    for key in keys:
+        if key not in mapping:
+            continue
+        value = mapping[key]
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            return True
+        if _non_empty_text(value):
+            return True
+    return False
 
 
 def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> bool:
@@ -1038,7 +1165,12 @@ def _bundle_has_verification_path_or_script(
     return isinstance(scripts, dict) and bool({"build", "test"} <= set(scripts))
 
 
-def _should_attempt_deliverable_repair(*, status: str | None, evidence: dict[str, bool]) -> bool:
+def _should_attempt_deliverable_repair(
+    *,
+    status: str | None,
+    evidence: dict[str, bool],
+    case_id: str,
+) -> bool:
     return (
         status == "completed"
         and evidence.get("final_artifacts") is True
@@ -1046,6 +1178,10 @@ def _should_attempt_deliverable_repair(*, status: str | None, evidence: dict[str
         and (
             evidence.get("deliverable_quality") is not True
             or evidence.get("agent_standard_verification") is not True
+            or (
+                _case_requires_discussion_trace(case_id)
+                and evidence.get("discussion_trace") is not True
+            )
         )
     )
 

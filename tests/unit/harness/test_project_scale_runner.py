@@ -38,6 +38,7 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
     )
     assert "run_events" in payload["required_evidence"]
     assert "agent_standard_verification" in payload["required_evidence"]
+    assert "discussion_trace" in payload["required_evidence"]
     assert "delete_workspace" in payload["cleanup_actions"]
 
 
@@ -104,6 +105,7 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         "final_artifacts": True,
         "deliverable_quality": True,
         "agent_standard_verification": True,
+        "discussion_trace": False,
         "deliverable_repair_trace": False,
         "self_repair_trace": False,
         "project_preflight_approval": False,
@@ -224,6 +226,7 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
         "final_artifacts": 2,
         "deliverable_quality": 2,
         "agent_standard_verification": 2,
+        "discussion_trace": 2,
         "workspace_bundle": 1,
         "self_repair_trace": 1,
     }
@@ -302,6 +305,27 @@ def test_execute_project_scale_plan_repairs_missing_agent_standard_verification(
     assert "agent_standard_verification" in repair_message
     assert "plan_before_implementation" in repair_message
     assert "root_cause_repair" in repair_message
+
+
+def test_execute_project_scale_plan_repairs_missing_hybrid_discussion_trace() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("hybrid",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-hybrid",
+        session_id="project-scale-small-hybrid",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        discussion_trace_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert report.results[0].run_id == "run-small-hybrid-repair"
+    assert report.results[0].evidence["discussion_trace"] is True
+    assert report.results[0].evidence["deliverable_repair_trace"] is True
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "discussion_trace: missing hybrid/discussion process evidence" in repair_message
+    assert "record discussion_trace" in repair_message
 
 
 def test_execute_project_scale_plan_explains_quality_and_standard_repair_reasons() -> None:
@@ -493,12 +517,14 @@ def test_project_scale_execution_payload_lists_missing_evidence() -> None:
         "project_preflight_approval",
         "workspace_bundle",
         "cleanup_cancel",
+        "discussion_trace",
         "self_repair_trace",
     ]
     assert payload["missing_evidence"] == [
         "final_artifacts",
         "deliverable_quality",
         "agent_standard_verification",
+        "discussion_trace",
         "self_repair_trace",
     ]
 
@@ -532,7 +558,7 @@ def test_project_scale_execution_text_line_lists_failed_case_diagnostics() -> No
     assert line == (
         "ultra:self_repair run_id=run-ultra-self-repair ok=false "
         "focus=interaction_stability,final_result,self_repair,project_preflight_approval "
-        "missing=final_artifacts,self_repair_trace errors=1"
+        "missing=final_artifacts,discussion_trace,self_repair_trace errors=1"
     )
 
 
@@ -557,6 +583,8 @@ class FakeAcceptanceClient:
         deliverable_quality_sequence: tuple[bool, ...] | None = None,
         agent_standard: bool = True,
         agent_standard_sequence: tuple[bool, ...] | None = None,
+        discussion_trace: bool = True,
+        discussion_trace_sequence: tuple[bool, ...] | None = None,
         actual_mode: str | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
@@ -577,6 +605,9 @@ class FakeAcceptanceClient:
         self.agent_standard = agent_standard
         self.agent_standard_sequence = list(agent_standard_sequence or ())
         self.current_agent_standard = agent_standard
+        self.discussion_trace = discussion_trace
+        self.discussion_trace_sequence = list(discussion_trace_sequence or ())
+        self.current_discussion_trace = discussion_trace
         self.actual_mode = actual_mode
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
@@ -626,6 +657,7 @@ class FakeAcceptanceClient:
                 details_run_id = self.details_run_id or self.run_id
             deliverable_quality = self._next_deliverable_quality()
             agent_standard = self._next_agent_standard()
+            discussion_trace = self._next_discussion_trace()
             details_response: dict[str, object] = {
                 "id": details_run_id,
                 "status": status,
@@ -647,6 +679,30 @@ class FakeAcceptanceClient:
                     "plan_before_implementation": True,
                     "reproducible_verification": True,
                     "root_cause_repair": True,
+                }
+            if discussion_trace:
+                details_response["discussion_trace"] = {
+                    "participants": ["planner", "reviewer"],
+                    "member_statements": [
+                        {
+                            "agent": "planner",
+                            "summary": "proposed the implementation path and acceptance gates",
+                        },
+                        {
+                            "agent": "reviewer",
+                            "summary": "challenged missing verification evidence before approval",
+                        },
+                    ],
+                    "disagreements": [
+                        {
+                            "topic": "verification depth",
+                            "resolution": "run build, unit, and interaction checks before finalizing",
+                        }
+                    ],
+                    "verification_steps": ["compare requirements", "inspect artifacts", "review tests"],
+                    "final_decision": (
+                        "planner and reviewer selected the implementation path after evidence review"
+                    ),
                 }
             return details_response
         if path in {
@@ -711,6 +767,13 @@ class FakeAcceptanceClient:
         else:
             self.current_agent_standard = self.agent_standard
         return self.current_agent_standard
+
+    def _next_discussion_trace(self) -> bool:
+        if self.discussion_trace_sequence:
+            self.current_discussion_trace = self.discussion_trace_sequence.pop(0)
+        else:
+            self.current_discussion_trace = self.discussion_trace
+        return self.current_discussion_trace
 
 
 def _project_bundle(files: dict[str, str]) -> bytes:

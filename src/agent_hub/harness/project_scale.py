@@ -36,6 +36,7 @@ PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "final_artifacts",
     "deliverable_quality",
     "agent_standard_verification",
+    "discussion_trace",
     "project_preflight_approval",
     "self_repair_trace",
 )

@@ -29,6 +29,7 @@ def test_project_scale_matrix_requires_isolation_evidence_and_cleanup() -> None:
     assert "final_artifacts" in matrix.required_evidence
     assert "deliverable_quality" in matrix.required_evidence
     assert "agent_standard_verification" in matrix.required_evidence
+    assert "discussion_trace" in matrix.required_evidence
     assert "project_preflight_approval" in matrix.required_evidence
     assert "self_repair_trace" in matrix.required_evidence
     assert "release_health" not in matrix.required_evidence
@@ -124,6 +125,7 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
         "final_artifacts",
         "deliverable_quality",
         "agent_standard_verification",
+        "discussion_trace",
         "project_preflight_approval",
         "self_repair_trace",
     )
