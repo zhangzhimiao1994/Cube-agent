@@ -28,6 +28,7 @@ def test_project_scale_matrix_requires_isolation_evidence_and_cleanup() -> None:
     assert "run_events" in matrix.required_evidence
     assert "final_artifacts" in matrix.required_evidence
     assert "deliverable_quality" in matrix.required_evidence
+    assert "agent_standard_verification" in matrix.required_evidence
     assert "project_preflight_approval" in matrix.required_evidence
     assert "self_repair_trace" in matrix.required_evidence
     assert "release_health" in matrix.required_evidence
@@ -83,6 +84,7 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
         assert "satisfy the requested requirements" in message
         assert "avoid placeholder or stub-only output" in message
         assert "deliverable_quality" in message
+        assert "agent_standard_verification" in message
         assert "Codex/Claude Code verification standards" in message
         assert "plan before implementation" in message
         assert "repair root causes" in message
@@ -121,6 +123,7 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
         "workspace_bundle",
         "final_artifacts",
         "deliverable_quality",
+        "agent_standard_verification",
         "project_preflight_approval",
         "self_repair_trace",
         "release_health",
@@ -156,10 +159,12 @@ def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
                     "and flow=capability_validation. Read constraints first, keep interaction "
                     "stable, use the approved workspace, produce final artifacts, satisfy "
                     "the requested requirements, verify build/test/interaction behavior, avoid "
-                    "placeholder or stub-only output, record deliverable_quality evidence, and "
-                    "follow Codex/Claude Code verification standards: read constraints, plan "
-                    "before implementation, verify with reproducible evidence, and repair root "
-                    "causes instead of silently degrading."
+                    "placeholder or stub-only output, record deliverable_quality and "
+                    "agent_standard_verification evidence, include a lightweight implementation "
+                    "plan and verification note in the workspace, and follow Codex/Claude Code "
+                    "verification standards: read constraints, plan before implementation, verify "
+                    "with reproducible evidence, and repair root causes instead of silently "
+                    "degrading."
                 ),
                 "mode": "hybrid",
                 "project_id": "project-scale-acceptance",

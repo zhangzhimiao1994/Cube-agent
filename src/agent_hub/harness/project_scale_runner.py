@@ -34,6 +34,19 @@ _QUALITY_PAYLOAD_KEYS = (
     "quality_gate",
     "acceptance",
 )
+_AGENT_STANDARD_KEYS = frozenset(
+    {
+        "constraints_read",
+        "plan_before_implementation",
+        "reproducible_verification",
+        "root_cause_repair",
+    }
+)
+_AGENT_STANDARD_PAYLOAD_KEYS = (
+    "agent_standard_verification",
+    "codex_claude_verification",
+    "verification_standard",
+)
 _PLACEHOLDER_MARKERS = (
     "lorem ipsum",
     "placeholder project",
@@ -74,6 +87,7 @@ class ProjectScaleCaseResult:
             "terminal_status",
             "final_artifacts",
             "deliverable_quality",
+            "agent_standard_verification",
             "project_preflight_approval",
             "workspace_bundle",
             "cleanup_cancel",
@@ -215,6 +229,7 @@ def execute_project_scale_plan(
             "terminal_status": False,
             "final_artifacts": False,
             "deliverable_quality": False,
+            "agent_standard_verification": False,
             "deliverable_repair_trace": False,
             "self_repair_trace": False,
             "project_preflight_approval": False,
@@ -243,6 +258,14 @@ def execute_project_scale_plan(
             run_id = raw_run_id
             status = _string_value(response.get("status"))
             _validate_run_submission_scope(response, run_request.body)
+            _extend_unique(
+                errors,
+                _validate_mode_control(
+                    response,
+                    requested_body=run_request.body,
+                    validation_focus=run_request.validation_focus,
+                ),
+            )
             if _case_requires_project_preflight(run_request.case_id):
                 approval_body = _project_preflight_approval_body(response)
                 approval = client.request_json(
@@ -266,11 +289,24 @@ def execute_project_scale_plan(
                 errors=errors,
             )
             status = observation.status
+            _extend_unique(
+                errors,
+                _validate_mode_control(
+                    observation.details,
+                    requested_body=run_request.body,
+                    validation_focus=run_request.validation_focus,
+                ),
+            )
             if evidence["terminal_status"] and status != "completed":
                 errors.append(f"terminal_status: {status or 'unknown'}")
 
             evidence["self_repair_trace"] = _has_self_repair_trace(observation.events)
             evidence["deliverable_quality"] = _has_deliverable_quality(
+                observation.details,
+                observation.events,
+                observation.workspace_bundle,
+            )
+            evidence["agent_standard_verification"] = _has_agent_standard_verification(
                 observation.details,
                 observation.events,
                 observation.workspace_bundle,
@@ -289,6 +325,14 @@ def execute_project_scale_plan(
                 if not isinstance(repair_response, dict):
                     raise TypeError("deliverable repair returned non-object JSON")
                 _validate_run_submission_scope(repair_response, run_request.body)
+                _extend_unique(
+                    errors,
+                    _validate_mode_control(
+                        repair_response,
+                        requested_body=run_request.body,
+                        validation_focus=run_request.validation_focus,
+                    ),
+                )
                 repair_run_id = repair_response.get("id")
                 if not isinstance(repair_run_id, str) or not repair_run_id:
                     raise RuntimeError("deliverable repair response missing id")
@@ -306,6 +350,14 @@ def execute_project_scale_plan(
                     errors=errors,
                 )
                 status = repair_observation.status
+                _extend_unique(
+                    errors,
+                    _validate_mode_control(
+                        repair_observation.details,
+                        requested_body=run_request.body,
+                        validation_focus=run_request.validation_focus,
+                    ),
+                )
                 if evidence["terminal_status"] and status != "completed":
                     errors.append(f"terminal_status: {status or 'unknown'}")
                 evidence["self_repair_trace"] = (
@@ -318,12 +370,25 @@ def execute_project_scale_plan(
                     repair_observation.events,
                     repair_observation.workspace_bundle,
                 )
+                evidence["agent_standard_verification"] = _has_agent_standard_verification(
+                    repair_observation.details,
+                    repair_observation.events,
+                    repair_observation.workspace_bundle,
+                )
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
-                and not evidence["deliverable_quality"]
+                and (
+                    not evidence["deliverable_quality"]
+                    or not evidence["agent_standard_verification"]
+                )
             ):
-                errors.append("deliverable_quality: project deliverable failed quality gate")
+                if not evidence["deliverable_quality"]:
+                    errors.append("deliverable_quality: project deliverable failed quality gate")
+                if not evidence["agent_standard_verification"]:
+                    errors.append(
+                        "agent_standard_verification: missing reproducible planning and repair evidence"
+                    )
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -466,6 +531,12 @@ def _summarize_validation_focus(results: Sequence[ProjectScaleCaseResult]) -> li
     return list(focus)
 
 
+def _extend_unique(target: list[str], items: Sequence[str]) -> None:
+    for item in items:
+        if item not in target:
+            target.append(item)
+
+
 def _workspace_bundle_path(body: dict[str, object]) -> str:
     project_id = body.get("project_id")
     session_id = body.get("workspace_session_id")
@@ -548,6 +619,29 @@ def _validate_run_submission_scope(response: dict[str, object], body: dict[str, 
             raise RuntimeError(f"run scope mismatch: {field} expected {expected} got {got}")
 
 
+def _validate_mode_control(
+    response: dict[str, object] | None,
+    *,
+    requested_body: dict[str, object],
+    validation_focus: Sequence[str],
+) -> list[str]:
+    if (
+        "mode_control" not in validation_focus
+        and "no_silent_downgrade" not in validation_focus
+    ):
+        return []
+    requested = requested_body.get("mode")
+    if not isinstance(requested, str) or not requested:
+        return ["mode_control: request missing mode"]
+    if response is None:
+        return ["mode_control: response missing mode"]
+    actual = response.get("mode")
+    if actual != requested:
+        got = actual if isinstance(actual, str) and actual else "missing"
+        return [f"mode_control: requested {requested} got {got}"]
+    return []
+
+
 def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None:
     actual = details.get("id")
     if actual != run_id:
@@ -609,7 +703,10 @@ def _deliverable_repair_body(
         "repair the implementation in the same workspace, rerun build/test/interaction checks, "
         "remove placeholders or stub-only output, and record deliverable_quality with "
         "requirements_satisfied, build_passed, tests_passed, interactive_checks_passed, "
-        "no_placeholders, and artifact_integrity all true. Original request:\n"
+        "no_placeholders, and artifact_integrity all true. Also record "
+        "agent_standard_verification with constraints_read, plan_before_implementation, "
+        "reproducible_verification, and root_cause_repair all true, and keep implementation "
+        "plan plus verification notes in the workspace. Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
     repair_body["skip_evolution_proposal"] = True
@@ -674,6 +771,16 @@ def _has_deliverable_quality(
     )
 
 
+def _has_agent_standard_verification(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    workspace_bundle: bytes | None,
+) -> bool:
+    return _has_agent_standard_payload(
+        details, events
+    ) and _workspace_bundle_has_agent_standard_evidence(workspace_bundle)
+
+
 def _has_quality_payload(details: dict[str, object] | None, events: list[object] | None) -> bool:
     if details is not None and _mapping_has_quality_payload(details):
         return True
@@ -691,6 +798,36 @@ def _mapping_has_quality_payload(mapping: Mapping[str, object]) -> bool:
         if isinstance(payload, Mapping) and _quality_payload_passes(payload.get(key)):
             return True
     return False
+
+
+def _has_agent_standard_payload(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+) -> bool:
+    if details is not None and _mapping_has_agent_standard_payload(details):
+        return True
+    if events is None:
+        return False
+    return any(
+        isinstance(event, dict) and _mapping_has_agent_standard_payload(event) for event in events
+    )
+
+
+def _mapping_has_agent_standard_payload(mapping: Mapping[str, object]) -> bool:
+    for key in _AGENT_STANDARD_PAYLOAD_KEYS:
+        value = mapping.get(key)
+        if _agent_standard_payload_passes(value):
+            return True
+        payload = mapping.get("payload")
+        if isinstance(payload, Mapping) and _agent_standard_payload_passes(payload.get(key)):
+            return True
+    return False
+
+
+def _agent_standard_payload_passes(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return all(value.get(key) is True for key in _AGENT_STANDARD_KEYS)
 
 
 def _quality_payload_passes(value: object) -> bool:
@@ -718,6 +855,35 @@ def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> boo
         and _bundle_has_source_files(lowered)
         and _bundle_has_verification_path_or_script(lowered, package_json)
         and not any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS)
+    )
+
+
+def _workspace_bundle_has_agent_standard_evidence(workspace_bundle: bytes | None) -> bool:
+    if not workspace_bundle:
+        return False
+    try:
+        with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+            names = tuple(name for name in archive.namelist() if not name.endswith("/"))
+            lowered = tuple(name.lower() for name in names)
+    except (OSError, zipfile.BadZipFile):
+        return False
+    basenames = {name.rsplit("/", 1)[-1] for name in lowered}
+    return bool(
+        basenames
+        & {
+            "implementation_plan.md",
+            "project_plan.md",
+            "plan.md",
+            "architecture_plan.md",
+        }
+    ) and bool(
+        basenames
+        & {
+            "verification.md",
+            "test_report.md",
+            "acceptance_report.md",
+            "validation.md",
+        }
     )
 
 
@@ -810,7 +976,10 @@ def _should_attempt_deliverable_repair(*, status: str | None, evidence: dict[str
         status == "completed"
         and evidence.get("final_artifacts") is True
         and evidence.get("workspace_bundle") is True
-        and evidence.get("deliverable_quality") is not True
+        and (
+            evidence.get("deliverable_quality") is not True
+            or evidence.get("agent_standard_verification") is not True
+        )
     )
 
 

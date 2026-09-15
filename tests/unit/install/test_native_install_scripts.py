@@ -164,6 +164,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     )
     assert "workspace_bundle" in command
     assert "deliverable_quality" in command
+    assert "agent_standard_verification" in command
+    assert "agent verification standard evidence" in command
     assert "cancel_or_archive_probe_runs" in command
     assert "ok: project scale acceptance matrix" in command
     assert "check_project_scale_runner_contract" in command
@@ -183,6 +185,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "agent verification standard focus" in command
     assert "execution result validation focus" in command
     assert "format_project_scale_result_line" in command
+    assert "agent_standard_verification=2" in command
     assert "missing=final_artifacts,self_repair_trace errors=1" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command
     assert "ok: project scale execution runner" in command

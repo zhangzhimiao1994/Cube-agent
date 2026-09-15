@@ -35,6 +35,7 @@ PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "workspace_bundle",
     "final_artifacts",
     "deliverable_quality",
+    "agent_standard_verification",
     "project_preflight_approval",
     "self_repair_trace",
     "release_health",
@@ -281,9 +282,10 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         f"and flow={case.flow}. Read constraints first, keep interaction stable, use the "
         "approved workspace, produce final artifacts, satisfy the requested requirements, "
         "verify build/test/interaction behavior, avoid placeholder or stub-only output, record "
-        "deliverable_quality evidence, and follow Codex/Claude Code verification standards: "
-        "read constraints, plan before implementation, verify with reproducible evidence, and "
-        "repair root causes instead of silently degrading."
+        "deliverable_quality and agent_standard_verification evidence, include a lightweight "
+        "implementation plan and verification note in the workspace, and follow Codex/Claude "
+        "Code verification standards: read constraints, plan before implementation, verify with "
+        "reproducible evidence, and repair root causes instead of silently degrading."
     )
 
 
