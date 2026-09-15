@@ -86,6 +86,8 @@ const REPAIR_ERROR_CODE_LABELS: Record<string, string> = {
   "plugin.backend_unavailable": "插件后端不可用",
   "plugin.endpoint_unavailable": "插件端点不可用",
   "plugin.sandbox_unsupported": "插件沙箱不支持",
+  "mcp.tool_unavailable": "MCP 工具不可用",
+  "mcp.timeout": "MCP 调用超时",
   "mcp.server_not_discovered": "MCP 服务未发现",
   "mcp.server_timeout": "MCP 服务超时",
   "mcp.server_failed": "MCP 服务失败",

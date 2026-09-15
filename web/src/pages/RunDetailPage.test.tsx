@@ -858,10 +858,13 @@ describe("RunDetailPage", () => {
     expect(within(summary).getByText("能力执行边界")).not.toBeNull();
     expect(
       within(summary).getByText(
-        "2 个角色，3 项能力，库存 4，失败码 3，mcp.server_failed 1，plugin.invalid_arguments 1，plugin.timeout 2，已截断",
+        "2 个角色，3 项能力，库存 4，失败码 3，MCP 服务失败 1，插件参数无效 1，插件执行超时 2，已截断",
       ),
     ).not.toBeNull();
     expect(within(summary).getByText("已记录能力协商")).not.toBeNull();
+    expect(within(summary).queryByText(/mcp\.server_failed/)).toBeNull();
+    expect(within(summary).queryByText(/plugin\.invalid_arguments/)).toBeNull();
+    expect(within(summary).queryByText(/plugin\.timeout/)).toBeNull();
     expect(screen.queryByText("sk_secret")).toBeNull();
     expect(screen.queryByText("plugin.secret_token")).toBeNull();
     expect(screen.queryByText("token_leak")).toBeNull();

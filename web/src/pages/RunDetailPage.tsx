@@ -1397,7 +1397,7 @@ function safeFailureCodeCounts(value: unknown) {
 function failureCodeCountsLabel(counts: Record<string, number>) {
   return Object.entries(counts)
     .filter(([, count]) => count > 0)
-    .map(([code, count]) => `${code} ${count}`)
+    .map(([code, count]) => `${repairErrorCodeLabel(code)} ${count}`)
     .join("，");
 }
 

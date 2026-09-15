@@ -13,4 +13,13 @@ describe("repair error-code labels", () => {
     expect(repairErrorCodeLabel("plugin.endpoint_unavailable")).toBe("插件端点不可用");
     expect(repairErrorCodeLabel("plugin.sandbox_unsupported")).toBe("插件沙箱不支持");
   });
+
+  it("localizes standard MCP failure codes", () => {
+    expect(repairErrorCodeLabel("mcp.tool_unavailable")).toBe("MCP 工具不可用");
+    expect(repairErrorCodeLabel("mcp.timeout")).toBe("MCP 调用超时");
+    expect(repairErrorCodeLabel("mcp.server_not_discovered")).toBe("MCP 服务未发现");
+    expect(repairErrorCodeLabel("mcp.server_timeout")).toBe("MCP 服务超时");
+    expect(repairErrorCodeLabel("mcp.server_failed")).toBe("MCP 服务失败");
+    expect(repairErrorCodeLabel("mcp.server_unavailable")).toBe("MCP 服务不可用");
+  });
 });
