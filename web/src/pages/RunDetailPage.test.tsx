@@ -153,6 +153,7 @@ describe("RunDetailPage", () => {
     expect(document.body.style.overflow).toBe("hidden");
     expect(document.body.style.touchAction).toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
+    await user.click(within(drawer).getByRole("button", { name: /SUMMARY_SHOULD_BE_COMPACTED_BEFORE_DRA/ }));
     expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
     expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
     expect(within(drawer).queryByText(longArtifactText)).toBeNull();
@@ -312,6 +313,7 @@ describe("RunDetailPage", () => {
     expect(within(drawer).getByText("主 Agent 初始判断")).not.toBeNull();
     expect(within(drawer).getByText("reviewer 子 Agent 调度")).not.toBeNull();
     expect(within(drawer).getAllByText("critic 子 Agent 已下班").length).toBeGreaterThan(0);
+    expect(drawer.querySelector(".run-process-detail")).toBeNull();
     await user.click(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ }));
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).toContain("reviewer 子 Agent 调度");
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
@@ -1740,6 +1742,7 @@ describe("RunDetailPage", () => {
     await user.click(processCard);
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: /初始动作摘要/ }));
     expect(within(drawer).getAllByText(initialSummary).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("2026-08-20T00:00:01Z").length).toBeGreaterThan(0);
 

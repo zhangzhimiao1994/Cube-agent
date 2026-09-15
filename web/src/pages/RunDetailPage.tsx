@@ -2027,10 +2027,10 @@ function DetailProcessDrawer({
   onSelectCard,
 }: {
   cards: DetailProcessCard[];
-  selectedCard: DetailProcessCard;
+  selectedCard: DetailProcessCard | null;
   dialogId: string;
   onClose: () => void;
-  onSelectCard: (card: DetailProcessCard) => void;
+  onSelectCard: (card: DetailProcessCard | null) => void;
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const actionPreview = recentPreview(cards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
@@ -2055,41 +2055,48 @@ function DetailProcessDrawer({
           </button>
         </div>
         <div className="agent-workbench-detail">
-          <div className="agent-workbench-actions">
-            <div className="agent-workbench-actions-header">
-              <strong>调度动作</strong>
-              <small>{cards.length} 条</small>
-              {cards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
-                <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
-                  {showAllActions ? "收起调度动作" : "显示全部调度动作"}
+          {selectedCard ? (
+            <section className="agent-workbench-actions" aria-label="动作细节">
+              <div className="agent-workbench-actions-header">
+                <strong>动作细节</strong>
+                <small>{selectedCard.label}</small>
+                <button type="button" className="secondary-action" onClick={() => onSelectCard(null)}>
+                  返回调度动作
                 </button>
-              ) : null}
+              </div>
+              <div className="run-process-detail" role="region" aria-label="动作细节">
+                <DetailProcessCardBody card={selectedCard} />
+              </div>
+            </section>
+          ) : (
+            <div className="agent-workbench-actions">
+              <div className="agent-workbench-actions-header">
+                <strong>调度动作</strong>
+                <small>{cards.length} 条</small>
+                {cards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                    {showAllActions ? "收起调度动作" : "显示全部调度动作"}
+                  </button>
+                ) : null}
+              </div>
+              {actionPreview.hiddenCount > 0 ? <p className="agent-workbench-compressed-note">已折叠 {actionPreview.hiddenCount} 个较早调度动作</p> : null}
+              <div className="agent-cluster-actions" aria-label="Agent 工作席动作">
+                {actionPreview.visible.map((card) => (
+                  <button
+                    key={card.id}
+                    type="button"
+                    className="run-process-toggle process-intermediate-card"
+                    onClick={() => onSelectCard(card)}
+                  >
+                    <span aria-hidden="true">›</span>
+                    <small className="process-card-badge">{card.label}</small>
+                    <strong>{card.title}</strong>
+                    {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
+                  </button>
+                ))}
+              </div>
             </div>
-            {actionPreview.hiddenCount > 0 ? (
-              <p className="agent-workbench-compressed-note">
-                已折叠 {actionPreview.hiddenCount} 个较早调度动作
-              </p>
-            ) : null}
-            <div className="agent-cluster-actions" aria-label="Agent 工作席动作">
-              {actionPreview.visible.map((card) => (
-                <button
-                  key={card.id}
-                  type="button"
-                  className="run-process-toggle process-intermediate-card"
-                  aria-current={selectedCard.id === card.id ? "true" : undefined}
-                  onClick={() => onSelectCard(card)}
-                >
-                  <span aria-hidden="true">›</span>
-                  <small className="process-card-badge">{card.label}</small>
-                  <strong>{card.title}</strong>
-                  {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="run-process-detail">
-          <DetailProcessCardBody card={selectedCard} />
+          )}
         </div>
       </section>
     </div>,
@@ -2101,7 +2108,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
   const [selectedCard, setSelectedCard] = useState<DetailProcessCard | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const previouslyFocused = useRef<HTMLElement | null>(null);
-  const selected = selectedCard ? refreshedDetailProcessCard(selectedCard, cards) : (cards.at(-1) ?? null);
+  const selected = selectedCard ? refreshedDetailProcessCard(selectedCard, cards) : null;
   useEffect(() => {
     if (!drawerOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -2141,7 +2148,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
           aria-controls={workbenchId}
           aria-expanded={drawerOpen}
           onClick={() => {
-            setSelectedCard(cards.at(-1) ?? null);
+            setSelectedCard(null);
             setDrawerOpen(true);
           }}
         >
@@ -2152,7 +2159,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
           </small>
         </button>
       </div>
-      {drawerOpen && selected ? (
+      {drawerOpen ? (
         <DetailProcessDrawer
           cards={cards}
           selectedCard={selected}
