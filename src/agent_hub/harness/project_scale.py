@@ -80,6 +80,7 @@ class ProjectScaleCase:
 class ProjectScaleRunRequest:
     case_id: str
     body: dict[str, object]
+    validation_focus: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ class ProjectScaleRunPlan:
             "requests": [
                 {
                     "case_id": request.case_id,
+                    "validation_focus": list(request.validation_focus),
                     "body": dict(request.body),
                 }
                 for request in self.requests
@@ -191,7 +193,7 @@ def build_project_scale_run_request(case: ProjectScaleCase) -> ProjectScaleRunRe
         "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
         "skip_evolution_proposal": True,
     }
-    return ProjectScaleRunRequest(case_id=case.id, body=body)
+    return ProjectScaleRunRequest(case_id=case.id, body=body, validation_focus=case.validation_focus)
 
 
 def build_project_scale_run_plan(

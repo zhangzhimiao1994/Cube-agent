@@ -123,6 +123,44 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
     assert plan.requests[0].body["workspace_session_id"] == "project-scale-small-direct"
 
 
+def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("capability_validation",))
+
+    payload = plan.to_payload()
+
+    assert payload["requests"] == [
+        {
+            "case_id": "small:capability_validation",
+            "validation_focus": [
+                "interaction_stability",
+                "final_result",
+                "capability_matrix",
+                "mode_control",
+                "no_silent_downgrade",
+            ],
+            "body": {
+                "message": (
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=capability_validation. Read constraints first, keep interaction "
+                    "stable, use the approved workspace, produce final artifacts, record "
+                    "verification evidence, and diagnose and repair failures instead of "
+                    "silently degrading."
+                ),
+                "mode": "hybrid",
+                "project_id": "project-scale-acceptance",
+                "workspace_session_id": "project-scale-small-capability_validation",
+                "sandbox_profile": "workspace_write",
+                "requested_permissions": [
+                    "workspace.read",
+                    "workspace.write",
+                    "command.run",
+                ],
+                "skip_evolution_proposal": True,
+            },
+        }
+    ]
+
+
 def test_project_scale_run_plan_filters_scale_and_flow() -> None:
     plan = build_project_scale_run_plan(scales=("ultra",), flows=("self_repair", "plugin"))
 

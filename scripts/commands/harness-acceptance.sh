@@ -2595,12 +2595,14 @@ check_project_scale_runner_contract() {
     failures=$((failures + 1))
     return 1
   fi
-  if ! dry_run_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" -m agent_hub.harness.project_scale_runner --scale small --flow self_repair --json 2>&1)"; then
+  if ! dry_run_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" -m agent_hub.harness.project_scale_runner --scale small --flow capability_validation --json 2>&1)"; then
     printf 'fail: project scale execution runner dry-run\n' >&2
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$dry_run_output" != *'"dry_run": true'* || "$dry_run_output" != *'"case_id": "small:self_repair"'* ]]; then
+  if [[ "$dry_run_output" != *'"dry_run": true'* \
+    || "$dry_run_output" != *'"case_id": "small:capability_validation"'* \
+    || "$dry_run_output" != *'"validation_focus": ["interaction_stability", "final_result", "capability_matrix", "mode_control", "no_silent_downgrade"]'* ]]; then
     printf 'fail: project scale execution runner dry-run payload\n' >&2
     failures=$((failures + 1))
     return 1
