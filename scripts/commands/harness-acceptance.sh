@@ -2098,6 +2098,133 @@ PY
   return 1
 }
 
+check_outbox_publish_pressure_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: outbox publish pressure guard\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: outbox publish pressure guard requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+from typing import cast
+from uuid import UUID, uuid4
+
+from agent_hub.domain.runs import TaskMode
+from agent_hub.runs.repository import PendingOutbox, RunRepository
+from agent_hub.runs.service import RunService
+from agent_hub.runtime.contracts import RuntimeCheckpoint
+from agent_hub.runtime.registry import RuntimeRegistry
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+class OutboxPressureRepository:
+    def __init__(self, row_count: int) -> None:
+        self.rows = tuple(
+            PendingOutbox(
+                id=uuid4(),
+                run_id=uuid4(),
+                idempotency_key=f"tenant:pressure:{index}",
+            )
+            for index in range(row_count)
+        )
+        self.delivered: set[UUID] = set()
+        self._lock = asyncio.Lock()
+
+    async def pending_outbox(self, limit: int = 100) -> tuple[PendingOutbox, ...]:
+        return self.rows[:limit]
+
+    async def deliver_outbox(self, outbox_id, deliver):
+        async with self._lock:
+            if outbox_id in self.delivered:
+                return False
+            row = next(row for row in self.rows if row.id == outbox_id)
+            await deliver(row.run_id, row.idempotency_key)
+            self.delivered.add(outbox_id)
+            return True
+
+
+class RecordingQueue:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[UUID, str]] = []
+
+    async def enqueue_run(self, run_id: UUID, *, idempotency_key: str) -> None:
+        self.enqueued.append((run_id, idempotency_key))
+
+
+class UnusedRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context):
+        del context
+        raise AssertionError("outbox publish pressure guard should not execute runtime")
+        yield  # pragma: no cover
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+        raise AssertionError("not used")
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+async def main() -> None:
+    worker_count = 8
+    row_count = 16
+    repository = OutboxPressureRepository(row_count)
+    queue = RecordingQueue()
+    services = tuple(
+        RunService(
+            cast(RunRepository, repository),
+            runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+            router=None,
+            task_queue=queue,
+        )
+        for _ in range(worker_count)
+    )
+
+    delivered_counts = await asyncio.gather(
+        *(service.publish_pending(limit=row_count) for service in services)
+    )
+
+    require(
+        sum(delivered_counts) == row_count,
+        "outbox publish pressure must report only delivered rows",
+    )
+    require(len(queue.enqueued) == row_count, "outbox publish pressure must enqueue each run once")
+    require(
+        len({run_id for run_id, _ in queue.enqueued}) == row_count,
+        "outbox publish pressure must enqueue each run once",
+    )
+    require(
+        len({idempotency_key for _, idempotency_key in queue.enqueued}) == row_count,
+        "outbox publish pressure must preserve unique idempotency keys",
+    )
+
+
+asyncio.run(main())
+PY
+  then
+    printf 'ok: outbox publish pressure guard workers=8 rows=16 delivered=16 unique_enqueues=16\n'
+    return 0
+  fi
+  printf 'fail: outbox publish pressure guard\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_model_capability_recovery_contract() {
   local python_bin
   local script_dir
@@ -3488,6 +3615,7 @@ run_codex_profile() {
   check_prometheus_metrics || true
   check_running_recovery_contract || true
   check_approval_resume_crash_recovery_contract || true
+  check_outbox_publish_pressure_contract || true
   check_self_repair_failure_injection_matrix || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true

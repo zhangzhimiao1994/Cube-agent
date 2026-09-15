@@ -132,6 +132,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "approval-resume recovery must complete without duplicate approval" in command
     assert "approval-resume recovery must not duplicate outbox submission" in command
     assert "ok: approval resume crash recovery guard" in command
+    assert "check_outbox_publish_pressure_contract" in command
+    assert "profile: outbox publish pressure guard" in command
+    assert "outbox publish pressure must enqueue each run once" in command
+    assert "outbox publish pressure must report only delivered rows" in command
+    assert "ok: outbox publish pressure guard workers=8 rows=16 delivered=16 unique_enqueues=16" in command
     assert "check_model_capability_recovery_contract" in command
     assert "profile: model capability recovery" in command
     assert "capability_unavailable" in command
