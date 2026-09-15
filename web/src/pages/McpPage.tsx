@@ -1415,6 +1415,16 @@ export function McpPage() {
                         <span key={field} className="status-chip">{field}</span>
                       ))}
                     </div>
+                    <p>失败码：</p>
+                    <div className="toolbar">
+                      {adapter.failure_codes.length > 0 ? (
+                        adapter.failure_codes.map((failureCode) => (
+                          <span key={failureCode} className="status-chip">{failureCode}</span>
+                        ))
+                      ) : (
+                        <span className="status-chip">未声明</span>
+                      )}
+                    </div>
                   </article>
                 ))}
               </div>

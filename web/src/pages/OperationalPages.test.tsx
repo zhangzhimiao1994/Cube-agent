@@ -6771,9 +6771,14 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "已配置插件" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
-    expect(within(screen.getByRole("region", { name: "插件适配器目录" })).getByRole("heading", {
+    const adapterCatalog = screen.getByRole("region", { name: "插件适配器目录" });
+    const httpJsonAdapterCard = within(adapterCatalog).getByRole("heading", {
       name: "HTTP JSON",
-    })).not.toBeNull();
+    }).closest("article");
+    expect(httpJsonAdapterCard).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).getByText("失败码：")).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).getByText("plugin.timeout")).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).getByText("plugin.endpoint_unavailable")).not.toBeNull();
     expect(screen.getByText("endpoint_url, domain_allowlist")).not.toBeNull();
     expect(screen.getAllByText("input_schema").length).toBeGreaterThan(0);
     expect(screen.getByText("Calendar HTTP")).not.toBeNull();
