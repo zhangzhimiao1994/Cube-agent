@@ -349,7 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"dry_run={str(plan.dry_run).lower()} execute={str(plan.execute).lower()}"
             )
             for request in plan.requests:
-                print(request.case_id)
+                print(f"{request.case_id} focus={','.join(request.validation_focus)}")
     return 0 if (not args.execute or report.ok) else 1
 
 

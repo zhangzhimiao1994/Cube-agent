@@ -37,6 +37,16 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
     assert "delete_workspace" in payload["cleanup_actions"]
 
 
+def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
+    result = run_project_scale_runner("--scale", "small", "--flow", "capability_validation")
+
+    assert result.returncode == 0
+    assert (
+        "small:capability_validation "
+        "focus=interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade"
+    ) in result.stdout
+
+
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:
     output_path = tmp_path / "project-scale-report.json"
 
