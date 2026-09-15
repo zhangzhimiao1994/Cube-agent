@@ -1916,6 +1916,148 @@ PY
   return 1
 }
 
+check_approval_resume_crash_recovery_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: approval resume crash recovery guard\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: approval resume crash recovery guard requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+import logging
+from datetime import datetime
+from typing import cast
+from uuid import UUID, uuid4
+
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.service import RunService, SubmittedRun
+from agent_hub.runtime.contracts import RuntimeCheckpoint
+from agent_hub.runtime.registry import RuntimeRegistry
+
+logging.getLogger("agent_hub.runs.service").setLevel(logging.CRITICAL)
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+class ApprovalResumeRecoveryRepository:
+    def __init__(self, run_id: UUID) -> None:
+        self._run_id = run_id
+        self.remaining_candidates = [run_id]
+        self.approval_rows = 1
+        self.outbox_rows = 1
+
+    async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
+        del now
+        candidates = tuple(self.remaining_candidates[:limit])
+        self.remaining_candidates = self.remaining_candidates[limit:]
+        return candidates
+
+
+class ApprovalResumeRecoveryService(RunService):
+    def __init__(self, repository: ApprovalResumeRecoveryRepository) -> None:
+        super().__init__(
+            cast(RunRepository, repository),
+            runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+            router=None,
+            task_queue=UnusedQueue(),
+        )
+        self._repository_probe = repository
+        self.restored_checkpoint_ids = [uuid4()]
+        self.resume_checkpoint_id = uuid4()
+        self.recover_calls = 0
+
+    async def recover(self, run_id: UUID) -> SubmittedRun:
+        self.recover_calls += 1
+        require(
+            self._repository_probe.approval_rows == 1,
+            "approval-resume recovery must complete without duplicate approval",
+        )
+        require(
+            self._repository_probe.outbox_rows == 1,
+            "approval-resume recovery must not duplicate outbox submission",
+        )
+        self.restored_checkpoint_ids.append(self.resume_checkpoint_id)
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=uuid4(),
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=3,
+        )
+
+
+class UnusedRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context):
+        del context
+        raise AssertionError("approval resume recovery guard should use patched recover")
+        yield  # pragma: no cover
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+        raise AssertionError("not used")
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class UnusedQueue:
+    async def enqueue_run(self, run_id: UUID, *, idempotency_key: str) -> None:
+        del run_id, idempotency_key
+        raise AssertionError("not used")
+
+
+async def main() -> None:
+    run_id = uuid4()
+    repository = ApprovalResumeRecoveryRepository(run_id)
+    service = ApprovalResumeRecoveryService(repository)
+
+    recovered = await service.recover_running(limit=10)
+    duplicate_recovered = await service.recover_running(limit=10)
+
+    require(recovered == 1, "approval-resume recovery must recover one expired run")
+    require(duplicate_recovered == 0, "approval-resume recovery must not recover twice")
+    require(service.recover_calls == 1, "approval-resume recovery must call recover once")
+    require(
+        len(service.restored_checkpoint_ids) == 2,
+        "approval-resume recovery must restore initial and resumed checkpoints",
+    )
+    require(
+        repository.approval_rows == 1,
+        "approval-resume recovery must complete without duplicate approval",
+    )
+    require(
+        repository.outbox_rows == 1,
+        "approval-resume recovery must not duplicate outbox submission",
+    )
+
+
+asyncio.run(main())
+PY
+  then
+    printf 'ok: approval resume crash recovery guard\n'
+    return 0
+  fi
+  printf 'fail: approval resume crash recovery guard\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_model_capability_recovery_contract() {
   local python_bin
   local script_dir
@@ -3305,6 +3447,7 @@ run_codex_profile() {
   check_health_json "api readiness" "/health/ready" || true
   check_prometheus_metrics || true
   check_running_recovery_contract || true
+  check_approval_resume_crash_recovery_contract || true
   check_self_repair_failure_injection_matrix || true
   check_protected_boundary "run read requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000" || true
   check_protected_boundary "run events requires bearer" "/api/v1/runs/00000000-0000-0000-0000-000000000000/events" || true

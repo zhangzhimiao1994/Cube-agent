@@ -123,6 +123,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: running recovery guard" in command
     assert 'logging.getLogger("agent_hub.runs.service").setLevel(logging.CRITICAL)' in command
     assert "ok: running recovery guard" in command
+    assert "check_approval_resume_crash_recovery_contract" in command
+    assert "profile: approval resume crash recovery guard" in command
+    assert "approval-resume recovery must complete without duplicate approval" in command
+    assert "approval-resume recovery must not duplicate outbox submission" in command
+    assert "ok: approval resume crash recovery guard" in command
     assert "check_model_capability_recovery_contract" in command
     assert "profile: model capability recovery" in command
     assert "capability_unavailable" in command
