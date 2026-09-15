@@ -46,7 +46,8 @@ def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
     assert result.returncode == 0
     assert (
         "small:capability_validation "
-        "focus=interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade"
+        "focus=interaction_stability,final_result,deliverable_quality,"
+        "agent_standard_verification,capability_matrix,mode_control,no_silent_downgrade"
     ) in result.stdout
 
 
@@ -139,6 +140,8 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
     assert results[0]["validation_focus"] == [
         "interaction_stability",
         "final_result",
+        "deliverable_quality",
+        "agent_standard_verification",
         "capability_matrix",
         "mode_control",
         "no_silent_downgrade",

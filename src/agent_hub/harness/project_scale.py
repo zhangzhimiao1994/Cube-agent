@@ -226,7 +226,12 @@ def build_project_scale_run_plan(
 
 
 def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectScaleCase:
-    focus = ["interaction_stability", "final_result"]
+    focus = [
+        "interaction_stability",
+        "final_result",
+        "deliverable_quality",
+        "agent_standard_verification",
+    ]
     if scale in _LONG_RUNNING_SCALES:
         focus.append("long_running_control")
     if scale in _PREFLIGHT_SCALES:
@@ -274,8 +279,11 @@ def _fixture_message(case: ProjectScaleCase) -> str:
     return (
         f"Project-scale acceptance fixture: build a {scale_label} for scale={case.scale} "
         f"and flow={case.flow}. Read constraints first, keep interaction stable, use the "
-        "approved workspace, produce final artifacts, record verification evidence, and "
-        "diagnose and repair failures instead of silently degrading."
+        "approved workspace, produce final artifacts, satisfy the requested requirements, "
+        "verify build/test/interaction behavior, avoid placeholder or stub-only output, record "
+        "deliverable_quality evidence, and follow Codex/Claude Code verification standards: "
+        "read constraints, plan before implementation, verify with reproducible evidence, and "
+        "repair root causes instead of silently degrading."
     )
 
 

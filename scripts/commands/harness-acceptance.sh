@@ -2591,6 +2591,10 @@ require(
     any(case.flow == "self_repair" and "self_repair" in case.validation_focus for case in matrix.cases),
     "self repair focus",
 )
+require(
+    all("agent_standard_verification" in case.validation_focus for case in matrix.cases),
+    "agent verification standard focus",
+)
 print(summary)
 PY
   then
@@ -2642,7 +2646,7 @@ check_project_scale_runner_contract() {
   fi
   if [[ "$dry_run_output" != *'"dry_run": true'* \
     || "$dry_run_output" != *'"case_id": "small:capability_validation"'* \
-    || "$dry_run_output" != *'"validation_focus": ["interaction_stability", "final_result", "capability_matrix", "mode_control", "no_silent_downgrade"]'* ]]; then
+    || "$dry_run_output" != *'"validation_focus": ["interaction_stability", "final_result", "deliverable_quality", "agent_standard_verification", "capability_matrix", "mode_control", "no_silent_downgrade"]'* ]]; then
     printf 'fail: project scale execution runner dry-run payload\n' >&2
     failures=$((failures + 1))
     return 1
@@ -2652,7 +2656,7 @@ check_project_scale_runner_contract() {
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$dry_run_text_output" != *"small:capability_validation focus=interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade"* ]]; then
+  if [[ "$dry_run_text_output" != *"small:capability_validation focus=interaction_stability,final_result,deliverable_quality,agent_standard_verification,capability_matrix,mode_control,no_silent_downgrade"* ]]; then
     printf 'fail: project scale execution runner dry-run text focus\n' >&2
     failures=$((failures + 1))
     return 1
@@ -2735,6 +2739,8 @@ payload = ProjectScaleCaseResult(
     validation_focus=(
         "interaction_stability",
         "final_result",
+        "deliverable_quality",
+        "agent_standard_verification",
         "capability_matrix",
         "mode_control",
         "no_silent_downgrade",
@@ -2747,7 +2753,7 @@ PY
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$focus_output" != "interaction_stability,final_result,capability_matrix,mode_control,no_silent_downgrade" ]]; then
+  if [[ "$focus_output" != "interaction_stability,final_result,deliverable_quality,agent_standard_verification,capability_matrix,mode_control,no_silent_downgrade" ]]; then
     printf 'fail: project scale execution result validation focus payload\n' >&2
     failures=$((failures + 1))
     return 1

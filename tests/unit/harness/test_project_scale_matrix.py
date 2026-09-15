@@ -45,6 +45,8 @@ def test_project_scale_matrix_marks_large_profiles_as_explicit_server_runs() -> 
     assert all(case.requires_explicit_server_profile for case in ultra_cases)
     assert any(case.expected_preflight for case in ultra_cases)
     assert any("self_repair" in case.validation_focus for case in ultra_cases)
+    assert all("deliverable_quality" in case.validation_focus for case in matrix.cases)
+    assert all("agent_standard_verification" in case.validation_focus for case in matrix.cases)
 
 
 def test_project_scale_matrix_has_explicit_capability_validation_flow() -> None:
@@ -78,6 +80,12 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
         assert isinstance(message, str)
         assert case.scale in message
         assert case.flow in message
+        assert "satisfy the requested requirements" in message
+        assert "avoid placeholder or stub-only output" in message
+        assert "deliverable_quality" in message
+        assert "Codex/Claude Code verification standards" in message
+        assert "plan before implementation" in message
+        assert "repair root causes" in message
 
 
 def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
@@ -136,6 +144,8 @@ def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
             "validation_focus": [
                 "interaction_stability",
                 "final_result",
+                "deliverable_quality",
+                "agent_standard_verification",
                 "capability_matrix",
                 "mode_control",
                 "no_silent_downgrade",
@@ -144,9 +154,12 @@ def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
                 "message": (
                     "Project-scale acceptance fixture: build a small project for scale=small "
                     "and flow=capability_validation. Read constraints first, keep interaction "
-                    "stable, use the approved workspace, produce final artifacts, record "
-                    "verification evidence, and diagnose and repair failures instead of "
-                    "silently degrading."
+                    "stable, use the approved workspace, produce final artifacts, satisfy "
+                    "the requested requirements, verify build/test/interaction behavior, avoid "
+                    "placeholder or stub-only output, record deliverable_quality evidence, and "
+                    "follow Codex/Claude Code verification standards: read constraints, plan "
+                    "before implementation, verify with reproducible evidence, and repair root "
+                    "causes instead of silently degrading."
                 ),
                 "mode": "hybrid",
                 "project_id": "project-scale-acceptance",
