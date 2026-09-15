@@ -2928,6 +2928,7 @@ check_project_scale_runner_contract() {
   local text_line_output
   local focus_output
   local summary_output
+  local repair_output
   local execute_output
   local execute_status
 
@@ -3138,6 +3139,51 @@ PY
   fi
   if [[ "$summary_output" != "2|medium:artifact_production,ultra:self_repair|final_artifacts=2,deliverable_quality=2,agent_standard_verification=2,discussion_trace=2,workspace_bundle=1,self_repair_trace=1|interaction_stability,final_result,artifact_integrity,long_running_control,project_preflight,fault_injection,self_repair" ]]; then
     printf 'fail: project scale execution report failure summary payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! repair_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+from agent_hub.harness.project_scale_runner import (
+    ProjectScaleCaseResult,
+    format_project_scale_result_line,
+)
+
+result = ProjectScaleCaseResult(
+    case_id="medium:artifact_production",
+    run_id="run-medium-artifact-repair",
+    status="completed",
+    evidence={
+        "run_details": True,
+        "run_events": True,
+        "terminal_status": True,
+        "final_artifacts": True,
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "agent_standard_verification": True,
+        "deliverable_repair_trace": True,
+        "cleanup_cancel": True,
+    },
+    validation_focus=("interaction_stability", "final_result", "deliverable_quality"),
+    errors=("deliverable_quality: missing or incomplete structured quality flags",),
+)
+payload = result.to_payload()
+print(
+    "|".join(
+        (
+            str(payload["repair_attempted"]).lower(),
+            str(payload["repair_outcome"]),
+            format_project_scale_result_line(result),
+        )
+    )
+)
+PY
+  )"; then
+    printf 'fail: project scale execution repair outcome projection\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$repair_output" != "true|failed|medium:artifact_production run_id=run-medium-artifact-repair ok=false focus=interaction_stability,final_result,deliverable_quality missing=deliverable_quality,discussion_trace errors=1 repair=failed" ]]; then
+    printf 'fail: project scale execution repair outcome payload\n' >&2
     failures=$((failures + 1))
     return 1
   fi

@@ -125,12 +125,26 @@ class ProjectScaleCaseResult:
     def ok(self) -> bool:
         return not self.errors and not self.missing_evidence
 
+    @property
+    def repair_attempted(self) -> bool:
+        return self.evidence.get("deliverable_repair_trace") is True
+
+    @property
+    def repair_outcome(self) -> str:
+        if not self.repair_attempted:
+            return "not_attempted"
+        if not self.missing_evidence and not self.errors:
+            return "passed"
+        return "failed"
+
     def to_payload(self) -> dict[str, object]:
         return {
             "case_id": self.case_id,
             "run_id": self.run_id,
             "status": self.status,
             "ok": self.ok,
+            "repair_attempted": self.repair_attempted,
+            "repair_outcome": self.repair_outcome,
             "validation_focus": list(self.validation_focus),
             "required_evidence": list(self.required_evidence),
             "missing_evidence": list(self.missing_evidence),
@@ -573,6 +587,8 @@ def format_project_scale_result_line(result: ProjectScaleCaseResult) -> str:
         parts.append(f"missing={','.join(result.missing_evidence)}")
     if result.errors:
         parts.append(f"errors={len(result.errors)}")
+    if result.repair_attempted:
+        parts.append(f"repair={result.repair_outcome}")
     return " ".join(parts)
 
 

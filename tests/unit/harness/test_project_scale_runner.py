@@ -351,6 +351,34 @@ def test_execute_project_scale_plan_explains_quality_and_standard_repair_reasons
     assert "workspace_bundle: missing verification report artifact" in repair_message
 
 
+def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() -> None:
+    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality_sequence=(False, False),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    payload = result.to_payload()
+    assert report.ok is False
+    assert result.run_id == "run-medium-artifact-repair"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert payload["repair_attempted"] is True
+    assert payload["repair_outcome"] == "failed"
+    assert "deliverable_quality: missing or incomplete structured quality flags" in result.errors
+    assert format_project_scale_result_line(result) == (
+        "medium:artifact_production run_id=run-medium-artifact-repair ok=false "
+        "focus=interaction_stability,final_result,deliverable_quality,"
+        "agent_standard_verification,artifact_integrity "
+        "missing=deliverable_quality,agent_standard_verification errors=6 repair=failed"
+    )
+
+
 def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
