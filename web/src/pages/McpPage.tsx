@@ -12,6 +12,7 @@ import {
   type PluginSigningKey,
 } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { repairErrorCodeLabel } from "./repairLabels";
 
 function parseCsv(value: string) {
   return value
@@ -1425,7 +1426,7 @@ export function McpPage() {
                     <div className="toolbar">
                       {adapter.failure_codes.length > 0 ? (
                         adapter.failure_codes.map((failureCode) => (
-                          <span key={failureCode} className="status-chip">{failureCode}</span>
+                          <span key={failureCode} className="status-chip">{repairErrorCodeLabel(failureCode)}</span>
                         ))
                       ) : (
                         <span className="status-chip">未声明</span>

@@ -6784,8 +6784,10 @@ describe("operational management pages", () => {
     }).closest("article");
     expect(httpJsonAdapterCard).not.toBeNull();
     expect(within(httpJsonAdapterCard as HTMLElement).getByText("失败码：")).not.toBeNull();
-    expect(within(httpJsonAdapterCard as HTMLElement).getByText("plugin.timeout")).not.toBeNull();
-    expect(within(httpJsonAdapterCard as HTMLElement).getByText("plugin.endpoint_unavailable")).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).getByText("插件执行超时")).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).getByText("插件端点不可用")).not.toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).queryByText("plugin.timeout")).toBeNull();
+    expect(within(httpJsonAdapterCard as HTMLElement).queryByText("plugin.endpoint_unavailable")).toBeNull();
     expect(screen.getByText("endpoint_url, domain_allowlist")).not.toBeNull();
     expect(screen.getAllByText("input_schema").length).toBeGreaterThan(0);
     expect(screen.getByText("Calendar HTTP")).not.toBeNull();
