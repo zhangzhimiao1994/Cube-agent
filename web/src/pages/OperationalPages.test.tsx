@@ -460,6 +460,13 @@ const calendarPlugin: PluginResource = {
     schema_version: 1,
     kind: "adapter_package",
     package_version: "1.2.3",
+    provenance: {
+      source: "marketplace",
+      source_id: "calendar/plugin",
+      source_url: "https://plugins.example/marketplace/calendar",
+      publisher: "Calendar Labs",
+      description: "Trusted calendar adapter listing",
+    },
     adapter_id: "calendar_python",
     sdk_api_version: "1.0",
     signature: {
@@ -6799,6 +6806,14 @@ describe("operational management pages", () => {
     expect(screen.getByText("1.0")).not.toBeNull();
     expect(screen.getByText("包版本：")).not.toBeNull();
     expect(screen.getByText("1.2.3")).not.toBeNull();
+    expect(screen.getByText("包来源：")).not.toBeNull();
+    expect(screen.getByText("marketplace / calendar/plugin")).not.toBeNull();
+    expect(screen.getByText("来源 URL：")).not.toBeNull();
+    expect(screen.getByText("https://plugins.example/marketplace/calendar")).not.toBeNull();
+    expect(screen.getByText("发布者：")).not.toBeNull();
+    expect(screen.getByText("Calendar Labs")).not.toBeNull();
+    expect(screen.getByText("来源说明：")).not.toBeNull();
+    expect(screen.getByText("Trusted calendar adapter listing")).not.toBeNull();
     expect(screen.getByText("签名：")).not.toBeNull();
     expect(screen.getByText("ed25519 / calendar-prod / not_verified")).not.toBeNull();
     expect(screen.getByText("签名信任过期：")).not.toBeNull();

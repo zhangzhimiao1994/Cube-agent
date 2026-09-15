@@ -129,6 +129,12 @@ function formatPluginPackageDependencies(plugin: PluginResource) {
     .join(", ")}；运行时不会自动安装依赖`;
 }
 
+function formatPluginPackageProvenance(plugin: PluginResource) {
+  const provenance = plugin.package_metadata?.provenance;
+  if (!provenance) return "未配置";
+  return provenance.source_id ? `${provenance.source} / ${provenance.source_id}` : provenance.source;
+}
+
 function parseSchemaText(value: string, label: string): PluginCapability["input_schema"] {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -1471,6 +1477,10 @@ export function McpPage() {
                     <p>适配器 ID：<span>{plugin.package_metadata?.adapter_id ?? "未配置"}</span></p>
                     <p>SDK API：<span>{plugin.package_metadata?.sdk_api_version ?? "未配置"}</span></p>
                     <p>包版本：<span>{plugin.package_metadata?.package_version ?? "未配置"}</span></p>
+                    <p>包来源：<span>{formatPluginPackageProvenance(plugin)}</span></p>
+                    <p>来源 URL：<span>{plugin.package_metadata?.provenance?.source_url ?? "未配置"}</span></p>
+                    <p>发布者：<span>{plugin.package_metadata?.provenance?.publisher ?? "未配置"}</span></p>
+                    <p>来源说明：<span>{plugin.package_metadata?.provenance?.description ?? "未配置"}</span></p>
                     <p>
                       签名：
                       <span>
