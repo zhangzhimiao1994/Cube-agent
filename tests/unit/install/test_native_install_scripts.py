@@ -168,6 +168,8 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "project-scale-runner.XXXXXX" in command
     assert "--output \"$report_file\"" in command
     assert "rm -f -- \"$report_file\"" in command
+    assert "format_project_scale_result_line" in command
+    assert "missing=final_artifacts,self_repair_trace errors=1" in command
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in command
     assert "ok: project scale execution runner" in command
     assert "run_authenticated_project_scale_execution_profile" in command

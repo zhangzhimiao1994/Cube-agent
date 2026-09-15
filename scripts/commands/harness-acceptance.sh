@@ -2569,6 +2569,7 @@ check_project_scale_runner_contract() {
   local dry_run_output
   local report_file
   local report_output
+  local text_line_output
   local execute_output
   local execute_status
 
@@ -2617,6 +2618,38 @@ check_project_scale_runner_contract() {
   rm -f -- "$report_file"
   if [[ "$report_output" != *'"dry_run": true'* || "$report_output" != *'"case_id": "small:direct"'* ]]; then
     printf 'fail: project scale execution runner report payload\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! text_line_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+from agent_hub.harness.project_scale_runner import (
+    ProjectScaleCaseResult,
+    format_project_scale_result_line,
+)
+
+result = ProjectScaleCaseResult(
+    case_id="ultra:self_repair",
+    run_id="run-ultra-self-repair",
+    status="failed",
+    evidence={
+        "run_details": True,
+        "run_events": True,
+        "terminal_status": True,
+        "project_preflight_approval": True,
+        "workspace_bundle": True,
+        "cleanup_cancel": True,
+    },
+    errors=("terminal_status: failed",),
+)
+print(format_project_scale_result_line(result))
+PY
+  )"; then
+    printf 'fail: project scale execution runner text diagnostics\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$text_line_output" != "ultra:self_repair run_id=run-ultra-self-repair ok=false missing=final_artifacts,self_repair_trace errors=1" ]]; then
+    printf 'fail: project scale execution runner text diagnostic payload\n' >&2
     failures=$((failures + 1))
     return 1
   fi
