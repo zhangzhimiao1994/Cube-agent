@@ -1102,6 +1102,8 @@ cases = [
     ("mcp_server_timeout", "mcp_runtime", "server_timeout", "mcp.server_timeout", True),
     ("mcp.server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
     ("mcp_server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
+    ("mcp.server_unavailable", "mcp_runtime", "server_unavailable", "mcp.server_unavailable", True),
+    ("mcp_server_unavailable", "mcp_runtime", "server_unavailable", "mcp.server_unavailable", True),
 ]
 
 for reason, stage, category, code, retryable in cases:
@@ -1345,6 +1347,7 @@ for reason, code, retryable in (
     ("Plugin credential unavailable", "plugin.credential_unavailable", False),
     ("mcp_server_timeout", "mcp.server_timeout", True),
     ("mcp_server_failed", "mcp.server_failed", True),
+    ("mcp_server_unavailable", "mcp.server_unavailable", True),
 ):
     diagnostic = runtime_failure_diagnostic_from_reason(reason)
     require(diagnostic.get("error_code") == code, f"{reason} code")
@@ -1644,6 +1647,17 @@ cases = (
                 sequence=1,
                 run_id=base_run_id,
                 reason="MCP tool timed out",
+            ),
+        ),
+        "mcp_runtime_unavailable", "repair_mcp_server_or_adapter_and_retry",
+    ),
+    (
+        (
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=base_run_id,
+                reason="mcp.server_unavailable",
             ),
         ),
         "mcp_runtime_unavailable", "repair_mcp_server_or_adapter_and_retry",

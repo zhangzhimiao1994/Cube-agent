@@ -15,6 +15,7 @@ MCP_RUNTIME_FAILURE_CODES: tuple[str, ...] = (
     "mcp.server_not_discovered",
     "mcp.server_timeout",
     "mcp.server_failed",
+    "mcp.server_unavailable",
 )
 
 

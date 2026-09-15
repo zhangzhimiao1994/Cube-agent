@@ -81,6 +81,7 @@ const REPAIR_ERROR_CODE_LABELS: Record<string, string> = {
   "mcp.server_not_discovered": "MCP 服务未发现",
   "mcp.server_timeout": "MCP 服务超时",
   "mcp.server_failed": "MCP 服务失败",
+  "mcp.server_unavailable": "MCP 服务不可用",
   temporary_failure: "临时故障",
 };
 

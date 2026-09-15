@@ -361,6 +361,8 @@ def test_runtime_failure_diagnostic_classifies_plugin_runtime_failures(
         ("mcp_server_timeout", "server_timeout", "mcp.server_timeout", True),
         ("mcp.server_failed", "server_failed", "mcp.server_failed", True),
         ("mcp_server_failed", "server_failed", "mcp.server_failed", True),
+        ("mcp.server_unavailable", "server_unavailable", "mcp.server_unavailable", True),
+        ("mcp_server_unavailable", "server_unavailable", "mcp.server_unavailable", True),
     ],
 )
 def test_runtime_failure_diagnostic_classifies_mcp_runtime_failures(

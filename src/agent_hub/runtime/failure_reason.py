@@ -509,11 +509,19 @@ def _mcp_runtime_diagnostic(
             suggested_action="MCP server 健康检查或工具发现超时；检查连接、降低负载或恢复服务后重试。",
             status_code=status_code,
         )
+    if lowered in {"mcp_server_unavailable", "mcp.server_unavailable"}:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_unavailable",
+            error_code="mcp.server_unavailable",
+            retryable=True,
+            suggested_action="MCP server 不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
+            status_code=status_code,
+        )
     if lowered in {
         "mcp_server_failed",
-        "mcp_server_unavailable",
         "mcp.server_failed",
-        "mcp.server_unavailable",
     }:
         return _base_diagnostic(
             reason,

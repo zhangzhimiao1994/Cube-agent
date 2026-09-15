@@ -17,6 +17,7 @@ MCP_FAILURE_CODES = (
     "mcp.server_not_discovered",
     "mcp.server_timeout",
     "mcp.server_failed",
+    "mcp.server_unavailable",
 )
 
 

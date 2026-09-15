@@ -377,6 +377,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"mcp.server_not_discovered"' in command
     assert '"mcp.server_timeout"' in command
     assert '"mcp.server_failed"' in command
+    assert '"mcp.server_unavailable"' in command
 
     assert "PluginConfigCapabilityManifestSource" in command
     assert '"plugin_package_adapter_unavailable"' in command
@@ -436,6 +437,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"plugin.backend_unavailable"' in command
     assert '"manual_review_plugin_adapter"' in command
     assert '"mcp.server_timeout"' in command
+    assert '"mcp.server_unavailable"' in command
     assert "_looks_like_schedule_intent" in command
     assert "ordinary schedule-like reminders must stay chat" in command
     assert "schedule feature discussion must stay chat" in command
