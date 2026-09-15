@@ -213,6 +213,12 @@ class _RunObservation:
     workspace_bundle: bytes | None
 
 
+@dataclass(frozen=True, slots=True)
+class _EvidenceCheck:
+    passed: bool
+    reasons: tuple[str, ...]
+
+
 def execute_project_scale_plan(
     plan: ProjectScaleRunPlan,
     client: AcceptanceClient,
@@ -301,21 +307,30 @@ def execute_project_scale_plan(
                 errors.append(f"terminal_status: {status or 'unknown'}")
 
             evidence["self_repair_trace"] = _has_self_repair_trace(observation.events)
-            evidence["deliverable_quality"] = _has_deliverable_quality(
+            deliverable_quality = _evaluate_deliverable_quality(
                 observation.details,
                 observation.events,
                 observation.workspace_bundle,
             )
-            evidence["agent_standard_verification"] = _has_agent_standard_verification(
+            evidence["deliverable_quality"] = deliverable_quality.passed
+            agent_standard_verification = _evaluate_agent_standard_verification(
                 observation.details,
                 observation.events,
                 observation.workspace_bundle,
             )
+            evidence["agent_standard_verification"] = agent_standard_verification.passed
             if _should_attempt_deliverable_repair(status=status, evidence=evidence):
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
-                    body=_deliverable_repair_body(run_request.body, run_request.case_id),
+                    body=_deliverable_repair_body(
+                        run_request.body,
+                        run_request.case_id,
+                        failed_reasons=(
+                            *deliverable_quality.reasons,
+                            *agent_standard_verification.reasons,
+                        ),
+                    ),
                     idempotency_key=_deliverable_repair_idempotency_key(
                         run_request.case_id,
                         index,
@@ -365,16 +380,18 @@ def execute_project_scale_plan(
                     or _has_self_repair_trace(repair_observation.events)
                     or _has_deliverable_repair_trace(repair_observation.events)
                 )
-                evidence["deliverable_quality"] = _has_deliverable_quality(
+                deliverable_quality = _evaluate_deliverable_quality(
                     repair_observation.details,
                     repair_observation.events,
                     repair_observation.workspace_bundle,
                 )
-                evidence["agent_standard_verification"] = _has_agent_standard_verification(
+                evidence["deliverable_quality"] = deliverable_quality.passed
+                agent_standard_verification = _evaluate_agent_standard_verification(
                     repair_observation.details,
                     repair_observation.events,
                     repair_observation.workspace_bundle,
                 )
+                evidence["agent_standard_verification"] = agent_standard_verification.passed
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
@@ -384,11 +401,9 @@ def execute_project_scale_plan(
                 )
             ):
                 if not evidence["deliverable_quality"]:
-                    errors.append("deliverable_quality: project deliverable failed quality gate")
+                    errors.extend(deliverable_quality.reasons)
                 if not evidence["agent_standard_verification"]:
-                    errors.append(
-                        "agent_standard_verification: missing reproducible planning and repair evidence"
-                    )
+                    errors.extend(agent_standard_verification.reasons)
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -694,9 +709,12 @@ def _deliverable_repair_idempotency_key(
 def _deliverable_repair_body(
     body: dict[str, object],
     case_id: str,
+    *,
+    failed_reasons: Sequence[str] = (),
 ) -> dict[str, object]:
     repair_body = dict(body)
     original_message = body.get("message")
+    reason_text = _format_failed_reasons(failed_reasons)
     repair_body["message"] = (
         f"Project-scale deliverable repair for {case_id}: the previous generated project "
         "failed acceptance quality. Diagnose the mismatches against the original request, "
@@ -706,11 +724,21 @@ def _deliverable_repair_body(
         "no_placeholders, and artifact_integrity all true. Also record "
         "agent_standard_verification with constraints_read, plan_before_implementation, "
         "reproducible_verification, and root_cause_repair all true, and keep implementation "
-        "plan plus verification notes in the workspace. Original request:\n"
+        f"plan plus verification notes in the workspace.{reason_text} Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
     repair_body["skip_evolution_proposal"] = True
     return repair_body
+
+
+def _format_failed_reasons(reasons: Sequence[str]) -> str:
+    unique: dict[str, None] = {}
+    for reason in reasons:
+        if reason:
+            unique.setdefault(reason, None)
+    if not unique:
+        return ""
+    return "\nPrevious failed evidence:\n" + "\n".join(f"- {reason}" for reason in unique) + "\n"
 
 
 def _default_execution_id() -> str:
@@ -766,9 +794,7 @@ def _has_deliverable_quality(
     events: list[object] | None,
     workspace_bundle: bytes | None,
 ) -> bool:
-    return _has_quality_payload(details, events) and _workspace_bundle_has_project_quality(
-        workspace_bundle
-    )
+    return _evaluate_deliverable_quality(details, events, workspace_bundle).passed
 
 
 def _has_agent_standard_verification(
@@ -776,9 +802,33 @@ def _has_agent_standard_verification(
     events: list[object] | None,
     workspace_bundle: bytes | None,
 ) -> bool:
-    return _has_agent_standard_payload(
-        details, events
-    ) and _workspace_bundle_has_agent_standard_evidence(workspace_bundle)
+    return _evaluate_agent_standard_verification(details, events, workspace_bundle).passed
+
+
+def _evaluate_deliverable_quality(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    workspace_bundle: bytes | None,
+) -> _EvidenceCheck:
+    reasons: list[str] = []
+    if not _has_quality_payload(details, events):
+        reasons.append("deliverable_quality: missing or incomplete structured quality flags")
+    reasons.extend(_workspace_bundle_project_quality_reasons(workspace_bundle))
+    return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
+
+
+def _evaluate_agent_standard_verification(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    workspace_bundle: bytes | None,
+) -> _EvidenceCheck:
+    reasons: list[str] = []
+    if not _has_agent_standard_payload(details, events):
+        reasons.append(
+            "agent_standard_verification: missing or incomplete Codex/Claude standard flags"
+        )
+    reasons.extend(_workspace_bundle_agent_standard_reasons(workspace_bundle))
+    return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
 
 
 def _has_quality_payload(details: dict[str, object] | None, events: list[object] | None) -> bool:
@@ -837,38 +887,51 @@ def _quality_payload_passes(value: object) -> bool:
 
 
 def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> bool:
+    return not _workspace_bundle_project_quality_reasons(workspace_bundle)
+
+
+def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) -> tuple[str, ...]:
     if not workspace_bundle:
-        return False
+        return ("workspace_bundle: missing project bundle",)
     try:
         with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
             names = tuple(name for name in archive.namelist() if not name.endswith("/"))
             lowered = tuple(name.lower() for name in names)
             if not lowered:
-                return False
+                return ("workspace_bundle: empty project bundle",)
             text = _workspace_bundle_text(archive, names)
             package_json = _read_bundle_file(archive, names, "package.json")
     except (OSError, zipfile.BadZipFile):
-        return False
+        return ("workspace_bundle: invalid or unreadable zip bundle",)
 
-    return (
-        _bundle_has_requirement_document(lowered)
-        and _bundle_has_source_files(lowered)
-        and _bundle_has_verification_path_or_script(lowered, package_json)
-        and not any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS)
-    )
+    reasons: list[str] = []
+    if not _bundle_has_requirement_document(lowered):
+        reasons.append("workspace_bundle: missing requirements or README artifact")
+    if not _bundle_has_source_files(lowered):
+        reasons.append("workspace_bundle: missing source files")
+    if not _bundle_has_verification_path_or_script(lowered, package_json):
+        reasons.append("workspace_bundle: missing test path or build/test script")
+    if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
+        reasons.append("workspace_bundle: contains placeholder or stub markers")
+    return tuple(reasons)
 
 
 def _workspace_bundle_has_agent_standard_evidence(workspace_bundle: bytes | None) -> bool:
+    return not _workspace_bundle_agent_standard_reasons(workspace_bundle)
+
+
+def _workspace_bundle_agent_standard_reasons(workspace_bundle: bytes | None) -> tuple[str, ...]:
     if not workspace_bundle:
-        return False
+        return ("workspace_bundle: missing project bundle",)
     try:
         with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
             names = tuple(name for name in archive.namelist() if not name.endswith("/"))
             lowered = tuple(name.lower() for name in names)
     except (OSError, zipfile.BadZipFile):
-        return False
+        return ("workspace_bundle: invalid or unreadable zip bundle",)
     basenames = {name.rsplit("/", 1)[-1] for name in lowered}
-    return bool(
+    reasons: list[str] = []
+    if not (
         basenames
         & {
             "implementation_plan.md",
@@ -876,7 +939,9 @@ def _workspace_bundle_has_agent_standard_evidence(workspace_bundle: bytes | None
             "plan.md",
             "architecture_plan.md",
         }
-    ) and bool(
+    ):
+        reasons.append("workspace_bundle: missing implementation plan artifact")
+    if not (
         basenames
         & {
             "verification.md",
@@ -884,7 +949,9 @@ def _workspace_bundle_has_agent_standard_evidence(workspace_bundle: bytes | None
             "acceptance_report.md",
             "validation.md",
         }
-    )
+    ):
+        reasons.append("workspace_bundle: missing verification report artifact")
+    return tuple(reasons)
 
 
 def _workspace_bundle_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:

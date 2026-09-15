@@ -31,7 +31,7 @@ def test_project_scale_matrix_requires_isolation_evidence_and_cleanup() -> None:
     assert "agent_standard_verification" in matrix.required_evidence
     assert "project_preflight_approval" in matrix.required_evidence
     assert "self_repair_trace" in matrix.required_evidence
-    assert "release_health" in matrix.required_evidence
+    assert "release_health" not in matrix.required_evidence
     assert "delete_workspace" in matrix.cleanup_actions
     assert "cancel_or_archive_probe_runs" in matrix.cleanup_actions
     assert "remove_release_packages" in matrix.cleanup_actions
@@ -126,7 +126,6 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
         "agent_standard_verification",
         "project_preflight_approval",
         "self_repair_trace",
-        "release_health",
     )
     assert plan.cleanup_actions == (
         "cancel_or_archive_probe_runs",

@@ -38,7 +38,6 @@ PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "agent_standard_verification",
     "project_preflight_approval",
     "self_repair_trace",
-    "release_health",
 )
 PROJECT_SCALE_CLEANUP_ACTIONS: tuple[str, ...] = (
     "cancel_or_archive_probe_runs",

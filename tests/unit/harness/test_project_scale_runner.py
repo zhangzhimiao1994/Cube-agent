@@ -304,6 +304,29 @@ def test_execute_project_scale_plan_repairs_missing_agent_standard_verification(
     assert "root_cause_repair" in repair_message
 
 
+def test_execute_project_scale_plan_explains_quality_and_standard_repair_reasons() -> None:
+    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality_sequence=(False, True),
+        agent_standard_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "Previous failed evidence:" in repair_message
+    assert "deliverable_quality: missing or incomplete structured quality flags" in repair_message
+    assert "workspace_bundle: contains placeholder or stub markers" in repair_message
+    assert "agent_standard_verification: missing or incomplete Codex/Claude standard flags" in repair_message
+    assert "workspace_bundle: missing implementation plan artifact" in repair_message
+    assert "workspace_bundle: missing verification report artifact" in repair_message
+
+
 def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
