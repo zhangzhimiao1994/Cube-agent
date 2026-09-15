@@ -13,6 +13,7 @@ ProjectScaleFlow = Literal[
     "model_failure",
     "self_repair",
     "artifact_production",
+    "capability_validation",
 ]
 ProjectScaleRunMode = Literal["direct", "dispatch", "hybrid"]
 
@@ -26,6 +27,7 @@ PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
     "model_failure",
     "self_repair",
     "artifact_production",
+    "capability_validation",
 )
 PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "run_details",
@@ -46,6 +48,7 @@ _LONG_RUNNING_SCALES = frozenset({"large", "ultra"})
 _PREFLIGHT_SCALES = frozenset({"large", "ultra"})
 _FAILURE_FLOWS = frozenset({"model_failure", "self_repair"})
 _ARTIFACT_FLOWS = frozenset({"artifact_production", "plugin", "multi_agent"})
+_CAPABILITY_VALIDATION_FLOWS = frozenset({"capability_validation"})
 _FLOW_RUN_MODES: dict[ProjectScaleFlow, ProjectScaleRunMode] = {
     "direct": "direct",
     "dispatch": "dispatch",
@@ -55,6 +58,7 @@ _FLOW_RUN_MODES: dict[ProjectScaleFlow, ProjectScaleRunMode] = {
     "model_failure": "hybrid",
     "self_repair": "hybrid",
     "artifact_production": "hybrid",
+    "capability_validation": "hybrid",
 }
 
 
@@ -228,6 +232,8 @@ def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectSc
         focus.extend(("fault_injection", "self_repair"))
     if flow in _ARTIFACT_FLOWS:
         focus.append("artifact_integrity")
+    if flow in _CAPABILITY_VALIDATION_FLOWS:
+        focus.extend(("capability_matrix", "mode_control", "no_silent_downgrade"))
     return ProjectScaleCase(
         scale=scale,
         flow=flow,

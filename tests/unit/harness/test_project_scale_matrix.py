@@ -46,6 +46,17 @@ def test_project_scale_matrix_marks_large_profiles_as_explicit_server_runs() -> 
     assert any("self_repair" in case.validation_focus for case in ultra_cases)
 
 
+def test_project_scale_matrix_has_explicit_capability_validation_flow() -> None:
+    matrix = ProjectScaleMatrix.default()
+    capability_cases = [case for case in matrix.cases if case.flow == "capability_validation"]
+
+    assert len(capability_cases) == len(PROJECT_SCALE_TIERS)
+    for case in capability_cases:
+        assert "capability_matrix" in case.validation_focus
+        assert "mode_control" in case.validation_focus
+        assert "no_silent_downgrade" in case.validation_focus
+
+
 def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
     matrix = ProjectScaleMatrix.default()
 
@@ -82,6 +93,10 @@ def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
         build_project_scale_run_request(cases["small:artifact_production"]).body["mode"]
         == "hybrid"
     )
+    assert (
+        build_project_scale_run_request(cases["small:capability_validation"]).body["mode"]
+        == "hybrid"
+    )
 
 
 def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None:
@@ -89,7 +104,7 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
 
     assert plan.dry_run is True
     assert plan.execute is False
-    assert plan.case_count == 32
+    assert plan.case_count == 36
     assert plan.requires_bearer_token is True
     assert plan.required_evidence == (
         "run_details",

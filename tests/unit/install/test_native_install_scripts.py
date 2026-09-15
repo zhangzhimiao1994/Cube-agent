@@ -157,7 +157,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "profile: project scale acceptance matrix" in command
     assert "describe_project_scale_matrix" in command
     assert "small,medium,large,ultra" in command
-    assert "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production" in command
+    assert (
+        "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,"
+        "artifact_production,capability_validation"
+        in command
+    )
     assert "workspace_bundle" in command
     assert "cancel_or_archive_probe_runs" in command
     assert "ok: project scale acceptance matrix" in command

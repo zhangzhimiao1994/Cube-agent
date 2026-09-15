@@ -2537,7 +2537,7 @@ matrix.validate()
 summary = describe_project_scale_matrix(matrix)
 require("small,medium,large,ultra" in summary, "project scale tiers")
 require(
-    "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production"
+    "direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production,capability_validation"
     in summary,
     "project scale flows",
 )
