@@ -233,7 +233,9 @@ test("operator inspects run detail and cancels safely", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "120 ms" })).toBeVisible();
   await expect(page.getByRole("status", { name: /任务态势，执行异常/ })).toBeVisible();
   await expect(page.getByRole("region", { name: "工具链路" })).toBeVisible();
-  await expect(page.getByText("run_safe_command").first()).toBeVisible();
+  await expect(page.getByText("终端").first()).toBeVisible();
+  await expect(page.getByText("命令非零退出").first()).toBeVisible();
+  await expect(page.getByText("run_safe_command")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "故障诊断" })).toBeVisible();
   await expect(page.getByText("Readiness report")).toBeVisible();
   await page.getByRole("button", { name: "取消" }).click();
@@ -569,9 +571,12 @@ test("operator validates a simple coding run and downloads final and intermediat
   await expect(page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ })).toBeVisible();
   await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();
   await expect(page.getByText("hello-world-source.zip")).toHaveCount(1);
-  await expect(page.getByRole("region", { name: "Agent 工作席详情" })).toContainText("陆微");
-  await expect(page.getByRole("region", { name: "Agent 集群动作" })).toContainText("生成中间项目文件。");
-  await expect(page.getByRole("region", { name: "Agent 集群动作" })).not.toContainText("create_project");
+  const workbenchDrawer = page.getByRole("dialog", { name: "Agent 工作席详情" });
+  await expect(workbenchDrawer).toContainText("陆微");
+  await expect(workbenchDrawer).toContainText("生成中间项目文件。");
+  await expect(workbenchDrawer).not.toContainText("create_project");
+  await workbenchDrawer.getByRole("button", { name: "关闭" }).click();
+  await expect(workbenchDrawer).toHaveCount(0);
 
   const finalDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: /下载 hello-world\.zip/ }).click();
@@ -600,6 +605,7 @@ test("operator validates a simple coding run and downloads final and intermediat
   expect(runResult.status).toBe(0);
   expect(runResult.stdout.trim()).toBe("hello world");
 
+  await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toBeVisible();
   const intermediateDownload = page.waitForEvent("download");
@@ -631,7 +637,7 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
 
   const workbench = page.getByRole("button", { name: /Agent 工作席 7 个 Agent/ });
   await expect(workbench).toBeVisible();
-  await expect(page.getByRole("region", { name: "Agent 工作席详情" })).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Agent 工作席详情" })).toHaveCount(0);
   await expect(page.getByText("工程师开始创建最小项目。")).toHaveCount(0);
   const collapsedBox = await workbench.boundingBox();
   expect(collapsedBox).not.toBeNull();
@@ -640,7 +646,7 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
   expect(collapsedBox!.height).toBeLessThanOrEqual(48);
 
   await workbench.click();
-  const detail = page.getByRole("region", { name: "Agent 工作席详情" });
+  const detail = page.getByRole("dialog", { name: "Agent 工作席详情" });
   await expect(detail).toContainText("陆微");
   await expect(detail).toContainText("工程师 · vibe-engineer");
   await expect(detail).toContainText("工程师开始创建最小项目。");
