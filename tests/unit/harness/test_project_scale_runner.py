@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import (
@@ -118,7 +119,9 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
 
     report = execute_project_scale_plan(plan, client)
 
-    assert report.to_payload()["results"][0]["validation_focus"] == [
+    results = cast(list[dict[str, object]], report.to_payload()["results"])
+
+    assert results[0]["validation_focus"] == [
         "interaction_stability",
         "final_result",
         "capability_matrix",
