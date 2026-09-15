@@ -105,6 +105,13 @@ _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
         "plugin tool timed out",
     }
 )
+_PLUGIN_ADAPTER_UNAVAILABLE_MARKERS = frozenset(
+    {
+        "plugin.adapter_unavailable",
+        "plugin adapter unavailable",
+        "plugin_package_adapter_unavailable",
+    }
+)
 _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS = frozenset(
     {
         "plugin.credential_unavailable",
@@ -169,6 +176,7 @@ _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
         "model_quota_or_billing_unavailable",
         "model_deployment_unavailable",
         "model_request_contract_invalid",
+        "plugin_adapter_unavailable",
         "plugin_credential_unavailable",
         "plugin_invalid_arguments",
         "plugin_invalid_result",
@@ -572,6 +580,8 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         return "停止自动重试，检查模型请求参数、上下文限制、工具 schema 和供应商兼容性，修正契约后再审批继续。"
     if failure_category == "plugin_runtime_unavailable":
         return "检查插件端点、适配器健康状态和网络连通性，修正可恢复配置后只重试受影响的插件调用。"
+    if failure_category == "plugin_adapter_unavailable":
+        return "停止自动重试，检查插件适配器注册、运行时 reload 和 package 激活状态，修正并审批后再继续。"
     if failure_category == "plugin_credential_unavailable":
         return "停止自动重试，检查插件凭据配置、授权边界和轮换状态，凭据修正并审批后再继续。"
     if failure_category == "plugin_invalid_arguments":
@@ -927,6 +937,8 @@ def _failure_category(event: RunEvent) -> str:
         return "model_deployment_unavailable"
     if _contains_marker(text, _MODEL_REQUEST_CONTRACT_INVALID_MARKERS):
         return "model_request_contract_invalid"
+    if _contains_marker(text, _PLUGIN_ADAPTER_UNAVAILABLE_MARKERS):
+        return "plugin_adapter_unavailable"
     if _contains_marker(text, _PLUGIN_CREDENTIAL_UNAVAILABLE_MARKERS):
         return "plugin_credential_unavailable"
     if _contains_marker(text, _PLUGIN_INVALID_ARGUMENTS_MARKERS):

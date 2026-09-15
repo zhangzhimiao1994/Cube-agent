@@ -318,6 +318,11 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
             "manual_review_model_request_contract",
         ),
         (
+            "plugin.adapter_unavailable secret://plugin-token",
+            "plugin_adapter_unavailable",
+            "manual_review_plugin_adapter",
+        ),
+        (
             "Plugin credential unavailable secret://plugin-token",
             "plugin_credential_unavailable",
             "manual_review_plugin_credentials",

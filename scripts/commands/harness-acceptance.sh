@@ -1060,6 +1060,7 @@ from agent_hub.project_preflight import build_project_preflight_files
 from types import SimpleNamespace
 
 cases = [
+    ("plugin.adapter_unavailable", "plugin_runtime", "adapter_unavailable", "plugin.adapter_unavailable", False),
     ("Plugin tool timed out", "plugin_runtime", "timeout", "plugin.timeout", True),
     (
         "Plugin credential unavailable",
@@ -1637,6 +1638,11 @@ for events, category, strategy in cases:
     classify(events, category, strategy)
 
 manual_cases = (
+    (
+        "plugin.adapter_unavailable secret://plugin-token",
+        "plugin_adapter_unavailable",
+        "manual_review_plugin_adapter",
+    ),
     (
         "model.provider_auth_failed secret://model-token",
         "model_credential_unavailable",

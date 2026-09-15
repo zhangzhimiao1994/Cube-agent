@@ -283,6 +283,12 @@ def test_runtime_failure_diagnostic_classifies_plugin_adapter_unavailable() -> N
     ("reason", "error_category", "error_code", "retryable"),
     [
         (
+            "plugin.adapter_unavailable",
+            "adapter_unavailable",
+            "plugin.adapter_unavailable",
+            False,
+        ),
+        (
             "Plugin tool timed out",
             "timeout",
             "plugin.timeout",

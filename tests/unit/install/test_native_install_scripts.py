@@ -368,6 +368,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"provider_metadata"' in command
     assert "fail: run detail schema safe projection" in command
     assert "fail: runtime failure diagnostics" in command
+    assert '"plugin.adapter_unavailable"' in command
     assert '"plugin.timeout"' in command
     assert '"plugin.credential_unavailable"' in command
     assert '"plugin.endpoint_unavailable"' in command
@@ -430,6 +431,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"requires_approval"' in command
     assert '"automatic_execution"' in command
     assert '"plugin.backend_unavailable"' in command
+    assert '"manual_review_plugin_adapter"' in command
     assert '"mcp.server_timeout"' in command
     assert "_looks_like_schedule_intent" in command
     assert "ordinary schedule-like reminders must stay chat" in command

@@ -182,7 +182,9 @@ def runtime_failure_diagnostic_from_reason(
             ),
             status_code=status_code,
         )
-    if "plugin_package_adapter_unavailable" in lowered:
+    if lowered in {"plugin.adapter_unavailable", "plugin adapter unavailable"} or (
+        "plugin_package_adapter_unavailable" in lowered
+    ):
         return _base_diagnostic(
             normalized,
             error_stage="plugin_runtime",

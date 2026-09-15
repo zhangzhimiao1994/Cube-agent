@@ -13,6 +13,7 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
         "model_deployment_unavailable": "manual_review_model_deployment",
         "model_request_contract_invalid": "manual_review_model_request_contract",
         "plugin_runtime_unavailable": "repair_plugin_endpoint_or_adapter_and_retry",
+        "plugin_adapter_unavailable": "manual_review_plugin_adapter",
         "plugin_credential_unavailable": "manual_review_plugin_credentials",
         "plugin_invalid_arguments": "manual_review_plugin_arguments",
         "plugin_invalid_result": "manual_review_plugin_result_contract",
