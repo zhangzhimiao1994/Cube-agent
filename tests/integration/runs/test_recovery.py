@@ -107,6 +107,51 @@ class FakeRuntime:
         raise AssertionError("not used")
 
 
+class ApprovalResumeCrashRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.restored: list[RuntimeCheckpoint] = []
+        self.resume_checkpoint_id = uuid4()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.calls += 1
+        if context.checkpoint is None:
+            raise AssertionError("approval resume recovery must start from a checkpoint")
+        if len(self.restored) == 1:
+            checkpoint = RuntimeCheckpoint(
+                id=self.resume_checkpoint_id,
+                runtime_type="approval-resume-dispatch",
+                runtime_version="1",
+                run_id=context.run_id,
+                tenant_id=context.tenant_id,
+                mode=TaskMode.DISPATCH,
+                state={"completed_step_ids": ("approved-tool",)},
+            )
+            yield RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=1,
+                run_id=context.run_id,
+                checkpoint=checkpoint,
+            )
+            return
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("service persists checkpoint events directly")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored.append(checkpoint)
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
 class GatedTakeoverRuntime:
     mode = TaskMode.DISPATCH
 
@@ -1689,6 +1734,137 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
     assert [event["kind"] for event in events].count("approval.resolved") == 1
     assert [event["kind"] for event in events].count("runtime.completed") == 1
     assert not any(event["kind"] == "runtime.failed" for event in events)
+
+
+async def test_approved_capability_resume_crash_is_recovered_once_without_duplicate_approval_or_outbox(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    runtime = ApprovalResumeCrashRuntime()
+    repository = RunRepository(run_session_factory)
+    queue = RecordingQueue([], [])
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=queue,
+    )
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="resume approval, crash, then recover",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="approval-resume-dispatch",
+        runtime_version="1",
+        run_id=submitted.id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DISPATCH,
+        state={"completed_step_ids": ("prepare",)},
+    )
+    approval_id = "approval-resume-crash"
+    approval_fingerprint = "fingerprint-resume-crash"
+    async with run_session_factory() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=1,
+                run_id=submitted.id,
+                checkpoint=checkpoint,
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_REQUESTED,
+                sequence=2,
+                run_id=submitted.id,
+                actor="operator",
+                approval_id=approval_id,
+                action="tool_execute",
+                reason="requires_user_approval",
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.APPROVAL_RESOLVED,
+                sequence=3,
+                run_id=submitted.id,
+                actor="operator",
+                approval_id=approval_id,
+                decision="approved",
+            ),
+        )
+    await repository.begin_capability_approval(
+        tenant_id=tenant_id,
+        run_id=submitted.id,
+        approval_id=approval_id,
+        approval_fingerprint=approval_fingerprint,
+    )
+    waiting = await repository.get(tenant_id, submitted.id)
+    await repository.approve_capability_and_enqueue(
+        tenant_id=tenant_id,
+        run_id=submitted.id,
+        approval_id=approval_id,
+        version=waiting.version,
+    )
+
+    first_published = await service.publish_pending()
+    second_published = await service.publish_pending()
+    crashed = await service.execute(
+        submitted.id,
+        crash_after_event_kind=EventKind.CHECKPOINT_SAVED,
+    )
+    await _expire_worker_lease(repository, submitted.id)
+    recovered_count = await service.recover_running(limit=10)
+    recovered = await service.get(tenant_id, submitted.id)
+    events = await service.events(tenant_id, submitted.id)
+    async with run_session_factory() as session:
+        approval_rows = (
+            await session.scalars(
+                select(RunApprovalRow).where(
+                    RunApprovalRow.run_id == submitted.id,
+                    RunApprovalRow.approval_id == approval_id,
+                )
+            )
+        ).all()
+        outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(RunOutboxRow)
+            .where(RunOutboxRow.run_id == submitted.id)
+        )
+
+    assert first_published == 1
+    assert second_published == 0
+    assert queue.enqueued == [submitted.id]
+    assert len(queue.idempotency_keys or ()) == 1
+    assert crashed.status is RunStatus.RUNNING
+    assert recovered_count == 1
+    assert recovered.status is RunStatus.COMPLETED
+    assert runtime.calls == 2
+    assert [item.id for item in runtime.restored] == [checkpoint.id, runtime.resume_checkpoint_id]
+    assert [event["kind"] for event in events].count("approval.requested") == 1
+    assert [event["kind"] for event in events].count("approval.resolved") == 1
+    assert [event["kind"] for event in events].count("checkpoint.saved") == 2
+    assert [event["kind"] for event in events].count("runtime.completed") == 1
+    assert not any(event["kind"] == "runtime.failed" for event in events)
+    assert len(approval_rows) == 1
+    assert outbox_count == 1
 
 
 async def test_approved_capability_resume_fails_safe_when_non_replayable_event_after_checkpoint(

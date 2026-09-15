@@ -3462,6 +3462,9 @@ describe("operational management pages", () => {
 
     const panel = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     expect(document.querySelector(".process-drawer-backdrop")?.parentElement).toBe(document.body);
+    expect(within(stream).queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull();
+    expect(within(stream).queryByRole("region", { name: "调度与讨论" })).toBeNull();
+    expect(within(stream).queryByRole("region", { name: "过程轨迹" })).toBeNull();
     expect(within(panel).getByText("文案生成")).not.toBeNull();
     expect(within(panel).getByText("Copywriter · qwen-max")).not.toBeNull();
     expect(within(panel).getByText("负责输出可拍摄脚本文案。")).not.toBeNull();
@@ -3473,6 +3476,50 @@ describe("operational management pages", () => {
     expect(within(panel).getAllByText("已完成").length).toBeGreaterThan(0);
     expect(within(panel).getAllByText("活动轨迹").length).toBeGreaterThan(0);
     expect(within(panel).queryByText("Final Synthesizer")).toBeNull();
+  });
+
+  it("keeps unassigned process evidence behind the workbench trigger", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "",
+      },
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: conversationCreatedAt,
+          actor: null,
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            summary: "生成项目结构",
+            result: "得到一个可运行项目",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByRole("button", { name: /Agent 工作席 2 条证据/ })).not.toBeNull();
+    expect(within(stream).queryByRole("button", { name: /生成项目结构/ })).toBeNull();
+
+    const workbench = await openAgentWorkbench(user, stream);
+    expect(within(workbench).getByRole("region", { name: "过程轨迹" })).not.toBeNull();
+    expect(within(workbench).getByRole("button", { name: /得到一个可运行项目/ })).not.toBeNull();
   });
 
   it("keeps recruited subagent statuses isolated when planned steps are shared", async () => {

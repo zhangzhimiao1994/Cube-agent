@@ -3273,7 +3273,13 @@ function RunProcessSummary({
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
-  const hasWorkbench = dispatchCards.length > 0 || taskChain.length > 0 || coordinationItems.length > 0;
+  const shouldShowSummary =
+    items.length > 0 ||
+    dispatchCards.length > 0 ||
+    taskChain.length > 0 ||
+    failureDiagnostics.length > 0 ||
+    executionIntents.length > 0;
+  const hasWorkbench = shouldShowSummary;
   const workbenchMeta = agentWorkbenchMeta({
     cards: dispatchCards,
     diagnostics: failureDiagnostics,
@@ -3281,12 +3287,6 @@ function RunProcessSummary({
     items,
     taskChain,
   });
-  const shouldShowSummary =
-    items.length > 0 ||
-    dispatchCards.length > 0 ||
-    taskChain.length > 0 ||
-    failureDiagnostics.length > 0 ||
-    executionIntents.length > 0;
   useEffect(() => {
     if (!isWorkbenchOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
