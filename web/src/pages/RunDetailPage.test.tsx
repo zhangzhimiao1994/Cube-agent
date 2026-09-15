@@ -854,7 +854,8 @@ describe("RunDetailPage", () => {
 
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(within(summary).getByText("能力协商")).not.toBeNull();
-    expect(within(summary).getByText("3 个角色，满足 1，缺口 1，缺 tool_calling 1，未知 1，已截断")).not.toBeNull();
+    expect(within(summary).getByText("3 个角色，满足 1，缺口 1，缺 工具调用 1，未知 1，已截断")).not.toBeNull();
+    expect(within(summary).queryByText(/tool_calling/)).toBeNull();
     expect(within(summary).getByText("能力执行边界")).not.toBeNull();
     expect(
       within(summary).getByText(

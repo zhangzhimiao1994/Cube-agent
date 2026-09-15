@@ -9,13 +9,13 @@ import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repair
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MODEL_CAPABILITY_LABELS: Record<string, string> = {
-  text: "text",
-  tool_calling: "tool_calling",
-  structured_output: "structured_output",
-  vision: "vision",
-  image_generation: "image_generation",
-  video_generation: "video_generation",
-  audio_generation: "audio_generation",
+  text: "文本",
+  tool_calling: "工具调用",
+  structured_output: "结构化输出",
+  vision: "视觉理解",
+  image_generation: "图像生成",
+  video_generation: "视频生成",
+  audio_generation: "音频生成",
 };
 const MANUAL_RUN_MODES = [
   { value: "direct", label: "直接执行", description: "让主 Agent 或指定角色直接回答。" },
