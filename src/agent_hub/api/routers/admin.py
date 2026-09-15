@@ -873,8 +873,26 @@ class PluginPackageDependency(BaseModel):
     )
 
 
-class PluginPackageMetadata(BaseModel):
+class PluginPackageProvenanceMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    source: Literal["upload", "marketplace", "registry", "git", "url"] = "upload"
+    source_id: str | None = Field(
+        default=None,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}$",
+    )
+    source_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        pattern=r"^https://[^\s]+$",
+    )
+    publisher: str | None = Field(default=None, max_length=128)
+    description: str | None = Field(default=None, max_length=256)
+
+
+class PluginPackageMetadata(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
     schema_version: Literal[1] = 1
     kind: Literal["manifest_only", "adapter_package"] = "manifest_only"
@@ -937,6 +955,46 @@ class PluginPackageMetadata(BaseModel):
     install_mode: PluginPackageInstallMode = "scan_only"
     dependencies: tuple[PluginPackageDependency, ...] = Field(default_factory=tuple, max_length=32)
     artifact: PluginPackageArtifactMetadata | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_known_package_fields(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        allowed_fields = {
+            "schema_version",
+            "kind",
+            "package_version",
+            "provenance",
+            "adapter_id",
+            "sdk_api_version",
+            "signature",
+            "signature_verification",
+            "verified_public_key_sha256",
+            "signature_trust_expires_at",
+            "approval_state",
+            "approval_reason",
+            "approved_by",
+            "approved_at",
+            "activation_state",
+            "activation_reason",
+            "runtime",
+            "entrypoint",
+            "isolation",
+            "install_mode",
+            "dependencies",
+            "artifact",
+        }
+        unknown_fields = sorted(set(value) - allowed_fields)
+        if unknown_fields:
+            raise ValueError("plugin package contains unsupported metadata fields")
+        provenance = value.get("provenance")
+        if provenance is not None:
+            try:
+                PluginPackageProvenanceMetadata.model_validate(provenance)
+            except ValidationError:
+                raise ValueError("plugin package provenance is invalid") from None
+        return value
 
     @field_validator("signature_trust_expires_at")
     @classmethod

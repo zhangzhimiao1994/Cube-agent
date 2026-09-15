@@ -1055,6 +1055,13 @@ describe("api client transport", () => {
         schema_version: 1,
         kind: "adapter_package",
         package_version: "1.2.3",
+        provenance: {
+          source: "marketplace",
+          source_id: "calendar/plugin",
+          source_url: "https://plugins.example/marketplace/calendar",
+          publisher: "Calendar Labs",
+          description: "Reviewed marketplace package",
+        },
         adapter_id: "calendar_python",
         sdk_api_version: "1.0",
         signature: {
@@ -1103,9 +1110,14 @@ describe("api client transport", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(
-      api.uploadPluginArchive(new File(["plugin-bytes"], "calendar plugin.zip", { type: "application/zip" })),
-    ).resolves.toEqual(response);
+    const result = await api.uploadPluginArchive(
+      new File(["plugin-bytes"], "calendar plugin.zip", { type: "application/zip" }),
+    );
+    expect(result).toEqual(response);
+    expect(result.plugin.package_metadata?.provenance?.source).toBe("marketplace");
+    expect(result.plugin.package_metadata?.provenance?.source_url).toBe(
+      "https://plugins.example/marketplace/calendar",
+    );
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins/install");
     expect(fetchMock.mock.calls[0]?.[1]).toEqual(

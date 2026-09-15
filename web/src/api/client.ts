@@ -1080,6 +1080,15 @@ const PluginPackageMetadataSchema = z.object({
   schema_version: z.literal(1).default(1),
   kind: z.enum(["manifest_only", "adapter_package"]).default("manifest_only"),
   package_version: z.string().nullable().default(null),
+  provenance: z
+    .object({
+      source: z.enum(["upload", "marketplace", "registry", "git", "url"]).default("upload"),
+      source_id: z.string().nullable().default(null),
+      source_url: z.string().nullable().default(null),
+      publisher: z.string().nullable().default(null),
+      description: z.string().nullable().default(null),
+    })
+    .optional(),
   adapter_id: z.string().nullable().default(null),
   sdk_api_version: z.string().nullable().default(null),
   signature: z

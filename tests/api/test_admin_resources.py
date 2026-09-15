@@ -4842,6 +4842,13 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
                     "schema_version": 1,
                     "kind": "adapter_package",
                     "package_version": "1.2.3",
+                    "provenance": {
+                        "source": "marketplace",
+                        "source_id": "calendar/plugin",
+                        "source_url": "https://plugins.example/marketplace/calendar",
+                        "publisher": "Calendar Labs",
+                        "description": "Reviewed marketplace package",
+                    },
                     "adapter_id": "calendar_python",
                     "sdk_api_version": "1.0",
                     "signature": {
@@ -4875,6 +4882,13 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
         "schema_version": 1,
         "kind": "adapter_package",
         "package_version": "1.2.3",
+        "provenance": {
+            "source": "marketplace",
+            "source_id": "calendar/plugin",
+            "source_url": "https://plugins.example/marketplace/calendar",
+            "publisher": "Calendar Labs",
+            "description": "Reviewed marketplace package",
+        },
         "adapter_id": "calendar_python",
         "sdk_api_version": "1.0",
         "signature": {
