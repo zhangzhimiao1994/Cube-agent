@@ -2717,7 +2717,7 @@ PY
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$text_line_output" != "ultra:self_repair run_id=run-ultra-self-repair ok=false focus=interaction_stability,final_result,self_repair,project_preflight_approval missing=final_artifacts,self_repair_trace errors=1" ]]; then
+  if [[ "$text_line_output" != "ultra:self_repair run_id=run-ultra-self-repair ok=false focus=interaction_stability,final_result,self_repair,project_preflight_approval missing=final_artifacts,discussion_trace,self_repair_trace errors=1" ]]; then
     printf 'fail: project scale execution runner text diagnostic payload\n' >&2
     failures=$((failures + 1))
     return 1
