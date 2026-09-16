@@ -86,6 +86,22 @@ _PLACEHOLDER_MARKERS = (
     "mock only",
     "stub only",
 )
+_VERIFICATION_REPORT_BASENAMES = frozenset(
+    {
+        "verification.md",
+        "test_report.md",
+        "acceptance_report.md",
+        "validation.md",
+    }
+)
+_EXECUTION_PASS_MARKERS = (
+    "passed",
+    "pass",
+    "success",
+    "succeeded",
+    "ok",
+    "0 failed",
+)
 
 
 class AcceptanceClient(Protocol):
@@ -1136,6 +1152,7 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
             if not lowered:
                 return ("workspace_bundle: empty project bundle",)
             text = _workspace_bundle_text(archive, names)
+            verification_text = _workspace_bundle_verification_text(archive, names)
             package_json = _read_bundle_file(archive, names, "package.json")
     except (OSError, zipfile.BadZipFile):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
@@ -1147,6 +1164,8 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing source files")
     if not _bundle_has_verification_path_or_script(lowered, package_json):
         reasons.append("workspace_bundle: missing test path or build/test script")
+    if not _bundle_has_build_test_execution_evidence(verification_text):
+        reasons.append("workspace_bundle: missing build/test execution evidence")
     if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
         reasons.append("workspace_bundle: contains placeholder or stub markers")
     return tuple(reasons)
@@ -1194,6 +1213,18 @@ def _workspace_bundle_text(archive: zipfile.ZipFile, names: Sequence[str]) -> st
     chunks: list[str] = []
     for name in names:
         if not _is_text_candidate(name):
+            continue
+        try:
+            chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
+        except (KeyError, RuntimeError, OSError):
+            continue
+    return "\n".join(chunks)
+
+
+def _workspace_bundle_verification_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:
+    chunks: list[str] = []
+    for name in names:
+        if name.lower().rsplit("/", 1)[-1] not in _VERIFICATION_REPORT_BASENAMES:
             continue
         try:
             chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
@@ -1272,6 +1303,23 @@ def _bundle_has_verification_path_or_script(
         return False
     scripts = package.get("scripts") if isinstance(package, dict) else None
     return isinstance(scripts, dict) and bool({"build", "test"} <= set(scripts))
+
+
+def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:
+    lowered = verification_text.lower()
+    return (
+        _line_has_execution_pass(lowered, ("build", "npm run build", "pnpm build", "yarn build"))
+        and _line_has_execution_pass(lowered, ("test", "npm test", "npm run test", "pytest"))
+    )
+
+
+def _line_has_execution_pass(text: str, command_markers: Sequence[str]) -> bool:
+    for line in text.splitlines():
+        if not any(marker in line for marker in command_markers):
+            continue
+        if any(marker in line for marker in _EXECUTION_PASS_MARKERS):
+            return True
+    return False
 
 
 def _should_attempt_deliverable_repair(

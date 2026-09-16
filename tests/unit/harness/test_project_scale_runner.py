@@ -352,6 +352,27 @@ def test_execute_project_scale_plan_repairs_missing_agent_standard_verification(
     assert "root_cause_repair" in repair_message
 
 
+def test_execute_project_scale_plan_repairs_missing_build_test_execution_evidence() -> None:
+    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        execution_evidence_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert report.results[0].run_id == "run-medium-artifact-repair"
+    assert report.results[0].evidence["deliverable_quality"] is True
+    assert report.results[0].evidence["deliverable_repair_trace"] is True
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "workspace_bundle: missing build/test execution evidence" in repair_message
+    assert "rerun build/test/interaction checks" in repair_message
+
+
 def test_execute_project_scale_plan_repairs_missing_hybrid_discussion_trace() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("hybrid",), execute=True)
     client = FakeAcceptanceClient(
@@ -420,7 +441,7 @@ def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() 
         "medium:artifact_production run_id=run-medium-artifact-repair ok=false "
         "focus=interaction_stability,final_result,deliverable_quality,"
         "agent_standard_verification,artifact_integrity "
-        "missing=deliverable_quality,agent_standard_verification errors=6 repair=failed"
+        "missing=deliverable_quality,agent_standard_verification errors=7 repair=failed"
     )
 
 
@@ -660,6 +681,8 @@ class FakeAcceptanceClient:
         discussion_trace_sequence: tuple[bool, ...] | None = None,
         plugin_contract: bool = True,
         plugin_contract_sequence: tuple[bool, ...] | None = None,
+        execution_evidence: bool = True,
+        execution_evidence_sequence: tuple[bool, ...] | None = None,
         actual_mode: str | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
@@ -686,6 +709,9 @@ class FakeAcceptanceClient:
         self.plugin_contract = plugin_contract
         self.plugin_contract_sequence = list(plugin_contract_sequence or ())
         self.current_plugin_contract = plugin_contract
+        self.execution_evidence = execution_evidence
+        self.execution_evidence_sequence = list(execution_evidence_sequence or ())
+        self.current_execution_evidence = execution_evidence
         self.actual_mode = actual_mode
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
@@ -811,6 +837,7 @@ class FakeAcceptanceClient:
         self.calls.append((method, path, None))
         if self.fail_bundle:
             raise RuntimeError("workspace bundle unavailable")
+        self._next_execution_evidence()
         if not self.current_deliverable_quality:
             return _project_bundle({"README.md": "placeholder project"})
         if not self.current_agent_standard:
@@ -826,12 +853,17 @@ class FakeAcceptanceClient:
                     "tests/app.test.ts": "import { status } from '../src/main';\n",
                 }
             )
+        verification = (
+            "- npm run build: passed\n- npm test: passed\n- interaction smoke: passed\n"
+            if self.current_execution_evidence
+            else "- npm run build\n- npm test\n- interaction smoke planned\n"
+        )
         return _project_bundle(
             {
                 "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
                 "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
-                "VERIFICATION.md": "- npm run build\n- npm test\n- interaction smoke passed\n",
+                "VERIFICATION.md": verification,
                 "package.json": json.dumps(
                     {"scripts": {"build": "vite build", "test": "vitest run"}},
                     sort_keys=True,
@@ -868,6 +900,13 @@ class FakeAcceptanceClient:
         else:
             self.current_plugin_contract = self.plugin_contract
         return self.current_plugin_contract
+
+    def _next_execution_evidence(self) -> bool:
+        if self.execution_evidence_sequence:
+            self.current_execution_evidence = self.execution_evidence_sequence.pop(0)
+        else:
+            self.current_execution_evidence = self.execution_evidence
+        return self.current_execution_evidence
 
 
 def _project_bundle(files: dict[str, str]) -> bytes:
