@@ -78,5 +78,21 @@ jobs:
           bats -v
       - run: bash -n install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
       - run: shellcheck install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
-      - run: bats tests/install
+      - name: Run bats tests/install
+        shell: bash
+        run: |
+          set +e
+          bats tests/install 2>&1 | tee bats-output.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          from pathlib import Path
+
+          output = Path("bats-output.txt").read_text(encoding="utf-8", errors="replace")
+          detail = output[-3500:].strip() or "bats tests/install failed without captured output"
+          detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error file=tests/install,title=bats failure::{detail}")
+          PY
+          fi
+          exit "$status"
       - run: docker compose -f deploy/compose/docker-compose.yml config --quiet
