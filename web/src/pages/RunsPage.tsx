@@ -3088,11 +3088,13 @@ function AgentWorkbenchDrawer({
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [activeView, setActiveView] = useState<"overview" | "coordination" | "actions" | "recovery">("overview");
   const selectedAgent = dispatchCards.find((card) => card.id === selectedAgentId) ?? null;
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
   const actionItems = items.filter((item) => !isWorkbenchCoordinationItem(item));
   const selectedAgentItems = selectedAgent ? agentActivityItems(selectedAgent, items) : [];
   const actionPreview = recentPreview(selectedAgentItems, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
+  const recoveryCount = failureDiagnostics.length + executionIntents.length;
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -3150,20 +3152,66 @@ function AgentWorkbenchDrawer({
             </section>
           ) : (
             <>
-              <div className="agent-workbench-list">
-                {dispatchCards.map((card) => {
-                  const activityItems = agentActivityItems(card, items);
-                  return (
-                    <button
-                      key={card.id}
-                      type="button"
-                      className={`agent-workbench-agent-card status-${card.status}`}
-                      aria-label={`打开${card.name}工作调度`}
-                      onClick={() => {
-                        setSelectedAgentId(card.id);
-                        setShowAllActions(false);
-                      }}
-                    >
+              <div className="agent-workbench-tabs" aria-label="工作席视图">
+                <button
+                  type="button"
+                  aria-label="助手总览"
+                  aria-pressed={activeView === "overview"}
+                  className={activeView === "overview" ? "active" : ""}
+                  onClick={() => setActiveView("overview")}
+                >
+                  助手总览
+                  <small>{dispatchCards.length} 个 Agent</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="调度讨论"
+                  aria-pressed={activeView === "coordination"}
+                  className={activeView === "coordination" ? "active" : ""}
+                  onClick={() => setActiveView("coordination")}
+                >
+                  调度讨论
+                  <small>{coordinationItems.length} 条</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="实际动作"
+                  aria-pressed={activeView === "actions"}
+                  className={activeView === "actions" ? "active" : ""}
+                  onClick={() => setActiveView("actions")}
+                >
+                  实际动作
+                  <small>{actionItems.length} 条</small>
+                </button>
+                {recoveryCount > 0 ? (
+                  <button
+                    type="button"
+                    aria-label="修复异常"
+                    aria-pressed={activeView === "recovery"}
+                    className={activeView === "recovery" ? "active" : ""}
+                    onClick={() => setActiveView("recovery")}
+                  >
+                    修复异常
+                    <small>{recoveryCount} 条</small>
+                  </button>
+                ) : null}
+              </div>
+              {activeView === "overview" ? (
+                <>
+                  <div className="agent-workbench-list">
+                    {dispatchCards.map((card) => {
+                      const activityItems = agentActivityItems(card, items);
+                      return (
+                        <button
+                          key={card.id}
+                          type="button"
+                          className={`agent-workbench-agent-card status-${card.status}`}
+                          aria-label={`打开${card.name}工作调度`}
+                          onClick={() => {
+                            setSelectedAgentId(card.id);
+                            setShowAllActions(false);
+                          }}
+                        >
                   <div className="agent-workbench-agent-header">
                     <div className="agent-workbench-avatar" aria-hidden="true">
                       {card.name.slice(0, 1)}
@@ -3183,32 +3231,34 @@ function AgentWorkbenchDrawer({
                       <p>{activityItems.length} 条，点击查看</p>
                     </div>
                   ) : null}
-                    </button>
-                  );
-                })}
-              </div>
-              {taskChain.length > 0 ? (
-                <section className="run-task-chain" aria-label="任务链路">
-                  <div className="run-task-chain-header">
-                    <span aria-hidden="true">⌁</span>
-                    <strong>任务链路</strong>
-                    <small>{taskChain.length} 个步骤</small>
+                        </button>
+                      );
+                    })}
                   </div>
-                  <div className="run-task-chain-list">
-                    {taskChain.map((step, index) => (
-                      <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
-                        <small>第 {index + 1} 步</small>
-                        <div>
-                          <strong>{step.agentName}</strong>
-                          <span>{step.status}</span>
-                        </div>
-                        <p>{step.summary || "等待执行"}</p>
-                      </article>
-                    ))}
-                  </div>
-                </section>
+                  {taskChain.length > 0 ? (
+                    <section className="run-task-chain" aria-label="任务链路">
+                      <div className="run-task-chain-header">
+                        <span aria-hidden="true">⌁</span>
+                        <strong>任务链路</strong>
+                        <small>{taskChain.length} 个步骤</small>
+                      </div>
+                      <div className="run-task-chain-list">
+                        {taskChain.map((step, index) => (
+                          <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
+                            <small>第 {index + 1} 步</small>
+                            <div>
+                              <strong>{step.agentName}</strong>
+                              <span>{step.status}</span>
+                            </div>
+                            <p>{step.summary || "等待执行"}</p>
+                          </article>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
+                </>
               ) : null}
-              {coordinationItems.length > 0 ? (
+              {activeView === "coordination" && coordinationItems.length > 0 ? (
                 <section className="agent-workbench-actions" aria-label="调度与讨论">
                   <div className="agent-workbench-actions-header">
                     <strong>调度与讨论</strong>
@@ -3225,7 +3275,7 @@ function AgentWorkbenchDrawer({
                   </div>
                 </section>
               ) : null}
-              {actionItems.length > 0 ? (
+              {activeView === "actions" && actionItems.length > 0 ? (
                 <section className="agent-workbench-actions" aria-label="过程轨迹">
                   <div className="agent-workbench-actions-header">
                     <strong>过程轨迹</strong>
@@ -3243,8 +3293,12 @@ function AgentWorkbenchDrawer({
                   </div>
                 </section>
               ) : null}
-              <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
-              <RunExecutionIntentsPanel intents={executionIntents} />
+              {activeView === "recovery" ? (
+                <>
+                  <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
+                  <RunExecutionIntentsPanel intents={executionIntents} />
+                </>
+              ) : null}
             </>
           )}
         </div>

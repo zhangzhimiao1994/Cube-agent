@@ -2136,6 +2136,43 @@ article:hover {
   padding: 0.52rem;
 }
 
+.agent-workbench-tabs {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.32rem;
+  grid-template-columns: repeat(auto-fit, minmax(6.8rem, 1fr));
+  padding: 0.28rem;
+}
+
+.agent-workbench-tabs button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+  padding: 0.42rem 0.48rem;
+  text-align: left;
+}
+
+.agent-workbench-tabs button.active,
+.agent-workbench-tabs button:hover,
+.agent-workbench-tabs button:focus-visible {
+  background: rgba(27, 178, 226, 0.16);
+  border-color: rgba(123, 225, 255, 0.28);
+  color: var(--text);
+}
+
+.agent-workbench-tabs button small {
+  color: inherit;
+  font-size: 0.68rem;
+  font-weight: 850;
+  opacity: 0.72;
+}
+
 .agent-workbench-list {
   display: grid;
   gap: 0.5rem;
