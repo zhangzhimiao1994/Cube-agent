@@ -227,6 +227,7 @@ class ManifestCapabilities(FakeCapabilities):
                     "adapter": "plugin_runtime",
                     "available": True,
                     "description": "Create a calendar event through the approved plugin.",
+                    "failure_codes": ("plugin.timeout", "plugin.invalid_arguments"),
                     "input_schema": {
                         "type": "object",
                         "additionalProperties": False,
@@ -1440,7 +1441,10 @@ async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> No
 
     assert len(harness.calls) == 1
     (model_tool,) = gateway.requests[0].tools
-    assert model_tool.description == "Create a calendar event through the approved plugin."
+    assert model_tool.description == (
+        "Create a calendar event through the approved plugin. "
+        "Failure codes: plugin.timeout, plugin.invalid_arguments."
+    )
     assert model_tool.parameters["type"] == "object"
     assert model_tool.parameters["additionalProperties"] is False
     assert model_tool.parameters["required"] == ("title", "date")

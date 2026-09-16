@@ -626,6 +626,29 @@ def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str |
     return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
 
 
+def _manifest_failure_codes(metadata: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    value = metadata.get("failure_codes")
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and _ID.fullmatch(item) is not None:
+            result.append(item)
+            if len(result) >= 6:
+                break
+    return tuple(result)
+
+
+def _description_with_failure_codes(description: str, failure_codes: Sequence[str]) -> str:
+    safe_codes = tuple(code for code in failure_codes if _ID.fullmatch(code) is not None)[:6]
+    if not safe_codes:
+        return description
+    suffix = " Failure codes: " + ", ".join(safe_codes) + "."
+    if len((description + suffix).encode("utf-8")) > 2_000:
+        return description
+    return description + suffix
+
+
 def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
     value = metadata.get("input_schema")
     if not isinstance(value, Mapping):
@@ -807,12 +830,16 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         sandbox_profile: str | None = None,
         description: str | None = None,
         input_schema: Mapping[str, JsonValue] | None = None,
+        failure_codes: Sequence[str] = (),
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
             _DynamicToolResult,
             name=name,
-            description=description or f"Approved Agent Hub capability {name}",
+            description=_description_with_failure_codes(
+                description or f"Approved Agent Hub capability {name}",
+                failure_codes,
+            ),
         )
         self._gateway = gateway
         self._tenant_id = tenant_id
@@ -1542,6 +1569,7 @@ class AutoGenDiscussionRuntime:
                             or _routing_sandbox_profile(context.routing_decision),
                             description=_manifest_description(metadata, name),
                             input_schema=_manifest_input_schema(metadata),
+                            failure_codes=_manifest_failure_codes(metadata),
                         )
                     )
                 return tools

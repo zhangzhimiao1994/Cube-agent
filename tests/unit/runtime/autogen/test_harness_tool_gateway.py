@@ -222,6 +222,7 @@ def test_gateway_capability_tool_schema_uses_manifest_input_schema() -> None:
                 "date": {"type": "string"},
             },
         },
+        failure_codes=("plugin.timeout", "plugin.invalid_arguments"),
         description="Create a calendar event through the approved plugin.",
     )
 
@@ -234,7 +235,10 @@ def test_gateway_capability_tool_schema_uses_manifest_input_schema() -> None:
             "date": {"type": "string"},
         },
     }
-    assert tool.schema["description"] == "Create a calendar event through the approved plugin."
+    assert tool.schema["description"] == (
+        "Create a calendar event through the approved plugin. "
+        "Failure codes: plugin.timeout, plugin.invalid_arguments."
+    )
 
 
 async def test_gateway_capability_tool_preserves_deterministic_harness_failure() -> None:

@@ -289,20 +289,28 @@ def _tool_definitions(
     metadata_by_name: Mapping[str, Mapping[str, JsonValue]] | None = None,
 ) -> tuple[ToolDefinition, ...]:
     mapping = _tool_name_mapping(internal_names)
+    metadata = metadata_by_name or {}
     return tuple(
-        ToolDefinition(
-            name=external_name,
-            description=_manifest_description(
-                (metadata_by_name or {}).get(internal_name, {}),
-                internal_name,
-            )
-            or _tool_description(internal_name),
-            parameters=_tool_parameters(
-                internal_name,
-                (metadata_by_name or {}).get(internal_name, {}),
-            ),
-        )
+        _tool_definition(external_name, internal_name, metadata.get(internal_name, {}))
         for external_name, internal_name in sorted(mapping.items())
+    )
+
+
+def _tool_definition(
+    external_name: str,
+    internal_name: str,
+    metadata: Mapping[str, JsonValue],
+) -> ToolDefinition:
+    description = _manifest_description(metadata, internal_name) or _tool_description(
+        internal_name
+    )
+    return ToolDefinition(
+        name=external_name,
+        description=_description_with_failure_codes(
+            description,
+            _manifest_failure_codes(metadata),
+        ),
+        parameters=_tool_parameters(internal_name, metadata),
     )
 
 
@@ -509,6 +517,34 @@ def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str |
     if not stripped or len(stripped.encode()) > 2_000:
         return None
     return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
+
+
+_SAFE_FAILURE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+
+
+def _manifest_failure_codes(metadata: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    value = metadata.get("failure_codes")
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and _SAFE_FAILURE_CODE.fullmatch(item) is not None:
+            result.append(item)
+            if len(result) >= 6:
+                break
+    return tuple(result)
+
+
+def _description_with_failure_codes(description: str, failure_codes: Sequence[str]) -> str:
+    safe_codes = tuple(
+        code for code in failure_codes if _SAFE_FAILURE_CODE.fullmatch(code) is not None
+    )[:6]
+    if not safe_codes:
+        return description
+    suffix = " Failure codes: " + ", ".join(safe_codes) + "."
+    if len((description + suffix).encode("utf-8")) > 1_024:
+        return description
+    return description + suffix
 
 
 def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
