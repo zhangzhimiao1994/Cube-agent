@@ -1391,6 +1391,7 @@ async def test_fallback_dependent_plain_text_output_is_wrapped_for_handoff_recov
     draft_created = next(
         event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
     )
+    assert draft_created.artifact is not None
     output = draft_created.artifact.content["text"]
     assert json.loads(cast(str, output)) == {
         "summary": "plain fallback evidence",
