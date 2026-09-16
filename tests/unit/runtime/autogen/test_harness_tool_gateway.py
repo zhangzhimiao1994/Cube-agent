@@ -471,3 +471,136 @@ async def test_autogen_runtime_yields_tool_failure_before_runtime_failure() -> N
     failed_index = kinds.index(EventKind.TOOL_FAILED)
     assert events[failed_index].reason == "capability denied"
     assert kinds[failed_index + 1] is EventKind.RUNTIME_FAILED
+
+
+async def test_autogen_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> None:
+    class ToolCallingGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text="analyst",
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+                if len(self.requests) == 1
+                else ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        GatewayToolCall(
+                            id="call_1",
+                            name="calendar.create_event",
+                            arguments={"title": "Review", "date": "2026-09-16"},
+                        ),
+                    ),
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="shared",
+                logical_model=request.logical_model,
+                provider_id="openai",
+                provider_model="openai/test",
+                cost_usd=Decimal(0),
+            )
+
+    class ManifestGateway:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "calendar.create_event"
+
+        def capability_manifest(self, tenant_id: UUID) -> Mapping[str, object]:
+            del tenant_id
+            return {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "available": True,
+                        "description": "Create a calendar event through the approved plugin.",
+                        "sandbox_profile": "remote_connector",
+                        "replay_safe": True,
+                    },
+                ),
+            }
+
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
+            raise AssertionError("tool execution must be routed through harness")
+
+    class RecordingHarnessGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"created": True},
+            )
+
+    participant = DiscussionParticipant(
+        id="analyst",
+        role="Analyst",
+        goal="Create calendar evidence",
+        logical_model="shared",
+        allowed_tools=("calendar.create_event",),
+    )
+    harness = RecordingHarnessGateway()
+    runtime = AutoGenDiscussionRuntime(
+        ToolCallingGateway(),
+        DiscussionPlan(
+            participants=(
+                participant,
+                DiscussionParticipant(
+                    id="critic",
+                    role="Critic",
+                    goal="Review",
+                    logical_model="shared",
+                ),
+            ),
+            selector_model="shared",
+            max_turns=2,
+        ),
+        capability_gateway=ManifestGateway(),
+        harness_tool_gateway=harness,
+    )
+    ctx = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISCUSS,
+        request="Create a review event.",
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
+        routing_decision={"sandbox_profile": "restricted"},
+    )
+
+    events: list[Any] = [event async for event in runtime.run(ctx)]
+
+    assert harness.calls
+    assert harness.calls[0].sandbox == "remote_connector"
+    started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
+    assert started.payload["sandbox"] == "remote_connector"

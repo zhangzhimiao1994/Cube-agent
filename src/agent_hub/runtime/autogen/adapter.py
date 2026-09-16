@@ -525,6 +525,16 @@ def _tool_sandbox(
         return "read_only"
     if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "none"
+    if sandbox_profile in {
+        "restricted",
+        "remote_connector",
+        "local_process",
+        "http_read",
+        "in_process",
+        "read_only",
+        "none",
+    }:
+        return sandbox_profile
     return "restricted"
 
 
@@ -549,6 +559,71 @@ def _nonblank_argument(arguments: Mapping[str, JsonValue], name: str) -> bool:
 def _routing_sandbox_profile(routing_decision: Mapping[str, JsonValue]) -> str | None:
     value = routing_decision.get("sandbox_profile")
     return value if isinstance(value, str) else None
+
+
+def _capability_manifest_tool_metadata(
+    gateway: object,
+    *,
+    tenant_id: UUID,
+    name: str,
+) -> Mapping[str, JsonValue]:
+    manifest = getattr(gateway, "capability_manifest", None)
+    if not callable(manifest):
+        return {}
+    try:
+        payload = manifest(tenant_id)
+    except Exception:  # noqa: BLE001 - manifest lookup must never break tool construction.
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    item = _capability_manifest_item(payload, name)
+    if item is None or item.get("available") is False:
+        return {}
+    return item
+
+
+def _capability_manifest_item(
+    payload: Mapping[object, object],
+    name: str,
+) -> Mapping[str, JsonValue] | None:
+    capabilities = payload.get("capabilities")
+    candidates: Sequence[object]
+    if isinstance(capabilities, Mapping):
+        candidates = tuple(capabilities.values())
+    elif isinstance(capabilities, Sequence) and not isinstance(capabilities, str | bytes):
+        candidates = capabilities
+    else:
+        return None
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        item = cast(Mapping[str, JsonValue], candidate)
+        if item.get("id") == name or _manifest_aliases_include(item.get("aliases"), name):
+            return item
+    return None
+
+
+def _manifest_aliases_include(value: object, name: str) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, str | bytes)
+        and any(alias == name for alias in value if isinstance(alias, str))
+    )
+
+
+def _manifest_sandbox_profile(metadata: Mapping[str, JsonValue]) -> str | None:
+    value = metadata.get("sandbox_profile")
+    return value if isinstance(value, str) else None
+
+
+def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str | None:
+    value = metadata.get("description")
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped.encode()) > 2_000:
+        return None
+    return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
 
 
 def _safe_id(value: str, name: str) -> str:
@@ -706,12 +781,13 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         role: Role | None = None,
         approval_envelope_required: bool = True,
         sandbox_profile: str | None = None,
+        description: str | None = None,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
             _DynamicToolResult,
             name=name,
-            description=f"Approved Agent Hub capability {name}",
+            description=description or f"Approved Agent Hub capability {name}",
         )
         self._gateway = gateway
         self._tenant_id = tenant_id
@@ -1391,36 +1467,51 @@ class AutoGenDiscussionRuntime:
                     sequence += 1
                 return tuple(events)
 
+            def participant_tools(
+                participant: DiscussionParticipant,
+            ) -> list[
+                BaseTool[Any, Any] | Callable[..., Any] | Callable[..., Awaitable[Any]]
+            ] | None:
+                if not participant.allowed_tools:
+                    return None
+                tools: list[
+                    BaseTool[Any, Any] | Callable[..., Any] | Callable[..., Awaitable[Any]]
+                ] = []
+                for name in participant.allowed_tools:
+                    metadata = _capability_manifest_tool_metadata(
+                        self._capabilities,
+                        tenant_id=context.tenant_id,
+                        name=name,
+                    )
+                    tools.append(
+                        GatewayCapabilityTool(
+                            cast(CapabilityGateway, self._capabilities),
+                            tenant_id=context.tenant_id,
+                            run_id=context.run_id,
+                            actor=participant.id,
+                            name=name,
+                            records=tool_records,
+                            durability=durability,
+                            harness_tool_gateway=cast(
+                                HarnessToolInvoker, self._tool_gateway
+                            ),
+                            user_id=context.actor_id,
+                            role=context.actor_role,
+                            approval_envelope_required=self._uses_external_harness_tool_gateway,
+                            sandbox_profile=_manifest_sandbox_profile(metadata)
+                            or _routing_sandbox_profile(context.routing_decision),
+                            description=_manifest_description(metadata, name),
+                        )
+                    )
+                return tools
+
             agents: list[ChatAgent | Team] = [
                 cast(
                     ChatAgent,
                     AssistantAgent(
                         participant.id,
                         model_client=clients[participant.id],
-                        tools=(
-                            [
-                                GatewayCapabilityTool(
-                                    cast(CapabilityGateway, self._capabilities),
-                                    tenant_id=context.tenant_id,
-                                    run_id=context.run_id,
-                                    actor=participant.id,
-                                    name=name,
-                                    records=tool_records,
-                                    durability=durability,
-                                    harness_tool_gateway=cast(
-                                        HarnessToolInvoker, self._tool_gateway
-                                    ),
-                                    user_id=context.actor_id,
-                                    role=context.actor_role,
-                                    approval_envelope_required=self._uses_external_harness_tool_gateway,
-                                    sandbox_profile=_routing_sandbox_profile(
-                                        context.routing_decision
-                                    ),
-                                )
-                                for name in participant.allowed_tools
-                            ]
-                            or None
-                        ),
+                        tools=participant_tools(participant),
                         description=f"{participant.role}: {participant.goal}",
                         system_message=(
                             f"Role: {participant.role}. Goal: {participant.goal}. "
