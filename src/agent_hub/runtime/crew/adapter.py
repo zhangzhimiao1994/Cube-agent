@@ -841,6 +841,10 @@ def _agent_model_fallback_label(agent: AgentSpec, recovery_attempt: int) -> str 
     return logical_model if logical_model != agent.logical_model else None
 
 
+def _subagent_recovery_attempt_limit(agent: AgentSpec) -> int:
+    return max(_STEP_TIMEOUT_RECOVERY_RETRIES, len(agent.fallback_models))
+
+
 def _step_orchestration_payload(
     plan: DispatchPlan,
     step: DispatchStep,
@@ -978,17 +982,27 @@ def _can_compact_retry_subagent(
     *,
     recovery_attempt: int,
     remaining_seconds: float,
+    max_recovery_attempts: int = _STEP_TIMEOUT_RECOVERY_RETRIES,
 ) -> bool:
-    return (
+    error_code = diagnostic.get("error_code")
+    retryable_compact_error = (
         diagnostic.get("retryable") is True
-        and diagnostic.get("error_code")
+        and error_code
         in {
             "crew.step_timeout",
             "model.empty_response",
             "model.capacity_unavailable",
             "capability.transient_execution_failed",
         }
-        and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
+    )
+    fallback_model_rejected = (
+        error_code == "model.provider_bad_request"
+        and recovery_attempt > 0
+        and recovery_attempt < max_recovery_attempts
+    )
+    return (
+        (retryable_compact_error or fallback_model_rejected)
+        and recovery_attempt < max_recovery_attempts
         and remaining_seconds > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
     )
 
@@ -997,6 +1011,7 @@ def _recovery_status_after_attempts(
     diagnostic: Mapping[str, object],
     *,
     recovery_attempts: int,
+    max_recovery_attempts: int = _STEP_TIMEOUT_RECOVERY_RETRIES,
 ) -> str:
     return (
         "failed_after_compact_retry"
@@ -1007,7 +1022,7 @@ def _recovery_status_after_attempts(
             "model.capacity_unavailable",
             "capability.transient_execution_failed",
         }
-        and recovery_attempts >= _STEP_TIMEOUT_RECOVERY_RETRIES
+        and recovery_attempts >= max_recovery_attempts
         else "failed_without_compact_retry"
     )
 
@@ -2611,6 +2626,7 @@ class CrewDispatchRuntime:
                                 remaining_seconds=self._remaining_timeout(
                                     run_state, step_deadline
                                 ),
+                                max_recovery_attempts=_subagent_recovery_attempt_limit(reviewer),
                             ):
                                 review_recovery_attempt += 1
                                 step_deadline = self._recovery_step_deadline(
@@ -2642,6 +2658,7 @@ class CrewDispatchRuntime:
                             recovery_status = _recovery_status_after_attempts(
                                 review_diagnostic,
                                 recovery_attempts=review_recovery_attempt,
+                                max_recovery_attempts=_subagent_recovery_attempt_limit(reviewer),
                             )
                             if recovery_status == "failed_after_compact_retry":
                                 review_diagnostic = {
@@ -2797,6 +2814,7 @@ class CrewDispatchRuntime:
                     diagnostic,
                     recovery_attempt=recovery_attempt,
                     remaining_seconds=self._remaining_timeout(run_state, step_deadline),
+                    max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
                 ):
                     recovery_attempt += 1
                     step_deadline = self._recovery_step_deadline(run_state, step_deadline)
@@ -2828,6 +2846,7 @@ class CrewDispatchRuntime:
                 recovery_status = _recovery_status_after_attempts(
                     diagnostic,
                     recovery_attempts=recovery_attempt,
+                    max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
                 )
                 if recovery_status == "failed_after_compact_retry":
                     diagnostic = {

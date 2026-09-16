@@ -15,6 +15,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
     ModelRequest,
@@ -554,6 +555,48 @@ class CapacityUnavailableThenRoleAwareGateway(RoleAwareGateway):
         )
 
 
+class CapacityThenBadRequestThenRoleAwareGateway(RoleAwareGateway):
+    def __init__(
+        self,
+        *,
+        unavailable_logical_model: str,
+        bad_request_logical_model: str,
+    ) -> None:
+        super().__init__()
+        self.unavailable_logical_model = unavailable_logical_model
+        self.bad_request_logical_model = bad_request_logical_model
+        self._unavailable_returned = False
+        self._bad_request_returned = False
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if (
+            request.logical_model == self.unavailable_logical_model
+            and not self._unavailable_returned
+        ):
+            self._unavailable_returned = True
+            raise CapacityUnavailable("model capacity unavailable")
+        if (
+            request.logical_model == self.bad_request_logical_model
+            and not self._bad_request_returned
+        ):
+            self._bad_request_returned = True
+            raise ModelTransportError("model transport failed", status_code=400)
+        text = (
+            '{"verdict":"approve"}'
+            if request.logical_model == "review"
+            else _role_output_text(request)
+        )
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class SlowCapacityRecoveryGateway(RoleAwareGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -710,6 +753,30 @@ def _one_step_plan_with_model_fallback() -> DispatchPlan:
                 goal="Write",
                 logical_model="primary",
                 fallback_models=("backup",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+
+
+def _one_step_plan_with_two_model_fallbacks() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="primary",
+                fallback_models=("backup", "final"),
             ),
         ),
         steps=(
@@ -2180,6 +2247,32 @@ async def test_agent_empty_model_response_retries_with_agent_fallback_model() ->
     assert retrying.actor == "writer"
     assert retrying.payload["error_code"] == "model.empty_response"
     assert retrying.payload["model_fallback"] == "backup"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_agent_fallback_provider_bad_request_retries_next_fallback_model() -> None:
+    gateway = CapacityThenBadRequestThenRoleAwareGateway(
+        unavailable_logical_model="primary",
+        bad_request_logical_model="backup",
+    )
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan_with_two_model_fallbacks(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    assert [request.logical_model for request in gateway.requests] == [
+        "primary",
+        "backup",
+        "final",
+    ]
+    retrying = [event for event in events if event.kind is EventKind.STEP_RETRYING]
+    assert [event.payload["model_fallback"] for event in retrying] == ["backup", "final"]
+    assert retrying[0].payload["error_code"] == "model.capacity_unavailable"
+    assert retrying[1].payload["error_code"] == "model.provider_bad_request"
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
