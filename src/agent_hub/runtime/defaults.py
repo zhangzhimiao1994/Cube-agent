@@ -535,6 +535,16 @@ class ConfigBackedDispatchRuntime:
             deployment_constraint=deployment_constraint,
             required_capabilities_by_role=role_capability_requirements,
         )
+        role_fallbacks_by_id = _role_model_fallbacks_by_id(
+            role_sources,
+            roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+            role_tools_by_id=role_tools_by_id,
+            deployment_constraint=deployment_constraint,
+            required_capabilities_by_role=role_capability_requirements,
+        )
         plan = _dispatch_plan(
             roles,
             context,
@@ -545,6 +555,7 @@ class ConfigBackedDispatchRuntime:
                 deployment_constraint=deployment_constraint,
             ),
             capability_gateway=self._capability_gateway,
+            role_fallbacks_by_id=role_fallbacks_by_id,
         )
         role_payload = _dispatch_role_payload(plan)
         return _PlannedRuntime(
@@ -898,6 +909,16 @@ class ConfigBackedHybridRuntime:
             deployment_constraint=deployment_constraint,
             required_capabilities_by_role=role_capability_requirements,
         )
+        dispatch_fallbacks_by_id = _role_model_fallbacks_by_id(
+            dispatch_role_sources,
+            dispatch_roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+            role_tools_by_id=dispatch_role_tools_by_id,
+            deployment_constraint=deployment_constraint,
+            required_capabilities_by_role=role_capability_requirements,
+        )
         discussion_matrix, discussion_matrix_truncated = _role_model_routing_matrix_payload(
             discussion_role_sources,
             discussion_roles,
@@ -920,6 +941,7 @@ class ConfigBackedHybridRuntime:
                 deployment_constraint=deployment_constraint,
             ),
             capability_gateway=self._capability_gateway,
+            role_fallbacks_by_id=dispatch_fallbacks_by_id,
         )
         discussion_plan = _discussion_plan(
             discussion_roles,
@@ -1140,6 +1162,7 @@ def _dispatch_plan(
     *,
     max_parallelism: int = 1,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+    role_fallbacks_by_id: Mapping[str, tuple[str, ...]] | None = None,
 ) -> DispatchPlan:
     selected_roles = tuple(roles)
     if not selected_roles:
@@ -1177,6 +1200,7 @@ def _dispatch_plan(
         )
         for role in selected_roles
     }
+    role_fallbacks_by_id = role_fallbacks_by_id or {}
     agents = [
         AgentSpec(
             id=role.id,
@@ -1184,6 +1208,7 @@ def _dispatch_plan(
             goal=role.mission,
             logical_model=role.model,
             allowed_tools=role_tools_by_id[role.id],
+            fallback_models=role_fallbacks_by_id.get(role.id, ()),
             output_schema=_project_preflight_role_output_schema(
                 role,
                 preflight_context=preflight_context,
@@ -2598,6 +2623,61 @@ def _role_model_routing_matrix_payload(
         )
         assigned_counts[selected] = assigned_counts.get(selected, 0) + 1
     return tuple(payload), truncated
+
+
+def _role_model_fallbacks_by_id(
+    source_roles: tuple[RoleAssignment, ...],
+    assigned_roles: tuple[RoleAssignment, ...],
+    config: PlatformConfig,
+    *,
+    default_model: str,
+    task: object,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
+    required_capabilities_by_role: Mapping[str, frozenset[ModelCapability]] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    fallbacks: dict[str, tuple[str, ...]] = {}
+    for index, role in enumerate(source_roles):
+        assigned_role = assigned_roles[index] if index < len(assigned_roles) else None
+        selected = assigned_role.model if assigned_role is not None else default_model
+        role_tools = _routing_tools_for_role(role, role_tools_by_id)
+        required_capabilities = _required_model_capabilities_for_assignment(
+            role,
+            allowed_tools=role_tools,
+            required_capability_override=_required_capability_override(
+                role,
+                required_capabilities_by_role,
+            ),
+        )
+        ranked = tuple(
+            candidate.logical_model
+            for candidate in rank_role_models(
+                RoleModelRoutingRequest(
+                    task=task,
+                    role_id=role.id,
+                    role=role.role,
+                    purpose=role.purpose.value,
+                    mission=role.mission,
+                    skills=role.skills,
+                    must_answer=role.must_answer,
+                    allowed_tools=role_tools,
+                    preferred_model=role.model,
+                    default_model=default_model,
+                    required_capabilities=required_capabilities,
+                ),
+                config,
+            )
+            if candidate.eligible
+            and candidate.logical_model != selected
+            and _logical_model_satisfies_deployment_constraint(
+                config,
+                candidate.logical_model,
+                required_capabilities,
+                deployment_constraint=deployment_constraint,
+            )
+        )
+        fallbacks[role.id] = tuple(dict.fromkeys(ranked))[:3]
+    return fallbacks
 
 
 def _capability_execution_plan_payload(

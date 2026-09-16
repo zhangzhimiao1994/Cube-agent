@@ -41,6 +41,7 @@ from agent_hub.runtime.defaults import (
     _dispatch_parallelism,
     _dispatch_plan,
     _model_execution_plan_payload,
+    _role_model_fallbacks_by_id,
     _role_model_routing_matrix_payload,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
@@ -5743,6 +5744,85 @@ def test_role_model_routing_matrix_explains_capacity_balanced_selection() -> Non
     reasons = candidates[0]["reasons"]
     assert isinstance(reasons, tuple)
     assert "capacity_adjustment:selected_after_balance" in reasons
+
+
+def test_role_model_fallbacks_keep_unselected_candidates_internal_only() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build and package the project.",
+            must_answer=("What changed?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="qwen",
+        ),
+    )
+    assigned = _assign_models_to_roles(
+        roles,
+        config,
+        default_model="deepseek",
+        task="Build a small software project and package a ZIP.",
+        role_tools_by_id={"implementer": ("project.generate_zip",)},
+    )
+
+    fallbacks = _role_model_fallbacks_by_id(
+        roles,
+        assigned,
+        config,
+        default_model="deepseek",
+        task="Build a small software project and package a ZIP.",
+        role_tools_by_id={"implementer": ("project.generate_zip",)},
+    )
+    matrix, _truncated = _role_model_routing_matrix_payload(
+        roles,
+        assigned,
+        config,
+        default_model="deepseek",
+        task="Build a small software project and package a ZIP.",
+        role_tools_by_id={"implementer": ("project.generate_zip",)},
+    )
+
+    assert assigned[0].model == "qwen"
+    assert fallbacks["implementer"] == ("deepseek",)
+    candidates_value = matrix[0]["candidates"]
+    assert isinstance(candidates_value, tuple)
+    candidates = cast(tuple[Mapping[str, JsonValue], ...], candidates_value)
+    assert [candidate["logical_model"] for candidate in candidates] == ["qwen"]
 
 
 def test_role_model_routing_matrix_caps_event_payload_and_hides_unselected_models() -> None:

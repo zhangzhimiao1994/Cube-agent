@@ -701,6 +701,30 @@ def _one_step_plan() -> DispatchPlan:
     )
 
 
+def _one_step_plan_with_model_fallback() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="primary",
+                fallback_models=("backup",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+
+
 def _short_timeout_plan() -> DispatchPlan:
     return DispatchPlan(
         agents=(
@@ -2138,6 +2162,25 @@ async def test_agent_empty_model_response_compact_retries_before_completing() ->
     await restored.restore_checkpoint(checkpoint)
     resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
     assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
+async def test_agent_empty_model_response_retries_with_agent_fallback_model() -> None:
+    gateway = EmptyThenRoleAwareGateway(empty_logical_model="primary")
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan_with_model_fallback(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    assert [request.logical_model for request in gateway.requests] == ["primary", "backup"]
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "writer"
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert retrying.payload["model_fallback"] == "backup"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_agent_capacity_unavailable_compact_retries_before_completing() -> None:

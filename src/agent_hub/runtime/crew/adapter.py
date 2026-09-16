@@ -812,18 +812,33 @@ def _subagent_recovery_payload(
     recovery_attempt: int | None = None,
     recovery_attempts: int | None = None,
     strategy: str = "compact_retry",
+    model_fallback: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "recovery_strategy": strategy,
         "recovery_layers": _STEP_TIMEOUT_RECOVERY_LAYERS,
         "recovery_status": status,
-        "model_fallback": _MODEL_FALLBACK_UNAVAILABLE,
+        "model_fallback": model_fallback or _MODEL_FALLBACK_UNAVAILABLE,
     }
     if recovery_attempt is not None:
         payload["recovery_attempt"] = recovery_attempt
     if recovery_attempts is not None:
         payload["recovery_attempts"] = recovery_attempts
     return payload
+
+
+def _agent_logical_model_for_recovery(agent: AgentSpec, recovery_attempt: int) -> str:
+    if recovery_attempt <= 0:
+        return agent.logical_model
+    fallback_index = recovery_attempt - 1
+    if fallback_index < len(agent.fallback_models):
+        return agent.fallback_models[fallback_index]
+    return agent.logical_model
+
+
+def _agent_model_fallback_label(agent: AgentSpec, recovery_attempt: int) -> str | None:
+    logical_model = _agent_logical_model_for_recovery(agent, recovery_attempt)
+    return logical_model if logical_model != agent.logical_model else None
 
 
 def _step_orchestration_payload(
@@ -2793,10 +2808,17 @@ class CrewDispatchRuntime:
                         payload={
                             "attempt": retries + recovery_attempt + 1,
                             "role": agent.role,
-                            "logical_model": agent.logical_model,
+                            "logical_model": _agent_logical_model_for_recovery(
+                                agent,
+                                recovery_attempt,
+                            ),
                             **_subagent_recovery_payload(
                                 status="retrying_after_compact_trigger",
                                 recovery_attempt=recovery_attempt,
+                                model_fallback=_agent_model_fallback_label(
+                                    agent,
+                                    recovery_attempt,
+                                ),
                             ),
                             **diagnostic,
                             **_step_orchestration_payload(plan, step),
@@ -2921,7 +2943,8 @@ class CrewDispatchRuntime:
                     "preserve required deliverables, avoid verbose reasoning, and explicitly name "
                     "any blocker with evidence."
                 ),
-                "model_fallback": _MODEL_FALLBACK_UNAVAILABLE,
+                "model_fallback": _agent_model_fallback_label(agent, recovery_attempt)
+                or _MODEL_FALLBACK_UNAVAILABLE,
             }
         if feedback is not None:
             user["untrusted_reviewer_feedback"] = feedback
@@ -2956,6 +2979,7 @@ class CrewDispatchRuntime:
                     sources,
                     retries,
                     _subagent_model_attempt(retries, recovery_attempt),
+                    recovery_attempt,
                     run_state,
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
@@ -3048,6 +3072,7 @@ class CrewDispatchRuntime:
         input_sources: tuple[Artifact, ...],
         retries: int,
         model_attempt: int,
+        recovery_attempt: int,
         run_state: _RunState,
         step_deadline: float,
         *,
@@ -3074,21 +3099,23 @@ class CrewDispatchRuntime:
             required_capabilities.add(ModelCapability.TOOL_CALLING)
         if response_schema is not None:
             required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
+        logical_model = _agent_logical_model_for_recovery(agent, recovery_attempt)
         for _round in range(_MAX_TOOL_ROUNDS + 1):
             await emit(
                 kind=EventKind.MODEL_STARTED,
                 actor=agent.id,
-                message=f"{agent.role} 调用模型 {agent.logical_model}。",
+                message=f"{agent.role} 调用模型 {logical_model}。",
                 payload={
                     "role": agent.role,
-                    "logical_model": agent.logical_model,
+                    "logical_model": logical_model,
+                    "primary_logical_model": agent.logical_model,
                     "task": step.task,
                     "attempt": retries + 1,
                     "tools": tuple(step.tools),
                 },
             )
             request = ModelRequest(
-                logical_model=agent.logical_model,
+                logical_model=logical_model,
                 messages=tuple(messages),
                 required_capabilities=frozenset(required_capabilities),
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),

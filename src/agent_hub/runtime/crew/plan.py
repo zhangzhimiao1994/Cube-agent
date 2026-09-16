@@ -130,6 +130,7 @@ class AgentSpec(_PlanModel):
     goal: str = Field(repr=False)
     logical_model: str
     allowed_tools: tuple[str, ...] = ()
+    fallback_models: tuple[str, ...] = ()
     max_output_tokens: int = Field(default=4096, ge=1, le=1_000_000)
     output_schema: dict[str, str] = Field(default_factory=dict)
 
@@ -152,6 +153,11 @@ class AgentSpec(_PlanModel):
     @classmethod
     def tools(cls, value: object) -> tuple[str, ...]:
         return _id_tuple(value, "agent tools")
+
+    @field_validator("fallback_models", mode="before")
+    @classmethod
+    def fallback_model_ids(cls, value: object) -> tuple[str, ...]:
+        return _id_tuple(value, "agent fallback models", maximum=16)
 
     @field_validator("output_schema", mode="before")
     @classmethod
