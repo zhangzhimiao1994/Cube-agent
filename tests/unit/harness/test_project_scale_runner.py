@@ -39,6 +39,7 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
     assert "run_events" in payload["required_evidence"]
     assert "agent_standard_verification" in payload["required_evidence"]
     assert "discussion_trace" in payload["required_evidence"]
+    assert "plugin_contract" in payload["required_evidence"]
     assert "delete_workspace" in payload["cleanup_actions"]
 
 
@@ -106,6 +107,7 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         "deliverable_quality": True,
         "agent_standard_verification": True,
         "discussion_trace": False,
+        "plugin_contract": False,
         "deliverable_repair_trace": False,
         "self_repair_trace": False,
         "project_preflight_approval": False,
@@ -150,6 +152,49 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
         "mode_control",
         "no_silent_downgrade",
     ]
+
+
+def test_execute_project_scale_plan_requires_plugin_contract_evidence() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-plugin",
+        session_id="project-scale-small-plugin",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        plugin_contract=False,
+        plugin_contract_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-small-plugin-repair"
+    assert result.evidence["plugin_contract"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "plugin_contract: missing or incomplete plugin capability contract evidence" in repair_message
+    assert "adapter contracts" in repair_message
+    assert "sandbox and policy boundaries" in repair_message
+
+
+def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_repair() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-plugin",
+        session_id="project-scale-small-plugin",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        plugin_contract=False,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is False
+    assert result.evidence["plugin_contract"] is False
+    assert "plugin_contract: missing or incomplete plugin capability contract evidence" in result.errors
+    assert "plugin_contract" in result.missing_evidence
 
 
 def test_execute_project_scale_plan_rejects_silent_mode_downgrade() -> None:
@@ -613,6 +658,8 @@ class FakeAcceptanceClient:
         agent_standard_sequence: tuple[bool, ...] | None = None,
         discussion_trace: bool = True,
         discussion_trace_sequence: tuple[bool, ...] | None = None,
+        plugin_contract: bool = True,
+        plugin_contract_sequence: tuple[bool, ...] | None = None,
         actual_mode: str | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
@@ -636,6 +683,9 @@ class FakeAcceptanceClient:
         self.discussion_trace = discussion_trace
         self.discussion_trace_sequence = list(discussion_trace_sequence or ())
         self.current_discussion_trace = discussion_trace
+        self.plugin_contract = plugin_contract
+        self.plugin_contract_sequence = list(plugin_contract_sequence or ())
+        self.current_plugin_contract = plugin_contract
         self.actual_mode = actual_mode
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
@@ -686,6 +736,7 @@ class FakeAcceptanceClient:
             deliverable_quality = self._next_deliverable_quality()
             agent_standard = self._next_agent_standard()
             discussion_trace = self._next_discussion_trace()
+            plugin_contract = self._next_plugin_contract()
             details_response: dict[str, object] = {
                 "id": details_run_id,
                 "status": status,
@@ -731,6 +782,14 @@ class FakeAcceptanceClient:
                     "final_decision": (
                         "planner and reviewer selected the implementation path after evidence review"
                     ),
+                }
+            if plugin_contract:
+                details_response["plugin_contract"] = {
+                    "manifest_discovered": True,
+                    "adapter_contract_checked": True,
+                    "policy_boundary_checked": True,
+                    "sandbox_profile_checked": True,
+                    "failure_recovery_checked": True,
                 }
             return details_response
         if path in {
@@ -802,6 +861,13 @@ class FakeAcceptanceClient:
         else:
             self.current_discussion_trace = self.discussion_trace
         return self.current_discussion_trace
+
+    def _next_plugin_contract(self) -> bool:
+        if self.plugin_contract_sequence:
+            self.current_plugin_contract = self.plugin_contract_sequence.pop(0)
+        else:
+            self.current_plugin_contract = self.plugin_contract
+        return self.current_plugin_contract
 
 
 def _project_bundle(files: dict[str, str]) -> bytes:

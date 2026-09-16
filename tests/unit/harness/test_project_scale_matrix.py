@@ -32,6 +32,7 @@ def test_project_scale_matrix_requires_isolation_evidence_and_cleanup() -> None:
     assert "discussion_trace" in matrix.required_evidence
     assert "project_preflight_approval" in matrix.required_evidence
     assert "self_repair_trace" in matrix.required_evidence
+    assert "plugin_contract" in matrix.required_evidence
     assert "release_health" not in matrix.required_evidence
     assert "delete_workspace" in matrix.cleanup_actions
     assert "cancel_or_archive_probe_runs" in matrix.cleanup_actions
@@ -62,6 +63,18 @@ def test_project_scale_matrix_has_explicit_capability_validation_flow() -> None:
         assert "no_silent_downgrade" in case.validation_focus
 
 
+def test_project_scale_matrix_has_explicit_plugin_contract_flow() -> None:
+    matrix = ProjectScaleMatrix.default()
+    plugin_cases = [case for case in matrix.cases if case.flow == "plugin"]
+
+    assert len(plugin_cases) == len(PROJECT_SCALE_TIERS)
+    for case in plugin_cases:
+        assert "plugin_contract" in case.validation_focus
+        assert "capability_matrix" in case.validation_focus
+        assert "sandbox_policy" in case.validation_focus
+        assert "failure_recovery" in case.validation_focus
+
+
 def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
     matrix = ProjectScaleMatrix.default()
 
@@ -86,6 +99,10 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
         assert "avoid placeholder or stub-only output" in message
         assert "deliverable_quality" in message
         assert "agent_standard_verification" in message
+        if case.flow == "plugin":
+            assert "plugin_contract" in message
+            assert "manifest discovery" in message
+            assert "sandbox and policy boundaries" in message
         assert "Codex/Claude Code verification standards" in message
         assert "plan before implementation" in message
         assert "repair root causes" in message
@@ -128,6 +145,7 @@ def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None
         "discussion_trace",
         "project_preflight_approval",
         "self_repair_trace",
+        "plugin_contract",
     )
     assert plan.cleanup_actions == (
         "cancel_or_archive_probe_runs",

@@ -2889,6 +2889,7 @@ require(
 require("workspace_bundle" in summary, "project scale evidence")
 require("deliverable_quality" in summary, "project scale quality evidence")
 require("agent_standard_verification" in summary, "agent verification standard evidence")
+require("plugin_contract" in summary, "plugin contract evidence")
 require("cancel_or_archive_probe_runs" in summary, "project scale cleanup")
 require(matrix.case_count == len(PROJECT_SCALE_TIERS) * len(PROJECT_SCALE_FLOW_KINDS), "case count")
 require(matrix.requires_isolated_workspace is True, "isolated workspace")
@@ -2904,6 +2905,17 @@ require(
 require(
     all("agent_standard_verification" in case.validation_focus for case in matrix.cases),
     "agent verification standard focus",
+)
+require(
+    all(
+        "plugin_contract" in case.validation_focus
+        and "capability_matrix" in case.validation_focus
+        and "sandbox_policy" in case.validation_focus
+        and "failure_recovery" in case.validation_focus
+        for case in matrix.cases
+        if case.flow == "plugin"
+    ),
+    "plugin contract focus",
 )
 print(summary)
 PY
@@ -2923,6 +2935,7 @@ check_project_scale_runner_contract() {
   local help_output
   local dry_run_output
   local dry_run_text_output
+  local plugin_focus_output
   local report_file
   local report_output
   local text_line_output
@@ -2969,6 +2982,16 @@ check_project_scale_runner_contract() {
   fi
   if [[ "$dry_run_text_output" != *"small:capability_validation focus=interaction_stability,final_result,deliverable_quality,agent_standard_verification,capability_matrix,mode_control,no_silent_downgrade"* ]]; then
     printf 'fail: project scale execution runner dry-run text focus\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! plugin_focus_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" -m agent_hub.harness.project_scale_runner --scale small --flow plugin 2>&1)"; then
+    printf 'fail: project scale execution runner plugin dry-run text\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$plugin_focus_output" != *"small:plugin focus=interaction_stability,final_result,deliverable_quality,agent_standard_verification,artifact_integrity,plugin_contract,capability_matrix,sandbox_policy,failure_recovery"* ]]; then
+    printf 'fail: project scale execution runner plugin focus\n' >&2
     failures=$((failures + 1))
     return 1
   fi

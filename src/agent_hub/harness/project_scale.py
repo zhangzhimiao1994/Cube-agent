@@ -39,6 +39,7 @@ PROJECT_SCALE_REQUIRED_EVIDENCE: tuple[str, ...] = (
     "discussion_trace",
     "project_preflight_approval",
     "self_repair_trace",
+    "plugin_contract",
 )
 PROJECT_SCALE_CLEANUP_ACTIONS: tuple[str, ...] = (
     "cancel_or_archive_probe_runs",
@@ -241,6 +242,8 @@ def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectSc
         focus.extend(("fault_injection", "self_repair"))
     if flow in _ARTIFACT_FLOWS:
         focus.append("artifact_integrity")
+    if flow == "plugin":
+        focus.extend(("plugin_contract", "capability_matrix", "sandbox_policy", "failure_recovery"))
     if flow in _CAPABILITY_VALIDATION_FLOWS:
         focus.extend(("capability_matrix", "mode_control", "no_silent_downgrade"))
     return ProjectScaleCase(
@@ -277,6 +280,12 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         "large": "large project",
         "ultra": "ultra-large project",
     }[case.scale]
+    plugin_guidance = (
+        " For plugin flow, record plugin_contract evidence covering manifest discovery, "
+        "adapter contracts, sandbox and policy boundaries, and failure recovery behavior."
+        if case.flow == "plugin"
+        else ""
+    )
     return (
         f"Project-scale acceptance fixture: build a {scale_label} for scale={case.scale} "
         f"and flow={case.flow}. Read constraints first, keep interaction stable, use the "
@@ -286,6 +295,7 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         "implementation plan and verification note in the workspace, and follow Codex/Claude "
         "Code verification standards: read constraints, plan before implementation, verify with "
         "reproducible evidence, and repair root causes instead of silently degrading."
+        f"{plugin_guidance}"
     )
 
 

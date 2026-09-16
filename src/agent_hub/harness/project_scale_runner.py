@@ -52,6 +52,20 @@ _DISCUSSION_TRACE_PAYLOAD_KEYS = (
     "dispatch_discussion_trace",
     "coordination_trace",
 )
+_PLUGIN_CONTRACT_KEYS = frozenset(
+    {
+        "manifest_discovered",
+        "adapter_contract_checked",
+        "policy_boundary_checked",
+        "sandbox_profile_checked",
+        "failure_recovery_checked",
+    }
+)
+_PLUGIN_CONTRACT_PAYLOAD_KEYS = (
+    "plugin_contract",
+    "plugin_capability_contract",
+    "plugin_validation",
+)
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
         "dispatch",
@@ -113,6 +127,8 @@ class ProjectScaleCaseResult:
             required = tuple(key for key in required if key != "project_preflight_approval")
         if _case_requires_discussion_trace(self.case_id):
             required = (*required, "discussion_trace")
+        if _case_requires_plugin_contract(self.case_id):
+            required = (*required, "plugin_contract")
         if "self_repair" in self.case_id or "model_failure" in self.case_id:
             required = (*required, "self_repair_trace")
         return required
@@ -270,6 +286,7 @@ def execute_project_scale_plan(
             "deliverable_quality": False,
             "agent_standard_verification": False,
             "discussion_trace": False,
+            "plugin_contract": False,
             "deliverable_repair_trace": False,
             "self_repair_trace": False,
             "project_preflight_approval": False,
@@ -359,6 +376,12 @@ def execute_project_scale_plan(
                 case_id=run_request.case_id,
             )
             evidence["discussion_trace"] = discussion_trace.passed
+            plugin_contract = _evaluate_plugin_contract(
+                observation.details,
+                observation.events,
+                case_id=run_request.case_id,
+            )
+            evidence["plugin_contract"] = plugin_contract.passed
             if _should_attempt_deliverable_repair(
                 status=status,
                 evidence=evidence,
@@ -374,6 +397,7 @@ def execute_project_scale_plan(
                             *deliverable_quality.reasons,
                             *agent_standard_verification.reasons,
                             *discussion_trace.reasons,
+                            *plugin_contract.reasons,
                         ),
                     ),
                     idempotency_key=_deliverable_repair_idempotency_key(
@@ -443,6 +467,12 @@ def execute_project_scale_plan(
                     case_id=run_request.case_id,
                 )
                 evidence["discussion_trace"] = discussion_trace.passed
+                plugin_contract = _evaluate_plugin_contract(
+                    repair_observation.details,
+                    repair_observation.events,
+                    case_id=run_request.case_id,
+                )
+                evidence["plugin_contract"] = plugin_contract.passed
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
@@ -452,6 +482,10 @@ def execute_project_scale_plan(
                     or (
                         _case_requires_discussion_trace(run_request.case_id)
                         and not evidence["discussion_trace"]
+                    )
+                    or (
+                        _case_requires_plugin_contract(run_request.case_id)
+                        and not evidence["plugin_contract"]
                     )
                 )
             ):
@@ -464,6 +498,11 @@ def execute_project_scale_plan(
                     and not evidence["discussion_trace"]
                 ):
                     errors.extend(discussion_trace.reasons)
+                if (
+                    _case_requires_plugin_contract(run_request.case_id)
+                    and not evidence["plugin_contract"]
+                ):
+                    errors.extend(plugin_contract.reasons)
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -789,7 +828,9 @@ def _deliverable_repair_body(
         "plan plus verification notes in the workspace. When the run uses dispatch, hybrid, "
         "multi-agent, discussion, or repair coordination, record discussion_trace with "
         "participants, member statements, disagreements, verification steps, and final decision "
-        f"so the workbench can show the scheduling debate.{reason_text} Original request:\n"
+        "so the workbench can show the scheduling debate. For plugin flows, also record "
+        "plugin_contract with manifest discovery, adapter contracts, sandbox and policy "
+        f"boundaries, and failure recovery behavior.{reason_text} Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
     repair_body["skip_evolution_proposal"] = True
@@ -826,6 +867,11 @@ def _case_requires_project_preflight(case_id: str) -> bool:
 def _case_requires_discussion_trace(case_id: str) -> bool:
     _scale, _, flow = case_id.partition(":")
     return flow in _DISCUSSION_TRACE_FLOWS
+
+
+def _case_requires_plugin_contract(case_id: str) -> bool:
+    _scale, _, flow = case_id.partition(":")
+    return flow == "plugin"
 
 
 def _project_preflight_approval_body(response: dict[str, object]) -> dict[str, object]:
@@ -917,6 +963,22 @@ def _evaluate_discussion_trace(
     )
 
 
+def _evaluate_plugin_contract(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+    *,
+    case_id: str,
+) -> _EvidenceCheck:
+    if not _case_requires_plugin_contract(case_id):
+        return _EvidenceCheck(passed=False, reasons=())
+    if _has_plugin_contract_payload(details, events):
+        return _EvidenceCheck(passed=True, reasons=())
+    return _EvidenceCheck(
+        passed=False,
+        reasons=("plugin_contract: missing or incomplete plugin capability contract evidence",),
+    )
+
+
 def _has_quality_payload(details: dict[str, object] | None, events: list[object] | None) -> bool:
     if details is not None and _mapping_has_quality_payload(details):
         return True
@@ -985,6 +1047,31 @@ def _mapping_has_discussion_trace_payload(mapping: Mapping[str, object]) -> bool
     return False
 
 
+def _has_plugin_contract_payload(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+) -> bool:
+    if details is not None and _mapping_has_plugin_contract_payload(details):
+        return True
+    if events is None:
+        return False
+    return any(
+        isinstance(event, dict) and _mapping_has_plugin_contract_payload(event)
+        for event in events
+    )
+
+
+def _mapping_has_plugin_contract_payload(mapping: Mapping[str, object]) -> bool:
+    for key in _PLUGIN_CONTRACT_PAYLOAD_KEYS:
+        value = mapping.get(key)
+        if _plugin_contract_payload_passes(value):
+            return True
+        payload = mapping.get("payload")
+        if isinstance(payload, Mapping) and _plugin_contract_payload_passes(payload.get(key)):
+            return True
+    return False
+
+
 def _agent_standard_payload_passes(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -1007,6 +1094,12 @@ def _discussion_trace_payload_passes(value: object) -> bool:
         and _non_empty_sequence(value.get("verification_steps"))
         and _non_empty_text(value.get("final_decision"))
     )
+
+
+def _plugin_contract_payload_passes(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return all(value.get(key) is True for key in _PLUGIN_CONTRACT_KEYS)
 
 
 def _non_empty_sequence(value: object) -> bool:
@@ -1197,6 +1290,10 @@ def _should_attempt_deliverable_repair(
             or (
                 _case_requires_discussion_trace(case_id)
                 and evidence.get("discussion_trace") is not True
+            )
+            or (
+                _case_requires_plugin_contract(case_id)
+                and evidence.get("plugin_contract") is not True
             )
         )
     )
