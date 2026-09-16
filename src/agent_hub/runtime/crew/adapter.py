@@ -284,12 +284,19 @@ def _tool_name_mapping(internal_names: tuple[str, ...]) -> dict[str, str]:
     return mapping
 
 
-def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, ...]:
+def _tool_definitions(
+    internal_names: tuple[str, ...],
+    metadata_by_name: Mapping[str, Mapping[str, JsonValue]] | None = None,
+) -> tuple[ToolDefinition, ...]:
     mapping = _tool_name_mapping(internal_names)
     return tuple(
         ToolDefinition(
             name=external_name,
-            description=_tool_description(internal_name),
+            description=_manifest_description(
+                (metadata_by_name or {}).get(internal_name, {}),
+                internal_name,
+            )
+            or _tool_description(internal_name),
             parameters=_tool_parameters(internal_name),
         )
         for external_name, internal_name in sorted(mapping.items())
@@ -360,6 +367,8 @@ def _tool_sandbox(
     name: str,
     routing_decision: Mapping[str, JsonValue] | None = None,
     arguments: Mapping[str, JsonValue] | None = None,
+    *,
+    sandbox_profile: str | None = None,
 ) -> str:
     if (
         name == "project.generate_zip"
@@ -371,6 +380,16 @@ def _tool_sandbox(
         return "read_only"
     if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "none"
+    if sandbox_profile in {
+        "restricted",
+        "remote_connector",
+        "local_process",
+        "http_read",
+        "in_process",
+        "read_only",
+        "none",
+    }:
+        return sandbox_profile
     return "restricted"
 
 
@@ -397,6 +416,90 @@ def _routing_sandbox_profile(routing_decision: Mapping[str, JsonValue] | None) -
         return None
     value = routing_decision.get("sandbox_profile")
     return value if isinstance(value, str) else None
+
+
+def _capability_manifest_tool_metadata_map(
+    gateway: object,
+    *,
+    tenant_id: UUID,
+    names: tuple[str, ...],
+) -> dict[str, Mapping[str, JsonValue]]:
+    return {
+        name: metadata
+        for name in names
+        if (
+            metadata := _capability_manifest_tool_metadata(
+                gateway,
+                tenant_id=tenant_id,
+                name=name,
+            )
+        )
+    }
+
+
+def _capability_manifest_tool_metadata(
+    gateway: object,
+    *,
+    tenant_id: UUID,
+    name: str,
+) -> Mapping[str, JsonValue]:
+    manifest = getattr(gateway, "capability_manifest", None)
+    if not callable(manifest):
+        return {}
+    try:
+        payload = manifest(tenant_id)
+    except Exception:  # noqa: BLE001 - manifest lookup must not break runtime execution.
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    item = _capability_manifest_item(payload, name)
+    if item is None or item.get("available") is False:
+        return {}
+    return item
+
+
+def _capability_manifest_item(
+    payload: Mapping[object, object],
+    name: str,
+) -> Mapping[str, JsonValue] | None:
+    capabilities = payload.get("capabilities")
+    candidates: Sequence[object]
+    if isinstance(capabilities, Mapping):
+        candidates = tuple(capabilities.values())
+    elif isinstance(capabilities, Sequence) and not isinstance(capabilities, str | bytes):
+        candidates = capabilities
+    else:
+        return None
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        item = cast(Mapping[str, JsonValue], candidate)
+        if item.get("id") == name or _manifest_aliases_include(item.get("aliases"), name):
+            return item
+    return None
+
+
+def _manifest_aliases_include(value: object, name: str) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, str | bytes)
+        and any(alias == name for alias in value if isinstance(alias, str))
+    )
+
+
+def _manifest_sandbox_profile(metadata: Mapping[str, JsonValue]) -> str | None:
+    value = metadata.get("sandbox_profile")
+    return value if isinstance(value, str) else None
+
+
+def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str | None:
+    value = metadata.get("description")
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped.encode()) > 2_000:
+        return None
+    return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
 
 
 def _map_completion_tool_names(
@@ -2891,7 +2994,12 @@ class CrewDispatchRuntime:
     ) -> GatewayCompletion:
         messages = list(self._normalize_crewai_messages(crew_messages))
         tool_mapping = _tool_name_mapping(step.tools)
-        request_tools = _tool_definitions(step.tools)
+        tool_metadata_by_name = _capability_manifest_tool_metadata_map(
+            self._capabilities,
+            tenant_id=context.tenant_id,
+            names=step.tools,
+        )
+        request_tools = _tool_definitions(step.tools, tool_metadata_by_name)
         unavailable_tools = _unavailable_step_tools(
             self._capabilities,
             context.tenant_id,
@@ -3183,6 +3291,9 @@ class CrewDispatchRuntime:
                     tool_call.name,
                     context.routing_decision,
                     tool_call.arguments,
+                    sandbox_profile=_manifest_sandbox_profile(
+                        tool_metadata_by_name.get(tool_call.name, {})
+                    ),
                 )
                 await emit(
                     kind=EventKind.TOOL_STARTED,

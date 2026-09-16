@@ -92,6 +92,37 @@ class ToolGateway:
         )
 
 
+class ManifestToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call",
+                        name="calendar_create_event",
+                        arguments={"title": "Review", "date": "2026-09-16"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="calendar event ready", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ContractToolGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -179,6 +210,28 @@ class FakeCapabilities:
 
     def is_replay_safe(self, name: str) -> bool:
         return name == "web.search"
+
+
+class ManifestCapabilities(FakeCapabilities):
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "calendar.create_event"
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, object]:
+        del tenant_id
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "calendar.create_event",
+                    "kind": "plugin",
+                    "adapter": "plugin_runtime",
+                    "available": True,
+                    "description": "Create a calendar event through the approved plugin.",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": True,
+                },
+            ),
+        }
 
 
 class UnavailableCapabilities(FakeCapabilities):
@@ -679,6 +732,32 @@ def _tool_plan() -> DispatchPlan:
             ),
         ),
         allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+
+
+def _manifest_tool_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("calendar.create_event",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("calendar.create_event",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("calendar.create_event",),
         total_token_budget=100,
     )
 
@@ -1330,6 +1409,34 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     result = tool_artifact.content["result"]
     assert isinstance(result, Mapping)
     assert result["items"] == ("harness result",)
+
+
+async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> None:
+    gateway = ManifestToolGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _manifest_tool_plan(),
+        capability_gateway=ManifestCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(routing_decision={"sandbox_profile": "restricted"})
+        )
+    ]
+
+    assert len(harness.calls) == 1
+    (model_tool,) = gateway.requests[0].tools
+    assert model_tool.description == "Create a calendar event through the approved plugin."
+    _tenant_id, request = harness.calls[0]
+    assert request.tool_name == "calendar.create_event"
+    assert request.sandbox == "remote_connector"
+    tool_started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
+    assert tool_started.payload["sandbox"] == "remote_connector"
 
 
 async def test_project_zip_failure_after_final_zip_reuses_existing_artifact() -> None:
