@@ -525,6 +525,22 @@ class FallbackSequenceGateway(SequenceGateway):
         )
 
 
+class LogicalFallbackSequenceGateway(SequenceGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        text = self._texts.pop(0) if self._texts else "done"
+        logical_model = "glm" if len(self.requests) == 1 else request.logical_model
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="glm_1" if logical_model == "glm" else "primary",
+            logical_model=logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+            attempted_logical_models=(logical_model,),
+        )
+
+
 class EmptyThenRoleAwareGateway(RoleAwareGateway):
     def __init__(self, *, empty_logical_model: str) -> None:
         super().__init__()
@@ -1395,6 +1411,35 @@ async def test_fallback_dependent_plain_text_output_is_wrapped_for_handoff_recov
     output = draft_created.artifact.content["text"]
     assert json.loads(cast(str, output)) == {
         "summary": "plain fallback evidence",
+        "findings": ["Recovered non-JSON fallback output for downstream handoff."],
+        "risks": ["Fallback output did not satisfy the structured response schema."],
+    }
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+
+
+async def test_logical_fallback_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+    gateway = LogicalFallbackSequenceGateway("plain logical fallback evidence", "final answer")
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _structured_dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(gateway.requests) == 2
+    draft_created = next(
+        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
+    )
+    assert draft_created.artifact is not None
+    output = draft_created.artifact.content["text"]
+    assert json.loads(cast(str, output)) == {
+        "summary": "plain logical fallback evidence",
         "findings": ["Recovered non-JSON fallback output for downstream handoff."],
         "risks": ["Fallback output did not satisfy the structured response schema."],
     }

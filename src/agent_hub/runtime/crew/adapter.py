@@ -948,7 +948,8 @@ def _reconcile_structured_handoff_completion(
     agent: AgentSpec,
     completion: GatewayCompletion,
 ) -> GatewayCompletion:
-    if not agent.output_schema or not _step_has_dependents(plan, step) or not completion.fallback_used:
+    recovery_output = completion.fallback_used or completion.logical_model != agent.logical_model
+    if not agent.output_schema or not _step_has_dependents(plan, step) or not recovery_output:
         return completion
     text = completion.response.text
     if not isinstance(text, str):
