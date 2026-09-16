@@ -1377,9 +1377,12 @@ def _producer_step_timeout(
     context: TaskContext,
     selected_roles: tuple[RoleAssignment, ...],
 ) -> float:
+    base_timeout = max(context.timeout_seconds / max(2, len(selected_roles)), 120.0)
+    if context.timeout_seconds >= 600.0:
+        base_timeout = max(base_timeout, context.timeout_seconds * 0.45)
     return min(
-        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
-        300.0,
+        base_timeout,
+        900.0 if context.timeout_seconds >= 600.0 else 300.0,
     )
 
 
