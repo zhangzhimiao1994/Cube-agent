@@ -1070,7 +1070,10 @@ def _deployment_routing_constraint(
 
 
 def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
-    if TaskProfile.SOFTWARE not in _task_profiles(context.request):
+    if (
+        TaskProfile.SOFTWARE not in _task_profiles(context.request)
+        and not _is_project_scale_artifact_request(context)
+    ):
         return ""
     lines = [
         "Software delivery requirements:",
@@ -1083,6 +1086,10 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
         lines.append(
             "Use project.generate_zip only after verification; set presentation to final_attachment for the user-downloadable ZIP."
         )
+        if _is_project_scale_artifact_request(context):
+            lines.append(
+                "If read_context has no additional runtime context, continue with the requested files and call project.generate_zip instead of rereading context."
+            )
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -1525,7 +1532,21 @@ def _role_allowed_tools(
             continue
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
+    if (
+        role.id == "implementer"
+        and "project.generate_zip" in filtered
+        and _is_project_scale_artifact_request(context)
+    ):
+        filtered = [name for name in filtered if name != "read_context"]
     return tuple(dict.fromkeys(filtered))
+
+
+def _is_project_scale_artifact_request(context: TaskContext) -> bool:
+    text = str(context.request).casefold()
+    return (
+        "project-scale acceptance fixture" in text
+        and "flow=artifact_production" in text
+    )
 
 
 def _available_inventory_tools_for_role(

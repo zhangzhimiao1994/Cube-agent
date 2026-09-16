@@ -5192,6 +5192,41 @@ def test_dispatch_plan_requires_verification_before_final_project_zip() -> None:
     assert "Do not claim the project works without verification evidence" in final_step.task
 
 
+def test_project_scale_artifact_implementer_does_not_loop_on_empty_context() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("read_context", "project.generate_zip"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Project-scale acceptance fixture: build a small project for scale=small "
+                "and flow=artifact_production."
+            ),
+        ),
+        capability_gateway=FakeCapabilityAvailability({"read_context", "project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert implementer_step.tools == ("project.generate_zip",)
+    assert "If read_context has no additional runtime context, continue with the requested files" in implementer_step.task
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
