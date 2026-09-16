@@ -89,6 +89,34 @@ def test_dispatch_software_task_allows_implementer_to_generate_project_zip() -> 
     assert "project.generate_zip" in implementer.allowed_tools
 
 
+def test_software_artifact_production_keeps_general_planning_roles_out_of_delivery_chain() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "Project-scale acceptance fixture: build a small project for scale=small "
+                "and flow=artifact_production. Read constraints first, keep interaction stable, "
+                "use the approved workspace, produce final artifacts, satisfy the requested "
+                "requirements, verify build/test/interaction behavior, avoid placeholder or "
+                "stub-only output, record deliverable_quality and agent_standard_verification "
+                "evidence, include a lightweight implementation plan and verification note in "
+                "the workspace, and follow Codex/Claude Code verification standards."
+            ),
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.SOFTWARE,
+            profiles=(TaskProfile.SOFTWARE, TaskProfile.GENERAL),
+            default_model="code-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {"architect", "implementer", "tester", "security_reviewer"}.issubset(role_ids)
+    assert "project_manager" not in role_ids
+    assert "product_manager" not in role_ids
+    assert "market_researcher" not in role_ids
+    assert "quality_reviewer" not in role_ids
+
+
 def test_research_discussion_includes_data_source_and_writer_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

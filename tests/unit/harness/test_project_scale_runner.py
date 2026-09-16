@@ -126,6 +126,23 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     ]
 
 
+def test_execute_project_scale_plan_accepts_production_events_envelope_and_artifact_ids() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[],
+        artifact_ids=["artifact-1"],
+        events_envelope=True,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["run_events"] is True
+    assert result.evidence["final_artifacts"] is True
+
+
 def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
     plan = build_project_scale_run_plan(
         scales=("small",),
@@ -526,6 +543,22 @@ def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup()
     assert report.results[0].errors == ("workspace_bundle: workspace bundle unavailable",)
 
 
+def test_execute_project_scale_plan_attempts_repair_when_workspace_bundle_is_missing() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert len(client.submitted_bodies) == 2
+    assert report.results[0].evidence["deliverable_repair_trace"] is True
+    assert "workspace_bundle: workspace bundle unavailable" in report.results[0].errors
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
@@ -670,6 +703,8 @@ class FakeAcceptanceClient:
         statuses: tuple[str, ...] | None = None,
         artifacts: list[dict[str, object]] | None = None,
         events: list[dict[str, object]] | None = None,
+        events_envelope: bool = False,
+        artifact_ids: list[str] | None = None,
         response_project_id: str | None = None,
         response_session_id: str | None = None,
         details_run_id: str | None = None,
@@ -694,6 +729,8 @@ class FakeAcceptanceClient:
         self.statuses = list(statuses or (status,))
         self.artifacts = artifacts or []
         self.events = [{"kind": "run.created"}] if events is None else events
+        self.events_envelope = events_envelope
+        self.artifact_ids = artifact_ids or []
         self.response_project_id = response_project_id
         self.response_session_id = response_session_id
         self.details_run_id = details_run_id
@@ -767,6 +804,7 @@ class FakeAcceptanceClient:
                 "id": details_run_id,
                 "status": status,
                 "artifacts": self.artifacts,
+                "artifact_ids": self.artifact_ids,
                 "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
             }
             if deliverable_quality:
@@ -825,6 +863,8 @@ class FakeAcceptanceClient:
             events = list(self.events)
             if path == f"/api/v1/runs/{self.repair_run_id}/events":
                 events.append({"kind": "deliverable.repair.completed", "run_id": self.repair_run_id})
+            if self.events_envelope:
+                return {"items": events}
             return events
         if path in {
             f"/api/v1/runs/{self.run_id}/cancel",

@@ -716,12 +716,13 @@ def _collect_run_observation(
             time.sleep(poll_interval_seconds)
 
     events_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
-    if isinstance(events_response, list) and events_response:
-        events = events_response
+    normalized_events = _run_events_items(events_response)
+    if isinstance(normalized_events, list) and normalized_events:
+        events = normalized_events
         evidence["run_events"] = True
-        errors.extend(_validate_run_events_scope(events_response, run_id))
-    elif isinstance(events_response, list):
-        events = events_response
+        errors.extend(_validate_run_events_scope(normalized_events, run_id))
+    elif isinstance(normalized_events, list):
+        events = normalized_events
         errors.append("run_events: empty event stream")
     else:
         errors.append("run_events: returned non-list JSON")
@@ -749,6 +750,13 @@ def _validate_run_submission_scope(response: dict[str, object], body: dict[str, 
         if actual != expected:
             got = actual if isinstance(actual, str) and actual else "missing"
             raise RuntimeError(f"run scope mismatch: {field} expected {expected} got {got}")
+
+
+def _run_events_items(response: dict[str, object] | list[object]) -> list[object] | None:
+    if isinstance(response, list):
+        return response
+    items = response.get("items") if isinstance(response, dict) else None
+    return items if isinstance(items, list) else None
 
 
 def _validate_mode_control(
@@ -916,6 +924,9 @@ def _has_final_artifacts(details: dict[str, object]) -> bool:
         return True
     final_artifacts = details.get("final_artifacts")
     if isinstance(final_artifacts, list) and final_artifacts:
+        return True
+    artifact_ids = details.get("artifact_ids")
+    if isinstance(artifact_ids, list) and artifact_ids:
         return True
     artifact_count = details.get("artifact_count")
     return isinstance(artifact_count, int) and artifact_count > 0
@@ -1331,9 +1342,9 @@ def _should_attempt_deliverable_repair(
     return (
         status == "completed"
         and evidence.get("final_artifacts") is True
-        and evidence.get("workspace_bundle") is True
         and (
-            evidence.get("deliverable_quality") is not True
+            evidence.get("workspace_bundle") is not True
+            or evidence.get("deliverable_quality") is not True
             or evidence.get("agent_standard_verification") is not True
             or (
                 _case_requires_discussion_trace(case_id)

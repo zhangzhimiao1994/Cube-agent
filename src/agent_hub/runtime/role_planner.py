@@ -205,12 +205,13 @@ class RolePlanner:
                 requires_user=True,
                 reason="ambiguous_high_risk_role_plan",
             )
+        base_profiles = _base_spec_profiles(request)
         if request.mode is TaskMode.DISCUSS:
             role_specs = _combined_specs(
-                _discussion_specs(profile, request.high_risk) for profile in request.profiles
+                _discussion_specs(profile, request.high_risk) for profile in base_profiles
             )
         else:
-            role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
+            role_specs = _combined_specs(_dispatch_specs(profile) for profile in base_profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
         role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
         roles = tuple(_assignment(spec, request) for spec in role_specs)
@@ -772,6 +773,15 @@ def _combined_specs(spec_groups: Iterable[tuple[_RoleSpec, ...]]) -> tuple[_Role
     return tuple(combined)
 
 
+def _base_spec_profiles(request: RolePlanningRequest) -> tuple[TaskProfile, ...]:
+    if any(profile is not TaskProfile.GENERAL for profile in request.profiles):
+        profiles = tuple(
+            profile for profile in request.profiles if profile is not TaskProfile.GENERAL
+        )
+        return profiles or (TaskProfile.GENERAL,)
+    return request.profiles
+
+
 def _assignment(spec: _RoleSpec, request: RolePlanningRequest) -> RoleAssignment:
     role_id, role, purpose, mission, must_answer, allowed_tools, forbidden, skills, schema = spec
     merged_skills = tuple(dict.fromkeys((*skills, *request.requested_skills)))
@@ -838,15 +848,34 @@ def _select_relevant_catalog_specs(
 ) -> tuple[_RoleSpec, ...]:
     if not specs:
         return ()
-    selected = [spec for spec in specs if _role_matches_task(spec, request)]
+    selected = [
+        spec
+        for spec in specs
+        if _role_matches_task(spec, request)
+        and not _is_redundant_software_delivery_catalog_spec(spec, request)
+    ]
     if selected:
         return tuple(selected)
     if request.requested_skills:
         return ()
-    return tuple(spec for spec in specs if spec[0] in _BASELINE_CATALOG_ROLE_IDS)
+    return tuple(
+        spec
+        for spec in specs
+        if spec[0] in _BASELINE_CATALOG_ROLE_IDS
+        and not _is_redundant_software_delivery_catalog_spec(spec, request)
+    )
 
 
 _BASELINE_CATALOG_ROLE_IDS = frozenset({"project_manager", "quality_reviewer", "user_advocate"})
+_SOFTWARE_DELIVERY_REDUNDANT_CATALOG_ROLE_IDS = frozenset(
+    {
+        "market_researcher",
+        "operations_coordinator",
+        "product_manager",
+        "project_manager",
+        "quality_reviewer",
+    }
+)
 
 _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
@@ -938,10 +967,10 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
         (role_id, role, mission, " ".join(must_answer), " ".join(skills))
     ).casefold()
     triggers = _ROLE_TRIGGER_KEYWORDS.get(role_id, ())
-    if any(keyword.casefold() in task for keyword in triggers):
+    if any(_task_contains_keyword(task, keyword) for keyword in triggers):
         return True
     if role_id == "project_manager" and any(
-        keyword in task
+        _task_contains_keyword(task, keyword)
         for keyword in (
             "plan",
             "scope",
@@ -957,7 +986,7 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     ):
         return True
     if role_id == "quality_reviewer" and any(
-        keyword in task
+        _task_contains_keyword(task, keyword)
         for keyword in (
             "build",
             "prototype",
@@ -977,7 +1006,7 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     ):
         return True
     if role_id == "copywriter" and any(
-        keyword in task
+        _task_contains_keyword(task, keyword)
         for keyword in (
             "文案",
             "脚本",
@@ -994,21 +1023,25 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     ):
         return True
     if role_id == "economic_analyst" and any(
-        keyword in task for keyword in ("经济", "市场", "需求", "定价", "商业回报", "回报", "预算")
+        _task_contains_keyword(task, keyword)
+        for keyword in ("经济", "市场", "需求", "定价", "商业回报", "回报", "预算")
     ):
         return True
     if role_id == "finance_analyst" and any(
-        keyword in task for keyword in ("预算", "成本", "收入", "财务", "回报")
+        _task_contains_keyword(task, keyword)
+        for keyword in ("预算", "成本", "收入", "财务", "回报")
     ):
         return True
-    if role_id == "sales_advisor" and any(keyword in task for keyword in ("销售", "话术", "客户")):
+    if role_id == "sales_advisor" and any(
+        _task_contains_keyword(task, keyword) for keyword in ("销售", "话术", "客户")
+    ):
         return True
     if role_id == "operations_coordinator" and any(
-        keyword in task for keyword in ("交付", "清单", "排期", "协同", "执行")
+        _task_contains_keyword(task, keyword) for keyword in ("交付", "清单", "排期", "协同", "执行")
     ):
         return True
     if role_id == "legal_compliance_reviewer" and any(
-        keyword in task for keyword in ("法律", "合规", "版权", "隐私", "许可")
+        _task_contains_keyword(task, keyword) for keyword in ("法律", "合规", "版权", "隐私", "许可")
     ):
         return True
     # Custom catalog roles stay discoverable without hard-coding: if a role's
@@ -1018,6 +1051,46 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
         for token in (*skills, role_id.replace("_", " "), role)
         if token.casefold() in haystack
     )
+
+
+def _is_redundant_software_delivery_catalog_spec(
+    spec: _RoleSpec,
+    request: RolePlanningRequest,
+) -> bool:
+    if request.profile is not TaskProfile.SOFTWARE:
+        return False
+    if any(
+        profile not in {TaskProfile.SOFTWARE, TaskProfile.GENERAL}
+        for profile in request.profiles
+    ):
+        return False
+    role_id = spec[0]
+    if role_id not in _SOFTWARE_DELIVERY_REDUNDANT_CATALOG_ROLE_IDS:
+        return False
+    if role_id == "product_manager":
+        return not any(
+            _task_contains_keyword(request.task.casefold(), keyword)
+            for keyword in (
+                "product",
+                "roadmap",
+                "priority",
+                "acceptance criteria",
+                "user story",
+                "产品",
+                "用户价值",
+                "优先级",
+            )
+        )
+    return True
+
+
+def _task_contains_keyword(task: str, keyword: str) -> bool:
+    keyword = keyword.casefold()
+    if not keyword:
+        return False
+    if keyword.isascii() and any(character.isalnum() for character in keyword):
+        return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", task) is not None
+    return keyword in task
 
 
 _MULTIMEDIA_GENERATION_TERMS = (
