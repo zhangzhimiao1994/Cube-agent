@@ -227,6 +227,15 @@ class ManifestCapabilities(FakeCapabilities):
                     "adapter": "plugin_runtime",
                     "available": True,
                     "description": "Create a calendar event through the approved plugin.",
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ("title", "date"),
+                        "properties": {
+                            "title": {"type": "string"},
+                            "date": {"type": "string"},
+                        },
+                    },
                     "sandbox_profile": "remote_connector",
                     "replay_safe": True,
                 },
@@ -1432,6 +1441,13 @@ async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> No
     assert len(harness.calls) == 1
     (model_tool,) = gateway.requests[0].tools
     assert model_tool.description == "Create a calendar event through the approved plugin."
+    assert model_tool.parameters["type"] == "object"
+    assert model_tool.parameters["additionalProperties"] is False
+    assert model_tool.parameters["required"] == ("title", "date")
+    properties = model_tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    assert properties["title"] == {"type": "string"}
+    assert properties["date"] == {"type": "string"}
     _tenant_id, request = harness.calls[0]
     assert request.tool_name == "calendar.create_event"
     assert request.sandbox == "remote_connector"

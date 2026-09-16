@@ -297,7 +297,10 @@ def _tool_definitions(
                 internal_name,
             )
             or _tool_description(internal_name),
-            parameters=_tool_parameters(internal_name),
+            parameters=_tool_parameters(
+                internal_name,
+                (metadata_by_name or {}).get(internal_name, {}),
+            ),
         )
         for external_name, internal_name in sorted(mapping.items())
     )
@@ -318,7 +321,13 @@ def _tool_description(internal_name: str) -> str:
     return f"Approved Agent Hub capability: {internal_name}"
 
 
-def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
+def _tool_parameters(
+    internal_name: str,
+    metadata: Mapping[str, JsonValue] | None = None,
+) -> Mapping[str, JsonValue]:
+    manifest_schema = _manifest_input_schema(metadata or {})
+    if manifest_schema is not None:
+        return manifest_schema
     if internal_name == "project.generate_zip":
         return {
             "type": "object",
@@ -500,6 +509,22 @@ def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str |
     if not stripped or len(stripped.encode()) > 2_000:
         return None
     return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
+
+
+def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
+    value = metadata.get("input_schema")
+    if not isinstance(value, Mapping):
+        return None
+    schema = cast(Mapping[str, JsonValue], _mutable_json(value))
+    if schema.get("type") != "object":
+        return None
+    try:
+        encoded = json.dumps(schema, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > 8_192:
+        return None
+    return schema
 
 
 def _map_completion_tool_names(

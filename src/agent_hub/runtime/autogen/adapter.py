@@ -626,6 +626,30 @@ def _manifest_description(metadata: Mapping[str, JsonValue], name: str) -> str |
     return stripped.replace("\x00", "") or f"Approved Agent Hub capability {name}"
 
 
+def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
+    value = metadata.get("input_schema")
+    if not isinstance(value, Mapping):
+        return None
+    return _safe_manifest_input_schema(value)
+
+
+def _safe_manifest_input_schema(
+    value: Mapping[str, JsonValue] | None,
+) -> Mapping[str, JsonValue] | None:
+    if value is None:
+        return None
+    schema = cast(Mapping[str, JsonValue], _mutable_json(value))
+    if schema.get("type") != "object":
+        return None
+    try:
+        encoded = json.dumps(schema, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > 8_192:
+        return None
+    return schema
+
+
 def _safe_id(value: str, name: str) -> str:
     if type(value) is not str or _ID.fullmatch(value) is None:
         raise ValueError(f"{name} must be a safe identifier")
@@ -782,6 +806,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         approval_envelope_required: bool = True,
         sandbox_profile: str | None = None,
         description: str | None = None,
+        input_schema: Mapping[str, JsonValue] | None = None,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -800,6 +825,21 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._role = role
         self._approval_envelope_required = approval_envelope_required
         self._sandbox_profile = sandbox_profile
+        self._input_schema = _safe_manifest_input_schema(input_schema)
+
+    @property
+    def schema(self) -> ToolSchema:
+        if self._input_schema is None:
+            return super().schema
+        return cast(
+            ToolSchema,
+            {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self._input_schema,
+                "strict": False,
+            },
+        )
 
     async def run(
         self, args: _DynamicToolArguments, cancellation_token: CancellationToken
@@ -1501,6 +1541,7 @@ class AutoGenDiscussionRuntime:
                             sandbox_profile=_manifest_sandbox_profile(metadata)
                             or _routing_sandbox_profile(context.routing_decision),
                             description=_manifest_description(metadata, name),
+                            input_schema=_manifest_input_schema(metadata),
                         )
                     )
                 return tools

@@ -149,6 +149,94 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     assert "source-a" not in json.dumps(dict(completed.payload))
 
 
+def test_gateway_capability_tool_schema_uses_manifest_input_schema() -> None:
+    class ReplayGateway:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "calendar.create_event"
+
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
+            raise AssertionError("tool execution must be routed through harness")
+
+    async def publish(
+        durable_artifacts: tuple[Artifact, ...],
+        model_entries: tuple[dict[str, JsonValue], ...],
+        tool_entries: tuple[dict[str, JsonValue], ...],
+    ) -> None:
+        del durable_artifacts, model_entries, tool_entries
+
+    async def store(artifact: Artifact) -> UUID:
+        del artifact
+        return uuid4()
+
+    async def abort(write_id: UUID) -> bool:
+        del write_id
+        return True
+
+    def finalize(write_id: UUID) -> None:
+        del write_id
+
+    class HarnessGateway:
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, request, user_id, role
+            raise AssertionError("schema inspection must not invoke the harness")
+
+    run_id = uuid4()
+    tool = GatewayCapabilityTool(
+        ReplayGateway(),
+        tenant_id=uuid4(),
+        run_id=run_id,
+        actor="scheduler",
+        name="calendar.create_event",
+        records=[],
+        durability=_DiscussionDurability(
+            publish,
+            store,
+            abort,
+            finalize,
+            run_id=run_id,
+        ),
+        harness_tool_gateway=HarnessGateway(),
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title", "date"),
+            "properties": {
+                "title": {"type": "string"},
+                "date": {"type": "string"},
+            },
+        },
+        description="Create a calendar event through the approved plugin.",
+    )
+
+    assert tool.schema["parameters"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["title", "date"],
+        "properties": {
+            "title": {"type": "string"},
+            "date": {"type": "string"},
+        },
+    }
+    assert tool.schema["description"] == "Create a calendar event through the approved plugin."
+
+
 async def test_gateway_capability_tool_preserves_deterministic_harness_failure() -> None:
     class ReplayGateway:
         def is_replay_safe(self, name: str) -> bool:
