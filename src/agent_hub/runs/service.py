@@ -445,6 +445,7 @@ class RunService:
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
         requested_permissions: tuple[str, ...] = (),
+        runtime_timeout_seconds: float | None = None,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
@@ -479,6 +480,9 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if skip_evolution_proposal:
             operator_selection["skip_evolution_proposal"] = True
+        cleaned_runtime_timeout = _explicit_runtime_timeout_seconds(runtime_timeout_seconds)
+        if cleaned_runtime_timeout is not None:
+            operator_selection["runtime_timeout_seconds"] = cleaned_runtime_timeout
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         evolution_proposal = None
@@ -1384,7 +1388,9 @@ class RunService:
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
                 timeout_seconds=_runtime_timeout_seconds(
-                    mode, configured_seconds=self._runtime_timeout_seconds
+                    mode,
+                    configured_seconds=self._runtime_timeout_seconds,
+                    explicit_seconds=_routing_runtime_timeout_seconds(routing_decision),
                 ),
                 token_budget=token_budget,
             )
@@ -3678,8 +3684,15 @@ def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"
 
 
-def _runtime_timeout_seconds(mode: TaskMode, *, configured_seconds: float) -> float:
+def _runtime_timeout_seconds(
+    mode: TaskMode,
+    *,
+    configured_seconds: float,
+    explicit_seconds: float | None = None,
+) -> float:
     del mode
+    if explicit_seconds is not None:
+        return _explicit_runtime_timeout_seconds(explicit_seconds) or 300.0
     if (
         isinstance(configured_seconds, bool)
         or not isinstance(configured_seconds, int | float)
@@ -3688,6 +3701,20 @@ def _runtime_timeout_seconds(mode: TaskMode, *, configured_seconds: float) -> fl
     ):
         return 300.0
     return max(1.0, min(float(configured_seconds), 3600.0))
+
+
+def _explicit_runtime_timeout_seconds(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    if value <= 0:
+        return None
+    return max(1.0, min(float(value), 3600.0))
+
+
+def _routing_runtime_timeout_seconds(decision: Mapping[str, object]) -> float | None:
+    return _explicit_runtime_timeout_seconds(decision.get("runtime_timeout_seconds"))
 
 
 def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:

@@ -195,6 +195,7 @@ def build_project_scale_run_request(case: ProjectScaleCase) -> ProjectScaleRunRe
         "sandbox_profile": "workspace_write",
         "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
         "skip_evolution_proposal": True,
+        "runtime_timeout_seconds": _runtime_timeout_seconds(case),
     }
     return ProjectScaleRunRequest(case_id=case.id, body=body, validation_focus=case.validation_focus)
 
@@ -254,6 +255,15 @@ def _build_case(*, scale: ProjectScaleTier, flow: ProjectScaleFlow) -> ProjectSc
         expected_preflight=scale in _PREFLIGHT_SCALES,
         validation_focus=tuple(dict.fromkeys(focus)),
     )
+
+
+def _runtime_timeout_seconds(case: ProjectScaleCase) -> int:
+    return {
+        "small": 900,
+        "medium": 1200,
+        "large": 1800,
+        "ultra": 3600,
+    }[case.scale]
 
 
 def _validated_filter(

@@ -103,6 +103,7 @@ class StubRunService:
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
     workspace_contexts: list[dict[str, object]] = field(default_factory=list)
+    runtime_timeouts: list[float | None] = field(default_factory=list)
     paused: list[tuple[UUID, UUID]] = field(default_factory=list)
     resumed: list[tuple[UUID, UUID]] = field(default_factory=list)
     cancelled: list[tuple[UUID, UUID]] = field(default_factory=list)
@@ -129,6 +130,7 @@ class StubRunService:
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
         requested_permissions: tuple[str, ...] = (),
+        runtime_timeout_seconds: float | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
@@ -143,6 +145,7 @@ class StubRunService:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
             self.vibe_coding_flags.append(vibe_coding)
+        self.runtime_timeouts.append(runtime_timeout_seconds)
         self.workspace_contexts.append(
             {
                 "project_id": project_id,
@@ -682,6 +685,23 @@ def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
     assert details["workspace_session_id"] == "Conv Workspace 01"
     assert details["sandbox_profile"] == "workspace_write"
     assert details["requested_permissions"] == ["workspace.read", "workspace.write"]
+
+
+def test_run_submission_forwards_explicit_runtime_timeout() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请构建一个项目并完成验收验证",
+            "mode": "hybrid",
+            "runtime_timeout_seconds": 900,
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.runtime_timeouts[-1] == 900
 
 
 def test_run_submission_defaults_to_workspace_write_without_network() -> None:

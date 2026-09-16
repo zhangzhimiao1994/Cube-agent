@@ -128,6 +128,14 @@ def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
     )
 
 
+def test_project_scale_artifact_production_requests_extended_runtime_budget() -> None:
+    cases = {case.id: case for case in ProjectScaleMatrix.default().cases}
+
+    body = build_project_scale_run_request(cases["small:artifact_production"]).body
+
+    assert body["runtime_timeout_seconds"] == 900
+
+
 def test_project_scale_run_plan_defaults_to_safe_dry_run_for_all_cases() -> None:
     plan = build_project_scale_run_plan()
 
@@ -195,6 +203,7 @@ def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
                     "command.run",
                 ],
                 "skip_evolution_proposal": True,
+                "runtime_timeout_seconds": 900,
             },
         }
     ]

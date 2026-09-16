@@ -86,6 +86,7 @@ class RunServiceProtocol(Protocol):
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
         requested_permissions: tuple[str, ...] = (),
+        runtime_timeout_seconds: float | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -210,6 +211,7 @@ class CreateRunRequest(BaseModel):
     workspace_session_id: str | None = Field(default=None, max_length=128)
     sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    runtime_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -953,6 +955,7 @@ async def create_run(
             workspace_session_id=body.workspace_session_id,
             sandbox_profile=body.sandbox_profile,
             requested_permissions=body.requested_permissions,
+            runtime_timeout_seconds=body.runtime_timeout_seconds,
             idempotency_key=idempotency_key,
         )
     except VibeCodingUnavailable as error:
