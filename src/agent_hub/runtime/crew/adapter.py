@@ -942,6 +942,73 @@ def _validate_structured_role_output(
             fail("field type mismatch")
 
 
+def _reconcile_structured_handoff_completion(
+    plan: DispatchPlan,
+    step: DispatchStep,
+    agent: AgentSpec,
+    completion: GatewayCompletion,
+) -> GatewayCompletion:
+    if not agent.output_schema or not _step_has_dependents(plan, step) or not completion.fallback_used:
+        return completion
+    text = completion.response.text
+    if not isinstance(text, str):
+        return completion
+    try:
+        _validate_structured_role_output(plan, step, agent, text)
+    except RuntimeExecutionError:
+        pass
+    else:
+        return completion
+    recovered_text = _truncate_prompt_text(text.strip() or "Fallback output was empty.", max_bytes=4_000)
+    payload: dict[str, JsonValue] = {}
+    for field_name, description in agent.output_schema.items():
+        payload[field_name] = _structured_recovery_field_value(
+            field_name,
+            description,
+            recovered_text,
+        )
+    response = completion.response
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            tool_calls=response.tool_calls,
+            usage=response.usage,
+            provider_metadata=response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
+    )
+
+
+def _structured_recovery_field_value(
+    field_name: str,
+    description: str,
+    recovered_text: str,
+) -> JsonValue:
+    normalized = description.strip().casefold()
+    normalized_field = field_name.casefold()
+    if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
+        if "risk" in normalized_field:
+            return ("Fallback output did not satisfy the structured response schema.",)
+        return ("Recovered non-JSON fallback output for downstream handoff.",)
+    if normalized in {"boolean", "bool"}:
+        return False
+    if normalized in {"integer", "int"}:
+        return 0
+    if normalized in {"number", "float", "decimal"}:
+        return 0
+    if "risk" in normalized_field:
+        return "Fallback output did not satisfy the structured response schema."
+    return recovered_text
+
+
 def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
     return any(step.id in candidate.depends_on for candidate in plan.steps)
 
@@ -2570,6 +2637,12 @@ class CrewDispatchRuntime:
                     run_state,
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
+                )
+                completion = _reconcile_structured_handoff_completion(
+                    plan,
+                    step,
+                    agent,
+                    completion,
                 )
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(

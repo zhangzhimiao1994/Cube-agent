@@ -504,6 +504,27 @@ class SequenceGateway:
         )
 
 
+class FallbackSequenceGateway(SequenceGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        text = self._texts.pop(0) if self._texts else "done"
+        fallback_used = len(self.requests) == 1
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="fallback" if fallback_used else "primary",
+            logical_model="fallback" if fallback_used else request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+            fallback_used=fallback_used,
+            fallback_from_logical_model=request.logical_model if fallback_used else None,
+            fallback_reason="capacity" if fallback_used else None,
+            attempted_logical_models=(
+                (request.logical_model, "fallback") if fallback_used else (request.logical_model,)
+            ),
+        )
+
+
 class EmptyThenRoleAwareGateway(RoleAwareGateway):
     def __init__(self, *, empty_logical_model: str) -> None:
         super().__init__()
@@ -1354,6 +1375,34 @@ async def test_invalid_dependent_structured_role_output_blocks_handoff(
     assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
     assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert not any(event.step_id == "final_response" for event in events)
+
+
+async def test_fallback_dependent_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+    gateway = FallbackSequenceGateway("plain fallback evidence", "final answer")
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _structured_dependent_final_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(gateway.requests) == 2
+    draft_created = next(
+        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
+    )
+    output = draft_created.artifact.content["text"]
+    assert json.loads(cast(str, output)) == {
+        "summary": "plain fallback evidence",
+        "findings": ["Recovered non-JSON fallback output for downstream handoff."],
+        "risks": ["Fallback output did not satisfy the structured response schema."],
+    }
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
 
 
 async def test_agent_output_schema_becomes_structured_model_request() -> None:
