@@ -559,13 +559,22 @@ class ConfigBackedDispatchRuntime:
             role_fallbacks_by_id=role_fallbacks_by_id,
         )
         role_payload = _dispatch_role_payload(plan)
-        return _PlannedRuntime(
-            CrewDispatchRuntime(
-                gateway,
-                plan,
-                capability_gateway=self._capability_gateway,
+        dispatch_runtime: ExecutionRuntime = CrewDispatchRuntime(
+            gateway,
+            plan,
+            capability_gateway=self._capability_gateway,
+            harness_tool_gateway=self._harness_tool_gateway,
+        )
+        if (
+            self._harness_tool_gateway is not None
+            and _is_project_scale_artifact_request(context)
+        ):
+            dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
+                dispatch_runtime,
                 harness_tool_gateway=self._harness_tool_gateway,
-            ),
+            )
+        return _PlannedRuntime(
+            dispatch_runtime,
             mode=TaskMode.DISPATCH,
             main_agent_model=logical_model,
             roles=role_payload,
