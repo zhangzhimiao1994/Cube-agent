@@ -3491,11 +3491,15 @@ describe("operational management pages", () => {
     expect(within(panel).getByText("文案生成")).not.toBeNull();
     expect(within(panel).getByText("Copywriter · qwen-max")).not.toBeNull();
     expect(within(panel).getByText("负责输出可拍摄脚本文案。")).not.toBeNull();
-    expect(within(panel).queryByText("workspace.read")).toBeNull();
+    expect(within(panel).getByText("职责 执行")).not.toBeNull();
+    expect(within(panel).getByText("任务 步骤 copywriter_step")).not.toBeNull();
+    expect(within(panel).getByText("工具 workspace.read")).not.toBeNull();
     expect(within(panel).getByText("工作中")).not.toBeNull();
     expect(within(panel).getByText("reviewer")).not.toBeNull();
     expect(within(panel).getByText("Reviewer · deepseek-chat")).not.toBeNull();
     expect(within(panel).getByText("负责审查产物是否符合请求。")).not.toBeNull();
+    expect(within(panel).getByText("职责 审核")).not.toBeNull();
+    expect(within(panel).getByText("依赖 copywriter_step")).not.toBeNull();
     expect(within(panel).getAllByText("已完成").length).toBeGreaterThan(0);
     expect(within(panel).getAllByText("活动轨迹").length).toBeGreaterThan(0);
     expect(within(panel).queryByText("Final Synthesizer")).toBeNull();

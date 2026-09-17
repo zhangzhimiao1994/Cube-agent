@@ -842,6 +842,10 @@ type AgentDispatchCard = {
   role: string;
   model: string;
   summary: string;
+  purpose: string;
+  taskInputs: string[];
+  dependencyInputs: string[];
+  toolInputs: string[];
   status: "异常" | "已完成" | "工作中" | "已安排";
 };
 
@@ -950,8 +954,44 @@ function fallbackAgentCards(detail: RunDetail, agentNames: Map<string, string>):
         .map((event) => (event.actor === id ? eventModelName(event) : ""))
         .find((model) => model.length > 0) ?? "默认模型",
     summary: "参与本轮调度或讨论，可查看该成员的动作轨迹。",
+    purpose: "",
+    taskInputs: [],
+    dependencyInputs: [],
+    toolInputs: [],
     status: agentStatusForPlan(detail, id, new Set()),
   }));
+}
+
+function planStepInputSummary(step: Record<string, unknown>) {
+  return (
+    stringValue(step.task) ??
+    stringValue(step.summary) ??
+    stringValue(step.objective) ??
+    stringValue(step.instruction) ??
+    stringValue(step.instructions) ??
+    stringValue(step.title) ??
+    (stringValue(step.id) ? `步骤 ${stringValue(step.id)}` : null)
+  );
+}
+
+function uniqLimited(values: string[], limit = 3) {
+  const unique = [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  if (unique.length <= limit) return unique;
+  return [...unique.slice(0, limit), `另 ${unique.length - limit} 项`];
+}
+
+function purposeLabel(value: string | null) {
+  const labels: Record<string, string> = {
+    discuss: "讨论",
+    execute: "执行",
+    plan: "规划",
+    review: "审核",
+    repair: "修复",
+    synthesize: "汇总",
+    verify: "验证",
+  };
+  if (!value) return "";
+  return labels[value] ?? value;
 }
 
 function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>): AgentDispatchCard[] {
@@ -988,12 +1028,20 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
         stringValue(role.description) ??
         stringValue(role.backstory) ??
         "等待执行分配任务";
+      const ownedSteps = steps.filter((step) => stringValue(step.agent) === id);
+      const taskInputs = uniqLimited(ownedSteps.flatMap((step) => (planStepInputSummary(step) ? [planStepInputSummary(step) as string] : [])));
+      const dependencyInputs = uniqLimited(ownedSteps.flatMap((step) => stringArrayValue(step.depends_on)));
+      const toolInputs = uniqLimited([...stringArrayValue(role.tools), ...ownedSteps.flatMap((step) => stringArrayValue(step.tools))]);
       return {
         id,
         name: agentNames.get(id) ?? id,
         role: roleLabel,
         model,
         summary: conciseProcessText(roleSummary, "等待执行分配任务"),
+        purpose: purposeLabel(purpose),
+        taskInputs,
+        dependencyInputs,
+        toolInputs,
         status: agentStatusForPlan(detail, id, stepIds),
       };
     })
@@ -3225,6 +3273,20 @@ function AgentWorkbenchDrawer({
                     <span>{card.status}</span>
                   </div>
                   <p>{card.summary}</p>
+                  {card.purpose || card.taskInputs.length > 0 || card.dependencyInputs.length > 0 || card.toolInputs.length > 0 ? (
+                    <div className="agent-workbench-inputs" aria-label={`${card.name}调度输入`}>
+                      {card.purpose ? <span>职责 {card.purpose}</span> : null}
+                      {card.taskInputs.map((item) => (
+                        <span key={`task-${item}`}>任务 {item}</span>
+                      ))}
+                      {card.dependencyInputs.map((item) => (
+                        <span key={`dependency-${item}`}>依赖 {item}</span>
+                      ))}
+                      {card.toolInputs.map((item) => (
+                        <span key={`tool-${item}`}>工具 {item}</span>
+                      ))}
+                    </div>
+                  ) : null}
                   {activityItems.length > 0 ? (
                     <div className="agent-workbench-activity">
                       <small>活动轨迹</small>

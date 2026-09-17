@@ -2263,6 +2263,28 @@ article:hover {
   margin: 0;
 }
 
+.agent-workbench-inputs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+  min-width: 0;
+}
+
+.agent-workbench-inputs span {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 850;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0.16rem 0.42rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-workbench-avatar {
   align-items: center;
   background: rgba(85, 215, 255, 0.12);
