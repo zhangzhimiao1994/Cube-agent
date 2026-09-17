@@ -108,6 +108,16 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
         assert "repair root causes" in message
 
 
+def test_direct_project_scale_request_requires_embedded_deliverable_bundle() -> None:
+    cases = {case.id: case for case in ProjectScaleMatrix.default().cases}
+    request = build_project_scale_run_request(cases["small:direct"])
+    message = str(request.body["message"])
+
+    assert "do not call tools" in message
+    assert "workspace_bundle.files" in message
+    assert "Markdown file blocks" in message
+
+
 def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
     cases = {case.id: case for case in ProjectScaleMatrix.default().cases}
 

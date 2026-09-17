@@ -296,6 +296,17 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         if case.flow == "plugin"
         else ""
     )
+    direct_guidance = (
+        " For direct flow, do not call tools, do not emit DSML/tool-call syntax, and do not "
+        "describe commands as if they were executed. Produce the deliverable inline as either "
+        "strict JSON with workspace_bundle.files mapping safe relative paths to complete file "
+        "contents, or Markdown file blocks headed exactly like ### `path/to/file` followed by "
+        "a fenced code block. Include README or requirements, source files, tests or build "
+        "scripts, an implementation plan, and a verification report with reproducible build, "
+        "test, and interaction evidence."
+        if case.flow == "direct"
+        else ""
+    )
     return (
         f"Project-scale acceptance fixture: build a {scale_label} for scale={case.scale} "
         f"and flow={case.flow}. Read constraints first, keep interaction stable, use the "
@@ -305,7 +316,7 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         "implementation plan and verification note in the workspace, and follow Codex/Claude "
         "Code verification standards: read constraints, plan before implementation, verify with "
         "reproducible evidence, and repair root causes instead of silently degrading."
-        f"{plugin_guidance}"
+        f"{plugin_guidance}{direct_guidance}"
     )
 
 

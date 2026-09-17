@@ -1158,6 +1158,17 @@ def _deliverable_repair_body(
     repair_body = dict(body)
     original_message = body.get("message")
     reason_text = _format_failed_reasons(failed_reasons)
+    direct_guidance = (
+        " This is a direct run: do not call tools, do not emit DSML/tool-call syntax, and "
+        "do not describe commands as if they were executed. Return a machine-verifiable "
+        "deliverable inline as strict JSON with workspace_bundle.files mapping safe relative "
+        "paths to complete file contents, or as Markdown file blocks headed exactly like "
+        "### `path/to/file` followed by a fenced code block. Include README or requirements, "
+        "source files, tests or build scripts, implementation plan, and verification report "
+        "with reproducible build, test, and interaction evidence."
+        if body.get("mode") == "direct" or case_id.endswith(":direct")
+        else ""
+    )
     repair_body["message"] = (
         f"Project-scale deliverable repair for {case_id}: the previous generated project "
         "failed acceptance quality. Diagnose the mismatches against the original request, "
@@ -1172,7 +1183,8 @@ def _deliverable_repair_body(
         "participants, member statements, disagreements, verification steps, and final decision "
         "so the workbench can show the scheduling debate. For plugin flows, also record "
         "plugin_contract with manifest discovery, adapter contracts, sandbox and policy "
-        f"boundaries, and failure recovery behavior.{reason_text} Original request:\n"
+        f"boundaries, and failure recovery behavior.{direct_guidance}{reason_text} "
+        "Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
     repair_body["skip_evolution_proposal"] = True
