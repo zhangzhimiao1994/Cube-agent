@@ -833,6 +833,104 @@ import { status } from '../src/main.js';
     assert result.errors == ()
 
 
+def test_execute_project_scale_plan_reads_quality_from_markdown_metadata_file() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    metadata = {
+        "deliverable_quality": {
+            "requirements_satisfied": True,
+            "build_passed": True,
+            "tests_passed": True,
+            "interactive_checks_passed": True,
+            "no_placeholders": True,
+            "artifact_integrity": True,
+        },
+        "agent_standard_verification": {
+            "constraints_read": True,
+            "plan_before_implementation": True,
+            "reproducible_verification": True,
+            "root_cause_repair": True,
+        },
+    }
+    markdown_bundle = f"""
+### `deliverable_metadata.json`
+
+```json
+{json.dumps(metadata, sort_keys=True)}
+```
+
+### `README.md`
+
+```markdown
+# Acceptance Fixture
+
+Implements the requested project scope.
+```
+
+### `IMPLEMENTATION_PLAN.md`
+
+```markdown
+- Read constraints
+- Build project
+```
+
+### `VERIFICATION_REPORT.md`
+
+```markdown
+- bash scripts/build.sh: passed
+- python -m unittest: passed
+- bash scripts/interaction_check.sh: passed
+```
+
+### `requirements.txt`
+
+```text
+# Standard library only.
+```
+
+### `direct_ledger/core.py`
+
+```python
+def ready():
+    return True
+```
+
+### `tests/test_core.py`
+
+```python
+from direct_ledger.core import ready
+```
+
+### `scripts/build.sh`
+
+```bash
+python -m compileall direct_ledger tests
+```
+""".strip()
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality=False,
+        agent_standard=False,
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "artifact": {"content": {"text": markdown_bundle}},
+            }
+        ],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])

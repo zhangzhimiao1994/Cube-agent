@@ -1300,7 +1300,10 @@ def _evaluate_deliverable_quality(
     workspace_bundle: bytes | None,
 ) -> _EvidenceCheck:
     reasons: list[str] = []
-    if not _has_quality_payload(details, events):
+    if not (
+        _has_quality_payload(details, events)
+        or _workspace_bundle_has_quality_payload(workspace_bundle)
+    ):
         reasons.append("deliverable_quality: missing or incomplete structured quality flags")
     reasons.extend(_workspace_bundle_project_quality_reasons(workspace_bundle))
     return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
@@ -1312,7 +1315,10 @@ def _evaluate_agent_standard_verification(
     workspace_bundle: bytes | None,
 ) -> _EvidenceCheck:
     reasons: list[str] = []
-    if not _has_agent_standard_payload(details, events):
+    if not (
+        _has_agent_standard_payload(details, events)
+        or _workspace_bundle_has_agent_standard_payload(workspace_bundle)
+    ):
         reasons.append(
             "agent_standard_verification: missing or incomplete Codex/Claude standard flags"
         )
@@ -1610,6 +1616,45 @@ def _workspace_bundle_verification_text(archive: zipfile.ZipFile, names: Sequenc
     return "\n".join(chunks)
 
 
+def _workspace_bundle_json_mappings(workspace_bundle: bytes | None) -> tuple[Mapping[str, object], ...]:
+    if not workspace_bundle:
+        return ()
+    try:
+        with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+            names = tuple(name for name in archive.namelist() if not name.endswith("/"))
+            mappings: list[Mapping[str, object]] = []
+            for name in names:
+                if not name.lower().endswith(".json"):
+                    continue
+                try:
+                    raw = archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000]
+                except (KeyError, RuntimeError, OSError):
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, Mapping):
+                    mappings.append(parsed)
+    except (OSError, zipfile.BadZipFile):
+        return ()
+    return tuple(mappings)
+
+
+def _workspace_bundle_has_quality_payload(workspace_bundle: bytes | None) -> bool:
+    return any(
+        _mapping_has_quality_payload(mapping)
+        for mapping in _workspace_bundle_json_mappings(workspace_bundle)
+    )
+
+
+def _workspace_bundle_has_agent_standard_payload(workspace_bundle: bytes | None) -> bool:
+    return any(
+        _mapping_has_agent_standard_payload(mapping)
+        for mapping in _workspace_bundle_json_mappings(workspace_bundle)
+    )
+
+
 def _read_bundle_file(archive: zipfile.ZipFile, names: Sequence[str], filename: str) -> str:
     for name in names:
         if name.lower().rsplit("/", 1)[-1] != filename:
@@ -1659,9 +1704,20 @@ def _bundle_has_source_files(lowered_names: Sequence[str]) -> bool:
     return any(
         name.startswith(("src/", "app/", "pages/"))
         or name.endswith(("/main.py", "/main.ts", "/main.tsx", "/index.html"))
+        or _is_project_source_file(name)
         or name in {"main.py", "index.html", "package.json"}
         for name in lowered_names
     )
+
+
+def _is_project_source_file(name: str) -> bool:
+    if "/" not in name:
+        return False
+    if name.startswith(("tests/", "test/", "scripts/", "docs/", "quality/")):
+        return False
+    if "/tests/" in name or "/test/" in name:
+        return False
+    return name.endswith((".py", ".js", ".jsx", ".ts", ".tsx"))
 
 
 def _bundle_has_verification_path_or_script(
