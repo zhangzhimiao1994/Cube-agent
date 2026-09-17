@@ -697,6 +697,7 @@ def _collect_run_observation(
     details: dict[str, object] | None = None
     events: list[object] | None = None
     workspace_bundle: bytes | None = None
+    approved_capabilities: set[str] = set()
 
     deadline = time.monotonic() + max(wait_seconds, 0)
     while True:
@@ -707,6 +708,15 @@ def _collect_run_observation(
             _validate_run_details_scope(details, run_id)
             status = _string_value(details.get("status")) or status
             evidence["final_artifacts"] = _has_final_artifacts(details)
+            approved_status = _approve_pending_capability(
+                client,
+                run_id=run_id,
+                details=details,
+                approved_capabilities=approved_capabilities,
+                errors=errors,
+            )
+            if approved_status is not None:
+                status = approved_status
         if _is_terminal_status(status):
             evidence["terminal_status"] = True
             break
@@ -787,6 +797,72 @@ def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None
     if actual != run_id:
         got = actual if isinstance(actual, str) and actual else "missing"
         raise RuntimeError(f"run details scope mismatch: id expected {run_id} got {got}")
+
+
+def _approve_pending_capability(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    details: dict[str, object],
+    approved_capabilities: set[str],
+    errors: list[str],
+) -> str | None:
+    if details.get("status") != "waiting_approval":
+        return None
+    approval = _capability_approval_request(client, run_id=run_id, details=details)
+    if approval is None:
+        return None
+    approval_id, version = approval
+    if approval_id in approved_capabilities:
+        return None
+    approved_capabilities.add(approval_id)
+    try:
+        response = client.request_json(
+            "POST",
+            f"/api/v1/runs/{quote(run_id)}/approve-capability",
+            body={"approval_id": approval_id, "version": version},
+        )
+    except RuntimeError as error:
+        errors.append(f"capability_approval: {error}")
+        return None
+    if not isinstance(response, dict):
+        errors.append("capability_approval: approve-capability returned non-object JSON")
+        return None
+    return _string_value(response.get("status"))
+
+
+def _capability_approval_request(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    details: dict[str, object],
+) -> tuple[str, int] | None:
+    approval = _capability_approval_from_mapping(details)
+    if approval is not None:
+        return approval
+    try:
+        admin_response = client.request_json("GET", f"/api/v1/admin/runs/{quote(run_id)}")
+    except RuntimeError:
+        return None
+    if not isinstance(admin_response, dict):
+        return None
+    return _capability_approval_from_mapping(admin_response)
+
+
+def _capability_approval_from_mapping(payload: Mapping[str, object]) -> tuple[str, int] | None:
+    version = payload.get("version")
+    approval_id = payload.get("approval_id")
+    explicit_details = payload.get("explicit_details")
+    if isinstance(explicit_details, Mapping):
+        approval_id = approval_id or explicit_details.get("approval_id")
+        raw_version = explicit_details.get("version")
+        if isinstance(raw_version, str) and raw_version.isdigit():
+            version = int(raw_version)
+    if not isinstance(approval_id, str) or not approval_id:
+        return None
+    if not isinstance(version, int) or version <= 0:
+        return None
+    return approval_id, version
 
 
 def _validate_run_events_scope(events: list[object], run_id: str) -> list[str]:

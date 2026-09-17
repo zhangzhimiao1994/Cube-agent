@@ -592,6 +592,28 @@ def test_execute_project_scale_plan_approves_large_project_preflight() -> None:
     assert ("POST", "/api/v1/runs/run-large-direct/approve-project-preflight", None) in client.calls
 
 
+def test_execute_project_scale_plan_approves_waiting_capability_tool() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("artifact_production",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-artifact",
+        session_id="project-scale-small-artifact_production",
+        statuses=("waiting_approval", "completed"),
+        artifacts=[{"id": "artifact-1"}],
+        capability_approval_id="approval_project_zip",
+        capability_approval_version=3,
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
+
+    assert report.ok is True
+    assert report.results[0].status == "completed"
+    assert (
+        "POST",
+        "/api/v1/runs/run-small-artifact/approve-capability",
+        None,
+    ) in client.calls
+
+
 def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("self_repair",), execute=True)
     client = FakeAcceptanceClient(
@@ -719,6 +741,8 @@ class FakeAcceptanceClient:
         execution_evidence: bool = True,
         execution_evidence_sequence: tuple[bool, ...] | None = None,
         actual_mode: str | None = None,
+        capability_approval_id: str | None = None,
+        capability_approval_version: int | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -750,6 +774,8 @@ class FakeAcceptanceClient:
         self.execution_evidence_sequence = list(execution_evidence_sequence or ())
         self.current_execution_evidence = execution_evidence
         self.actual_mode = actual_mode
+        self.capability_approval_id = capability_approval_id
+        self.capability_approval_version = capability_approval_version
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
@@ -787,6 +813,22 @@ class FakeAcceptanceClient:
                 "version": self.decision_version,
             }
             return {"id": self.run_id, "status": self.statuses[0]}
+        if path == f"/api/v1/runs/{self.run_id}/approve-capability":
+            assert body == {
+                "approval_id": self.capability_approval_id,
+                "version": self.capability_approval_version,
+            }
+            return {"id": self.run_id, "status": "queued", "version": self.capability_approval_version}
+        if path == f"/api/v1/admin/runs/{self.run_id}":
+            return {
+                "id": self.run_id,
+                "status": self.statuses[0],
+                "version": self.capability_approval_version,
+                "explicit_details": {
+                    "approval_id": self.capability_approval_id,
+                    "version": str(self.capability_approval_version),
+                },
+            }
         if path in {
             f"/api/v1/runs/{self.run_id}/details",
             f"/api/v1/runs/{self.repair_run_id}/details",
