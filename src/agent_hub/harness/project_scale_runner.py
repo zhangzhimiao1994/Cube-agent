@@ -66,6 +66,9 @@ _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
     "plugin_capability_contract",
     "plugin_validation",
 )
+_EMBEDDED_WORKSPACE_MAX_FILES = 200
+_EMBEDDED_WORKSPACE_MAX_FILE_BYTES = 512_000
+_EMBEDDED_WORKSPACE_MAX_TOTAL_BYTES = 2_000_000
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
         "dispatch",
@@ -822,7 +825,11 @@ def _collect_run_observation(
         workspace_bundle = client.request_bytes("GET", _workspace_bundle_path(body))
         evidence["workspace_bundle"] = True
     except Exception as error:  # noqa: BLE001 - acceptance reports must continue cleanup.
-        errors.append(f"workspace_bundle: {error}")
+        workspace_bundle = _embedded_workspace_bundle_from_observation(details, events)
+        if workspace_bundle is not None:
+            evidence["workspace_bundle"] = True
+        else:
+            errors.append(f"workspace_bundle: {error}")
 
     return _RunObservation(
         status=status,
@@ -848,6 +855,130 @@ def _run_events_items(response: dict[str, object] | list[object]) -> list[object
         return response
     items = response.get("items") if isinstance(response, dict) else None
     return items if isinstance(items, list) else None
+
+
+def _embedded_workspace_bundle_from_observation(
+    details: dict[str, object] | None,
+    events: list[object] | None,
+) -> bytes | None:
+    candidates: list[Mapping[str, object]] = []
+    if details is not None:
+        candidates.append(details)
+    if events is not None:
+        candidates.extend(event for event in events if isinstance(event, Mapping))
+    for candidate in candidates:
+        bundle = _embedded_workspace_bundle_from_mapping(candidate)
+        if bundle is not None:
+            return bundle
+    return None
+
+
+def _embedded_workspace_bundle_from_mapping(mapping: Mapping[str, object]) -> bytes | None:
+    direct = _embedded_workspace_bundle_from_payload(mapping)
+    if direct is not None:
+        return direct
+    artifact = mapping.get("artifact")
+    if isinstance(artifact, Mapping):
+        artifact_bundle = _embedded_workspace_bundle_from_payload(artifact)
+        if artifact_bundle is not None:
+            return artifact_bundle
+    payload = mapping.get("payload")
+    if isinstance(payload, Mapping):
+        payload_bundle = _embedded_workspace_bundle_from_payload(payload)
+        if payload_bundle is not None:
+            return payload_bundle
+    artifacts = mapping.get("artifacts")
+    if isinstance(artifacts, Sequence) and not isinstance(artifacts, str | bytes):
+        for artifact_item in artifacts:
+            if not isinstance(artifact_item, Mapping):
+                continue
+            artifact_bundle = _embedded_workspace_bundle_from_payload(artifact_item)
+            if artifact_bundle is not None:
+                return artifact_bundle
+    return None
+
+
+def _embedded_workspace_bundle_from_payload(payload: Mapping[str, object]) -> bytes | None:
+    workspace_bundle = payload.get("workspace_bundle")
+    if isinstance(workspace_bundle, Mapping):
+        bundle = _workspace_bundle_mapping_to_zip(workspace_bundle)
+        if bundle is not None:
+            return bundle
+    content = payload.get("content")
+    if isinstance(content, Mapping):
+        text = content.get("text")
+        bundle = _embedded_workspace_bundle_from_text(text)
+        if bundle is not None:
+            return bundle
+    for key in ("text", "output", "result", "summary"):
+        bundle = _embedded_workspace_bundle_from_text(payload.get(key))
+        if bundle is not None:
+            return bundle
+    return None
+
+
+def _embedded_workspace_bundle_from_text(value: object) -> bytes | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("```"):
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            text = text[first : last + 1]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    return _embedded_workspace_bundle_from_payload(parsed)
+
+
+def _workspace_bundle_mapping_to_zip(workspace_bundle: Mapping[str, object]) -> bytes | None:
+    files = workspace_bundle.get("files")
+    if not isinstance(files, Mapping) or not files:
+        return None
+    if len(files) > _EMBEDDED_WORKSPACE_MAX_FILES:
+        return None
+    normalized: dict[str, str] = {}
+    total_bytes = 0
+    for raw_path, raw_content in files.items():
+        if not isinstance(raw_path, str) or not isinstance(raw_content, str):
+            return None
+        path = _safe_embedded_workspace_path(raw_path)
+        if path is None:
+            return None
+        content_bytes = raw_content.encode("utf-8")
+        if len(content_bytes) > _EMBEDDED_WORKSPACE_MAX_FILE_BYTES:
+            return None
+        total_bytes += len(content_bytes)
+        if total_bytes > _EMBEDDED_WORKSPACE_MAX_TOTAL_BYTES:
+            return None
+        normalized[path] = raw_content
+    if not normalized:
+        return None
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in sorted(normalized.items()):
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+def _safe_embedded_workspace_path(value: str) -> str | None:
+    candidate = value.replace("\\", "/")
+    if candidate.startswith("/") or "\x00" in candidate:
+        return None
+    path = candidate.strip("/")
+    if not path:
+        return None
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    normalized = "/".join(parts)
+    if len(normalized) > 512:
+        return None
+    return normalized
 
 
 def _validate_mode_control(

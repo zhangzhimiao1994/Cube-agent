@@ -633,6 +633,51 @@ def test_execute_project_scale_plan_attempts_repair_when_workspace_bundle_is_mis
     assert "workspace_bundle: workspace bundle unavailable" in report.results[0].errors
 
 
+def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    embedded_bundle = {
+        "workspace_bundle": {
+            "files": {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+                "VERIFICATION.md": (
+                    "- npm run build: passed\n"
+                    "- npm test: passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps(
+                    {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                    sort_keys=True,
+                ),
+                "src/main.js": "export const status = 'ready';\n",
+                "tests/main.test.js": "import { status } from '../src/main.js';\n",
+            }
+        }
+    }
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "artifact": {"content": {"text": json.dumps(embedded_bundle)}},
+            }
+        ],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
