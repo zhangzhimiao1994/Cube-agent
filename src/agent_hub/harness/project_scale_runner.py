@@ -92,6 +92,7 @@ _PLACEHOLDER_MARKERS = (
 _VERIFICATION_REPORT_BASENAMES = frozenset(
     {
         "verification.md",
+        "verification_report.md",
         "test_report.md",
         "acceptance_report.md",
         "validation.md",
@@ -926,15 +927,28 @@ def _embedded_workspace_bundle_from_text(value: object) -> bytes | None:
         last = text.rfind("}")
         if first >= 0 and last > first:
             text = text[first : last + 1]
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
+    parsed = _json_mapping_from_text(text)
     if isinstance(parsed, Mapping):
         bundle = _embedded_workspace_bundle_from_payload(parsed)
         if bundle is not None:
             return bundle
     return _markdown_file_blocks_to_zip(text)
+
+
+def _json_mapping_from_text(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("```"):
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            text = text[first : last + 1]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
 
 
 def _workspace_bundle_mapping_to_zip(workspace_bundle: Mapping[str, object]) -> bytes | None:
@@ -1352,6 +1366,9 @@ def _mapping_has_quality_payload(mapping: Mapping[str, object]) -> bool:
         payload = mapping.get("payload")
         if isinstance(payload, Mapping) and _quality_payload_passes(payload.get(key)):
             return True
+    for embedded in _embedded_structured_mappings(mapping):
+        if _mapping_has_quality_payload(embedded):
+            return True
     return False
 
 
@@ -1376,7 +1393,32 @@ def _mapping_has_agent_standard_payload(mapping: Mapping[str, object]) -> bool:
         payload = mapping.get("payload")
         if isinstance(payload, Mapping) and _agent_standard_payload_passes(payload.get(key)):
             return True
+    for embedded in _embedded_structured_mappings(mapping):
+        if _mapping_has_agent_standard_payload(embedded):
+            return True
     return False
+
+
+def _embedded_structured_mappings(mapping: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    values: list[object] = []
+    content = mapping.get("content")
+    if isinstance(content, Mapping):
+        values.append(content.get("text"))
+    artifact = mapping.get("artifact")
+    if isinstance(artifact, Mapping):
+        artifact_content = artifact.get("content")
+        if isinstance(artifact_content, Mapping):
+            values.append(artifact_content.get("text"))
+    payload = mapping.get("payload")
+    if isinstance(payload, Mapping):
+        values.extend(payload.get(key) for key in ("text", "output", "result", "summary"))
+    values.extend(mapping.get(key) for key in ("text", "output", "result", "summary"))
+    parsed: list[Mapping[str, object]] = []
+    for value in values:
+        item = _json_mapping_from_text(value)
+        if item is not None:
+            parsed.append(item)
+    return tuple(parsed)
 
 
 def _has_discussion_trace_payload(
@@ -1537,15 +1579,7 @@ def _workspace_bundle_agent_standard_reasons(workspace_bundle: bytes | None) -> 
         }
     ):
         reasons.append("workspace_bundle: missing implementation plan artifact")
-    if not (
-        basenames
-        & {
-            "verification.md",
-            "test_report.md",
-            "acceptance_report.md",
-            "validation.md",
-        }
-    ):
+    if not (basenames & _VERIFICATION_REPORT_BASENAMES):
         reasons.append("workspace_bundle: missing verification report artifact")
     return tuple(reasons)
 
