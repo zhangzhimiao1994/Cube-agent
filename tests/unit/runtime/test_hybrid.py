@@ -470,6 +470,53 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
 
 
 @pytest.mark.asyncio
+async def test_project_scale_artifact_preseed_accepts_string_uuid_context_boundary() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    harness = RecordingHarnessToolGateway()
+    child = MultiArtifactRuntime(TaskMode.DISPATCH, ())
+    runtime = ProjectScaleArtifactPreseedRuntime(
+        child,
+        harness_tool_gateway=harness,
+    )
+    context = TaskContext(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        actor_role=Role.ADMIN,
+        mode=TaskMode.DISPATCH,
+        request=(
+            "Project-scale acceptance fixture: build a small project for scale=small "
+            "and flow=artifact_production."
+        ),
+        routing_decision={
+            "project_id": "project-scale-acceptance",
+            "workspace_session_id": "project-scale-small-artifact_production",
+            "sandbox_profile": "workspace_write",
+        },
+    )
+    string_boundary_context = context.model_copy(
+        update={
+            "run_id": str(run_id),
+            "tenant_id": str(tenant_id),
+            "actor_id": str(actor_id),
+        }
+    )
+
+    events = [event async for event in runtime.run(string_boundary_context)]
+
+    assert len(harness.calls) == 1
+    assert harness.calls[0].run_id == run_id
+    assert harness.user_ids == [actor_id]
+    assert child.contexts[0].run_id == run_id
+    assert child.contexts[0].tenant_id == tenant_id
+    assert child.contexts[0].actor_id == actor_id
+    assert events[0].kind is EventKind.TOOL_STARTED
+    assert events[1].kind is EventKind.TOOL_COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_after_dispatch() -> None:
     run_id = uuid4()
     dispatch_output = artifact("planner", "dispatch result")

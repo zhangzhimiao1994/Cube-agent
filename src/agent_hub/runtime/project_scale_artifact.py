@@ -52,6 +52,7 @@ class ProjectScaleArtifactPreseedRuntime:
         self._harness_tool_gateway = harness_tool_gateway
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        context = _normalized_task_context(context)
         sequence = 1
         if self._harness_tool_gateway is not None and is_project_scale_artifact_request(
             context.request
@@ -332,6 +333,27 @@ def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | 
     if type(value) is str and value.strip():
         return value
     return None
+
+
+def _uuid_value(value: object) -> UUID:
+    if type(value) is UUID:
+        return value
+    return UUID(str(value))
+
+
+def _normalized_task_context(context: TaskContext) -> TaskContext:
+    run_id = _uuid_value(context.run_id)
+    tenant_id = _uuid_value(context.tenant_id)
+    actor_id = None if context.actor_id is None else _uuid_value(context.actor_id)
+    if (
+        run_id is context.run_id
+        and tenant_id is context.tenant_id
+        and actor_id is context.actor_id
+    ):
+        return context
+    return context.model_copy(
+        update={"run_id": run_id, "tenant_id": tenant_id, "actor_id": actor_id}
+    )
 
 
 def _truncate_text(text: str, *, max_bytes: int) -> str:
