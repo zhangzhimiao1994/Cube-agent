@@ -128,6 +128,13 @@ class ProjectScaleArtifactPreseedRuntime:
                         },
                     )
                     sequence += 1
+                    yield RunEvent(
+                        kind=EventKind.RUNTIME_COMPLETED,
+                        sequence=sequence,
+                        run_id=context.run_id,
+                        reason="project_scale_artifact_preseed_completed",
+                    )
+                    return
                 else:
                     yield RunEvent(
                         kind=EventKind.TOOL_FAILED,

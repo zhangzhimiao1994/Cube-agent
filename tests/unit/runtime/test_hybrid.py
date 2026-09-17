@@ -383,7 +383,7 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
     harness = RecordingHarnessToolGateway()
     runtime = HybridRuntime(
         ProjectScaleArtifactPreseedRuntime(
-            FailingRuntime(TaskMode.DISPATCH, "dispatch deadline exhausted"),
+            UnusedRuntime(TaskMode.DISPATCH, "dispatch should be short-circuited"),
             harness_tool_gateway=harness,
         ),
         FailingRuntime(TaskMode.DISCUSS, "unused"),
@@ -509,11 +509,10 @@ async def test_project_scale_artifact_preseed_accepts_string_uuid_context_bounda
     assert len(harness.calls) == 1
     assert harness.calls[0].run_id == run_id
     assert harness.user_ids == [actor_id]
-    assert child.contexts[0].run_id == run_id
-    assert child.contexts[0].tenant_id == tenant_id
-    assert child.contexts[0].actor_id == actor_id
+    assert child.contexts == []
     assert events[0].kind is EventKind.TOOL_STARTED
     assert events[1].kind is EventKind.TOOL_COMPLETED
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio
