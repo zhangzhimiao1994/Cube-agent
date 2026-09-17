@@ -116,6 +116,8 @@ def test_direct_project_scale_request_requires_embedded_deliverable_bundle() -> 
     assert "do not call tools" in message
     assert "workspace_bundle.files" in message
     assert "Markdown file blocks" in message
+    assert "credential-like terms" in message
+    assert "sk-" in message
 
 
 def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:

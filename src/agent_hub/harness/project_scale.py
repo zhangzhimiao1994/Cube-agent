@@ -303,7 +303,8 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         "contents, or Markdown file blocks headed exactly like ### `path/to/file` followed by "
         "a fenced code block. Include README or requirements, source files, tests or build "
         "scripts, an implementation plan, and a verification report with reproducible build, "
-        "test, and interaction evidence."
+        "test, and interaction evidence. Avoid credential-like terms and avoid package, file, "
+        "variable, or fixture names that contain the sk- prefix so public evidence stays visible."
         if case.flow == "direct"
         else ""
     )

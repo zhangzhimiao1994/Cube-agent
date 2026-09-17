@@ -647,6 +647,8 @@ def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:
     assert "do not call tools" in repair_message
     assert "workspace_bundle.files" in repair_message
     assert "Markdown file blocks" in repair_message
+    assert "credential-like terms" in repair_message
+    assert "sk-" in repair_message
 
 
 def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() -> None:

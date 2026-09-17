@@ -1179,7 +1179,9 @@ def _deliverable_repair_body(
         "paths to complete file contents, or as Markdown file blocks headed exactly like "
         "### `path/to/file` followed by a fenced code block. Include README or requirements, "
         "source files, tests or build scripts, implementation plan, and verification report "
-        "with reproducible build, test, and interaction evidence."
+        "with reproducible build, test, and interaction evidence. Avoid credential-like terms "
+        "and avoid package, file, variable, or fixture names that contain the sk- prefix so "
+        "public evidence stays visible."
         if body.get("mode") == "direct" or case_id.endswith(":direct")
         else ""
     )
