@@ -2183,11 +2183,11 @@ async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() 
             _context(
                 request=(
                     "Project-scale acceptance fixture: build a small project for scale=small "
-                    "and flow=artifact_production."
+                    "and flow=dispatch."
                 ),
                 routing_decision={
                     "project_id": "project-scale-acceptance",
-                    "workspace_session_id": "project-scale-small-artifact_production",
+                    "workspace_session_id": "project-scale-small-dispatch",
                     "sandbox_profile": "workspace_write",
                 },
             )
@@ -2199,7 +2199,7 @@ async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() 
     assert call.tool_name == "project.generate_zip"
     assert call.sandbox == "workspace_write"
     assert call.arguments["project_id"] == "project-scale-acceptance"
-    assert call.arguments["workspace_session_id"] == "project-scale-small-artifact_production"
+    assert call.arguments["workspace_session_id"] == "project-scale-small-dispatch"
     files = call.arguments["files"]
     assert isinstance(files, Mapping)
     assert set(files) >= {

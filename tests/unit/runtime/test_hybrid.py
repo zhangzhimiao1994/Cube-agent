@@ -401,11 +401,11 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
                 mode=TaskMode.HYBRID,
                 request=(
                     "Project-scale acceptance fixture: build a small project for scale=small "
-                    "and flow=artifact_production."
+                    "and flow=dispatch."
                 ),
                 routing_decision={
                     "project_id": "project-scale-acceptance",
-                    "workspace_session_id": "project-scale-small-artifact_production",
+                    "workspace_session_id": "project-scale-small-dispatch",
                     "sandbox_profile": "workspace_write",
                 },
             )
@@ -420,7 +420,7 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
     assert call.sandbox == "workspace_write"
     assert call.approval_required is False
     assert call.arguments["project_id"] == "project-scale-acceptance"
-    assert call.arguments["workspace_session_id"] == "project-scale-small-artifact_production"
+    assert call.arguments["workspace_session_id"] == "project-scale-small-dispatch"
     assert call.arguments["presentation"] == "final_attachment"
     files = call.arguments["files"]
     assert isinstance(files, Mapping)
@@ -488,11 +488,11 @@ async def test_project_scale_artifact_preseed_accepts_string_uuid_context_bounda
         mode=TaskMode.DISPATCH,
         request=(
             "Project-scale acceptance fixture: build a small project for scale=small "
-            "and flow=artifact_production."
+            "and flow=dispatch."
         ),
         routing_decision={
             "project_id": "project-scale-acceptance",
-            "workspace_session_id": "project-scale-small-artifact_production",
+            "workspace_session_id": "project-scale-small-dispatch",
             "sandbox_profile": "workspace_write",
         },
     )

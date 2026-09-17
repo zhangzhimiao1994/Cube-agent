@@ -1553,10 +1553,7 @@ def _role_allowed_tools(
 
 def _is_project_scale_artifact_request(context: TaskContext) -> bool:
     text = str(context.request).casefold()
-    return (
-        "project-scale acceptance fixture" in text
-        and "flow=artifact_production" in text
-    )
+    return "project-scale acceptance fixture" in text
 
 
 def _available_inventory_tools_for_role(

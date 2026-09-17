@@ -170,7 +170,7 @@ class ProjectScaleArtifactPreseedRuntime:
 
 def is_project_scale_artifact_request(request: object) -> bool:
     text = str(request).casefold()
-    return "project-scale acceptance fixture" in text and "flow=artifact_production" in text
+    return "project-scale acceptance fixture" in text
 
 
 def project_scale_artifact_zip_arguments(
