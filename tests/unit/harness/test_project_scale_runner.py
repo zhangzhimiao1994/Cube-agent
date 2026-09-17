@@ -866,19 +866,28 @@ def test_execute_project_scale_plan_reads_quality_from_markdown_metadata_file() 
 Implements the requested project scope.
 ```
 
-### `IMPLEMENTATION_PLAN.md`
+### `docs/implementation-plan.md`
 
 ```markdown
 - Read constraints
 - Build project
 ```
 
-### `VERIFICATION_REPORT.md`
+### `docs/verification-report.md`
 
 ```markdown
-- bash scripts/build.sh: passed
-- python -m unittest: passed
-- bash scripts/interaction_check.sh: passed
+## Reproducible build evidence
+npm run build
+{{"build": "ok"}}
+
+## Reproducible test evidence
+npm test
+Expected deterministic result: all cases pass.
+
+npm run test:interaction
+- build_passed: true
+- tests_passed: true
+- interactive_checks_passed: true
 ```
 
 ### `requirements.txt`

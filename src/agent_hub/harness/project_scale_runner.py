@@ -92,10 +92,24 @@ _PLACEHOLDER_MARKERS = (
 _VERIFICATION_REPORT_BASENAMES = frozenset(
     {
         "verification.md",
+        "verification-report.md",
         "verification_report.md",
+        "test-report.md",
         "test_report.md",
+        "acceptance-report.md",
         "acceptance_report.md",
         "validation.md",
+    }
+)
+_IMPLEMENTATION_PLAN_BASENAMES = frozenset(
+    {
+        "implementation-plan.md",
+        "implementation_plan.md",
+        "project-plan.md",
+        "project_plan.md",
+        "plan.md",
+        "architecture-plan.md",
+        "architecture_plan.md",
     }
 )
 _EXECUTION_PASS_MARKERS = (
@@ -1577,15 +1591,7 @@ def _workspace_bundle_agent_standard_reasons(workspace_bundle: bytes | None) -> 
         return ("workspace_bundle: invalid or unreadable zip bundle",)
     basenames = {name.rsplit("/", 1)[-1] for name in lowered}
     reasons: list[str] = []
-    if not (
-        basenames
-        & {
-            "implementation_plan.md",
-            "project_plan.md",
-            "plan.md",
-            "architecture_plan.md",
-        }
-    ):
+    if not (basenames & _IMPLEMENTATION_PLAN_BASENAMES):
         reasons.append("workspace_bundle: missing implementation plan artifact")
     if not (basenames & _VERIFICATION_REPORT_BASENAMES):
         reasons.append("workspace_bundle: missing verification report artifact")
