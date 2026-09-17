@@ -18,6 +18,7 @@ from agent_hub.harness.project_scale_runner import (
     UrllibAcceptanceClient,
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
+    _discussion_trace_payload_passes,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
@@ -61,6 +62,24 @@ def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
         "focus=interaction_stability,final_result,deliverable_quality,"
         "agent_standard_verification,capability_matrix,mode_control,no_silent_downgrade"
     ) in result.stdout
+
+
+def test_discussion_trace_rejects_empty_disagreement_evidence() -> None:
+    assert (
+        _discussion_trace_payload_passes(
+            {
+                "participants": ["architect", "reviewer"],
+                "member_statements": [
+                    {"member": "architect", "position": "Plan first."},
+                    {"member": "reviewer", "position": "Verify before release."},
+                ],
+                "disagreements": [],
+                "verification_steps": ["Run the acceptance suite."],
+                "final_decision": "Proceed after verification.",
+            }
+        )
+        is False
+    )
 
 
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:

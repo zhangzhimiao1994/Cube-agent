@@ -1669,7 +1669,7 @@ def _has_present_field(mapping: Mapping[str, object], keys: Sequence[str]) -> bo
             continue
         value = mapping[key]
         if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-            return True
+            return bool(value)
         if _non_empty_text(value):
             return True
     return False
