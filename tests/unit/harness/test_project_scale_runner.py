@@ -1046,6 +1046,26 @@ def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
     assert result.errors == ()
 
 
+def test_execute_project_scale_plan_repairs_failed_run_with_artifacts() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("dispatch",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-dispatch",
+        session_id="project-scale-small-dispatch",
+        statuses=("failed", "completed"),
+        artifacts=[{"id": "artifact-1"}],
+        discussion_trace_sequence=(False, True),
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.run_id == "run-small-dispatch-repair"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["discussion_trace"] is True
+    assert not any(error.startswith("terminal_status: failed") for error in result.errors)
+
+
 def test_project_scale_execution_payload_lists_missing_evidence() -> None:
     result = ProjectScaleCaseResult(
         case_id="ultra:self_repair",

@@ -492,9 +492,6 @@ def execute_project_scale_plan(
                             validation_focus=run_request.validation_focus,
                         ),
                     )
-            if evidence["terminal_status"] and status != "completed":
-                errors.append(f"terminal_status: {status or 'unknown'}")
-
             evidence["self_repair_trace"] = _has_self_repair_trace(observation.events)
             deliverable_quality = _evaluate_deliverable_quality(
                 observation.details,
@@ -580,8 +577,6 @@ def execute_project_scale_plan(
                         validation_focus=run_request.validation_focus,
                     ),
                 )
-                if evidence["terminal_status"] and status != "completed":
-                    errors.append(f"terminal_status: {status or 'unknown'}")
                 evidence["self_repair_trace"] = (
                     evidence["self_repair_trace"]
                     or _has_self_repair_trace(repair_observation.events)
@@ -641,6 +636,8 @@ def execute_project_scale_plan(
                     and not evidence["plugin_contract"]
                 ):
                     errors.extend(plugin_contract.reasons)
+            if evidence["terminal_status"] and status != "completed":
+                errors.append(f"terminal_status: {status or 'unknown'}")
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -1399,6 +1396,7 @@ def _evaluate_deliverable_quality(
     if not (
         _has_quality_payload(details, events)
         or _workspace_bundle_has_quality_payload(workspace_bundle)
+        or _workspace_bundle_has_project_quality(workspace_bundle)
     ):
         reasons.append("deliverable_quality: missing or incomplete structured quality flags")
     reasons.extend(_workspace_bundle_project_quality_reasons(workspace_bundle))
@@ -1414,6 +1412,7 @@ def _evaluate_agent_standard_verification(
     if not (
         _has_agent_standard_payload(details, events)
         or _workspace_bundle_has_agent_standard_payload(workspace_bundle)
+        or _workspace_bundle_has_agent_standard_evidence(workspace_bundle)
     ):
         reasons.append(
             "agent_standard_verification: missing or incomplete Codex/Claude standard flags"
@@ -1828,10 +1827,33 @@ def _bundle_has_verification_path_or_script(
 
 def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:
     lowered = verification_text.lower()
-    return (
-        _line_has_execution_pass(lowered, ("build", "npm run build", "pnpm build", "yarn build"))
-        and _line_has_execution_pass(lowered, ("test", "npm test", "npm run test", "pytest"))
+    has_success_summary = any(
+        marker in lowered
+        for marker in (
+            "all checks passed",
+            "all tests passed",
+            "all checks pass",
+            "all tests pass",
+            "\nok\n",
+        )
     )
+    return (
+        (
+            _line_has_execution_pass(
+                lowered,
+                ("build", "npm run build", "pnpm build", "yarn build"),
+            )
+            or (has_success_summary and _has_marker(lowered, ("build", "compileall")))
+        )
+        and (
+            _line_has_execution_pass(lowered, ("test", "npm test", "npm run test", "pytest"))
+            or (has_success_summary and _has_marker(lowered, ("test", "pytest", "unittest")))
+        )
+    )
+
+
+def _has_marker(text: str, markers: Sequence[str]) -> bool:
+    return any(marker in text for marker in markers)
 
 
 def _line_has_execution_pass(text: str, command_markers: Sequence[str]) -> bool:
@@ -1850,7 +1872,7 @@ def _should_attempt_deliverable_repair(
     case_id: str,
 ) -> bool:
     return (
-        status == "completed"
+        status in {"completed", "failed"}
         and evidence.get("final_artifacts") is True
         and (
             evidence.get("workspace_bundle") is not True
