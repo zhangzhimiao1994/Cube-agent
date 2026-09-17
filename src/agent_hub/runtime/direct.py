@@ -66,6 +66,7 @@ class _RequestOutcome:
 class _BudgetUsageOutcome:
     usage: TokenUsage | None = None
     estimated: bool = False
+    completion_exceeded_request: bool = False
     error_code: str | None = None
 
 
@@ -303,6 +304,9 @@ class DirectRuntime:
                 _raise_execution_error(budget_error_code)
             budget_usage = budget_outcome.usage
             usage_estimated = budget_outcome.estimated
+            usage_completion_exceeded_request = (
+                budget_outcome.completion_exceeded_request
+            )
 
             artifact_failed = False
             artifact: Artifact | None = None
@@ -374,6 +378,7 @@ class DirectRuntime:
                     "attempted_logical_models": completion_attempted_logical_models,
                     "fallback_attempt_count": completion_fallback_attempt_count,
                     "usage_estimated": usage_estimated,
+                    "usage_completion_exceeded_request": usage_completion_exceeded_request,
                     "artifact_id": str(artifact.id),
                     "output": artifact_text_preview,
                     "result": artifact_text_preview,
@@ -417,6 +422,7 @@ class DirectRuntime:
                     "attempted_logical_models": completion_attempted_logical_models,
                     "fallback_attempt_count": completion_fallback_attempt_count,
                     "usage_estimated": usage_estimated,
+                    "usage_completion_exceeded_request": usage_completion_exceeded_request,
                     "artifact_id": str(artifact.id),
                     "summary": artifact_text_preview,
                 },
@@ -670,15 +676,16 @@ class DirectRuntime:
                 return _BudgetUsageOutcome(
                     error_code="model response budget total is inconsistent"
                 )
-            if usage.completion_tokens > request_max_output_tokens:
-                return _BudgetUsageOutcome(
-                    error_code="model response budget completion exceeds request limit"
-                )
             if usage.total_tokens > context_token_budget:
                 return _BudgetUsageOutcome(
                     error_code="model response budget exceeds runtime limit"
                 )
-            return _BudgetUsageOutcome(usage=usage, estimated=False)
+            return _BudgetUsageOutcome(
+                usage=usage,
+                estimated=False,
+                completion_exceeded_request=usage.completion_tokens
+                > request_max_output_tokens,
+            )
         completion_estimate = len(response_text.encode("utf-8"))
         try:
             estimated = TokenUsage(

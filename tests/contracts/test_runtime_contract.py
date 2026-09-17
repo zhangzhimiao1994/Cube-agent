@@ -960,10 +960,6 @@ async def test_invalid_model_text_is_redacted() -> None:
     ("usage", "expected_reason"),
     [
         (
-            TokenUsage(1, 1000, 1001),
-            "model response budget completion exceeds request limit",
-        ),
-        (
             TokenUsage(1000, 1, 1001),
             "model response budget exceeds runtime limit",
         ),
@@ -986,6 +982,17 @@ async def test_direct_fails_closed_when_usage_cannot_prove_budget(
         await runtime.save_checkpoint()
 
 
+async def test_direct_accepts_provider_completion_usage_over_request_when_total_is_safe() -> None:
+    gateway = FakeGateway(ModelResponse(text="answer", usage=TokenUsage(1, 9000, 9001)))
+    runtime = DirectRuntime(gateway, logical_model="general")
+
+    events = await collect(runtime, context(token_budget=10_000))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[1].payload["usage_completion_exceeded_request"] is True
+    assert events[-1].payload["usage_completion_exceeded_request"] is True
+
+
 async def test_direct_uses_conservative_budget_when_provider_omits_usage() -> None:
     gateway = FakeGateway(ModelResponse(text="answer", usage=None))
     runtime = DirectRuntime(gateway, logical_model="general")
@@ -994,7 +1001,9 @@ async def test_direct_uses_conservative_budget_when_provider_omits_usage() -> No
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].payload["usage_estimated"] is True
+    assert events[1].payload["usage_completion_exceeded_request"] is False
     assert events[-1].payload["usage_estimated"] is True
+    assert events[-1].payload["usage_completion_exceeded_request"] is False
 
 
 async def test_direct_rejects_missing_usage_when_estimate_exceeds_budget() -> None:
