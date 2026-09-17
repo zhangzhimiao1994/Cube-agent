@@ -1250,7 +1250,7 @@ class FakeAcceptanceClient:
                 "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
             }
         if path == f"/api/v1/admin/runs/{self.run_id}":
-            response: dict[str, object] = {
+            admin_response: dict[str, object] = {
                 "id": self.run_id,
                 "status": self.statuses[0],
                 "version": self.capability_approval_version,
@@ -1260,10 +1260,10 @@ class FakeAcceptanceClient:
                 },
             }
             if self.self_repair_decision_token is not None:
-                response["decision_token"] = self.self_repair_decision_token
-                response["version"] = self.self_repair_decision_version or 1
-                response["repair_proposal"] = _self_repair_proposal_fixture()
-            return response
+                admin_response["decision_token"] = self.self_repair_decision_token
+                admin_response["version"] = self.self_repair_decision_version or 1
+                admin_response["repair_proposal"] = _self_repair_proposal_fixture()
+            return admin_response
         if path in {
             f"/api/v1/runs/{self.run_id}/details",
             f"/api/v1/runs/{self.repair_run_id}/details",
