@@ -622,6 +622,15 @@ async function openWorkbenchView(
   return workbench;
 }
 
+function queryWorkbenchActionButton(workbench: HTMLElement, name: RegExp) {
+  const actionLists = Array.from(workbench.querySelectorAll(".agent-cluster-actions"));
+  for (const actionList of actionLists) {
+    const match = within(actionList as HTMLElement).queryAllByRole("button", { name })[0];
+    if (match) return match;
+  }
+  return within(workbench).queryAllByRole("button", { name })[0] ?? null;
+}
+
 async function openWorkbenchProcessButton(
   user: ReturnType<typeof userEvent.setup>,
   stream: HTMLElement,
@@ -631,13 +640,13 @@ async function openWorkbenchProcessButton(
   const coordinationView = within(workbench).queryByRole("button", { name: "调度讨论" });
   if (coordinationView) {
     await user.click(coordinationView);
-    const coordinationMatch = within(workbench).queryByRole("button", { name });
+    const coordinationMatch = queryWorkbenchActionButton(workbench, name);
     if (coordinationMatch) return coordinationMatch;
   }
   const actionsView = within(workbench).queryByRole("button", { name: "实际动作" });
   if (actionsView) {
     await user.click(actionsView);
-    const actionMatch = within(workbench).queryByRole("button", { name });
+    const actionMatch = queryWorkbenchActionButton(workbench, name);
     if (actionMatch) return actionMatch;
   }
   return within(workbench).getByRole("button", { name });
@@ -4180,9 +4189,17 @@ describe("operational management pages", () => {
     const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     await openWorkbenchView(user, workbenchDrawer, "调度讨论");
     expect(within(workbenchDrawer).getByRole("region", { name: "调度与讨论" })).not.toBeNull();
-    const mainPlan = within(workbenchDrawer).getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
-    const dispatch = within(workbenchDrawer).getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
-    const minutes = within(workbenchDrawer).getByRole("button", {
+    const brief = within(workbenchDrawer).getByRole("region", { name: "调度简报" });
+    expect(within(brief).getByText("成员发言")).not.toBeNull();
+    expect(within(brief).getByRole("button", { name: /文案生成意见 文案建议主打灯谜游园会/ })).not.toBeNull();
+    expect(within(brief).getByRole("button", { name: /分歧 是否保留嘉宾签到环节存在分歧/ })).not.toBeNull();
+    expect(within(brief).getByRole("button", { name: /主 Agent 裁决 主 Agent 采纳灯谜游园会方案/ })).not.toBeNull();
+    const coordinationActionList = workbenchDrawer.querySelector(".agent-cluster-actions");
+    expect(coordinationActionList).not.toBeNull();
+    const coordinationActions = within(coordinationActionList as HTMLElement);
+    const mainPlan = coordinationActions.getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
+    const dispatch = coordinationActions.getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
+    const minutes = coordinationActions.getByRole("button", {
       name: /讨论纪要：共识 采用灯谜游园会，压缩签到流程；分歧 是否保留嘉宾签到/,
     });
     const ordered = [mainPlan, dispatch, minutes];
@@ -6327,6 +6344,7 @@ describe("operational management pages", () => {
     expect(within(workbench).queryByRole("button", { name: /文案生成 输出/ })).toBeNull();
 
     await user.click(within(workbench).getByRole("button", { name: "调度讨论" }));
+    expect(within(workbench).getByRole("region", { name: "调度简报" })).not.toBeNull();
     expect(within(workbench).getByRole("button", { name: /讨论纪要：共识/ })).not.toBeNull();
     expect(within(workbench).queryByRole("button", { name: /文案生成 输出/ })).toBeNull();
 

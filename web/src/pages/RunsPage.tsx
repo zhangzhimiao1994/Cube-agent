@@ -866,6 +866,7 @@ type TaskChainStep = {
 
 const WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
 const WORKBENCH_AGENT_ACTIVITY_PREVIEW_LIMIT = 5;
+const WORKBENCH_COORDINATION_SECTION_LIMIT = 4;
 
 function recentPreview<T>(items: T[], limit: number, expanded = false) {
   if (expanded || items.length <= limit) {
@@ -1092,6 +1093,86 @@ function isWorkbenchCoordinationItem(item: ProcessDetailTarget) {
     item.badge === "决策过程" ||
     item.sourceActor === "main_agent"
   );
+}
+
+type WorkbenchCoordinationSnippet = {
+  id: string;
+  label: string;
+  text: string;
+  target: ProcessDetailTarget;
+};
+
+type WorkbenchCoordinationSection = {
+  key: string;
+  title: string;
+  empty: string;
+  snippets: WorkbenchCoordinationSnippet[];
+};
+
+function minutePart(value: string, label: string) {
+  const match = value.match(new RegExp(`${label}[:：]([^；;]+)`));
+  return match?.[1]?.trim() ?? "";
+}
+
+function addCoordinationSnippet(
+  sections: Map<string, WorkbenchCoordinationSnippet[]>,
+  key: string,
+  item: ProcessDetailTarget,
+  label: string,
+  text: string,
+) {
+  const normalized = conciseProcessText(text, "").trim();
+  if (!normalized) return;
+  const bucket = sections.get(key) ?? [];
+  if (bucket.some((snippet) => snippet.text === normalized && snippet.label === label)) return;
+  bucket.push({
+    id: `${item.id}-${key}-${bucket.length}`,
+    label,
+    text: normalized,
+    target: item,
+  });
+  sections.set(key, bucket);
+}
+
+function coordinationEvidenceSections(items: ProcessDetailTarget[]): WorkbenchCoordinationSection[] {
+  const sections = new Map<string, WorkbenchCoordinationSnippet[]>();
+  items.forEach((item) => {
+    if (item.badge === "调度判断" || item.badge === "调度过程") {
+      addCoordinationSnippet(sections, "dispatch", item, item.badge, item.message);
+    }
+    if (item.badge === "决策过程") {
+      addCoordinationSnippet(sections, "decision", item, item.badge, item.message);
+    }
+    item.rows.forEach((row) => {
+      if (row.label.endsWith("意见")) {
+        addCoordinationSnippet(sections, "statements", item, row.label, row.value);
+      }
+      if (/分歧|风险|冲突|concern/i.test(row.label)) {
+        addCoordinationSnippet(sections, "disagreement", item, row.label, row.value);
+      }
+      if (/验证|求证|证据|检查|测试|安全摘要/.test(row.label)) {
+        addCoordinationSnippet(sections, "verification", item, row.label, row.value);
+      }
+      if (/裁决|决策|结论/.test(row.label)) {
+        addCoordinationSnippet(sections, "decision", item, row.label, row.value);
+      }
+      if (row.label === "会议纪要") {
+        addCoordinationSnippet(sections, "disagreement", item, "分歧", minutePart(row.value, "分歧"));
+        addCoordinationSnippet(sections, "decision", item, "结论", minutePart(row.value, "结论"));
+      }
+    });
+  });
+  const descriptors = [
+    { key: "dispatch", title: "派工依据", empty: "暂无派工依据" },
+    { key: "statements", title: "成员发言", empty: "暂无成员发言" },
+    { key: "disagreement", title: "分歧与风险", empty: "暂无分歧记录" },
+    { key: "verification", title: "求证与验证", empty: "暂无求证记录" },
+    { key: "decision", title: "最终决策", empty: "暂无最终决策" },
+  ];
+  return descriptors.map((descriptor) => ({
+    ...descriptor,
+    snippets: (sections.get(descriptor.key) ?? []).slice(0, WORKBENCH_COORDINATION_SECTION_LIMIT),
+  }));
 }
 
 function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): TaskChainStep[] {
@@ -3117,6 +3198,43 @@ function RunExecutionIntentsPanel({ intents }: { intents: RunExecutionIntent[] }
   );
 }
 
+function AgentCoordinationEvidence({
+  sections,
+  onOpen,
+}: {
+  sections: WorkbenchCoordinationSection[];
+  onOpen: (target: ProcessDetailTarget) => void;
+}) {
+  return (
+    <section className="agent-workbench-brief" aria-label="调度简报">
+      <div className="agent-workbench-brief-header">
+        <strong>调度简报</strong>
+        <small>派工、分歧、求证和决策</small>
+      </div>
+      <div className="agent-workbench-brief-grid">
+        {sections.map((section) => (
+          <article key={section.key} className="agent-workbench-brief-section">
+            <div>
+              <strong>{section.title}</strong>
+              <small>{section.snippets.length > 0 ? `${section.snippets.length} 条` : section.empty}</small>
+            </div>
+            {section.snippets.length > 0 ? (
+              <div>
+                {section.snippets.map((snippet) => (
+                  <button key={snippet.id} type="button" onClick={() => onOpen(snippet.target)}>
+                    <small>{snippet.label}</small>
+                    <span>{snippet.text}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function AgentWorkbenchDrawer({
   dispatchCards,
   executionIntents,
@@ -3140,6 +3258,7 @@ function AgentWorkbenchDrawer({
   const selectedAgent = dispatchCards.find((card) => card.id === selectedAgentId) ?? null;
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
   const actionItems = items.filter((item) => !isWorkbenchCoordinationItem(item));
+  const coordinationSections = coordinationEvidenceSections(coordinationItems);
   const selectedAgentItems = selectedAgent ? agentActivityItems(selectedAgent, items) : [];
   const actionPreview = recentPreview(selectedAgentItems, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
   const recoveryCount = failureDiagnostics.length + executionIntents.length;
@@ -3326,6 +3445,7 @@ function AgentWorkbenchDrawer({
                     <strong>调度与讨论</strong>
                     <small>{coordinationItems.length} 条</small>
                   </div>
+                  <AgentCoordinationEvidence sections={coordinationSections} onOpen={onOpen} />
                   <div className="agent-cluster-actions">
                     {coordinationItems.map((item) => (
                       <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
