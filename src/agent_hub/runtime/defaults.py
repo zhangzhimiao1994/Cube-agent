@@ -67,6 +67,7 @@ from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
+from agent_hub.runtime.project_scale_artifact import ProjectScaleArtifactPreseedRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
@@ -950,14 +951,23 @@ class ConfigBackedHybridRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
+        dispatch_runtime: ExecutionRuntime = CrewDispatchRuntime(
+            gateway,
+            dispatch_plan,
+            capability_gateway=self._capability_gateway,
+            harness_tool_gateway=self._harness_tool_gateway,
+        )
+        if (
+            self._harness_tool_gateway is not None
+            and _is_project_scale_artifact_request(context)
+        ):
+            dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
+                dispatch_runtime,
+                harness_tool_gateway=self._harness_tool_gateway,
+            )
         return _PlannedRuntime(
             HybridRuntime(
-                CrewDispatchRuntime(
-                    gateway,
-                    dispatch_plan,
-                    capability_gateway=self._capability_gateway,
-                    harness_tool_gateway=self._harness_tool_gateway,
-                ),
+                dispatch_runtime,
                 AutoGenDiscussionRuntime(
                     gateway,
                     discussion_plan,

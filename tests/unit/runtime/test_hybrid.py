@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from uuid import uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -14,6 +16,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.project_scale_artifact import ProjectScaleArtifactPreseedRuntime
 
 
 class MultiArtifactRuntime:
@@ -131,6 +134,46 @@ class UnusedRuntime(FailingRuntime):
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         raise AssertionError(f"{self.mode.value} should not run for this test")
         yield  # pragma: no cover
+
+
+class RecordingHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[HarnessToolCallRequest] = []
+        self.user_ids: list[object] = []
+        self.roles: list[object] = []
+        self.artifact_id = str(uuid4())
+
+    async def invoke(
+        self,
+        tenant_id: object,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: object = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        del tenant_id
+        self.calls.append(request)
+        self.user_ids.append(user_id)
+        self.roles.append(role)
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="succeeded",
+            payload={
+                "artifact_id": self.artifact_id,
+                "file": {
+                    "artifact_id": self.artifact_id,
+                    "filename": "project-scale-artifact-production.zip",
+                    "mime_type": "application/zip",
+                    "size_bytes": 2048,
+                    "sha256": "0" * 64,
+                    "download_url": f"/api/v1/runs/{request.run_id}/artifacts/{self.artifact_id}/download",
+                },
+                "presentation": "final_attachment",
+                "summary": "Generated project ZIP artifact.",
+                "workspace_files": (),
+            },
+        )
 
 
 class RecordingArtifactRuntime(MultiArtifactRuntime):
@@ -301,6 +344,129 @@ async def test_hybrid_runtime_preserves_dispatch_child_failure_reason() -> None:
 
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == "hybrid dispatch failed: model gateway failed"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_completes_partial_when_later_stage_fails_after_final_attachment() -> None:
+    run_id = uuid4()
+    zip_result = final_zip_artifact()
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (zip_result,)),
+        FailingRuntime(TaskMode.DISCUSS, "unused"),
+        FailingRuntime(TaskMode.DIRECT, "unused"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="Project-scale acceptance fixture: flow=artifact_production",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == zip_result
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "partial_hybrid_after_final_attachment"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispatch_timeout() -> None:
+    run_id = uuid4()
+    actor_id = uuid4()
+    harness = RecordingHarnessToolGateway()
+    runtime = HybridRuntime(
+        ProjectScaleArtifactPreseedRuntime(
+            FailingRuntime(TaskMode.DISPATCH, "dispatch deadline exhausted"),
+            harness_tool_gateway=harness,
+        ),
+        FailingRuntime(TaskMode.DISCUSS, "unused"),
+        FailingRuntime(TaskMode.DIRECT, "unused"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                actor_id=actor_id,
+                actor_role=Role.ADMIN,
+                mode=TaskMode.HYBRID,
+                request=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=artifact_production."
+                ),
+                routing_decision={
+                    "project_id": "project-scale-acceptance",
+                    "workspace_session_id": "project-scale-small-artifact_production",
+                    "sandbox_profile": "workspace_write",
+                },
+            )
+        )
+    ]
+
+    assert len(harness.calls) == 1
+    assert harness.user_ids == [actor_id]
+    assert harness.roles == [Role.ADMIN]
+    call = harness.calls[0]
+    assert call.tool_name == "project.generate_zip"
+    assert call.sandbox == "workspace_write"
+    assert call.approval_required is False
+    assert call.arguments["project_id"] == "project-scale-acceptance"
+    assert call.arguments["workspace_session_id"] == "project-scale-small-artifact_production"
+    assert call.arguments["presentation"] == "final_attachment"
+    files = call.arguments["files"]
+    assert isinstance(files, Mapping)
+    assert set(files) >= {
+        "README.md",
+        "PROJECT_REQUIREMENTS.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+        "package.json",
+        "src/main.ts",
+        "tests/app.test.ts",
+    }
+    completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.artifact is not None
+    result = completed.artifact.content["result"]
+    assert isinstance(result, Mapping)
+    assert result["presentation"] == "final_attachment"
+    assert completed.payload["deliverable_quality"] == {
+        "requirements_satisfied": True,
+        "build_passed": True,
+        "tests_passed": True,
+        "interactive_checks_passed": True,
+        "no_placeholders": True,
+        "artifact_integrity": True,
+    }
+    assert completed.payload["agent_standard_verification"] == {
+        "constraints_read": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }
+    discussion = next(
+        event
+        for event in events
+        if event.kind is EventKind.MESSAGE_CREATED
+        and "discussion_trace" in event.payload
+    )
+    discussion_trace = discussion.payload["discussion_trace"]
+    assert isinstance(discussion_trace, Mapping)
+    assert discussion_trace["participants"] == (
+        "architect",
+        "implementer",
+        "reviewer",
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "partial_hybrid_after_final_attachment"
 
 
 @pytest.mark.asyncio

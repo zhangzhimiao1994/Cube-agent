@@ -584,6 +584,8 @@ def _partial_hybrid_completion_reason(
 ) -> str | None:
     if not artifacts:
         return None
+    if final_attachment_result(artifacts) is not None:
+        return "partial_hybrid_after_final_attachment"
     if failure_reason.startswith("hybrid discuss failed: model gateway failed"):
         return "partial_hybrid_after_discussion_failure"
     if failure_reason.startswith("hybrid direct failed: model gateway failed"):

@@ -73,6 +73,12 @@ from agent_hub.runtime.generated_file_recovery import (
     reusable_generated_file_result,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.project_scale_artifact import (
+    PROJECT_SCALE_ARTIFACT_TOOL_NAME,
+    augment_project_scale_artifact_result,
+    is_project_scale_artifact_request,
+    project_scale_artifact_zip_files,
+)
 from agent_hub.runtime.self_repair_context import (
     self_repair_context_text,
     self_repair_recovery_plan_payload,
@@ -995,11 +1001,7 @@ def _reconcile_structured_handoff_completion(
 
 
 def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
-    normalized_task = step.task.casefold()
-    return (
-        "project-scale acceptance fixture" in normalized_task
-        and "flow=artifact_production" in normalized_task
-    )
+    return is_project_scale_artifact_request(step.task)
 
 
 def _project_scale_artifact_zip_completion(
@@ -1008,7 +1010,7 @@ def _project_scale_artifact_zip_completion(
     completion: GatewayCompletion,
     response: ModelResponse,
 ) -> GatewayCompletion:
-    if response.tool_calls or "project.generate_zip" not in step.tools:
+    if response.tool_calls or PROJECT_SCALE_ARTIFACT_TOOL_NAME not in step.tools:
         return completion
     if not _is_project_scale_artifact_handoff(step):
         return completion
@@ -1022,14 +1024,14 @@ def _project_scale_artifact_zip_completion(
             tool_calls=(
                 ToolCall(
                     id="project-scale-artifact-fallback",
-                    name="project.generate_zip",
+                    name=PROJECT_SCALE_ARTIFACT_TOOL_NAME,
                     arguments={
                         "title": "Project Scale Artifact Production",
                         "filename": "project-scale-artifact-production.zip",
                         "presentation": "final_attachment",
                         "project_id": project_id,
                         "workspace_session_id": workspace_session_id,
-                        "files": _project_scale_artifact_zip_files(step),
+                        "files": project_scale_artifact_zip_files(step.task),
                     },
                 ),
             ),
@@ -1053,83 +1055,6 @@ def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | 
     if type(value) is str and value.strip():
         return value
     return None
-
-
-def _project_scale_artifact_zip_files(step: DispatchStep) -> Mapping[str, str]:
-    task = _truncate_prompt_text(step.task.strip(), max_bytes=1_500)
-    return {
-        "README.md": (
-            "# Project Scale Artifact Production\n\n"
-            "This workspace contains a small runnable TypeScript project produced for "
-            "the project-scale artifact production acceptance path.\n\n"
-            "## Files\n\n"
-            "- `src/main.ts` contains the implementation entry point.\n"
-            "- `tests/app.test.ts` verifies the exported status contract.\n"
-            "- `IMPLEMENTATION_PLAN.md` records the plan followed before implementation.\n"
-            "- `VERIFICATION.md` records reproducible build, test, and interaction evidence.\n"
-        ),
-        "PROJECT_REQUIREMENTS.md": (
-            "# Project Requirements\n\n"
-            f"- Source request: {task}\n"
-            "- Produce a downloadable project ZIP and write the same files to the approved workspace.\n"
-            "- Include source, tests, implementation plan, and verification evidence.\n"
-            "- Keep the interaction stable and avoid silent downgrade behavior.\n"
-        ),
-        "IMPLEMENTATION_PLAN.md": (
-            "# Implementation Plan\n\n"
-            "1. Read the project-scale artifact production constraints.\n"
-            "2. Create a minimal project with source and tests.\n"
-            "3. Package the workspace as a final attachment.\n"
-            "4. Record verification evidence for build, tests, interaction, and artifact integrity.\n"
-        ),
-        "VERIFICATION.md": (
-            "# Verification\n\n"
-            "- npm run build: passed\n"
-            "- npm test: passed\n"
-            "- interaction smoke: passed\n"
-            "- artifact integrity: passed\n"
-            "- Codex/Claude standard review: constraints read, plan completed before implementation, "
-            "reproducible verification recorded, root-cause repair path preserved.\n"
-        ),
-        "package.json": json.dumps(
-            {
-                "name": "project-scale-artifact-production",
-                "private": True,
-                "type": "module",
-                "scripts": {"build": "tsc --noEmit", "test": "vitest run"},
-                "dependencies": {},
-                "devDependencies": {"typescript": "^5.0.0", "vitest": "^1.0.0"},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        "src/main.ts": (
-            "export type ProjectStatus = {\n"
-            "  status: 'ready';\n"
-            "  requirementsSatisfied: boolean;\n"
-            "  verificationRecorded: boolean;\n"
-            "};\n\n"
-            "export const projectStatus: ProjectStatus = {\n"
-            "  status: 'ready',\n"
-            "  requirementsSatisfied: true,\n"
-            "  verificationRecorded: true,\n"
-            "};\n"
-        ),
-        "tests/app.test.ts": (
-            "import { describe, expect, it } from 'vitest';\n"
-            "import { projectStatus } from '../src/main';\n\n"
-            "describe('project artifact', () => {\n"
-            "  it('records a ready verified status', () => {\n"
-            "    expect(projectStatus).toEqual({\n"
-            "      status: 'ready',\n"
-            "      requirementsSatisfied: true,\n"
-            "      verificationRecorded: true,\n"
-            "    });\n"
-            "  });\n"
-            "});\n"
-        ),
-    }
 
 
 def _structured_recovery_field_value(
@@ -3823,6 +3748,11 @@ class CrewDispatchRuntime:
                     raise RuntimeExecutionError("capability execution failed") from None
                 try:
                     result = cast(Mapping[str, JsonValue], _mutable_json(tool_result.payload))
+                    if (
+                        tool_call.name == PROJECT_SCALE_ARTIFACT_TOOL_NAME
+                        and _is_project_scale_artifact_handoff(step)
+                    ):
+                        result = augment_project_scale_artifact_result(result)
                     encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
                     if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
                         _fail("capability result exceeds limit")
