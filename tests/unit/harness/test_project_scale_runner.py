@@ -82,6 +82,32 @@ def test_discussion_trace_rejects_empty_disagreement_evidence() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"participants": [""]},
+        {"member_statements": [{}]},
+        {"verification_steps": [""]},
+    ],
+)
+def test_discussion_trace_rejects_empty_coordination_details(
+    override: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "participants": ["architect", "reviewer"],
+        "member_statements": [
+            {"member": "architect", "position": "Plan first."},
+            {"member": "reviewer", "position": "Verify before release."},
+        ],
+        "disagreements": ["Scope risk needs verification."],
+        "verification_steps": ["Run the acceptance suite."],
+        "final_decision": "Proceed after verification.",
+    }
+    payload.update(override)
+
+    assert _discussion_trace_payload_passes(payload) is False
+
+
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:
     output_path = tmp_path / "project-scale-report.json"
 

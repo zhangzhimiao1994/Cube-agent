@@ -1641,10 +1641,10 @@ def _discussion_trace_payload_passes(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
     return (
-        _non_empty_sequence(value.get("participants"))
-        and _non_empty_sequence(value.get("member_statements"))
+        _non_empty_text_sequence(value.get("participants"))
+        and _member_statements_pass(value.get("member_statements"))
         and _has_present_field(value, ("disagreements", "disagreement_summary"))
-        and _non_empty_sequence(value.get("verification_steps"))
+        and _non_empty_text_sequence(value.get("verification_steps"))
         and _non_empty_text(value.get("final_decision"))
     )
 
@@ -1657,6 +1657,30 @@ def _plugin_contract_payload_passes(value: object) -> bool:
 
 def _non_empty_sequence(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, str | bytes) and bool(value)
+
+
+def _non_empty_text_sequence(value: object) -> bool:
+    if not _non_empty_sequence(value):
+        return False
+    items = cast(Sequence[object], value)
+    return all(_non_empty_text(item) for item in items)
+
+
+def _member_statements_pass(value: object) -> bool:
+    if not _non_empty_sequence(value):
+        return False
+    items = cast(Sequence[object], value)
+    for item in items:
+        if not isinstance(item, Mapping):
+            return False
+        if not _has_present_field(item, ("member", "agent", "role", "name")):
+            return False
+        if not _has_present_field(
+            item,
+            ("position", "statement", "opinion", "message", "text", "summary"),
+        ):
+            return False
+    return True
 
 
 def _non_empty_text(value: object) -> bool:
