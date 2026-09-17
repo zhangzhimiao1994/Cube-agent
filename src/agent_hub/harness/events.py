@@ -27,6 +27,14 @@ _PUBLIC_FALLBACK_REASONS = frozenset(
         "transport_retryable",
     }
 )
+_PUBLIC_TOOL_RESULT_EVIDENCE_KEYS = frozenset(
+    {
+        "deliverable_quality",
+        "agent_standard_verification",
+        "discussion_trace",
+        "plugin_contract",
+    }
+)
 
 
 def provider_events_to_run_events(
@@ -304,6 +312,10 @@ def safe_tool_event_payload(
         if argument_bytes is not None:
             payload["argument_bytes"] = argument_bytes
     if result is not None:
+        for key in sorted(_PUBLIC_TOOL_RESULT_EVIDENCE_KEYS):
+            value = result.get(key)
+            if _is_public_evidence_mapping(value):
+                payload[key] = value
         exit_code = result.get("exit_code")
         if type(exit_code) is int:
             payload["exit_code"] = exit_code
@@ -338,6 +350,13 @@ def safe_tool_event_payload(
         if safe_failure_kind is not None:
             payload["failure_kind"] = safe_failure_kind
     return payload
+
+
+def _is_public_evidence_mapping(value: object) -> bool:
+    return isinstance(value, Mapping) and all(
+        isinstance(key, str) and type(item) in {bool, str, int}
+        for key, item in value.items()
+    )
 
 
 def _tool_operation_kind(name: str) -> str:

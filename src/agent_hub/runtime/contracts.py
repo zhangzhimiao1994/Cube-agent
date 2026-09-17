@@ -74,6 +74,10 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "truncated",
         "artifact_id",
         "failure_kind",
+        "deliverable_quality",
+        "agent_standard_verification",
+        "discussion_trace",
+        "plugin_contract",
     }
 )
 

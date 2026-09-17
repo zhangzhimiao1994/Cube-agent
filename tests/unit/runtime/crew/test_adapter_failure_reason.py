@@ -926,6 +926,36 @@ def _project_zip_plan() -> DispatchPlan:
     )
 
 
+def _project_scale_artifact_plan() -> DispatchPlan:
+    task = (
+        "Project-scale acceptance fixture: build a small project for scale=small "
+        "and flow=artifact_production."
+    )
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="implementer",
+                role="implementer",
+                goal="Produce a verified project bundle",
+                logical_model="general",
+                allowed_tools=("project.generate_zip",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="implement",
+                agent="implementer",
+                task=task,
+                tools=("project.generate_zip",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("project.generate_zip",),
+        total_token_budget=100,
+    )
+
+
 def _reviewed_step_plan(*, reviewer_retries: int = 0) -> DispatchPlan:
     return DispatchPlan(
         agents=(
@@ -2061,6 +2091,148 @@ async def test_project_zip_workspace_write_uses_run_sandbox_for_harness_request(
     assert request.sandbox == "workspace_write"
     started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
     assert started.payload["sandbox"] == "workspace_write"
+
+
+async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() -> None:
+    class TextOnlyGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text="workspace package ready",
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    class ZipHarnessToolGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+            self.artifact_id = str(uuid4())
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={
+                    "artifact_id": self.artifact_id,
+                    "file": {
+                        "artifact_id": self.artifact_id,
+                        "filename": "project-scale-artifact-production.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 2048,
+                        "sha256": "0" * 64,
+                        "download_url": (
+                            f"/api/v1/runs/{RUN_ID}/artifacts/{self.artifact_id}/download"
+                        ),
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated project ZIP artifact.",
+                    "workspace_files": (),
+                    "deliverable_quality": {
+                        "requirements_satisfied": True,
+                        "build_passed": True,
+                        "tests_passed": True,
+                        "interactive_checks_passed": True,
+                        "no_placeholders": True,
+                        "artifact_integrity": True,
+                    },
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    },
+                },
+            )
+
+    gateway = TextOnlyGateway()
+    harness = ZipHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _project_scale_artifact_plan(),
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=artifact_production."
+                ),
+                routing_decision={
+                    "project_id": "project-scale-acceptance",
+                    "workspace_session_id": "project-scale-small-artifact_production",
+                    "sandbox_profile": "workspace_write",
+                },
+            )
+        )
+    ]
+
+    assert len(harness.calls) == 1
+    call = harness.calls[0]
+    assert call.tool_name == "project.generate_zip"
+    assert call.sandbox == "workspace_write"
+    assert call.arguments["project_id"] == "project-scale-acceptance"
+    assert call.arguments["workspace_session_id"] == "project-scale-small-artifact_production"
+    files = call.arguments["files"]
+    assert isinstance(files, Mapping)
+    assert set(files) >= {
+        "README.md",
+        "PROJECT_REQUIREMENTS.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+        "package.json",
+        "src/main.ts",
+        "tests/app.test.ts",
+    }
+    assert len(gateway.requests) == 2
+    assert any(
+        isinstance(message.content, str)
+        and message.content.startswith("UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+        for message in gateway.requests[1].messages
+    )
+    completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.payload["deliverable_quality"] == {
+        "requirements_satisfied": True,
+        "build_passed": True,
+        "tests_passed": True,
+        "interactive_checks_passed": True,
+        "no_placeholders": True,
+        "artifact_integrity": True,
+    }
+    assert completed.payload["agent_standard_verification"] == {
+        "constraints_read": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
