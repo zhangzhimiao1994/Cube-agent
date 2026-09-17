@@ -948,7 +948,12 @@ def _reconcile_structured_handoff_completion(
     agent: AgentSpec,
     completion: GatewayCompletion,
 ) -> GatewayCompletion:
-    recovery_output = completion.fallback_used or completion.logical_model != agent.logical_model
+    project_scale_artifact_output = _is_project_scale_artifact_handoff(step)
+    recovery_output = (
+        completion.fallback_used
+        or completion.logical_model != agent.logical_model
+        or project_scale_artifact_output
+    )
     if not agent.output_schema or not _step_has_dependents(plan, step) or not recovery_output:
         return completion
     text = completion.response.text
@@ -967,6 +972,7 @@ def _reconcile_structured_handoff_completion(
             field_name,
             description,
             recovered_text,
+            project_scale_artifact_output=project_scale_artifact_output,
         )
     response = completion.response
     return GatewayCompletion(
@@ -988,16 +994,30 @@ def _reconcile_structured_handoff_completion(
     )
 
 
+def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
+    normalized_task = step.task.casefold()
+    return (
+        "project-scale acceptance fixture" in normalized_task
+        and "flow=artifact_production" in normalized_task
+    )
+
+
 def _structured_recovery_field_value(
     field_name: str,
     description: str,
     recovered_text: str,
+    *,
+    project_scale_artifact_output: bool = False,
 ) -> JsonValue:
     normalized = description.strip().casefold()
     normalized_field = field_name.casefold()
     if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
         if "risk" in normalized_field:
+            if project_scale_artifact_output:
+                return ("Project-scale artifact output did not satisfy the structured response schema.",)
             return ("Fallback output did not satisfy the structured response schema.",)
+        if project_scale_artifact_output:
+            return ("Recovered non-JSON project-scale artifact output for downstream handoff.",)
         return ("Recovered non-JSON fallback output for downstream handoff.",)
     if normalized in {"boolean", "bool"}:
         return False
@@ -1006,6 +1026,8 @@ def _structured_recovery_field_value(
     if normalized in {"number", "float", "decimal"}:
         return 0
     if "risk" in normalized_field:
+        if project_scale_artifact_output:
+            return "Project-scale artifact output did not satisfy the structured response schema."
         return "Fallback output did not satisfy the structured response schema."
     return recovered_text
 

@@ -1451,6 +1451,72 @@ async def test_logical_fallback_plain_text_output_is_wrapped_for_handoff_recover
     assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
 
 
+async def test_project_scale_artifact_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+    gateway = SequenceGateway("plain project-scale evidence", "final answer")
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={
+                    "summary": "string",
+                    "findings": "string[]",
+                    "risks": "string[]",
+                },
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="draft",
+                agent="writer",
+                task=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=artifact_production. Return only the role-specific result."
+                ),
+                token_budget=1000,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("draft",),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        total_token_budget=1000,
+    )
+    runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
+
+    events = await _collect(runtime)
+
+    assert len(gateway.requests) == 2
+    draft_created = next(
+        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
+    )
+    assert draft_created.artifact is not None
+    output = draft_created.artifact.content["text"]
+    assert json.loads(cast(str, output)) == {
+        "summary": "plain project-scale evidence",
+        "findings": ["Recovered non-JSON project-scale artifact output for downstream handoff."],
+        "risks": ["Project-scale artifact output did not satisfy the structured response schema."],
+    }
+    final_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
+    )
+    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+
+
 async def test_agent_output_schema_becomes_structured_model_request() -> None:
     gateway = SequenceGateway('{"summary":"done","risks":[]}')
     plan = DispatchPlan(
