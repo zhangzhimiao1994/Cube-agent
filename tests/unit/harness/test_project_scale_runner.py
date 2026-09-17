@@ -1015,6 +1015,36 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     assert client.calls.count(("GET", "/api/v1/runs/run-small-self-repair/details", None)) == 2
 
 
+def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("dispatch",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-small-dispatch",
+        session_id="project-scale-small-dispatch",
+        statuses=("failed", "completed"),
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "repair.classified", "run_id": "run-small-dispatch"}],
+        self_repair_decision_token="repair-token-12345678901234567890",
+        self_repair_decision_version=7,
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.run_id == "run-small-dispatch-repair"
+    assert result.evidence["self_repair_trace"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.evidence["discussion_trace"] is True
+    assert (
+        "POST",
+        "/api/v1/runs/run-small-dispatch/accept-repair",
+        None,
+    ) in client.calls
+    assert result.errors == ()
+
+
 def test_project_scale_execution_payload_lists_missing_evidence() -> None:
     result = ProjectScaleCaseResult(
         case_id="ultra:self_repair",
@@ -1124,6 +1154,8 @@ class FakeAcceptanceClient:
         actual_mode: str | None = None,
         capability_approval_id: str | None = None,
         capability_approval_version: int | None = None,
+        self_repair_decision_token: str | None = None,
+        self_repair_decision_version: int | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -1157,6 +1189,8 @@ class FakeAcceptanceClient:
         self.actual_mode = actual_mode
         self.capability_approval_id = capability_approval_id
         self.capability_approval_version = capability_approval_version
+        self.self_repair_decision_token = self_repair_decision_token
+        self.self_repair_decision_version = self_repair_decision_version
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
@@ -1200,6 +1234,18 @@ class FakeAcceptanceClient:
                 "version": self.capability_approval_version,
             }
             return {"id": self.run_id, "status": "queued", "version": self.capability_approval_version}
+        if path == f"/api/v1/runs/{self.run_id}/accept-repair":
+            assert body == {
+                "decision_token": self.self_repair_decision_token,
+                "version": self.self_repair_decision_version,
+            }
+            return {
+                "id": self.repair_run_id,
+                "status": "queued",
+                "project_id": self.submitted_bodies[-1]["project_id"],
+                "workspace_session_id": self.submitted_bodies[-1]["workspace_session_id"],
+                "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
+            }
         if path == f"/api/v1/admin/runs/{self.run_id}":
             return {
                 "id": self.run_id,
@@ -1278,6 +1324,21 @@ class FakeAcceptanceClient:
                     "sandbox_profile_checked": True,
                     "failure_recovery_checked": True,
                 }
+            if path == f"/api/v1/runs/{self.run_id}/details":
+                if self.self_repair_decision_token is not None:
+                    details_response["decision_token"] = self.self_repair_decision_token
+                if self.self_repair_decision_version is not None:
+                    details_response["version"] = self.self_repair_decision_version
+                if self.self_repair_decision_token is not None:
+                    details_response["repair_proposal"] = {
+                        "kind": "repair.classified",
+                        "failure_kind": "runtime_failure",
+                        "repair_action": "draft_repair_proposal",
+                        "requires_approval": True,
+                        "automatic_execution": False,
+                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                    }
             return details_response
         if path in {
             f"/api/v1/runs/{self.run_id}/events",
@@ -1285,6 +1346,7 @@ class FakeAcceptanceClient:
         }:
             events = list(self.events)
             if path == f"/api/v1/runs/{self.repair_run_id}/events":
+                events = []
                 events.append({"kind": "deliverable.repair.completed", "run_id": self.repair_run_id})
             if self.events_envelope:
                 return {"items": events}

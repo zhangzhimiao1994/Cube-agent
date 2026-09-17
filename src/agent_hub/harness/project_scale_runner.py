@@ -443,6 +443,51 @@ def execute_project_scale_plan(
                     validation_focus=run_request.validation_focus,
                 ),
             )
+            if evidence["terminal_status"] and status != "completed" and observation.details:
+                repair_body = _self_repair_acceptance_body(observation.details)
+                if repair_body is not None:
+                    repair_response = client.request_json(
+                        "POST",
+                        f"/api/v1/runs/{quote(run_id)}/accept-repair",
+                        body=repair_body,
+                    )
+                    if not isinstance(repair_response, dict):
+                        raise TypeError("self repair acceptance returned non-object JSON")
+                    _validate_run_submission_scope(repair_response, run_request.body)
+                    _extend_unique(
+                        errors,
+                        _validate_mode_control(
+                            repair_response,
+                            requested_body=run_request.body,
+                            validation_focus=run_request.validation_focus,
+                        ),
+                    )
+                    repair_run_id = repair_response.get("id")
+                    if not isinstance(repair_run_id, str) or not repair_run_id:
+                        raise RuntimeError("self repair acceptance response missing id")
+                    run_id = repair_run_id
+                    status = _string_value(repair_response.get("status")) or status
+                    evidence["deliverable_repair_trace"] = True
+                    self_repair_observation = _collect_run_observation(
+                        client,
+                        run_id=run_id,
+                        body=run_request.body,
+                        wait_seconds=wait_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                        current_status=status,
+                        evidence=evidence,
+                        errors=errors,
+                    )
+                    observation = self_repair_observation
+                    status = self_repair_observation.status
+                    _extend_unique(
+                        errors,
+                        _validate_mode_control(
+                            self_repair_observation.details,
+                            requested_body=run_request.body,
+                            validation_focus=run_request.validation_focus,
+                        ),
+                    )
             if evidence["terminal_status"] and status != "completed":
                 errors.append(f"terminal_status: {status or 'unknown'}")
 
@@ -1133,6 +1178,19 @@ def _capability_approval_from_mapping(payload: Mapping[str, object]) -> tuple[st
     if not isinstance(version, int) or version <= 0:
         return None
     return approval_id, version
+
+
+def _self_repair_acceptance_body(details: Mapping[str, object]) -> dict[str, object] | None:
+    proposal = details.get("repair_proposal")
+    if not isinstance(proposal, Mapping):
+        return None
+    decision_token = details.get("decision_token")
+    version = details.get("version")
+    if not isinstance(decision_token, str) or not decision_token:
+        return None
+    if not isinstance(version, int) or version <= 0:
+        return None
+    return {"decision_token": decision_token, "version": version}
 
 
 def _validate_run_events_scope(events: list[object], run_id: str) -> list[str]:
