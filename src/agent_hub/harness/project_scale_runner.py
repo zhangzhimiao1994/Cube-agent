@@ -82,6 +82,7 @@ _DISCUSSION_TRACE_FLOWS = frozenset(
         "capability_validation",
     }
 )
+_AUTHENTICATION_BUSY_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 _PLACEHOLDER_MARKERS = (
     "lorem ipsum",
     "placeholder project",
@@ -331,18 +332,32 @@ class UrllibAcceptanceClient:
         if self._tenant_id:
             body["tenant_id"] = self._tenant_id
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        raw = self._request(
-            "POST",
-            "/api/v1/auth/login",
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            data=data,
-            retry_auth=False,
-            include_bearer=False,
-        )
+        raw = self._request_acceptance_login(data)
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict) or not isinstance(parsed.get("access_token"), str):
             raise TypeError("acceptance login returned invalid token response")
         self._bearer_token = cast(str, parsed["access_token"])
+
+    def _request_acceptance_login(self, data: bytes) -> bytes:
+        for attempt, delay in enumerate((0.0, *_AUTHENTICATION_BUSY_RETRY_DELAYS_SECONDS)):
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                return self._request(
+                    "POST",
+                    "/api/v1/auth/login",
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    data=data,
+                    retry_auth=False,
+                    include_bearer=False,
+                )
+            except RuntimeError as error:
+                if (
+                    attempt >= len(_AUTHENTICATION_BUSY_RETRY_DELAYS_SECONDS)
+                    or not _is_authentication_busy_error_message(str(error))
+                ):
+                    raise
+        raise RuntimeError("acceptance login failed after authentication busy retries")
 
 
 @dataclass(frozen=True, slots=True)
@@ -808,6 +823,25 @@ def _is_invalid_token_body(body: str) -> bool:
     if not isinstance(error, Mapping):
         return False
     return error.get("code") == "invalid_token"
+
+
+def _is_authentication_busy_error_message(message: str) -> bool:
+    if "status=429" not in message:
+        return False
+    body_marker = " body="
+    body_index = message.find(body_marker)
+    if body_index < 0:
+        return False
+    try:
+        payload = json.loads(message[body_index + len(body_marker) :])
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return False
+    return error.get("code") == "authentication_busy"
 
 
 def _extend_unique(target: list[str], items: Sequence[str]) -> None:

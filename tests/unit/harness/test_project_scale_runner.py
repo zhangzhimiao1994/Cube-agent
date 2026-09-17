@@ -166,6 +166,80 @@ def test_urllib_acceptance_client_reauthenticates_once_on_expired_token(
     ]
 
 
+def test_urllib_acceptance_client_retries_busy_acceptance_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None, bytes | None]] = []
+    sleeps: list[float] = []
+
+    class UrlopenRequest(Protocol):
+        full_url: str
+        data: bytes | None
+
+        def get_header(self, header_name: str) -> str | None: ...
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def fake_urlopen(request: object, *, timeout: float) -> Response:
+        del timeout
+        request = cast(UrlopenRequest, request)
+        url = request.full_url
+        auth = request.get_header("Authorization")
+        data = request.data
+        calls.append((url, auth, data))
+        if url.endswith("/api/v1/auth/login") and len(calls) == 1:
+            raise HTTPError(
+                url,
+                429,
+                "Too Many Requests",
+                hdrs=Message(),
+                fp=BytesIO(
+                    b'{"error":{"code":"authentication_busy","message":"authentication busy"}}'
+                ),
+            )
+        if url.endswith("/api/v1/auth/login"):
+            assert auth is None
+            return Response(
+                b'{"access_token":"fresh-token","token_type":"bearer",'
+                b'"principal":{"user_id":"11111111-1111-4111-8111-111111111111",'
+                b'"tenant_id":"22222222-2222-4222-8222-222222222222",'
+                b'"role":"super_admin"}}'
+            )
+        return Response(b'{"ok":true}')
+
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "agent_hub.harness.project_scale_runner.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+    client = UrllibAcceptanceClient(
+        base_url="http://agent-hub.local",
+        username="test",
+        password="valid password",
+    )
+
+    result = client.request_json("GET", "/api/v1/runs/run-1/details")
+
+    assert result == {"ok": True}
+    assert [call[0].removeprefix("http://agent-hub.local") for call in calls] == [
+        "/api/v1/auth/login",
+        "/api/v1/auth/login",
+        "/api/v1/runs/run-1/details",
+    ]
+    assert sleeps == [1.0]
+
+
 def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])

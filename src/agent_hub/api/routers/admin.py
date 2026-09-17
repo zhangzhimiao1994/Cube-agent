@@ -4187,6 +4187,12 @@ def _plugin_package_store_root(request: Request) -> Path:
     return Path(configured)
 
 
+@dataclass(frozen=True, slots=True)
+class _StoredPluginPackageMetadata:
+    package: PluginPackageMetadata | None
+    artifact_created: bool = False
+
+
 def _ensure_path_inside(root: Path, path: Path) -> None:
     root_resolved = root.resolve()
     path_resolved = path.resolve()
@@ -4204,7 +4210,7 @@ def _stored_plugin_package_metadata(
     package: PluginPackageMetadata | None,
     archive_bytes: bytes,
     content_sha256: str,
-) -> PluginPackageMetadata | None:
+) -> _StoredPluginPackageMetadata:
     if (
         package is None
         or package.kind != "adapter_package"
@@ -4213,7 +4219,7 @@ def _stored_plugin_package_metadata(
             and package.verified_public_key_sha256 is None
         )
     ):
-        return package
+        return _StoredPluginPackageMetadata(package=package)
     files = _plugin_archive_signature_files(archive_bytes)
     if len(files) > _MAX_PLUGIN_PACKAGE_FILE_COUNT:
         raise InvalidSkillPackage("plugin archive contains too many package files")
@@ -4224,10 +4230,12 @@ def _stored_plugin_package_metadata(
     storage_key = f"{tenant_id}/{plugin_id}/{content_sha256}"
     artifact_root = store_root / str(tenant_id) / plugin_id / content_sha256
     temp_root = artifact_root.parent / f"tmp-{uuid4().hex}"
+    artifact_created = False
     try:
         artifact_root.parent.mkdir(parents=True, exist_ok=True)
         _ensure_path_inside(store_root, artifact_root)
         _ensure_path_inside(store_root, temp_root)
+        artifact_root_existed = artifact_root.exists()
         if not _plugin_package_artifact_matches(artifact_root, files):
             for path, content in files:
                 target = temp_root.joinpath(*PurePosixPath(path).parts)
@@ -4237,6 +4245,7 @@ def _stored_plugin_package_metadata(
             if artifact_root.exists():
                 shutil.rmtree(artifact_root)
             temp_root.replace(artifact_root)
+            artifact_created = not artifact_root_existed
     except OSError as error:
         with contextlib.suppress(OSError):
             if temp_root.exists():
@@ -4246,17 +4255,20 @@ def _stored_plugin_package_metadata(
             "plugin_package_store_unavailable",
             "plugin package store is unavailable",
         ) from error
-    return package.model_copy(
-        update={
-            "artifact": PluginPackageArtifactMetadata(
-                storage_key=storage_key,
-                content_sha256=content_sha256,
-                file_count=len(files),
-                total_size_bytes=total_size_bytes,
-                stored_at=datetime.now(UTC),
-                quarantine_state="stored",
-            )
-        }
+    return _StoredPluginPackageMetadata(
+        package=package.model_copy(
+            update={
+                "artifact": PluginPackageArtifactMetadata(
+                    storage_key=storage_key,
+                    content_sha256=content_sha256,
+                    file_count=len(files),
+                    total_size_bytes=total_size_bytes,
+                    stored_at=datetime.now(UTC),
+                    quarantine_state="stored",
+                )
+            }
+        ),
+        artifact_created=artifact_created,
     )
 
 
@@ -4283,14 +4295,29 @@ def _cleanup_plugin_package_artifact(
     *,
     tenant_id: UUID,
 ) -> None:
-    artifact = plugin.package_metadata.artifact if plugin.package_metadata is not None else None
+    _cleanup_plugin_package_metadata_artifact(
+        request,
+        plugin_id=plugin.id,
+        package=plugin.package_metadata,
+        tenant_id=tenant_id,
+    )
+
+
+def _cleanup_plugin_package_metadata_artifact(
+    request: Request,
+    *,
+    plugin_id: str,
+    package: PluginPackageMetadata | None,
+    tenant_id: UUID,
+) -> None:
+    artifact = package.artifact if package is not None else None
     if artifact is None:
         return
-    expected_storage_key = f"{tenant_id}/{plugin.id}/{artifact.content_sha256}"
+    expected_storage_key = f"{tenant_id}/{plugin_id}/{artifact.content_sha256}"
     if artifact.storage_key != expected_storage_key:
         _LOGGER.warning(
             "skipping plugin package artifact cleanup with mismatched storage key",
-            extra={"plugin_id": plugin.id},
+            extra={"plugin_id": plugin_id},
         )
         return
     try:
@@ -4302,7 +4329,7 @@ def _cleanup_plugin_package_artifact(
     except (InvalidSkillPackage, OSError):
         _LOGGER.warning(
             "failed to cleanup plugin package artifact",
-            extra={"plugin_id": plugin.id},
+            extra={"plugin_id": plugin_id},
             exc_info=True,
         )
 
@@ -13271,7 +13298,7 @@ async def install_plugin_archive(
     _validate_plugin_capability_configs(request, plugin_request)
     try:
         _validate_runtime_registered_plugin_package(request, plugin_request, package_metadata)
-        package_metadata = _stored_plugin_package_metadata(
+        stored_package = _stored_plugin_package_metadata(
             request,
             tenant_id=principal.tenant_id,
             plugin_id=plugin_request.id,
@@ -13279,6 +13306,7 @@ async def install_plugin_archive(
             archive_bytes=archive_bytes,
             content_sha256=content_sha256,
         )
+        package_metadata = stored_package.package
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -13286,14 +13314,24 @@ async def install_plugin_archive(
             "plugin package is invalid",
             details={"reason": _safe_model_check_detail(str(error))},
         ) from None
-    plugin = await service.upsert_plugin(
-        plugin_request,
-        tenant_id=principal.tenant_id,
-        actor_id=principal.user_id,
-        source_filename=filename,
-        content_sha256=content_sha256,
-        package_metadata=package_metadata,
-    )
+    try:
+        plugin = await service.upsert_plugin(
+            plugin_request,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            source_filename=filename,
+            content_sha256=content_sha256,
+            package_metadata=package_metadata,
+        )
+    except Exception:
+        if stored_package.artifact_created:
+            _cleanup_plugin_package_metadata_artifact(
+                request,
+                plugin_id=plugin_request.id,
+                package=package_metadata,
+                tenant_id=principal.tenant_id,
+            )
+        raise
     await service.record_audit_event(
         actor=str(principal.user_id),
         action="plugin.install",

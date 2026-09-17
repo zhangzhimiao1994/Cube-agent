@@ -5562,6 +5562,53 @@ def test_plugin_delete_removes_verified_adapter_package_artifact(
     assert not artifact_root.exists()
 
 
+def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
+    tmp_path: Path,
+) -> None:
+    class FailingPluginWriteService(InMemoryAdminResourceService):
+        async def upsert_plugin(
+            self,
+            request: PluginResourceRequest,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+            source_filename: str | None = None,
+            content_sha256: str | None = None,
+            package_metadata: PluginPackageMetadata | None = None,
+        ) -> PluginResourceResponse:
+            raise RuntimeError("plugin persistence failed")
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    cast(Any, api.app).state.admin_resource_service = FailingPluginWriteService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(private_key)
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=archive_bytes,
+    )
+
+    assert response.status_code == 500
+    assert not artifact_root.exists()
+
+
 def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
     api = client()
 
