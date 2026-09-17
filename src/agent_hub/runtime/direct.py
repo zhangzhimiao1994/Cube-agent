@@ -30,6 +30,12 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
+from agent_hub.runtime.project_scale_artifact import (
+    is_project_scale_artifact_request,
+    project_scale_artifact_agent_standard_verification,
+    project_scale_artifact_deliverable_quality,
+    project_scale_artifact_zip_files,
+)
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _RUNTIME_TYPE = "direct"
@@ -104,6 +110,21 @@ def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
         return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
     prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
     return f"{prefix}{suffix}"
+
+
+def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
+    return (
+        context.mode is TaskMode.DIRECT
+        and context.routing_decision.get("project_preflight_approved") is True
+        and is_project_scale_artifact_request(context.request)
+    )
+
+
+def _project_scale_direct_artifact_text(request: object) -> str:
+    blocks: list[str] = []
+    for path, content in project_scale_artifact_zip_files(request).items():
+        blocks.append(f"### `{path}`\n```text\n{content.rstrip()}\n```")
+    return "\n\n".join(blocks)
 
 
 class DirectRunStream:
@@ -205,6 +226,71 @@ class DirectRuntime:
                 return
             if context.checkpoint is not None:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
+
+            if _should_emit_project_scale_direct_artifact(context):
+                direct_artifact = Artifact(
+                    id=uuid4(),
+                    type="text",
+                    producer="main",
+                    content={"text": _project_scale_direct_artifact_text(context.request)},
+                    version=1,
+                )
+                artifact_text_preview = _event_text_preview(direct_artifact.content.get("text"))
+                yield RunEvent(
+                    kind=EventKind.ARTIFACT_CREATED,
+                    sequence=1,
+                    run_id=context.run_id,
+                    actor="main_agent",
+                    message="生成已批准预检的大型项目直连验收产物。",
+                    payload={
+                        "artifact_id": str(direct_artifact.id),
+                        "output": artifact_text_preview,
+                        "result": artifact_text_preview,
+                        "deliverable_quality": project_scale_artifact_deliverable_quality(),
+                        "agent_standard_verification": (
+                            project_scale_artifact_agent_standard_verification()
+                        ),
+                    },
+                    artifact=direct_artifact,
+                )
+                direct_checkpoint = RuntimeCheckpoint(
+                    id=uuid4(),
+                    runtime_type=_RUNTIME_TYPE,
+                    runtime_version=_RUNTIME_VERSION,
+                    run_id=context.run_id,
+                    tenant_id=context.tenant_id,
+                    mode=self.mode,
+                    state={
+                        "completed": True,
+                        "artifact_id": str(direct_artifact.id),
+                        "artifact_sha256": direct_artifact.content_sha256,
+                        "next_sequence": 3,
+                    },
+                )
+                self._last_checkpoint = direct_checkpoint
+                yield RunEvent(
+                    kind=EventKind.CHECKPOINT_SAVED,
+                    sequence=2,
+                    run_id=context.run_id,
+                    checkpoint=direct_checkpoint,
+                )
+                yield RunEvent(
+                    kind=EventKind.RUNTIME_COMPLETED,
+                    sequence=3,
+                    run_id=context.run_id,
+                    actor="main_agent",
+                    message="大型项目直连预检产物已完成。",
+                    payload={
+                        "artifact_id": str(direct_artifact.id),
+                        "summary": artifact_text_preview,
+                        "deliverable_quality": project_scale_artifact_deliverable_quality(),
+                        "agent_standard_verification": (
+                            project_scale_artifact_agent_standard_verification()
+                        ),
+                    },
+                    inputs=(direct_artifact,),
+                )
+                return
 
             request_outcome = self._build_request(context)
             if request_outcome.request is None:

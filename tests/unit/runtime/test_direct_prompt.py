@@ -1,8 +1,10 @@
 from typing import cast
 from uuid import uuid4
 
+import pytest
+
 from agent_hub.domain.runs import TaskMode
-from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
 
 
@@ -144,3 +146,55 @@ def test_direct_prompt_includes_approved_project_preflight_context() -> None:
     assert "stage_status" in serialized
     assert "verification_evidence" in serialized
     assert "acceptance_review" in serialized
+
+
+@pytest.mark.asyncio
+async def test_direct_project_scale_preflight_emits_verified_artifact_without_gateway() -> None:
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=(
+                    "Project-scale acceptance fixture: build a large project for scale=large "
+                    "and flow=direct."
+                ),
+                routing_decision={
+                    "project_preflight_approved": True,
+                    "project_preflight_proposal": {
+                        "kind": "project_architecture_preflight",
+                        "capability": "project.preflight_architecture",
+                        "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+                        "graph_path": "architecture-map.html",
+                        "summary": "Approved large-project architecture preflight.",
+                    },
+                },
+            )
+        )
+    ]
+
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    text = artifact_event.artifact.content["text"]
+    assert isinstance(text, str)
+    assert "### `README.md`" in text
+    assert "### `VERIFICATION.md`" in text
+    assert artifact_event.payload["deliverable_quality"] == {
+        "requirements_satisfied": True,
+        "build_passed": True,
+        "tests_passed": True,
+        "interactive_checks_passed": True,
+        "no_placeholders": True,
+        "artifact_integrity": True,
+    }
+    assert artifact_event.payload["agent_standard_verification"] == {
+        "constraints_read": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }
