@@ -296,15 +296,18 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         if case.flow == "plugin"
         else ""
     )
+    deliverable_guidance = (
+        " Produce the final deliverable as either strict JSON with workspace_bundle.files mapping "
+        "safe relative paths to complete file contents, or Markdown file blocks headed exactly "
+        "like ### `path/to/file` followed by a fenced code block. Include README or requirements, "
+        "source files, tests or build scripts, an implementation plan, and a verification report "
+        "with reproducible build, test, and interaction evidence. Avoid credential-like terms and "
+        "avoid package, file, variable, or fixture names that contain the sk- prefix so public "
+        "evidence stays visible."
+    )
     direct_guidance = (
         " For direct flow, do not call tools, do not emit DSML/tool-call syntax, and do not "
-        "describe commands as if they were executed. Produce the deliverable inline as either "
-        "strict JSON with workspace_bundle.files mapping safe relative paths to complete file "
-        "contents, or Markdown file blocks headed exactly like ### `path/to/file` followed by "
-        "a fenced code block. Include README or requirements, source files, tests or build "
-        "scripts, an implementation plan, and a verification report with reproducible build, "
-        "test, and interaction evidence. Avoid credential-like terms and avoid package, file, "
-        "variable, or fixture names that contain the sk- prefix so public evidence stays visible."
+        "describe commands as if they were executed."
         if case.flow == "direct"
         else ""
     )
@@ -317,7 +320,7 @@ def _fixture_message(case: ProjectScaleCase) -> str:
         "implementation plan and verification note in the workspace, and follow Codex/Claude "
         "Code verification standards: read constraints, plan before implementation, verify with "
         "reproducible evidence, and repair root causes instead of silently degrading."
-        f"{plugin_guidance}{direct_guidance}"
+        f"{plugin_guidance}{deliverable_guidance}{direct_guidance}"
     )
 
 

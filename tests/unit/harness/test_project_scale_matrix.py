@@ -108,16 +108,19 @@ def test_project_scale_run_requests_are_safe_workspace_write_fixtures() -> None:
         assert "repair root causes" in message
 
 
-def test_direct_project_scale_request_requires_embedded_deliverable_bundle() -> None:
+def test_project_scale_requests_require_embedded_deliverable_bundle() -> None:
     cases = {case.id: case for case in ProjectScaleMatrix.default().cases}
-    request = build_project_scale_run_request(cases["small:direct"])
-    message = str(request.body["message"])
 
-    assert "do not call tools" in message
-    assert "workspace_bundle.files" in message
-    assert "Markdown file blocks" in message
-    assert "credential-like terms" in message
-    assert "sk-" in message
+    for case in cases.values():
+        request = build_project_scale_run_request(case)
+        message = str(request.body["message"])
+
+        assert "workspace_bundle.files" in message
+        assert "Markdown file blocks" in message
+        assert "credential-like terms" in message
+        assert "sk-" in message
+        if case.flow == "direct":
+            assert "do not call tools" in message
 
 
 def test_project_scale_run_requests_map_flows_to_execution_modes() -> None:
@@ -180,45 +183,37 @@ def test_project_scale_run_plan_payload_includes_validation_focus() -> None:
 
     payload = plan.to_payload()
 
-    assert payload["requests"] == [
-        {
-            "case_id": "small:capability_validation",
-            "validation_focus": [
-                "interaction_stability",
-                "final_result",
-                "deliverable_quality",
-                "agent_standard_verification",
-                "capability_matrix",
-                "mode_control",
-                "no_silent_downgrade",
-            ],
-            "body": {
-                "message": (
-                    "Project-scale acceptance fixture: build a small project for scale=small "
-                    "and flow=capability_validation. Read constraints first, keep interaction "
-                    "stable, use the approved workspace, produce final artifacts, satisfy "
-                    "the requested requirements, verify build/test/interaction behavior, avoid "
-                    "placeholder or stub-only output, record deliverable_quality and "
-                    "agent_standard_verification evidence, include a lightweight implementation "
-                    "plan and verification note in the workspace, and follow Codex/Claude Code "
-                    "verification standards: read constraints, plan before implementation, verify "
-                    "with reproducible evidence, and repair root causes instead of silently "
-                    "degrading."
-                ),
-                "mode": "hybrid",
-                "project_id": "project-scale-acceptance",
-                "workspace_session_id": "project-scale-small-capability_validation",
-                "sandbox_profile": "workspace_write",
-                "requested_permissions": [
-                    "workspace.read",
-                    "workspace.write",
-                    "command.run",
-                ],
-                "skip_evolution_proposal": True,
-                "runtime_timeout_seconds": 900,
-            },
-        }
+    requests = payload["requests"]
+    assert isinstance(requests, list)
+    assert len(requests) == 1
+    request = requests[0]
+    assert isinstance(request, dict)
+    assert request["case_id"] == "small:capability_validation"
+    assert request["validation_focus"] == [
+        "interaction_stability",
+        "final_result",
+        "deliverable_quality",
+        "agent_standard_verification",
+        "capability_matrix",
+        "mode_control",
+        "no_silent_downgrade",
     ]
+    body = request["body"]
+    assert body["mode"] == "hybrid"
+    assert body["project_id"] == "project-scale-acceptance"
+    assert body["workspace_session_id"] == "project-scale-small-capability_validation"
+    assert body["sandbox_profile"] == "workspace_write"
+    assert body["requested_permissions"] == [
+        "workspace.read",
+        "workspace.write",
+        "command.run",
+    ]
+    assert body["skip_evolution_proposal"] is True
+    assert body["runtime_timeout_seconds"] == 900
+    message = str(body["message"])
+    assert "flow=capability_validation" in message
+    assert "workspace_bundle.files" in message
+    assert "no_silent_downgrade" not in message
 
 
 def test_project_scale_run_plan_filters_scale_and_flow() -> None:
