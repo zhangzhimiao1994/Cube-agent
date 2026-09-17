@@ -347,10 +347,11 @@ def project_scale_artifact_discussion_trace() -> Mapping[str, JsonValue]:
 
 def project_scale_artifact_plugin_contract() -> Mapping[str, JsonValue]:
     return {
-        "manifest_discovery": True,
-        "adapter_contracts": True,
-        "sandbox_policy_boundaries": True,
-        "failure_recovery": True,
+        "manifest_discovered": True,
+        "adapter_contract_checked": True,
+        "policy_boundary_checked": True,
+        "sandbox_profile_checked": True,
+        "failure_recovery_checked": True,
     }
 
 

@@ -499,10 +499,11 @@ async def test_project_scale_plugin_preseed_records_plugin_contract_evidence() -
 
     completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
     assert completed.payload["plugin_contract"] == {
-        "manifest_discovery": True,
-        "adapter_contracts": True,
-        "sandbox_policy_boundaries": True,
-        "failure_recovery": True,
+        "manifest_discovered": True,
+        "adapter_contract_checked": True,
+        "policy_boundary_checked": True,
+        "sandbox_profile_checked": True,
+        "failure_recovery_checked": True,
     }
     discussion = next(
         event
