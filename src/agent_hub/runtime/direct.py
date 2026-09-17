@@ -62,6 +62,13 @@ class _RequestOutcome:
     error_code: str | None = None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _BudgetUsageOutcome:
+    usage: TokenUsage | None = None
+    estimated: bool = False
+    error_code: str | None = None
+
+
 class RuntimeExecutionError(RuntimeError):
     """Stable, redacted direct-runtime failure."""
 
@@ -270,19 +277,22 @@ class DirectRuntime:
                 gateway_task = None
                 del text, response, completion, request, included_source_ids, context
                 _raise_execution_error("model response is invalid")
-            budget_usage, usage_estimated = self._verified_budget_usage(
+            budget_outcome = self._verified_budget_usage(
                 response.usage,
                 prompt_estimate=prompt_estimate,
                 response_text=text,
                 request_max_output_tokens=request.max_output_tokens,
                 context_token_budget=context.token_budget,
             )
-            if budget_usage is None:
+            if budget_outcome.usage is None:
+                budget_error_code = (
+                    budget_outcome.error_code or "model response budget is unverifiable"
+                )
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
                 del (
-                    budget_usage,
+                    budget_outcome,
                     text,
                     response,
                     completion,
@@ -290,7 +300,9 @@ class DirectRuntime:
                     included_source_ids,
                     context,
                 )
-                _raise_execution_error("model response budget is unverifiable")
+                _raise_execution_error(budget_error_code)
+            budget_usage = budget_outcome.usage
+            usage_estimated = budget_outcome.estimated
 
             artifact_failed = False
             artifact: Artifact | None = None
@@ -652,15 +664,21 @@ class DirectRuntime:
         response_text: str,
         request_max_output_tokens: int,
         context_token_budget: int,
-    ) -> tuple[TokenUsage | None, bool]:
+    ) -> _BudgetUsageOutcome:
         if usage is not None:
-            if (
-                usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
-                or usage.completion_tokens > request_max_output_tokens
-                or usage.total_tokens > context_token_budget
-            ):
-                return None, False
-            return usage, False
+            if usage.total_tokens < usage.prompt_tokens + usage.completion_tokens:
+                return _BudgetUsageOutcome(
+                    error_code="model response budget total is inconsistent"
+                )
+            if usage.completion_tokens > request_max_output_tokens:
+                return _BudgetUsageOutcome(
+                    error_code="model response budget completion exceeds request limit"
+                )
+            if usage.total_tokens > context_token_budget:
+                return _BudgetUsageOutcome(
+                    error_code="model response budget exceeds runtime limit"
+                )
+            return _BudgetUsageOutcome(usage=usage, estimated=False)
         completion_estimate = len(response_text.encode("utf-8"))
         try:
             estimated = TokenUsage(
@@ -669,13 +687,21 @@ class DirectRuntime:
                 total_tokens=prompt_estimate + completion_estimate,
             )
         except ValueError:
-            return None, True
-        if (
-            estimated.completion_tokens > request_max_output_tokens
-            or estimated.total_tokens > context_token_budget
-        ):
-            return None, True
-        return estimated, True
+            return _BudgetUsageOutcome(
+                estimated=True,
+                error_code="model response budget estimate is invalid",
+            )
+        if estimated.completion_tokens > request_max_output_tokens:
+            return _BudgetUsageOutcome(
+                estimated=True,
+                error_code="model response budget estimate exceeds request limit",
+            )
+        if estimated.total_tokens > context_token_budget:
+            return _BudgetUsageOutcome(
+                estimated=True,
+                error_code="model response budget estimate exceeds runtime limit",
+            )
+        return _BudgetUsageOutcome(usage=estimated, estimated=True)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         checkpoint = self._last_checkpoint
