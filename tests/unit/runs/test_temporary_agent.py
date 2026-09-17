@@ -938,6 +938,45 @@ async def test_project_preflight_approval_enqueues_the_planned_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_large_project_requires_preflight_and_preserves_direct_mode() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="Build a large project with architecture planning and production result.",
+        mode=TaskMode.DIRECT,
+        project_id="project-scale-acceptance",
+        workspace_session_id="project-scale-large-direct",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.project_preflight_proposal is not None
+    assert submitted.project_preflight_proposal["mode"] == "direct"
+
+    assert submitted.decision_token is not None
+    approved = await service.approve_project_preflight(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=submitted.id,
+        decision_token=submitted.decision_token,
+        version=submitted.version,
+    )
+
+    assert approved.status is RunStatus.QUEUED
+    assert approved.mode is TaskMode.DIRECT
+
+
+@pytest.mark.asyncio
 async def test_auto_router_classification_unavailable_uses_local_main_agent() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()

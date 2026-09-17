@@ -3240,14 +3240,14 @@ def _local_project_preflight_proposal(
     project_id: str,
     workspace_session_id: str,
 ) -> ProjectPreflightProposal | None:
-    if mode not in {TaskMode.AUTO, TaskMode.DISPATCH, TaskMode.HYBRID}:
+    if mode not in {TaskMode.AUTO, TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.HYBRID}:
         return None
     if not _message_suggests_ultra_large_project(message):
         return None
     return ProjectPreflightProposal(
         title="超大型项目架构预检",
         request=message.strip(),
-        mode=TaskMode.HYBRID,
+        mode=TaskMode.HYBRID if mode is TaskMode.AUTO else mode,
         project_id=project_id,
         workspace_session_id=workspace_session_id,
         plan_path="PROJECT_ARCHITECTURE_PLAN.md",
