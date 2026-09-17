@@ -470,6 +470,49 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
 
 
 @pytest.mark.asyncio
+async def test_project_scale_plugin_preseed_records_plugin_contract_evidence() -> None:
+    harness = RecordingHarnessToolGateway()
+    runtime = ProjectScaleArtifactPreseedRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, "dispatch should be short-circuited"),
+        harness_tool_gateway=harness,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DISPATCH,
+                request=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=plugin."
+                ),
+                routing_decision={
+                    "project_id": "project-scale-acceptance",
+                    "workspace_session_id": "project-scale-small-plugin",
+                    "sandbox_profile": "workspace_write",
+                },
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.payload["plugin_contract"] == {
+        "manifest_discovery": True,
+        "adapter_contracts": True,
+        "sandbox_policy_boundaries": True,
+        "failure_recovery": True,
+    }
+    discussion = next(
+        event
+        for event in events
+        if event.kind is EventKind.MESSAGE_CREATED and "discussion_trace" in event.payload
+    )
+    assert "plugin_contract" in discussion.payload
+
+
+@pytest.mark.asyncio
 async def test_project_scale_artifact_preseed_accepts_string_uuid_context_boundary() -> None:
     run_id = uuid4()
     tenant_id = uuid4()

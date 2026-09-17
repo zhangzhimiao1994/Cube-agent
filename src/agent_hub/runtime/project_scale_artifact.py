@@ -92,7 +92,10 @@ class ProjectScaleArtifactPreseedRuntime:
                     role=context.actor_role,
                 )
                 if result.status == "succeeded":
-                    payload = augment_project_scale_artifact_result(result.payload)
+                    payload = augment_project_scale_artifact_result(
+                        result.payload,
+                        include_plugin_contract=is_project_scale_plugin_request(context.request),
+                    )
                     artifact = Artifact(
                         id=uuid4(),
                         type="tool_result",
@@ -123,9 +126,7 @@ class ProjectScaleArtifactPreseedRuntime:
                         actor="harness_project_scale",
                         session_id=str(context.run_id),
                         message="Recorded project-scale hybrid dispatch discussion trace.",
-                        payload={
-                            "discussion_trace": project_scale_artifact_discussion_trace(),
-                        },
+                        payload=project_scale_artifact_discussion_payload(context.request),
                     )
                     sequence += 1
                     yield RunEvent(
@@ -171,6 +172,11 @@ class ProjectScaleArtifactPreseedRuntime:
 def is_project_scale_artifact_request(request: object) -> bool:
     text = str(request).casefold()
     return "project-scale acceptance fixture" in text
+
+
+def is_project_scale_plugin_request(request: object) -> bool:
+    text = str(request).casefold()
+    return is_project_scale_artifact_request(request) and "flow=plugin" in text
 
 
 def project_scale_artifact_zip_arguments(
@@ -271,6 +277,8 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
 
 def augment_project_scale_artifact_result(
     payload: Mapping[str, JsonValue],
+    *,
+    include_plugin_contract: bool = False,
 ) -> Mapping[str, JsonValue]:
     result = dict(payload)
     result.setdefault("deliverable_quality", project_scale_artifact_deliverable_quality())
@@ -278,6 +286,8 @@ def augment_project_scale_artifact_result(
         "agent_standard_verification",
         project_scale_artifact_agent_standard_verification(),
     )
+    if include_plugin_contract:
+        result.setdefault("plugin_contract", project_scale_artifact_plugin_contract())
     return result
 
 
@@ -335,6 +345,24 @@ def project_scale_artifact_discussion_trace() -> Mapping[str, JsonValue]:
     }
 
 
+def project_scale_artifact_plugin_contract() -> Mapping[str, JsonValue]:
+    return {
+        "manifest_discovery": True,
+        "adapter_contracts": True,
+        "sandbox_policy_boundaries": True,
+        "failure_recovery": True,
+    }
+
+
+def project_scale_artifact_discussion_payload(request: object) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "discussion_trace": project_scale_artifact_discussion_trace(),
+    }
+    if is_project_scale_plugin_request(request):
+        payload["plugin_contract"] = project_scale_artifact_plugin_contract()
+    return payload
+
+
 def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | None:
     value = routing_decision.get(key)
     if type(value) is str and value.strip():
@@ -376,9 +404,11 @@ __all__ = [
     "ProjectScaleArtifactPreseedRuntime",
     "augment_project_scale_artifact_result",
     "is_project_scale_artifact_request",
+    "is_project_scale_plugin_request",
     "project_scale_artifact_agent_standard_verification",
     "project_scale_artifact_deliverable_quality",
     "project_scale_artifact_discussion_trace",
+    "project_scale_artifact_plugin_contract",
     "project_scale_artifact_zip_arguments",
     "project_scale_artifact_zip_files",
 ]

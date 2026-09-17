@@ -10,14 +10,17 @@ from urllib.error import HTTPError
 
 import pytest
 
+from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
     UrllibAcceptanceClient,
+    _deliverable_repair_body,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
+from agent_hub.runtime.role_planner import RolePlanningRequest
 
 
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
@@ -267,6 +270,27 @@ def test_execute_project_scale_plan_requires_plugin_contract_evidence() -> None:
     assert "plugin_contract: missing or incomplete plugin capability contract evidence" in repair_message
     assert "adapter contracts" in repair_message
     assert "sandbox and policy boundaries" in repair_message
+
+
+def test_deliverable_repair_body_keeps_dispatch_task_bounded_for_plugin_flow() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    body = dict(plan.requests[0].body)
+    body["message"] = f"{body['message']}\n" + ("original context " * 220)
+
+    repair_body = _deliverable_repair_body(
+        body,
+        "small:plugin",
+        failed_reasons=(
+            "plugin_contract: missing or incomplete plugin capability contract evidence",
+            "discussion_trace: missing hybrid/discussion process evidence",
+        ),
+    )
+
+    message = repair_body["message"]
+    assert isinstance(message, str)
+    assert message == message.strip()
+    assert len(message) <= 2_000
+    RolePlanningRequest(task=message, mode=TaskMode.DISPATCH)
 
 
 def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_repair() -> None:

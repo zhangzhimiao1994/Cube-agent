@@ -1278,7 +1278,7 @@ def _deliverable_repair_body(
         if body.get("mode") == "direct" or case_id.endswith(":direct")
         else ""
     )
-    repair_body["message"] = (
+    repair_message = (
         f"Project-scale deliverable repair for {case_id}: the previous generated project "
         "failed acceptance quality. Diagnose the mismatches against the original request, "
         "repair the implementation in the same workspace, rerun build/test/interaction checks, "
@@ -1296,8 +1296,23 @@ def _deliverable_repair_body(
         "Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
+    repair_body["message"] = _bounded_role_planning_task_text(repair_message)
     repair_body["skip_evolution_proposal"] = True
     return repair_body
+
+
+def _bounded_role_planning_task_text(value: str, *, max_chars: int = 2_000) -> str:
+    text = " ".join(value.split())
+    if len(text) <= max_chars:
+        return text
+    marker = "Original request:"
+    marker_index = text.find(marker)
+    if marker_index > 0:
+        prefix = text[: marker_index + len(marker)].strip()
+        remaining = max_chars - len(prefix) - len(" ...") - 1
+        if remaining > 0:
+            return f"{prefix} {text[marker_index + len(marker):][:remaining].strip()} ...".strip()
+    return text[: max_chars - 4].rstrip() + " ..."
 
 
 def _format_failed_reasons(reasons: Sequence[str]) -> str:
