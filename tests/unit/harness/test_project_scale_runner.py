@@ -2,14 +2,19 @@ import json
 import subprocess
 import sys
 import zipfile
+from email.message import Message
 from io import BytesIO
 from pathlib import Path
-from typing import cast
+from typing import Protocol, Self, cast
+from urllib.error import HTTPError
+
+import pytest
 
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
+    UrllibAcceptanceClient,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
@@ -78,7 +83,7 @@ def test_project_scale_runner_rejects_execute_without_token() -> None:
     result = run_project_scale_runner("--execute", "--scale", "small", "--flow", "direct")
 
     assert result.returncode == 2
-    assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute" in result.stderr
+    assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or" in result.stderr
 
 
 def test_project_scale_runner_rejects_unknown_filters() -> None:
@@ -86,6 +91,75 @@ def test_project_scale_runner_rejects_unknown_filters() -> None:
 
     assert result.returncode == 2
     assert "unknown project scale: tiny" in result.stderr
+
+
+def test_urllib_acceptance_client_reauthenticates_once_on_expired_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None, bytes | None]] = []
+
+    class UrlopenRequest(Protocol):
+        full_url: str
+        data: bytes | None
+
+        def get_header(self, header_name: str) -> str | None: ...
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def fake_urlopen(request: object, *, timeout: float) -> Response:
+        del timeout
+        request = cast(UrlopenRequest, request)
+        url = request.full_url
+        auth = request.get_header("Authorization")
+        data = request.data
+        calls.append((url, auth, data))
+        if len(calls) == 1:
+            raise HTTPError(
+                url,
+                401,
+                "Unauthorized",
+                hdrs=Message(),
+                fp=BytesIO(
+                    b'{"error":{"code":"invalid_token","message":"invalid access token"}}'
+                ),
+            )
+        if url.endswith("/api/v1/auth/login"):
+            assert auth is None
+            return Response(
+                b'{"access_token":"fresh-token","token_type":"bearer",'
+                b'"principal":{"user_id":"11111111-1111-4111-8111-111111111111",'
+                b'"tenant_id":"22222222-2222-4222-8222-222222222222",'
+                b'"role":"super_admin"}}'
+            )
+        return Response(b'{"ok":true}')
+
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.urlopen", fake_urlopen)
+    client = UrllibAcceptanceClient(
+        base_url="http://agent-hub.local",
+        bearer_token="expired-token",
+        username="test",
+        password="valid password",
+    )
+
+    result = client.request_json("GET", "/api/v1/runs/run-1/details")
+
+    assert result == {"ok": True}
+    assert [call[1] for call in calls] == [
+        "Bearer expired-token",
+        None,
+        "Bearer fresh-token",
+    ]
 
 
 def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:

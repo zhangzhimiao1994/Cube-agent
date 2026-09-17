@@ -217,10 +217,22 @@ class ProjectScaleExecutionReport:
 
 
 class UrllibAcceptanceClient:
-    def __init__(self, *, base_url: str, bearer_token: str, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        bearer_token: str = "",
+        timeout: float = 20.0,
+        username: str | None = None,
+        password: str | None = None,
+        tenant_id: str | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/") + "/"
         self._bearer_token = bearer_token
         self._timeout = timeout
+        self._username = username
+        self._password = password
+        self._tenant_id = tenant_id
 
     def request_json(
         self,
@@ -257,7 +269,14 @@ class UrllibAcceptanceClient:
         *,
         headers: dict[str, str],
         data: bytes | None,
+        retry_auth: bool = True,
+        include_bearer: bool = True,
     ) -> bytes:
+        if retry_auth and include_bearer and not self._bearer_token and self._can_login():
+            self._refresh_bearer_token()
+        if include_bearer and self._bearer_token:
+            headers = dict(headers)
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
         url = urljoin(self._base_url, path.lstrip("/"))
         request = Request(url, data=data, headers=headers, method=method)
         try:
@@ -265,9 +284,45 @@ class UrllibAcceptanceClient:
                 return cast(bytes, response.read())
         except HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
+            if retry_auth and error.code == 401 and self._can_login() and _is_invalid_token_body(body):
+                self._refresh_bearer_token()
+                return self._request(
+                    method,
+                    path,
+                    headers=headers,
+                    data=data,
+                    retry_auth=False,
+                    include_bearer=include_bearer,
+                )
             raise RuntimeError(f"{method} {path} failed status={error.code} body={body[:240]}") from error
         except URLError as error:
             raise RuntimeError(f"{method} {path} failed: {error.reason}") from error
+
+    def _can_login(self) -> bool:
+        return bool(self._username and self._password)
+
+    def _refresh_bearer_token(self) -> None:
+        if not self._can_login():
+            raise RuntimeError("acceptance login credentials are unavailable")
+        body: dict[str, object] = {
+            "username": self._username,
+            "password": self._password,
+        }
+        if self._tenant_id:
+            body["tenant_id"] = self._tenant_id
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        raw = self._request(
+            "POST",
+            "/api/v1/auth/login",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            data=data,
+            retry_auth=False,
+            include_bearer=False,
+        )
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("access_token"), str):
+            raise TypeError("acceptance login returned invalid token response")
+        self._bearer_token = cast(str, parsed["access_token"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,8 +639,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
 
-    if args.execute and not os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN"):
-        parser.error("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute")
+    bearer_token = os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "")
+    username = os.environ.get("AGENT_HUB_ACCEPTANCE_USERNAME")
+    password = os.environ.get("AGENT_HUB_ACCEPTANCE_PASSWORD")
+    tenant_id = os.environ.get("AGENT_HUB_ACCEPTANCE_TENANT_ID")
+    if args.execute and not bearer_token and not (username and password):
+        parser.error(
+            "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or "
+            "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required for --execute"
+        )
 
     try:
         plan = build_project_scale_run_plan(
@@ -597,10 +659,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(error))
 
     if args.execute:
-        token = os.environ["AGENT_HUB_ACCEPTANCE_BEARER_TOKEN"]
         report = execute_project_scale_plan(
             plan,
-            UrllibAcceptanceClient(base_url=args.base_url, bearer_token=token, timeout=args.timeout),
+            UrllibAcceptanceClient(
+                base_url=args.base_url,
+                bearer_token=bearer_token,
+                timeout=args.timeout,
+                username=username,
+                password=password,
+                tenant_id=tenant_id,
+            ),
             wait_seconds=args.wait_seconds,
             poll_interval_seconds=args.poll_interval,
             execution_id=args.execution_id or _default_execution_id(),
@@ -661,6 +729,19 @@ def _summarize_validation_focus(results: Sequence[ProjectScaleCaseResult]) -> li
         for item in result.validation_focus:
             focus.setdefault(item, None)
     return list(focus)
+
+
+def _is_invalid_token_body(body: str) -> bool:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, Mapping):
+        return False
+    return error.get("code") == "invalid_token"
 
 
 def _extend_unique(target: list[str], items: Sequence[str]) -> None:

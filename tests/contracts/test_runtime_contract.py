@@ -958,12 +958,32 @@ async def test_invalid_model_text_is_redacted() -> None:
 
 @pytest.mark.parametrize(
     "usage",
-    [None, TokenUsage(1, 1000, 1001), TokenUsage(1000, 1, 1001)],
+    [TokenUsage(1, 1000, 1001), TokenUsage(1000, 1, 1001)],
 )
 async def test_direct_fails_closed_when_usage_cannot_prove_budget(
     usage: TokenUsage | None,
 ) -> None:
     gateway = FakeGateway(ModelResponse(text="answer", usage=usage))
+    runtime = DirectRuntime(gateway, logical_model="general")
+    with pytest.raises(RuntimeExecutionError, match="budget"):
+        await collect(runtime, context(token_budget=1000))
+    with pytest.raises(RuntimeExecutionError, match="boundary"):
+        await runtime.save_checkpoint()
+
+
+async def test_direct_uses_conservative_budget_when_provider_omits_usage() -> None:
+    gateway = FakeGateway(ModelResponse(text="answer", usage=None))
+    runtime = DirectRuntime(gateway, logical_model="general")
+
+    events = await collect(runtime, context(token_budget=1000))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[1].payload["usage_estimated"] is True
+    assert events[-1].payload["usage_estimated"] is True
+
+
+async def test_direct_rejects_missing_usage_when_estimate_exceeds_budget() -> None:
+    gateway = FakeGateway(ModelResponse(text="x" * 900, usage=None))
     runtime = DirectRuntime(gateway, logical_model="general")
     with pytest.raises(RuntimeExecutionError, match="budget"):
         await collect(runtime, context(token_budget=1000))

@@ -58,6 +58,7 @@ class _PromptOutcome:
 class _RequestOutcome:
     request: ModelRequest | None = field(default=None, repr=False)
     included_source_ids: tuple[str, ...] = ()
+    prompt_estimate: int = 0
     error_code: str | None = None
 
 
@@ -204,6 +205,7 @@ class DirectRuntime:
                 _raise_execution_error(error_code)
             request = request_outcome.request
             included_source_ids = request_outcome.included_source_ids
+            prompt_estimate = request_outcome.prompt_estimate
             del request_outcome
             gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
             if self._active_token is not token:  # pragma: no cover - defensive
@@ -268,17 +270,26 @@ class DirectRuntime:
                 gateway_task = None
                 del text, response, completion, request, included_source_ids, context
                 _raise_execution_error("model response is invalid")
-            usage = response.usage
-            if (
-                usage is None
-                or usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
-                or usage.completion_tokens > request.max_output_tokens
-                or usage.total_tokens > context.token_budget
-            ):
+            budget_usage, usage_estimated = self._verified_budget_usage(
+                response.usage,
+                prompt_estimate=prompt_estimate,
+                response_text=text,
+                request_max_output_tokens=request.max_output_tokens,
+                context_token_budget=context.token_budget,
+            )
+            if budget_usage is None:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
-                del usage, text, response, completion, request, included_source_ids, context
+                del (
+                    budget_usage,
+                    text,
+                    response,
+                    completion,
+                    request,
+                    included_source_ids,
+                    context,
+                )
                 _raise_execution_error("model response budget is unverifiable")
 
             artifact_failed = False
@@ -331,7 +342,7 @@ class DirectRuntime:
             await self._consume_task_terminal(gateway_task)
             self._active_task = None
             gateway_task = None
-            del text, response, completion, request
+            del text, response, completion, request, budget_usage
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2,
@@ -350,6 +361,7 @@ class DirectRuntime:
                     "fallback_reason": completion_fallback_reason,
                     "attempted_logical_models": completion_attempted_logical_models,
                     "fallback_attempt_count": completion_fallback_attempt_count,
+                    "usage_estimated": usage_estimated,
                     "artifact_id": str(artifact.id),
                     "output": artifact_text_preview,
                     "result": artifact_text_preview,
@@ -392,6 +404,7 @@ class DirectRuntime:
                     "fallback_reason": completion_fallback_reason,
                     "attempted_logical_models": completion_attempted_logical_models,
                     "fallback_attempt_count": completion_fallback_attempt_count,
+                    "usage_estimated": usage_estimated,
                     "artifact_id": str(artifact.id),
                     "summary": artifact_text_preview,
                 },
@@ -443,10 +456,15 @@ class DirectRuntime:
             del error
             failed = True
         included_source_ids = prompt.included_source_ids
+        prompt_estimate = prompt.prompt_estimate
         del prompt, context, messages
         if failed or request is None:
             return _RequestOutcome(error_code="runtime model request is invalid")
-        return _RequestOutcome(request=request, included_source_ids=included_source_ids)
+        return _RequestOutcome(
+            request=request,
+            included_source_ids=included_source_ids,
+            prompt_estimate=prompt_estimate,
+        )
 
     def _build_prompt(
         self, context: TaskContext
@@ -625,6 +643,39 @@ class DirectRuntime:
         if failed or validated is None:
             return None
         return validated
+
+    @staticmethod
+    def _verified_budget_usage(
+        usage: TokenUsage | None,
+        *,
+        prompt_estimate: int,
+        response_text: str,
+        request_max_output_tokens: int,
+        context_token_budget: int,
+    ) -> tuple[TokenUsage | None, bool]:
+        if usage is not None:
+            if (
+                usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
+                or usage.completion_tokens > request_max_output_tokens
+                or usage.total_tokens > context_token_budget
+            ):
+                return None, False
+            return usage, False
+        completion_estimate = len(response_text.encode("utf-8"))
+        try:
+            estimated = TokenUsage(
+                prompt_tokens=prompt_estimate,
+                completion_tokens=completion_estimate,
+                total_tokens=prompt_estimate + completion_estimate,
+            )
+        except ValueError:
+            return None, True
+        if (
+            estimated.completion_tokens > request_max_output_tokens
+            or estimated.total_tokens > context_token_budget
+        ):
+            return None, True
+        return estimated, True
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         checkpoint = self._last_checkpoint
