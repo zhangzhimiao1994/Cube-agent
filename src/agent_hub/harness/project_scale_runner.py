@@ -929,10 +929,12 @@ def _embedded_workspace_bundle_from_text(value: object) -> bytes | None:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, Mapping):
-        return None
-    return _embedded_workspace_bundle_from_payload(parsed)
+        parsed = None
+    if isinstance(parsed, Mapping):
+        bundle = _embedded_workspace_bundle_from_payload(parsed)
+        if bundle is not None:
+            return bundle
+    return _markdown_file_blocks_to_zip(text)
 
 
 def _workspace_bundle_mapping_to_zip(workspace_bundle: Mapping[str, object]) -> bytes | None:
@@ -963,6 +965,34 @@ def _workspace_bundle_mapping_to_zip(workspace_bundle: Mapping[str, object]) -> 
         for path, content in sorted(normalized.items()):
             archive.writestr(path, content)
     return buffer.getvalue()
+
+
+def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
+    lines = text.splitlines()
+    files: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not (line.startswith("### `") and line.endswith("`")):
+            index += 1
+            continue
+        path = _safe_embedded_workspace_path(line[5:-1])
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if path is None or index >= len(lines) or not lines[index].lstrip().startswith("```"):
+            continue
+        index += 1
+        content_lines: list[str] = []
+        while index < len(lines) and not lines[index].lstrip().startswith("```"):
+            content_lines.append(lines[index])
+            index += 1
+        if index < len(lines):
+            index += 1
+        files[path] = "\n".join(content_lines).rstrip() + "\n"
+    if not files:
+        return None
+    return _workspace_bundle_mapping_to_zip({"files": files})
 
 
 def _safe_embedded_workspace_path(value: str) -> str | None:

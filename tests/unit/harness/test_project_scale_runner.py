@@ -678,6 +678,82 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
     assert result.errors == ()
 
 
+def test_execute_project_scale_plan_uses_markdown_file_bundle_artifact() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    markdown_bundle = """
+# Direct Deliverable
+
+### `README.md`
+
+```markdown
+# Acceptance Fixture
+
+Implements the requested project scope.
+```
+
+### `PROJECT_REQUIREMENTS.md`
+
+```markdown
+- Requirement satisfied
+- Interaction verified
+```
+
+### `IMPLEMENTATION_PLAN.md`
+
+```markdown
+- Read constraints
+- Build project
+```
+
+### `VERIFICATION.md`
+
+```markdown
+- npm run build: passed
+- npm test: passed
+- interaction smoke: passed
+```
+
+### `package.json`
+
+```json
+{"scripts":{"build":"node --check src/main.js","test":"node --test"}}
+```
+
+### `src/main.js`
+
+```js
+export const status = 'ready';
+```
+
+### `tests/main.test.js`
+
+```js
+import { status } from '../src/main.js';
+```
+""".strip()
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "artifact": {"content": {"text": markdown_bundle}},
+            }
+        ],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
