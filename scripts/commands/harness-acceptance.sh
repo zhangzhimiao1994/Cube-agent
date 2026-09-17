@@ -3213,13 +3213,16 @@ PY
   set +e
   execute_output="$(
     env -u AGENT_HUB_ACCEPTANCE_BEARER_TOKEN \
+      -u AGENT_HUB_ACCEPTANCE_USERNAME \
+      -u AGENT_HUB_ACCEPTANCE_PASSWORD \
+      -u AGENT_HUB_ACCEPTANCE_TENANT_ID \
       PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
       "$python_bin" -m agent_hub.harness.project_scale_runner \
       --execute --scale small --flow direct --wait-seconds 1 --poll-interval 0 --json 2>&1
   )"
   execute_status=$?
   set -e
-  if [[ "$execute_status" -ne 2 || "$execute_output" != *"AGENT_HUB_ACCEPTANCE_BEARER_TOKEN is required for --execute"* ]]; then
+  if [[ "$execute_status" -ne 2 || "$execute_output" != *"AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required for --execute"* ]]; then
     printf 'fail: project scale execution runner execute token gate\n' >&2
     failures=$((failures + 1))
     return 1
