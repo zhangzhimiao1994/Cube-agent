@@ -26,6 +26,36 @@ def test_public_event_payload_redacts_sensitive_values_under_safe_keys() -> None
     }
 
 
+def test_public_event_payload_does_not_redact_task_manager_as_sk_secret() -> None:
+    text = (
+        "### `README.md`\n\n```markdown\n"
+        "# task-manager-direct-fixture\n\n"
+        "A normal package name containing task-manager must remain visible.\n"
+        "```\n"
+        "### `src/main.py`\n\n```python\nprint('ready')\n```\n"
+    )
+
+    payload = _public_event_payload(
+        {
+            "kind": "artifact.created",
+            "artifact": {
+                "content": {"text": text},
+            },
+        }
+    )
+
+    artifact = payload["artifact"]
+    assert isinstance(artifact, Mapping)
+    content = artifact["content"]
+    assert isinstance(content, Mapping)
+    redacted = content["text"]
+    assert isinstance(redacted, str)
+    assert "README.md" in redacted
+    assert "task-manager-direct-fixture" in redacted
+    assert "src/main.py" in redacted
+    assert "[redacted]" not in redacted
+
+
 def test_public_artifact_payload_removes_generated_file_storage_key() -> None:
     payload = _public_artifact_payload(
         {

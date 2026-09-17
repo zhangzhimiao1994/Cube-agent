@@ -105,7 +105,7 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
     }
 )
 _SENSITIVE_PUBLIC_TEXT = re.compile(
-    r"(?:api[_ -]?key|sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
+    r"(?:api[_ -]?key|(?<![a-z0-9])sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
     re.IGNORECASE,
 )
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
