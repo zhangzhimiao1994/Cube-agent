@@ -444,7 +444,11 @@ def execute_project_scale_plan(
                 ),
             )
             if evidence["terminal_status"] and status != "completed" and observation.details:
-                repair_body = _self_repair_acceptance_body(observation.details)
+                repair_body = _self_repair_acceptance_body(
+                    client,
+                    run_id=run_id,
+                    details=observation.details,
+                )
                 if repair_body is not None:
                     repair_response = client.request_json(
                         "POST",
@@ -1180,12 +1184,32 @@ def _capability_approval_from_mapping(payload: Mapping[str, object]) -> tuple[st
     return approval_id, version
 
 
-def _self_repair_acceptance_body(details: Mapping[str, object]) -> dict[str, object] | None:
-    proposal = details.get("repair_proposal")
+def _self_repair_acceptance_body(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    details: Mapping[str, object],
+) -> dict[str, object] | None:
+    direct = _self_repair_acceptance_body_from_mapping(details)
+    if direct is not None:
+        return direct
+    try:
+        admin_response = client.request_json("GET", f"/api/v1/admin/runs/{quote(run_id)}")
+    except RuntimeError:
+        return None
+    if not isinstance(admin_response, dict):
+        return None
+    return _self_repair_acceptance_body_from_mapping(admin_response)
+
+
+def _self_repair_acceptance_body_from_mapping(
+    mapping: Mapping[str, object],
+) -> dict[str, object] | None:
+    proposal = mapping.get("repair_proposal")
     if not isinstance(proposal, Mapping):
         return None
-    decision_token = details.get("decision_token")
-    version = details.get("version")
+    decision_token = mapping.get("decision_token")
+    version = mapping.get("version")
     if not isinstance(decision_token, str) or not decision_token:
         return None
     if not isinstance(version, int) or version <= 0:

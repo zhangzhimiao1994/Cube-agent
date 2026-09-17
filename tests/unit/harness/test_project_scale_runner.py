@@ -1025,6 +1025,7 @@ def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
         events=[{"kind": "repair.classified", "run_id": "run-small-dispatch"}],
         self_repair_decision_token="repair-token-12345678901234567890",
         self_repair_decision_version=7,
+        public_self_repair_proposal=False,
     )
 
     report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
@@ -1156,6 +1157,7 @@ class FakeAcceptanceClient:
         capability_approval_version: int | None = None,
         self_repair_decision_token: str | None = None,
         self_repair_decision_version: int | None = None,
+        public_self_repair_proposal: bool = True,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -1191,6 +1193,7 @@ class FakeAcceptanceClient:
         self.capability_approval_version = capability_approval_version
         self.self_repair_decision_token = self_repair_decision_token
         self.self_repair_decision_version = self_repair_decision_version
+        self.public_self_repair_proposal = public_self_repair_proposal
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
@@ -1247,7 +1250,7 @@ class FakeAcceptanceClient:
                 "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
             }
         if path == f"/api/v1/admin/runs/{self.run_id}":
-            return {
+            response: dict[str, object] = {
                 "id": self.run_id,
                 "status": self.statuses[0],
                 "version": self.capability_approval_version,
@@ -1256,6 +1259,11 @@ class FakeAcceptanceClient:
                     "version": str(self.capability_approval_version),
                 },
             }
+            if self.self_repair_decision_token is not None:
+                response["decision_token"] = self.self_repair_decision_token
+                response["version"] = self.self_repair_decision_version or 1
+                response["repair_proposal"] = _self_repair_proposal_fixture()
+            return response
         if path in {
             f"/api/v1/runs/{self.run_id}/details",
             f"/api/v1/runs/{self.repair_run_id}/details",
@@ -1324,21 +1332,16 @@ class FakeAcceptanceClient:
                     "sandbox_profile_checked": True,
                     "failure_recovery_checked": True,
                 }
-            if path == f"/api/v1/runs/{self.run_id}/details":
+            if (
+                path == f"/api/v1/runs/{self.run_id}/details"
+                and self.public_self_repair_proposal
+            ):
                 if self.self_repair_decision_token is not None:
                     details_response["decision_token"] = self.self_repair_decision_token
                 if self.self_repair_decision_version is not None:
                     details_response["version"] = self.self_repair_decision_version
                 if self.self_repair_decision_token is not None:
-                    details_response["repair_proposal"] = {
-                        "kind": "repair.classified",
-                        "failure_kind": "runtime_failure",
-                        "repair_action": "draft_repair_proposal",
-                        "requires_approval": True,
-                        "automatic_execution": False,
-                        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
-                        "orchestration_recovery_hint": "retry_blocked_contract_chain",
-                    }
+                    details_response["repair_proposal"] = _self_repair_proposal_fixture()
             return details_response
         if path in {
             f"/api/v1/runs/{self.run_id}/events",
@@ -1440,3 +1443,15 @@ def _project_bundle(files: dict[str, str]) -> bytes:
         for path, content in files.items():
             archive.writestr(path, content)
     return buffer.getvalue()
+
+
+def _self_repair_proposal_fixture() -> dict[str, object]:
+    return {
+        "kind": "self_repair",
+        "failure_kind": "runtime_failure",
+        "repair_action": "draft_repair_proposal",
+        "requires_approval": True,
+        "automatic_execution": False,
+        "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+        "orchestration_recovery_hint": "retry_blocked_contract_chain",
+    }
