@@ -16,6 +16,7 @@ from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
     UrllibAcceptanceClient,
+    _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     execute_project_scale_plan,
     format_project_scale_result_line,
@@ -291,6 +292,32 @@ def test_deliverable_repair_body_keeps_dispatch_task_bounded_for_plugin_flow() -
     assert message == message.strip()
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DISPATCH)
+
+
+def test_python_verification_report_counts_split_build_and_unittest_success() -> None:
+    verification_text = """
+    ## Reproducible build
+    bash scripts/build.sh
+    build: ok
+    The script byte-compiles src, tests, and scripts with python -m compileall -q.
+
+    ## Reproducible tests
+    bash scripts/test.sh
+    Ran 15 tests
+    OK
+    """
+
+    assert _bundle_has_build_test_execution_evidence(verification_text) is True
+
+
+def test_planned_interaction_smoke_does_not_count_as_execution_success() -> None:
+    verification_text = """
+    - npm run build
+    - npm test
+    - interaction smoke planned
+    """
+
+    assert _bundle_has_build_test_execution_evidence(verification_text) is False
 
 
 def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_repair() -> None:

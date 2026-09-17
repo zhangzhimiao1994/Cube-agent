@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import zipfile
@@ -120,6 +121,7 @@ _EXECUTION_PASS_MARKERS = (
     "ok",
     "0 failed",
 )
+_EXECUTION_PASS_RE = re.compile(r"(?:\b(?:passed|pass|success|succeeded|ok)\b|0 failed)")
 
 
 class AcceptanceClient(Protocol):
@@ -1858,10 +1860,18 @@ def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:
                 lowered,
                 ("build", "npm run build", "pnpm build", "yarn build"),
             )
+            or _nearby_block_has_execution_pass(
+                lowered,
+                ("build", "npm run build", "pnpm build", "yarn build", "compileall"),
+            )
             or (has_success_summary and _has_marker(lowered, ("build", "compileall")))
         )
         and (
             _line_has_execution_pass(lowered, ("test", "npm test", "npm run test", "pytest"))
+            or _nearby_block_has_execution_pass(
+                lowered,
+                ("test", "npm test", "npm run test", "pytest", "unittest"),
+            )
             or (has_success_summary and _has_marker(lowered, ("test", "pytest", "unittest")))
         )
     )
@@ -1875,9 +1885,26 @@ def _line_has_execution_pass(text: str, command_markers: Sequence[str]) -> bool:
     for line in text.splitlines():
         if not any(marker in line for marker in command_markers):
             continue
-        if any(marker in line for marker in _EXECUTION_PASS_MARKERS):
+        if _has_execution_pass_marker(line):
             return True
     return False
+
+
+def _nearby_block_has_execution_pass(text: str, command_markers: Sequence[str]) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not any(marker in line for marker in command_markers):
+            continue
+        block = "\n".join(lines[index : index + 6])
+        if _has_execution_pass_marker(block):
+            return True
+        if "ran " in block and " tests" in block:
+            return True
+    return False
+
+
+def _has_execution_pass_marker(text: str) -> bool:
+    return _EXECUTION_PASS_RE.search(text) is not None
 
 
 def _should_attempt_deliverable_repair(
