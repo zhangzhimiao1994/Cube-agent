@@ -663,6 +663,35 @@ require_native_service_active() {
   die "$unit did not become active after install; inspect the logs above"
 }
 
+require_native_readiness() {
+  local ready_url="http://127.0.0.1:${AGENT_HUB_API_PORT:-8000}/health/ready"
+  local timeout="${AGENT_HUB_NATIVE_READY_TIMEOUT_SECONDS:-120}"
+  local poll_interval="${AGENT_HUB_NATIVE_READY_POLL_INTERVAL_SECONDS:-2}"
+  local started="$SECONDS"
+  local status=""
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required to verify native readiness"
+  fi
+  if [[ ! "$timeout" =~ ^[1-9][0-9]*$ || ! "$poll_interval" =~ ^[1-9][0-9]*$ ]]; then
+    die "native readiness timeout and poll interval must be positive integers"
+  fi
+  while true; do
+    status="$(curl --noproxy '*' \
+      --connect-timeout 2 \
+      --max-time 5 \
+      -sS -o /dev/null -w '%{http_code}' \
+      "$ready_url" 2>/dev/null || true)"
+    if [[ "$status" == "200" ]]; then
+      log "native readiness reached 200"
+      return 0
+    fi
+    if ((SECONDS - started >= timeout)); then
+      die "native readiness did not reach 200: ${status:-curl-error}"
+    fi
+    sleep "$poll_interval"
+  done
+}
+
 run_native_migrations() {
   log "running native database migrations"
   (
@@ -720,5 +749,6 @@ install_native_mode() {
   require_native_service_active agent-hub-api.service
   require_native_service_active agent-hub-worker.service
   require_native_service_active agent-hub-litellm.service
+  require_native_readiness
   mark_stage "native-up"
 }

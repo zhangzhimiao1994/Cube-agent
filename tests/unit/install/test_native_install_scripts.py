@@ -811,6 +811,30 @@ def test_native_installer_fails_fast_when_core_services_do_not_become_active() -
     assert start < litellm_check < mark
 
 
+def test_native_installer_waits_for_readiness_before_marking_native_up() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "require_native_readiness" in script
+    assert "AGENT_HUB_NATIVE_READY_TIMEOUT_SECONDS" in script
+    assert "http://127.0.0.1:${AGENT_HUB_API_PORT:-8000}/health/ready" in script
+    assert "native readiness did not reach 200" in script
+    start = script.index("systemctl enable --now agent-hub.target")
+    readiness = script.index("require_native_readiness", start)
+    mark = script.index('mark_stage "native-up"')
+    assert start < readiness < mark
+
+
+def test_verify_release_can_wait_for_readiness_boundary() -> None:
+    script = read("scripts/commands/verify-release.sh")
+
+    assert "--wait-ready" in script
+    assert "AGENT_HUB_VERIFY_READY_TIMEOUT_SECONDS" in script
+    assert "AGENT_HUB_VERIFY_READY_BASE_URL" in script
+    assert "wait_for_release_readiness" in script
+    assert '"$ready_base_url/health/ready"' in script
+    assert "release readiness did not reach 200" in script
+
+
 def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() -> None:
     script = read("scripts/lib/install_native.sh")
     secrets = read("scripts/lib/secrets.sh")

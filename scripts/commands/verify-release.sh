@@ -9,13 +9,21 @@ source "$SCRIPT_DIR/../lib/common.sh"
 install_root="${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
 expect_revision="${AGENT_HUB_EXPECT_REVISION:-}"
 check_services=1
+wait_ready=0
+ready_base_url="${AGENT_HUB_VERIFY_READY_BASE_URL:-http://127.0.0.1:8000}"
+ready_timeout="${AGENT_HUB_VERIFY_READY_TIMEOUT_SECONDS:-120}"
+ready_poll_interval="${AGENT_HUB_VERIFY_READY_POLL_INTERVAL_SECONDS:-2}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/agent-hub verify-release [--install-root dir] [--expect-revision sha] [--skip-services]
+Usage: scripts/agent-hub verify-release [--install-root dir] [--expect-revision sha] [--skip-services] [--wait-ready]
 
 Verifies the native current release pointer, REVISION file, and systemd service
 state when systemctl is available.
+
+Options:
+  --wait-ready      Poll /health/ready until it returns 200. Defaults to
+                    AGENT_HUB_VERIFY_READY_BASE_URL or http://127.0.0.1:8000.
 EOF
 }
 
@@ -52,6 +60,33 @@ require_readable_by_caddy() {
   fi
 }
 
+positive_int() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+wait_for_release_readiness() {
+  local status=""
+  local started="$SECONDS"
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required for --wait-ready"
+  fi
+  while true; do
+    status="$(curl --noproxy '*' \
+      --connect-timeout 2 \
+      --max-time 5 \
+      -sS -o /dev/null -w '%{http_code}' \
+      "$ready_base_url/health/ready" 2>/dev/null || true)"
+    if [[ "$status" == "200" ]]; then
+      printf 'ok: release readiness /health/ready -> %s\n' "$status"
+      return 0
+    fi
+    if ((SECONDS - started >= ready_timeout)); then
+      die "release readiness did not reach 200: ${status:-curl-error}"
+    fi
+    sleep "$ready_poll_interval"
+  done
+}
+
 while (($#)); do
   case "$1" in
     --install-root)
@@ -66,6 +101,10 @@ while (($#)); do
       check_services=0
       shift
       ;;
+    --wait-ready)
+      wait_ready=1
+      shift
+      ;;
     --help)
       usage
       exit 0
@@ -77,6 +116,10 @@ while (($#)); do
       ;;
   esac
 done
+
+if ! positive_int "$ready_timeout" || ! positive_int "$ready_poll_interval"; then
+  die "readiness wait timeout and poll interval must be positive integers"
+fi
 
 release_dir="$install_root/releases"
 current_link="$install_root/current"
@@ -140,4 +183,8 @@ if [[ "$check_services" -eq 1 ]]; then
   else
     printf 'skip: systemctl unavailable\n'
   fi
+fi
+
+if [[ "$wait_ready" -eq 1 ]]; then
+  wait_for_release_readiness
 fi
