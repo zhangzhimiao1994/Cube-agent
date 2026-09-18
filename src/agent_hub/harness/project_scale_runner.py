@@ -690,6 +690,19 @@ def execute_project_scale_plan(
     return ProjectScaleExecutionReport(results=tuple(results))
 
 
+def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | None]:
+    username = os.environ.get("AGENT_HUB_ACCEPTANCE_USERNAME") or os.environ.get(
+        "AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME"
+    )
+    password = os.environ.get("AGENT_HUB_ACCEPTANCE_PASSWORD") or os.environ.get(
+        "AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD"
+    )
+    tenant_id = os.environ.get("AGENT_HUB_ACCEPTANCE_TENANT_ID") or os.environ.get(
+        "AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID"
+    )
+    return username, password, tenant_id
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agent_hub.harness.project_scale_runner",
@@ -731,13 +744,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     bearer_token = os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "")
-    username = os.environ.get("AGENT_HUB_ACCEPTANCE_USERNAME")
-    password = os.environ.get("AGENT_HUB_ACCEPTANCE_PASSWORD")
-    tenant_id = os.environ.get("AGENT_HUB_ACCEPTANCE_TENANT_ID")
+    username, password, tenant_id = _acceptance_credentials_from_env()
     if args.execute and not bearer_token and not (username and password):
         parser.error(
             "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or "
-            "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required for --execute"
+            "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD or "
+            "AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME/PASSWORD is required for --execute"
         )
 
     try:

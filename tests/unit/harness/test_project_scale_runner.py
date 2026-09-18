@@ -16,6 +16,7 @@ from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
     UrllibAcceptanceClient,
+    _acceptance_credentials_from_env,
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
@@ -228,6 +229,17 @@ def test_project_scale_runner_rejects_execute_without_token() -> None:
 
     assert result.returncode == 2
     assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or" in result.stderr
+
+
+def test_project_scale_runner_accepts_harness_login_env_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_HUB_ACCEPTANCE_USERNAME", raising=False)
+    monkeypatch.delenv("AGENT_HUB_ACCEPTANCE_PASSWORD", raising=False)
+    monkeypatch.delenv("AGENT_HUB_ACCEPTANCE_TENANT_ID", raising=False)
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME", "admin")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD", "valid-password")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID", "tenant-1")
+
+    assert _acceptance_credentials_from_env() == ("admin", "valid-password", "tenant-1")
 
 
 def test_project_scale_runner_rejects_unknown_filters() -> None:
