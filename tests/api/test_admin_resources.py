@@ -2447,6 +2447,76 @@ def test_run_detail_response_classifies_tool_failure_without_runtime_noise() -> 
     assert diagnostics[0].wrapped_by == 2
 
 
+def test_run_detail_response_classifies_plugin_tool_failure_message() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.failed",
+                message="Plugin tool unavailable: plugin_package_adapter_unavailable",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="calendar.create_event",
+                tool_call_id="call_plugin",
+                step_id="engineer_step",
+                payload={"failure_kind": "capability_failed"},
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    diagnostic = response.failure_diagnostics[0]
+    assert diagnostic.category == "tool"
+    assert diagnostic.error_stage == "plugin_runtime"
+    assert diagnostic.error_category == "adapter_unavailable"
+    assert diagnostic.error_code == "plugin.adapter_unavailable"
+    assert diagnostic.retryable is False
+    assert "插件适配器" in diagnostic.recommendation
+
+
+def test_run_detail_response_classifies_mcp_tool_failure_message() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.failed",
+                message="MCP tool unavailable",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="browser.open_page",
+                tool_call_id="call_mcp",
+                step_id="engineer_step",
+                payload={"failure_kind": "capability_failed"},
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    diagnostic = response.failure_diagnostics[0]
+    assert diagnostic.category == "tool"
+    assert diagnostic.error_stage == "mcp_runtime"
+    assert diagnostic.error_category == "tool_unavailable"
+    assert diagnostic.error_code == "mcp.tool_unavailable"
+    assert diagnostic.retryable is False
+    assert "MCP" in diagnostic.recommendation
+
+
 def test_run_detail_response_exposes_empty_response_code_and_retryability() -> None:
     response = RunDetailResponse(
         id=uuid4(),

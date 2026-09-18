@@ -10058,22 +10058,49 @@ def _tool_failure_diagnostic(
         f"output_bytes={output_bytes}" if output_bytes else "",
     ]
     wrapper = _tool_failure_wrapper(event, events)
-    error_code = _tool_failure_error_code(failure_kind)
+    message_diagnostic = runtime_failure_diagnostic_from_reason(event.message)
+    message_error_code = _safe_diagnostic_text(message_diagnostic.get("error_code"))
+    use_message_diagnostic = message_error_code not in {None, "runtime.failed"}
+    error_code = (
+        message_error_code
+        if use_message_diagnostic and message_error_code is not None
+        else _tool_failure_error_code(failure_kind)
+    )
+    retryable = error_code != "capability.outcome_uncertain"
+    message_retryable = message_diagnostic.get("retryable")
+    if use_message_diagnostic and type(message_retryable) is bool:
+        retryable = message_retryable
     return FailureDiagnosticResponse(
         category="tool",
         stage=event.kind,
         reason="; ".join(part for part in reason_parts if part),
-        recommendation=_tool_failure_recommendation(failure_kind),
+        recommendation=(
+            _safe_diagnostic_text(message_diagnostic.get("suggested_action"))
+            if use_message_diagnostic
+            else None
+        )
+        or _tool_failure_recommendation(failure_kind),
         sequence=event.sequence,
         actor=event.actor,
         step_id=event.step_id,
         tool_name=event.tool_name,
         tool_call_id=event.tool_call_id,
         failure_kind=failure_kind,
-        error_stage="capability",
-        error_category=failure_kind or "tool_failed",
+        error_stage=(
+            _safe_diagnostic_text(message_diagnostic.get("error_stage"))
+            if use_message_diagnostic
+            else None
+        )
+        or "capability",
+        error_category=(
+            _safe_diagnostic_text(message_diagnostic.get("error_category"))
+            if use_message_diagnostic
+            else None
+        )
+        or failure_kind
+        or "tool_failed",
         error_code=error_code,
-        retryable=error_code != "capability.outcome_uncertain",
+        retryable=retryable,
         wrapped_by=wrapper.sequence if wrapper is not None else None,
     )
 
