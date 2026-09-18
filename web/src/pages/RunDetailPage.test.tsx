@@ -319,6 +319,81 @@ describe("RunDetailPage", () => {
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
   });
 
+  it("shows checkpoint recovery as a clear workbench action without leaking checkpoint internals", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      runtime_recovery_summary: {
+        recovery_count: 1,
+        last_completed_steps: 2,
+        last_total_steps: 5,
+        model_status_counts: { failed: 1, succeeded: 2 },
+        tool_status_counts: { running: 1 },
+        review_artifacts: 1,
+      },
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "runtime.recovered",
+          message: "runtime recovered from checkpoint",
+          summary: null,
+          actor: "main_agent",
+          step_id: "runtime-recovery",
+          artifact: null,
+          payload: {
+            recovery_count: 1,
+            completed_steps: 2,
+            total_steps: 5,
+            model_status_counts: { failed: 1, succeeded: 2 },
+            tool_status_counts: { running: 1 },
+            review_artifacts: 1,
+            checkpoint_id: "checkpoint-00000000-0000-4000-8000-000000000001",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    const recoveryAction = within(workbenchActions).getByRole("button", { name: /断点续跑/ });
+
+    expect(recoveryAction.textContent).toContain("恢复完成");
+    expect(recoveryAction.textContent).toContain("2/5 步");
+    expect(within(drawer).queryByText("checkpoint-00000000-0000-4000-8000-000000000001")).toBeNull();
+
+    await user.click(recoveryAction);
+
+    const detail = drawer.querySelector(".run-process-detail") as HTMLElement;
+    expect(detail.textContent).toContain("断点续跑");
+    expect(detail.textContent).toContain("模型状态：异常 1，已完成 2");
+    expect(detail.textContent).toContain("工具状态：进行中 1");
+    expect(detail.textContent).toContain("审查产物 1");
+    expect(detail.textContent).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
+  });
+
   it("compresses long run detail workbench action lists until expanded", async () => {
     const user = userEvent.setup();
     const longActionRun: RunDetail = {

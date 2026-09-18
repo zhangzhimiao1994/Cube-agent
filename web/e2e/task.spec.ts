@@ -649,6 +649,8 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
   const detail = page.getByRole("dialog", { name: "Agent 工作席详情" });
   await expect(detail).toContainText("陆微");
   await expect(detail).toContainText("工程师 · vibe-engineer");
+  await expect(detail).not.toContainText("工程师开始创建最小项目。");
+  await detail.getByRole("button", { name: /打开陆微工作调度/ }).click();
   await expect(detail).toContainText("工程师开始创建最小项目。");
   const layout = await page.evaluate(() => ({
     bodyScrollWidth: document.body.scrollWidth,

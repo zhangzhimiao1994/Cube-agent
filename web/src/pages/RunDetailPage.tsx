@@ -325,6 +325,7 @@ const DETAIL_EVENT_KIND_LABELS: Record<string, string> = {
   "model.text_delta": "模型输出",
   "observer.notice": "调度观察",
   "review.completed": "审查完成",
+  "runtime.recovered": "恢复完成",
   "runtime.failed": "运行失败",
   "step.completed": "执行完成",
   "step.failed": "执行失败",
@@ -603,6 +604,9 @@ function formatDetailPayloadDisplayValue(key: string, value: unknown): string {
   if (key === "failure_kind") {
     return repairFailureKindLabel(formatDetailValue(value));
   }
+  if (key === "model_status_counts" || key === "tool_status_counts") {
+    return runtimeRecoveryPayloadStatusLabel(value);
+  }
   if (key === "recovery_strategy" || key === "orchestration_recovery_hint") {
     return repairRecoveryStrategyLabel(formatDetailValue(value));
   }
@@ -617,6 +621,27 @@ function formatDetailPayloadDisplayValue(key: string, value: unknown): string {
     return isPayloadFlagTrue(value) ? "自动执行" : "等待确认";
   }
   return formatDetailValue(value);
+}
+
+function runtimeRecoveryPayloadStatusLabel(value: unknown) {
+  const counts = objectPayload(value);
+  if (!counts) return "";
+  return runtimeRecoveryStatusParts(counts as Record<string, number>, TOOL_STATUS_LABELS).join("，");
+}
+
+function runtimeRecoveryEventSummary(event: RunEvent) {
+  const completedSteps = payloadNumber(event.payload, "completed_steps") ?? payloadNumber(event.payload, "last_completed_steps") ?? 0;
+  const totalSteps = payloadNumber(event.payload, "total_steps") ?? payloadNumber(event.payload, "last_total_steps") ?? 0;
+  const modelStatus = runtimeRecoveryPayloadStatusLabel(event.payload.model_status_counts);
+  const toolStatus = runtimeRecoveryPayloadStatusLabel(event.payload.tool_status_counts);
+  const reviewArtifacts = payloadNumber(event.payload, "review_artifacts") ?? 0;
+  const headline = totalSteps > 0 ? `恢复完成：${completedSteps}/${totalSteps} 步` : "恢复完成";
+  const detailParts = [
+    modelStatus ? `模型状态：${modelStatus}` : "",
+    toolStatus ? `工具状态：${toolStatus}` : "",
+    reviewArtifacts > 0 ? `审查产物 ${reviewArtifacts}` : "",
+  ].filter(Boolean);
+  return detailParts.length > 0 ? `${headline}。${detailParts.join("；")}` : headline;
 }
 
 function conciseProcessText(value: string, fallback: string) {
@@ -660,13 +685,31 @@ function detailPayloadLabel(key: string) {
     operation_kind: "操作类别",
     failure_kind: "失败类型",
     replay_safe: "可回放",
+    recovery_count: "续跑次数",
+    completed_steps: "已完成步骤",
+    total_steps: "总步骤",
+    model_status_counts: "模型状态",
+    tool_status_counts: "工具状态",
+    review_artifacts: "审查产物",
   };
   return labels[key] ?? key.replace(/_/g, " ");
 }
 
 function isSensitivePayloadKey(key: string) {
   const normalized = key.trim().toLowerCase();
-  if (["api_base", "lease_id", "quota_scope_id", "capacity_scope_id", "model_execution_plan", "reservation_id"].includes(normalized)) {
+  if (
+    [
+      "api_base",
+      "checkpoint",
+      "checkpoint_id",
+      "checkpoint_state",
+      "lease_id",
+      "quota_scope_id",
+      "capacity_scope_id",
+      "model_execution_plan",
+      "reservation_id",
+    ].includes(normalized)
+  ) {
     return true;
   }
   return /api[_-]?key|secret|token|password|credential/i.test(key);
@@ -818,6 +861,7 @@ function detailTimelineItems(events: RunEvent[]): DetailTimelineItem[] {
 }
 
 function detailProcessLabel(event: RunEvent) {
+  if (event.kind === "runtime.recovered") return "断点续跑";
   if (event.kind.startsWith("tool.")) return "工具动作";
   if (event.kind.startsWith("model.")) return "模型过程";
   if (event.kind.startsWith("harness.")) return "Harness";
@@ -972,6 +1016,7 @@ function isGenericEventMessage(event: RunEvent) {
 
 function safeDetailEventSummary(event: RunEvent) {
   if (event.summary?.trim()) return conciseProcessText(event.summary, displayDetailEventKind(event.kind));
+  if (event.kind === "runtime.recovered") return runtimeRecoveryEventSummary(event);
   if (event.kind === "artifact.created") {
     const artifactTitle = event.artifact?.title?.trim();
     if (artifactTitle) return `生成了${artifactTitle}`;
@@ -2007,6 +2052,7 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
 function DetailProcessCardBody({ card }: { card: DetailProcessCard }) {
   return (
     <article>
+      <strong>{card.label}</strong>
       <p>{card.detail}</p>
       {card.artifact ? (
         <div className="artifact-download-list" aria-label="中间产物">
