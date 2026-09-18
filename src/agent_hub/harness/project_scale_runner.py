@@ -748,8 +748,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.execute and not bearer_token and not (username and password):
         parser.error(
             "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or "
-            "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD or "
-            "AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME/PASSWORD is required for --execute"
+            "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required for --execute "
+            "(AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME/PASSWORD is also accepted)"
         )
 
     try:

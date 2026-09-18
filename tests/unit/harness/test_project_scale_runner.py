@@ -228,7 +228,11 @@ def test_project_scale_runner_rejects_execute_without_token() -> None:
     result = run_project_scale_runner("--execute", "--scale", "small", "--flow", "direct")
 
     assert result.returncode == 2
-    assert "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or" in result.stderr
+    assert (
+        "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or "
+        "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required for --execute"
+    ) in result.stderr
+    assert "AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME/PASSWORD" in result.stderr
 
 
 def test_project_scale_runner_accepts_harness_login_env_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
