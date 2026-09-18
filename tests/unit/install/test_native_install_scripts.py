@@ -778,7 +778,12 @@ def test_install_verification_uses_public_url_for_docker_mode() -> None:
     assert ".litellm-venv/bin/litellm" in verify
     assert "litellm.proxy.proxy_server" in verify
     assert 'verify_url "$base_url/health/live"' in verify
-    assert 'verify_url "$base_url/health/ready"' in verify
+    assert "wait_for_installation_readiness" in verify
+    assert "AGENT_HUB_INSTALL_READY_TIMEOUT_SECONDS" in verify
+    assert "AGENT_HUB_INSTALL_READY_POLL_INTERVAL_SECONDS" in verify
+    assert '"$base_url/health/ready"' in verify
+    assert "readiness did not reach 200" in verify
+    assert 'verify_url "$base_url/health/ready"' not in verify
 
 
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:

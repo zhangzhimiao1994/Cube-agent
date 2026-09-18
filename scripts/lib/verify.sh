@@ -9,6 +9,37 @@ verify_url() {
   fi
 }
 
+wait_for_installation_readiness() {
+  local base_url="$1"
+  local timeout="${AGENT_HUB_INSTALL_READY_TIMEOUT_SECONDS:-120}"
+  local poll_interval="${AGENT_HUB_INSTALL_READY_POLL_INTERVAL_SECONDS:-2}"
+  local started="$SECONDS"
+  local status=""
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl unavailable; skipping $base_url/health/ready"
+    return 0
+  fi
+  if [[ ! "$timeout" =~ ^[1-9][0-9]*$ || ! "$poll_interval" =~ ^[1-9][0-9]*$ ]]; then
+    warn "readiness wait timeout and poll interval must be positive integers"
+    return 1
+  fi
+  while true; do
+    status="$(curl --noproxy '*' \
+      --connect-timeout 2 \
+      --max-time 5 \
+      -sS -o /dev/null -w '%{http_code}' \
+      "$base_url/health/ready" 2>/dev/null || true)"
+    if [[ "$status" == "200" ]]; then
+      return 0
+    fi
+    if ((SECONDS - started >= timeout)); then
+      warn "readiness did not reach 200 at $base_url/health/ready: ${status:-curl-error}"
+      return 1
+    fi
+    sleep "$poll_interval"
+  done
+}
+
 installation_health_base_url() {
   if [[ "${MODE:-}" == "docker" ]]; then
     local public_url
@@ -93,5 +124,5 @@ verify_installation() {
   verify_native_litellm_proxy
   verify_native_agent_hub_python_dependencies
   verify_url "$base_url/health/live" || warn "live health not reachable yet at $base_url"
-  verify_url "$base_url/health/ready" || warn "readiness not reachable yet at $base_url; run scripts/agent-hub doctor"
+  wait_for_installation_readiness "$base_url" || warn "readiness not reachable yet at $base_url; run scripts/agent-hub doctor"
 }
