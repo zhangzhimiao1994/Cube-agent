@@ -540,9 +540,6 @@ class RuntimePluginService:
                 )
             )
         except Exception:  # noqa: BLE001 - plugin runtime context must fail closed.
-            if target_tenant_id not in self._plugins_by_tenant:
-                self._plugins_by_tenant[target_tenant_id] = ()
-                self._plugins_loaded_at[target_tenant_id] = self._monotonic()
             return
         self._plugins_loaded_at[target_tenant_id] = self._monotonic()
 

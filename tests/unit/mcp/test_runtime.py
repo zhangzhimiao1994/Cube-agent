@@ -450,3 +450,35 @@ async def test_runtime_mcp_reload_failure_preserves_loaded_tenant_service() -> N
     assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
     assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
     assert result == {"answer": "cached"}
+
+
+async def test_runtime_mcp_invocation_retries_after_initial_reload_failure() -> None:
+    admin_service = FailingOnceTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    client = InMemoryMcpClient(
+        tools=(McpToolSchema(name="web_search"),),
+        responses={"web_search": McpInvocationResult(content={"answer": "retried"})},
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: client,
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="runtime_planning",
+        name="search.web_search",
+        arguments={"query": "retry"},
+        idempotency_key="mcp_initial_retry",
+    )
+
+    assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert result == {"answer": "retried"}

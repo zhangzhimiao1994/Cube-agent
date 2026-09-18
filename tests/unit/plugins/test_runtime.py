@@ -3278,6 +3278,43 @@ async def test_runtime_plugin_reload_failure_preserves_loaded_tenant_plugins() -
     }
 
 
+async def test_runtime_plugin_invocation_retries_after_initial_reload_failure() -> None:
+    admin_service = FailingOnceTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    adapter = RecordingPluginAdapter(calls=[])
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="tenant-admin",
+        name="tenant_calendar.create_event",
+        arguments={"title": "retry"},
+        idempotency_key="plugin_initial_retry",
+    )
+
+    assert admin_service.tenant_ids == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert result == {
+        "ok": True,
+        "plugin_id": "tenant-calendar",
+        "capability_id": "tenant_calendar.create_event",
+    }
+
+
 async def test_runtime_plugin_manifest_includes_capability_schemas() -> None:
     admin_service = FakeAdminService(
         (

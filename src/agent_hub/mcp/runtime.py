@@ -93,7 +93,6 @@ class RuntimeMcpService:
                 tenant_id=target_tenant_id,
             )
         except Exception:  # noqa: BLE001 - live MCP planning context is optional.
-            self._services_by_tenant.setdefault(target_tenant_id, None)
             return
         definitions = _server_definitions(target_tenant_id, configured_servers)
         if not definitions:
@@ -119,7 +118,6 @@ class RuntimeMcpService:
         try:
             await service.start()
         except Exception:  # noqa: BLE001 - a broken MCP server must not break startup.
-            self._services_by_tenant.setdefault(target_tenant_id, None)
             return
         self._services_by_tenant[target_tenant_id] = service
 
