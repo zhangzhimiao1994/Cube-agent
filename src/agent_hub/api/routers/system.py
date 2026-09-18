@@ -58,14 +58,14 @@ async def health_ready(request: Request) -> HealthResponse | JSONResponse:
         statuses = {}
         for name, task in tasks.items():
             if task.cancelled():
-                statuses[name] = "timeout"
+                statuses[name] = _pending_readiness_status(name)
             elif task.done():
                 try:
                     statuses[name] = "failed" if task.exception() else "ok"
                 except asyncio.CancelledError:
-                    statuses[name] = "timeout"
+                    statuses[name] = _pending_readiness_status(name)
             else:
-                statuses[name] = "timeout"
+                statuses[name] = _pending_readiness_status(name)
     finally:
         for task in tasks.values():
             if not task.done():
@@ -112,3 +112,9 @@ def _readiness_checks(request: Request) -> dict[str, ReadinessCheck] | None:
     if isinstance(extra, dict):
         checks.update(extra)
     return checks
+
+
+def _pending_readiness_status(name: str) -> str:
+    if name in {"database", "redis"}:
+        return "timeout"
+    return "starting"

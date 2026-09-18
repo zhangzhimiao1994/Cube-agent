@@ -162,6 +162,33 @@ async def test_ready_timeout_cancels_and_reaps_both_probes() -> None:
     assert redis.task is not None and redis.task.done()
 
 
+async def test_ready_reports_starting_for_extra_dependency_timeout() -> None:
+    database = Probe()
+    redis = Probe()
+    litellm = HangingProbe()
+    app = create_app(
+        database_probe=database,
+        redis_probe=redis,
+        readiness_timeout_seconds=0.01,
+        auth_service=object(),
+        config_service=object(),
+        rate_limiter=object(),
+    )
+    app.state.extra_readiness_checks = {"litellm": litellm}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"] == {
+        "database": "ok",
+        "redis": "ok",
+        "litellm": "starting",
+    }
+    assert litellm.cancelled.is_set()
+
+
 async def test_cancelling_ready_request_cancels_and_reaps_both_probes() -> None:
     database = HangingProbe()
     redis = HangingProbe()
