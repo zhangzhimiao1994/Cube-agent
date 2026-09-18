@@ -91,6 +91,75 @@ printf 'mode=%s keep=%s release_dir=%s current=%s\n' \
 declare -A protected=()
 protected["$(basename -- "$current_real")"]="current"
 
+protect_release_path() {
+  local release_path="$1"
+  local reason="$2"
+  local release_relative
+  local release_name
+  local release_real
+
+  case "$release_path" in
+    "$release_dir_real"/*)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  release_relative="${release_path#"$release_dir_real"/}"
+  release_name="${release_relative%%/*}"
+  release_real="$release_dir_real/$release_name"
+  if [[ -d "$release_real" && -z "${protected[$release_name]:-}" ]]; then
+    protected["$release_name"]="$reason"
+  fi
+}
+
+protect_runtime_release_chain() {
+  local runtime_name="$1"
+  local runtime_path="$2"
+  local runtime_cursor="$runtime_path"
+  local link_target
+  local link_target_dir
+  local link_target_base
+  local link_target_parent_real
+  local link_relative
+  local link_release_name
+  local link_release_real
+  local hop=0
+
+  while [[ -L "$runtime_cursor" ]]; do
+    ((hop += 1))
+    ((hop <= 16)) || return 0
+
+    link_target="$(readlink -- "$runtime_cursor")" || return 0
+    case "$link_target" in
+      /*)
+        ;;
+      *)
+        link_target="$(dirname -- "$runtime_cursor")/$link_target"
+        ;;
+    esac
+
+    link_target_dir="$(dirname -- "$link_target")"
+    link_target_base="$(basename -- "$link_target")"
+    link_target_parent_real="$(cd -P -- "$link_target_dir" 2>/dev/null && pwd -P)" || return 0
+    link_target="$link_target_parent_real/$link_target_base"
+    case "$link_target" in
+      "$release_dir_real"/*)
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+
+    link_relative="${link_target#"$release_dir_real"/}"
+    link_release_name="${link_relative%%/*}"
+    link_release_real="$release_dir_real/$link_release_name"
+    protect_release_path "$link_release_real" "current-runtime-link:$runtime_name"
+    runtime_cursor="$link_target"
+  done
+}
+
 protect_runtime_release() {
   local runtime_name="$1"
   local runtime_path="$current_real/$runtime_name"
@@ -98,10 +167,13 @@ protect_runtime_release() {
   local runtime_relative
   local runtime_release_name
   local runtime_release_real
+  local runtime_release_reason
 
   if [[ ! -e "$runtime_path" && ! -L "$runtime_path" ]]; then
     return 0
   fi
+
+  protect_runtime_release_chain "$runtime_name" "$runtime_path"
 
   runtime_real="$(readlink -f -- "$runtime_path")"
   case "$runtime_real" in
@@ -115,7 +187,8 @@ protect_runtime_release() {
   runtime_relative="${runtime_real#"$release_dir_real"/}"
   runtime_release_name="${runtime_relative%%/*}"
   runtime_release_real="$release_dir_real/$runtime_release_name"
-  if [[ -d "$runtime_release_real" && -z "${protected[$runtime_release_name]:-}" ]]; then
+  runtime_release_reason="${protected[$runtime_release_name]:-}"
+  if [[ -d "$runtime_release_real" && ( -z "$runtime_release_reason" || "$runtime_release_reason" == current-runtime-link:* ) ]]; then
     protected["$(basename -- "$runtime_release_real")"]="current-runtime:$runtime_name"
   fi
 }

@@ -63,6 +63,16 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     assert 'rm -rf -- "$release_path"' in command
 
 
+def test_release_pruner_protects_runtime_symlink_chain_releases() -> None:
+    command = read("scripts/commands/prune-releases.sh")
+
+    assert "protect_runtime_release_chain" in command
+    assert 'runtime_cursor="$runtime_path"' in command
+    assert 'while [[ -L "$runtime_cursor" ]]' in command
+    assert 'protect_release_path "$link_release_real" "current-runtime-link:$runtime_name"' in command
+    assert 'runtime_cursor="$link_target"' in command
+
+
 def test_release_verifier_is_registered_and_checks_current_revision() -> None:
     launcher = read("scripts/agent-hub")
     command = read("scripts/commands/verify-release.sh")
