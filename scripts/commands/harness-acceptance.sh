@@ -1534,6 +1534,7 @@ from agent_hub.runs.self_repair import (
 )
 from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
+from agent_hub.runtime.self_repair_context import self_repair_recovery_plan_payload
 
 
 def require(value, label):
@@ -1567,6 +1568,35 @@ def classify(events, expected_category, expected_strategy):
     context = repair_context_from_proposal(proposal)
     require(context.get("failure_kind") == expected_category, f"{expected_category} context kind")
     require(context.get("recovery_strategy") == expected_strategy, f"{expected_category} context strategy")
+    expected_runtime_scope = {
+        "plugin_runtime_unavailable": "plugin_runtime",
+        "mcp_runtime_unavailable": "mcp_runtime",
+    }.get(expected_category)
+    if expected_runtime_scope is not None:
+        recovery_plan = self_repair_recovery_plan_payload(
+            {
+                "source": "self_repair",
+                "self_repair_accepted": True,
+                "self_repair_context": context,
+            }
+        )
+        require(recovery_plan is not None, f"{expected_category} recovery plan")
+        require(
+            recovery_plan.get("recovery_strategy") == expected_strategy,
+            f"{expected_category} recovery plan strategy",
+        )
+        require(
+            recovery_plan.get("replan_scope") == expected_runtime_scope,
+            f"{expected_category} recovery plan scope",
+        )
+        require(
+            recovery_plan.get("refresh_runtime_capabilities") is True,
+            f"{expected_category} recovery plan refresh",
+        )
+        require(
+            recovery_plan.get("retry_failed_capability_only") is True,
+            f"{expected_category} recovery plan retry scope",
+        )
     serialized = repr({"proposal": proposal, "context": context})
     require("secret://token" not in serialized, f"{expected_category} secret redaction")
     require("Authorization: Bearer" not in serialized, f"{expected_category} auth redaction")

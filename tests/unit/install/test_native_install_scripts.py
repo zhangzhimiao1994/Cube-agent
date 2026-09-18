@@ -449,6 +449,7 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "RunMonitor" in command
     assert "SelfRepairPolicy" in command
     assert "repair_context_from_proposal" in command
+    assert "self_repair_recovery_plan_payload" in command
     assert '"model_capacity_pressure"' in command
     assert '"reschedule_or_reassign_model"' in command
     assert '"switch_to_available_model_and_retry"' in command
@@ -463,6 +464,10 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"requires_approval"' in command
     assert '"automatic_execution"' in command
     assert '"plugin.backend_unavailable"' in command
+    assert '"refresh_runtime_capabilities"' in command
+    assert '"retry_failed_capability_only"' in command
+    assert '"plugin_runtime"' in command
+    assert '"mcp_runtime"' in command
     assert '"manual_review_plugin_adapter"' in command
     assert '"mcp.server_timeout"' in command
     assert '"mcp.server_unavailable"' in command
