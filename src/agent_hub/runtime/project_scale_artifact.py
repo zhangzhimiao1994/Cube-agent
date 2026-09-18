@@ -352,6 +352,11 @@ def project_scale_artifact_plugin_contract() -> Mapping[str, JsonValue]:
         "policy_boundary_checked": True,
         "sandbox_profile_checked": True,
         "failure_recovery_checked": True,
+        "manifest_ref": "project-scale-plugin-manifest",
+        "adapter_ref": "project.generate_zip",
+        "policy_ref": "fail-closed plugin policy",
+        "sandbox_ref": "workspace_write",
+        "recovery_ref": "install/start failure recovery",
     }
 
 

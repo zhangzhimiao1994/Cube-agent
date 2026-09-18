@@ -504,6 +504,11 @@ async def test_project_scale_plugin_preseed_records_plugin_contract_evidence() -
         "policy_boundary_checked": True,
         "sandbox_profile_checked": True,
         "failure_recovery_checked": True,
+        "manifest_ref": "project-scale-plugin-manifest",
+        "adapter_ref": "project.generate_zip",
+        "policy_ref": "fail-closed plugin policy",
+        "sandbox_ref": "workspace_write",
+        "recovery_ref": "install/start failure recovery",
     }
     discussion = next(
         event

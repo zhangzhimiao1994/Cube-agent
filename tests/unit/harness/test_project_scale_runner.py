@@ -21,6 +21,7 @@ from agent_hub.harness.project_scale_runner import (
     _discussion_trace_payload_passes,
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
+    _plugin_contract_payload_passes,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
@@ -165,6 +166,41 @@ def test_deliverable_repair_trace_rejects_generic_keyword_text() -> None:
 )
 def test_deliverable_repair_trace_accepts_explicit_event_markers(event: object) -> None:
     assert _has_deliverable_repair_trace([event]) is True
+
+
+def test_plugin_contract_payload_rejects_boolean_only_shell() -> None:
+    assert (
+        _plugin_contract_payload_passes(
+            {
+                "manifest_discovered": True,
+                "adapter_contract_checked": True,
+                "policy_boundary_checked": True,
+                "sandbox_profile_checked": True,
+                "failure_recovery_checked": True,
+            }
+        )
+        is False
+    )
+
+
+def test_plugin_contract_payload_accepts_auditable_contract_details() -> None:
+    assert (
+        _plugin_contract_payload_passes(
+            {
+                "manifest_discovered": True,
+                "adapter_contract_checked": True,
+                "policy_boundary_checked": True,
+                "sandbox_profile_checked": True,
+                "failure_recovery_checked": True,
+                "manifest_ref": "project-scale-plugin-manifest",
+                "adapter_ref": "project.generate_zip",
+                "policy_ref": "fail-closed plugin policy",
+                "sandbox_ref": "workspace_write",
+                "recovery_ref": "install/start failure recovery",
+            }
+        )
+        is True
+    )
 
 
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:
@@ -1580,6 +1616,11 @@ class FakeAcceptanceClient:
                     "policy_boundary_checked": True,
                     "sandbox_profile_checked": True,
                     "failure_recovery_checked": True,
+                    "manifest_ref": "project-scale-plugin-manifest",
+                    "adapter_ref": "project.generate_zip",
+                    "policy_ref": "fail-closed plugin policy",
+                    "sandbox_ref": "workspace_write",
+                    "recovery_ref": "install/start failure recovery",
                 }
             if (
                 path == f"/api/v1/runs/{self.run_id}/details"

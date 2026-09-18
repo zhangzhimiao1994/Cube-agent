@@ -62,6 +62,13 @@ _PLUGIN_CONTRACT_KEYS = frozenset(
         "failure_recovery_checked",
     }
 )
+_PLUGIN_CONTRACT_DETAIL_KEYS = (
+    ("manifest_ref", "manifest_name", "manifest_path", "manifest"),
+    ("adapter_ref", "adapter_name", "adapter_kind", "adapter_contract"),
+    ("policy_ref", "policy_boundary", "capability_policy", "policy"),
+    ("sandbox_ref", "sandbox_profile", "sandbox_policy", "sandbox"),
+    ("recovery_ref", "failure_modes", "recovery_plan", "failure_recovery"),
+)
 _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
     "plugin_contract",
     "plugin_capability_contract",
@@ -1655,7 +1662,9 @@ def _discussion_trace_payload_passes(value: object) -> bool:
 def _plugin_contract_payload_passes(value: object) -> bool:
     if not isinstance(value, Mapping):
         return False
-    return all(value.get(key) is True for key in _PLUGIN_CONTRACT_KEYS)
+    return all(value.get(key) is True for key in _PLUGIN_CONTRACT_KEYS) and all(
+        _has_present_field(value, keys) for keys in _PLUGIN_CONTRACT_DETAIL_KEYS
+    )
 
 
 def _non_empty_sequence(value: object) -> bool:
