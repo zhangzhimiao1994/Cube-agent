@@ -902,6 +902,40 @@ async def test_ultra_large_project_requires_preflight_approval_before_queueing()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "这个需求是超大型任务，需要先做系统架构、拆解阶段，再构建到生产结果。",
+        "我要做一个大项目，从架构搭建、需求拆解到最终生产结果都要完成。",
+        "需要构建一个大型系统，先做系统设计和分阶段实现，再给出生产结果。",
+    ],
+)
+async def test_large_project_synonyms_require_preflight_approval(message: str) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message=message,
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.clarification_reason == "project_preflight_requires_user_approval"
+    assert submitted.project_preflight_proposal is not None
+    assert submitted.project_preflight_proposal["capability"] == "project.preflight_architecture"
+    assert repository.outbox == []
+
+
+@pytest.mark.asyncio
 async def test_project_preflight_approval_enqueues_the_planned_run() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()

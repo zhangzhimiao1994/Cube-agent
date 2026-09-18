@@ -11832,8 +11832,50 @@ def _schedule_proposal(
     proposal = routing_decision.get("schedule_proposal")
     if not isinstance(proposal, dict):
         return None
-    safe = _safe_proposal_json_mapping(proposal)
+    safe: dict[str, JsonValue] = {}
+    for key in _SCHEDULE_PROPOSAL_FIELDS:
+        if key not in proposal:
+            continue
+        converted, accepted = _safe_schedule_proposal_value(proposal[key])
+        if accepted:
+            safe[key] = converted
+    metadata = proposal.get("metadata")
+    if isinstance(metadata, dict):
+        safe_metadata: dict[str, JsonValue] = {}
+        for key in _SCHEDULE_PROPOSAL_METADATA_FIELDS:
+            if key not in metadata:
+                continue
+            converted, accepted = _safe_schedule_proposal_value(metadata[key])
+            if accepted:
+                safe_metadata[key] = converted
+        if safe_metadata:
+            safe["metadata"] = safe_metadata
     return safe or None
+
+
+_SCHEDULE_PROPOSAL_FIELDS = (
+    "name",
+    "message",
+    "mode",
+    "workflow_id",
+    "kind",
+    "timezone",
+    "misfire_policy",
+    "budget",
+    "run_at",
+    "cron",
+    "summary",
+)
+_SCHEDULE_PROPOSAL_METADATA_FIELDS = ("source", "requires_user_confirmation")
+
+
+def _safe_schedule_proposal_value(value: object) -> tuple[JsonValue, bool]:
+    if value is None:
+        return None, True
+    converted = _safe_proposal_json_value(value)
+    if converted is None:
+        return None, False
+    return converted, True
 
 
 def _safe_proposal_json_mapping(value: dict[object, object]) -> dict[str, JsonValue]:

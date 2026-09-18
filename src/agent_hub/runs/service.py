@@ -3046,12 +3046,20 @@ def _message_suggests_ultra_large_project(message: str) -> bool:
     text = message.casefold()
     scale_markers = (
         "超大型项目",
+        "超大型任务",
         "大型项目",
+        "大型任务",
+        "大型系统",
+        "大项目",
         "完整项目",
+        "完整系统",
         "整个项目",
         "production result",
         "large project",
+        "large system",
         "full project",
+        "full system",
+        "mega project",
     )
     architecture_markers = (
         "架构",

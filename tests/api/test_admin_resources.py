@@ -62,6 +62,7 @@ from agent_hub.api.routers.admin import (
     _repair_proposal,
     _routing_details,
     _run_debug_from_detail,
+    _schedule_proposal,
 )
 from agent_hub.app import _submit_scheduled_task, create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
@@ -2645,6 +2646,51 @@ def test_repair_proposal_drops_unknown_recovery_metadata_values() -> None:
     assert "orchestration_recovery_hint" not in proposal
     assert "secret://model-provider-token" not in serialized
     assert "dump_private_context" not in serialized
+
+
+def test_schedule_proposal_projects_allowlisted_fields_only() -> None:
+    proposal = _schedule_proposal(
+        {
+            "schedule_proposal": {
+                "name": "chat-daily-schedule",
+                "message": "创建计划任务：每天9点提醒我填写日报",
+                "mode": "dispatch",
+                "workflow_id": "scheduled_task",
+                "kind": "cron",
+                "timezone": "Asia/Shanghai",
+                "misfire_policy": "fire_once",
+                "budget": 16384,
+                "run_at": None,
+                "cron": "0 9 * * *",
+                "summary": "每天 09:00 执行。",
+                "metadata": {
+                    "source": "chat_schedule_proposal",
+                    "requires_user_confirmation": "true",
+                    "internal_token": "do-not-project",
+                },
+                "unsafe": "do-not-project",
+                "debug": {"operator_notes": "do-not-project"},
+            }
+        }
+    )
+
+    assert proposal == {
+        "name": "chat-daily-schedule",
+        "message": "创建计划任务：每天9点提醒我填写日报",
+        "mode": "dispatch",
+        "workflow_id": "scheduled_task",
+        "kind": "cron",
+        "timezone": "Asia/Shanghai",
+        "misfire_policy": "fire_once",
+        "budget": 16384,
+        "run_at": None,
+        "cron": "0 9 * * *",
+        "summary": "每天 09:00 执行。",
+        "metadata": {
+            "source": "chat_schedule_proposal",
+            "requires_user_confirmation": "true",
+        },
+    }
 
 
 def test_run_detail_response_exposes_tool_lifecycle_without_raw_payloads() -> None:
