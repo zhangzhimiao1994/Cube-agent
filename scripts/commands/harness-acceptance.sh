@@ -3299,6 +3299,9 @@ PY
       -u AGENT_HUB_ACCEPTANCE_USERNAME \
       -u AGENT_HUB_ACCEPTANCE_PASSWORD \
       -u AGENT_HUB_ACCEPTANCE_TENANT_ID \
+      -u AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME \
+      -u AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD \
+      -u AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID \
       PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
       "$python_bin" -m agent_hub.harness.project_scale_runner \
       --execute --scale small --flow direct --wait-seconds 1 --poll-interval 0 --json 2>&1

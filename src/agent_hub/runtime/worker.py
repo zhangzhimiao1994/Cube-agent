@@ -225,6 +225,11 @@ async def run_worker_loop(
             run_id = await queue.get()
             try:
                 await service.execute(run_id)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
+                _LOGGER.exception("run_worker_execute_cancelled run_id=%s", run_id)
             except Exception as error:
                 _LOGGER.exception(
                     "run_worker_execute_failed run_id=%s error_type=%s",

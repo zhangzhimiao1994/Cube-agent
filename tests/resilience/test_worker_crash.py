@@ -41,6 +41,28 @@ def test_worker_publishes_pending_outbox_and_executes_enqueued_runs() -> None:
     asyncio.run(scenario())
 
 
+def test_worker_loop_survives_run_execution_cancelled_error() -> None:
+    async def scenario() -> None:
+        run_id = uuid4()
+        queue = LocalRunQueue()
+        service = CancelledRunService(queue, run_id)
+        stop = asyncio.Event()
+
+        await run_worker_loop(
+            service,
+            queue,
+            stop=stop,
+            poll_interval_seconds=0.01,
+            batch_limit=10,
+            max_idle_polls=2,
+        )
+
+        assert service.executed_run_ids == [run_id]
+        assert queue.empty()
+
+    asyncio.run(scenario())
+
+
 def test_worker_recovers_after_publish_pending_failure() -> None:
     async def scenario() -> None:
         run_id = uuid4()
@@ -202,6 +224,12 @@ class FailingMcpRuntime(RecordingMcpRuntime):
     async def reload(self) -> None:
         self.reloads += 1
         raise RuntimeError("raw mcp reload failure")
+
+
+class CancelledRunService(RecordingRunService):
+    async def execute(self, run_id: UUID) -> None:
+        self.executed_run_ids.append(run_id)
+        raise asyncio.CancelledError("runtime run cancellation")
 
 
 class RecordingPluginRuntime:
