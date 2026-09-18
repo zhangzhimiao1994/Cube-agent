@@ -245,6 +245,7 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     "runtime.started": "开始执行本次对话",
     "runtime.completed": "完成本次对话",
     "runtime.failed": "本次对话中断",
+    "runtime.recovered": "恢复完成",
     "harness.started": "Harness 已启动",
     "message.created": actor ? `${actor} 输出阶段消息` : "输出阶段消息",
     "artifact.created": actor ? `${actor} 产出阶段内容` : "产出阶段内容",
@@ -289,6 +290,7 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     "runtime.started": "运行时已启动，正在按模式执行。",
     "runtime.completed": "运行完成，已汇总结果。",
     "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
+    "runtime.recovered": "已从检查点恢复并继续执行。",
     "harness.started": "Harness 已完成模型、能力和策略选择，运行进入工程执行面。",
     "message.created": readableMessage ?? "运行过程中产生了一条可公开消息。",
     "artifact.created": "已生成一个可查看的结果或中间产物。",
@@ -569,6 +571,12 @@ function eventPayloadLabel(key: string) {
     remediation_action: "修复动作",
     self_repair: "自修复",
     upstream_model: "上游模型",
+    recovery_count: "续跑次数",
+    completed_steps: "已完成步骤",
+    total_steps: "总步骤",
+    model_status_counts: "模型状态",
+    tool_status_counts: "工具状态",
+    review_artifacts: "审查产物",
   };
   if (labels[key]) return labels[key];
   if (key.endsWith("_opinion")) {
@@ -615,6 +623,12 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
     "main_agent_judgement",
     "main_agent_judgment",
     "final_decision",
+    "recovery_count",
+    "completed_steps",
+    "total_steps",
+    "model_status_counts",
+    "tool_status_counts",
+    "review_artifacts",
   ];
   return Object.entries(payload).sort(([left], [right]) => {
     const leftIndex = priority.indexOf(left);
@@ -643,6 +657,48 @@ function modelDeltaEventsCanMerge(left: RunEvent, right: RunEvent) {
 function numericPayloadValue(event: RunEvent, key: string) {
   const value = event.payload[key];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+const RUNTIME_RECOVERY_STATUS_LABELS: Record<string, string> = {
+  completed: "已完成",
+  failed: "异常",
+  running: "进行中",
+  started: "进行中",
+  succeeded: "已完成",
+};
+
+function numericPayloadRecordValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function runtimeRecoveryPayloadStatusLabel(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  return Object.entries(value as Record<string, unknown>)
+    .flatMap(([status, count]) => {
+      if (typeof count !== "number" || !Number.isFinite(count) || count <= 0) return [];
+      return [`${RUNTIME_RECOVERY_STATUS_LABELS[status] ?? status} ${count}`];
+    })
+    .join("，");
+}
+
+function runtimeRecoveryEventSummary(event: RunEvent) {
+  const completedSteps =
+    numericPayloadRecordValue(event.payload, "completed_steps") ||
+    numericPayloadRecordValue(event.payload, "last_completed_steps");
+  const totalSteps =
+    numericPayloadRecordValue(event.payload, "total_steps") ||
+    numericPayloadRecordValue(event.payload, "last_total_steps");
+  const modelStatus = runtimeRecoveryPayloadStatusLabel(event.payload.model_status_counts);
+  const toolStatus = runtimeRecoveryPayloadStatusLabel(event.payload.tool_status_counts);
+  const reviewArtifacts = numericPayloadRecordValue(event.payload, "review_artifacts");
+  const headline = totalSteps > 0 ? `恢复完成：${completedSteps}/${totalSteps} 步` : "恢复完成";
+  const detailParts = [
+    modelStatus ? `模型状态：${modelStatus}` : "",
+    toolStatus ? `工具状态：${toolStatus}` : "",
+    reviewArtifacts > 0 ? `审查产物 ${reviewArtifacts}` : "",
+  ].filter(Boolean);
+  return detailParts.length > 0 ? `${headline}。${detailParts.join("；")}` : headline;
 }
 
 function isToolEvent(event: RunDetail["events"][number]) {
@@ -709,6 +765,26 @@ const DISCUSSION_MINUTES_PAYLOAD_KEYS = new Set([
   "main_agent_judgment",
   "final_decision",
 ]);
+
+function isSensitiveEventPayloadKey(key: string) {
+  const normalized = key.trim().toLowerCase();
+  if (
+    [
+      "api_base",
+      "checkpoint",
+      "checkpoint_id",
+      "checkpoint_state",
+      "lease_id",
+      "quota_scope_id",
+      "capacity_scope_id",
+      "model_execution_plan",
+      "reservation_id",
+    ].includes(normalized)
+  ) {
+    return true;
+  }
+  return /api[_-]?key|secret|token|password|credential/i.test(key);
+}
 
 function isIntentEventWithRestrictedPayload(event: RunDetail["events"][number]) {
   return event.kind === "step.retrying" || event.kind.startsWith("approval.") || isRepairIntentEvent(event);
@@ -802,6 +878,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (safeSummary) rows.push({ label: "安全摘要", value: safeSummary });
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
+    if (isSensitiveEventPayloadKey(key)) return;
     if (key === "participants" || key === "participant_models") return;
     if (event.kind === "discussion.completed" && (DISCUSSION_MINUTES_PAYLOAD_KEYS.has(key) || key.endsWith("_opinion"))) return;
     if (safeSummary && key === "summary") {
@@ -1091,7 +1168,7 @@ function isWorkbenchCoordinationItem(item: ProcessDetailTarget) {
     item.badge === "调度过程" ||
     item.badge === "讨论过程" ||
     item.badge === "决策过程" ||
-    item.sourceActor === "main_agent"
+    (item.sourceActor === "main_agent" && item.badge !== "断点续跑")
   );
 }
 
@@ -1788,6 +1865,9 @@ function formatEventPayloadDisplayValue(key: string, value: unknown) {
   }
   if (key === "recovery_strategy" || key === "orchestration_recovery_hint") {
     return repairRecoveryStrategyLabel(formatEventPayloadValue(value));
+  }
+  if (key === "model_status_counts" || key === "tool_status_counts") {
+    return runtimeRecoveryPayloadStatusLabel(value);
   }
   if (key === "requires_approval") {
     const formatted = formatEventPayloadValue(value);
@@ -2718,6 +2798,9 @@ function eventSummaryText(
     const provider = formatEventPayloadValue(event.payload.provider);
     return `Harness 启动：${conciseProcessText(logicalModel, "模型")}${provider ? ` / ${provider}` : ""}`;
   }
+  if (event.kind === "runtime.recovered") {
+    return runtimeRecoveryEventSummary(event);
+  }
   if (event.kind === "tool.requested") {
     const requestedTool = formatEventPayloadValue(event.payload.name) || event.tool_name || "工具";
     const requestedDisplay = toolOperationLabel(requestedTool) === "使用工具" ? requestedTool : toolOperationLabel(requestedTool);
@@ -2821,6 +2904,7 @@ function modelRowsForEvent(
 function processBadgeForEvent(event: RunEvent) {
   if (event.kind.startsWith("approval.")) return "审批意图";
   if (event.kind === "step.retrying") return "重试意图";
+  if (event.kind === "runtime.recovered") return "断点续跑";
   if (isRepairIntentEvent(event)) return "修复意图";
   if (event.kind === "artifact.created" || event.kind === "message.created" || event.kind === "step.completed") {
     return "中间产物";

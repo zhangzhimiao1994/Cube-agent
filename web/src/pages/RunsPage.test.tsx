@@ -227,6 +227,55 @@ describe("conversation ordering", () => {
       "2026-09-02T00:00:02Z",
     ]);
   });
+
+  it("surfaces runtime recovery without checkpoint internals in chat workbench process items", () => {
+    const recoveredRun: RunDetail = {
+      ...baseRun,
+      runtime_recovery_summary: {
+        recovery_count: 1,
+        last_completed_steps: 2,
+        last_total_steps: 5,
+        model_status_counts: { failed: 1, succeeded: 2 },
+        tool_status_counts: { running: 1 },
+        review_artifacts: 1,
+      },
+      events: [
+        {
+          sequence: 1,
+          kind: "runtime.recovered",
+          message: "runtime recovered from checkpoint",
+          created_at: "2026-09-02T00:00:01Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "runtime-recovery",
+          action: null,
+          decision: null,
+          payload: {
+            recovery_count: 1,
+            completed_steps: 2,
+            total_steps: 5,
+            model_status_counts: { failed: 1, succeeded: 2 },
+            tool_status_counts: { running: 1 },
+            review_artifacts: 1,
+            checkpoint_id: "checkpoint-00000000-0000-4000-8000-000000000001",
+          },
+        },
+      ],
+    };
+
+    const items = runProcessItems(recoveredRun, new Map());
+    const recovery = items.find((item) => item.badge === "断点续跑");
+
+    expect(recovery).toBeTruthy();
+    expect(`${recovery?.title} ${recovery?.message}`).toContain("恢复完成");
+    expect(`${recovery?.title} ${recovery?.message}`).toContain("2/5 步");
+    expect(`${recovery?.title} ${recovery?.message}`).toContain("模型状态：异常 1，已完成 2");
+    expect(`${recovery?.title} ${recovery?.message}`).toContain("工具状态：进行中 1");
+    expect(`${recovery?.title} ${recovery?.message}`).toContain("审查产物 1");
+    expect(JSON.stringify(recovery?.rows)).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
+    expect(JSON.stringify(recovery?.rows)).not.toContain("checkpoint_id");
+  });
 });
 
 describe("workspace and sandbox submission helpers", () => {

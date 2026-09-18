@@ -3559,6 +3559,76 @@ describe("operational management pages", () => {
     expect(within(workbench).getByRole("button", { name: /得到一个可运行项目/ })).not.toBeNull();
   });
 
+  it("shows checkpoint recovery as an actual workbench action without exposing checkpoint internals", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      runtime_recovery_summary: {
+        recovery_count: 1,
+        last_completed_steps: 2,
+        last_total_steps: 5,
+        model_status_counts: { failed: 1, succeeded: 2 },
+        tool_status_counts: { running: 1 },
+        review_artifacts: 1,
+      },
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "",
+      },
+      events: [
+        {
+          sequence: 1,
+          kind: "runtime.recovered",
+          message: "runtime recovered from checkpoint",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "runtime-recovery",
+          action: null,
+          decision: null,
+          payload: {
+            recovery_count: 1,
+            completed_steps: 2,
+            total_steps: 5,
+            model_status_counts: { failed: 1, succeeded: 2 },
+            tool_status_counts: { running: 1 },
+            review_artifacts: 1,
+            checkpoint_id: "checkpoint-00000000-0000-4000-8000-000000000001",
+            checkpoint_state: { private: "hidden-state" },
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const workbench = await openAgentWorkbench(user, stream);
+    await openWorkbenchView(user, workbench, "实际动作");
+    const recoveryAction = within(workbench).getByRole("button", { name: /恢复完成：2\/5 步/ });
+
+    expect(recoveryAction.textContent).toContain("断点续跑");
+    expect(recoveryAction.textContent).toContain("模型状态：异常 1，已完成 2");
+    expect(recoveryAction.textContent).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
+
+    await user.click(recoveryAction);
+
+    const detail = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(detail.textContent).toContain("断点续跑");
+    expect(detail.textContent).toContain("恢复完成：2/5 步");
+    expect(detail.textContent).toContain("模型状态：异常 1，已完成 2");
+    expect(detail.textContent).toContain("工具状态：进行中 1");
+    expect(detail.textContent).toContain("审查产物 1");
+    expect(detail.textContent).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
+    expect(detail.textContent).not.toContain("hidden-state");
+  });
+
   it("keeps recruited subagent statuses isolated when planned steps are shared", async () => {
     const user = userEvent.setup();
     visibleRunDetail = {
