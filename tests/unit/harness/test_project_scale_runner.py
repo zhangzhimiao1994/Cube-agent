@@ -89,6 +89,9 @@ def test_discussion_trace_rejects_empty_disagreement_evidence() -> None:
     [
         {"participants": [""]},
         {"member_statements": [{}]},
+        {"member_statements": [{"member": [""], "position": "Plan first."}]},
+        {"disagreements": [" "]},
+        {"disagreements": [{}]},
         {"verification_steps": [""]},
     ],
 )

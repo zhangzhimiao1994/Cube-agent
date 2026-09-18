@@ -1694,11 +1694,18 @@ def _has_present_field(mapping: Mapping[str, object], keys: Sequence[str]) -> bo
     for key in keys:
         if key not in mapping:
             continue
-        value = mapping[key]
-        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-            return bool(value)
-        if _non_empty_text(value):
+        if _value_has_present_text(mapping[key]):
             return True
+    return False
+
+
+def _value_has_present_text(value: object) -> bool:
+    if _non_empty_text(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(_value_has_present_text(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return any(_value_has_present_text(item) for item in value)
     return False
 
 
