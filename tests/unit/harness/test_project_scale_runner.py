@@ -19,6 +19,7 @@ from agent_hub.harness.project_scale_runner import (
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
+    _has_self_repair_trace,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
@@ -106,6 +107,31 @@ def test_discussion_trace_rejects_empty_coordination_details(
     payload.update(override)
 
     assert _discussion_trace_payload_passes(payload) is False
+
+
+def test_self_repair_trace_rejects_generic_repair_text() -> None:
+    assert (
+        _has_self_repair_trace(
+            [
+                {
+                    "kind": "message.created",
+                    "message": "The plan mentions repair readiness but no repair event occurred.",
+                }
+            ]
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"kind": "repair.classified"},
+        {"kind": "runtime.self_repair.completed"},
+    ],
+)
+def test_self_repair_trace_accepts_explicit_repair_events(event: dict[str, object]) -> None:
+    assert _has_self_repair_trace([event]) is True
 
 
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:

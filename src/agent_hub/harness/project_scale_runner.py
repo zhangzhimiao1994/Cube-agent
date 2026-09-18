@@ -452,6 +452,7 @@ def execute_project_scale_plan(
                 errors=errors,
             )
             status = observation.status
+            initial_self_repair_trace = _has_self_repair_trace(observation.events)
             _extend_unique(
                 errors,
                 _validate_mode_control(
@@ -509,7 +510,9 @@ def execute_project_scale_plan(
                             validation_focus=run_request.validation_focus,
                         ),
                     )
-            evidence["self_repair_trace"] = _has_self_repair_trace(observation.events)
+            evidence["self_repair_trace"] = initial_self_repair_trace or _has_self_repair_trace(
+                observation.events
+            )
             deliverable_quality = _evaluate_deliverable_quality(
                 observation.details,
                 observation.events,
@@ -1999,7 +2002,23 @@ def _has_deliverable_repair_trace(events: list[object] | None) -> bool:
 def _has_self_repair_trace(events: object) -> bool:
     if not isinstance(events, list):
         return False
-    return any("repair" in json.dumps(event, ensure_ascii=False).lower() for event in events)
+    return any(_event_has_self_repair_marker(event) for event in events)
+
+
+def _event_has_self_repair_marker(event: object) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    for key in ("kind", "event", "type", "action"):
+        marker = event.get(key)
+        if not isinstance(marker, str):
+            continue
+        normalized = marker.lower()
+        if normalized.startswith("repair.") or "self_repair" in normalized:
+            return True
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        return _event_has_self_repair_marker(payload)
+    return False
 
 
 if __name__ == "__main__":  # pragma: no cover
