@@ -12,7 +12,7 @@ Options are passed through to:
 
 Common options:
   --scale small|medium|large|ultra     Limit to one scale; repeatable.
-  --flow direct|dispatch|hybrid|multi_agent|plugin|model_failure|self_repair|artifact_production
+  --flow direct|dispatch|hybrid|multi_agent|plugin|model_failure|self_repair|artifact_production|capability_validation
                                        Limit to one flow; repeatable.
   --json                               Print machine-readable JSON.
   --execute                            Execute real server probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.

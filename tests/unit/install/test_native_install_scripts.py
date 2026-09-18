@@ -223,6 +223,16 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "ok: project scale execution runner" in command
     assert "run_authenticated_project_scale_execution_profile" in command
     assert "profile: authenticated project scale execution runner" in command
+    assert (
+        'project_scale_scales="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES:-'
+        '${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALE:-small,medium,large,ultra}}"'
+        in command
+    )
+    assert (
+        'project_scale_flows="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS:-'
+        '${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production,capability_validation}}"'
+        in command
+    )
     assert "check_acceptance_credential_readiness" in command
     assert "profile: acceptance credential readiness" in command
     assert "ok: acceptance credential readiness bearer_token=set" in command
@@ -686,6 +696,7 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     assert "python -m agent_hub.harness.project_scale_runner" in command
     assert "--wait-seconds SECONDS" in command
     assert "--poll-interval SECONDS" in command
+    assert "capability_validation" in command
     assert "--output PATH" in command
     assert "--execution-id ID" in command
     assert "--json" in command
