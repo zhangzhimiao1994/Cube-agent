@@ -71,7 +71,10 @@ from agent_hub.capabilities.tools.registry import PLUGIN_RUNTIME_FAILURE_CODES
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
+from agent_hub.mcp.client import InMemoryMcpClient
 from agent_hub.mcp.manifest import MCP_RUNTIME_FAILURE_CODES
+from agent_hub.mcp.runtime import build_runtime_mcp_service
+from agent_hub.mcp.types import McpInvocationResult, McpToolSchema
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import (
@@ -10726,6 +10729,76 @@ async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_serv
             idempotency_key="after-delete",
         )
     assert [call["idempotency_key"] for call in adapter_calls] == ["before-delete"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_admin_runtime_delete_reload_fails_closed_for_existing_service() -> None:
+    clients: dict[str, InMemoryMcpClient] = {}
+
+    def client_factory(server: Any) -> InMemoryMcpClient:
+        client = InMemoryMcpClient(
+            tools=(McpToolSchema(name="read_file"),),
+            responses={
+                "read_file": McpInvocationResult(content={"content": "ok"}),
+            },
+        )
+        clients[server.id] = client
+        return client
+
+    api = client()
+    admin_service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    runtime_mcp_service = await build_runtime_mcp_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=client_factory,
+    )
+    cast(Any, api.app).state.mcp_service = runtime_mcp_service
+    cast(Any, api.app).state.reload_mcp_runtime_config = runtime_mcp_service.reload
+
+    created = api.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={
+            "id": "filesystem",
+            "name": "Filesystem MCP",
+            "allowed_tools": ["read_file"],
+            "transport": "streamable_http",
+            "url": "https://files.example.com/mcp",
+            "domain_allowlist": ["example.com"],
+            "timeout_seconds": 10,
+        },
+    )
+    first = await runtime_mcp_service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="runtime_planning",
+        name="filesystem.read_file",
+        arguments={"path": "README.md"},
+        idempotency_key="before-delete",
+    )
+
+    deleted = api.delete("/api/v1/admin/mcp/filesystem", headers=headers())
+
+    assert created.status_code == 200
+    assert first == {"content": "ok"}
+    assert deleted.status_code == 200
+    assert runtime_mcp_service.is_available(TENANT_ID, "filesystem.read_file") is False
+    with pytest.raises(RuntimeCapabilityError, match="MCP tool unavailable"):
+        await runtime_mcp_service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="runtime_planning",
+            name="filesystem.read_file",
+            arguments={"path": "README.md"},
+            idempotency_key="after-delete",
+        )
+    assert clients["filesystem"].invocations == [("read_file", {"path": "README.md"})]
 
 
 def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> None:
