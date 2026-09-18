@@ -1262,6 +1262,7 @@ check_interaction_prevention_and_recovery() {
   if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
 from uuid import uuid4
 
+from agent_hub.api.routers.admin import _schedule_proposal
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.gateway import ModelGatewayError, _fallback_reason, _retryable_model_failure
 from agent_hub.models.litellm_client import ModelTransportError
@@ -1271,7 +1272,7 @@ from agent_hub.runs.self_repair import (
     classify_terminal_run,
     repair_context_from_proposal,
 )
-from agent_hub.runs.service import _looks_like_schedule_intent
+from agent_hub.runs.service import _looks_like_schedule_intent, _message_suggests_ultra_large_project
 from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 
@@ -1318,6 +1319,58 @@ for message in (
         _looks_like_schedule_intent(message, message.lower()) is True,
         "explicit schedule task creation must still propose",
     )
+
+project_preflight_synonyms = (
+    "这个需求是超大型任务，需要先做系统架构、拆解阶段，再构建到生产结果。",
+    "我要做一个大项目，从架构搭建、需求拆解到最终生产结果都要完成。",
+    "需要构建一个大型系统，先做系统设计和分阶段实现，再给出生产结果。",
+)
+for message in project_preflight_synonyms:
+    require(
+        _message_suggests_ultra_large_project(message) is True,
+        "large project synonyms must require project preflight",
+    )
+
+project_preflight_non_triggers = (
+    "这是一个大型任务，先帮我总结一下背景。",
+    "我想讨论大项目怎么管理，不要直接开始构建。",
+)
+for message in project_preflight_non_triggers:
+    require(
+        _message_suggests_ultra_large_project(message) is False,
+        "large project preflight must still require architecture/build intent",
+    )
+
+schedule_projection = _schedule_proposal(
+    {
+        "schedule_proposal": {
+            "name": "chat-daily-schedule",
+            "message": "创建计划任务：每天9点提醒我填写日报",
+            "mode": "dispatch",
+            "workflow_id": "scheduled_task",
+            "kind": "cron",
+            "timezone": "Asia/Shanghai",
+            "misfire_policy": "fire_once",
+            "budget": 16384,
+            "run_at": None,
+            "cron": "0 9 * * *",
+            "summary": "每天 09:00 执行。",
+            "metadata": {
+                "source": "chat_schedule_proposal",
+                "requires_user_confirmation": "true",
+                "internal_token": "do-not-project",
+            },
+            "unsafe": "do-not-project",
+            "debug": {"operator_notes": "do-not-project"},
+        }
+    }
+)
+require(isinstance(schedule_projection, dict), "schedule projection must be present")
+require("unsafe" not in schedule_projection, "schedule projection must drop unsafe fields")
+require("debug" not in schedule_projection, "schedule projection must drop debug fields")
+metadata = schedule_projection.get("metadata")
+require(isinstance(metadata, dict), "schedule projection metadata must be present")
+require("internal_token" not in metadata, "schedule projection metadata must be allowlisted")
 
 empty_error = ModelGatewayError("model response text is empty")
 require(_retryable_model_failure(empty_error) is True, "empty response must be retryable")
