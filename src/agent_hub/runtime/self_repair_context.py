@@ -20,6 +20,11 @@ _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
 _SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_DIAGNOSTIC_CODE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$")
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
 _MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
@@ -69,6 +74,12 @@ def self_repair_context_text(
             max_chars=128,
         ),
     }
+    error_code = _safe_diagnostic_code(repair.get("error_code"))
+    if error_code is not None:
+        payload["error_code"] = error_code
+    suggested_action = _safe_text(repair.get("suggested_action"), "", _MAX_INSTRUCTION_CHARS)
+    if suggested_action:
+        payload["suggested_action"] = suggested_action
     blocked_contract_ids = (
         _safe_contract_ids(repair.get("blocked_contract_ids"))
         if routing_decision.get("source") == "self_repair"
@@ -192,7 +203,7 @@ def self_repair_role_capability_requirements(
 def _safe_text(value: object, default: str, max_chars: int) -> str:
     if not isinstance(value, str):
         return default
-    text = " ".join(value.split())[:max_chars]
+    text = _SENSITIVE_TEXT_PATTERN.sub("[redacted]", " ".join(value.split()))[:max_chars]
     return text or default
 
 
@@ -215,6 +226,13 @@ def _safe_int(value: object, default: int) -> int:
     if type(value) is not int:
         return default
     return min(max(value, 0), 3)
+
+
+def _safe_diagnostic_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:96]
+    return text if _SAFE_DIAGNOSTIC_CODE.fullmatch(text) is not None else None
 
 
 def _safe_contract_ids(value: object) -> tuple[str, ...]:

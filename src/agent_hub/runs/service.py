@@ -54,6 +54,11 @@ _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
 _SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_DIAGNOSTIC_CODE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$")
+_SENSITIVE_SELF_REPAIR_TEXT = re.compile(
+    r"(authorization:\s*bearer\s+\S+|bearer\s+\S+|secret://\S+|sk-[A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
 _MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
@@ -2514,6 +2519,16 @@ def _self_repair_execution_payload(
         payload["recovery_strategy"] = recovery_strategy
     if orchestration_recovery_hint is not None:
         payload["orchestration_recovery_hint"] = orchestration_recovery_hint
+    error_code = _bounded_diagnostic_code(repair.get("error_code"))
+    if error_code is not None:
+        payload["error_code"] = error_code
+    suggested_action = _bounded_self_repair_text(
+        repair.get("suggested_action"),
+        "",
+        240,
+    )
+    if suggested_action:
+        payload["suggested_action"] = suggested_action
     blocked_contract_ids = _bounded_contract_ids(repair.get("blocked_contract_ids"))
     if blocked_contract_ids:
         payload["blocked_contract_ids"] = blocked_contract_ids
@@ -2530,6 +2545,20 @@ def _bounded_text(value: object, default: str, max_chars: int) -> str:
         return default
     text = " ".join(value.split())[:max_chars]
     return text or default
+
+
+def _bounded_self_repair_text(value: object, default: str, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return default
+    text = _SENSITIVE_SELF_REPAIR_TEXT.sub("[redacted]", " ".join(value.split()))[:max_chars]
+    return text or default
+
+
+def _bounded_diagnostic_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:96]
+    return text if _SAFE_DIAGNOSTIC_CODE.fullmatch(text) is not None else None
 
 
 def _bounded_enum_text(

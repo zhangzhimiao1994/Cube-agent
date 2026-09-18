@@ -1180,6 +1180,8 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
         "max_attempts": 1,
         "instruction": "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。",
         "recovery_strategy": "switch_to_available_model_and_retry",
+        "error_code": "model.capacity_unavailable",
+        "suggested_action": "当前模型容量不可用；稍后重试，或切换到可用模型。",
         "requires_approval": True,
         "replay_safe": False,
         "automatic_execution": False,

@@ -22,7 +22,10 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
-from agent_hub.runtime.failure_reason import RECOVERY_BLOCKED_FAILURE_REASON
+from agent_hub.runtime.failure_reason import (
+    RECOVERY_BLOCKED_FAILURE_REASON,
+    runtime_failure_diagnostic_from_reason,
+)
 
 _FAILURE_KINDS = frozenset({EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED})
 _REPAIR_EVENT_KINDS = frozenset({"repair.classified", "repair.skipped"})
@@ -169,6 +172,7 @@ _SENSITIVE_TEXT_PATTERN = re.compile(
 )
 _SAFE_CONTRACT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,96}-to-[A-Za-z0-9_.:-]{1,96}$")
 _SAFE_ROLE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_DIAGNOSTIC_CODE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$")
 _MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
@@ -206,6 +210,8 @@ _REPAIR_PROPOSAL_FIELDS = frozenset(
         "fingerprint",
         "recovery_strategy",
         "orchestration_recovery_hint",
+        "error_code",
+        "suggested_action",
         "role_capability_requirements",
     }
 )
@@ -244,6 +250,8 @@ class SelfRepairDecision:
     skip_reason: str | None = None
     recovery_strategy: str | None = None
     orchestration_recovery_hint: str | None = None
+    error_code: str | None = None
+    suggested_action: str | None = None
     blocked_contract_ids: tuple[str, ...] = ()
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = ()
 
@@ -266,6 +274,8 @@ class SelfRepairDecision:
             skip_reason=self.skip_reason,
             recovery_strategy=self.recovery_strategy,
             orchestration_recovery_hint=self.orchestration_recovery_hint,
+            error_code=self.error_code,
+            suggested_action=self.suggested_action,
             blocked_contract_ids=self.blocked_contract_ids,
             role_capability_requirements=self.role_capability_requirements,
         )
@@ -294,6 +304,10 @@ class SelfRepairDecision:
             payload["recovery_strategy"] = self.recovery_strategy
         if self.orchestration_recovery_hint is not None:
             payload["orchestration_recovery_hint"] = self.orchestration_recovery_hint
+        if self.error_code is not None:
+            payload["error_code"] = self.error_code
+        if self.suggested_action is not None:
+            payload["suggested_action"] = self.suggested_action
         if self.role_capability_requirements:
             payload["role_capability_requirements"] = self.role_capability_requirements
         return RunEvent(kind=self.kind, sequence=sequence, run_id=run_id, payload=payload)
@@ -329,6 +343,10 @@ class SelfRepairDecision:
             proposal["recovery_strategy"] = self.recovery_strategy
         if self.orchestration_recovery_hint is not None:
             proposal["orchestration_recovery_hint"] = self.orchestration_recovery_hint
+        if self.error_code is not None:
+            proposal["error_code"] = self.error_code
+        if self.suggested_action is not None:
+            proposal["suggested_action"] = self.suggested_action
         if self.blocked_contract_ids:
             proposal["blocked_contract_ids"] = self.blocked_contract_ids
         if self.role_capability_requirements:
@@ -350,6 +368,7 @@ def classify_terminal_run(
     source_kind = "run.failed" if failure is None else _kind_text(failure.kind)
     source_sequence = 0 if failure is None else failure.sequence
     failure_category = "missing_failure_event" if failure is None else _failure_category(failure)
+    error_code, suggested_action = _failure_diagnostic_metadata(failure)
     orchestration_recovery_hint = _orchestration_recovery_hint(events)
     recovery_strategy = _recovery_strategy(
         failure_category=failure_category,
@@ -390,6 +409,8 @@ def classify_terminal_run(
             skip_reason="recursive_self_repair",
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
+            error_code=error_code,
+            suggested_action=suggested_action,
             blocked_contract_ids=blocked_contract_ids,
             role_capability_requirements=role_capability_requirements,
         )
@@ -408,6 +429,8 @@ def classify_terminal_run(
             severity="warning",
             recovery_strategy=recovery_strategy,
             orchestration_recovery_hint=orchestration_recovery_hint,
+            error_code=error_code,
+            suggested_action=suggested_action,
             blocked_contract_ids=blocked_contract_ids,
             role_capability_requirements=role_capability_requirements,
         )
@@ -428,6 +451,8 @@ def classify_terminal_run(
         max_attempts=policy.max_attempts,
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
+        error_code=error_code,
+        suggested_action=suggested_action,
         blocked_contract_ids=blocked_contract_ids,
         role_capability_requirements=role_capability_requirements,
     )
@@ -448,6 +473,8 @@ def _skipped_decision(
     severity: str = "info",
     recovery_strategy: str | None = None,
     orchestration_recovery_hint: str | None = None,
+    error_code: str | None = None,
+    suggested_action: str | None = None,
     blocked_contract_ids: tuple[str, ...] = (),
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = (),
 ) -> SelfRepairDecision:
@@ -469,6 +496,8 @@ def _skipped_decision(
         skip_reason=skip_reason,
         recovery_strategy=recovery_strategy,
         orchestration_recovery_hint=orchestration_recovery_hint,
+        error_code=error_code,
+        suggested_action=suggested_action,
         blocked_contract_ids=blocked_contract_ids,
         role_capability_requirements=role_capability_requirements,
     )
@@ -533,6 +562,12 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
         context["recovery_strategy"] = recovery_strategy
     if orchestration_recovery_hint is not None:
         context["orchestration_recovery_hint"] = orchestration_recovery_hint
+    error_code = _safe_diagnostic_code(proposal.get("error_code"))
+    if error_code is not None:
+        context["error_code"] = error_code
+    suggested_action = _safe_text(proposal.get("suggested_action"), default="", max_chars=240)
+    if suggested_action:
+        context["suggested_action"] = suggested_action
     blocked_contract_ids = _safe_contract_ids(proposal.get("blocked_contract_ids"))
     if blocked_contract_ids:
         context["blocked_contract_ids"] = blocked_contract_ids
@@ -659,6 +694,11 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
         return _safe_text(value, default="", max_chars=160)
     if key == "instruction":
         return _safe_text(value, default="", max_chars=240)
+    if key == "error_code":
+        return _safe_diagnostic_code(value)
+    if key == "suggested_action":
+        text = _safe_text(value, default="", max_chars=240)
+        return text or None
     if key in {"source_run_id", "fingerprint"}:
         return _safe_text(value, default="", max_chars=96)
     if key == "role_capability_requirements":
@@ -693,6 +733,30 @@ def _recovery_strategy(
 
 def _requires_manual_repair_approval(failure_category: str) -> bool:
     return failure_category in _MANUAL_APPROVAL_FAILURE_CATEGORIES
+
+
+def _failure_diagnostic_metadata(failure: RunEvent | None) -> tuple[str | None, str | None]:
+    if failure is None:
+        return None, None
+    payload_error_code = _safe_diagnostic_code(failure.payload.get("error_code"))
+    payload_suggested_action = _safe_text(
+        failure.payload.get("suggested_action"),
+        default="",
+        max_chars=240,
+    )
+    if payload_error_code is not None:
+        return payload_error_code, payload_suggested_action or None
+    diagnostic = runtime_failure_diagnostic_from_reason(_failure_text(failure))
+    error_code = _safe_diagnostic_code(diagnostic.get("error_code"))
+    suggested_action = _safe_text(diagnostic.get("suggested_action"), default="", max_chars=240)
+    return error_code, suggested_action or None
+
+
+def _safe_diagnostic_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:96]
+    return text if _SAFE_DIAGNOSTIC_CODE.fullmatch(text) is not None else None
 
 
 def _orchestration_recovery_hint(events: Sequence[RunEvent]) -> str | None:
@@ -996,7 +1060,18 @@ def _failure_text(event: RunEvent) -> str:
     parts: list[str] = []
     if event.reason:
         parts.append(event.reason)
-    for key in ("error", "error_type", "status", "status_code", "failure", "failure_kind", "stage"):
+    for key in (
+        "error",
+        "error_type",
+        "status",
+        "status_code",
+        "failure",
+        "failure_kind",
+        "stage",
+        "error_code",
+        "error_stage",
+        "error_category",
+    ):
         value = event.payload.get(key)
         if type(value) in {str, int}:
             parts.append(str(value))

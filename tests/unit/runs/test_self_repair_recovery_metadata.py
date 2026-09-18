@@ -290,6 +290,102 @@ def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -
 
 
 @pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_action_fragment"),
+    [
+        (
+            "plugin.adapter_unavailable",
+            "plugin.adapter_unavailable",
+            "插件适配器",
+        ),
+        (
+            "mcp.tool_unavailable",
+            "mcp.tool_unavailable",
+            "MCP 工具",
+        ),
+    ],
+)
+def test_plugin_and_mcp_self_repair_keeps_safe_diagnostic_hints(
+    reason: str,
+    expected_code: str,
+    expected_action_fragment: str,
+) -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.TOOL_FAILED,
+                sequence=1,
+                run_id=run_id,
+                actor="tool_runner",
+                tool_call_id="call_tool",
+                tool_name="plugin.tool",
+                reason=reason,
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    assert decision is not None
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["error_code"] == expected_code
+    assert expected_action_fragment in str(proposal["suggested_action"])
+
+    projected = repair_proposal_projection(proposal)
+    assert projected is not None
+    assert projected["error_code"] == expected_code
+    assert expected_action_fragment in str(projected["suggested_action"])
+
+    repair_context = repair_context_from_proposal(projected)
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+    prompt_context = self_repair_context_text(routing_decision)
+    assert expected_code in prompt_context
+    assert expected_action_fragment in prompt_context
+
+    audit_payload = _self_repair_execution_payload(
+        routing_decision,
+        status=RunStatus.RUNNING,
+    )
+    assert audit_payload["error_code"] == expected_code
+    assert expected_action_fragment in str(audit_payload["suggested_action"])
+
+
+def test_self_repair_classifies_plugin_failure_from_payload_error_code() -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=1,
+                run_id=run_id,
+                actor="tool_runner",
+                step_id="tool_runner",
+                reason="capability execution failed",
+                payload={
+                    "error_code": "plugin.invalid_arguments",
+                    "suggested_action": "插件入参不符合声明 schema；修正参数结构后重试。",
+                },
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "plugin_invalid_arguments"
+    assert decision.recovery_strategy == "manual_review_plugin_arguments"
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["error_code"] == "plugin.invalid_arguments"
+    assert "插件入参" in str(proposal["suggested_action"])
+
+
+@pytest.mark.parametrize(
     ("reason", "expected_category", "expected_strategy"),
     [
         (

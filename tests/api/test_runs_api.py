@@ -1356,6 +1356,8 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
                 "instruction": "只执行一次受控修复。",
                 "recovery_strategy": "switch_to_available_model_and_retry",
                 "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                "error_code": "plugin.adapter_unavailable",
+                "suggested_action": "检查插件适配器后重试。",
                 "requires_approval": True,
                 "replay_safe": False,
                 "automatic_execution": False,
@@ -1373,6 +1375,8 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
     assert payload["repair_proposal"]["instruction"] == "只执行一次受控修复。"
     assert payload["repair_proposal"]["recovery_strategy"] == "switch_to_available_model_and_retry"
     assert payload["repair_proposal"]["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
+    assert payload["repair_proposal"]["error_code"] == "plugin.adapter_unavailable"
+    assert payload["repair_proposal"]["suggested_action"] == "检查插件适配器后重试。"
     assert "command" not in payload["repair_proposal"]
     assert "stdout" not in payload["repair_proposal"]
     assert "private-token" not in json.dumps(payload, ensure_ascii=False)
@@ -1442,6 +1446,8 @@ def test_submitted_run_response_bounds_self_repair_proposal_text_fields() -> Non
                 "attempt": 99,
                 "max_attempts": 99,
                 "instruction": "read secret://model-provider-token " + ("i" * 400),
+                "error_code": "secret://model-provider-token",
+                "suggested_action": "Authorization: Bearer sk-secret " + ("s" * 300),
                 "requires_approval": True,
                 "replay_safe": False,
                 "automatic_execution": True,
@@ -1456,6 +1462,8 @@ def test_submitted_run_response_bounds_self_repair_proposal_text_fields() -> Non
     assert proposal["attempt"] == 3
     assert proposal["max_attempts"] == 3
     assert proposal["automatic_execution"] is False
+    assert "error_code" not in proposal
+    assert "[redacted]" in proposal["suggested_action"]
     assert len(proposal["title"]) <= 96
     assert len(proposal["summary"]) <= 160
     assert len(proposal["source_run_id"]) <= 96
