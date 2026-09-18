@@ -228,6 +228,103 @@ def test_model_capability_reassignment_metadata_is_bounded_and_structured() -> N
     assert "secret://token" not in repr(recovery_plan)
 
 
+@pytest.mark.parametrize(
+    (
+        "failure_kind",
+        "recovery_strategy",
+        "error_code",
+        "expected_scope",
+    ),
+    [
+        (
+            "plugin_runtime_unavailable",
+            "repair_plugin_endpoint_or_adapter_and_retry",
+            "plugin.backend_unavailable",
+            "plugin_runtime",
+        ),
+        (
+            "mcp_runtime_unavailable",
+            "repair_mcp_server_or_adapter_and_retry",
+            "mcp.server_unavailable",
+            "mcp_runtime",
+        ),
+    ],
+)
+def test_retryable_plugin_and_mcp_failures_build_structured_recovery_plan(
+    failure_kind: str,
+    recovery_strategy: str,
+    error_code: str,
+    expected_scope: str,
+) -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": failure_kind,
+            "source_run_id": "run_1",
+            "source_event_sequence": 2,
+            "attempt": 1,
+            "max_attempts": 1,
+            "fingerprint": "fp",
+            "recovery_strategy": recovery_strategy,
+            "error_code": error_code,
+            "suggested_action": "reload runtime metadata then retry secret://token",
+            "requires_approval": False,
+            "automatic_execution": True,
+        }
+    )
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+
+    assert recovery_plan == {
+        "schema_version": 1,
+        "status": "active",
+        "recovery_strategy": recovery_strategy,
+        "replan_scope": expected_scope,
+        "reuse_completed_artifacts": True,
+        "refresh_runtime_capabilities": True,
+        "retry_failed_capability_only": True,
+        "automatic_execution": True,
+        "diagnostic_error_code": error_code,
+    }
+    assert "secret://token" not in repr(recovery_plan)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "recovery_strategy", "error_code"),
+    [
+        (
+            "plugin_adapter_unavailable",
+            "manual_review_plugin_adapter",
+            "plugin.adapter_unavailable",
+        ),
+        (
+            "mcp_tool_unavailable",
+            "manual_review_mcp_configuration",
+            "mcp.tool_unavailable",
+        ),
+    ],
+)
+def test_manual_review_plugin_and_mcp_failures_do_not_build_retry_plan(
+    failure_kind: str,
+    recovery_strategy: str,
+    error_code: str,
+) -> None:
+    repair_context = repair_context_from_proposal(
+        {
+            "kind": "self_repair",
+            "failure_kind": failure_kind,
+            "recovery_strategy": recovery_strategy,
+            "error_code": error_code,
+            "requires_approval": True,
+            "automatic_execution": True,
+        }
+    )
+    routing_decision = {"source": "self_repair", "self_repair_context": repair_context}
+
+    assert self_repair_recovery_plan_payload(routing_decision) is None
+
+
 def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
     run_id = uuid4()
     decision = classify_terminal_run(

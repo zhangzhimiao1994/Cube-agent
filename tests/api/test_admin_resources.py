@@ -1052,6 +1052,84 @@ def test_admin_run_detail_reports_model_capability_self_repair_recovery_summary(
     assert "raw_plan" not in serialized
 
 
+def test_admin_run_detail_reports_plugin_runtime_self_repair_recovery_summary() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="running",
+        mode="dispatch",
+        request="repair plugin runtime",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "step.started",
+                    "message": "main_agent_plan",
+                    "created_at": now,
+                    "actor": "main_agent",
+                    "step_id": "main_agent_plan",
+                    "payload": {
+                        "model_execution_plan": {
+                            "schema_version": 1,
+                            "self_repair_recovery": {
+                                "schema_version": 1,
+                                "status": "active",
+                                "recovery_strategy": (
+                                    "repair_plugin_endpoint_or_adapter_and_retry"
+                                ),
+                                "replan_scope": "plugin_runtime",
+                                "reuse_completed_artifacts": True,
+                                "refresh_runtime_capabilities": True,
+                                "retry_failed_capability_only": True,
+                                "automatic_execution": True,
+                                "diagnostic_error_code": "plugin.backend_unavailable",
+                                "suggested_action": "reload plugin secret://repair-token",
+                                "credential_ref": "credential-private",
+                                "raw_plan": {"secret": "secret://repair-token"},
+                            },
+                        },
+                    },
+                }
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    expected_summary = {
+        "status": "active",
+        "recovery_strategy": "repair_plugin_endpoint_or_adapter_and_retry",
+        "orchestration_recovery_hint": None,
+        "replan_scope": "plugin_runtime",
+        "reuse_completed_artifacts": True,
+        "retry_blocked_contracts_only": False,
+        "automatic_execution": True,
+        "refresh_runtime_capabilities": True,
+        "retry_failed_capability_only": True,
+        "diagnostic_error_code": "plugin.backend_unavailable",
+    }
+    assert body["self_repair_recovery_summary"] == expected_summary
+    assert (
+        body["events"][0]["payload"]["model_execution_plan"]["self_repair_recovery"]
+        == expected_summary
+    )
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert "credential-private" not in serialized
+    assert "repair-token" not in serialized
+    assert "raw_plan" not in serialized
+
+
 def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses() -> None:
     now = datetime.now(UTC)
     protocol_plan = {

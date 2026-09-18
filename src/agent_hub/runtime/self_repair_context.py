@@ -29,6 +29,12 @@ _MAX_BLOCKED_CONTRACT_IDS = 8
 _MAX_ROLE_CAPABILITY_REQUIREMENTS = 8
 _MAX_REQUIRED_CAPABILITIES = 8
 _MODEL_CAPABILITY_RECOVERY_STRATEGY = "reassign_tool_role_to_capable_model_and_retry"
+_PLUGIN_RUNTIME_RECOVERY_STRATEGY = "repair_plugin_endpoint_or_adapter_and_retry"
+_MCP_RUNTIME_RECOVERY_STRATEGY = "repair_mcp_server_or_adapter_and_retry"
+_RUNTIME_RECOVERY_SCOPES_BY_STRATEGY = {
+    _PLUGIN_RUNTIME_RECOVERY_STRATEGY: "plugin_runtime",
+    _MCP_RUNTIME_RECOVERY_STRATEGY: "mcp_runtime",
+}
 
 
 def self_repair_context_text(
@@ -135,8 +141,24 @@ def self_repair_recovery_plan_payload(
     automatic_execution = _safe_automatic_execution(repair)
     if recovery_strategy != ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
         if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
-            return None
-        payload: dict[str, JsonValue] = {
+            runtime_scope = _RUNTIME_RECOVERY_SCOPES_BY_STRATEGY.get(recovery_strategy)
+            if runtime_scope is None:
+                return None
+            runtime_payload: dict[str, JsonValue] = {
+                "schema_version": 1,
+                "status": "active",
+                "recovery_strategy": recovery_strategy,
+                "replan_scope": runtime_scope,
+                "reuse_completed_artifacts": True,
+                "refresh_runtime_capabilities": True,
+                "retry_failed_capability_only": True,
+                "automatic_execution": automatic_execution,
+            }
+            error_code = _safe_diagnostic_code(repair.get("error_code"))
+            if error_code is not None:
+                runtime_payload["diagnostic_error_code"] = error_code
+            return runtime_payload
+        model_payload: dict[str, JsonValue] = {
             "schema_version": 1,
             "status": "active",
             "recovery_strategy": _MODEL_CAPABILITY_RECOVERY_STRATEGY,
@@ -148,11 +170,11 @@ def self_repair_recovery_plan_payload(
             repair.get("role_capability_requirements"),
         )
         if role_capability_requirements:
-            payload["role_capability_requirements"] = role_capability_requirements
-        return payload
+            model_payload["role_capability_requirements"] = role_capability_requirements
+        return model_payload
     if orchestration_recovery_hint != ORCHESTRATION_CONTRACT_RECOVERY_HINT:
         return None
-    payload = {
+    contract_payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "status": "active",
         "recovery_strategy": ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
@@ -164,8 +186,8 @@ def self_repair_recovery_plan_payload(
     }
     blocked_contract_ids = _safe_contract_ids(repair.get("blocked_contract_ids"))
     if blocked_contract_ids:
-        payload["blocked_contract_ids"] = blocked_contract_ids
-    return payload
+        contract_payload["blocked_contract_ids"] = blocked_contract_ids
+    return contract_payload
 
 
 def self_repair_role_capability_requirements(

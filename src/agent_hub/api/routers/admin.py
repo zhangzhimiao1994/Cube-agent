@@ -471,14 +471,24 @@ class SelfRepairRecoverySummaryResponse(BaseModel):
     recovery_strategy: Literal[
         "retry_blocked_contract_chain_after_replanning",
         "reassign_tool_role_to_capable_model_and_retry",
+        "repair_plugin_endpoint_or_adapter_and_retry",
+        "repair_mcp_server_or_adapter_and_retry",
     ]
     orchestration_recovery_hint: Literal["retry_blocked_contract_chain"] | None = None
-    replan_scope: Literal["blocked_contract_chain", "model_capability_roles"]
+    replan_scope: Literal[
+        "blocked_contract_chain",
+        "model_capability_roles",
+        "plugin_runtime",
+        "mcp_runtime",
+    ]
     reuse_completed_artifacts: bool
     retry_blocked_contracts_only: bool = False
     automatic_execution: bool = False
     role_capability_requirement_count: int = Field(default=0, ge=0)
     required_capability_count: int = Field(default=0, ge=0)
+    refresh_runtime_capabilities: bool = False
+    retry_failed_capability_only: bool = False
+    diagnostic_error_code: str | None = None
 
     @model_serializer(mode="wrap")
     def serialize(
@@ -489,6 +499,12 @@ class SelfRepairRecoverySummaryResponse(BaseModel):
         if self.replan_scope != "model_capability_roles":
             data.pop("role_capability_requirement_count", None)
             data.pop("required_capability_count", None)
+        if self.replan_scope not in {"plugin_runtime", "mcp_runtime"}:
+            data.pop("refresh_runtime_capabilities", None)
+            data.pop("retry_failed_capability_only", None)
+            data.pop("diagnostic_error_code", None)
+        if self.diagnostic_error_code is None:
+            data.pop("diagnostic_error_code", None)
         return data
 
 
@@ -9744,6 +9760,9 @@ def _self_repair_recovery_summary_from_mapping(
             retry_blocked_contracts_only=latest.get("retry_blocked_contracts_only") is True,
             automatic_execution=False,
         )
+    runtime_repair = _runtime_repair_recovery_summary(latest, recovery_strategy)
+    if runtime_repair is not None:
+        return runtime_repair
     if recovery_strategy != _MODEL_CAPABILITY_RECOVERY_STRATEGY:
         return None
     if latest.get("replan_scope") != "model_capability_roles":
@@ -9766,6 +9785,48 @@ def _self_repair_recovery_summary_from_mapping(
         role_capability_requirement_count=role_count,
         required_capability_count=capability_count,
     )
+
+
+def _runtime_repair_recovery_summary(
+    latest: Mapping[str, object],
+    recovery_strategy: object,
+) -> SelfRepairRecoverySummaryResponse | None:
+    if recovery_strategy == "repair_plugin_endpoint_or_adapter_and_retry":
+        replan_scope: Literal["plugin_runtime", "mcp_runtime"] = "plugin_runtime"
+    elif recovery_strategy == "repair_mcp_server_or_adapter_and_retry":
+        replan_scope = "mcp_runtime"
+    else:
+        return None
+    if latest.get("replan_scope") != replan_scope:
+        return None
+    return SelfRepairRecoverySummaryResponse(
+        recovery_strategy=recovery_strategy,
+        replan_scope=replan_scope,
+        reuse_completed_artifacts=latest.get("reuse_completed_artifacts") is True,
+        automatic_execution=latest.get("automatic_execution") is True,
+        refresh_runtime_capabilities=(
+            latest.get("refresh_runtime_capabilities") is True
+        ),
+        retry_failed_capability_only=latest.get("retry_failed_capability_only") is True,
+        diagnostic_error_code=_safe_recovery_diagnostic_code(
+            latest.get("diagnostic_error_code")
+        ),
+    )
+
+
+_SAFE_RECOVERY_DIAGNOSTIC_CODE_RE = re.compile(
+    r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$"
+)
+
+
+def _safe_recovery_diagnostic_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()[:96]
+    if _SAFE_RECOVERY_DIAGNOSTIC_CODE_RE.fullmatch(stripped) is None:
+        return None
+    safe = _safe_model_check_detail(stripped)
+    return None if safe == "redacted" else safe
 
 
 def _model_capability_recovery_count(value: object) -> int:

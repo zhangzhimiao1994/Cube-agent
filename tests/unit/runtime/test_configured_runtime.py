@@ -1283,6 +1283,49 @@ def test_model_execution_plan_reports_safe_blocked_contract_self_repair_recovery
     }
 
 
+def test_model_execution_plan_reports_plugin_runtime_self_repair_recovery() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="插件运行时不可用后重新加载能力目录再重试。",
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "plugin_runtime_unavailable",
+                "repair_action": "draft_repair_proposal",
+                "attempt": 1,
+                "max_attempts": 1,
+                "recovery_strategy": "repair_plugin_endpoint_or_adapter_and_retry",
+                "instruction": "刷新插件运行时能力目录后重试失败工具。",
+                "error_code": "plugin.backend_unavailable",
+                "automatic_execution": True,
+                "requires_approval": False,
+            },
+        },
+    )
+
+    plan = defaults_module._model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=(),
+        steps=(),
+    )
+
+    assert plan["self_repair_recovery"] == {
+        "schema_version": 1,
+        "status": "active",
+        "recovery_strategy": "repair_plugin_endpoint_or_adapter_and_retry",
+        "replan_scope": "plugin_runtime",
+        "reuse_completed_artifacts": True,
+        "refresh_runtime_capabilities": True,
+        "retry_failed_capability_only": True,
+        "automatic_execution": True,
+        "diagnostic_error_code": "plugin.backend_unavailable",
+    }
+
+
 def test_model_execution_plan_drops_unknown_self_repair_recovery_metadata() -> None:
     context = TaskContext(
         run_id=uuid4(),
