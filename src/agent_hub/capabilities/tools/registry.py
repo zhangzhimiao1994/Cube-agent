@@ -166,6 +166,26 @@ class CompositeCapabilityManifestSource:
                 )
                 continue
 
+    async def refresh_tenant(self, tenant_id: object) -> None:
+        for source in self._sources:
+            refresh_tenant = getattr(source, "refresh_tenant", None)
+            reload_tenant = getattr(source, "reload", None)
+            callback = refresh_tenant if callable(refresh_tenant) else reload_tenant
+            if not callable(callback):
+                continue
+            try:
+                result = callback(tenant_id)
+                if isawaitable(result):
+                    await result
+            except Exception as error:  # noqa: BLE001 - optional inventory refresh must fail closed.
+                _LOGGER.warning(
+                    "capability_manifest_source_refresh_failed source=%s tenant_id=%s error_type=%s",
+                    type(source).__name__,
+                    tenant_id,
+                    type(error).__name__,
+                )
+                continue
+
     def manifests_for_tenant(self, tenant_id: object) -> Mapping[str, JsonValue]:
         capabilities: list[Mapping[str, JsonValue]] = []
         for source in self._sources:

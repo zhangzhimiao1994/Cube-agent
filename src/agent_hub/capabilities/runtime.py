@@ -165,6 +165,19 @@ class RuntimeCapabilityGateway:
         except Exception:  # noqa: BLE001 - optional inventory preparation must fail closed.
             return
 
+    async def refresh_tenant(self, tenant_id: UUID) -> None:
+        if self._tool_registry is None:
+            return
+        refresh_tenant = getattr(self._tool_registry, "refresh_tenant", None)
+        if not callable(refresh_tenant):
+            return
+        try:
+            result = refresh_tenant(tenant_id)
+            if isawaitable(result):
+                await cast(Awaitable[object], result)
+        except Exception:  # noqa: BLE001 - optional inventory refresh must fail closed.
+            return
+
     def capability_manifest(
         self,
         tenant_id: UUID,

@@ -41,6 +41,7 @@ from agent_hub.runtime.defaults import (
     _dispatch_parallelism,
     _dispatch_plan,
     _model_execution_plan_payload,
+    _prepare_capability_gateway_for_tenant,
     _role_model_fallbacks_by_id,
     _role_model_routing_matrix_payload,
     _select_logical_model_for_role,
@@ -225,6 +226,66 @@ class TenantPreparedPluginManifestCapabilityGateway(FakeCapabilityAvailability):
                 "capabilities": (),
             }
         return AvailablePluginManifestCapabilityGateway().capability_manifest(tenant_id)
+
+
+class RefreshingTenantPreparedCapabilityGateway(TenantPreparedPluginManifestCapabilityGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    async def refresh_tenant(self, tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        self.calls.append("refresh")
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        await super().ensure_tenant_loaded(tenant_id)
+        self.calls.append("ensure")
+
+
+@pytest.mark.asyncio
+async def test_self_repair_runtime_plan_refreshes_capabilities_before_prepare() -> None:
+    gateway = RefreshingTenantPreparedCapabilityGateway()
+
+    await _prepare_capability_gateway_for_tenant(
+        TENANT_ID,
+        capability_gateway=gateway,
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_accepted": True,
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "plugin_runtime_unavailable",
+                "recovery_strategy": "repair_plugin_endpoint_or_adapter_and_retry",
+                "requires_approval": False,
+                "automatic_execution": True,
+            },
+        },
+    )
+
+    assert gateway.calls == ["refresh", "ensure"]
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_self_repair_plan_does_not_refresh_capabilities() -> None:
+    gateway = RefreshingTenantPreparedCapabilityGateway()
+
+    await _prepare_capability_gateway_for_tenant(
+        TENANT_ID,
+        capability_gateway=gateway,
+        routing_decision={
+            "source": "self_repair",
+            "self_repair_accepted": False,
+            "self_repair_context": {
+                "source": "self_repair",
+                "failure_kind": "plugin_runtime_unavailable",
+                "recovery_strategy": "repair_plugin_endpoint_or_adapter_and_retry",
+                "requires_approval": False,
+                "automatic_execution": True,
+            },
+        },
+    )
+
+    assert gateway.calls == ["ensure"]
 
 
 class BadManifestCapabilityGateway(FakeCapabilityAvailability):

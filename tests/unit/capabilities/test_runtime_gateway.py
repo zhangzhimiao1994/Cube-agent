@@ -102,6 +102,15 @@ class PreparedTenantManifestSource(TenantAwareManifestSource):
         self.prepared_tenants.append(tenant_id)
 
 
+class ReloadableTenantManifestSource(TenantAwareManifestSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reloaded_tenants: list[UUID] = []
+
+    async def reload(self, tenant_id: UUID) -> None:
+        self.reloaded_tenants.append(tenant_id)
+
+
 class InvalidTenantManifestSource:
     def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
         return cast(Mapping[str, JsonValue], None)
@@ -131,6 +140,16 @@ async def test_runtime_gateway_prepares_manifest_sources_for_tenant(tmp_path: Pa
     await gateway.ensure_tenant_loaded(TENANT_ID)
 
     assert source.prepared_tenants == [TENANT_ID]
+
+
+async def test_runtime_gateway_refreshes_manifest_sources_for_tenant(tmp_path: Path) -> None:
+    source = ReloadableTenantManifestSource()
+    composite = CompositeCapabilityManifestSource((source, ToolRegistry()))
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path, tool_registry=composite)
+
+    await gateway.refresh_tenant(TENANT_ID)
+
+    assert source.reloaded_tenants == [TENANT_ID]
 
 
 async def test_runtime_gateway_reads_only_configured_workspace(tmp_path: Path) -> None:

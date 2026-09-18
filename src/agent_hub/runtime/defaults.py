@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import keyword
+import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
@@ -81,6 +82,8 @@ from agent_hub.runtime.self_repair_context import (
     self_repair_role_capability_requirements,
 )
 from agent_hub.security.secrets import SecretService
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SecretResolver(Protocol):
@@ -486,6 +489,7 @@ class ConfigBackedDispatchRuntime:
         await _prepare_capability_gateway_for_tenant(
             context.tenant_id,
             capability_gateway=self._capability_gateway,
+            routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         selected_roles = _selected_config_role_assignments(
@@ -665,6 +669,7 @@ class ConfigBackedDiscussionRuntime:
         await _prepare_capability_gateway_for_tenant(
             context.tenant_id,
             capability_gateway=self._capability_gateway,
+            routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         selected_roles = _selected_config_role_assignments(
@@ -818,6 +823,7 @@ class ConfigBackedHybridRuntime:
         await _prepare_capability_gateway_for_tenant(
             context.tenant_id,
             capability_gateway=self._capability_gateway,
+            routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
         profile = _task_profile(context.request)
@@ -1663,9 +1669,21 @@ async def _prepare_capability_gateway_for_tenant(
     tenant_id: UUID,
     *,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+    routing_decision: Mapping[str, JsonValue] | None = None,
 ) -> None:
     if capability_gateway is None:
         return
+    if _should_refresh_runtime_capabilities(routing_decision):
+        refresh_tenant = getattr(capability_gateway, "refresh_tenant", None)
+        if callable(refresh_tenant):
+            try:
+                await refresh_tenant(tenant_id)
+            except Exception as error:  # noqa: BLE001 - capability inventory remains optional planning context.
+                _LOGGER.warning(
+                    "runtime_capability_refresh_failed tenant_id=%s error_type=%s",
+                    tenant_id,
+                    type(error).__name__,
+                )
     ensure_tenant_loaded = getattr(capability_gateway, "ensure_tenant_loaded", None)
     if not callable(ensure_tenant_loaded):
         return
@@ -1673,6 +1691,20 @@ async def _prepare_capability_gateway_for_tenant(
         await ensure_tenant_loaded(tenant_id)
     except Exception:  # noqa: BLE001 - capability inventory remains optional planning context.
         return
+
+
+def _should_refresh_runtime_capabilities(
+    routing_decision: Mapping[str, JsonValue] | None,
+) -> bool:
+    if routing_decision is None:
+        return False
+    if routing_decision.get("self_repair_accepted") is not True:
+        return False
+    repair_payload = self_repair_recovery_plan_payload(routing_decision)
+    return (
+        repair_payload is not None
+        and repair_payload.get("refresh_runtime_capabilities") is True
+    )
 
 
 def _selected_config_role_assignments(
