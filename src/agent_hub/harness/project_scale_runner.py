@@ -1996,7 +1996,23 @@ def _should_attempt_deliverable_repair(
 def _has_deliverable_repair_trace(events: list[object] | None) -> bool:
     if not isinstance(events, list):
         return False
-    return any("deliverable.repair" in json.dumps(event, ensure_ascii=False).lower() for event in events)
+    return any(_event_has_deliverable_repair_marker(event) for event in events)
+
+
+def _event_has_deliverable_repair_marker(event: object) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    for key in ("kind", "event", "type", "action"):
+        marker = event.get(key)
+        if not isinstance(marker, str):
+            continue
+        normalized = marker.lower()
+        if normalized.startswith(("deliverable.repair.", "repair.deliverable.")):
+            return True
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        return _event_has_deliverable_repair_marker(payload)
+    return False
 
 
 def _has_self_repair_trace(events: object) -> bool:
@@ -2013,7 +2029,11 @@ def _event_has_self_repair_marker(event: object) -> bool:
         if not isinstance(marker, str):
             continue
         normalized = marker.lower()
-        if normalized.startswith("repair.") or "self_repair" in normalized:
+        if (
+            normalized.startswith("repair.")
+            or normalized.endswith(".self_repair")
+            or ".self_repair." in normalized
+        ):
             return True
     payload = event.get("payload")
     if isinstance(payload, Mapping):

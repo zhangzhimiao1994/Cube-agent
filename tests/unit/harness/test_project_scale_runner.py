@@ -19,6 +19,7 @@ from agent_hub.harness.project_scale_runner import (
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
+    _has_deliverable_repair_trace,
     _has_self_repair_trace,
     execute_project_scale_plan,
     format_project_scale_result_line,
@@ -123,6 +124,10 @@ def test_self_repair_trace_rejects_generic_repair_text() -> None:
     )
 
 
+def test_self_repair_trace_rejects_note_style_marker() -> None:
+    assert _has_self_repair_trace([{"kind": "message.self_repair_note"}]) is False
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -132,6 +137,31 @@ def test_self_repair_trace_rejects_generic_repair_text() -> None:
 )
 def test_self_repair_trace_accepts_explicit_repair_events(event: dict[str, object]) -> None:
     assert _has_self_repair_trace([event]) is True
+
+
+def test_deliverable_repair_trace_rejects_generic_keyword_text() -> None:
+    assert (
+        _has_deliverable_repair_trace(
+            [
+                {
+                    "kind": "message.created",
+                    "message": "Operator asked for deliverable.repair evidence in the prompt.",
+                }
+            ]
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"kind": "deliverable.repair.completed", "run_id": "repair-run"},
+        {"payload": {"event": "deliverable.repair.started"}},
+    ],
+)
+def test_deliverable_repair_trace_accepts_explicit_event_markers(event: object) -> None:
+    assert _has_deliverable_repair_trace([event]) is True
 
 
 def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) -> None:
