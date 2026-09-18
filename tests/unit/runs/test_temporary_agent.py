@@ -936,6 +936,32 @@ async def test_large_project_synonyms_require_preflight_approval(message: str) -
 
 
 @pytest.mark.asyncio
+async def test_large_project_discussion_without_build_intent_does_not_require_preflight() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="我想讨论大项目怎么管理，不要直接开始构建。",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.project_preflight_proposal is None
+    assert repository.records[submitted.id].routing_decision is not None
+    assert repository.outbox
+
+
+@pytest.mark.asyncio
 async def test_project_preflight_approval_enqueues_the_planned_run() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()

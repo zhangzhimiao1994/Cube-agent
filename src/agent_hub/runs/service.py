@@ -3044,6 +3044,26 @@ def _message_suggests_large_context(message: str) -> bool:
 
 def _message_suggests_ultra_large_project(message: str) -> bool:
     text = message.casefold()
+    discussion_markers = ("讨论", "咨询", "了解", "怎么管理", "怎么规划", "如何管理", "如何规划")
+    non_execution_markers = (
+        "不要直接开始构建",
+        "不要开始构建",
+        "不直接开始构建",
+        "别开始构建",
+        "暂不构建",
+        "不需要构建",
+        "不要直接实现",
+        "不要开始实现",
+        "暂不实现",
+        "不需要实现",
+        "不要执行",
+        "暂不执行",
+        "不执行",
+    )
+    if any(marker in text for marker in discussion_markers) and any(
+        marker in text for marker in non_execution_markers
+    ):
+        return False
     scale_markers = (
         "超大型项目",
         "超大型任务",
