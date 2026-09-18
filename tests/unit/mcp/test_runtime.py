@@ -414,3 +414,39 @@ async def test_runtime_mcp_reload_failure_does_not_block_later_retry() -> None:
 
     assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
     assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
+
+
+async def test_runtime_mcp_reload_failure_preserves_loaded_tenant_service() -> None:
+    admin_service = FailingOnceTenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    admin_service.failures_remaining = 0
+    client = InMemoryMcpClient(
+        tools=(McpToolSchema(name="web_search"),),
+        responses={"web_search": McpInvocationResult(content={"answer": "cached"})},
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: client,
+    )
+    await service.reload(OTHER_TENANT_ID)
+
+    admin_service.failures_remaining = 1
+    await service.reload(OTHER_TENANT_ID)
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="runtime_planning",
+        name="search.web_search",
+        arguments={"query": "still available"},
+        idempotency_key="mcp_preserved",
+    )
+
+    assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
+    assert result == {"answer": "cached"}
