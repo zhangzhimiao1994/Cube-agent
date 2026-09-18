@@ -66,6 +66,7 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.app import _submit_scheduled_task, create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PLUGIN_RUNTIME_FAILURE_CODES
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -93,7 +94,10 @@ from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_cache_signature_payload_sha256,
     plugin_package_dependency_lock,
 )
-from agent_hub.plugins.runtime import PluginInvocationContext, build_runtime_plugin_service
+from agent_hub.plugins.runtime import (
+    PluginInvocationContext,
+    build_runtime_plugin_service,
+)
 from agent_hub.runs.repository import RunRecord, _event_with_failure_diagnostic
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 from agent_hub.scheduler.service import SchedulerService
@@ -2846,6 +2850,59 @@ def test_tool_lifecycle_does_not_attach_unscoped_approval_to_every_tool() -> Non
 
     assert [item.approval_id for item in response.tool_lifecycle] == [None, None]
     assert [item.sequences for item in response.tool_lifecycle] == [[1], [2]]
+
+
+def test_tool_lifecycle_scopes_approval_to_matching_tool_call() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="waiting_approval",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.started",
+                message="tool.started",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="read_file",
+                tool_call_id="call_first",
+                step_id="engineer_step",
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="tool.started",
+                message="tool.started",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="write_file",
+                tool_call_id="call_second",
+                step_id="engineer_step",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="approval.requested",
+                message="approval.requested",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                step_id="engineer_step",
+                approval_id="approval_write",
+                payload={"tool_call_id": "call_second", "replay_safe": False},
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    lifecycles = {item.tool_call_id: item for item in response.tool_lifecycle}
+    assert lifecycles["call_first"].approval_id is None
+    assert lifecycles["call_first"].sequences == [1]
+    assert lifecycles["call_second"].approval_id == "approval_write"
+    assert lifecycles["call_second"].replay_safe is False
+    assert lifecycles["call_second"].sequences == [2, 3]
 
 
 def test_failure_diagnostics_redact_sensitive_approval_action() -> None:
@@ -5653,6 +5710,63 @@ def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
 
     assert response.status_code == 500
     assert not artifact_root.exists()
+
+
+def test_plugin_archive_install_keeps_existing_artifact_when_reused_persist_fails(
+    tmp_path: Path,
+) -> None:
+    class FailingPluginWriteService(InMemoryAdminResourceService):
+        async def upsert_plugin(
+            self,
+            request: PluginResourceRequest,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+            source_filename: str | None = None,
+            content_sha256: str | None = None,
+            package_metadata: PluginPackageMetadata | None = None,
+        ) -> PluginResourceResponse:
+            raise RuntimeError("plugin persistence failed")
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(private_key)
+    install_headers = {
+        **headers(),
+        "Content-Type": "application/zip",
+        "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+    }
+    first = api.post(
+        "/api/v1/admin/plugins/install",
+        headers=install_headers,
+        content=archive_bytes,
+    )
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    marker = artifact_root / ".existing-marker"
+    marker.write_text("keep existing artifact directory")
+    cast(Any, api.app).state.admin_resource_service = FailingPluginWriteService()
+
+    second = api.post(
+        "/api/v1/admin/plugins/install",
+        headers=install_headers,
+        content=archive_bytes,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 500
+    assert marker.read_text() == "keep existing artifact directory"
+    assert (artifact_root / "adapter" / "main.py").is_file()
 
 
 def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
@@ -10354,6 +10468,112 @@ async def test_plugin_admin_runtime_in_process_adapter_acceptance_records_safe_a
     assert event["details"]["permission_class"] == "local.execute"
     assert event["details"]["sandbox_profile"] == "in_process"
     assert "status" not in audit.text
+
+
+@pytest.mark.asyncio
+async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_service() -> None:
+    adapter_calls: list[dict[str, object]] = []
+
+    class InProcessAdapter:
+        async def invoke(
+            self,
+            *,
+            plugin: PluginResourceResponse,
+            capability: PluginCapabilityRequest,
+            arguments: Mapping[str, JsonValue],
+            context: PluginInvocationContext,
+        ) -> Mapping[str, JsonValue]:
+            adapter_calls.append(
+                {
+                    "plugin_id": plugin.id,
+                    "capability_id": capability.id,
+                    "arguments": dict(arguments),
+                    "idempotency_key": context.idempotency_key,
+                }
+            )
+            return {"ok": True}
+
+        def descriptor(self) -> Mapping[str, JsonValue]:
+            return {
+                "id": "local_tool",
+                "name": "Local Tool",
+                "description": "Runs a trusted local test adapter.",
+                "resource_schema": {"type": "object", "additionalProperties": False},
+                "capability_schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "sandbox_profile": {"type": "string", "enum": ("in_process",)},
+                    },
+                    "additionalProperties": True,
+                },
+                "argument_schema": {
+                    "type": "object",
+                    "required": ("command",),
+                    "properties": {"command": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            }
+
+    api = client()
+    admin_service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    runtime_plugin_service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"local_tool": InProcessAdapter()},
+    )
+    cast(Any, api.app).state.plugin_service = runtime_plugin_service
+    cast(Any, api.app).state.reload_plugin_runtime_config = runtime_plugin_service.reload
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "local",
+            "name": "Local Plugin",
+            "capabilities": [
+                {
+                    "id": "local.run",
+                    "adapter": "local_tool",
+                    "permission_class": "local.execute",
+                    "sandbox_profile": "in_process",
+                    "policy_effect": "require_approval",
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/local/start", headers=headers())
+    first = await runtime_plugin_service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="acceptance",
+        name="local.run",
+        arguments={"command": "status"},
+        idempotency_key="before-delete",
+    )
+
+    deleted = api.delete("/api/v1/admin/plugins/local", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    assert first == {"ok": True}
+    assert deleted.status_code == 200
+    assert runtime_plugin_service.is_available(TENANT_ID, "local.run") is False
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await runtime_plugin_service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="acceptance",
+            name="local.run",
+            arguments={"command": "status"},
+            idempotency_key="after-delete",
+        )
+    assert [call["idempotency_key"] for call in adapter_calls] == ["before-delete"]
 
 
 def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> None:

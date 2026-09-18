@@ -10372,6 +10372,16 @@ def _merge_tool_lifecycle_approval(
     approval_id = event.approval_id
     if approval_id is None:
         return
+    tool_call_id = _safe_diagnostic_payload_value(event, "tool_call_id")
+    if tool_call_id:
+        item = grouped.get(tool_call_id)
+        if item is not None:
+            cast(list[int], item["sequences"]).append(event.sequence)
+            item["approval_id"] = approval_id
+            replay_safe = event.payload.get("replay_safe")
+            if type(replay_safe) is bool:
+                item["replay_safe"] = replay_safe
+        return
     if event.step_id is None:
         return
     for item in grouped.values():
