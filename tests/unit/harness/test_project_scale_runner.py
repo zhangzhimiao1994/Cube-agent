@@ -1308,6 +1308,37 @@ python -m compileall direct_ledger tests
     assert result.errors == ()
 
 
+def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    shell_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed\n"
+                "- npm test: passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "echo build passed", "test": "echo tests passed"}},
+                sort_keys=True,
+            ),
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: missing source files" in result.errors
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
@@ -1546,6 +1577,7 @@ class FakeAcceptanceClient:
         self_repair_decision_token: str | None = None,
         self_repair_decision_version: int | None = None,
         public_self_repair_proposal: bool = True,
+        workspace_bundle: bytes | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -1582,6 +1614,7 @@ class FakeAcceptanceClient:
         self.self_repair_decision_token = self_repair_decision_token
         self.self_repair_decision_version = self_repair_decision_version
         self.public_self_repair_proposal = public_self_repair_proposal
+        self.workspace_bundle = workspace_bundle
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
@@ -1758,6 +1791,8 @@ class FakeAcceptanceClient:
         self.calls.append((method, path, None))
         if self.fail_bundle:
             raise RuntimeError("workspace bundle unavailable")
+        if self.workspace_bundle is not None:
+            return self.workspace_bundle
         self._next_execution_evidence()
         if not self.current_deliverable_quality:
             return _project_bundle({"README.md": "placeholder project"})

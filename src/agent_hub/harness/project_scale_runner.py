@@ -1901,7 +1901,7 @@ def _bundle_has_source_files(lowered_names: Sequence[str]) -> bool:
         name.startswith(("src/", "app/", "pages/"))
         or name.endswith(("/main.py", "/main.ts", "/main.tsx", "/index.html"))
         or _is_project_source_file(name)
-        or name in {"main.py", "index.html", "package.json"}
+        or name in {"main.py", "index.html"}
         for name in lowered_names
     )
 
