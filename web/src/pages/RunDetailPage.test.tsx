@@ -1273,6 +1273,89 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("plugin_runtime")).toBeNull();
   });
 
+  it("allows accepting a controlled self-repair proposal from run detail", async () => {
+    const user = userEvent.setup();
+    const requests: Array<{ path: string; method: string; body: unknown }> = [];
+    const failedRun: RunDetail = {
+      ...runDetail,
+      status: "failed",
+      version: 7,
+      decision_token: "repair-token",
+      repair_proposal: {
+        kind: "self_repair",
+        title: "重试失败的插件调用",
+        summary: "插件端点临时不可用，修复后只重试失败步骤。",
+        repair_action: "repair_plugin_endpoint_or_adapter",
+        failure_kind: "plugin_runtime_unavailable",
+        source_run_id: runId,
+        source_event_sequence: 3,
+        attempt: 1,
+        max_attempts: 2,
+        instruction: "只重试失败的插件工具调用。",
+        requires_approval: true,
+        replay_safe: true,
+        automatic_execution: false,
+        fingerprint: "repair-fingerprint",
+        recovery_strategy: "repair_plugin_endpoint_or_adapter_and_retry",
+      },
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), "https://agent-hub.test");
+        const method = init?.method ?? "GET";
+        if (url.pathname === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (url.pathname === `/api/v1/admin/runs/${runId}`) return jsonResponse(failedRun);
+        if (url.pathname === `/api/v1/runs/${runId}/accept-repair` && method === "POST") {
+          requests.push({
+            path: url.pathname,
+            method,
+            body: JSON.parse(String(init?.body)),
+          });
+          return jsonResponse({
+            ...failedRun,
+            status: "queued",
+            decision_token: null,
+            repair_proposal: null,
+          });
+        }
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const approval = await screen.findByRole("status", { name: "自修复确认" });
+    expect(within(approval).getByText("自修复待确认")).not.toBeNull();
+    expect(within(approval).getByText("重试失败的插件调用")).not.toBeNull();
+    expect(within(approval).getByText(/插件运行时不可用/)).not.toBeNull();
+    expect(within(approval).getByText(/修复插件端点或适配器/)).not.toBeNull();
+
+    await user.click(within(approval).getByRole("button", { name: "接受修复" }));
+
+    await waitFor(() => {
+      expect(requests).toEqual([
+        {
+          path: `/api/v1/runs/${runId}/accept-repair`,
+          method: "POST",
+          body: {
+            decision_token: "repair-token",
+            version: 7,
+          },
+        },
+      ]);
+    });
+  });
+
   it("labels repair intent metadata without exposing raw repair codes", async () => {
     const detailedRun: RunDetail = {
       ...runDetail,

@@ -28,6 +28,7 @@ type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
+type RepairProposal = NonNullable<RunDetail["repair_proposal"]>;
 type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
 type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
 type ApiCapabilityExecutionSummary = RunDetail["capability_execution_summary"];
@@ -444,6 +445,33 @@ function runDetailVersion(run: RunDetail) {
   const fallbackVersion = Number(run.explicit_details.version ?? "0");
   if (typeof run.version === "number" && Number.isInteger(run.version) && run.version > 0) return run.version;
   return Number.isInteger(fallbackVersion) && fallbackVersion > 0 ? fallbackVersion : 0;
+}
+
+function repairApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: runDetailVersion(run),
+    proposal: run.repair_proposal,
+  };
+}
+
+function repairProposalBody(proposal: RepairProposal) {
+  return [
+    proposal.summary,
+    `失败类型：${repairFailureKindLabel(proposal.failure_kind)}`,
+    `修复动作：${repairActionLabel(proposal.repair_action)}`,
+    `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
+    proposal.instruction ? `受控指令：${proposal.instruction}` : "",
+    proposal.recovery_strategy ? `恢复策略：${repairRecoveryStrategyLabel(proposal.recovery_strategy)}` : "",
+    proposal.orchestration_recovery_hint
+      ? `角色交接恢复：${repairRecoveryStrategyLabel(proposal.orchestration_recovery_hint)}`
+      : "",
+    proposal.automatic_execution
+      ? "该修复提案标记为自动执行。"
+      : "不会自动执行；只有确认后才会重新排队一次。",
+  ].filter(Boolean).join("\n\n");
 }
 
 function capabilityApprovalFromRunDetail(run: RunDetail | undefined): CapabilityApproval | null {
@@ -2415,6 +2443,21 @@ export function RunDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const acceptSelfRepair = useMutation({
+    mutationFn: () => {
+      const approval = repairApprovalFromRunDetail(run.data);
+      if (!approval) throw new Error("repair approval is unavailable");
+      return api.acceptSelfRepair(approval.runId, {
+        decision_token: approval.decisionToken,
+        version: approval.version,
+      });
+    },
+    onSuccess: async (updated) => {
+      queryClient.setQueryData(["run", runId], updated);
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
 
   if (run.isLoading) return <p>正在加载运行详情...</p>;
   if (run.isError || !run.data) {
@@ -2427,6 +2470,7 @@ export function RunDetailPage() {
   const canCancel = !TERMINAL_STATUSES.has(orderedRunData.status);
   const isWaitingForMode = orderedRunData.status === "waiting_user_mode" && Boolean(orderedRunData.decision_token);
   const capabilityApproval = capabilityApprovalFromRunDetail(orderedRunData);
+  const repairApproval = repairApprovalFromRunDetail(orderedRunData);
   const observerNotices = collectObserverNotices(orderedRunData.events);
   const timelineItems = detailTimelineItems(orderedRunData.events);
   const processCards = detailProcessCards(timelineItems, orderedRunData.artifacts);
@@ -2676,6 +2720,19 @@ export function RunDetailPage() {
                 </div>
               </aside>
             ) : null}
+            {repairApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
+                <div>
+                  <span className="eyebrow">自修复待确认</span>
+                  <strong>{repairApproval.proposal.title}</strong>
+                  <small>{repairApproval.proposal.summary}</small>
+                </div>
+                <p>{repairProposalBody(repairApproval.proposal)}</p>
+                <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                  {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
+                </button>
+              </aside>
+            ) : null}
             <div className="toolbar">
               <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
                 暂停
@@ -2696,6 +2753,7 @@ export function RunDetailPage() {
         {chooseMode.isError ? <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p> : null}
         {approveCapability.isError ? <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p> : null}
         {rejectCapability.isError ? <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p> : null}
+        {acceptSelfRepair.isError ? <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p> : null}
       </article>
 
       {observerNotices.length > 0 ? (
