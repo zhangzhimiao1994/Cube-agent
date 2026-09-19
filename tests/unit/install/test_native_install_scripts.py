@@ -110,7 +110,15 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "--profile codex|deepseek|all|production-safe" in command
     assert "--stress" in command
     assert "--strict-interaction-recovery" in command
+    assert "--runtime-lifecycle" in command
     assert "--read-only" in command
+    assert 'runtime_lifecycle="${AGENT_HUB_ACCEPTANCE_RUNTIME_LIFECYCLE:-0}"' in command
+    assert "run_authenticated_runtime_lifecycle_profile" in command
+    assert "profile: authenticated plugin/MCP runtime lifecycle" in command
+    assert "skip: plugin/MCP runtime lifecycle is disabled in read-only mode" in command
+    assert "runtime lifecycle plugin capability appears in manifest" in command
+    assert "runtime lifecycle MCP capability appears in manifest" in command
+    assert "runtime lifecycle removed capabilities disappear from manifest" in command
     assert 'production-safe) profile="all"; read_only=1 ;;' in command
     assert 'codex|deepseek|all|production-safe) ;;' in command
     assert "mode: read-only" in command

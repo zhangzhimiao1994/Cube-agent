@@ -6,6 +6,7 @@ public_url="${AGENT_HUB_ACCEPTANCE_PUBLIC_URL:-}"
 profile="all"
 stress=0
 strict_interaction_recovery="${AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY:-0}"
+runtime_lifecycle="${AGENT_HUB_ACCEPTANCE_RUNTIME_LIFECYCLE:-0}"
 project_scale_execute_profile="${AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE:-0}"
 project_scale_scales="${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALES:-${AGENT_HUB_PROJECT_SCALE_PROFILE_SCALE:-small,medium,large,ultra}}"
 project_scale_flows="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS:-${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOW:-direct,dispatch,hybrid,multi_agent,plugin,model_failure,self_repair,artifact_production,capability_validation}}"
@@ -69,6 +70,7 @@ Options:
                                  Acceptance profile to run. production-safe runs all profiles in read-only mode.
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
   --strict-interaction-recovery  Run authenticated, non-mutating interaction recovery probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
+  --runtime-lifecycle            Run authenticated plugin/MCP create-project-cleanup lifecycle probes.
   --stress                       Run bounded HTTP stress checks.
   --stress-profile smoke|standard|heavy|endurance|custom
                                  Run a named stress scale. Defaults to AGENT_HUB_ACCEPTANCE_STRESS_PROFILE or custom.
@@ -113,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --strict-interaction-recovery)
       strict_interaction_recovery=1
+      shift
+      ;;
+    --runtime-lifecycle)
+      runtime_lifecycle=1
       shift
       ;;
     --read-only)
@@ -231,6 +237,14 @@ case "$strict_interaction_recovery" in
   0|1) ;;
   *)
     printf 'AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY must be 0 or 1\n' >&2
+    exit 2
+    ;;
+esac
+
+case "$runtime_lifecycle" in
+  0|1) ;;
+  *)
+    printf 'AGENT_HUB_ACCEPTANCE_RUNTIME_LIFECYCLE must be 0 or 1\n' >&2
     exit 2
     ;;
 esac
@@ -3410,6 +3424,255 @@ run_authenticated_project_scale_execution_profile() {
     "$project_scale_scales" "$project_scale_flows"
 }
 
+run_authenticated_runtime_lifecycle_profile() {
+  local python_bin
+  local suffix
+  local plugin_id
+  local plugin_capability
+  local mcp_id
+  local mcp_tool
+  local plugin_body
+  local mcp_body
+  local manifest_response
+  local removed_manifest_response
+
+  printf 'profile: authenticated plugin/MCP runtime lifecycle\n'
+  if [[ "$read_only" -eq 1 ]]; then
+    printf 'skip: plugin/MCP runtime lifecycle is disabled in read-only mode\n'
+    return 0
+  fi
+  if [[ "$runtime_lifecycle" != "1" ]]; then
+    printf 'skip: plugin/MCP runtime lifecycle requires AGENT_HUB_ACCEPTANCE_RUNTIME_LIFECYCLE=1\n'
+    return 0
+  fi
+  if [[ -z "$bearer_token" ]]; then
+    printf 'skip: plugin/MCP runtime lifecycle requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or acceptance login credentials\n'
+    return 0
+  fi
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: plugin/MCP runtime lifecycle requires python for JSON handling\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  suffix="$(date +%s)-$$"
+  plugin_id="acceptance-plugin-$suffix"
+  plugin_capability="acceptance.lifecycle-$suffix"
+  mcp_id="acceptance-mcp-$suffix"
+  mcp_tool="echo-$suffix"
+
+  if ! plugin_body="$(
+    ACCEPTANCE_PLUGIN_ID="$plugin_id" \
+    ACCEPTANCE_PLUGIN_CAPABILITY="$plugin_capability" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "id": os.environ["ACCEPTANCE_PLUGIN_ID"],
+    "name": "Acceptance Plugin Lifecycle Probe",
+    "version": "acceptance",
+    "description": "Temporary plugin resource created by harness acceptance.",
+    "capabilities": [
+        {
+            "id": os.environ["ACCEPTANCE_PLUGIN_CAPABILITY"],
+            "adapter": "plugin_runtime",
+            "permission_class": "plugin.use",
+            "sandbox_profile": "remote_connector",
+            "policy_effect": "inherit",
+            "replay_safe": False,
+            "input_schema": {"type": "object", "additionalProperties": True},
+            "output_schema": {"type": "object", "additionalProperties": True},
+        },
+    ],
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build plugin runtime lifecycle request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! mcp_body="$(
+    ACCEPTANCE_MCP_ID="$mcp_id" \
+    ACCEPTANCE_MCP_TOOL="$mcp_tool" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "id": os.environ["ACCEPTANCE_MCP_ID"],
+    "name": "Acceptance MCP Lifecycle Probe",
+    "transport": "streamable_http",
+    "url": "https://example.com/mcp",
+    "domain_allowlist": ["example.com"],
+    "allowed_tools": [os.environ["ACCEPTANCE_MCP_TOOL"]],
+    "timeout_seconds": 1,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build MCP runtime lifecycle request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  cleanup_runtime_lifecycle() {
+    curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -sS \
+      -X DELETE \
+      -H "Authorization: Bearer $bearer_token" \
+      "$base_url/api/v1/admin/plugins/$plugin_id" >/dev/null 2>&1 || true
+    curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -sS \
+      -X DELETE \
+      -H "Authorization: Bearer $bearer_token" \
+      "$base_url/api/v1/admin/mcp/$mcp_id" >/dev/null 2>&1 || true
+  }
+  cleanup_runtime_lifecycle
+
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$plugin_body" \
+    "$base_url/api/v1/admin/plugins" >/dev/null 2>&1; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle plugin upsert\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -X POST \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/plugins/$plugin_id/enable" >/dev/null 2>&1; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle plugin enable\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -X POST \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/plugins/$plugin_id/start" >/dev/null 2>&1; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle plugin start\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  printf 'ok: runtime lifecycle plugin created and started\n'
+
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$mcp_body" \
+    "$base_url/api/v1/admin/mcp" >/dev/null 2>&1; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle MCP upsert\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  printf 'ok: runtime lifecycle MCP created\n'
+
+  if ! manifest_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/capabilities/manifest" 2>/dev/null)"; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle capability manifest fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$manifest_response" \
+    ACCEPTANCE_PLUGIN_CAPABILITY="$plugin_capability" \
+    ACCEPTANCE_MCP_CAPABILITY="$mcp_id.$mcp_tool" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+items = {
+    item.get("id"): item
+    for item in payload.get("capabilities", [])
+    if isinstance(item, dict)
+}
+plugin_capability = items.get(os.environ["ACCEPTANCE_PLUGIN_CAPABILITY"])
+if not isinstance(plugin_capability, dict):
+    raise SystemExit("plugin capability missing")
+if plugin_capability.get("kind") != "plugin":
+    raise SystemExit("plugin capability kind mismatch")
+if plugin_capability.get("available") is not True:
+    raise SystemExit("plugin capability must be available after start")
+mcp_capability = items.get(os.environ["ACCEPTANCE_MCP_CAPABILITY"])
+if not isinstance(mcp_capability, dict):
+    raise SystemExit("mcp capability missing")
+if mcp_capability.get("kind") != "mcp":
+    raise SystemExit("mcp capability kind mismatch")
+PY
+  then
+    printf 'ok: runtime lifecycle plugin capability appears in manifest\n'
+    printf 'ok: runtime lifecycle MCP capability appears in manifest\n'
+  else
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle capabilities must appear in manifest\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  cleanup_runtime_lifecycle
+  if ! removed_manifest_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/capabilities/manifest" 2>/dev/null)"; then
+    printf 'fail: runtime lifecycle cleanup manifest fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$removed_manifest_response" \
+    ACCEPTANCE_PLUGIN_CAPABILITY="$plugin_capability" \
+    ACCEPTANCE_MCP_CAPABILITY="$mcp_id.$mcp_tool" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+ids = {
+    item.get("id")
+    for item in payload.get("capabilities", [])
+    if isinstance(item, dict)
+}
+if os.environ["ACCEPTANCE_PLUGIN_CAPABILITY"] in ids:
+    raise SystemExit("plugin capability still present")
+if os.environ["ACCEPTANCE_MCP_CAPABILITY"] in ids:
+    raise SystemExit("mcp capability still present")
+PY
+  then
+    printf 'ok: runtime lifecycle removed capabilities disappear from manifest\n'
+    return 0
+  fi
+  printf 'fail: runtime lifecycle removed capabilities disappear from manifest\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_multimode_interaction_matrix() {
   local python_bin
   local script_dir
@@ -4769,6 +5032,10 @@ fi
 
 if [[ "$strict_interaction_recovery" -eq 1 ]]; then
   run_strict_interaction_recovery_profile || true
+fi
+
+if [[ "$runtime_lifecycle" -eq 1 ]]; then
+  run_authenticated_runtime_lifecycle_profile || true
 fi
 
 if [[ "$verify_release" -eq 1 ]]; then
