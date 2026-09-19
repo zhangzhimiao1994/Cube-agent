@@ -3433,7 +3433,11 @@ run_authenticated_runtime_lifecycle_profile() {
   local mcp_tool
   local plugin_body
   local mcp_body
+  local plugin_registry_response
+  local mcp_registry_response
   local manifest_response
+  local removed_plugin_registry_response
+  local removed_mcp_registry_response
   local removed_manifest_response
 
   printf 'profile: authenticated plugin/MCP runtime lifecycle\n'
@@ -3588,6 +3592,57 @@ PY
   fi
   printf 'ok: runtime lifecycle MCP created\n'
 
+  if ! plugin_registry_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/plugins" 2>/dev/null)"; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle plugin registry fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! mcp_registry_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/mcp" 2>/dev/null)"; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle MCP registry fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_PLUGIN_REGISTRY_RESPONSE="$plugin_registry_response" \
+    ACCEPTANCE_MCP_REGISTRY_RESPONSE="$mcp_registry_response" \
+    ACCEPTANCE_PLUGIN_ID="$plugin_id" \
+    ACCEPTANCE_MCP_ID="$mcp_id" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+plugins = json.loads(os.environ["ACCEPTANCE_PLUGIN_REGISTRY_RESPONSE"])
+mcps = json.loads(os.environ["ACCEPTANCE_MCP_REGISTRY_RESPONSE"])
+if os.environ["ACCEPTANCE_PLUGIN_ID"] not in {
+    item.get("id") for item in plugins if isinstance(item, dict)
+}:
+    raise SystemExit("plugin missing from registry")
+if os.environ["ACCEPTANCE_MCP_ID"] not in {
+    item.get("id") for item in mcps if isinstance(item, dict)
+}:
+    raise SystemExit("mcp missing from registry")
+PY
+  then
+    printf 'ok: runtime lifecycle plugin appears in registry\n'
+    printf 'ok: runtime lifecycle MCP appears in registry\n'
+  else
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle resources must appear in registries\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
   if ! manifest_response="$(curl --noproxy '*' \
     --connect-timeout "$connect_timeout" \
     --max-time "$max_time" \
@@ -3636,6 +3691,53 @@ PY
   fi
 
   cleanup_runtime_lifecycle
+  if ! removed_plugin_registry_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/plugins" 2>/dev/null)"; then
+    printf 'fail: runtime lifecycle cleanup plugin registry fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ! removed_mcp_registry_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/mcp" 2>/dev/null)"; then
+    printf 'fail: runtime lifecycle cleanup MCP registry fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_PLUGIN_REGISTRY_RESPONSE="$removed_plugin_registry_response" \
+    ACCEPTANCE_MCP_REGISTRY_RESPONSE="$removed_mcp_registry_response" \
+    ACCEPTANCE_PLUGIN_ID="$plugin_id" \
+    ACCEPTANCE_MCP_ID="$mcp_id" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+plugins = json.loads(os.environ["ACCEPTANCE_PLUGIN_REGISTRY_RESPONSE"])
+mcps = json.loads(os.environ["ACCEPTANCE_MCP_REGISTRY_RESPONSE"])
+if os.environ["ACCEPTANCE_PLUGIN_ID"] in {
+    item.get("id") for item in plugins if isinstance(item, dict)
+}:
+    raise SystemExit("plugin still present in registry")
+if os.environ["ACCEPTANCE_MCP_ID"] in {
+    item.get("id") for item in mcps if isinstance(item, dict)
+}:
+    raise SystemExit("mcp still present in registry")
+PY
+  then
+    printf 'ok: runtime lifecycle removed resources disappear from registries\n'
+  else
+    printf 'fail: runtime lifecycle removed resources disappear from registries\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
   if ! removed_manifest_response="$(curl --noproxy '*' \
     --connect-timeout "$connect_timeout" \
     --max-time "$max_time" \

@@ -116,8 +116,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "run_authenticated_runtime_lifecycle_profile" in command
     assert "profile: authenticated plugin/MCP runtime lifecycle" in command
     assert "skip: plugin/MCP runtime lifecycle is disabled in read-only mode" in command
+    assert "runtime lifecycle plugin appears in registry" in command
+    assert "runtime lifecycle MCP appears in registry" in command
     assert "runtime lifecycle plugin capability appears in manifest" in command
     assert "runtime lifecycle MCP capability appears in manifest" in command
+    assert "runtime lifecycle removed resources disappear from registries" in command
     assert "runtime lifecycle removed capabilities disappear from manifest" in command
     assert 'production-safe) profile="all"; read_only=1 ;;' in command
     assert 'codex|deepseek|all|production-safe) ;;' in command
