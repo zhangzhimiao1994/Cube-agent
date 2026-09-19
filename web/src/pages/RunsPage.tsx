@@ -5659,8 +5659,8 @@ export function RunsPage() {
               <span>{mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 个角色` : "自动角色"}</span>
             </div>
           </div>
-          <details className="run-settings-panel" aria-label="本次运行设置" open>
-            <summary aria-label="展开或收起本次运行设置">执行前设置</summary>
+          <details className="run-settings-panel" aria-label="本次运行设置">
+            <summary aria-label="展开或收起本次运行设置">详细设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
             <label htmlFor="run-mode">
               模式

@@ -1598,6 +1598,10 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /打开本次运行配置|open/i }));
   }
 
+  async function expandRunConfigDetails(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByText("详细设置"));
+  }
+
   it("shows run operations and supports pause control on the detail page", async () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
@@ -2285,6 +2289,7 @@ describe("operational management pages", () => {
     expect(screen.getByText(/连续对话窗口/)).not.toBeNull();
 
     await openRunConfig(user);
+    await expandRunConfigDetails(user);
     await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
     expect(screen.getByText(/临场调整 开/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
@@ -2312,6 +2317,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await openRunConfig(user);
+    await expandRunConfigDetails(user);
     await user.clear(screen.getByLabelText("项目文件夹"));
     await user.type(screen.getByLabelText("项目文件夹"), "Mofang Agent");
     await user.type(screen.getByLabelText("项目名称"), "魔方 Agent");
@@ -6729,6 +6735,7 @@ describe("operational management pages", () => {
 
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
     await openRunConfig(user);
+    await expandRunConfigDetails(user);
     await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
@@ -6767,6 +6774,7 @@ describe("operational management pages", () => {
 
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
     await openRunConfig(user);
+    await expandRunConfigDetails(user);
     await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
@@ -6816,7 +6824,7 @@ describe("operational management pages", () => {
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
     await openRunConfig(user);
     expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
-    expect(screen.getByText("执行前设置")).not.toBeNull();
+    expect(screen.getByText("详细设置")).not.toBeNull();
   });
 
   it("keeps the new chat controls compact while exposing pre-run sandbox settings", async () => {
@@ -6833,6 +6841,8 @@ describe("operational management pages", () => {
     await openRunConfig(user);
     const config = screen.getByRole("region", { name: "本次运行更多设置" });
     expect(within(config).getByLabelText("本次运行设置概览")).not.toBeNull();
+    expect(within(config).getByText("详细设置")).not.toBeNull();
+    await expandRunConfigDetails(user);
     expect(within(config).getByRole("group", { name: "选择本次运行沙箱权限" })).not.toBeNull();
     expect(within(config).getByText("角色池 · 自动")).not.toBeNull();
   });
@@ -6844,6 +6854,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await openRunConfig(user);
+    await expandRunConfigDetails(user);
     await user.type(screen.getByLabelText("参考会话 ID"), "conv-previous");
     await user.click(screen.getByRole("button", { name: "读取参考会话" }));
 
