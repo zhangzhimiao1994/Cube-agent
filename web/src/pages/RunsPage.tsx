@@ -802,6 +802,16 @@ function toolEventName(event: RunDetail["events"][number]) {
   return event.tool_name || formatEventPayloadValue(event.payload.name) || "工具";
 }
 
+function toolOperationKindLabel(operationKind: string) {
+  const normalized = operationKind.toLowerCase().replace(/[.\s-]+/g, "_");
+  if (normalized === "terminal" || normalized === "server_command") return "运行终端";
+  if (normalized === "file_create") return "创建文件";
+  if (normalized === "file_edit" || normalized === "file_write") return "编辑文件";
+  if (normalized === "file_read") return "读取文件";
+  if (normalized === "browser" || normalized === "screen_read" || normalized === "desktop_action") return "浏览操作";
+  return "";
+}
+
 function toolOperationLabel(toolName: string) {
   const normalized = toolName.toLowerCase().replace(/[.\s-]+/g, "_");
   if (
@@ -825,15 +835,20 @@ function toolOperationLabel(toolName: string) {
   return "使用工具";
 }
 
+function toolOperationLabelForEvent(event: RunDetail["events"][number]) {
+  const operationKindLabel = toolOperationKindLabel(formatEventPayloadValue(event.payload.operation_kind));
+  return operationKindLabel || toolOperationLabel(toolEventName(event));
+}
+
 function toolDisplayName(event: RunDetail["events"][number]) {
   const toolName = toolEventName(event);
-  const operation = toolOperationLabel(toolName);
+  const operation = toolOperationLabelForEvent(event);
   return operation === "使用工具" ? toolName : operation;
 }
 
 function toolSummaryWithDisplay(event: RunDetail["events"][number], suffix = "") {
   const toolName = toolEventName(event);
-  const operation = toolOperationLabel(toolName);
+  const operation = toolOperationLabelForEvent(event);
   const displayName = toolDisplayName(event);
   const detail = displayName === operation ? "" : `：${displayName}`;
   return `${operation}${suffix}${detail}`;
@@ -2457,7 +2472,7 @@ function workbenchFileOperationFromArtifact(artifact: DownloadableFile) {
   const kind = artifact.kind?.toLowerCase() ?? "";
   const title = artifact.title?.toLowerCase() ?? "";
   if (kind.includes("workspace_bundle") || title.includes("文件夹")) return "文件夹";
-  if (kind.includes("workspace_file")) return "产物";
+  if (kind.includes("workspace_file")) return "创建文件";
   return "产物";
 }
 
@@ -2472,6 +2487,9 @@ function workbenchFileOperationFromProcessItem(item: ProcessDetailTarget | null,
   const text = `${item.title} ${item.message} ${item.rows.map((row) => `${row.label} ${row.value}`).join(" ")}`;
   const toolOperation = asWorkbenchFileOperation(badge);
   if (toolOperation && toolOperation !== "产物" && toolOperation !== "文件夹") return toolOperation;
+  if (/操作类别\s+file_create|file_create/i.test(text)) return "创建文件";
+  if (/操作类别\s+(file_edit|file_write)|file_edit|file_write/i.test(text)) return "编辑文件";
+  if (/操作类别\s+file_read|file_read/i.test(text)) return "读取文件";
   if (/编辑文件|修改|patch|edit/i.test(`${badge} ${text}`)) return "编辑文件";
   if (/创建文件|生成文件|write|create/i.test(`${badge} ${text}`)) return "创建文件";
   if (/读取文件|read/i.test(`${badge} ${text}`)) return "读取文件";
@@ -2988,7 +3006,8 @@ function eventSummaryText(
   }
   if (event.kind === "tool.requested") {
     const requestedTool = formatEventPayloadValue(event.payload.name) || event.tool_name || "工具";
-    const requestedDisplay = toolOperationLabel(requestedTool) === "使用工具" ? requestedTool : toolOperationLabel(requestedTool);
+    const requestedOperation = toolOperationLabelForEvent(event);
+    const requestedDisplay = requestedOperation === "使用工具" ? requestedTool : requestedOperation;
     return `工具请求：${conciseProcessText(requestedDisplay, "工具")}`;
   }
   if (event.kind === "tool.started") {
@@ -3099,7 +3118,7 @@ function processBadgeForEvent(event: RunEvent) {
   if (event.kind === "model.reasoning_delta") return "思考过程";
   if (event.kind === "model.text_delta") return "输出进度";
   if (event.kind === "tool.started" || event.kind === "tool.completed" || event.kind === "tool.failed") {
-    return toolOperationLabel(toolEventName(event));
+    return toolOperationLabelForEvent(event);
   }
   if (event.kind.startsWith("model.")) return "模型调用";
   if (event.kind.startsWith("tool.")) return "工具过程";

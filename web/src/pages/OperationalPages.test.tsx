@@ -2528,6 +2528,7 @@ describe("operational management pages", () => {
 
     await openWorkbenchView(user, workbench, "文件");
     const fileWindow = within(workbench).getByRole("region", { name: "文件窗口" });
+    expect(within(fileWindow).getAllByText("创建文件").length).toBeGreaterThan(0);
     expect(within(fileWindow).getByRole("button", { name: /src\/app\.py/ })).not.toBeNull();
     expect(await within(fileWindow).findByText("print('hello from workspace')")).not.toBeNull();
     expect(within(fileWindow).getByRole("button", { name: "下载 app.py" })).not.toBeNull();

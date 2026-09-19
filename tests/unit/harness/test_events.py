@@ -362,6 +362,18 @@ def test_safe_tool_event_payload_projects_terminal_result_metadata_only() -> Non
     assert '"result"' not in serialized
 
 
+def test_safe_tool_event_payload_marks_generated_file_tools_as_file_create() -> None:
+    for tool_name in (
+        "document.generate_docx",
+        "presentation.generate_pptx",
+        "project.generate_zip",
+        "project.preflight_architecture",
+    ):
+        payload = safe_tool_event_payload(name=tool_name, status="succeeded")
+
+        assert payload["operation_kind"] == "file_create"
+
+
 def test_gateway_completion_projects_safe_model_completed_event() -> None:
     completion = GatewayCompletion(
         response=ModelResponse(

@@ -363,6 +363,17 @@ def _tool_operation_kind(name: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
     if any(token in normalized for token in ("run_safe_command", "terminal", "shell", "exec")):
         return "terminal"
+    if (
+        normalized
+        in {
+            "document_generate_docx",
+            "presentation_generate_pptx",
+            "project_generate_zip",
+            "project_preflight_architecture",
+        }
+        or any(token in normalized for token in ("generate_docx", "generate_pptx", "generate_zip", "preflight_architecture"))
+    ):
+        return "file_create"
     if any(token in normalized for token in ("edit", "write", "patch")):
         return "file_edit"
     if any(token in normalized for token in ("read", "context", "workspace")):
