@@ -2038,7 +2038,24 @@ def _nearby_block_has_execution_pass(text: str, command_markers: Sequence[str]) 
 
 
 def _has_execution_pass_marker(text: str) -> bool:
-    return _EXECUTION_PASS_RE.search(text) is not None
+    return _EXECUTION_PASS_RE.search(text) is not None and _has_execution_detail_marker(text)
+
+
+def _has_execution_detail_marker(text: str) -> bool:
+    return (
+        re.search(r"\bexit(?:\s+code)?\s*[:=]?\s*0\b", text) is not None
+        or re.search(r"\bran\s+\d+\s+tests?\b", text) is not None
+        or re.search(r"\b\d+\s+(?:tests?\s+)?passed\b", text) is not None
+        or "0 failed" in text
+        or "compileall" in text
+        or "byte-compile" in text
+        or "node --check" in text
+        or "tsc -p" in text
+        or "vite build" in text
+        or "vitest" in text
+        or "pytest" in text
+        or "unittest" in text
+    )
 
 
 def _should_attempt_deliverable_repair(

@@ -610,6 +610,15 @@ def test_planned_interaction_smoke_does_not_count_as_execution_success() -> None
     assert _bundle_has_build_test_execution_evidence(verification_text) is False
 
 
+def test_simple_passed_lines_do_not_count_as_reproducible_execution_evidence() -> None:
+    verification_text = """
+    - npm run build: passed
+    - npm test: passed
+    """
+
+    assert _bundle_has_build_test_execution_evidence(verification_text) is False
+
+
 def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_repair() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
     client = FakeAcceptanceClient(
@@ -1028,8 +1037,8 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
                 "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
                 "VERIFICATION.md": (
-                    "- npm run build: passed\n"
-                    "- npm test: passed\n"
+                    "- npm run build: passed exit 0; vite build completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
                     "- interaction smoke: passed\n"
                 ),
                 "package.json": json.dumps(
@@ -1091,8 +1100,8 @@ def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> 
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
                 "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
                 "VERIFICATION_REPORT.md": (
-                    "- npm run build: passed\n"
-                    "- npm test: passed\n"
+                    "- npm run build: passed exit 0; vite build completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
                     "- interaction smoke: passed\n"
                 ),
                 "package.json": json.dumps(
@@ -1163,8 +1172,8 @@ Implements the requested project scope.
 ### `VERIFICATION.md`
 
 ```markdown
-- npm run build: passed
-- npm test: passed
+- npm run build: passed exit 0; vite build completed
+- npm test: passed exit 0; 1 test passed
 - interaction smoke: passed
 ```
 
@@ -1257,11 +1266,13 @@ Implements the requested project scope.
 ```markdown
 ## Reproducible build evidence
 npm run build
-{{"build": "ok"}}
+{{"build": "ok", "exit_code": 0, "tool": "compileall"}}
 
 ## Reproducible test evidence
 npm test
-Expected deterministic result: all cases pass.
+Ran 1 test
+OK
+exit 0
 
 npm run test:interaction
 - build_passed: true
@@ -1329,8 +1340,8 @@ def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
             "VERIFICATION.md": (
-                "- npm run build: passed\n"
-                "- npm test: passed\n"
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
                 "- interaction smoke: passed\n"
             ),
             "package.json": json.dumps(
@@ -1361,8 +1372,8 @@ def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
             "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
             "VERIFICATION.md": (
-                "- npm run build: passed\n"
-                "- npm test: passed\n"
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
                 "- interaction smoke: passed\n"
             ),
             "package.json": json.dumps(
@@ -1394,8 +1405,8 @@ def test_execute_project_scale_plan_rejects_import_only_test_files() -> None:
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
             "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
             "VERIFICATION.md": (
-                "- npm run build: passed\n"
-                "- npm test: passed\n"
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
                 "- interaction smoke: passed\n"
             ),
             "package.json": json.dumps(
@@ -1894,7 +1905,9 @@ class FakeAcceptanceClient:
                 }
             )
         verification = (
-            "- npm run build: passed\n- npm test: passed\n- interaction smoke: passed\n"
+            "- npm run build: passed exit 0; vite build completed\n"
+            "- npm test: passed exit 0; 1 test passed\n"
+            "- interaction smoke: passed\n"
             if self.current_execution_evidence
             else "- npm run build\n- npm test\n- interaction smoke planned\n"
         )
