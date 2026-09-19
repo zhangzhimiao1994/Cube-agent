@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +15,20 @@ const rawPayloadOutput =
 const longUnsafeSummary =
   "SUMMARY_SHOULD_BE_COMPACTED_BEFORE_DRAWER_RENDERING 第一段非常长，包含很多模型运行细节，不能完整平铺在一级页面或动作详情抽屉里。第二段继续追加上下文。";
 const nestedSecret = "NESTED_SECRET_SHOULD_NEVER_RENDER";
+
+it("keeps process detail values readable in narrow workbench drawers", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.run-process-detail dd\s*{[\s\S]*overflow-wrap:\s*anywhere;[\s\S]*word-break:\s*break-word;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 980px\)[\s\S]*\.run-process-detail dl\s*{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 980px\)[\s\S]*\.process-intermediate-card > strong,[\s\S]*\.process-intermediate-card > small:not\(\.process-card-badge\)\s*{[\s\S]*grid-column:\s*2;/,
+  );
+});
 
 const runDetail: RunDetail = {
   id: runId,

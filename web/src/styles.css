@@ -2860,8 +2860,9 @@ article:hover {
 .run-process-detail dl {
   display: grid;
   gap: 0.35rem 0.65rem;
-  grid-template-columns: max-content minmax(0, 1fr);
+  grid-template-columns: minmax(6.5rem, max-content) minmax(0, 1fr);
   margin: 0.55rem 0 0;
+  min-width: 0;
 }
 
 .run-process-detail dt {
@@ -2875,9 +2876,9 @@ article:hover {
   color: var(--text);
   margin: 0;
   min-width: 0;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
-  word-break: normal;
+  word-break: break-word;
 }
 
 .run-process-detail small {
@@ -2990,9 +2991,10 @@ article:hover {
   font-size: 0.86rem;
   line-height: 1.48;
   margin: -0.28rem 0 0;
-  overflow-wrap: break-word;
+  min-width: 0;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
-  word-break: normal;
+  word-break: break-word;
 }
 
 .artifact-file-card {
@@ -4672,6 +4674,43 @@ article:hover {
   .nav-floating .nav-list,
   .nav-floating .nav-drawer {
     display: none;
+  }
+
+  .run-process-detail dl {
+    gap: 0.24rem;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .run-process-detail dt {
+    font-size: 0.72rem;
+    overflow-wrap: anywhere;
+  }
+
+  .run-process-detail dd,
+  .process-detail-modal dd {
+    line-height: 1.55;
+    overflow-x: auto;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .process-detail-card,
+  .process-intermediate-card {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .process-intermediate-card > span:first-child {
+    grid-row: 1 / span 3;
+  }
+
+  .process-card-badge {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .process-intermediate-card > strong,
+  .process-intermediate-card > small:not(.process-card-badge) {
+    grid-column: 2;
   }
 
   .nav-floating .mobile-nav-groups {
