@@ -1,3 +1,5 @@
+import zipfile
+from io import BytesIO
 from typing import cast
 from uuid import uuid4
 
@@ -6,6 +8,7 @@ import pytest
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.project_scale_runner import (
     _embedded_workspace_bundle_from_text,
+    _workspace_bundle_agent_standard_reasons,
     _workspace_bundle_project_quality_reasons,
 )
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
@@ -15,6 +18,18 @@ from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_
 
 class UnusedGateway:
     pass
+
+
+def test_project_scale_fixture_files_include_agent_standard_reading_evidence() -> None:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in project_scale_artifact_zip_files(
+            "Project-scale acceptance fixture: build a small project for scale=small "
+            "and flow=artifact_production."
+        ).items():
+            archive.writestr(path, content)
+
+    assert _workspace_bundle_agent_standard_reasons(buffer.getvalue()) == ()
 
 
 def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -> None:

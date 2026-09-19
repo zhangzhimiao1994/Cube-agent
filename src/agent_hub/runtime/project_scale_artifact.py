@@ -245,6 +245,25 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "4. Package the workspace as a final attachment.\n"
             "5. Record verification evidence for build, tests, interaction, and artifact integrity.\n"
         ),
+        "constraints_reading_evidence.json": json.dumps(
+            {
+                "read_before_implementation": True,
+                "constraint_sources": [
+                    "AGENTS.md workspace rules",
+                    "HANDOFF current-state index",
+                    "PROJECT_REQUIREMENTS.md",
+                    "project-scale artifact production constraints",
+                ],
+                "skill_rules": [
+                    "applicable SKILL.md inventory",
+                    "project-scale agent-standard rules",
+                    "workspace rules",
+                ],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
         "VERIFICATION.md": (
             "# Verification\n\n"
             "- npm run build: passed; exit 0; tsc -p tsconfig.json --noEmit completed.\n"
