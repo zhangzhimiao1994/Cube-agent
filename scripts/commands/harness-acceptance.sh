@@ -12,6 +12,8 @@ project_scale_flows="${AGENT_HUB_PROJECT_SCALE_PROFILE_FLOWS:-${AGENT_HUB_PROJEC
 project_scale_wait_seconds="${AGENT_HUB_PROJECT_SCALE_WAIT_SECONDS:-120}"
 project_scale_poll_interval="${AGENT_HUB_PROJECT_SCALE_POLL_INTERVAL_SECONDS:-2}"
 project_scale_report_path="${AGENT_HUB_PROJECT_SCALE_REPORT_PATH:-}"
+project_scale_verify_artifact_build="${AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD:-0}"
+project_scale_artifact_build_timeout="${AGENT_HUB_PROJECT_SCALE_ARTIFACT_BUILD_TIMEOUT_SECONDS:-120}"
 read_only=0
 stress_profile="${AGENT_HUB_ACCEPTANCE_STRESS_PROFILE:-custom}"
 concurrency="${AGENT_HUB_ACCEPTANCE_CONCURRENCY:-4}"
@@ -57,6 +59,8 @@ AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID when the target tenant is not the
 configured bootstrap tenant.
 Set AGENT_HUB_PROJECT_SCALE_EXECUTE_PROFILE=1 with a bearer token to run
 the authenticated bounded project-scale execution runner.
+Set AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD=1 to make that runner
+download generated project ZIPs and run real build/test validation.
 
 Options:
   --base-url URL                 Base URL to test.
@@ -227,6 +231,14 @@ case "$strict_interaction_recovery" in
   0|1) ;;
   *)
     printf 'AGENT_HUB_ACCEPTANCE_STRICT_INTERACTION_RECOVERY must be 0 or 1\n' >&2
+    exit 2
+    ;;
+esac
+
+case "$project_scale_verify_artifact_build" in
+  0|1) ;;
+  *)
+    printf 'AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD must be 0 or 1\n' >&2
     exit 2
     ;;
 esac
@@ -3041,8 +3053,8 @@ check_project_scale_runner_contract() {
     failures=$((failures + 1))
     return 1
   fi
-  if [[ "$help_output" != *"--execute"* || "$help_output" != *"--wait-seconds"* || "$help_output" != *"--poll-interval"* || "$help_output" != *"--output"* ]]; then
-    printf 'fail: project scale execution runner help missing execute/wait options\n' >&2
+  if [[ "$help_output" != *"--execute"* || "$help_output" != *"--wait-seconds"* || "$help_output" != *"--poll-interval"* || "$help_output" != *"--output"* || "$help_output" != *"--verify-artifact-build"* || "$help_output" != *"--artifact-build-timeout"* ]]; then
+    printf 'fail: project scale execution runner help missing execute/wait/artifact-build options\n' >&2
     failures=$((failures + 1))
     return 1
   fi
@@ -3374,6 +3386,10 @@ run_authenticated_project_scale_execution_profile() {
   done
   args+=(--wait-seconds "$project_scale_wait_seconds")
   args+=(--poll-interval "$project_scale_poll_interval")
+  if [[ "$project_scale_verify_artifact_build" == "1" ]]; then
+    args+=(--verify-artifact-build)
+    args+=(--artifact-build-timeout "$project_scale_artifact_build_timeout")
+  fi
   if [[ -n "$project_scale_report_path" ]]; then
     args+=(--output "$project_scale_report_path")
   fi

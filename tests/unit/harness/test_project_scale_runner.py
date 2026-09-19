@@ -31,6 +31,7 @@ from agent_hub.harness.project_scale_runner import (
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
     _plugin_contract_payload_passes,
+    _safe_zip_member_path,
     _workspace_bundle_agent_standard_reasons,
     execute_project_scale_plan,
     format_project_scale_result_line,
@@ -100,8 +101,11 @@ def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_execute_project_scale_plan(*args: object, **_kwargs: object) -> ProjectScaleExecutionReport:
+    def fake_execute_project_scale_plan(
+        *args: object, **kwargs: object
+    ) -> ProjectScaleExecutionReport:
         captured["plan"] = args[0]
+        captured["kwargs"] = kwargs
         return ProjectScaleExecutionReport(results=())
 
     monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "test-token")
@@ -126,6 +130,44 @@ def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     assert {request.case_id for request in plan.requests} == {
         f"{scale}:{flow}" for scale in PROJECT_SCALE_TIERS for flow in PROJECT_SCALE_FLOW_KINDS
     }
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["validate_generated_project"] is False
+
+
+def test_project_scale_runner_execute_can_enable_generated_project_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execute_project_scale_plan(
+        *args: object, **kwargs: object
+    ) -> ProjectScaleExecutionReport:
+        captured["plan"] = args[0]
+        captured["kwargs"] = kwargs
+        return ProjectScaleExecutionReport(results=())
+
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "test-token")
+    monkeypatch.setenv("AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD", "1")
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "execute_project_scale_plan",
+        fake_execute_project_scale_plan,
+    )
+
+    exit_code = project_scale_runner_module.main(
+        ["--execute", "--artifact-build-timeout", "9", "--json"]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    assert exit_code == 0
+    assert payload["execute"] is True
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["validate_generated_project"] is True
+    assert kwargs["generated_project_timeout_seconds"] == 9
 
 
 def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
@@ -1577,6 +1619,134 @@ def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> 
     report = execute_project_scale_plan(plan, client)
 
     assert report.ok is True
+
+
+def test_execute_project_scale_plan_can_validate_generated_project_bundle() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+        generated_project_commands=(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; assert Path('package.json').exists(); "
+                    "assert Path('src/main.js').exists()"
+                ),
+            ),
+        ),
+    )
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["generated_project_validation"] is True
+    assert result.errors == ()
+
+
+def test_execute_project_scale_plan_fails_when_generated_project_validation_fails() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+        generated_project_commands=((sys.executable, "-c", "raise SystemExit(7)"),),
+    )
+
+    assert report.ok is False
+    result = report.results[0]
+    assert result.evidence["generated_project_validation"] is False
+    assert result.missing_evidence == ("generated_project_validation",)
+    assert result.errors == (
+        (
+            "generated_project_validation: command failed exit=7 command="
+            f"{sys.executable} -c raise SystemExit(7)"
+        ),
+    )
+
+
+def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+                r"nested\..\evil.js": "throw new Error('unsafe');\n",
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+        generated_project_commands=((sys.executable, "-c", "raise SystemExit(0)"),),
+    )
+
+    assert report.ok is False
+    result = report.results[0]
+    assert result.evidence["generated_project_validation"] is False
+    assert result.errors == (
+        "generated_project_validation: workspace bundle has unsafe path: nested/../evil.js",
+    )
+
+
+def test_generated_project_zip_path_validation_rejects_backslashes() -> None:
+    with pytest.raises(RuntimeError, match=r"unsafe path"):
+        _safe_zip_member_path(r"nested\evil.js")
 
 
 def test_workspace_bundle_agent_standard_requires_constraints_and_skill_rule_evidence() -> None:

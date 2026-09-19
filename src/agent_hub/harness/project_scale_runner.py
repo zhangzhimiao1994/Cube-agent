@@ -4,13 +4,15 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
@@ -77,6 +79,14 @@ _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
 _EMBEDDED_WORKSPACE_MAX_FILES = 200
 _EMBEDDED_WORKSPACE_MAX_FILE_BYTES = 512_000
 _EMBEDDED_WORKSPACE_MAX_TOTAL_BYTES = 2_000_000
+_GENERATED_PROJECT_MAX_FILES = 200
+_GENERATED_PROJECT_MAX_FILE_BYTES = 2_000_000
+_GENERATED_PROJECT_MAX_TOTAL_BYTES = 20_000_000
+_DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
+    ("npm", "install", "--no-audit", "--no-fund"),
+    ("npm", "run", "build"),
+    ("npm", "test"),
+)
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
         "dispatch",
@@ -192,6 +202,8 @@ class ProjectScaleCaseResult:
             required = (*required, "plugin_contract")
         if "self_repair" in self.case_id or "model_failure" in self.case_id:
             required = (*required, "self_repair_trace")
+        if "generated_project_validation" in self.evidence:
+            required = (*required, "generated_project_validation")
         return required
 
     @property
@@ -408,6 +420,9 @@ def execute_project_scale_plan(
     wait_seconds: float = 0,
     poll_interval_seconds: float = 2,
     execution_id: str | None = None,
+    validate_generated_project: bool = False,
+    generated_project_commands: Sequence[Sequence[str]] | None = None,
+    generated_project_timeout_seconds: float = 120,
 ) -> ProjectScaleExecutionReport:
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
@@ -427,6 +442,8 @@ def execute_project_scale_plan(
             "workspace_bundle": False,
             "cleanup_cancel": False,
         }
+        if validate_generated_project:
+            evidence["generated_project_validation"] = False
         errors: list[str] = []
         run_id: str | None = None
         status: str | None = None
@@ -565,6 +582,14 @@ def execute_project_scale_plan(
                 case_id=run_request.case_id,
             )
             evidence["plugin_contract"] = plugin_contract.passed
+            generated_project_validation = _EvidenceCheck(passed=True, reasons=())
+            if validate_generated_project:
+                generated_project_validation = _validate_generated_project_bundle(
+                    observation.workspace_bundle,
+                    commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
+                    timeout_seconds=generated_project_timeout_seconds,
+                )
+                evidence["generated_project_validation"] = generated_project_validation.passed
             if _should_attempt_deliverable_repair(
                 status=status,
                 evidence=evidence,
@@ -654,6 +679,15 @@ def execute_project_scale_plan(
                     case_id=run_request.case_id,
                 )
                 evidence["plugin_contract"] = plugin_contract.passed
+                if validate_generated_project:
+                    generated_project_validation = _validate_generated_project_bundle(
+                        repair_observation.workspace_bundle,
+                        commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
+                        timeout_seconds=generated_project_timeout_seconds,
+                    )
+                    evidence["generated_project_validation"] = (
+                        generated_project_validation.passed
+                    )
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
@@ -667,6 +701,10 @@ def execute_project_scale_plan(
                     or (
                         _case_requires_plugin_contract(run_request.case_id)
                         and not evidence["plugin_contract"]
+                    )
+                    or (
+                        validate_generated_project
+                        and not evidence["generated_project_validation"]
                     )
                 )
             ):
@@ -684,6 +722,8 @@ def execute_project_scale_plan(
                     and not evidence["plugin_contract"]
                 ):
                     errors.extend(plugin_contract.reasons)
+                if validate_generated_project and not evidence["generated_project_validation"]:
+                    errors.extend(generated_project_validation.reasons)
             if evidence["terminal_status"] and status != "completed":
                 errors.append(f"terminal_status: {status or 'unknown'}")
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
@@ -724,6 +764,11 @@ def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | No
     return username, password, tenant_id
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agent_hub.harness.project_scale_runner",
@@ -761,6 +806,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=os.environ.get("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID"),
         help="Scope execution idempotency keys; generated automatically for --execute.",
     )
+    parser.add_argument(
+        "--verify-artifact-build",
+        "--validate-generated-project",
+        action="store_true",
+        dest="validate_generated_project",
+        default=_env_flag("AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD")
+        or _env_flag("AGENT_HUB_PROJECT_SCALE_VALIDATE_GENERATED_PROJECT"),
+        help=(
+            "After each executed case, download the generated workspace/artifact ZIP, "
+            "extract it safely, and run real generated-project validation commands."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-build-timeout",
+        type=float,
+        default=float(
+            os.environ.get("AGENT_HUB_PROJECT_SCALE_ARTIFACT_BUILD_TIMEOUT_SECONDS", "120")
+        ),
+        help="Timeout in seconds for each generated-project validation command.",
+    )
     parser.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
 
@@ -796,6 +861,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             wait_seconds=args.wait_seconds,
             poll_interval_seconds=args.poll_interval,
             execution_id=args.execution_id or _default_execution_id(),
+            validate_generated_project=args.validate_generated_project,
+            generated_project_timeout_seconds=args.artifact_build_timeout,
         )
         payload = report.to_payload()
     else:
@@ -1002,6 +1069,132 @@ def _workspace_bundle_from_downloaded_artifact(raw: bytes) -> bytes | None:
     except UnicodeDecodeError:
         return None
     return _embedded_workspace_bundle_from_text(text)
+
+
+def _validate_generated_project_bundle(
+    workspace_bundle: bytes | None,
+    *,
+    commands: Sequence[Sequence[str]],
+    timeout_seconds: float,
+) -> _EvidenceCheck:
+    if workspace_bundle is None:
+        return _EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: missing workspace bundle",),
+        )
+    if not commands:
+        return _EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: no validation commands configured",),
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-hub-project-scale-") as temp_dir:
+            root = Path(temp_dir)
+            _extract_workspace_bundle_safely(workspace_bundle, root)
+            for command in commands:
+                reason = _run_generated_project_command(
+                    command,
+                    cwd=root,
+                    timeout_seconds=timeout_seconds,
+                )
+                if reason is not None:
+                    return _EvidenceCheck(passed=False, reasons=(reason,))
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        return _EvidenceCheck(
+            passed=False,
+            reasons=(f"generated_project_validation: {error}",),
+        )
+    return _EvidenceCheck(passed=True, reasons=())
+
+
+def _extract_workspace_bundle_safely(workspace_bundle: bytes, root: Path) -> None:
+    total_size = 0
+    with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+        infos = archive.infolist()
+        if len(infos) > _GENERATED_PROJECT_MAX_FILES:
+            raise RuntimeError("workspace bundle contains too many files")
+        for info in infos:
+            if info.is_dir():
+                continue
+            relative_path = _safe_zip_member_path(info.filename)
+            if info.file_size > _GENERATED_PROJECT_MAX_FILE_BYTES:
+                raise RuntimeError(f"workspace bundle file too large: {info.filename}")
+            total_size += info.file_size
+            if total_size > _GENERATED_PROJECT_MAX_TOTAL_BYTES:
+                raise RuntimeError("workspace bundle total size is too large")
+            target = root / Path(*relative_path.parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, target.open("wb") as destination:
+                destination.write(source.read())
+
+
+def _safe_zip_member_path(value: str) -> PurePosixPath:
+    if "\\" in value:
+        raise RuntimeError(f"workspace bundle has unsafe path: {value}")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts:
+        raise RuntimeError(f"workspace bundle has unsafe path: {value}")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise RuntimeError(f"workspace bundle has unsafe path: {value}")
+    if ":" in path.parts[0]:
+        raise RuntimeError(f"workspace bundle has unsafe path: {value}")
+    return path
+
+
+def _run_generated_project_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+) -> str | None:
+    if not command or any(not isinstance(part, str) or not part for part in command):
+        return "generated_project_validation: invalid validation command"
+    safe_env = _generated_project_command_env()
+    try:
+        completed = subprocess.run(
+            list(command),
+            cwd=cwd,
+            env=safe_env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_seconds, 1),
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            "generated_project_validation: command timed out "
+            f"timeout={max(timeout_seconds, 1):g}s command={_format_command(command)}"
+        )
+    except OSError as error:
+        return (
+            "generated_project_validation: command could not start "
+            f"command={_format_command(command)} reason={error}"
+        )
+    if completed.returncode != 0:
+        return (
+            "generated_project_validation: command failed "
+            f"exit={completed.returncode} command={_format_command(command)}"
+        )
+    return None
+
+
+def _generated_project_command_env() -> dict[str, str]:
+    keep_keys = {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "NPM_CONFIG_REGISTRY",
+    }
+    return {key: value for key, value in os.environ.items() if key.upper() in keep_keys}
+
+
+def _format_command(command: Sequence[str]) -> str:
+    return " ".join(command)
 
 
 def _collect_run_observation(
