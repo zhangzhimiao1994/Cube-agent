@@ -352,6 +352,88 @@ describe("RunDetailPage", () => {
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
   });
 
+  it("splits run detail workbench files terminals and results into separate inspectable windows", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "tool.completed",
+          message: "npm test completed",
+          summary: "运行终端 npm test",
+          actor: "runner",
+          tool_name: "terminal",
+          step_id: "terminal-test",
+          artifact: null,
+          payload: {
+            operation_kind: "terminal",
+            command: "npm test",
+            exit_code: 0,
+            output: "1 test passed",
+          },
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 2,
+          kind: "artifact.created",
+          message: "created final script",
+          summary: "创建文件 final-script.md",
+          actor: "writer",
+          step_id: "write-final",
+          payload: {
+            operation_kind: "file_create",
+            artifact_id: "artifact-final",
+          },
+          artifact: runDetail.artifacts[0],
+        },
+      ],
+      artifacts: [runDetail.artifacts[0]],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+
+    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("1 个");
+    expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
+    expect(within(drawer).getByRole("button", { name: "结果" }).textContent).toContain("1 条");
+
+    await user.click(within(drawer).getByRole("button", { name: "文件" }));
+    const filesWindow = within(drawer).getByLabelText("文件窗口");
+    const fileList = within(filesWindow).getByLabelText("文件操作列表");
+    expect(within(fileList).getByRole("button", { name: /final-script\.md/ })).not.toBeNull();
+    expect(within(filesWindow).getByText(longArtifactText)).not.toBeNull();
+
+    await user.click(within(drawer).getByRole("button", { name: "终端" }));
+    const terminalWindow = within(drawer).getByLabelText("终端窗口");
+    expect(within(terminalWindow).getByRole("button", { name: /运行终端 npm test/ })).not.toBeNull();
+
+    await user.click(within(drawer).getByRole("button", { name: "结果" }));
+    const resultWindow = within(drawer).getByLabelText("结果窗口");
+    expect(within(resultWindow).getByRole("button", { name: /创建文件 final-script\.md/ })).not.toBeNull();
+  });
+
   it("shows checkpoint recovery as a clear workbench action without leaking checkpoint internals", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {

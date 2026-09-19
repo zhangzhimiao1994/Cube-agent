@@ -4,7 +4,13 @@ import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
-import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
+import {
+  ArtifactFileCard,
+  artifactFileName,
+  formatFileSize,
+  hasArtifactDownload,
+  type DownloadableFile,
+} from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -184,7 +190,22 @@ type DownloadableArtifact = RunArtifact & {
 };
 
 const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
-type DetailWorkbenchView = "overview" | "coordination" | "actions" | "recovery";
+type DetailWorkbenchView = "overview" | "coordination" | "actions" | "files" | "terminal" | "results" | "recovery";
+
+type DetailWorkbenchFileItem = {
+  id: string;
+  title: string;
+  filename: string;
+  path: string | null;
+  kind: string;
+  operation: "创建文件" | "编辑文件" | "读取文件" | "产物" | "文件夹";
+  mimeType: string | null;
+  size: string;
+  sha256: string | null;
+  text: string | null;
+  download: DownloadableFile;
+  source: DetailProcessCard | null;
+};
 
 function recentPreview<T>(items: T[], limit: number, expanded = false) {
   if (expanded || items.length <= limit) {
@@ -1077,6 +1098,85 @@ function detailWorkbenchOverviewCards(cards: DetailProcessCard[]) {
     byIdentity.set(detailWorkbenchCardIdentity(card), card);
   });
   return [...byIdentity.values()];
+}
+
+function detailWorkbenchCardText(card: DetailProcessCard) {
+  return `${card.label} ${card.title} ${card.detail} ${card.rows.map((row) => `${row.label} ${row.value}`).join(" ")}`;
+}
+
+function isDetailTerminalCard(card: DetailProcessCard) {
+  const text = detailWorkbenchCardText(card);
+  return card.label === "运行终端" || /运行终端|terminal|server_command|命令|command|exit_code|退出码/i.test(text);
+}
+
+function isDetailResultCard(card: DetailProcessCard) {
+  if (isDetailTerminalCard(card)) return false;
+  const text = detailWorkbenchCardText(card);
+  return Boolean(card.artifact) || /产物|输出|结果|完成|final|artifact/i.test(text);
+}
+
+function asDetailWorkbenchFileOperation(value: string): DetailWorkbenchFileItem["operation"] | null {
+  if (value === "创建文件" || value === "编辑文件" || value === "读取文件" || value === "产物" || value === "文件夹") return value;
+  return null;
+}
+
+function detailWorkbenchFileOperation(card: DetailProcessCard, artifact: DownloadableArtifact): DetailWorkbenchFileItem["operation"] {
+  const direct = asDetailWorkbenchFileOperation(card.label);
+  if (direct && direct !== "产物" && direct !== "文件夹") return direct;
+  const text = `${detailWorkbenchCardText(card)} ${artifact.kind} ${artifact.title ?? ""} ${artifact.filename ?? ""}`;
+  if (/workspace_bundle|文件夹/.test(text)) return "文件夹";
+  if (/操作类别\s+file_create|file_create|创建文件|生成文件|create|write/i.test(text)) return "创建文件";
+  if (/操作类别\s+(file_edit|file_write)|file_edit|file_write|编辑文件|修改|patch|edit/i.test(text)) return "编辑文件";
+  if (/操作类别\s+file_read|file_read|读取文件|read/i.test(text)) return "读取文件";
+  if (artifact.kind?.toLowerCase().includes("workspace_file")) return "创建文件";
+  return "产物";
+}
+
+function detailWorkbenchFiles(cards: DetailProcessCard[]) {
+  const seen = new Set<string>();
+  const files: DetailWorkbenchFileItem[] = [];
+  cards.forEach((card) => {
+    const artifact = card.artifact;
+    const downloadUrl = artifact?.download_url?.trim();
+    if (!artifact || !downloadUrl || seen.has(downloadUrl)) return;
+    seen.add(downloadUrl);
+    const filename = artifactFileName(artifact);
+    files.push({
+      id: `${downloadUrl}:${card.id}`,
+      title: artifact.title || filename,
+      filename,
+      path: artifact.filename ?? artifact.title ?? null,
+      kind: artifact.kind || "file",
+      operation: detailWorkbenchFileOperation(card, artifact),
+      mimeType: artifact.mime_type ?? null,
+      size: formatFileSize(artifact.size_bytes),
+      sha256: artifact.sha256 ?? null,
+      text: isGenericDetailText(artifact.text) ? "" : artifact.text?.trim() || "",
+      download: { ...artifact, download_url: downloadUrl },
+      source: card,
+    });
+  });
+  return files;
+}
+
+function isDetailTextPreviewCandidate(file: DetailWorkbenchFileItem) {
+  const mime = file.mimeType?.toLowerCase() ?? "";
+  const name = file.filename.toLowerCase();
+  if (file.text?.trim()) return true;
+  if (mime.startsWith("text/") || mime.includes("json") || mime.includes("xml") || mime.includes("javascript")) return true;
+  return /\.(?:txt|md|json|js|jsx|ts|tsx|py|css|html|xml|yaml|yml|toml|ini|sh|sql|csv|log)$/i.test(name);
+}
+
+async function readDetailWorkbenchPreviewText(payload: unknown): Promise<string> {
+  if (typeof payload === "string") return payload;
+  if (payload instanceof Response) return payload.text();
+  if (payload instanceof ArrayBuffer) return new TextDecoder().decode(payload);
+  if (payload && typeof payload === "object") {
+    const maybeText = payload as { text?: () => Promise<string>; arrayBuffer?: () => Promise<ArrayBuffer> };
+    if (typeof maybeText.text === "function") return maybeText.text();
+    if (typeof maybeText.arrayBuffer === "function") return new TextDecoder().decode(await maybeText.arrayBuffer());
+  }
+  return "";
 }
 
 function isGenericEventMessage(event: RunEvent) {
@@ -2144,6 +2244,78 @@ function DetailProcessCardBody({ card }: { card: DetailProcessCard }) {
   );
 }
 
+function DetailWorkbenchFilePreview({
+  file,
+  onOpenSource,
+}: {
+  file: DetailWorkbenchFileItem;
+  onOpenSource: (card: DetailProcessCard) => void;
+}) {
+  const [previewText, setPreviewText] = useState<string | null>(file.text);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const canPreview = isDetailTextPreviewCandidate(file);
+
+  async function loadPreview() {
+    if (!canPreview || previewText) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const blob = await api.downloadGeneratedArtifact(file.download.download_url);
+      const text = await readDetailWorkbenchPreviewText(blob);
+      setPreviewText(text.length > 8000 ? `${text.slice(0, 8000)}\n\n...已截断，仅预览前 8000 字符` : text);
+    } catch (caught) {
+      setError(formatApiError(caught, "文件预览失败"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (canPreview && !previewText) void loadPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.id]);
+
+  return (
+    <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
+      <div className="agent-workbench-file-preview-header">
+        <div>
+          <small>{file.operation}</small>
+          <strong>{file.path || file.filename}</strong>
+        </div>
+        <ArtifactFileCard artifact={file.download} compact />
+      </div>
+      <dl>
+        <div>
+          <dt>类型</dt>
+          <dd>{[file.kind, file.mimeType, file.size].filter(Boolean).join(" · ") || "文件"}</dd>
+        </div>
+        {file.sha256 ? (
+          <div>
+            <dt>SHA-256</dt>
+            <dd>{file.sha256.slice(0, 16)}</dd>
+          </div>
+        ) : null}
+      </dl>
+      {file.source ? (
+        <button type="button" className="secondary-action" onClick={() => onOpenSource(file.source as DetailProcessCard)}>
+          查看来源动作
+        </button>
+      ) : null}
+      {canPreview ? (
+        <pre className="agent-workbench-file-code">{loading ? "正在读取文件预览..." : previewText || "暂无可预览内容"}</pre>
+      ) : (
+        <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
+      )}
+      {error ? (
+        <p role="alert" className="form-error">
+          {error}
+        </p>
+      ) : null}
+    </article>
+  );
+}
+
 function DetailProcessDrawer({
   cards,
   selectedCard,
@@ -2159,27 +2331,48 @@ function DetailProcessDrawer({
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const [activeView, setActiveView] = useState<DetailWorkbenchView>("overview");
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const overviewCards = detailWorkbenchOverviewCards(cards);
   const coordinationCards = cards.filter(isDetailCoordinationCard);
   const recoveryCards = cards.filter(isDetailRecoveryCard);
   const actionCards = detailActionCards(cards);
+  const fileItems = detailWorkbenchFiles(cards);
+  const terminalCards = actionCards.filter(isDetailTerminalCard);
+  const resultCards = actionCards.filter(isDetailResultCard);
+  const defaultFile = fileItems.find(isDetailTextPreviewCandidate) ?? fileItems[0] ?? null;
+  const selectedFile = fileItems.find((file) => file.id === selectedFileId) ?? defaultFile;
   const visibleCards =
     activeView === "coordination"
       ? coordinationCards
       : activeView === "recovery"
         ? recoveryCards
-        : activeView === "actions"
-          ? actionCards
-          : overviewCards;
+        : activeView === "terminal"
+          ? terminalCards
+          : activeView === "results"
+            ? resultCards
+            : activeView === "actions"
+              ? actionCards
+              : overviewCards;
   const visiblePreview = recentPreview(visibleCards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
   const visibleLabel =
-    activeView === "coordination" ? "调度讨论" : activeView === "recovery" ? "修复异常" : activeView === "actions" ? "实际动作" : "助手总览";
-  const visibleAria = activeView === "overview" ? "Agent 工作席概览" : "Agent 工作席动作";
+    activeView === "coordination"
+      ? "调度讨论"
+      : activeView === "recovery"
+        ? "修复异常"
+        : activeView === "terminal"
+          ? "终端窗口"
+          : activeView === "results"
+            ? "结果窗口"
+            : activeView === "actions"
+              ? "实际动作"
+              : "助手总览";
+  const visibleAria =
+    activeView === "overview" ? "Agent 工作席概览" : activeView === "terminal" ? "终端窗口" : activeView === "results" ? "结果窗口" : "Agent 工作席动作";
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
         id={dialogId}
-        className="process-drawer"
+        className="process-drawer agent-workbench-drawer"
         role="dialog"
         aria-label="Agent 工作席详情"
         aria-modal="true"
@@ -2251,6 +2444,45 @@ function DetailProcessDrawer({
                   实际动作
                   <small>{actionCards.length} 条</small>
                 </button>
+                <button
+                  type="button"
+                  aria-label="文件"
+                  aria-pressed={activeView === "files"}
+                  className={activeView === "files" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("files");
+                    setShowAllActions(false);
+                  }}
+                >
+                  文件
+                  <small>{fileItems.length} 个</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="终端"
+                  aria-pressed={activeView === "terminal"}
+                  className={activeView === "terminal" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("terminal");
+                    setShowAllActions(false);
+                  }}
+                >
+                  终端
+                  <small>{terminalCards.length} 条</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="结果"
+                  aria-pressed={activeView === "results"}
+                  className={activeView === "results" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("results");
+                    setShowAllActions(false);
+                  }}
+                >
+                  结果
+                  <small>{resultCards.length} 条</small>
+                </button>
                 {recoveryCards.length > 0 ? (
                   <button
                     type="button"
@@ -2267,34 +2499,67 @@ function DetailProcessDrawer({
                   </button>
                 ) : null}
               </div>
-              <div className="agent-workbench-actions-header">
-                <strong>{visibleLabel}</strong>
-                <small>{visibleCards.length} 条</small>
-                {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
-                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
-                    {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
-                  </button>
-                ) : null}
-              </div>
-              {visiblePreview.hiddenCount > 0 ? (
-                <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
-              ) : null}
-              <div className="agent-cluster-actions" aria-label={visibleAria}>
-                {visiblePreview.visible.map((card) => (
-                  <button
-                    key={card.id}
-                    type="button"
-                    className="run-process-toggle process-intermediate-card"
-                    onClick={() => onSelectCard(card)}
-                  >
-                    <span aria-hidden="true">›</span>
-                    <small className="process-card-badge">{card.label}</small>
-                    <strong>{card.title}</strong>
-                    {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
-                  </button>
-                ))}
-              </div>
-              {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
+              {activeView === "files" ? (
+                <section className="agent-workbench-files" aria-label="文件窗口">
+                  <div className="agent-workbench-actions-header">
+                    <strong>文件窗口</strong>
+                    <small>{fileItems.length} 个文件/产物</small>
+                  </div>
+                  {fileItems.length > 0 ? (
+                    <div className="agent-workbench-file-layout">
+                      <div className="agent-workbench-file-list" aria-label="文件操作列表">
+                        {fileItems.map((file) => (
+                          <button
+                            key={file.id}
+                            type="button"
+                            className={selectedFile?.id === file.id ? "active" : ""}
+                            aria-pressed={selectedFile?.id === file.id}
+                            onClick={() => setSelectedFileId(file.id)}
+                          >
+                            <small>{file.operation}</small>
+                            <strong>{file.path || file.filename}</strong>
+                            <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
+                          </button>
+                        ))}
+                      </div>
+                      {selectedFile ? <DetailWorkbenchFilePreview file={selectedFile} onOpenSource={onSelectCard} /> : null}
+                    </div>
+                  ) : (
+                    <p className="agent-workbench-compressed-note">暂无可预览文件；后续运行产生文件后会显示在这里。</p>
+                  )}
+                </section>
+              ) : (
+                <>
+                  <div className="agent-workbench-actions-header">
+                    <strong>{visibleLabel}</strong>
+                    <small>{visibleCards.length} 条</small>
+                    {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                      <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                        {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
+                      </button>
+                    ) : null}
+                  </div>
+                  {visiblePreview.hiddenCount > 0 ? (
+                    <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
+                  ) : null}
+                  <div className="agent-cluster-actions" aria-label={visibleAria}>
+                    {visiblePreview.visible.map((card) => (
+                      <button
+                        key={card.id}
+                        type="button"
+                        className="run-process-toggle process-intermediate-card"
+                        onClick={() => onSelectCard(card)}
+                      >
+                        <span aria-hidden="true">›</span>
+                        <small className="process-card-badge">{card.label}</small>
+                        <strong>{card.title}</strong>
+                        {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
+                      </button>
+                    ))}
+                  </div>
+                  {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
+                </>
+              )}
             </div>
           )}
         </div>
