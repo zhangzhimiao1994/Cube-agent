@@ -1724,7 +1724,7 @@ def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths()
                 "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
                 "src/main.js": _functional_js_source(),
                 "tests/main.test.js": _functional_js_test(),
-                r"nested\..\evil.js": "throw new Error('unsafe');\n",
+                "nested/../evil.js": "throw new Error('unsafe');\n",
             }
         ),
     )
