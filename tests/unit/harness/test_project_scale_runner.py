@@ -11,7 +11,12 @@ from urllib.error import HTTPError
 import pytest
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.harness.project_scale import build_project_scale_run_plan
+from agent_hub.harness import project_scale_runner as project_scale_runner_module
+from agent_hub.harness.project_scale import (
+    PROJECT_SCALE_FLOW_KINDS,
+    PROJECT_SCALE_TIERS,
+    build_project_scale_run_plan,
+)
 from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
@@ -55,6 +60,60 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
     assert "discussion_trace" in payload["required_evidence"]
     assert "plugin_contract" in payload["required_evidence"]
     assert "delete_workspace" in payload["cleanup_actions"]
+
+
+def test_project_scale_runner_defaults_to_full_matrix_plan_json() -> None:
+    result = run_project_scale_runner("--json")
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    expected_case_ids = [
+        f"{scale}:{flow}" for scale in PROJECT_SCALE_TIERS for flow in PROJECT_SCALE_FLOW_KINDS
+    ]
+    actual_case_ids = [request["case_id"] for request in payload["requests"]]
+
+    assert payload["dry_run"] is True
+    assert payload["execute"] is False
+    assert payload["case_count"] == len(expected_case_ids)
+    assert actual_case_ids == expected_case_ids
+    assert "small:direct" in actual_case_ids
+    assert "medium:hybrid" in actual_case_ids
+    assert "large:plugin" in actual_case_ids
+    assert "ultra:capability_validation" in actual_case_ids
+
+
+def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execute_project_scale_plan(*args: object, **_kwargs: object) -> ProjectScaleExecutionReport:
+        captured["plan"] = args[0]
+        return ProjectScaleExecutionReport(results=())
+
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "test-token")
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "execute_project_scale_plan",
+        fake_execute_project_scale_plan,
+    )
+
+    exit_code = project_scale_runner_module.main(["--execute", "--json"])
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    plan = captured["plan"]
+    assert exit_code == 0
+    assert payload["execute"] is True
+    assert payload["dry_run"] is False
+    assert isinstance(plan, project_scale_runner_module.ProjectScaleRunPlan)
+    assert plan.execute is True
+    assert plan.dry_run is False
+    assert plan.case_count == len(PROJECT_SCALE_TIERS) * len(PROJECT_SCALE_FLOW_KINDS)
+    assert {request.case_id for request in plan.requests} == {
+        f"{scale}:{flow}" for scale in PROJECT_SCALE_TIERS for flow in PROJECT_SCALE_FLOW_KINDS
+    }
 
 
 def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
