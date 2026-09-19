@@ -26,9 +26,9 @@ export const MODULE_GROUPS: ModuleGroup[] = [
   {
     id: "workspace",
     to: "/workspace",
-    label: "对话与进化",
-    eyebrow: "Conversation & Evolution",
-    description: "发起对话、接续会话、查看运行过程，并管理 Skill 蒸馏、长期迭代和进化任务。",
+    label: "对话",
+    eyebrow: "Conversation",
+    description: "发起对话、接续会话、查看运行过程和上下文附件。",
     tone: "cyan",
     modules: [
       {
@@ -37,19 +37,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "连续对话、历史会话、运行过程和附件入口集中在这里。",
         permission: "run:read",
       },
-      {
-        to: "/evolution",
-        label: "进化",
-        description: "管理 Skill、Agent、工作流和调度策略的评估、迭代、验证与人工确认。",
-        permission: "skill:read",
-        children: [
-          { to: "/evolution?type=skill", label: "Skill 进化", permission: "skill:read" },
-          { to: "/evolution?type=agent", label: "Agent/角色进化", permission: "agent:read" },
-          { to: "/evolution?type=workflow", label: "工作流进化", permission: "agent:read" },
-          { to: "/evolution?type=scheduler-policy", label: "调度策略进化", permission: "config:read" },
-          { to: "/evolution?type=context-memory", label: "多轮记忆策略", permission: "memory:read" },
-        ],
-      },
     ],
   },
   {
@@ -57,7 +44,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     to: "/orchestration",
     label: "编排",
     eyebrow: "Agent Control",
-    description: "主 Agent、角色和 Hermes 学习属于 Agent 编排控制层；低频模板和自动执行入口收进系统设置。",
+    description: "主 Agent 和 Hermes 学习属于 Agent 编排控制层；低频角色模板和自动执行入口收进系统设置。",
     tone: "green",
     modules: [
       {
@@ -71,12 +58,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
           { to: "/main-agent?section=concurrency", label: "并发槽", permission: "config:read" },
           { to: "/main-agent?section=hermes", label: "Hermes 介入", permission: "hermes:read" },
         ],
-      },
-      {
-        to: "/agents",
-        label: "Agent 角色",
-        description: "管理导演、文案、剪辑师、经济分析师等可扩展角色。",
-        permission: "agent:read",
       },
       {
         to: "/hermes",
@@ -194,7 +175,14 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         permission: "config:read",
         children: [
           { to: "/config?section=runtime", label: "运行默认值", permission: "config:read" },
+          { to: "/agents", label: "Agent 角色", permission: "agent:read" },
           { to: "/workflows?section=list", label: "工作流配置", permission: "agent:read" },
+          { to: "/evolution", label: "进化任务", permission: "skill:read" },
+          { to: "/evolution?type=skill", label: "Skill 进化", permission: "skill:read" },
+          { to: "/evolution?type=agent", label: "Agent/角色进化", permission: "agent:read" },
+          { to: "/evolution?type=workflow", label: "工作流进化", permission: "agent:read" },
+          { to: "/evolution?type=scheduler-policy", label: "调度策略进化", permission: "config:read" },
+          { to: "/evolution?type=context-memory", label: "多轮记忆策略", permission: "memory:read" },
           { to: "/schedules", label: "计划任务", permission: "run:create" },
           { to: "/config?section=safety", label: "安全与学习", permission: "config:read" },
           { to: "/config?section=attachments", label: "附件存储", permission: "config:read" },

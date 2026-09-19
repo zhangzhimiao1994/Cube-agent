@@ -76,7 +76,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(screen.getAllByText("工作台").length).toBeGreaterThan(0);
-    expect(screen.getByRole("link", { name: "对话与进化" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
     const accountNavigation = screen.getByRole("navigation", { name: "账号操作" });
@@ -92,7 +92,7 @@ describe("AppShell presentation", () => {
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
-    expect(within(navigation).getByRole("link", { name: "对话与进化" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "对话" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "编排" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "资源" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "工具" })).not.toBeNull();
@@ -101,18 +101,19 @@ describe("AppShell presentation", () => {
 
     const moduleGrid = screen.getByRole("list", { name: "编排模块" });
     expect(within(moduleGrid).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(moduleGrid).getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /Agent 角色/ })).toBeNull();
     expect(within(moduleGrid).queryByRole("link", { name: /工作流配置/ })).toBeNull();
     expect(within(moduleGrid).queryByRole("link", { name: /计划任务/ })).toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
 
     const drawer = screen.getByLabelText("编排二级导航");
     expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
+    expect(within(drawer).queryByRole("link", { name: /Agent 角色/ })).toBeNull();
     expect(within(drawer).queryByRole("link", { name: /工作流配置/ })).toBeNull();
     expect(within(drawer).queryByRole("link", { name: /计划任务/ })).toBeNull();
   });
 
-  it("keeps workflow configuration under system settings instead of orchestration navigation", async () => {
+  it("keeps low-frequency configuration under system settings instead of primary module navigation", async () => {
     render(<TestApp initialPath="/system" />);
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
@@ -124,19 +125,21 @@ describe("AppShell presentation", () => {
     expect(within(systemDrawer).getByRole("link", { name: "工作流配置" }).getAttribute("href")).toBe(
       "/workflows?section=list",
     );
+    expect(within(systemDrawer).getByRole("link", { name: "Agent 角色" }).getAttribute("href")).toBe("/agents");
+    expect(within(systemDrawer).getByRole("link", { name: "进化任务" }).getAttribute("href")).toBe("/evolution");
     expect(within(systemDrawer).getByRole("link", { name: "计划任务" }).getAttribute("href")).toBe("/schedules");
   });
 
-  it("shows tertiary navigation under module drawers without adding top-level entries", async () => {
+  it("shows tertiary settings navigation without adding primary entries", async () => {
     render(<TestApp initialPath="/evolution" />);
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
 
-    const workspaceDrawer = screen.getByLabelText("对话与进化二级导航");
-    expect(within(workspaceDrawer).getByRole("link", { name: "Skill 进化" }).getAttribute("href")).toBe("/evolution?type=skill");
-    expect(within(workspaceDrawer).getByRole("link", { name: "调度策略进化" }).getAttribute("href")).toBe("/evolution?type=scheduler-policy");
+    const systemDrawer = screen.getByLabelText("系统二级导航");
+    expect(within(systemDrawer).getByRole("link", { name: "Skill 进化" }).getAttribute("href")).toBe("/evolution?type=skill");
+    expect(within(systemDrawer).getByRole("link", { name: "调度策略进化" }).getAttribute("href")).toBe("/evolution?type=scheduler-policy");
   });
 
   it("activates the matching page section after a third-level menu click", async () => {
@@ -164,8 +167,8 @@ describe("AppShell presentation", () => {
       await waitFor(() => expect(document.querySelector('[data-nav-section="skill"]')).not.toBeNull());
       scrollIntoView.mockClear();
 
-      const drawer = screen.getByLabelText("对话与进化二级导航");
-      await user.click(within(drawer).getByRole("link", { name: "Skill 进化" }));
+    const drawer = screen.getByLabelText("系统二级导航");
+    await user.click(within(drawer).getByRole("link", { name: "Skill 进化" }));
 
       await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
     } finally {
@@ -204,7 +207,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
-    expect(within(navigation).getByRole("link", { name: "对话与进化" }).getAttribute("href")).toBe("/");
+    expect(within(navigation).getByRole("link", { name: "对话" }).getAttribute("href")).toBe("/");
     expect(within(navigation).getByRole("link", { name: "编排" }).getAttribute("href")).toBe("/main-agent");
     expect(within(navigation).getByRole("link", { name: "资源" }).getAttribute("href")).toBe("/models");
     expect(within(navigation).getByRole("link", { name: "工具" }).getAttribute("href")).toBe("/skills");
