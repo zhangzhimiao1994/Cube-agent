@@ -469,7 +469,7 @@ def _mcp_runtime_diagnostic(
     *,
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic | None:
-    if lowered in {"mcp tool unavailable", "mcp.tool_unavailable"}:
+    if "mcp tool unavailable" in lowered or "mcp.tool_unavailable" in lowered:
         return _base_diagnostic(
             reason,
             error_stage="mcp_runtime",

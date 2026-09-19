@@ -21,6 +21,7 @@ from agent_hub.runs.service import HermesRunOutcome, RunService
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    ExecutionRuntime,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -671,6 +672,68 @@ class RuntimeReportsToolFailure:
         raise AssertionError("not used")
 
 
+class RuntimeReportsPluginToolFailureThenGenericRuntimeFailure:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.TOOL_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="planner",
+            tool_call_id="call_plugin",
+            tool_name="calendar.create_event",
+            reason="Plugin tool unavailable: plugin_package_adapter_unavailable",
+            payload={"failure_kind": "capability_failed"},
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="capability execution failed",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeReportsMcpToolFailureThenGenericRuntimeFailure:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.TOOL_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="planner",
+            tool_call_id="call_mcp",
+            tool_name="browser.open_page",
+            reason="MCP tool unavailable",
+            payload={"failure_kind": "capability_failed"},
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="capability execution failed",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
 class RuntimeReportsUncertainToolThenRuntimeFailure:
     mode = TaskMode.DISPATCH
 
@@ -1237,6 +1300,64 @@ async def test_execute_classifies_empty_model_response_for_controlled_retry() ->
     assert "hybrid dispatch failed" not in closure_text
     assert "secret" not in closure_text
     assert repository.artifacts == [closure_artifact]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runtime", "failure_kind", "error_code", "source_tool_name"),
+    [
+        (
+            RuntimeReportsPluginToolFailureThenGenericRuntimeFailure(),
+            "plugin_adapter_unavailable",
+            "plugin.adapter_unavailable",
+            "calendar.create_event",
+        ),
+        (
+            RuntimeReportsMcpToolFailureThenGenericRuntimeFailure(),
+            "mcp_tool_unavailable",
+            "mcp.tool_unavailable",
+            "browser.open_page",
+        ),
+    ],
+)
+async def test_execute_persists_manual_repair_proposal_for_external_tool_failure(
+    runtime: ExecutionRuntime,
+    failure_kind: str,
+    error_code: str,
+    source_tool_name: str,
+) -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    assert repository.event_log[0].kind is EventKind.TOOL_FAILED
+    assert repository.event_log[1].kind is EventKind.RUNTIME_FAILED
+    assert repository.event_log[-1].kind == "repair.classified"
+    repair = repository.event_log[-1]
+    assert repair.payload["source_kind"] == "tool.failed"
+    assert repair.payload["source_sequence"] == 1
+    assert repair.payload["failure_category"] == failure_kind
+    assert repair.payload["requires_approval"] is True
+    assert repair.payload["automatic_execution"] is False
+    assert repair.payload["error_code"] == error_code
+    assert "secret://" not in repr(repair.payload)
+    assert submitted.decision_token is not None
+    assert submitted.repair_proposal is not None
+    assert submitted.repair_proposal["failure_kind"] == failure_kind
+    assert submitted.repair_proposal["source_event_sequence"] == 1
+    assert submitted.repair_proposal["requires_approval"] is True
+    assert submitted.repair_proposal["automatic_execution"] is False
+    assert submitted.repair_proposal["error_code"] == error_code
+    assert "secret://" not in repr(submitted.repair_proposal)
+    source_event = repository.event_log[0]
+    assert source_event.tool_name == source_tool_name
 
 
 def test_repair_classification_includes_bounded_protocol_recovery_hint() -> None:

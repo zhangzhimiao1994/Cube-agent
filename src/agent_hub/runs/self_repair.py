@@ -192,6 +192,7 @@ _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
         "mcp_server_not_discovered",
     }
 )
+_GENERIC_FAILURE_CATEGORIES = frozenset({"runtime_failure", "tool_failure", "step_failure"})
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -969,7 +970,10 @@ def _already_classified(events: Sequence[RunEvent]) -> bool:
 
 def _supervisor_source_failure(events: Sequence[RunEvent]) -> RunEvent | None:
     uncertain = _first_uncertain_failure_event(events)
-    return uncertain if uncertain is not None else _last_failure_event(events)
+    if uncertain is not None:
+        return uncertain
+    specific = _last_specific_failure_event(events)
+    return specific if specific is not None else _last_failure_event(events)
 
 
 def _first_uncertain_failure_event(events: Sequence[RunEvent]) -> RunEvent | None:
@@ -982,6 +986,13 @@ def _first_uncertain_failure_event(events: Sequence[RunEvent]) -> RunEvent | Non
 def _last_failure_event(events: Sequence[RunEvent]) -> RunEvent | None:
     for event in reversed(events):
         if event.kind in _FAILURE_KINDS:
+            return event
+    return None
+
+
+def _last_specific_failure_event(events: Sequence[RunEvent]) -> RunEvent | None:
+    for event in reversed(events):
+        if event.kind in _FAILURE_KINDS and _failure_category(event) not in _GENERIC_FAILURE_CATEGORIES:
             return event
     return None
 
