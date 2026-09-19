@@ -909,7 +909,7 @@ def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() 
         "medium:artifact_production run_id=run-medium-artifact-repair ok=false "
         "focus=interaction_stability,final_result,deliverable_quality,"
         "agent_standard_verification,artifact_integrity "
-        "missing=deliverable_quality,agent_standard_verification errors=8 repair=failed"
+        "missing=deliverable_quality,agent_standard_verification errors=9 repair=failed"
     )
 
 
@@ -1331,6 +1331,62 @@ python -m compileall direct_ledger tests
     assert result.evidence["deliverable_quality"] is True
     assert result.evidence["agent_standard_verification"] is True
     assert result.errors == ()
+
+
+def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    metadata = {
+        "deliverable_quality": {
+            "requirements_satisfied": True,
+            "build_passed": True,
+            "tests_passed": True,
+            "interactive_checks_passed": True,
+            "no_placeholders": True,
+            "artifact_integrity": True,
+        },
+        "agent_standard_verification": {
+            "constraints_read": True,
+            "plan_before_implementation": True,
+            "reproducible_verification": True,
+            "root_cause_repair": True,
+        },
+    }
+    shell_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+            ),
+            "deliverable_metadata.json": json.dumps(metadata, sort_keys=True),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": "export const status = 'ready';\n",
+            "tests/main.test.js": (
+                "import assert from 'node:assert/strict';\n"
+                "import { status } from '../src/main.js';\n"
+                "assert.equal(status, 'ready');\n"
+            ),
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality=False,
+        agent_standard=False,
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: missing interaction execution evidence" in result.errors
 
 
 def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:

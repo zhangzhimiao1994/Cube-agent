@@ -1763,6 +1763,8 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing meaningful test assertions")
     if not _bundle_has_build_test_execution_evidence(verification_text):
         reasons.append("workspace_bundle: missing build/test execution evidence")
+    if not _bundle_has_interaction_execution_evidence(verification_text):
+        reasons.append("workspace_bundle: missing interaction execution evidence")
     if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
         reasons.append("workspace_bundle: contains placeholder or stub markers")
     return tuple(reasons)
@@ -2008,6 +2010,39 @@ def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:
             )
             or (has_success_summary and _has_marker(lowered, ("test", "pytest", "unittest")))
         )
+    )
+
+
+def _bundle_has_interaction_execution_evidence(verification_text: str) -> bool:
+    lowered = verification_text.lower()
+    interaction_markers = (
+        "interaction",
+        "interactive",
+        "smoke",
+        "e2e",
+        "playwright",
+        "cypress",
+        "browser",
+        "manual check",
+        "manual verification",
+    )
+    lines = [line.strip() for line in lowered.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if not any(marker in line for marker in interaction_markers):
+            continue
+        block = "\n".join(lines[index : index + 6])
+        if _has_interaction_pass_marker(block):
+            return True
+    return False
+
+
+def _has_interaction_pass_marker(text: str) -> bool:
+    return (
+        _EXECUTION_PASS_RE.search(text) is not None
+        or "interactive_checks_passed: true" in text
+        or "interaction_checks_passed: true" in text
+        or "smoke: true" in text
+        or "e2e: true" in text
     )
 
 
