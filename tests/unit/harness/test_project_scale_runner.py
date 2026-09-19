@@ -15,6 +15,7 @@ from agent_hub.harness import project_scale_runner as project_scale_runner_modul
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_FLOW_KINDS,
     PROJECT_SCALE_TIERS,
+    ProjectScaleRunPlan,
     build_project_scale_run_plan,
 )
 from agent_hub.harness.project_scale_runner import (
@@ -107,7 +108,7 @@ def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     assert exit_code == 0
     assert payload["execute"] is True
     assert payload["dry_run"] is False
-    assert isinstance(plan, project_scale_runner_module.ProjectScaleRunPlan)
+    assert isinstance(plan, ProjectScaleRunPlan)
     assert plan.execute is True
     assert plan.dry_run is False
     assert plan.case_count == len(PROJECT_SCALE_TIERS) * len(PROJECT_SCALE_FLOW_KINDS)
