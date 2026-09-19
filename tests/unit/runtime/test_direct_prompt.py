@@ -1,3 +1,4 @@
+import json
 import zipfile
 from io import BytesIO
 from typing import cast
@@ -30,6 +31,23 @@ def test_project_scale_fixture_files_include_agent_standard_reading_evidence() -
             archive.writestr(path, content)
 
     assert _workspace_bundle_agent_standard_reasons(buffer.getvalue()) == ()
+
+
+def test_project_scale_fixture_files_include_buildable_node_type_config() -> None:
+    files = project_scale_artifact_zip_files(
+        "Project-scale acceptance fixture: build an ultra project for scale=ultra "
+        "and flow=artifact_production."
+    )
+
+    package_json = json.loads(files["package.json"])
+    tsconfig_json = json.loads(files["tsconfig.json"])
+
+    assert package_json["devDependencies"]["@types/node"].startswith("^")
+    compiler_options = tsconfig_json["compilerOptions"]
+    assert "node" in compiler_options["types"]
+    assert "ES2022" in compiler_options["lib"]
+    assert "ESNext.Disposable" in compiler_options["lib"]
+    assert "DOM" in compiler_options["lib"]
 
 
 def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -> None:
