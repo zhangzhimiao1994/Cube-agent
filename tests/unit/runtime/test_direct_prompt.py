@@ -10,6 +10,7 @@ from agent_hub.harness.project_scale_runner import (
 )
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 
 
 class UnusedGateway:
@@ -155,6 +156,10 @@ def test_direct_prompt_includes_approved_project_preflight_context() -> None:
 @pytest.mark.asyncio
 async def test_direct_project_scale_preflight_emits_verified_artifact_without_gateway() -> None:
     runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+    request = (
+        "Project-scale acceptance fixture: build a large project for scale=large "
+        "and flow=direct."
+    )
 
     events = [
         event
@@ -163,10 +168,7 @@ async def test_direct_project_scale_preflight_emits_verified_artifact_without_ga
                 run_id=uuid4(),
                 tenant_id=uuid4(),
                 mode=TaskMode.DIRECT,
-                request=(
-                    "Project-scale acceptance fixture: build a large project for scale=large "
-                    "and flow=direct."
-                ),
+                request=request,
                 routing_decision={
                     "project_preflight_approved": True,
                     "project_preflight_proposal": {
@@ -198,9 +200,20 @@ async def test_direct_project_scale_preflight_emits_verified_artifact_without_ga
     }
     assert artifact_event.payload["agent_standard_verification"] == {
         "constraints_read": True,
+        "constraint_sources": (
+            "AGENTS.md workspace rules; HANDOFF current-state index; PROJECT_REQUIREMENTS.md"
+        ),
+        "skill_rule_sources": (
+            "AGENTS.md workspace rules; applicable SKILL.md inventory; "
+            "project-scale agent-standard rules"
+        ),
+        "read_before_implementation": True,
         "plan_before_implementation": True,
         "reproducible_verification": True,
         "root_cause_repair": True,
+    }
+    assert artifact_event.payload["workspace_bundle"] == {
+        "files": project_scale_artifact_zip_files(request)
     }
 
 
@@ -248,7 +261,21 @@ async def test_direct_project_scale_fixture_emits_verified_artifact_without_pref
     }
     assert artifact_event.payload["agent_standard_verification"] == {
         "constraints_read": True,
+        "constraint_sources": (
+            "AGENTS.md workspace rules; HANDOFF current-state index; PROJECT_REQUIREMENTS.md"
+        ),
+        "skill_rule_sources": (
+            "AGENTS.md workspace rules; applicable SKILL.md inventory; "
+            "project-scale agent-standard rules"
+        ),
+        "read_before_implementation": True,
         "plan_before_implementation": True,
         "reproducible_verification": True,
         "root_cause_repair": True,
+    }
+    assert artifact_event.payload["workspace_bundle"] == {
+        "files": project_scale_artifact_zip_files(
+            "Project-scale acceptance fixture: build a small project for scale=small "
+            "and flow=direct."
+        )
     }

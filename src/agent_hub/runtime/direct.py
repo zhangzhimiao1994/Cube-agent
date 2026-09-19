@@ -23,6 +23,7 @@ from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
     GatewayProvenance,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -126,6 +127,10 @@ def _project_scale_direct_artifact_text(request: object) -> str:
     return "\n\n".join(blocks)
 
 
+def _project_scale_workspace_bundle_payload(request: object) -> dict[str, JsonValue]:
+    return {"files": dict(project_scale_artifact_zip_files(request))}
+
+
 class DirectRunStream:
     """A single-consumer session wrapper with explicit close ownership."""
 
@@ -227,6 +232,9 @@ class DirectRuntime:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
 
             if _should_emit_project_scale_direct_artifact(context):
+                workspace_bundle = _project_scale_workspace_bundle_payload(context.request)
+                deliverable_quality = project_scale_artifact_deliverable_quality()
+                agent_standard_verification = project_scale_artifact_agent_standard_verification()
                 direct_artifact = Artifact(
                     id=uuid4(),
                     type="text",
@@ -245,10 +253,9 @@ class DirectRuntime:
                         "artifact_id": str(direct_artifact.id),
                         "output": artifact_text_preview,
                         "result": artifact_text_preview,
-                        "deliverable_quality": project_scale_artifact_deliverable_quality(),
-                        "agent_standard_verification": (
-                            project_scale_artifact_agent_standard_verification()
-                        ),
+                        "workspace_bundle": workspace_bundle,
+                        "deliverable_quality": deliverable_quality,
+                        "agent_standard_verification": agent_standard_verification,
                     },
                     artifact=direct_artifact,
                 )
@@ -282,10 +289,9 @@ class DirectRuntime:
                     payload={
                         "artifact_id": str(direct_artifact.id),
                         "summary": artifact_text_preview,
-                        "deliverable_quality": project_scale_artifact_deliverable_quality(),
-                        "agent_standard_verification": (
-                            project_scale_artifact_agent_standard_verification()
-                        ),
+                        "workspace_bundle": workspace_bundle,
+                        "deliverable_quality": deliverable_quality,
+                        "agent_standard_verification": agent_standard_verification,
                     },
                     inputs=(direct_artifact,),
                 )
