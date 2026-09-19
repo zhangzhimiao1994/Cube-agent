@@ -78,6 +78,7 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "agent_standard_verification",
         "discussion_trace",
         "plugin_contract",
+        "workspace_files",
     }
 )
 

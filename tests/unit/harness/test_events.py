@@ -374,6 +374,55 @@ def test_safe_tool_event_payload_marks_generated_file_tools_as_file_create() -> 
         assert payload["operation_kind"] == "file_create"
 
 
+def test_safe_tool_event_payload_projects_safe_workspace_file_summaries() -> None:
+    payload = safe_tool_event_payload(
+        name="project.generate_zip",
+        status="succeeded",
+        result={
+            "workspace_files": (
+                {
+                    "path": "src/app.ts",
+                    "filename": "app.ts",
+                    "mime_type": "text/typescript",
+                    "size_bytes": 2048,
+                    "sha256": "a" * 64,
+                    "download_url": "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+                    "text": "private source should stay in the artifact preview, not event metadata",
+                },
+                {
+                    "path": "../secret.txt",
+                    "filename": "secret.txt",
+                    "mime_type": "text/plain",
+                    "size_bytes": 1,
+                },
+                {
+                    "path": "secrets.env",
+                    "filename": "secrets.env",
+                    "mime_type": "text/plain",
+                    "size_bytes": 16,
+                    "sha256": "sk-secret-token",
+                },
+            )
+        },
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["operation_kind"] == "file_create"
+    assert payload["workspace_files"] == (
+        {
+            "path": "src/app.ts",
+            "filename": "app.ts",
+            "mime_type": "text/typescript",
+            "size_bytes": 2048,
+            "sha256": "a" * 64,
+            "download_url": "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+        },
+    )
+    assert "private source should stay" not in serialized
+    assert "../secret.txt" not in serialized
+    assert "sk-secret-token" not in serialized
+
+
 def test_gateway_completion_projects_safe_model_completed_event() -> None:
     completion = GatewayCompletion(
         response=ModelResponse(

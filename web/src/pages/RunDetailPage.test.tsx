@@ -385,6 +385,17 @@ describe("RunDetailPage", () => {
           payload: {
             operation_kind: "file_create",
             artifact_id: "artifact-final",
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                mime_type: "text/typescript",
+                size_bytes: 512,
+                sha256: "b".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
           },
           artifact: runDetail.artifacts[0],
         },
@@ -415,14 +426,17 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
 
-    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("1 个");
+    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("2 个");
     expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
     expect(within(drawer).getByRole("button", { name: "结果" }).textContent).toContain("1 条");
 
     await user.click(within(drawer).getByRole("button", { name: "文件" }));
     const filesWindow = within(drawer).getByLabelText("文件窗口");
     const fileList = within(filesWindow).getByLabelText("文件操作列表");
-    expect(within(fileList).getByRole("button", { name: /final-script\.md/ })).not.toBeNull();
+    const finalScriptButton = within(fileList).getByRole("button", { name: /final-script\.md/ });
+    expect(finalScriptButton).not.toBeNull();
+    expect(within(fileList).getByRole("button", { name: /src\/app\.ts/ })).not.toBeNull();
+    await user.click(finalScriptButton);
     expect(within(filesWindow).getByText(longArtifactText)).not.toBeNull();
 
     await user.click(within(drawer).getByRole("button", { name: "终端" }));

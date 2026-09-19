@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import cast
 from uuid import UUID
 
@@ -18,6 +19,8 @@ _SENSITIVE_TEXT = re.compile(
 )
 _MAX_PROFILE_ITEMS = 6
 _MAX_PROFILE_TEXT = 160
+_MAX_FILE_SUMMARY_ITEMS = 12
+_MAX_FILE_SUMMARY_TEXT = 160
 _PUBLIC_DELTA_PHASES = frozenset({"analysis", "draft", "final"})
 _PUBLIC_FALLBACK_REASONS = frozenset(
     {
@@ -341,6 +344,9 @@ def safe_tool_event_payload(
         result_bytes = _encoded_json_bytes(result)
         if result_bytes is not None:
             payload["result_bytes"] = result_bytes
+        workspace_files = _safe_file_summaries(result.get("workspace_files"))
+        if workspace_files:
+            payload["workspace_files"] = workspace_files
     if artifact_id is not None:
         safe_artifact_id = _safe_text(artifact_id)
         if safe_artifact_id is not None:
@@ -381,6 +387,88 @@ def _tool_operation_kind(name: str) -> str:
     if any(token in normalized for token in ("browser", "click", "screen")):
         return "browser"
     return "generic"
+
+
+def _safe_file_summaries(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        summary = _safe_file_summary(item)
+        if summary is None:
+            continue
+        summaries.append(summary)
+        if len(summaries) >= _MAX_FILE_SUMMARY_ITEMS:
+            break
+    return tuple(summaries)
+
+
+def _safe_file_summary(item: Mapping[object, object]) -> Mapping[str, JsonValue] | None:
+    path = _safe_file_path(item.get("path"))
+    filename = _safe_file_text(item.get("filename"))
+    mime_type = _safe_file_text(item.get("mime_type"))
+    size_bytes = item.get("size_bytes")
+    if path is None:
+        return None
+    summary: dict[str, JsonValue] = {"path": path}
+    if filename is not None:
+        summary["filename"] = filename
+    if mime_type is not None:
+        summary["mime_type"] = mime_type
+    if type(size_bytes) is int and size_bytes >= 0:
+        summary["size_bytes"] = size_bytes
+    sha256 = _safe_sha256(item.get("sha256"))
+    if sha256 is not None:
+        summary["sha256"] = sha256
+    download_url = _safe_download_url(item.get("download_url"))
+    if download_url is not None:
+        summary["download_url"] = download_url
+    return summary
+
+
+def _safe_file_text(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    text = value.strip()
+    if not text or len(text) > _MAX_FILE_SUMMARY_TEXT or _SENSITIVE_TEXT.search(text):
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        return None
+    return text
+
+
+def _safe_file_path(value: object) -> str | None:
+    text = _safe_file_text(value)
+    if text is None:
+        return None
+    normalized = text.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    if (
+        posix.is_absolute()
+        or PureWindowsPath(text).is_absolute()
+        or normalized.startswith("/")
+        or any(part in {"", ".", ".."} for part in posix.parts)
+        or len(posix.parts) > 12
+    ):
+        return None
+    return posix.as_posix()
+
+
+def _safe_sha256(value: object) -> str | None:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        return None
+    return value
+
+
+def _safe_download_url(value: object) -> str | None:
+    text = _safe_file_text(value)
+    if text is None:
+        return None
+    if not text.startswith("/api/") or _SENSITIVE_TEXT.search(text):
+        return None
+    return text
 
 
 def _encoded_json_bytes(value: Mapping[str, JsonValue]) -> int | None:

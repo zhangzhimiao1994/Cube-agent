@@ -169,6 +169,7 @@ type DetailProcessCard = {
   rows: DetailProcessRow[];
   createdAt: string | null;
   artifact?: DownloadableArtifact;
+  workspaceFiles?: DownloadableArtifact[];
   sourceKind?: string;
   sourceStepId?: string | null;
   sourceActor?: string | null;
@@ -835,6 +836,39 @@ function artifactForEvent(event: RunEvent, artifacts: RunArtifact[]) {
   return artifactId ? artifacts.find((artifact) => artifact.id === artifactId) ?? null : null;
 }
 
+function safeWorkspaceFileText(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableArtifact[] {
+  const files = event.payload.workspace_files;
+  if (!Array.isArray(files)) return [];
+  return files.flatMap((file, index) => {
+    if (!file || typeof file !== "object") return [];
+    const item = file as Record<string, unknown>;
+    const path = safeWorkspaceFileText(item.path);
+    const downloadUrl = safeWorkspaceFileText(item.download_url);
+    if (!path || !downloadUrl) return [];
+    const filename = safeWorkspaceFileText(item.filename) ?? path.split("/").at(-1) ?? path;
+    const mimeType = safeWorkspaceFileText(item.mime_type);
+    const sha256 = safeWorkspaceFileText(item.sha256);
+    const sizeBytes = typeof item.size_bytes === "number" && Number.isFinite(item.size_bytes) ? item.size_bytes : null;
+    return [
+      {
+        id: `workspace-file-${event.sequence}-${index}`,
+        kind: "workspace_file",
+        title: path,
+        text: null,
+        filename,
+        mime_type: mimeType,
+        size_bytes: sizeBytes,
+        sha256,
+        download_url: downloadUrl,
+      },
+    ];
+  });
+}
+
 function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefined): DetailProcessRow[] {
   const rows: DetailProcessRow[] = [
     { label: "时间", value: runEventTimestamp(event.created_at) },
@@ -979,6 +1013,7 @@ function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[
         rows: eventDetailRows(event, artifact),
         createdAt: event.created_at,
         artifact: downloadableArtifact(artifact),
+        workspaceFiles: workspaceFileArtifactsForEvent(event),
         sourceKind: event.kind,
         sourceStepId: event.step_id,
         sourceActor: event.actor,
@@ -1136,25 +1171,28 @@ function detailWorkbenchFiles(cards: DetailProcessCard[]) {
   const seen = new Set<string>();
   const files: DetailWorkbenchFileItem[] = [];
   cards.forEach((card) => {
-    const artifact = card.artifact;
-    const downloadUrl = artifact?.download_url?.trim();
-    if (!artifact || !downloadUrl || seen.has(downloadUrl)) return;
-    seen.add(downloadUrl);
-    const filename = artifactFileName(artifact);
-    files.push({
-      id: `${downloadUrl}:${card.id}`,
-      title: artifact.title || filename,
-      filename,
-      path: artifact.filename ?? artifact.title ?? null,
-      kind: artifact.kind || "file",
-      operation: detailWorkbenchFileOperation(card, artifact),
-      mimeType: artifact.mime_type ?? null,
-      size: formatFileSize(artifact.size_bytes),
-      sha256: artifact.sha256 ?? null,
-      text: isGenericDetailText(artifact.text) ? "" : artifact.text?.trim() || "",
-      download: { ...artifact, download_url: downloadUrl },
-      source: card,
-    });
+    const append = (artifact: DownloadableArtifact) => {
+      const downloadUrl = artifact.download_url?.trim();
+      if (!downloadUrl || seen.has(downloadUrl)) return;
+      seen.add(downloadUrl);
+      const filename = artifactFileName(artifact);
+      files.push({
+        id: `${downloadUrl}:${card.id}`,
+        title: artifact.title || filename,
+        filename,
+        path: artifact.kind === "workspace_file" ? artifact.title ?? artifact.filename ?? null : artifact.filename ?? artifact.title ?? null,
+        kind: artifact.kind || "file",
+        operation: detailWorkbenchFileOperation(card, artifact),
+        mimeType: artifact.mime_type ?? null,
+        size: formatFileSize(artifact.size_bytes),
+        sha256: artifact.sha256 ?? null,
+        text: isGenericDetailText(artifact.text) ? "" : artifact.text?.trim() || "",
+        download: { ...artifact, download_url: downloadUrl },
+        source: card,
+      });
+    };
+    card.workspaceFiles?.forEach(append);
+    if (card.artifact) append(card.artifact);
   });
   return files;
 }
@@ -2256,6 +2294,12 @@ function DetailWorkbenchFilePreview({
   const [error, setError] = useState<string | null>(null);
   const canPreview = isDetailTextPreviewCandidate(file);
 
+  useEffect(() => {
+    setPreviewText(file.text);
+    setLoading(false);
+    setError(null);
+  }, [file.id, file.text]);
+
   async function loadPreview() {
     if (!canPreview || previewText) return;
     setLoading(true);
@@ -2522,7 +2566,7 @@ function DetailProcessDrawer({
                           </button>
                         ))}
                       </div>
-                      {selectedFile ? <DetailWorkbenchFilePreview file={selectedFile} onOpenSource={onSelectCard} /> : null}
+                      {selectedFile ? <DetailWorkbenchFilePreview key={selectedFile.id} file={selectedFile} onOpenSource={onSelectCard} /> : null}
                     </div>
                   ) : (
                     <p className="agent-workbench-compressed-note">暂无可预览文件；后续运行产生文件后会显示在这里。</p>

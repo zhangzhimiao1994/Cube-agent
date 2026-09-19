@@ -9,6 +9,7 @@ import {
   runConversationId,
   runDetailVersion,
   runProcessItems,
+  workbenchFileItems,
   workspacePreviewPath,
 } from "./RunsPage";
 
@@ -346,6 +347,42 @@ describe("workspace and sandbox submission helpers", () => {
 
     expect(files.final.map((artifact) => artifact.filename)).toEqual(["demo.zip"]);
     expect(files.intermediate.map((artifact) => artifact.filename)).toEqual(["draft.md"]);
+  });
+
+  it("projects event workspace files into the workbench file list", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "创建文件 src/app.ts",
+          created_at: "2026-09-02T00:01:30Z",
+          participants: [],
+          payload: {
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                mime_type: "text/typescript",
+                size_bytes: 512,
+                sha256: "b".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+                text: "raw file text should not be used",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, []);
+
+    expect(files.map((file) => file.path)).toEqual(["src/app.ts"]);
+    expect(files[0]?.operation).toBe("创建文件");
+    expect(files[0]?.text).toBe("");
   });
 
   it("maps sandbox profiles to bounded requested permissions", () => {

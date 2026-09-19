@@ -2476,6 +2476,40 @@ function workbenchFileOperationFromArtifact(artifact: DownloadableFile) {
   return "产物";
 }
 
+function safeWorkspaceFileText(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableFile[] {
+  const files = event.payload.workspace_files;
+  if (!Array.isArray(files)) return [];
+  return files.flatMap((file, index) => {
+    if (!file || typeof file !== "object") return [];
+    const item = file as Record<string, unknown>;
+    const path = safeWorkspaceFileText(item.path);
+    const downloadUrl = safeWorkspaceFileText(item.download_url);
+    if (!path || !downloadUrl) return [];
+    const filename = safeWorkspaceFileText(item.filename) ?? path.split("/").at(-1) ?? path;
+    const mimeType = safeWorkspaceFileText(item.mime_type);
+    const sha256 = safeWorkspaceFileText(item.sha256);
+    const sizeBytes = typeof item.size_bytes === "number" && Number.isFinite(item.size_bytes) ? item.size_bytes : null;
+    return [
+      {
+        id: `workspace-file-${event.sequence}-${index}`,
+        kind: "workspace_file",
+        title: path,
+        path,
+        text: null,
+        filename,
+        mime_type: mimeType,
+        size_bytes: sizeBytes,
+        sha256,
+        download_url: downloadUrl,
+      },
+    ];
+  });
+}
+
 function asWorkbenchFileOperation(value: string): WorkbenchFileItem["operation"] | null {
   if (value === "创建文件" || value === "编辑文件" || value === "读取文件" || value === "产物" || value === "文件夹") return value;
   return null;
@@ -2517,7 +2551,7 @@ function workbenchFileFromArtifact(
   };
 }
 
-function workbenchFileItems(
+export function workbenchFileItems(
   runs: RunDetail[],
   workspaceFiles: ConversationWorkspaceFileBuckets,
   processItems: ProcessDetailTarget[],
@@ -2538,7 +2572,10 @@ function workbenchFileItems(
 
   orderedConversationRuns(runs).forEach((run) => {
     run.artifacts.forEach((artifact) => append(artifact, null));
-    orderedRunEvents(run.events).forEach((event) => append(event.artifact, null));
+    orderedRunEvents(run.events).forEach((event) => {
+      workspaceFileArtifactsForEvent(event).forEach((artifact) => append(artifact, null));
+      append(event.artifact, null);
+    });
   });
   workspaceFiles.final.forEach((artifact) => append(artifact, null));
   workspaceFiles.intermediate.forEach((artifact) => append(artifact, null));
