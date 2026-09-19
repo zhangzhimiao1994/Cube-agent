@@ -352,6 +352,73 @@ describe("RunDetailPage", () => {
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
   });
 
+  it("shows structured discussion evidence in the run detail workbench coordination view", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "discussion.completed",
+          message: "discussion completed",
+          summary: "多角色完成方案讨论",
+          actor: "main_agent",
+          participants: ["planner", "critic"],
+          step_id: "discussion-final",
+          artifact: null,
+          payload: {
+            discussion_trace: {
+              participants: ["planner", "critic"],
+              member_statements: {
+                planner: "建议先生成计划文件和架构图谱，再进入实现。",
+                critic: "担心直接实现会遗漏测试标准，需要先补验收清单。",
+              },
+              disagreement_summary: "是否立即实现存在分歧，风险是跳过验收。",
+              verification_steps: ["核对技能规则", "读取约束", "检查计划任务不会抢占普通交互"],
+              final_decision: "先完成计划和验收清单，再派发实现任务。",
+            },
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
+
+    const brief = within(drawer).getByLabelText("调度简报");
+    expect(within(brief).getByText("成员发言")).not.toBeNull();
+    expect(within(brief).getByText(/建议先生成计划文件和架构图谱/)).not.toBeNull();
+    expect(within(brief).getAllByText("分歧与风险").length).toBeGreaterThan(0);
+    expect(within(brief).getByText(/是否立即实现存在分歧/)).not.toBeNull();
+    expect(within(brief).getAllByText("求证与验证").length).toBeGreaterThan(0);
+    expect(within(brief).getByText(/核对技能规则/)).not.toBeNull();
+    expect(within(brief).getAllByText("最终决策").length).toBeGreaterThan(0);
+    expect(within(brief).getByText(/先完成计划和验收清单/)).not.toBeNull();
+  });
+
   it("splits run detail workbench files terminals and results into separate inspectable windows", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {

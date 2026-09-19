@@ -899,6 +899,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (isSensitiveEventPayloadKey(key)) return;
     if (key === "participants" || key === "participant_models") return;
+    if (key === "discussion_trace" || key === "dispatch_discussion_trace" || key === "coordination_trace") return;
     if (event.kind === "discussion.completed" && (DISCUSSION_MINUTES_PAYLOAD_KEYS.has(key) || key.endsWith("_opinion"))) return;
     if (safeSummary && key === "summary") {
       const formatted = formatEventPayloadValue(value);
@@ -2942,6 +2943,48 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function discussionTracePayload(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function discussionTraceValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => formatEventPayloadValue(item)).filter(Boolean).join("、");
+  }
+  return formatEventPayloadValue(value);
+}
+
+function discussionTraceRows(event: RunEvent, agentNames: Map<string, string>) {
+  const trace =
+    discussionTracePayload(event.payload.discussion_trace) ??
+    discussionTracePayload(event.payload.dispatch_discussion_trace) ??
+    discussionTracePayload(event.payload.coordination_trace);
+  if (!trace) return [];
+  const rows: Array<{ label: string; value: string }> = [];
+  const memberStatements = trace.member_statements;
+  if (memberStatements && typeof memberStatements === "object") {
+    if (Array.isArray(memberStatements)) {
+      memberStatements.forEach((statement, index) => {
+        const value = discussionTraceValue(statement);
+        if (value) rows.push({ label: `成员发言 ${index + 1}`, value });
+      });
+    } else {
+      Object.entries(memberStatements as Record<string, unknown>).forEach(([actor, statement]) => {
+        const value = discussionTraceValue(statement);
+        if (value) rows.push({ label: `${agentNames.get(actor) ?? humanizeEventIdentifier(actor)}意见`, value });
+      });
+    }
+  }
+  const disagreement = discussionTraceValue(trace.disagreements) || discussionTraceValue(trace.disagreement_summary);
+  if (disagreement) rows.push({ label: "分歧与风险", value: disagreement });
+  const verification = discussionTraceValue(trace.verification_steps);
+  if (verification) rows.push({ label: "求证与验证", value: verification });
+  const finalDecision = discussionTraceValue(trace.final_decision);
+  if (finalDecision) rows.push({ label: "最终决策", value: finalDecision });
+  return rows;
+}
+
 function discussionConsensusSignal(event: RunEvent) {
   return (
     formatEventPayloadValue(event.payload.conclusion) ||
@@ -2991,6 +3034,7 @@ function discussionMinutesRows(event: RunEvent, agentNames: Map<string, string>)
   eventOpinionEntries(event, agentNames).forEach((opinion) => {
     rows.push({ label: `${opinion.actor}意见`, value: opinion.value });
   });
+  rows.push(...discussionTraceRows(event, agentNames));
   if (judgement) rows.push({ label: "主 Agent 裁决", value: judgement });
   return rows;
 }

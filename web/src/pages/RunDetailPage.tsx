@@ -208,6 +208,20 @@ type DetailWorkbenchFileItem = {
   source: DetailProcessCard | null;
 };
 
+type DetailCoordinationSnippet = {
+  id: string;
+  label: string;
+  text: string;
+  target: DetailProcessCard;
+};
+
+type DetailCoordinationSection = {
+  key: string;
+  title: string;
+  empty: string;
+  snippets: DetailCoordinationSnippet[];
+};
+
 function recentPreview<T>(items: T[], limit: number, expanded = false) {
   if (expanded || items.length <= limit) {
     return { visible: items, hiddenCount: 0 };
@@ -679,6 +693,50 @@ function formatDetailPayloadDisplayValue(key: string, value: unknown): string {
   return formatDetailValue(value);
 }
 
+function discussionTracePayload(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function discussionTraceValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => formatDetailValue(item)).filter(Boolean).join("、");
+  }
+  return formatDetailValue(value);
+}
+
+function discussionTraceRows(payload: Record<string, unknown>): DetailProcessRow[] {
+  const trace =
+    discussionTracePayload(payload.discussion_trace) ??
+    discussionTracePayload(payload.dispatch_discussion_trace) ??
+    discussionTracePayload(payload.coordination_trace);
+  if (!trace) return [];
+  const rows: DetailProcessRow[] = [];
+  const participants = discussionTraceValue(trace.participants);
+  if (participants) rows.push({ label: "讨论参与者", value: participants });
+  const memberStatements = trace.member_statements;
+  if (memberStatements && typeof memberStatements === "object") {
+    if (Array.isArray(memberStatements)) {
+      memberStatements.forEach((statement, index) => {
+        const value = discussionTraceValue(statement);
+        if (value) rows.push({ label: `成员发言 ${index + 1}`, value });
+      });
+    } else {
+      Object.entries(memberStatements as Record<string, unknown>).forEach(([actor, statement]) => {
+        const value = discussionTraceValue(statement);
+        if (value) rows.push({ label: `${detailPayloadLabel(actor)}意见`, value });
+      });
+    }
+  }
+  const disagreement = discussionTraceValue(trace.disagreements) || discussionTraceValue(trace.disagreement_summary);
+  if (disagreement) rows.push({ label: "分歧与风险", value: disagreement });
+  const verification = discussionTraceValue(trace.verification_steps);
+  if (verification) rows.push({ label: "求证与验证", value: verification });
+  const finalDecision = discussionTraceValue(trace.final_decision);
+  if (finalDecision) rows.push({ label: "最终决策", value: finalDecision });
+  return rows;
+}
+
 function runtimeRecoveryPayloadStatusLabel(value: unknown) {
   const counts = objectPayload(value);
   if (!counts) return "";
@@ -887,7 +945,9 @@ function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefin
   if (safeDiagnosticIdentifier(event.decision, "")) rows.push({ label: "决策", value: safeDiagnosticIdentifier(event.decision, "") });
   if (event.summary?.trim()) rows.push({ label: "安全摘要", value: event.summary.trim() });
   if (!isGenericDetailText(event.message)) rows.push({ label: "事件内容", value: event.message.trim() });
+  discussionTraceRows(event.payload).forEach((row) => rows.push(row));
   Object.entries(event.payload).forEach(([key, value]) => {
+    if (key === "discussion_trace" || key === "dispatch_discussion_trace" || key === "coordination_trace") return;
     if (isSensitivePayloadKey(key) || hasSensitiveNestedValue(value)) return;
     const formatted = formatDetailPayloadDisplayValue(key, value);
     if (formatted) rows.push({ label: detailPayloadLabel(key), value: formatted });
@@ -1110,6 +1170,77 @@ function isDetailCoordinationCard(card: DetailProcessCard) {
     card.label === "讨论过程" ||
     card.label === "决策过程"
   );
+}
+
+function minutePart(value: string, label: string) {
+  const match = value.match(new RegExp(`${label}[:：]\\s*([^；;]+)`));
+  return match?.[1]?.trim() ?? "";
+}
+
+function addDetailCoordinationSnippet(
+  sections: Map<string, DetailCoordinationSnippet[]>,
+  key: string,
+  card: DetailProcessCard,
+  label: string,
+  text: string,
+) {
+  const normalized = conciseProcessText(text, "").trim();
+  if (!normalized) return;
+  const bucket = sections.get(key) ?? [];
+  if (bucket.some((snippet) => snippet.text === normalized && snippet.label === label)) return;
+  bucket.push({
+    id: `${card.id}-${key}-${bucket.length}`,
+    label,
+    text: normalized,
+    target: card,
+  });
+  sections.set(key, bucket);
+}
+
+function detailCoordinationEvidenceSections(cards: DetailProcessCard[]): DetailCoordinationSection[] {
+  const sections = new Map<string, DetailCoordinationSnippet[]>();
+  cards.forEach((card) => {
+    if (card.label === "调度过程") {
+      addDetailCoordinationSnippet(sections, "dispatch", card, card.label, card.detail || card.title);
+    }
+    if (card.label === "决策过程") {
+      addDetailCoordinationSnippet(sections, "decision", card, card.label, card.detail || card.title);
+    }
+    card.rows.forEach((row) => {
+      const labelText = row.label;
+      const combined = `${row.label} ${row.value}`;
+      if (/意见|opinion/i.test(labelText)) {
+        addDetailCoordinationSnippet(sections, "statements", card, row.label, row.value);
+      }
+      if (/分歧|风险|冲突|disagreement|conflict|concern|risk/i.test(labelText)) {
+        addDetailCoordinationSnippet(sections, "disagreement", card, row.label, row.value);
+      }
+      if (/验证|求证|证据|检查|测试|verification|evidence|check|test/i.test(labelText)) {
+        addDetailCoordinationSnippet(sections, "verification", card, row.label, row.value);
+      }
+      if (/裁决|决策|结论|final decision|final_decision|decision|conclusion/i.test(labelText)) {
+        addDetailCoordinationSnippet(sections, "decision", card, row.label, row.value);
+      }
+      if (row.label === "会议纪要") {
+        addDetailCoordinationSnippet(sections, "disagreement", card, "分歧", minutePart(row.value, "分歧"));
+        addDetailCoordinationSnippet(sections, "decision", card, "结论", minutePart(row.value, "结论"));
+      }
+      if (/验证|求证|证据/.test(combined) && !/验证|求证|证据/.test(labelText)) {
+        addDetailCoordinationSnippet(sections, "verification", card, row.label, row.value);
+      }
+    });
+  });
+  const descriptors = [
+    { key: "dispatch", title: "派工依据", empty: "暂无派工依据" },
+    { key: "statements", title: "成员发言", empty: "暂无成员发言" },
+    { key: "disagreement", title: "分歧与风险", empty: "暂无分歧记录" },
+    { key: "verification", title: "求证与验证", empty: "暂无求证记录" },
+    { key: "decision", title: "最终决策", empty: "暂无最终决策" },
+  ];
+  return descriptors.map((descriptor) => ({
+    ...descriptor,
+    snippets: (sections.get(descriptor.key) ?? []).slice(0, 4),
+  }));
 }
 
 function isDetailRecoveryCard(card: DetailProcessCard) {
@@ -2282,6 +2413,43 @@ function DetailProcessCardBody({ card }: { card: DetailProcessCard }) {
   );
 }
 
+function DetailCoordinationEvidence({
+  sections,
+  onOpen,
+}: {
+  sections: DetailCoordinationSection[];
+  onOpen: (card: DetailProcessCard) => void;
+}) {
+  return (
+    <section className="agent-workbench-brief" aria-label="调度简报">
+      <div className="agent-workbench-brief-header">
+        <strong>调度简报</strong>
+        <small>派工、分歧、求证和决策</small>
+      </div>
+      <div className="agent-workbench-brief-grid">
+        {sections.map((section) => (
+          <article key={section.key} className="agent-workbench-brief-section">
+            <div>
+              <strong>{section.title}</strong>
+              <small>{section.snippets.length > 0 ? `${section.snippets.length} 条` : section.empty}</small>
+            </div>
+            {section.snippets.length > 0 ? (
+              <div>
+                {section.snippets.map((snippet) => (
+                  <button key={snippet.id} type="button" onClick={() => onOpen(snippet.target)}>
+                    <small>{snippet.label}</small>
+                    <span>{snippet.text}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function DetailWorkbenchFilePreview({
   file,
   onOpenSource,
@@ -2378,6 +2546,7 @@ function DetailProcessDrawer({
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const overviewCards = detailWorkbenchOverviewCards(cards);
   const coordinationCards = cards.filter(isDetailCoordinationCard);
+  const coordinationSections = detailCoordinationEvidenceSections(coordinationCards);
   const recoveryCards = cards.filter(isDetailRecoveryCard);
   const actionCards = detailActionCards(cards);
   const fileItems = detailWorkbenchFiles(cards);
@@ -2585,6 +2754,9 @@ function DetailProcessDrawer({
                   </div>
                   {visiblePreview.hiddenCount > 0 ? (
                     <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
+                  ) : null}
+                  {activeView === "coordination" && coordinationCards.length > 0 ? (
+                    <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} />
                   ) : null}
                   <div className="agent-cluster-actions" aria-label={visibleAria}>
                     {visiblePreview.visible.map((card) => (

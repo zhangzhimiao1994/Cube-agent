@@ -277,6 +277,43 @@ describe("conversation ordering", () => {
     expect(JSON.stringify(recovery?.rows)).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
     expect(JSON.stringify(recovery?.rows)).not.toContain("checkpoint_id");
   });
+
+  it("projects nested discussion traces into chat workbench process rows", () => {
+    const discussionRun: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "discussion.completed",
+          message: "discussion.completed",
+          summary: "多角色完成方案讨论",
+          created_at: "2026-09-02T00:00:01Z",
+          actor: "main_agent",
+          participants: ["planner", "critic"],
+          payload: {
+            discussion_trace: {
+              participants: ["planner", "critic"],
+              member_statements: {
+                planner: "建议先生成计划文件和架构图谱，再进入实现。",
+                critic: "担心直接实现会遗漏测试标准，需要先补验收清单。",
+              },
+              disagreement_summary: "是否立即实现存在分歧，风险是跳过验收。",
+              verification_steps: ["核对技能规则", "读取约束"],
+              final_decision: "先完成计划和验收清单，再派发实现任务。",
+            },
+          },
+        },
+      ],
+    };
+
+    const item = runProcessItems(discussionRun, new Map()).find((candidate) => candidate.badge === "讨论过程");
+    const rows = item?.rows.map((row) => `${row.label}:${row.value}`).join("\n") ?? "";
+
+    expect(rows).toContain("Planner意见:建议先生成计划文件和架构图谱");
+    expect(rows).toContain("分歧与风险:是否立即实现存在分歧");
+    expect(rows).toContain("求证与验证:核对技能规则、读取约束");
+    expect(rows).toContain("最终决策:先完成计划和验收清单");
+  });
 });
 
 describe("workspace and sandbox submission helpers", () => {
