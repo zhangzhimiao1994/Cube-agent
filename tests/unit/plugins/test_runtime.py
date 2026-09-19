@@ -3462,6 +3462,69 @@ async def test_runtime_plugin_service_invokes_registered_adapter_for_running_cap
     assert context.idempotency_key == "plugin_1"
 
 
+async def test_runtime_plugin_service_lifecycle_reload_controls_manifest_and_invocation() -> None:
+    admin_service = FakeAdminService((plugin("calendar"),))
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    first = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert first["ok"] is True
+    assert service.is_available(TENANT_ID, "calendar.create_event") is True
+    admin_service.plugins = (plugin("calendar", status="stopped", health="stopped"),)
+    await service.reload(TENANT_ID)
+
+    stopped_manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    stopped_capabilities = {
+        str(item["id"]): item
+        for item in cast(tuple[Mapping[str, object], ...], stopped_manifest["capabilities"])
+    }
+
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert stopped_capabilities["calendar.create_event"]["available"] is False
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_2",
+        )
+
+    admin_service.plugins = (plugin("calendar"),)
+    await service.reload(TENANT_ID)
+    second = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "follow-up"},
+        idempotency_key="plugin_3",
+    )
+
+    assert second["ok"] is True
+    assert service.is_available(TENANT_ID, "calendar.create_event") is True
+    assert [call[2] for call in adapter.calls] == [
+        {"title": "review"},
+        {"title": "follow-up"},
+    ]
+
+
 async def test_runtime_plugin_service_allows_remote_connector_sandbox_profile() -> None:
     adapter = RecordingPluginAdapter([])
     service = await build_runtime_plugin_service(

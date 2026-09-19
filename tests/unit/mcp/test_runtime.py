@@ -452,6 +452,50 @@ async def test_runtime_mcp_reload_failure_preserves_loaded_tenant_service() -> N
     assert result == {"answer": "cached"}
 
 
+async def test_runtime_mcp_build_failure_preserves_loaded_tenant_service() -> None:
+    admin_service = TenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    duplicate_tools = False
+
+    def client_factory(_server: Any) -> InMemoryMcpClient:
+        tools = (
+            (McpToolSchema(name="web_search"), McpToolSchema(name="web_search"))
+            if duplicate_tools
+            else (McpToolSchema(name="web_search"),)
+        )
+        return InMemoryMcpClient(
+            tools=tools,
+            responses={"web_search": McpInvocationResult(content={"answer": "cached"})},
+        )
+
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=client_factory,
+    )
+    await service.reload(OTHER_TENANT_ID)
+
+    duplicate_tools = True
+    await service.reload(OTHER_TENANT_ID)
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="runtime_planning",
+        name="search.web_search",
+        arguments={"query": "still available after build failure"},
+        idempotency_key="mcp_preserved_after_build_failure",
+    )
+
+    assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
+    assert result == {"answer": "cached"}
+
+
 async def test_runtime_mcp_invocation_retries_after_initial_reload_failure() -> None:
     admin_service = FailingOnceTenantMappedAdminService(
         {
