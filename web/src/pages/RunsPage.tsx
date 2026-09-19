@@ -2481,6 +2481,22 @@ function safeWorkspaceFileText(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function workspaceFileOperationKind(value: unknown) {
+  const normalized = safeWorkspaceFileText(value)?.toLowerCase();
+  if (
+    normalized === "file_create" ||
+    normalized === "file_edit" ||
+    normalized === "file_write" ||
+    normalized === "file_read" ||
+    normalized === "terminal" ||
+    normalized === "browser" ||
+    normalized === "generic"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
 function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableFile[] {
   const files = event.payload.workspace_files;
   if (!Array.isArray(files)) return [];
@@ -2492,6 +2508,7 @@ function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableFile[] {
     if (!path || !downloadUrl) return [];
     const filename = safeWorkspaceFileText(item.filename) ?? path.split("/").at(-1) ?? path;
     const mimeType = safeWorkspaceFileText(item.mime_type);
+    const operationKind = workspaceFileOperationKind(item.operation_kind);
     const sha256 = safeWorkspaceFileText(item.sha256);
     const sizeBytes = typeof item.size_bytes === "number" && Number.isFinite(item.size_bytes) ? item.size_bytes : null;
     return [
@@ -2502,6 +2519,7 @@ function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableFile[] {
         path,
         text: null,
         filename,
+        operation_kind: operationKind,
         mime_type: mimeType,
         size_bytes: sizeBytes,
         sha256,
@@ -2517,6 +2535,9 @@ function asWorkbenchFileOperation(value: string): WorkbenchFileItem["operation"]
 }
 
 function workbenchFileOperationFromProcessItem(item: ProcessDetailTarget | null, artifact: DownloadableFile) {
+  const fileOperation = artifact.operation_kind ? toolOperationKindLabel(artifact.operation_kind) : "";
+  const directFileOperation = asWorkbenchFileOperation(fileOperation);
+  if (directFileOperation && directFileOperation !== "产物" && directFileOperation !== "文件夹") return directFileOperation;
   if (!item) return workbenchFileOperationFromArtifact(artifact);
   const badge = item.badge;
   const text = `${item.title} ${item.message} ${item.rows.map((row) => `${row.label} ${row.value}`).join(" ")}`;

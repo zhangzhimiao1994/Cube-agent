@@ -188,6 +188,7 @@ type DetailProcessGroup = {
 
 type DownloadableArtifact = RunArtifact & {
   download_url: string;
+  operation_kind?: string | null;
 };
 
 const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
@@ -341,8 +342,13 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
 
 const TOOL_OPERATION_LABELS: Record<string, string> = {
   terminal: "终端",
+  server_command: "终端",
+  file_create: "文件创建",
   file_edit: "文件编辑",
+  file_write: "文件编辑",
   file_read: "文件读取",
+  screen_read: "屏幕读取",
+  desktop_action: "桌面操作",
   browser: "浏览器",
   generic: "工具",
 };
@@ -898,6 +904,22 @@ function safeWorkspaceFileText(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function workspaceFileOperationKind(value: unknown) {
+  const normalized = safeWorkspaceFileText(value)?.toLowerCase();
+  if (
+    normalized === "file_create" ||
+    normalized === "file_edit" ||
+    normalized === "file_write" ||
+    normalized === "file_read" ||
+    normalized === "terminal" ||
+    normalized === "browser" ||
+    normalized === "generic"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
 function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableArtifact[] {
   const files = event.payload.workspace_files;
   if (!Array.isArray(files)) return [];
@@ -909,6 +931,7 @@ function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableArtifact[]
     if (!path || !downloadUrl) return [];
     const filename = safeWorkspaceFileText(item.filename) ?? path.split("/").at(-1) ?? path;
     const mimeType = safeWorkspaceFileText(item.mime_type);
+    const operationKind = workspaceFileOperationKind(item.operation_kind);
     const sha256 = safeWorkspaceFileText(item.sha256);
     const sizeBytes = typeof item.size_bytes === "number" && Number.isFinite(item.size_bytes) ? item.size_bytes : null;
     return [
@@ -918,6 +941,7 @@ function workspaceFileArtifactsForEvent(event: RunEvent): DownloadableArtifact[]
         title: path,
         text: null,
         filename,
+        operation_kind: operationKind,
         mime_type: mimeType,
         size_bytes: sizeBytes,
         sha256,
@@ -1287,6 +1311,10 @@ function asDetailWorkbenchFileOperation(value: string): DetailWorkbenchFileItem[
 }
 
 function detailWorkbenchFileOperation(card: DetailProcessCard, artifact: DownloadableArtifact): DetailWorkbenchFileItem["operation"] {
+  const fileOperation = artifact.operation_kind ? displayToolOperation(artifact.operation_kind) : "";
+  if (fileOperation === "文件创建") return "创建文件";
+  if (fileOperation === "文件编辑") return "编辑文件";
+  if (fileOperation === "文件读取") return "读取文件";
   const direct = asDetailWorkbenchFileOperation(card.label);
   if (direct && direct !== "产物" && direct !== "文件夹") return direct;
   const text = `${detailWorkbenchCardText(card)} ${artifact.kind} ${artifact.title ?? ""} ${artifact.filename ?? ""}`;

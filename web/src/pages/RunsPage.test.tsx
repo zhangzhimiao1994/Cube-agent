@@ -422,6 +422,40 @@ describe("workspace and sandbox submission helpers", () => {
     expect(files[0]?.text).toBe("");
   });
 
+  it("uses workspace file operation metadata before event text fallbacks", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "创建文件 src/app.ts",
+          created_at: "2026-09-02T00:01:30Z",
+          participants: [],
+          payload: {
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                operation_kind: "file_edit",
+                mime_type: "text/typescript",
+                size_bytes: 512,
+                sha256: "b".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, []);
+
+    expect(files.map((file) => `${file.filename}:${file.operation}`)).toEqual(["app.ts:编辑文件"]);
+  });
+
   it("maps sandbox profiles to bounded requested permissions", () => {
     expect(requestedPermissionsForSandbox("none")).toEqual([]);
     expect(requestedPermissionsForSandbox("read_only")).toEqual(["workspace.read"]);

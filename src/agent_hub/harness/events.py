@@ -38,6 +38,17 @@ _PUBLIC_TOOL_RESULT_EVIDENCE_KEYS = frozenset(
         "plugin_contract",
     }
 )
+_SAFE_FILE_OPERATION_KINDS = frozenset(
+    {
+        "browser",
+        "file_create",
+        "file_edit",
+        "file_read",
+        "file_write",
+        "generic",
+        "terminal",
+    }
+)
 
 
 def provider_events_to_run_events(
@@ -415,6 +426,9 @@ def _safe_file_summary(item: Mapping[object, object]) -> Mapping[str, JsonValue]
     summary: dict[str, JsonValue] = {"path": path}
     if filename is not None:
         summary["filename"] = filename
+    operation_kind = _safe_file_operation_kind(item.get("operation_kind"))
+    if operation_kind is not None:
+        summary["operation_kind"] = operation_kind
     if mime_type is not None:
         summary["mime_type"] = mime_type
     if type(size_bytes) is int and size_bytes >= 0:
@@ -426,6 +440,15 @@ def _safe_file_summary(item: Mapping[object, object]) -> Mapping[str, JsonValue]
     if download_url is not None:
         summary["download_url"] = download_url
     return summary
+
+
+def _safe_file_operation_kind(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = value.strip().casefold()
+    if normalized in _SAFE_FILE_OPERATION_KINDS:
+        return normalized
+    return None
 
 
 def _safe_file_text(value: object) -> str | None:

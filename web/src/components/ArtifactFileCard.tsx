@@ -20,6 +20,7 @@ type FileLike = {
   download_url?: string | null;
   presentation?: string | null;
   path?: string | null;
+  operation_kind?: string | null;
 };
 export type DownloadableFile = FileLike & { download_url: string };
 

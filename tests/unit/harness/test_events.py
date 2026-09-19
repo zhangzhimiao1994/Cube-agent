@@ -383,6 +383,7 @@ def test_safe_tool_event_payload_projects_safe_workspace_file_summaries() -> Non
                 {
                     "path": "src/app.ts",
                     "filename": "app.ts",
+                    "operation_kind": "file_edit",
                     "mime_type": "text/typescript",
                     "size_bytes": 2048,
                     "sha256": "a" * 64,
@@ -398,6 +399,7 @@ def test_safe_tool_event_payload_projects_safe_workspace_file_summaries() -> Non
                 {
                     "path": "secrets.env",
                     "filename": "secrets.env",
+                    "operation_kind": "leak private command output",
                     "mime_type": "text/plain",
                     "size_bytes": 16,
                     "sha256": "sk-secret-token",
@@ -412,6 +414,7 @@ def test_safe_tool_event_payload_projects_safe_workspace_file_summaries() -> Non
         {
             "path": "src/app.ts",
             "filename": "app.ts",
+            "operation_kind": "file_edit",
             "mime_type": "text/typescript",
             "size_bytes": 2048,
             "sha256": "a" * 64,

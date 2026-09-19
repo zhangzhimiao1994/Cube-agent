@@ -456,6 +456,7 @@ describe("RunDetailPage", () => {
               {
                 path: "src/app.ts",
                 filename: "app.ts",
+                operation_kind: "file_edit",
                 mime_type: "text/typescript",
                 size_bytes: 512,
                 sha256: "b".repeat(64),
@@ -501,8 +502,12 @@ describe("RunDetailPage", () => {
     const filesWindow = within(drawer).getByLabelText("文件窗口");
     const fileList = within(filesWindow).getByLabelText("文件操作列表");
     const finalScriptButton = within(fileList).getByRole("button", { name: /final-script\.md/ });
+    const workspaceFileButton = within(fileList).getByRole("button", { name: /src\/app\.ts/ });
     expect(finalScriptButton).not.toBeNull();
-    expect(within(fileList).getByRole("button", { name: /src\/app\.ts/ })).not.toBeNull();
+    expect(workspaceFileButton).not.toBeNull();
+    await user.click(workspaceFileButton);
+    const workspacePreview = within(filesWindow).getByLabelText("app.ts预览");
+    expect(within(workspacePreview).getByText("编辑文件")).not.toBeNull();
     await user.click(finalScriptButton);
     expect(within(filesWindow).getByText(longArtifactText)).not.toBeNull();
 
