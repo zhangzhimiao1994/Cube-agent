@@ -97,6 +97,13 @@ _PLACEHOLDER_MARKERS = (
     "not implemented",
     "mock only",
     "stub only",
+    "todo: replace",
+    "replace with real implementation",
+    "dummy implementation",
+    "dummy data only",
+    "sample app",
+    "hello world",
+    "demo only",
 )
 _VERIFICATION_REPORT_BASENAMES = frozenset(
     {
@@ -1749,6 +1756,7 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
             text = _workspace_bundle_text(archive, names)
             verification_text = _workspace_bundle_verification_text(archive, names)
             test_text = _workspace_bundle_test_text(archive, names)
+            source_text = _workspace_bundle_source_text(archive, names)
     except (OSError, zipfile.BadZipFile):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
 
@@ -1757,6 +1765,8 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing requirements or README artifact")
     if not _bundle_has_source_files(lowered):
         reasons.append("workspace_bundle: missing source files")
+    elif not _source_text_has_meaningful_implementation(source_text):
+        reasons.append("workspace_bundle: missing meaningful source implementation")
     if not _bundle_has_verification_file_path(lowered):
         reasons.append("workspace_bundle: missing test or verification file path")
     if not _test_text_has_meaningful_assertions(test_text):
@@ -1820,6 +1830,19 @@ def _workspace_bundle_test_text(archive: zipfile.ZipFile, names: Sequence[str]) 
     chunks: list[str] = []
     for name in names:
         if not _is_test_file_name(name.lower()):
+            continue
+        try:
+            chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
+        except (KeyError, RuntimeError, OSError):
+            continue
+    return "\n".join(chunks)
+
+
+def _workspace_bundle_source_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:
+    chunks: list[str] = []
+    for name in names:
+        lowered = name.lower()
+        if not _is_project_source_file(lowered) and lowered not in {"main.py", "index.html"}:
             continue
         try:
             chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
@@ -1976,6 +1999,38 @@ def _test_text_has_meaningful_assertions(test_text: str) -> bool:
             "unittest.",
         )
     )
+
+
+def _source_text_has_meaningful_implementation(source_text: str) -> bool:
+    stripped = _source_text_without_comments(source_text)
+    lowered = stripped.lower()
+    if len(re.sub(r"\s+", "", stripped)) < 40:
+        return False
+    if any(marker in lowered for marker in ("hello world", "dummy implementation")):
+        return False
+    return any(
+        re.search(pattern, stripped, flags=re.IGNORECASE)
+        for pattern in (
+            r"\bfunction\s+\w+\s*\(",
+            r"\bclass\s+\w+",
+            r"=>",
+            r"\bdef\s+\w+\s*\(",
+            r"\b(if|for|while|switch|try|catch)\b",
+            r"\b(addEventListener|querySelector|fetch|map|filter|reduce|setState)\s*\(",
+            r"\bexport\s+(?:async\s+)?function\s+\w+\s*\(",
+        )
+    )
+
+
+def _source_text_without_comments(source_text: str) -> str:
+    without_block_comments = re.sub(r"/\*.*?\*/", "", source_text, flags=re.DOTALL)
+    lines: list[str] = []
+    for line in without_block_comments.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("#", "//")):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:

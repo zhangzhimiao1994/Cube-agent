@@ -1045,12 +1045,8 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
                     {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
                     sort_keys=True,
                 ),
-                "src/main.js": "export const status = 'ready';\n",
-                "tests/main.test.js": (
-                    "import assert from 'node:assert/strict';\n"
-                    "import { status } from '../src/main.js';\n"
-                    "assert.equal(status, 'ready');\n"
-                ),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
             }
         }
     }
@@ -1108,12 +1104,8 @@ def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> 
                     {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
                     sort_keys=True,
                 ),
-                "src/main.js": "export const status = 'ready';\n",
-                "tests/main.test.js": (
-                    "import assert from 'node:assert/strict';\n"
-                    "import { status } from '../src/main.js';\n"
-                    "assert.equal(status, 'ready');\n"
-                ),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
             }
         },
     }
@@ -1186,16 +1178,21 @@ Implements the requested project scope.
 ### `src/main.js`
 
 ```js
-export const status = 'ready';
+export function formatGreeting(name) {
+  const value = String(name || '').trim();
+  if (!value) return 'Hello, guest';
+  return `Hello, ${value}`;
+}
 ```
 
 ### `tests/main.test.js`
 
 ```js
-import { status } from '../src/main.js';
 import assert from 'node:assert/strict';
+import { formatGreeting } from '../src/main.js';
 
-assert.equal(status, 'ready');
+assert.equal(formatGreeting(' Ada '), 'Hello, Ada');
+assert.equal(formatGreeting(''), 'Hello, guest');
 ```
 """.strip()
     client = FakeAcceptanceClient(
@@ -1289,17 +1286,21 @@ npm run test:interaction
 ### `direct_ledger/core.py`
 
 ```python
-def ready():
-    return True
+def format_greeting(name):
+    value = str(name or "").strip()
+    if not value:
+        return "Hello, guest"
+    return f"Hello, {{value}}"
 ```
 
 ### `tests/test_core.py`
 
 ```python
-from direct_ledger.core import ready
+from direct_ledger.core import format_greeting
 
-def test_ready():
-    assert ready() is True
+def test_format_greeting():
+    assert format_greeting(" Ada ") == "Hello, Ada"
+    assert format_greeting("") == "Hello, guest"
 ```
 
 ### `scripts/build.sh`
@@ -1365,12 +1366,8 @@ def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed()
                 {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
                 sort_keys=True,
             ),
-            "src/main.js": "export const status = 'ready';\n",
-            "tests/main.test.js": (
-                "import assert from 'node:assert/strict';\n"
-                "import { status } from '../src/main.js';\n"
-                "assert.equal(status, 'ready');\n"
-            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
         }
     )
     client = FakeAcceptanceClient(
@@ -1387,6 +1384,127 @@ def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed()
     assert result.evidence["workspace_bundle"] is True
     assert result.evidence["deliverable_quality"] is False
     assert "workspace_bundle: missing interaction execution evidence" in result.errors
+
+
+def test_execute_project_scale_plan_rejects_todo_dummy_project_markers() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    shell_bundle = _project_bundle(
+        {
+            "README.md": (
+                "# Acceptance Fixture\n\n"
+                "TODO: replace with real implementation after the demo.\n"
+            ),
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": "export function runApp() { return 'dummy implementation'; }\n",
+            "tests/main.test.js": (
+                "import assert from 'node:assert/strict';\n"
+                "import { runApp } from '../src/main.js';\n"
+                "assert.equal(runApp(), 'ready');\n"
+            ),
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: contains placeholder or stub markers" in result.errors
+
+
+def test_execute_project_scale_plan_rejects_constant_only_source_bundle() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    shell_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": "export const status = 'ready';\n",
+            "tests/main.test.js": (
+                "import assert from 'node:assert/strict';\n"
+                "import { status } from '../src/main.js';\n"
+                "assert.equal(status, 'ready');\n"
+            ),
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: missing meaningful source implementation" in result.errors
+
+
+def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    functional_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 2 tests passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": (
+                "export function formatGreeting(name) {\n"
+                "  const value = String(name || '').trim();\n"
+                "  if (!value) return 'Hello, guest';\n"
+                "  return `Hello, ${value}`;\n"
+                "}\n"
+            ),
+            "tests/main.test.js": (
+                "import assert from 'node:assert/strict';\n"
+                "import { formatGreeting } from '../src/main.js';\n"
+                "assert.equal(formatGreeting(' Ada '), 'Hello, Ada');\n"
+                "assert.equal(formatGreeting(''), 'Hello, guest');\n"
+            ),
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=functional_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
 
 
 def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
@@ -1953,11 +2071,8 @@ class FakeAcceptanceClient:
                         {"scripts": {"build": "vite build", "test": "vitest run"}},
                         sort_keys=True,
                     ),
-                    "src/main.ts": "export const status = 'ready';\n",
-                    "tests/app.test.ts": (
-                        "import { status } from '../src/main';\n"
-                        "expect(status).toBe('ready');\n"
-                    ),
+                    "src/main.ts": _functional_ts_source(),
+                    "tests/app.test.ts": _functional_ts_test(),
                 }
             )
         verification = (
@@ -1977,11 +2092,8 @@ class FakeAcceptanceClient:
                     {"scripts": {"build": "vite build", "test": "vitest run"}},
                     sort_keys=True,
                 ),
-                "src/main.ts": "export const status = 'ready';\n",
-                "tests/app.test.ts": (
-                    "import { status } from '../src/main';\n"
-                    "expect(status).toBe('ready');\n"
-                ),
+                "src/main.ts": _functional_ts_source(),
+                "tests/app.test.ts": _functional_ts_test(),
             }
         )
 
@@ -2027,6 +2139,43 @@ def _project_bundle(files: dict[str, str]) -> bytes:
         for path, content in files.items():
             archive.writestr(path, content)
     return buffer.getvalue()
+
+
+def _functional_js_source() -> str:
+    return (
+        "export function formatGreeting(name) {\n"
+        "  const value = String(name || '').trim();\n"
+        "  if (!value) return 'Hello, guest';\n"
+        "  return `Hello, ${value}`;\n"
+        "}\n"
+    )
+
+
+def _functional_js_test() -> str:
+    return (
+        "import assert from 'node:assert/strict';\n"
+        "import { formatGreeting } from '../src/main.js';\n"
+        "assert.equal(formatGreeting(' Ada '), 'Hello, Ada');\n"
+        "assert.equal(formatGreeting(''), 'Hello, guest');\n"
+    )
+
+
+def _functional_ts_source() -> str:
+    return (
+        "export function formatGreeting(name: string | undefined): string {\n"
+        "  const value = String(name || '').trim();\n"
+        "  if (!value) return 'Hello, guest';\n"
+        "  return `Hello, ${value}`;\n"
+        "}\n"
+    )
+
+
+def _functional_ts_test() -> str:
+    return (
+        "import { formatGreeting } from '../src/main';\n"
+        "expect(formatGreeting(' Ada ')).toBe('Hello, Ada');\n"
+        "expect(formatGreeting('')).toBe('Hello, guest');\n"
+    )
 
 
 def _self_repair_proposal_fixture() -> dict[str, object]:
