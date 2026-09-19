@@ -11296,8 +11296,22 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "truncated",
         "artifact_id",
         "failure_kind",
+        "workspace_files",
     }
 )
+_SAFE_TOOL_FILE_OPERATION_KINDS = frozenset(
+    {
+        "browser",
+        "file_create",
+        "file_edit",
+        "file_read",
+        "file_write",
+        "generic",
+        "terminal",
+    }
+)
+_MAX_TOOL_WORKSPACE_FILES = 12
+_MAX_TOOL_WORKSPACE_FILE_TEXT = 160
 
 
 def _tool_event_payload(value: object) -> dict[str, JsonValue]:
@@ -11308,8 +11322,102 @@ def _tool_event_payload(value: object) -> dict[str, JsonValue]:
         key_text = str(key)
         if key_text not in _SAFE_TOOL_EVENT_PAYLOAD_KEYS:
             continue
+        if key_text == "workspace_files":
+            workspace_files = _safe_tool_workspace_files(item)
+            if workspace_files:
+                payload[key_text] = workspace_files
+            continue
         payload[key_text] = _safe_event_detail(item, key=key_text)
     return payload
+
+
+def _safe_tool_workspace_files(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    files: list[Mapping[str, JsonValue]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        file_summary = _safe_tool_workspace_file(item)
+        if file_summary is None:
+            continue
+        files.append(file_summary)
+        if len(files) >= _MAX_TOOL_WORKSPACE_FILES:
+            break
+    return tuple(files)
+
+
+def _safe_tool_workspace_file(item: Mapping[object, object]) -> Mapping[str, JsonValue] | None:
+    path = _safe_tool_workspace_file_path(item.get("path"))
+    if path is None:
+        return None
+    summary: dict[str, JsonValue] = {"path": path}
+    for key in ("filename", "mime_type"):
+        value = _safe_tool_workspace_file_text(item.get(key))
+        if value is not None:
+            summary[key] = value
+    operation_kind = _safe_tool_workspace_file_operation(item.get("operation_kind"))
+    if operation_kind is not None:
+        summary["operation_kind"] = operation_kind
+    size_bytes = item.get("size_bytes")
+    if type(size_bytes) is int and size_bytes >= 0:
+        summary["size_bytes"] = size_bytes
+    sha256 = _safe_tool_workspace_file_sha256(item.get("sha256"))
+    if sha256 is not None:
+        summary["sha256"] = sha256
+    download_url = _safe_tool_workspace_file_download_url(item.get("download_url"))
+    if download_url is not None:
+        summary["download_url"] = download_url
+    return summary
+
+
+def _safe_tool_workspace_file_operation(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = value.strip().casefold()
+    if normalized in _SAFE_TOOL_FILE_OPERATION_KINDS:
+        return normalized
+    return None
+
+
+def _safe_tool_workspace_file_text(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    text = value.strip()
+    if not text or len(text) > _MAX_TOOL_WORKSPACE_FILE_TEXT or _contains_sensitive_marker(text):
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        return None
+    return text
+
+
+def _safe_tool_workspace_file_path(value: object) -> str | None:
+    text = _safe_tool_workspace_file_text(value)
+    if text is None:
+        return None
+    normalized = text.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    if (
+        posix.is_absolute()
+        or normalized.startswith("/")
+        or any(part in {"", ".", ".."} for part in posix.parts)
+        or len(posix.parts) > 12
+    ):
+        return None
+    return posix.as_posix()
+
+
+def _safe_tool_workspace_file_sha256(value: object) -> str | None:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        return None
+    return value
+
+
+def _safe_tool_workspace_file_download_url(value: object) -> str | None:
+    text = _safe_tool_workspace_file_text(value)
+    if text is None or not text.startswith("/api/"):
+        return None
+    return text
 
 
 def _safe_event_detail(value: object, *, key: str | None = None, depth: int = 0) -> JsonValue:

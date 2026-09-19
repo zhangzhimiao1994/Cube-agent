@@ -3506,6 +3506,69 @@ def test_run_debug_snapshot_filters_tool_event_payloads() -> None:
     assert "private terminal output" not in serialized
 
 
+def test_run_debug_snapshot_preserves_safe_workspace_file_metadata() -> None:
+    run_id = uuid4()
+    response = RunDetailResponse(
+        id=run_id,
+        status="completed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="Edit a workspace file",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.completed",
+                message="tool.completed",
+                created_at=datetime.now(UTC),
+                actor="executor",
+                tool_call_id="call_1",
+                tool_name="workspace.edit_file",
+                payload={
+                    "operation_kind": "file_edit",
+                    "workspace_files": (
+                        {
+                            "path": "src/app.ts",
+                            "filename": "app.ts",
+                            "operation_kind": "file_edit",
+                            "mime_type": "text/typescript",
+                            "size_bytes": 2048,
+                            "sha256": "a" * 64,
+                            "download_url": "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+                            "text": "private source text",
+                        },
+                        {
+                            "path": "../secret.env",
+                            "filename": "secret.env",
+                            "operation_kind": "leak private command output",
+                        },
+                    ),
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    debug = _run_debug_from_detail(response)
+    serialized = debug.model_dump_json()
+
+    assert debug.events[0].payload["workspace_files"] == (
+        {
+            "path": "src/app.ts",
+            "filename": "app.ts",
+            "operation_kind": "file_edit",
+            "mime_type": "text/typescript",
+            "size_bytes": 2048,
+            "sha256": "a" * 64,
+            "download_url": "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+        },
+    )
+    assert "private source text" not in serialized
+    assert "../secret.env" not in serialized
+
+
 def test_run_debug_endpoint_exposes_safe_failure_snapshot() -> None:
     api = client()
     run_id = "22222222-2222-4222-8222-222222222222"
