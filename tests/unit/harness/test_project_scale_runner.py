@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import zipfile
+from collections.abc import Mapping
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -1227,6 +1228,61 @@ assert.equal(formatGreeting(''), 'Hello, guest');
     assert result.errors == ()
 
 
+def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_artifact() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    downloaded_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "payload": {
+                    "artifact_id": "artifact-1",
+                    "output": "### `README.md`\n\n```text\n# Acceptance Fixture\n...",
+                },
+            }
+        ],
+        artifact_downloads={"artifact-1": downloaded_bundle},
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+    assert (
+        "GET",
+        "/api/v1/runs/run-small-direct/artifacts/artifact-1/download",
+        None,
+    ) in client.calls
+    assert [call for call in client.calls if call[0] == "POST" and call[1] == "/api/v1/runs"] == [
+        ("POST", "/api/v1/runs", "project-scale-small-direct-0")
+    ]
+
+
 def test_execute_project_scale_plan_reads_quality_from_markdown_metadata_file() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     metadata = {
@@ -1969,6 +2025,7 @@ class FakeAcceptanceClient:
         self_repair_decision_version: int | None = None,
         public_self_repair_proposal: bool = True,
         workspace_bundle: bytes | None = None,
+        artifact_downloads: Mapping[str, bytes] | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.run_id = run_id
@@ -2006,6 +2063,7 @@ class FakeAcceptanceClient:
         self.self_repair_decision_version = self_repair_decision_version
         self.public_self_repair_proposal = public_self_repair_proposal
         self.workspace_bundle = workspace_bundle
+        self.artifact_downloads = dict(artifact_downloads or {})
         self.repair_run_id = f"{run_id}-repair"
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
@@ -2180,6 +2238,12 @@ class FakeAcceptanceClient:
 
     def request_bytes(self, method: str, path: str) -> bytes:
         self.calls.append((method, path, None))
+        artifact_prefix = f"/api/v1/runs/{self.run_id}/artifacts/"
+        if method == "GET" and path.startswith(artifact_prefix) and path.endswith("/download"):
+            artifact_id = path[len(artifact_prefix) : -len("/download")]
+            if artifact_id in self.artifact_downloads:
+                return self.artifact_downloads[artifact_id]
+            raise RuntimeError("artifact download unavailable")
         if self.fail_bundle:
             raise RuntimeError("workspace bundle unavailable")
         if self.workspace_bundle is not None:

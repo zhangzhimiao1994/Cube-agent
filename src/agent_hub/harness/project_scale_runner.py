@@ -905,6 +905,104 @@ def _workspace_bundle_path(body: dict[str, object]) -> str:
     )
 
 
+def _artifact_download_paths(
+    *,
+    run_id: str,
+    details: Mapping[str, object] | None,
+    events: Sequence[object] | None,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    encoded_run_id = quote(run_id)
+
+    def append_path(path: str) -> None:
+        if path in paths:
+            return
+        if path.startswith(f"/api/v1/runs/{encoded_run_id}/artifacts/") and path.endswith(
+            "/download"
+        ):
+            paths.append(path)
+            return
+        if path.startswith(f"/api/v1/admin/runs/{encoded_run_id}/artifacts/") and path.endswith(
+            "/download"
+        ):
+            paths.append(path)
+
+    def append_artifact_id(value: object) -> None:
+        artifact_id = _string_value(value)
+        if artifact_id:
+            append_path(
+                f"/api/v1/runs/{encoded_run_id}/artifacts/{quote(artifact_id)}/download"
+            )
+
+    def visit_mapping(mapping: Mapping[str, object], *, artifact_like: bool = False) -> None:
+        if artifact_like:
+            append_artifact_id(mapping.get("id"))
+        append_artifact_id(mapping.get("artifact_id"))
+        download_url = mapping.get("download_url")
+        if isinstance(download_url, str):
+            append_path(download_url)
+
+        artifact = mapping.get("artifact")
+        if isinstance(artifact, Mapping):
+            visit_mapping(artifact, artifact_like=True)
+
+        payload = mapping.get("payload")
+        if isinstance(payload, Mapping):
+            append_artifact_id(payload.get("artifact_id"))
+            payload_download_url = payload.get("download_url")
+            if isinstance(payload_download_url, str):
+                append_path(payload_download_url)
+
+        artifacts = mapping.get("artifacts")
+        if isinstance(artifacts, Sequence) and not isinstance(artifacts, str | bytes):
+            for artifact_item in artifacts:
+                if isinstance(artifact_item, Mapping):
+                    visit_mapping(artifact_item, artifact_like=True)
+
+        artifact_ids = mapping.get("artifact_ids")
+        if isinstance(artifact_ids, Sequence) and not isinstance(artifact_ids, str | bytes):
+            for artifact_id in artifact_ids:
+                append_artifact_id(artifact_id)
+
+    if details is not None:
+        visit_mapping(details)
+    if events is not None:
+        for event in events:
+            if isinstance(event, Mapping):
+                visit_mapping(event)
+    return tuple(paths)
+
+
+def _downloaded_workspace_bundle_from_artifacts(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    details: Mapping[str, object] | None,
+    events: Sequence[object] | None,
+) -> bytes | None:
+    for path in _artifact_download_paths(run_id=run_id, details=details, events=events):
+        try:
+            raw = client.request_bytes("GET", path)
+        except Exception:  # noqa: BLE001 - try remaining artifacts before failing the bundle.
+            raw = None
+        if raw is None:
+            continue
+        bundle = _workspace_bundle_from_downloaded_artifact(raw)
+        if bundle is not None:
+            return bundle
+    return None
+
+
+def _workspace_bundle_from_downloaded_artifact(raw: bytes) -> bytes | None:
+    if zipfile.is_zipfile(BytesIO(raw)):
+        return raw
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return _embedded_workspace_bundle_from_text(text)
+
+
 def _collect_run_observation(
     client: AcceptanceClient,
     *,
@@ -965,6 +1063,14 @@ def _collect_run_observation(
         evidence["workspace_bundle"] = True
     except Exception as error:  # noqa: BLE001 - acceptance reports must continue cleanup.
         workspace_bundle = _embedded_workspace_bundle_from_observation(details, events)
+        downloaded_bundle = _downloaded_workspace_bundle_from_artifacts(
+            client,
+            run_id=run_id,
+            details=details,
+            events=events,
+        )
+        if downloaded_bundle is not None:
+            workspace_bundle = downloaded_bundle
         if workspace_bundle is not None:
             evidence["workspace_bundle"] = True
         else:
