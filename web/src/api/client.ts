@@ -794,9 +794,14 @@ const RuntimeRecoverySummarySchema = z.object({
 
 const SelfRepairRecoverySummarySchema = z.object({
   status: z.literal("active"),
-  recovery_strategy: z.literal("retry_blocked_contract_chain_after_replanning"),
-  orchestration_recovery_hint: z.literal("retry_blocked_contract_chain"),
-  replan_scope: z.literal("blocked_contract_chain"),
+  recovery_strategy: z.enum([
+    "retry_blocked_contract_chain_after_replanning",
+    "switch_to_available_model_and_retry",
+    "repair_plugin_endpoint_or_adapter_and_retry",
+    "repair_mcp_server_or_adapter_and_retry",
+  ]),
+  orchestration_recovery_hint: z.literal("retry_blocked_contract_chain").nullable().optional(),
+  replan_scope: z.enum(["blocked_contract_chain", "model_capability_roles", "plugin_runtime", "mcp_runtime"]),
   reuse_completed_artifacts: z.boolean(),
   retry_blocked_contracts_only: z.boolean(),
   automatic_execution: z.boolean(),

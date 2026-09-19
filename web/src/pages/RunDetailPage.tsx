@@ -96,10 +96,15 @@ type RuntimeRecoverySummary = {
 };
 
 type SelfRepairRecoverySummary = {
-  recoveryStrategy: "retry_blocked_contract_chain_after_replanning";
-  replanScope: "blocked_contract_chain";
+  recoveryStrategy:
+    | "retry_blocked_contract_chain_after_replanning"
+    | "switch_to_available_model_and_retry"
+    | "repair_plugin_endpoint_or_adapter_and_retry"
+    | "repair_mcp_server_or_adapter_and_retry";
+  replanScope: "blocked_contract_chain" | "model_capability_roles" | "plugin_runtime" | "mcp_runtime";
   reuseCompletedArtifacts: boolean;
   retryBlockedContractsOnly: boolean;
+  automaticExecution: boolean;
 };
 
 type OrchestrationContract = {
@@ -178,6 +183,7 @@ type DownloadableArtifact = RunArtifact & {
 };
 
 const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
+type DetailWorkbenchView = "overview" | "coordination" | "actions" | "recovery";
 
 function recentPreview<T>(items: T[], limit: number, expanded = false) {
   if (expanded || items.length <= limit) {
@@ -1010,6 +1016,41 @@ function detailWorkbenchStatusCounts(cards: DetailProcessCard[]) {
   });
 }
 
+function isDetailCoordinationCard(card: DetailProcessCard) {
+  const kind = card.sourceKind ?? "";
+  return (
+    kind.startsWith("dispatch.") ||
+    kind.startsWith("discussion.") ||
+    kind.startsWith("decision.") ||
+    card.label === "调度过程" ||
+    card.label === "讨论过程" ||
+    card.label === "决策过程"
+  );
+}
+
+function isDetailRecoveryCard(card: DetailProcessCard) {
+  const kind = card.sourceKind ?? "";
+  return (
+    kind === "runtime.recovered" ||
+    kind.includes("repair") ||
+    kind.endsWith(".failed") ||
+    card.label === "断点续跑" ||
+    /修复|恢复|异常|失败/.test(card.title)
+  );
+}
+
+function detailActionCards(cards: DetailProcessCard[]) {
+  return cards.filter((card) => !isDetailCoordinationCard(card) && !isDetailRecoveryCard(card));
+}
+
+function detailWorkbenchOverviewCards(cards: DetailProcessCard[]) {
+  const byIdentity = new Map<string, DetailProcessCard>();
+  cards.forEach((card) => {
+    byIdentity.set(detailWorkbenchCardIdentity(card), card);
+  });
+  return [...byIdentity.values()];
+}
+
 function isGenericEventMessage(event: RunEvent) {
   return event.message === event.kind || /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message);
 }
@@ -1293,18 +1334,12 @@ function selfRepairRecoverySummaryFromApi(
   summary: ApiSelfRepairRecoverySummary,
 ): SelfRepairRecoverySummary | null {
   if (!summary || summary.status !== "active") return null;
-  if (
-    summary.recovery_strategy !== "retry_blocked_contract_chain_after_replanning" ||
-    summary.orchestration_recovery_hint !== "retry_blocked_contract_chain" ||
-    summary.replan_scope !== "blocked_contract_chain"
-  ) {
-    return null;
-  }
   return {
     recoveryStrategy: summary.recovery_strategy,
     replanScope: summary.replan_scope,
     reuseCompletedArtifacts: summary.reuse_completed_artifacts,
     retryBlockedContractsOnly: summary.retry_blocked_contracts_only,
+    automaticExecution: summary.automatic_execution,
   };
 }
 
@@ -1474,10 +1509,26 @@ function runtimeRecoveryLabel(summary: RuntimeRecoverySummary) {
   return `${summary.recoveryCount} 次续跑，${summary.completedSteps}/${summary.totalSteps} 步`;
 }
 
+const SELF_REPAIR_RECOVERY_STRATEGY_LABELS: Record<SelfRepairRecoverySummary["recoveryStrategy"], string> = {
+  retry_blocked_contract_chain_after_replanning: "契约链重规划",
+  switch_to_available_model_and_retry: "切换可用模型并重试",
+  repair_plugin_endpoint_or_adapter_and_retry: "修复插件运行时并重试",
+  repair_mcp_server_or_adapter_and_retry: "修复 MCP 运行时并重试",
+};
+
+const SELF_REPAIR_REPLAN_SCOPE_LABELS: Record<SelfRepairRecoverySummary["replanScope"], string> = {
+  blocked_contract_chain: "阻塞链路",
+  model_capability_roles: "模型能力角色",
+  plugin_runtime: "插件运行时",
+  mcp_runtime: "MCP 运行时",
+};
+
 function selfRepairRecoveryLabel(summary: SelfRepairRecoverySummary) {
-  const parts = ["契约链重规划"];
+  const parts = [SELF_REPAIR_RECOVERY_STRATEGY_LABELS[summary.recoveryStrategy]];
+  parts.push(`范围 ${SELF_REPAIR_REPLAN_SCOPE_LABELS[summary.replanScope]}`);
   if (summary.retryBlockedContractsOnly) parts.push("只重试阻塞链路");
   if (summary.reuseCompletedArtifacts) parts.push("复用已完成产物");
+  if (summary.automaticExecution) parts.push("自动执行");
   return parts.join("，");
 }
 
@@ -2079,7 +2130,23 @@ function DetailProcessDrawer({
   onSelectCard: (card: DetailProcessCard | null) => void;
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
-  const actionPreview = recentPreview(cards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
+  const [activeView, setActiveView] = useState<DetailWorkbenchView>("overview");
+  const overviewCards = detailWorkbenchOverviewCards(cards);
+  const coordinationCards = cards.filter(isDetailCoordinationCard);
+  const recoveryCards = cards.filter(isDetailRecoveryCard);
+  const actionCards = detailActionCards(cards);
+  const visibleCards =
+    activeView === "coordination"
+      ? coordinationCards
+      : activeView === "recovery"
+        ? recoveryCards
+        : activeView === "actions"
+          ? actionCards
+          : overviewCards;
+  const visiblePreview = recentPreview(visibleCards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
+  const visibleLabel =
+    activeView === "coordination" ? "调度讨论" : activeView === "recovery" ? "修复异常" : activeView === "actions" ? "实际动作" : "助手总览";
+  const visibleAria = activeView === "overview" ? "Agent 工作席概览" : "Agent 工作席动作";
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -2116,18 +2183,76 @@ function DetailProcessDrawer({
             </section>
           ) : (
             <div className="agent-workbench-actions">
-              <div className="agent-workbench-actions-header">
-                <strong>调度动作</strong>
-                <small>{cards.length} 条</small>
-                {cards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
-                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
-                    {showAllActions ? "收起调度动作" : "显示全部调度动作"}
+              <div className="agent-workbench-tabs" aria-label="工作席视图">
+                <button
+                  type="button"
+                  aria-label="助手总览"
+                  aria-pressed={activeView === "overview"}
+                  className={activeView === "overview" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("overview");
+                    setShowAllActions(false);
+                  }}
+                >
+                  助手总览
+                  <small>{overviewCards.length} 个 Agent</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="调度讨论"
+                  aria-pressed={activeView === "coordination"}
+                  className={activeView === "coordination" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("coordination");
+                    setShowAllActions(false);
+                  }}
+                >
+                  调度讨论
+                  <small>{coordinationCards.length} 条</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label="实际动作"
+                  aria-pressed={activeView === "actions"}
+                  className={activeView === "actions" ? "active" : ""}
+                  onClick={() => {
+                    setActiveView("actions");
+                    setShowAllActions(false);
+                  }}
+                >
+                  实际动作
+                  <small>{actionCards.length} 条</small>
+                </button>
+                {recoveryCards.length > 0 ? (
+                  <button
+                    type="button"
+                    aria-label="修复异常"
+                    aria-pressed={activeView === "recovery"}
+                    className={activeView === "recovery" ? "active" : ""}
+                    onClick={() => {
+                      setActiveView("recovery");
+                      setShowAllActions(false);
+                    }}
+                  >
+                    修复异常
+                    <small>{recoveryCards.length} 条</small>
                   </button>
                 ) : null}
               </div>
-              {actionPreview.hiddenCount > 0 ? <p className="agent-workbench-compressed-note">已折叠 {actionPreview.hiddenCount} 个较早调度动作</p> : null}
-              <div className="agent-cluster-actions" aria-label="Agent 工作席动作">
-                {actionPreview.visible.map((card) => (
+              <div className="agent-workbench-actions-header">
+                <strong>{visibleLabel}</strong>
+                <small>{visibleCards.length} 条</small>
+                {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                    {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
+                  </button>
+                ) : null}
+              </div>
+              {visiblePreview.hiddenCount > 0 ? (
+                <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
+              ) : null}
+              <div className="agent-cluster-actions" aria-label={visibleAria}>
+                {visiblePreview.visible.map((card) => (
                   <button
                     key={card.id}
                     type="button"
@@ -2141,6 +2266,7 @@ function DetailProcessDrawer({
                   </button>
                 ))}
               </div>
+              {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
             </div>
           )}
         </div>

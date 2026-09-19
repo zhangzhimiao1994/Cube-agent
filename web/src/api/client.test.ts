@@ -508,6 +508,68 @@ describe("api client transport", () => {
     });
   });
 
+  it("accepts self-repair recovery summaries for model, plugin, and MCP runtime scopes", async () => {
+    const summaries = [
+      {
+        status: "active",
+        recovery_strategy: "switch_to_available_model_and_retry",
+        replan_scope: "model_capability_roles",
+        reuse_completed_artifacts: true,
+        retry_blocked_contracts_only: false,
+        automatic_execution: false,
+      },
+      {
+        status: "active",
+        recovery_strategy: "repair_plugin_endpoint_or_adapter_and_retry",
+        replan_scope: "plugin_runtime",
+        reuse_completed_artifacts: false,
+        retry_blocked_contracts_only: false,
+        automatic_execution: false,
+      },
+      {
+        status: "active",
+        recovery_strategy: "repair_mcp_server_or_adapter_and_retry",
+        replan_scope: "mcp_runtime",
+        reuse_completed_artifacts: false,
+        retry_blocked_contracts_only: false,
+        automatic_execution: true,
+      },
+    ] as const;
+
+    for (const [index, summary] of summaries.entries()) {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: `run_${index}`,
+            status: "completed",
+            mode: "dispatch",
+            version: 1,
+            request: "Repair summary.",
+            created_at: "2026-09-06T13:50:00Z",
+            queue_wait_ms: 0,
+            capacity_wait_ms: 0,
+            cost_usd: "0",
+            events: [],
+            artifacts: [],
+            explicit_details: {},
+            failure_diagnostics: [],
+            tool_lifecycle: [],
+            self_repair_recovery_summary: summary,
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const run = await api.run(`run_${index}`);
+
+      expect(run.self_repair_recovery_summary).toEqual(summary);
+    }
+  });
+
   it("accepts a zero-count runtime recovery summary without checkpoint internals", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

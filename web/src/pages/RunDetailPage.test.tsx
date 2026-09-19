@@ -309,11 +309,25 @@ describe("RunDetailPage", () => {
     await user.click(workbenchButton);
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(drawer).getByRole("button", { name: "助手总览" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(drawer).getByRole("button", { name: "调度讨论" }).textContent).toContain("1 条");
+    expect(within(drawer).getByRole("button", { name: "实际动作" }).textContent).toContain("5 条");
+    expect(within(drawer).getByRole("button", { name: "修复异常" }).textContent).toContain("1 条");
+    const workbenchOverview = within(drawer).getByLabelText("Agent 工作席概览");
     expect(within(drawer).getByText("主 Agent 初始判断")).not.toBeNull();
     expect(within(drawer).getByText("reviewer 子 Agent 调度")).not.toBeNull();
-    expect(within(drawer).getAllByText("critic 子 Agent 已下班").length).toBeGreaterThan(0);
+    expect(within(workbenchOverview).queryByText("critic 子 Agent 已下班")).toBeNull();
     expect(drawer.querySelector(".run-process-detail")).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
+    expect(within(drawer).getByRole("button", { name: "调度讨论" }).getAttribute("aria-pressed")).toBe("true");
+    const coordinationActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(coordinationActions).getByRole("button", { name: /planner 子 Agent 已安排/ })).not.toBeNull();
+    expect(within(coordinationActions).queryByRole("button", { name: /critic 子 Agent 已下班/ })).toBeNull();
+
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ })).not.toBeNull();
+    expect(within(workbenchActions).getByRole("button", { name: /critic 子 Agent 已下班/ })).not.toBeNull();
     await user.click(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ }));
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).toContain("reviewer 子 Agent 调度");
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
@@ -377,6 +391,7 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "修复异常" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
     const recoveryAction = within(workbenchActions).getByRole("button", { name: /断点续跑/ });
 
@@ -392,6 +407,66 @@ describe("RunDetailPage", () => {
     expect(detail.textContent).toContain("工具状态：进行中 1");
     expect(detail.textContent).toContain("审查产物 1");
     expect(detail.textContent).not.toContain("checkpoint-00000000-0000-4000-8000-000000000001");
+  });
+
+  it("keeps action detail fields readable in the mobile workbench drawer", async () => {
+    const user = userEvent.setup();
+    window.innerWidth = 390;
+    window.innerHeight = 844;
+    window.dispatchEvent(new Event("resize"));
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "decision.completed",
+          message: "decision.completed",
+          summary: "主 Agent 选择运行模式与角色",
+          actor: "main_agent",
+          step_id: "mode-decision",
+          artifact: null,
+          payload: {
+            capability_execution_plan:
+              "Agent selected the runtime mode, roles, and models. The value should wrap by words instead of becoming a one-letter vertical column.",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    await user.click(within(workbenchActions).getByRole("button", { name: /主 Agent 选择运行模式与角色/ }));
+
+    const detailRegion = drawer.querySelector(".run-process-detail") as HTMLElement;
+    expect(detailRegion.textContent).toContain("主 Agent 选择运行模式与角色");
+    await user.click(within(detailRegion).getByRole("button", { name: /(活动|证据|决策)：Agent selected the runtime mode/ }));
+    const detailModal = await screen.findByRole("dialog", { name: /(活动|证据|决策)详情/ });
+    const detailValue = within(detailModal).getByText(/Agent selected the runtime mode/);
+    expect(detailValue.closest("dd")?.textContent).toContain("wrap by words instead of becoming a one-letter vertical column");
   });
 
   it("compresses long run detail workbench action lists until expanded", async () => {
@@ -438,17 +513,18 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
-    expect(within(drawer).getByText("已折叠 4 个较早调度动作")).not.toBeNull();
+    expect(within(drawer).getByText("已折叠 4 个较早实际动作")).not.toBeNull();
     expect(within(workbenchActions).queryByRole("button", { name: /worker 第 01 步处理/ })).toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 05 步处理/ })).not.toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 16 步处理/ })).not.toBeNull();
 
-    await user.click(within(drawer).getByRole("button", { name: "显示全部调度动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "显示全部实际动作" }));
 
-    expect(within(drawer).queryByText("已折叠 4 个较早调度动作")).toBeNull();
+    expect(within(drawer).queryByText("已折叠 4 个较早实际动作")).toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 01 步处理/ })).not.toBeNull();
-    expect(within(drawer).getByRole("button", { name: "收起调度动作" })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: "收起实际动作" })).not.toBeNull();
   });
 
   it("renders run detail events in sequence order when backend payload arrives out of order", async () => {
@@ -1152,9 +1228,49 @@ describe("RunDetailPage", () => {
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(within(summary).getByText("已记录自修复")).not.toBeNull();
     expect(within(summary).getByText("自修复")).not.toBeNull();
-    expect(within(summary).getByText("契约链重规划，只重试阻塞链路，复用已完成产物")).not.toBeNull();
+    expect(within(summary).getByText("契约链重规划，范围 阻塞链路，只重试阻塞链路，复用已完成产物")).not.toBeNull();
     expect(screen.queryByText("retry_blocked_contract_chain_after_replanning")).toBeNull();
     expect(screen.queryByText("retry_blocked_contract_chain")).toBeNull();
+  });
+
+  it("shows plugin runtime self-repair recovery summaries without failing run detail parsing", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      self_repair_recovery_summary: {
+        status: "active",
+        recovery_strategy: "repair_plugin_endpoint_or_adapter_and_retry",
+        replan_scope: "plugin_runtime",
+        reuse_completed_artifacts: false,
+        retry_blocked_contracts_only: false,
+        automatic_execution: true,
+      },
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("已记录自修复")).not.toBeNull();
+    expect(within(summary).getByText("修复插件运行时并重试，范围 插件运行时，自动执行")).not.toBeNull();
+    expect(screen.queryByText("repair_plugin_endpoint_or_adapter_and_retry")).toBeNull();
+    expect(screen.queryByText("plugin_runtime")).toBeNull();
   });
 
   it("labels repair intent metadata without exposing raw repair codes", async () => {
@@ -1882,6 +1998,7 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
     expect(within(workbenchActions).getByRole("button", { name: /writer 初始动作/ })).not.toBeNull();
 
