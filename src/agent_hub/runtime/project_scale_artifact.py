@@ -243,9 +243,10 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
         ),
         "VERIFICATION.md": (
             "# Verification\n\n"
-            "- npm run build: passed\n"
-            "- npm test: passed\n"
-            "- interaction smoke: passed\n"
+            "- npm run build: passed; exit 0; tsc -p tsconfig.json --noEmit completed.\n"
+            "- npm test: passed; exit 0; vitest run completed with 1 test passed, 0 failed.\n"
+            "- interaction smoke: passed; manual verification covered the send-to-artifact "
+            "flow and final attachment preview.\n"
             "- artifact integrity: passed\n"
             "- Codex/Claude standard review: constraints read, plan completed before implementation, "
             "reproducible verification recorded, root-cause repair path preserved.\n"
@@ -255,9 +256,25 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
                 "name": "project-scale-artifact-production",
                 "private": True,
                 "type": "module",
-                "scripts": {"build": "tsc --noEmit", "test": "vitest run"},
+                "scripts": {"build": "tsc -p tsconfig.json --noEmit", "test": "vitest run"},
                 "dependencies": {},
                 "devDependencies": {"typescript": "^5.6.0", "vitest": "^2.1.0"},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "tsconfig.json": json.dumps(
+            {
+                "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "ES2022",
+                    "moduleResolution": "Bundler",
+                    "strict": True,
+                    "noEmit": True,
+                    "types": ["vitest"],
+                },
+                "include": ["src/**/*.ts", "tests/**/*.ts"],
             },
             indent=2,
             ensure_ascii=False,

@@ -4,6 +4,10 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.project_scale_runner import (
+    _embedded_workspace_bundle_from_text,
+    _workspace_bundle_project_quality_reasons,
+)
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
 
@@ -231,6 +235,9 @@ async def test_direct_project_scale_fixture_emits_verified_artifact_without_pref
     assert "### `VERIFICATION.md`" in text
     assert "- npm run build: passed" in text
     assert "- npm test: passed" in text
+    bundle = _embedded_workspace_bundle_from_text(text)
+    assert bundle is not None
+    assert _workspace_bundle_project_quality_reasons(bundle) == ()
     assert artifact_event.payload["deliverable_quality"] == {
         "requirements_satisfied": True,
         "build_passed": True,
