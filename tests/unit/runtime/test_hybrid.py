@@ -448,6 +448,14 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
     }
     assert completed.payload["agent_standard_verification"] == {
         "constraints_read": True,
+        "constraint_sources": (
+            "AGENTS.md workspace rules; HANDOFF current-state index; PROJECT_REQUIREMENTS.md"
+        ),
+        "skill_rule_sources": (
+            "AGENTS.md workspace rules; applicable SKILL.md inventory; "
+            "project-scale agent-standard rules"
+        ),
+        "read_before_implementation": True,
         "plan_before_implementation": True,
         "reproducible_verification": True,
         "root_cause_repair": True,

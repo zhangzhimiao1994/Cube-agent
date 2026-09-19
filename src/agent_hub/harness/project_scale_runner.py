@@ -128,6 +128,16 @@ _IMPLEMENTATION_PLAN_BASENAMES = frozenset(
         "architecture_plan.md",
     }
 )
+_READING_EVIDENCE_BASENAMES = frozenset(
+    {
+        "constraints-reading-evidence.json",
+        "constraints_reading_evidence.json",
+        "context-reading-evidence.json",
+        "context_reading_evidence.json",
+        "reading-evidence.json",
+        "reading_evidence.json",
+    }
+)
 _EXECUTION_PASS_MARKERS = (
     "passed",
     "pass",
@@ -1355,7 +1365,9 @@ def _deliverable_repair_body(
         "no_placeholders, and artifact_integrity all true. Also record "
         "agent_standard_verification with constraints_read, plan_before_implementation, "
         "reproducible_verification, and root_cause_repair all true, and keep implementation "
-        "plan plus verification notes in the workspace. When the run uses dispatch, hybrid, "
+        "plan plus verification notes in the workspace. Include constraints_reading_evidence.json "
+        "or an implementation-plan section that names the AGENTS/HANDOFF/requirements and "
+        "skill or rule sources read before implementation. When the run uses dispatch, hybrid, "
         "multi-agent, discussion, or repair coordination, record discussion_trace with "
         "participants, member statements, disagreements, verification steps, and final decision "
         "so the workbench can show the scheduling debate. For plugin flows, also record "
@@ -1791,15 +1803,186 @@ def _workspace_bundle_agent_standard_reasons(workspace_bundle: bytes | None) -> 
         with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
             names = tuple(name for name in archive.namelist() if not name.endswith("/"))
             lowered = tuple(name.lower() for name in names)
+            plan_text = _workspace_bundle_named_text(archive, names, _IMPLEMENTATION_PLAN_BASENAMES)
+            reading_evidence = _workspace_bundle_has_reading_evidence(archive, names)
     except (OSError, zipfile.BadZipFile):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
     basenames = {name.rsplit("/", 1)[-1] for name in lowered}
     reasons: list[str] = []
     if not (basenames & _IMPLEMENTATION_PLAN_BASENAMES):
         reasons.append("workspace_bundle: missing implementation plan artifact")
+    elif not (reading_evidence or _implementation_plan_has_reading_evidence(plan_text)):
+        reasons.append(
+            "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan"
+        )
     if not (basenames & _VERIFICATION_REPORT_BASENAMES):
         reasons.append("workspace_bundle: missing verification report artifact")
     return tuple(reasons)
+
+
+def _workspace_bundle_named_text(
+    archive: zipfile.ZipFile,
+    names: Sequence[str],
+    basenames: frozenset[str],
+) -> str:
+    chunks: list[str] = []
+    for name in names:
+        if name.lower().rsplit("/", 1)[-1] not in basenames:
+            continue
+        try:
+            chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
+        except (KeyError, RuntimeError, OSError):
+            continue
+    return "\n".join(chunks)
+
+
+def _workspace_bundle_has_reading_evidence(
+    archive: zipfile.ZipFile,
+    names: Sequence[str],
+) -> bool:
+    for name in names:
+        if name.lower().rsplit("/", 1)[-1] not in _READING_EVIDENCE_BASENAMES:
+            continue
+        try:
+            raw = archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000]
+        except (KeyError, RuntimeError, OSError):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if _reading_evidence_payload_passes(parsed):
+            return True
+    return False
+
+
+def _reading_evidence_payload_passes(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    read_before_plan = value.get("read_before_plan") is True or value.get(
+        "read_before_implementation"
+    ) is True
+    return (
+        read_before_plan
+        and _reading_evidence_has_required_constraint_sources(
+            value,
+            ("constraints", "constraint_sources", "files_read", "documents_read", "sources"),
+        )
+        and _reading_evidence_has_required_skill_sources(
+            value,
+            ("skills", "skill_rules", "rules", "skill_sources"),
+        )
+    )
+
+
+def _reading_evidence_has_required_constraint_sources(
+    mapping: Mapping[str, object],
+    keys: Sequence[str],
+) -> bool:
+    text = _present_field_text(mapping, keys)
+    lowered = text.casefold()
+    return (
+        _has_marker(lowered, ("agents.md", "workspace rules", "项目规则", "工作区规则"))
+        and _has_marker(lowered, ("handoff", "交接"))
+        and _has_marker(
+            lowered,
+            (
+                "project_requirements",
+                "project requirements",
+                "requirements.md",
+                "requirements",
+                "需求",
+            ),
+        )
+    )
+
+
+def _reading_evidence_has_required_skill_sources(
+    mapping: Mapping[str, object],
+    keys: Sequence[str],
+) -> bool:
+    lowered = _present_field_text(mapping, keys).casefold()
+    return _has_marker(
+        lowered,
+        (
+            "skill.md",
+            "skill inventory",
+            "applicable skill",
+            "project-specific skill",
+            "project specific skill",
+            "agent-standard rules",
+            "workspace rules",
+            "技能",
+            "规则",
+        ),
+    )
+
+
+def _present_field_text(mapping: Mapping[str, object], keys: Sequence[str]) -> str:
+    values = [mapping[key] for key in keys if key in mapping]
+    return " ".join(_flatten_present_text(value) for value in values)
+
+
+def _flatten_present_text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        return " ".join(_flatten_present_text(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return " ".join(_flatten_present_text(item) for item in value)
+    return ""
+
+
+def _implementation_plan_has_reading_evidence(plan_text: str) -> bool:
+    lowered = plan_text.casefold()
+    before_markers = (
+        "before implementation",
+        "before build",
+        "before coding",
+        "before execution",
+        "read_before_plan",
+        "先读",
+        "先读取",
+    )
+    return (
+        _plan_text_has_required_constraint_sources(lowered)
+        and _plan_text_has_required_skill_sources(lowered)
+        and _has_marker(lowered, before_markers)
+    )
+
+
+def _plan_text_has_required_constraint_sources(lowered: str) -> bool:
+    return (
+        _has_marker(lowered, ("agents.md", "workspace rules", "项目规则", "工作区规则"))
+        and _has_marker(lowered, ("handoff", "交接"))
+        and _has_marker(
+            lowered,
+            (
+                "project_requirements",
+                "project requirements",
+                "requirements.md",
+                "requirements",
+                "需求",
+            ),
+        )
+    )
+
+
+def _plan_text_has_required_skill_sources(lowered: str) -> bool:
+    return _has_marker(
+        lowered,
+        (
+            "skill.md",
+            "skill inventory",
+            "applicable skill",
+            "project-specific skill",
+            "project specific skill",
+            "agent-standard rules",
+            "workspace rules",
+            "技能",
+            "规则",
+        ),
+    )
 
 
 def _workspace_bundle_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:

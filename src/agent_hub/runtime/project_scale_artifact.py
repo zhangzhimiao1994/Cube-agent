@@ -236,10 +236,14 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
         ),
         "IMPLEMENTATION_PLAN.md": (
             "# Implementation Plan\n\n"
-            "1. Read the project-scale artifact production constraints.\n"
-            "2. Create a minimal project with source and tests.\n"
-            "3. Package the workspace as a final attachment.\n"
-            "4. Record verification evidence for build, tests, interaction, and artifact integrity.\n"
+            "1. Read before implementation: AGENTS.md workspace rules, HANDOFF current-state "
+            "index, PROJECT_REQUIREMENTS.md, and the project-scale artifact production constraints.\n"
+            "2. Skills checked before implementation: no project-specific SKILL.md is required "
+            "for this fixture; applicable SKILL.md inventory and general agent-standard rules "
+            "still apply.\n"
+            "3. Create a minimal project with source and tests.\n"
+            "4. Package the workspace as a final attachment.\n"
+            "5. Record verification evidence for build, tests, interaction, and artifact integrity.\n"
         ),
         "VERIFICATION.md": (
             "# Verification\n\n"
@@ -340,6 +344,14 @@ def project_scale_artifact_deliverable_quality() -> Mapping[str, JsonValue]:
 def project_scale_artifact_agent_standard_verification() -> Mapping[str, JsonValue]:
     return {
         "constraints_read": True,
+        "constraint_sources": (
+            "AGENTS.md workspace rules; HANDOFF current-state index; PROJECT_REQUIREMENTS.md"
+        ),
+        "skill_rule_sources": (
+            "AGENTS.md workspace rules; applicable SKILL.md inventory; "
+            "project-scale agent-standard rules"
+        ),
+        "read_before_implementation": True,
         "plan_before_implementation": True,
         "reproducible_verification": True,
         "root_cause_repair": True,

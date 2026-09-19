@@ -29,10 +29,19 @@ from agent_hub.harness.project_scale_runner import (
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
     _plugin_contract_payload_passes,
+    _workspace_bundle_agent_standard_reasons,
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
 from agent_hub.runtime.role_planner import RolePlanningRequest
+
+_AGENT_STANDARD_IMPLEMENTATION_PLAN = (
+    "- Read before implementation: AGENTS.md workspace rules, HANDOFF current-state index, "
+    "and PROJECT_REQUIREMENTS.md.\n"
+    "- Skill/rule sources checked before implementation: AGENTS.md workspace rules, "
+    "applicable SKILL.md inventory, and no project-specific SKILL.md required for this fixture.\n"
+    "- Build project\n"
+)
 
 
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
@@ -817,6 +826,7 @@ def test_execute_project_scale_plan_repairs_missing_agent_standard_verification(
     repair_message = str(client.submitted_bodies[1]["message"])
     assert "agent_standard_verification" in repair_message
     assert "plan_before_implementation" in repair_message
+    assert "constraints_reading_evidence.json" in repair_message
     assert "root_cause_repair" in repair_message
 
 
@@ -1035,7 +1045,7 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
             "files": {
                 "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-                "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
                 "VERIFICATION.md": (
                     "- npm run build: passed exit 0; vite build completed\n"
                     "- npm test: passed exit 0; 1 test passed\n"
@@ -1094,7 +1104,7 @@ def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> 
             "files": {
                 "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-                "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
                 "VERIFICATION_REPORT.md": (
                     "- npm run build: passed exit 0; vite build completed\n"
                     "- npm test: passed exit 0; 1 test passed\n"
@@ -1157,8 +1167,7 @@ Implements the requested project scope.
 ### `IMPLEMENTATION_PLAN.md`
 
 ```markdown
-- Read constraints
-- Build project
+__IMPLEMENTATION_PLAN__
 ```
 
 ### `VERIFICATION.md`
@@ -1194,7 +1203,7 @@ import { formatGreeting } from '../src/main.js';
 assert.equal(formatGreeting(' Ada '), 'Hello, Ada');
 assert.equal(formatGreeting(''), 'Hello, guest');
 ```
-""".strip()
+""".replace("__IMPLEMENTATION_PLAN__", _AGENT_STANDARD_IMPLEMENTATION_PLAN).strip()
     client = FakeAcceptanceClient(
         fail_bundle=True,
         status="completed",
@@ -1254,8 +1263,7 @@ Implements the requested project scope.
 ### `docs/implementation-plan.md`
 
 ```markdown
-- Read constraints
-- Build project
+{_AGENT_STANDARD_IMPLEMENTATION_PLAN}
 ```
 
 ### `docs/verification-report.md`
@@ -1356,7 +1364,7 @@ def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed()
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -1395,7 +1403,7 @@ def test_execute_project_scale_plan_rejects_todo_dummy_project_markers() -> None
                 "TODO: replace with real implementation after the demo.\n"
             ),
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -1433,7 +1441,7 @@ def test_execute_project_scale_plan_rejects_constant_only_source_bundle() -> Non
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -1471,7 +1479,7 @@ def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> 
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 2 tests passed\n"
@@ -1507,12 +1515,129 @@ def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> 
     assert report.ok is True
 
 
+def test_workspace_bundle_agent_standard_requires_constraints_and_skill_rule_evidence() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan" in (
+        _workspace_bundle_agent_standard_reasons(bundle)
+    )
+
+
+def test_workspace_bundle_agent_standard_rejects_generic_reading_claims() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": (
+                "- Read before implementation: requirements and rules were reviewed.\n"
+                "- Skills checked before implementation: applicable rules reviewed.\n"
+                "- Build project\n"
+            ),
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan" in (
+        _workspace_bundle_agent_standard_reasons(bundle)
+    )
+
+
+def test_workspace_bundle_agent_standard_rejects_partial_plan_reading_evidence() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": (
+                "- Read before implementation: HANDOFF current-state index and "
+                "PROJECT_REQUIREMENTS.md.\n"
+                "- Rules checked before implementation: applicable runtime rules.\n"
+                "- Build project\n"
+            ),
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan" in (
+        _workspace_bundle_agent_standard_reasons(bundle)
+    )
+
+
+def test_workspace_bundle_agent_standard_rejects_generic_json_reading_evidence() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Build project\n",
+            "constraints_reading_evidence.json": json.dumps(
+                {
+                    "read_before_implementation": True,
+                    "sources": ["requirements"],
+                    "rules": ["general rules"],
+                },
+                sort_keys=True,
+            ),
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan" in (
+        _workspace_bundle_agent_standard_reasons(bundle)
+    )
+
+
 def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -1544,7 +1669,7 @@ def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -1577,7 +1702,7 @@ def test_execute_project_scale_plan_rejects_import_only_test_files() -> None:
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
             "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
             "VERIFICATION.md": (
                 "- npm run build: passed exit 0; vite build completed\n"
                 "- npm test: passed exit 0; 1 test passed\n"
@@ -2086,7 +2211,7 @@ class FakeAcceptanceClient:
             {
                 "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
                 "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
-                "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
                 "VERIFICATION.md": verification,
                 "package.json": json.dumps(
                     {"scripts": {"build": "vite build", "test": "vitest run"}},
