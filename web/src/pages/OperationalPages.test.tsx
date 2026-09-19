@@ -1748,6 +1748,7 @@ describe("operational management pages", () => {
     const workbenchCard = within(processRegion).getByRole("button", { name: /Agent 工作席/ });
     await user.click(workbenchCard);
     const actionDrawer = screen.getByRole("dialog", { name: "Agent 工作席详情" });
+    await openWorkbenchView(user, actionDrawer, "实际动作");
     const workbenchActions = within(actionDrawer).getByLabelText("Agent 工作席动作");
     const toolCards = within(workbenchActions).getAllByRole("button", { name: /工具动作/ });
     expect(toolCards.length).toBeGreaterThan(0);
@@ -2068,6 +2069,7 @@ describe("operational management pages", () => {
     const workbenchCard = within(processRegion).getByRole("button", { name: /Agent 工作席/ });
     await user.click(workbenchCard);
     const workbenchDrawer = screen.getByRole("dialog", { name: "Agent 工作席详情" });
+    await openWorkbenchView(user, workbenchDrawer, "实际动作");
     const workbenchActions = within(workbenchDrawer).getByLabelText("Agent 工作席动作");
     const checkpointCard = within(workbenchActions).getByRole("button", { name: /保存第一版 harness checkpoint/ });
     await user.click(checkpointCard);
@@ -2266,7 +2268,7 @@ describe("operational management pages", () => {
 
     await openRunConfig(user);
     await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
-    expect(screen.getByText(/全局临场策略已开启/)).not.toBeNull();
+    expect(screen.getByText(/临场调整 开/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -6765,7 +6767,25 @@ describe("operational management pages", () => {
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
     await openRunConfig(user);
     expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
-    expect(screen.getByText("本次运行设置")).not.toBeNull();
+    expect(screen.getByText("执行前设置")).not.toBeNull();
+  });
+
+  it("keeps the new chat controls compact while exposing pre-run sandbox settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    expect(screen.queryByText("先选一个运行方式，也可以保持自动直接发送。")).toBeNull();
+    expect(screen.getByText("自动 · 主 Agent 判断，低把握才确认")).not.toBeNull();
+
+    const composer = screen.getByRole("form", { name: "发送消息" });
+    expect(within(composer).getByText("自动 · 项目写入 · 自动角色")).not.toBeNull();
+
+    await openRunConfig(user);
+    const config = screen.getByRole("region", { name: "本次运行更多设置" });
+    expect(within(config).getByLabelText("本次运行设置概览")).not.toBeNull();
+    expect(within(config).getByRole("group", { name: "选择本次运行沙箱权限" })).not.toBeNull();
+    expect(within(config).getByText("角色池 · 自动")).not.toBeNull();
   });
 
 

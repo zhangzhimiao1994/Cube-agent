@@ -143,6 +143,10 @@ function displayMode(mode: string | null | undefined) {
   return RUN_MODES.find((item) => item.value === mode)?.label ?? mode ?? "等待选择";
 }
 
+function displaySandboxProfile(profile: SandboxProfile) {
+  return SANDBOX_OPTIONS.find((item) => item.value === profile)?.label ?? profile;
+}
+
 function displayRoutingReason(reason: string) {
   const normalized = reason.trim();
   const labels: Record<string, string> = {
@@ -3862,20 +3866,19 @@ function ModeEntryPanel({
   onSelect: (mode: RunMode) => void;
 }) {
   const entryModes = [
-    { value: "auto", label: "自动", description: "主 Agent 判断该怎么回复；把握不足时才向你确认。" },
-    { value: "direct", label: "直连", description: "指定一个模型/API直接回答，主 Agent 负责控场和提示词。" },
-    { value: "dispatch", label: "派单", description: "把任务拆给合适角色执行，最后汇总成一条回复。" },
-    { value: "discuss", label: "讨论", description: "多角色表达意见，主 Agent 说明取舍。" },
-    { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，适合复杂问题。" },
+    { value: "auto", label: "自动", description: "主 Agent 判断，低把握才确认" },
+    { value: "direct", label: "直连", description: "指定模型/API直接回答" },
+    { value: "dispatch", label: "派单", description: "拆给角色执行后汇总" },
+    { value: "discuss", label: "讨论", description: "多角色讨论后裁决" },
+    { value: "hybrid", label: "混合", description: "先讨论，再派单执行" },
   ] as const;
   const selected = entryModes.find((item) => item.value === selectedMode) ?? entryModes[0];
   return (
     <article className="mode-entry-panel">
-      <span className="mode-entry-logo" aria-hidden="true">
-        ✦
-      </span>
-      <h3>新对话</h3>
-      <p>先选一个运行方式，也可以保持自动直接发送。</p>
+      <div className="mode-entry-heading">
+        <h3>新对话</h3>
+        <p>{selected.label} · {selected.description}</p>
+      </div>
       <div className="mode-entry-tabs" role="list" aria-label="对话模式入口">
         {entryModes.map((item) => (
           <button
@@ -3890,7 +3893,6 @@ function ModeEntryPanel({
           </button>
         ))}
       </div>
-      <p>{selected.description}</p>
     </article>
   );
 }
@@ -5068,6 +5070,7 @@ export function RunsPage() {
 
   const items = runListItems;
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
+  const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
@@ -5330,8 +5333,17 @@ export function RunsPage() {
         <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>
           {configOpen ? (
               <div className="composer-config-sheet" role="region" aria-label="本次运行更多设置">
+          <div className="composer-config-summary" aria-label="本次运行设置概览">
+            <strong>本次运行配置</strong>
+            <div>
+              <span>{selectedMode.label}</span>
+              <span>{selectedSandboxLabel}</span>
+              <span>{workflowId ? selectedWorkflow?.name ?? workflowId : "无固定工作流"}</span>
+              <span>{mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 个角色` : "自动角色"}</span>
+            </div>
+          </div>
           <details className="run-settings-panel" aria-label="本次运行设置" open>
-            <summary aria-label="展开或收起本次运行设置">本次运行设置</summary>
+            <summary aria-label="展开或收起本次运行设置">执行前设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
             <label htmlFor="run-mode">
               模式
@@ -5344,8 +5356,13 @@ export function RunsPage() {
               </select>
             </label>
             <label htmlFor="run-workflow">
-              使用工作流
-              <select id="run-workflow" value={workflowId} onChange={(event) => setWorkflowId(event.target.value)}>
+              工作流
+              <select
+                id="run-workflow"
+                aria-label="使用工作流"
+                value={workflowId}
+                onChange={(event) => setWorkflowId(event.target.value)}
+              >
                 <option value="">不使用固定工作流</option>
                 {savedWorkflows
                   .filter((workflow) => workflow.enabled)
@@ -5353,52 +5370,9 @@ export function RunsPage() {
                     <option key={workflow.id} value={workflow.id}>
                       {workflow.name}
                     </option>
-                  ))}
+                ))}
               </select>
             </label>
-            <label htmlFor="conversation-id">
-              本次会话 ID
-              <input
-                id="conversation-id"
-                value={conversationId}
-                onChange={(event) => setConversationId(event.target.value)}
-              />
-            </label>
-            <label htmlFor="project-id">
-              项目文件夹
-              <input
-                id="project-id"
-                value={projectId}
-                onChange={(event) => setProjectId(event.target.value)}
-                placeholder="default"
-              />
-            </label>
-            <label htmlFor="project-label">
-              项目名称
-              <input
-                id="project-label"
-                value={projectLabel}
-                onChange={(event) => setProjectLabel(event.target.value)}
-                placeholder="可选"
-              />
-            </label>
-            <label htmlFor="reference-conversation-id">
-              参考会话 ID
-              <input
-                id="reference-conversation-id"
-                value={referenceConversationId}
-                onChange={(event) => setReferenceConversationId(event.target.value)}
-                placeholder="可选：粘贴其他会话 ID"
-              />
-            </label>
-            <button
-              className="secondary-action inline-action"
-              type="button"
-              disabled={!trimmedReferenceConversationId || referenceConversation.isFetching}
-              onClick={loadReferenceConversation}
-            >
-              {referenceConversation.isFetching ? "读取中..." : "读取参考会话"}
-            </button>
             <div className="sandbox-settings" aria-label="沙箱权限">
               <span className="field-label">沙箱权限</span>
               <div className="sandbox-choice-row" role="group" aria-label="选择本次运行沙箱权限">
@@ -5415,13 +5389,56 @@ export function RunsPage() {
                   </button>
                 ))}
               </div>
-              <p className="field-help">
-                工作区：{workspacePreviewPath(projectId, conversationId)}
-              </p>
             </div>
+            <label htmlFor="conversation-id">
+              会话 ID
+              <input
+                id="conversation-id"
+                value={conversationId}
+                onChange={(event) => setConversationId(event.target.value)}
+              />
+            </label>
+            <label htmlFor="project-id">
+              项目
+              <input
+                id="project-id"
+                aria-label="项目文件夹"
+                value={projectId}
+                onChange={(event) => setProjectId(event.target.value)}
+                placeholder="default"
+              />
+            </label>
+            <label htmlFor="project-label">
+              项目名
+              <input
+                id="project-label"
+                aria-label="项目名称"
+                value={projectLabel}
+                onChange={(event) => setProjectLabel(event.target.value)}
+                placeholder="可选"
+              />
+            </label>
+            <label htmlFor="reference-conversation-id">
+              参考会话
+              <input
+                id="reference-conversation-id"
+                aria-label="参考会话 ID"
+                value={referenceConversationId}
+                onChange={(event) => setReferenceConversationId(event.target.value)}
+                placeholder="可选：粘贴其他会话 ID"
+              />
+            </label>
+            <button
+              className="secondary-action inline-action"
+              type="button"
+              disabled={!trimmedReferenceConversationId || referenceConversation.isFetching}
+              onClick={loadReferenceConversation}
+            >
+              {referenceConversation.isFetching ? "读取中..." : "读取参考会话"}
+            </button>
             <div className="mode-help">
-              <span className="eyebrow">{selectedMode.label}</span>
-              <p>{selectedMode.description}</p>
+              <span className="eyebrow">当前设置</span>
+              <p>工作区：{workspacePreviewPath(projectId, conversationId)} · {selectedMode.label} · {selectedSandboxLabel}</p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
               {settings.isError ? (
                 <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p>
@@ -5431,25 +5448,13 @@ export function RunsPage() {
               ) : null}
               {selectedWorkflow ? (
                 <>
+                  <p>工作流：{selectedWorkflow.name}{selectedWorkflow.task_type ? ` · ${selectedWorkflow.task_type}` : ""}</p>
                   <p>
-                    当前工作流：{selectedWorkflow.name}
-                    {selectedWorkflow.task_type ? `；适用场景：${selectedWorkflow.task_type}` : ""}
-                  </p>
-                  <p>
-                    全局临场策略：
-                    {settings.data?.allow_main_agent_override
-                      ? "全局临场策略已开启；主 Agent 可以提出改步骤、换角色或加交付物，但执行前必须向你核对。"
-                      : "关闭；主 Agent 会按预设执行，只提示明显不匹配风险。"}
-                  </p>
-                  <p>
-                    临时子 Agent：
-                    {settings.data?.allow_temporary_agents
-                      ? "允许在能力不足时提出申请，用户确认后才加入。"
-                      : "关闭；不会临时扩充角色池。"}
+                    临场调整 {settings.data?.allow_main_agent_override ? "开" : "关"} · 临时子 Agent {settings.data?.allow_temporary_agents ? "开" : "关"}
                   </p>
                 </>
               ) : (
-                <p>未选择工作流时，主 Agent 会按消息内容和你勾选的角色进行调度。</p>
+                <p>未固定工作流，由主 Agent 按任务和角色池判断。</p>
               )}
             </div>
             {referenceConversation.data ? (
@@ -5469,8 +5474,8 @@ export function RunsPage() {
             </div>
           </details>
 
-          <details className="inline-guide" open={mode !== "direct"}>
-            <summary>{mode === "direct" ? "直连说明" : "选择本次参与角色池"}</summary>
+          <details className="inline-guide">
+            <summary>{mode === "direct" ? "直连模型" : `角色池 · ${agentIds.length > 0 ? `${agentIds.length} 已选` : "自动"}`}</summary>
             {mode === "direct" ? (
               <>
                 <p className="field-help">
@@ -5488,9 +5493,6 @@ export function RunsPage() {
               </>
             ) : (
               <>
-                <p className="field-help">
-                  同一个模式可以派给不同对象。选择工作流会自动带出默认角色；你也可以为本次任务临时增删。
-                </p>
                 <fieldset>
                   <legend>角色池</legend>
                   {agents.isLoading ? (
@@ -5941,14 +5943,12 @@ export function RunsPage() {
               </div>
               <div className="composer-status-line" role="status">
                 <span>
-                  {mode === "auto"
-                    ? "自动 · 主 Agent 判断"
-                    : mode === "direct"
-                      ? `直连 · 模型 ${directModelName}`
-                      : `${displayMode(mode)} · 本会话倾向`}
-                  {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
-                  {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
-                  {referenceConversationId.trim() ? " · 已引用会话" : ""}
+                  {[
+                    displayMode(mode),
+                    selectedSandboxLabel,
+                    mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 角色` : "自动角色",
+                    referenceConversationId.trim() ? "已引用" : null,
+                  ].filter(Boolean).join(" · ")}
                 </span>
               </div>
               <div className="composer-send-row">
