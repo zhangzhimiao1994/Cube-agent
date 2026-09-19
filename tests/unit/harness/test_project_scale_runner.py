@@ -900,7 +900,7 @@ def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() 
         "medium:artifact_production run_id=run-medium-artifact-repair ok=false "
         "focus=interaction_stability,final_result,deliverable_quality,"
         "agent_standard_verification,artifact_integrity "
-        "missing=deliverable_quality,agent_standard_verification errors=7 repair=failed"
+        "missing=deliverable_quality,agent_standard_verification errors=8 repair=failed"
     )
 
 
@@ -1037,7 +1037,11 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
                     sort_keys=True,
                 ),
                 "src/main.js": "export const status = 'ready';\n",
-                "tests/main.test.js": "import { status } from '../src/main.js';\n",
+                "tests/main.test.js": (
+                    "import assert from 'node:assert/strict';\n"
+                    "import { status } from '../src/main.js';\n"
+                    "assert.equal(status, 'ready');\n"
+                ),
             }
         }
     }
@@ -1096,7 +1100,11 @@ def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> 
                     sort_keys=True,
                 ),
                 "src/main.js": "export const status = 'ready';\n",
-                "tests/main.test.js": "import { status } from '../src/main.js';\n",
+                "tests/main.test.js": (
+                    "import assert from 'node:assert/strict';\n"
+                    "import { status } from '../src/main.js';\n"
+                    "assert.equal(status, 'ready');\n"
+                ),
             }
         },
     }
@@ -1176,6 +1184,9 @@ export const status = 'ready';
 
 ```js
 import { status } from '../src/main.js';
+import assert from 'node:assert/strict';
+
+assert.equal(status, 'ready');
 ```
 """.strip()
     client = FakeAcceptanceClient(
@@ -1275,6 +1286,9 @@ def ready():
 
 ```python
 from direct_ledger.core import ready
+
+def test_ready():
+    assert ready() is True
 ```
 
 ### `scripts/build.sh`
@@ -1370,6 +1384,40 @@ def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -
     assert result.evidence["workspace_bundle"] is True
     assert result.evidence["deliverable_quality"] is False
     assert "workspace_bundle: missing test or verification file path" in result.errors
+
+
+def test_execute_project_scale_plan_rejects_import_only_test_files() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    shell_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed\n"
+                "- npm test: passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": "export const status = 'ready';\n",
+            "tests/main.test.js": "import { status } from '../src/main.js';\n",
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: missing meaningful test assertions" in result.errors
 
 
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
@@ -1839,7 +1887,10 @@ class FakeAcceptanceClient:
                         sort_keys=True,
                     ),
                     "src/main.ts": "export const status = 'ready';\n",
-                    "tests/app.test.ts": "import { status } from '../src/main';\n",
+                    "tests/app.test.ts": (
+                        "import { status } from '../src/main';\n"
+                        "expect(status).toBe('ready');\n"
+                    ),
                 }
             )
         verification = (
@@ -1858,7 +1909,10 @@ class FakeAcceptanceClient:
                     sort_keys=True,
                 ),
                 "src/main.ts": "export const status = 'ready';\n",
-                "tests/app.test.ts": "import { status } from '../src/main';\n",
+                "tests/app.test.ts": (
+                    "import { status } from '../src/main';\n"
+                    "expect(status).toBe('ready');\n"
+                ),
             }
         )
 

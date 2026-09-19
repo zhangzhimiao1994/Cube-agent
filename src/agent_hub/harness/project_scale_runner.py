@@ -1748,6 +1748,7 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
                 return ("workspace_bundle: empty project bundle",)
             text = _workspace_bundle_text(archive, names)
             verification_text = _workspace_bundle_verification_text(archive, names)
+            test_text = _workspace_bundle_test_text(archive, names)
     except (OSError, zipfile.BadZipFile):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
 
@@ -1758,6 +1759,8 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing source files")
     if not _bundle_has_verification_file_path(lowered):
         reasons.append("workspace_bundle: missing test or verification file path")
+    if not _test_text_has_meaningful_assertions(test_text):
+        reasons.append("workspace_bundle: missing meaningful test assertions")
     if not _bundle_has_build_test_execution_evidence(verification_text):
         reasons.append("workspace_bundle: missing build/test execution evidence")
     if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
@@ -1803,6 +1806,18 @@ def _workspace_bundle_verification_text(archive: zipfile.ZipFile, names: Sequenc
     chunks: list[str] = []
     for name in names:
         if name.lower().rsplit("/", 1)[-1] not in _VERIFICATION_REPORT_BASENAMES:
+            continue
+        try:
+            chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
+        except (KeyError, RuntimeError, OSError):
+            continue
+    return "\n".join(chunks)
+
+
+def _workspace_bundle_test_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:
+    chunks: list[str] = []
+    for name in names:
+        if not _is_test_file_name(name.lower()):
             continue
         try:
             chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])
@@ -1918,7 +1933,12 @@ def _is_project_source_file(name: str) -> bool:
 def _bundle_has_verification_file_path(
     lowered_names: Sequence[str],
 ) -> bool:
-    has_test_path = any(
+    has_test_path = any(_is_test_file_name(name) for name in lowered_names)
+    return has_test_path
+
+
+def _is_test_file_name(name: str) -> bool:
+    return (
         name.startswith(("tests/", "test/"))
         or "/tests/" in name
         or name.endswith(
@@ -1935,9 +1955,25 @@ def _bundle_has_verification_file_path(
                 ".spec.tsx",
             )
         )
-        for name in lowered_names
     )
-    return has_test_path
+
+
+def _test_text_has_meaningful_assertions(test_text: str) -> bool:
+    lowered = test_text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "assert ",
+            "assert(",
+            "assert.",
+            "expect(",
+            ".tobe(",
+            ".toequal(",
+            "self.assert",
+            "pytest.",
+            "unittest.",
+        )
+    )
 
 
 def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:
