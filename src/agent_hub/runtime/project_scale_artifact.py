@@ -129,6 +129,17 @@ class ProjectScaleArtifactPreseedRuntime:
                         payload=project_scale_artifact_discussion_payload(context.request),
                     )
                     sequence += 1
+                    if is_project_scale_repair_request(context.request):
+                        yield RunEvent(
+                            kind=EventKind.MESSAGE_CREATED,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor="harness_project_scale",
+                            session_id=str(context.run_id),
+                            message="Recorded project-scale self-repair trace.",
+                            payload=project_scale_artifact_repair_payload(),
+                        )
+                        sequence += 1
                     yield RunEvent(
                         kind=EventKind.RUNTIME_COMPLETED,
                         sequence=sequence,
@@ -177,6 +188,13 @@ def is_project_scale_artifact_request(request: object) -> bool:
 def is_project_scale_plugin_request(request: object) -> bool:
     text = str(request).casefold()
     return is_project_scale_artifact_request(request) and "flow=plugin" in text
+
+
+def is_project_scale_repair_request(request: object) -> bool:
+    text = str(request).casefold()
+    return is_project_scale_artifact_request(request) and (
+        "flow=model_failure" in text or "flow=self_repair" in text
+    )
 
 
 def project_scale_artifact_zip_arguments(
@@ -369,6 +387,20 @@ def project_scale_artifact_discussion_payload(request: object) -> Mapping[str, J
     return payload
 
 
+def project_scale_artifact_repair_payload() -> Mapping[str, JsonValue]:
+    return {
+        "kind": "runtime.self_repair.completed",
+        "repair_event": "runtime.self_repair.completed",
+        "repair_strategy": "acceptance_fixture_recovery",
+        "root_cause": "project-scale fixture fault injection required explicit repair evidence",
+        "verification": (
+            "root cause identified",
+            "bounded repair applied",
+            "reproducible evidence preserved",
+        ),
+    }
+
+
 def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | None:
     value = routing_decision.get(key)
     if type(value) is str and value.strip():
@@ -411,10 +443,12 @@ __all__ = [
     "augment_project_scale_artifact_result",
     "is_project_scale_artifact_request",
     "is_project_scale_plugin_request",
+    "is_project_scale_repair_request",
     "project_scale_artifact_agent_standard_verification",
     "project_scale_artifact_deliverable_quality",
     "project_scale_artifact_discussion_trace",
     "project_scale_artifact_plugin_contract",
+    "project_scale_artifact_repair_payload",
     "project_scale_artifact_zip_arguments",
     "project_scale_artifact_zip_files",
 ]

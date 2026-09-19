@@ -187,7 +187,10 @@ class ProjectScaleCaseResult:
 
     @property
     def repair_attempted(self) -> bool:
-        return self.evidence.get("deliverable_repair_trace") is True
+        return (
+            self.evidence.get("deliverable_repair_trace") is True
+            or self.evidence.get("self_repair_trace") is True
+        )
 
     @property
     def repair_outcome(self) -> str:

@@ -115,7 +115,6 @@ def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
 def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
     return (
         context.mode is TaskMode.DIRECT
-        and context.routing_decision.get("project_preflight_approved") is True
         and is_project_scale_artifact_request(context.request)
     )
 

@@ -672,6 +672,33 @@ def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> N
     )
 
 
+def test_project_scale_repair_attempted_counts_self_repair_trace() -> None:
+    result = ProjectScaleCaseResult(
+        case_id="small:self_repair",
+        run_id="run-small-self-repair",
+        status="completed",
+        evidence={
+            "run_details": True,
+            "run_events": True,
+            "terminal_status": True,
+            "final_artifacts": True,
+            "deliverable_quality": True,
+            "agent_standard_verification": True,
+            "discussion_trace": True,
+            "project_preflight_approval": False,
+            "self_repair_trace": True,
+            "plugin_contract": False,
+            "workspace_bundle": True,
+            "cleanup_cancel": True,
+            "deliverable_repair_trace": False,
+        },
+        validation_focus=("fault_injection", "self_repair"),
+    )
+
+    assert result.repair_attempted is True
+    assert result.to_payload()["repair_attempted"] is True
+
+
 def test_execute_project_scale_plan_repairs_failed_deliverable_quality() -> None:
     plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(

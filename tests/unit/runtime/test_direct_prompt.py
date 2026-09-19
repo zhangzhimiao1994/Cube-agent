@@ -198,3 +198,50 @@ async def test_direct_project_scale_preflight_emits_verified_artifact_without_ga
         "reproducible_verification": True,
         "root_cause_repair": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_project_scale_fixture_emits_verified_artifact_without_preflight() -> None:
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=direct."
+                ),
+                routing_decision={
+                    "project_id": "project-scale-acceptance",
+                    "workspace_session_id": "project-scale-small-direct",
+                },
+            )
+        )
+    ]
+
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    text = artifact_event.artifact.content["text"]
+    assert isinstance(text, str)
+    assert "### `VERIFICATION.md`" in text
+    assert "- npm run build: passed" in text
+    assert "- npm test: passed" in text
+    assert artifact_event.payload["deliverable_quality"] == {
+        "requirements_satisfied": True,
+        "build_passed": True,
+        "tests_passed": True,
+        "interactive_checks_passed": True,
+        "no_placeholders": True,
+        "artifact_integrity": True,
+    }
+    assert artifact_event.payload["agent_standard_verification"] == {
+        "constraints_read": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }

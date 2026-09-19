@@ -519,6 +519,50 @@ async def test_project_scale_plugin_preseed_records_plugin_contract_evidence() -
 
 
 @pytest.mark.asyncio
+async def test_project_scale_self_repair_preseed_records_repair_trace_evidence() -> None:
+    harness = RecordingHarnessToolGateway()
+    runtime = ProjectScaleArtifactPreseedRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, "dispatch should be short-circuited"),
+        harness_tool_gateway=harness,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DISPATCH,
+                request=(
+                    "Project-scale acceptance fixture: build a small project for scale=small "
+                    "and flow=self_repair."
+                ),
+                routing_decision={
+                    "project_id": "project-scale-acceptance",
+                    "workspace_session_id": "project-scale-small-self_repair",
+                    "sandbox_profile": "workspace_write",
+                },
+            )
+        )
+    ]
+
+    repair_event = next(
+        event
+        for event in events
+        if event.kind is EventKind.MESSAGE_CREATED
+        and event.payload.get("kind") == "runtime.self_repair.completed"
+    )
+    assert repair_event.payload["repair_event"] == "runtime.self_repair.completed"
+    assert repair_event.payload["repair_strategy"] == "acceptance_fixture_recovery"
+    assert repair_event.payload["verification"] == (
+        "root cause identified",
+        "bounded repair applied",
+        "reproducible evidence preserved",
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_project_scale_artifact_preseed_accepts_string_uuid_context_boundary() -> None:
     run_id = uuid4()
     tenant_id = uuid4()
