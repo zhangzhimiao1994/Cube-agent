@@ -1627,15 +1627,16 @@ def _evaluate_agent_standard_verification(
     workspace_bundle: bytes | None,
 ) -> _EvidenceCheck:
     reasons: list[str] = []
-    if not (
-        _has_agent_standard_payload(details, events)
-        or _workspace_bundle_has_agent_standard_payload(workspace_bundle)
-        or _workspace_bundle_has_agent_standard_evidence(workspace_bundle)
-    ):
+    has_structured_evidence = _has_agent_standard_payload(
+        details, events
+    ) or _workspace_bundle_has_agent_standard_payload(workspace_bundle)
+    has_workspace_evidence = _workspace_bundle_has_agent_standard_evidence(workspace_bundle)
+    if not (has_structured_evidence or has_workspace_evidence):
         reasons.append(
             "agent_standard_verification: missing or incomplete Codex/Claude standard flags"
         )
-    reasons.extend(_workspace_bundle_agent_standard_reasons(workspace_bundle))
+    if not has_structured_evidence:
+        reasons.extend(_workspace_bundle_agent_standard_reasons(workspace_bundle))
     return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
 
 

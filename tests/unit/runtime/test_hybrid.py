@@ -7,7 +7,7 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
-from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -155,6 +155,14 @@ class RecordingHarnessToolGateway:
         self.calls.append(request)
         self.user_ids.append(user_id)
         self.roles.append(role)
+        raw_files = request.arguments.get("files")
+        workspace_files: tuple[Mapping[str, JsonValue], ...] = ()
+        if isinstance(raw_files, Mapping):
+            workspace_files = tuple(
+                {"path": path}
+                for path in sorted(raw_files)
+                if isinstance(path, str)
+            )
         return HarnessToolCallResult(
             call_id=request.call_id,
             tool_name=request.tool_name,
@@ -171,7 +179,7 @@ class RecordingHarnessToolGateway:
                 },
                 "presentation": "final_attachment",
                 "summary": "Generated project ZIP artifact.",
-                "workspace_files": (),
+                "workspace_files": workspace_files,
             },
         )
 
@@ -428,6 +436,7 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
         "README.md",
         "PROJECT_REQUIREMENTS.md",
         "IMPLEMENTATION_PLAN.md",
+        "constraints_reading_evidence.json",
         "VERIFICATION.md",
         "package.json",
         "src/main.ts",
@@ -438,6 +447,13 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
     result = completed.artifact.content["result"]
     assert isinstance(result, Mapping)
     assert result["presentation"] == "final_attachment"
+    workspace_files = result["workspace_files"]
+    assert isinstance(workspace_files, tuple)
+    assert any(
+        item.get("path") == "constraints_reading_evidence.json"
+        for item in workspace_files
+        if isinstance(item, Mapping)
+    )
     assert completed.payload["deliverable_quality"] == {
         "requirements_satisfied": True,
         "build_passed": True,

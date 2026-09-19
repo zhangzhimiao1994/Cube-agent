@@ -27,6 +27,7 @@ from agent_hub.harness.project_scale_runner import (
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
+    _evaluate_agent_standard_verification,
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
     _plugin_contract_payload_passes,
@@ -927,7 +928,7 @@ def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() 
         "medium:artifact_production run_id=run-medium-artifact-repair ok=false "
         "focus=interaction_stability,final_result,deliverable_quality,"
         "agent_standard_verification,artifact_integrity "
-        "missing=deliverable_quality,agent_standard_verification errors=9 repair=failed"
+        "missing=deliverable_quality errors=7 repair=failed"
     )
 
 
@@ -1693,6 +1694,44 @@ def test_workspace_bundle_agent_standard_rejects_generic_json_reading_evidence()
     assert "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan" in (
         _workspace_bundle_agent_standard_reasons(bundle)
     )
+
+
+def test_agent_standard_verification_accepts_public_tool_event_evidence() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+    event = {
+        "kind": "tool.completed",
+        "tool_name": "project.generate_zip",
+        "payload": {
+            "agent_standard_verification": {
+                "constraints_read": True,
+                "plan_before_implementation": True,
+                "reproducible_verification": True,
+                "root_cause_repair": True,
+            },
+        },
+    }
+
+    check = _evaluate_agent_standard_verification(None, [event], bundle)
+
+    assert check.passed is True
+    assert check.reasons == ()
 
 
 def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
