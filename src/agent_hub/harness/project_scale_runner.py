@@ -1748,7 +1748,6 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
                 return ("workspace_bundle: empty project bundle",)
             text = _workspace_bundle_text(archive, names)
             verification_text = _workspace_bundle_verification_text(archive, names)
-            package_json = _read_bundle_file(archive, names, "package.json")
     except (OSError, zipfile.BadZipFile):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
 
@@ -1757,8 +1756,8 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing requirements or README artifact")
     if not _bundle_has_source_files(lowered):
         reasons.append("workspace_bundle: missing source files")
-    if not _bundle_has_verification_path_or_script(lowered, package_json):
-        reasons.append("workspace_bundle: missing test path or build/test script")
+    if not _bundle_has_verification_file_path(lowered):
+        reasons.append("workspace_bundle: missing test or verification file path")
     if not _bundle_has_build_test_execution_evidence(verification_text):
         reasons.append("workspace_bundle: missing build/test execution evidence")
     if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
@@ -1916,22 +1915,29 @@ def _is_project_source_file(name: str) -> bool:
     return name.endswith((".py", ".js", ".jsx", ".ts", ".tsx"))
 
 
-def _bundle_has_verification_path_or_script(
+def _bundle_has_verification_file_path(
     lowered_names: Sequence[str],
-    package_json: str,
 ) -> bool:
     has_test_path = any(
-        name.startswith(("tests/", "test/")) or "/tests/" in name or name.endswith(".test.ts")
+        name.startswith(("tests/", "test/"))
+        or "/tests/" in name
+        or name.endswith(
+            (
+                ".test.js",
+                ".test.jsx",
+                ".test.py",
+                ".test.ts",
+                ".test.tsx",
+                ".spec.js",
+                ".spec.jsx",
+                ".spec.py",
+                ".spec.ts",
+                ".spec.tsx",
+            )
+        )
         for name in lowered_names
     )
-    if has_test_path:
-        return True
-    try:
-        package = json.loads(package_json)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    scripts = package.get("scripts") if isinstance(package, dict) else None
-    return isinstance(scripts, dict) and bool({"build", "test"} <= set(scripts))
+    return has_test_path
 
 
 def _bundle_has_build_test_execution_evidence(verification_text: str) -> bool:

@@ -1339,6 +1339,39 @@ def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
     assert "workspace_bundle: missing source files" in result.errors
 
 
+def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    shell_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Read constraints\n- Build project\n",
+            "VERIFICATION.md": (
+                "- npm run build: passed\n"
+                "- npm test: passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "echo build passed", "test": "echo tests passed"}},
+                sort_keys=True,
+            ),
+            "src/main.js": "export const status = 'ready';\n",
+        }
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=shell_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is False
+    assert "workspace_bundle: missing test or verification file path" in result.errors
+
+
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
