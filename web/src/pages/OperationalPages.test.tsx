@@ -616,7 +616,7 @@ async function openAgentWorkbench(user: ReturnType<typeof userEvent.setup>, stre
 async function openWorkbenchView(
   user: ReturnType<typeof userEvent.setup>,
   workbench: HTMLElement,
-  name: "助手总览" | "调度讨论" | "实际动作" | "修复异常",
+  name: "助手总览" | "调度讨论" | "实际动作" | "文件" | "终端" | "结果" | "修复异常",
 ) {
   await user.click(within(workbench).getByRole("button", { name }));
   return workbench;
@@ -1332,6 +1332,24 @@ describe("operational management pages", () => {
             sha256: "a".repeat(64),
             expires_at: "2026-08-17T00:00:00Z",
           });
+        }
+        if (path === "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download") {
+          return {
+            ok: true,
+            status: 200,
+            blob: async () => ({
+              text: async () => "print('hello from workspace')\n",
+            }),
+          } as Response;
+        }
+        if (path === "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download") {
+          return {
+            ok: true,
+            status: 200,
+            blob: async () => ({
+              text: async () => "PK\x03\x04",
+            }),
+          } as Response;
         }
         if (path === "/api/v1/admin/workflows") {
           return jsonResponse(visibleWorkflows);
@@ -2483,6 +2501,36 @@ describe("operational management pages", () => {
     expect(within(files).getByRole("heading", { name: "当前会话文件" })).not.toBeNull();
     expect(within(files).getByRole("button", { name: "下载 workspace.zip" })).not.toBeNull();
     expect(within(files).getByText("中间产物")).not.toBeNull();
+  });
+
+  it("shows workspace files inside the agent workbench file window with text preview", async () => {
+    const user = userEvent.setup();
+    visibleWorkspaceFiles = {
+      items: [
+        {
+          path: "src/app.py",
+          filename: "app.py",
+          mime_type: "text/x-python",
+          size_bytes: 21,
+          sha256: "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+          download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=src%2Fapp.py",
+        },
+      ],
+      bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const workbench = await openAgentWorkbench(user, stream);
+
+    await openWorkbenchView(user, workbench, "文件");
+    const fileWindow = within(workbench).getByRole("region", { name: "文件窗口" });
+    expect(within(fileWindow).getByRole("button", { name: /src\/app\.py/ })).not.toBeNull();
+    expect(await within(fileWindow).findByText("print('hello from workspace')")).not.toBeNull();
+    expect(within(fileWindow).getByRole("button", { name: "下载 app.py" })).not.toBeNull();
   });
 
   it("places current conversation workspace files after the conversation messages", async () => {
