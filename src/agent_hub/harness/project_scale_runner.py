@@ -411,6 +411,7 @@ def execute_project_scale_plan(
 ) -> ProjectScaleExecutionReport:
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
+        request_body = _scoped_execution_body(run_request.body, execution_id=execution_id)
         evidence = {
             "run_details": False,
             "run_events": False,
@@ -433,7 +434,7 @@ def execute_project_scale_plan(
             response = client.request_json(
                 "POST",
                 "/api/v1/runs",
-                body=run_request.body,
+                body=request_body,
                 idempotency_key=_idempotency_key(
                     run_request.case_id,
                     index,
@@ -447,12 +448,12 @@ def execute_project_scale_plan(
                 raise RuntimeError("run create response missing id")
             run_id = raw_run_id
             status = _string_value(response.get("status"))
-            _validate_run_submission_scope(response, run_request.body)
+            _validate_run_submission_scope(response, request_body)
             _extend_unique(
                 errors,
                 _validate_mode_control(
                     response,
-                    requested_body=run_request.body,
+                    requested_body=request_body,
                     validation_focus=run_request.validation_focus,
                 ),
             )
@@ -471,7 +472,7 @@ def execute_project_scale_plan(
             observation = _collect_run_observation(
                 client,
                 run_id=run_id,
-                body=run_request.body,
+                body=request_body,
                 wait_seconds=wait_seconds,
                 poll_interval_seconds=poll_interval_seconds,
                 current_status=status,
@@ -484,7 +485,7 @@ def execute_project_scale_plan(
                 errors,
                 _validate_mode_control(
                     observation.details,
-                    requested_body=run_request.body,
+                    requested_body=request_body,
                     validation_focus=run_request.validation_focus,
                 ),
             )
@@ -502,12 +503,12 @@ def execute_project_scale_plan(
                     )
                     if not isinstance(repair_response, dict):
                         raise TypeError("self repair acceptance returned non-object JSON")
-                    _validate_run_submission_scope(repair_response, run_request.body)
+                    _validate_run_submission_scope(repair_response, request_body)
                     _extend_unique(
                         errors,
                         _validate_mode_control(
                             repair_response,
-                            requested_body=run_request.body,
+                            requested_body=request_body,
                             validation_focus=run_request.validation_focus,
                         ),
                     )
@@ -520,7 +521,7 @@ def execute_project_scale_plan(
                     self_repair_observation = _collect_run_observation(
                         client,
                         run_id=run_id,
-                        body=run_request.body,
+                        body=request_body,
                         wait_seconds=wait_seconds,
                         poll_interval_seconds=poll_interval_seconds,
                         current_status=status,
@@ -533,7 +534,7 @@ def execute_project_scale_plan(
                         errors,
                         _validate_mode_control(
                             self_repair_observation.details,
-                            requested_body=run_request.body,
+                            requested_body=request_body,
                             validation_focus=run_request.validation_focus,
                         ),
                     )
@@ -573,7 +574,7 @@ def execute_project_scale_plan(
                     "POST",
                     "/api/v1/runs",
                     body=_deliverable_repair_body(
-                        run_request.body,
+                        request_body,
                         run_request.case_id,
                         failed_reasons=(
                             *deliverable_quality.reasons,
@@ -590,12 +591,12 @@ def execute_project_scale_plan(
                 )
                 if not isinstance(repair_response, dict):
                     raise TypeError("deliverable repair returned non-object JSON")
-                _validate_run_submission_scope(repair_response, run_request.body)
+                _validate_run_submission_scope(repair_response, request_body)
                 _extend_unique(
                     errors,
                     _validate_mode_control(
                         repair_response,
-                        requested_body=run_request.body,
+                        requested_body=request_body,
                         validation_focus=run_request.validation_focus,
                     ),
                 )
@@ -608,7 +609,7 @@ def execute_project_scale_plan(
                 repair_observation = _collect_run_observation(
                     client,
                     run_id=run_id,
-                    body=run_request.body,
+                    body=request_body,
                     wait_seconds=wait_seconds,
                     poll_interval_seconds=poll_interval_seconds,
                     current_status=status,
@@ -620,7 +621,7 @@ def execute_project_scale_plan(
                     errors,
                     _validate_mode_control(
                         repair_observation.details,
-                        requested_body=run_request.body,
+                        requested_body=request_body,
                         validation_focus=run_request.validation_focus,
                     ),
                 )
@@ -1429,6 +1430,22 @@ def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = Non
     if execution_id is not None:
         key = f"{key}-{_safe_idempotency_token(execution_id)}"
     return key[:90]
+
+
+def _scoped_execution_body(
+    body: dict[str, object],
+    *,
+    execution_id: str | None,
+) -> dict[str, object]:
+    if execution_id is None:
+        return body
+    scoped = dict(body)
+    session_id = _string_value(scoped.get("workspace_session_id"))
+    if session_id:
+        scoped["workspace_session_id"] = (
+            f"{session_id}-{_safe_idempotency_token(execution_id)}"
+        )[:120]
+    return scoped
 
 
 def _deliverable_repair_idempotency_key(

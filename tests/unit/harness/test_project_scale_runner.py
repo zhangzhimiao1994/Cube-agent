@@ -739,11 +739,18 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
 
 def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
-    client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        session_id="project-scale-small-direct-acceptance-20260914",
+    )
 
     report = execute_project_scale_plan(plan, client, execution_id="acceptance-20260914")
 
     assert report.ok is True
+    assert client.submitted_bodies[0]["workspace_session_id"] == (
+        "project-scale-small-direct-acceptance-20260914"
+    )
     assert client.calls[0] == (
         "POST",
         "/api/v1/runs",
