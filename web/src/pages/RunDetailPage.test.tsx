@@ -28,6 +28,9 @@ it("keeps process detail values readable in narrow workbench drawers", () => {
   expect(stylesCss).toMatch(
     /@media \(max-width: 980px\)[\s\S]*\.process-intermediate-card > strong,[\s\S]*\.process-intermediate-card > small:not\(\.process-card-badge\)\s*{[\s\S]*grid-column:\s*2;/,
   );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-tabs\s*{[\s\S]*display:\s*flex;[\s\S]*overflow-x:\s*auto;/,
+  );
 });
 
 const runDetail: RunDetail = {

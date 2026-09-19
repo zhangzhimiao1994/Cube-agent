@@ -5180,6 +5180,20 @@ article:hover {
     width: min(100vw, 100%);
   }
 
+  .agent-workbench-tabs {
+    display: flex;
+    gap: 0.35rem;
+    overflow-x: auto;
+    padding-bottom: 0.35rem;
+    scroll-snap-type: x proximity;
+  }
+
+  .agent-workbench-tabs button {
+    flex: 0 0 7.25rem;
+    min-height: 3.1rem;
+    scroll-snap-align: start;
+  }
+
   .agent-workbench-file-layout,
   .agent-workbench-file-preview-header {
     grid-template-columns: minmax(0, 1fr);
