@@ -70,7 +70,7 @@ Options:
                                  Acceptance profile to run. production-safe runs all profiles in read-only mode.
   --read-only                    Skip runtime write probes; keep GET probes, OpenAPI contracts, and stress.
   --strict-interaction-recovery  Run authenticated, non-mutating interaction recovery probes; requires AGENT_HUB_ACCEPTANCE_BEARER_TOKEN.
-  --runtime-lifecycle            Run authenticated plugin/MCP create-project-cleanup lifecycle probes.
+  --runtime-lifecycle            Run authenticated plugin/MCP create/manifest/cleanup lifecycle probes.
   --stress                       Run bounded HTTP stress checks.
   --stress-profile smoke|standard|heavy|endurance|custom
                                  Run a named stress scale. Defaults to AGENT_HUB_ACCEPTANCE_STRESS_PROFILE or custom.
