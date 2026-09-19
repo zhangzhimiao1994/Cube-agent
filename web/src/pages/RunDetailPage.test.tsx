@@ -33,6 +33,23 @@ it("keeps process detail values readable in narrow workbench drawers", () => {
   );
 });
 
+it("gives the workbench drawer enough room for inspectable detail panes", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(96dvh,\s*1080px\);[\s\S]*max-width:\s*min\(96vw,\s*1180px\);[\s\S]*width:\s*min\(96vw,\s*1180px\);/,
+  );
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(96dvh - 7rem\);[\s\S]*overflow-y:\s*auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal\s*{[\s\S]*max-height:\s*min\(86dvh,\s*820px\);[\s\S]*max-width:\s*min\(94vw,\s*920px\);[\s\S]*width:\s*min\(94vw,\s*920px\);/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*96dvh;[\s\S]*width:\s*100vw;/,
+  );
+});
+
 const runDetail: RunDetail = {
   id: runId,
   status: "completed",
