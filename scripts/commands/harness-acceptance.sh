@@ -3659,6 +3659,7 @@ run_authenticated_runtime_lifecycle_profile() {
   local removed_plugin_registry_response
   local removed_mcp_registry_response
   local removed_manifest_response
+  local plugin_lifecycle_manifest_response
 
   printf 'profile: authenticated plugin/MCP runtime lifecycle\n'
   if [[ "$read_only" -eq 1 ]]; then
@@ -3755,6 +3756,72 @@ PY
       -X DELETE \
       -H "Authorization: Bearer $bearer_token" \
       "$base_url/api/v1/admin/mcp/$mcp_id" >/dev/null 2>&1 || true
+  }
+  post_runtime_lifecycle_plugin_action() {
+    local action="$1"
+    if ! curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS \
+      -X POST \
+      -H "Authorization: Bearer $bearer_token" \
+      "$base_url/api/v1/admin/plugins/$plugin_id/$action" >/dev/null 2>&1; then
+      cleanup_runtime_lifecycle
+      printf 'fail: runtime lifecycle plugin %s\n' "$action" >&2
+      failures=$((failures + 1))
+      return 1
+    fi
+  }
+  assert_runtime_lifecycle_plugin_manifest_state() {
+    local expected_available="$1"
+    local expected_reason="$2"
+    local label="$3"
+    if ! plugin_lifecycle_manifest_response="$(curl --noproxy '*' \
+      --connect-timeout "$connect_timeout" \
+      --max-time "$max_time" \
+      -fsS \
+      -H "Authorization: Bearer $bearer_token" \
+      "$base_url/api/v1/admin/capabilities/manifest" 2>/dev/null)"; then
+      cleanup_runtime_lifecycle
+      printf 'fail: %s manifest fetch\n' "$label" >&2
+      failures=$((failures + 1))
+      return 1
+    fi
+    if ACCEPTANCE_RESPONSE="$plugin_lifecycle_manifest_response" \
+      ACCEPTANCE_PLUGIN_CAPABILITY="$plugin_capability" \
+      ACCEPTANCE_EXPECTED_AVAILABLE="$expected_available" \
+      ACCEPTANCE_EXPECTED_REASON="$expected_reason" \
+      "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+items = {
+    item.get("id"): item
+    for item in payload.get("capabilities", [])
+    if isinstance(item, dict)
+}
+capability = items.get(os.environ["ACCEPTANCE_PLUGIN_CAPABILITY"])
+if not isinstance(capability, dict):
+    raise SystemExit("plugin capability missing")
+expected_available = os.environ["ACCEPTANCE_EXPECTED_AVAILABLE"] == "true"
+if capability.get("available") is not expected_available:
+    raise SystemExit("plugin availability mismatch")
+expected_reason = os.environ["ACCEPTANCE_EXPECTED_REASON"]
+if expected_reason:
+    if capability.get("availability_reason") != expected_reason:
+        raise SystemExit("plugin availability reason mismatch")
+elif capability.get("availability_reason") is not None:
+    raise SystemExit("plugin availability reason must be absent")
+PY
+    then
+      printf 'ok: %s\n' "$label"
+      return 0
+    fi
+    cleanup_runtime_lifecycle
+    printf 'fail: %s\n' "$label" >&2
+    failures=$((failures + 1))
+    return 1
   }
   cleanup_runtime_lifecycle
 
@@ -3909,6 +3976,25 @@ PY
     failures=$((failures + 1))
     return 1
   fi
+
+  post_runtime_lifecycle_plugin_action "stop" || return 1
+  assert_runtime_lifecycle_plugin_manifest_state \
+    "false" \
+    "plugin_stopped" \
+    "runtime lifecycle plugin stop marks manifest unavailable" || return 1
+
+  post_runtime_lifecycle_plugin_action "disable" || return 1
+  assert_runtime_lifecycle_plugin_manifest_state \
+    "false" \
+    "plugin_disabled" \
+    "runtime lifecycle plugin disable marks manifest unavailable" || return 1
+
+  post_runtime_lifecycle_plugin_action "enable" || return 1
+  post_runtime_lifecycle_plugin_action "reload" || return 1
+  assert_runtime_lifecycle_plugin_manifest_state \
+    "true" \
+    "" \
+    "runtime lifecycle plugin reload restores manifest availability" || return 1
 
   cleanup_runtime_lifecycle
   if ! removed_plugin_registry_response="$(curl --noproxy '*' \

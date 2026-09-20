@@ -124,6 +124,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "runtime lifecycle MCP appears in registry" in command
     assert "runtime lifecycle plugin capability appears in manifest" in command
     assert "runtime lifecycle MCP capability appears in manifest" in command
+    assert "runtime lifecycle plugin stop marks manifest unavailable" in command
+    assert "runtime lifecycle plugin disable marks manifest unavailable" in command
+    assert "runtime lifecycle plugin reload restores manifest availability" in command
     assert "runtime lifecycle removed resources disappear from registries" in command
     assert "runtime lifecycle removed capabilities disappear from manifest" in command
     assert 'production-safe) profile="all"; read_only=1 ;;' in command
