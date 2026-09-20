@@ -18,6 +18,7 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
         "plugin_invalid_arguments": "manual_review_plugin_arguments",
         "plugin_invalid_result": "manual_review_plugin_result_contract",
         "plugin_sandbox_unsupported": "manual_review_plugin_sandbox",
+        "plugin_disabled": "manual_review_plugin_disabled",
         "mcp_runtime_unavailable": "repair_mcp_server_or_adapter_and_retry",
         "mcp_tool_unavailable": "manual_review_mcp_configuration",
         "mcp_server_not_discovered": "manual_review_mcp_configuration",

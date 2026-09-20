@@ -141,6 +141,12 @@ _PLUGIN_SANDBOX_UNSUPPORTED_MARKERS = frozenset(
         "plugin sandbox profile unsupported",
     }
 )
+_PLUGIN_DISABLED_MARKERS = frozenset(
+    {
+        "plugin.disabled",
+        "plugin_disabled",
+    }
+)
 _MCP_RUNTIME_UNAVAILABLE_MARKERS = frozenset(
     {
         "mcp.server_failed",
@@ -188,6 +194,7 @@ _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
         "plugin_invalid_arguments",
         "plugin_invalid_result",
         "plugin_sandbox_unsupported",
+        "plugin_disabled",
         "mcp_tool_unavailable",
         "mcp_server_not_discovered",
     }
@@ -629,6 +636,8 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         return "停止自动重试，检查插件输出契约、适配器版本和 output schema，修正后再审批继续。"
     if failure_category == "plugin_sandbox_unsupported":
         return "停止自动重试，检查插件隔离策略、运行时支持和 host adapter 配置，修正后再审批继续。"
+    if failure_category == "plugin_disabled":
+        return "停止自动重试，启用并启动插件、刷新插件/MCP 能力清单，确认权限后再继续。"
     if failure_category == "mcp_runtime_unavailable":
         return "检查 MCP 服务进程、连接和适配器状态，修正可恢复问题后只重试受影响的 MCP 调用。"
     if failure_category in {"mcp_tool_unavailable", "mcp_server_not_discovered"}:
@@ -1025,14 +1034,16 @@ def _failure_category(event: RunEvent) -> str:
         return "plugin_invalid_result"
     if _contains_marker(text, _PLUGIN_SANDBOX_UNSUPPORTED_MARKERS):
         return "plugin_sandbox_unsupported"
-    if _contains_marker(text, _MCP_TOOL_UNAVAILABLE_MARKERS):
-        return "mcp_tool_unavailable"
-    if _contains_marker(text, _MCP_SERVER_NOT_DISCOVERED_MARKERS):
-        return "mcp_server_not_discovered"
+    if _contains_marker(text, _PLUGIN_DISABLED_MARKERS):
+        return "plugin_disabled"
     if _contains_marker(text, _PLUGIN_RUNTIME_UNAVAILABLE_MARKERS):
         return "plugin_runtime_unavailable"
     if _contains_marker(text, _MCP_RUNTIME_UNAVAILABLE_MARKERS):
         return "mcp_runtime_unavailable"
+    if _contains_marker(text, _MCP_SERVER_NOT_DISCOVERED_MARKERS):
+        return "mcp_server_not_discovered"
+    if _contains_marker(text, _MCP_TOOL_UNAVAILABLE_MARKERS):
+        return "mcp_tool_unavailable"
     if _contains_marker(text, _RECOVERY_BLOCKED_MARKERS):
         return "runtime_recovery_blocked"
     if _contains_marker(text, _CAPACITY_MARKERS):

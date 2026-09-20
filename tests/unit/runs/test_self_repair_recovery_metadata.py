@@ -536,6 +536,11 @@ def test_self_repair_classifies_plugin_failure_from_payload_error_code() -> None
             "manual_review_plugin_sandbox",
         ),
         (
+            "Plugin tool unavailable: plugin_disabled secret://plugin-token",
+            "plugin_disabled",
+            "manual_review_plugin_disabled",
+        ),
+        (
             "MCP tool unavailable secret://plugin-token",
             "mcp_tool_unavailable",
             "manual_review_mcp_configuration",
@@ -708,6 +713,18 @@ def test_self_repair_failure_injection_matrix_classifies_common_failures() -> No
                     sequence=1,
                     run_id=base_run_id,
                     reason="mcp.server_unavailable",
+                ),
+            ),
+            "mcp_runtime_unavailable",
+            "repair_mcp_server_or_adapter_and_retry",
+        ),
+        (
+            (
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=base_run_id,
+                    reason="MCP tool unavailable: mcp_server_failed",
                 ),
             ),
             "mcp_runtime_unavailable",
