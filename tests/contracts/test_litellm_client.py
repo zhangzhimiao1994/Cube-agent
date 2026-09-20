@@ -717,7 +717,94 @@ async def test_retries_root_relay_base_with_v1_suffix_when_route_is_missing() ->
     second_close.assert_awaited_once_with()
 
 
-async def test_uses_anthropic_messages_surface_when_base_points_to_messages() -> None:
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_messages_schema_is_rejected_before_constructing_clients(
+    path: str, stream: bool
+) -> None:
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {"content": [{"type": "text", "text": "plain text"}]},
+        )
+    )
+    openai_factory = MagicMock()
+    http_factory = MagicMock(return_value=SimpleNamespace(post=post, aclose=AsyncMock()))
+    transport = LiteLLMClient(
+        client_factory=openai_factory,
+        http_client_factory=http_factory,
+    )
+    schema = StructuredResponseSchema(
+        name="answer_contract",
+        schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ("answer",),
+            "additionalProperties": False,
+        },
+    )
+    structured_request = request(
+        required_capabilities={ModelCapability.STRUCTURED_OUTPUT},
+        response_schema=schema,
+    )
+    target = deployment(
+        api_base=f"https://proxy.example.com{path}",
+        capabilities={ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT},
+    )
+
+    with pytest.raises(ValueError, match="messages endpoint response schemas are not supported"):
+        if stream:
+            transport.stream_openai_compatible_chunks(target, structured_request, API_KEY)
+        else:
+            await transport.complete(target, structured_request, API_KEY)
+
+    openai_factory.assert_not_called()
+    http_factory.assert_not_called()
+    post.assert_not_awaited()
+    assert structured_request.response_schema is schema
+
+
+@pytest.mark.parametrize("with_schema", [False, True])
+async def test_messages_tools_rejection_is_preserved(with_schema: bool) -> None:
+    openai_factory = MagicMock()
+    http_factory = MagicMock()
+    transport = LiteLLMClient(
+        client_factory=openai_factory,
+        http_client_factory=http_factory,
+    )
+    capabilities = {ModelCapability.TOOL_CALLING, ModelCapability.STRUCTURED_OUTPUT}
+    tool_request = request(
+        required_capabilities=capabilities,
+        tools=[
+            ToolDefinition(
+                name="lookup", description="Look up context.", parameters={"type": "object"}
+            )
+        ],
+        response_schema=(
+            StructuredResponseSchema(name="answer_contract", schema={"type": "object"})
+            if with_schema
+            else None
+        ),
+    )
+
+    with pytest.raises(ValueError, match="messages endpoint tool definitions are not supported"):
+        await transport.complete(
+            deployment(
+                api_base="https://proxy.example.com/v1/messages",
+                capabilities=capabilities,
+            ),
+            tool_request,
+            API_KEY,
+        )
+
+    openai_factory.assert_not_called()
+    http_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("declares_structured", [False, True])
+async def test_uses_anthropic_messages_surface_when_base_points_to_messages(
+    declares_structured: bool,
+) -> None:
     post = AsyncMock(
         return_value=SimpleNamespace(
             status_code=200,
@@ -743,6 +830,11 @@ async def test_uses_anthropic_messages_surface_when_base_points_to_messages() ->
             api_base="https://toapis.com/v1/messages",
             provider_model="openai-compatible/claude-sonnet-4-6",
             request_model="claude-sonnet-4-6",
+            capabilities=(
+                {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
+                if declares_structured
+                else {ModelCapability.TEXT}
+            ),
         ),
         request(max_output_tokens=1024),
         API_KEY,

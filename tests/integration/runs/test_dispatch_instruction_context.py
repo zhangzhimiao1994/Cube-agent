@@ -29,7 +29,7 @@ class CapturingGateway:
         text = (
             '{"verdict":"approve"}'
             if request.logical_model == "reviewer_probe"
-            else "Workspace probe complete."
+            else '{"result":"Workspace probe complete.","evidence":[]}'
         )
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(10, 5, 15)),
@@ -47,7 +47,8 @@ def _reviewed_plan() -> DispatchPlan:
     return DispatchPlan(
         agents=(
             AgentSpec(id="worker", role="Worker", goal="Answer the workspace request.",
-                      logical_model="worker_probe", max_output_tokens=2048),
+                      logical_model="worker_probe", max_output_tokens=2048,
+                      output_schema={"result": "string", "evidence": "string[]"}),
             AgentSpec(id="reviewer", role="Reviewer", goal="Review the worker answer.",
                       logical_model="reviewer_probe", max_output_tokens=2048),
         ),
@@ -62,6 +63,19 @@ def _reviewed_plan() -> DispatchPlan:
 
 def _request_text(request: ModelRequest) -> str:
     return "\n".join(str(message.content) for message in request.messages)
+
+
+def _assert_response_contract(request: ModelRequest) -> None:
+    assert request.response_schema is not None
+    marker = "INTERNAL_RESPONSE_SCHEMA_JSON="
+    assert _request_text(request).count(marker) == 1
+    contracts = [message for message in request.messages if marker in str(message.content)]
+    assert len(contracts) == 1
+    assert contracts[0].role == "system"
+    assert contracts[0] == request.messages[-1]
+    actual = json.loads(str(contracts[0].content).split(marker, 1)[1])
+    expected = json.loads(json.dumps(request.response_schema.schema, default=dict))
+    assert actual == expected
 
 
 async def test_persisted_dispatch_guidance_reaches_real_worker_and_reviewer(
@@ -108,7 +122,15 @@ async def test_persisted_dispatch_guidance_reaches_real_worker_and_reviewer(
                 "worker_probe", "reviewer_probe",
             ]
             assert all(not request.tools for request in requests)
+            for request in requests:
+                _assert_response_contract(request)
+            assert requests[0].response_schema is not None
+            assert requests[0].response_schema.name == "DispatchRoleOutput"
+            required = requests[0].response_schema.schema["required"]
+            assert isinstance(required, tuple)
+            assert set(required) == {"result", "evidence"}
             assert requests[1].response_schema is not None
+            assert requests[1].response_schema.name == "DispatchReviewVerdict"
             assert (storage_root / "agent-hub" / str(tenant) / str(submitted.id)).is_dir()
 
             loaded = [event for event in events if event["kind"] == "context.loaded"]

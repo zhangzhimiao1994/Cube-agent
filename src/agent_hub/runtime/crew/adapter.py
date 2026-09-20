@@ -3245,6 +3245,31 @@ class CrewDispatchRuntime:
             {"role": message.role, "content": message.content} for message in messages
         ])
 
+    @classmethod
+    def _response_contract_messages(
+        cls, messages: Sequence[ModelMessage], schema: StructuredResponseSchema | None,
+    ) -> tuple[ModelMessage, ...]:
+        if schema is None:
+            return tuple(messages)
+        contract = ModelMessage(role="system", content=(
+            "This call produces an internal role result, not the user-facing final reply. "
+            "Preserve the user's task and the assigned role. User-facing brevity or presentation "
+            "instructions do not replace this internal output contract. When returning the role "
+            "result, emit exactly one JSON object matching INTERNAL_RESPONSE_SCHEMA_JSON. "
+            "No prose prefix, suffix, or Markdown fences. Do not invent evidence or claim "
+            "verification that was not performed. Existing tool permissions remain unchanged; "
+            "authorized tool calls may precede the final role result.\n"
+            "INTERNAL_RESPONSE_SCHEMA_JSON=" + json.dumps(
+                _mutable_json(schema.schema), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+        ))
+        # Assemble afresh per call, before size checks, request hashes, and ledger writes.
+        return cls._normalize_crewai_messages([
+            {"role": message.role, "content": message.content}
+            for message in (*messages, contract)
+        ])
+
     async def _complete_with_guidance(
         self, context: TaskContext, request: ModelRequest, emit: EventEmitter,
         run_state: _RunState, *, actor: str, step_id: str,
@@ -3348,7 +3373,7 @@ class CrewDispatchRuntime:
             )
             request = ModelRequest(
                 logical_model=logical_model,
-                messages=tuple(messages),
+                messages=self._response_contract_messages(messages, response_schema),
                 required_capabilities=frozenset(required_capabilities),
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),
                 max_output_tokens=min(agent.max_output_tokens, step.token_budget),
@@ -4229,7 +4254,9 @@ class CrewDispatchRuntime:
                 )
                 request = ModelRequest(
                     logical_model=reviewer.logical_model,
-                    messages=runtime._guidance_messages(context, crew_messages),
+                    messages=runtime._response_contract_messages(
+                        runtime._guidance_messages(context, crew_messages), _REVIEW_RESPONSE_SCHEMA,
+                    ),
                     required_capabilities=frozenset(
                         {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
                     ),

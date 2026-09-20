@@ -199,6 +199,8 @@ def _validate_transport_request(
         return ValueError("deployment lacks tool_calling capability")
     if request.tools and _is_messages_endpoint(deployment.api_base):
         return ValueError("messages endpoint tool definitions are not supported")
+    if request.response_schema is not None and _is_messages_endpoint(deployment.api_base):
+        return ValueError("messages endpoint response schemas are not supported")
     return None
 
 
