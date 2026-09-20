@@ -3621,6 +3621,157 @@ PY
     failures=$((failures + 1))
     return 1
   fi
+  if ! repair_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+import json
+import sys
+import tempfile
+import zipfile
+from io import BytesIO
+from pathlib import Path
+
+from agent_hub.harness.project_scale import build_project_scale_run_plan
+from agent_hub.harness.project_scale_runner import execute_project_scale_plan
+
+
+def project_bundle() -> bytes:
+    buffer = BytesIO()
+    files = {
+        "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+        "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+        "IMPLEMENTATION_PLAN.md": (
+            "- Read before implementation: AGENTS.md workspace rules, HANDOFF current-state index, "
+            "and PROJECT_REQUIREMENTS.md.\n"
+            "- Skill/rule sources checked before implementation: AGENTS.md workspace rules, "
+            "applicable SKILL.md inventory, and no project-specific SKILL.md required for this fixture.\n"
+            "- Build project\n"
+        ),
+        "VERIFICATION.md": (
+            "- npm run build: passed exit 0; node --check completed\n"
+            "- npm test: passed exit 0; 1 test passed\n"
+            "- interaction smoke: passed\n"
+        ),
+        "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+        "src/main.js": "export function ok() { return true; }\n",
+        "tests/main.test.js": "import assert from 'node:assert/strict';\nassert.equal(true, true);\n",
+    }
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+class Client:
+    def __init__(self) -> None:
+        self.submitted_bodies = []
+        self.bundle = project_bundle()
+
+    def request_json(self, method, path, *, body=None, idempotency_key=None):
+        if method == "POST" and path == "/api/v1/runs":
+            assert body is not None
+            self.submitted_bodies.append(dict(body))
+            is_repair = "deliverable-repair" in (idempotency_key or "")
+            return {
+                "id": "run-medium-artifact-repair" if is_repair else "run-medium-artifact",
+                "status": "completed",
+                "project_id": body["project_id"],
+                "workspace_session_id": body["workspace_session_id"],
+                "mode": body["mode"],
+            }
+        if path in {
+            "/api/v1/runs/run-medium-artifact/details",
+            "/api/v1/runs/run-medium-artifact-repair/details",
+        }:
+            return {
+                "id": path.split("/")[4],
+                "status": "completed",
+                "artifacts": [{"id": "artifact-1"}],
+                "mode": self.submitted_bodies[-1]["mode"],
+                "deliverable_quality": {
+                    "requirements_satisfied": True,
+                    "build_passed": True,
+                    "tests_passed": True,
+                    "interactive_checks_passed": True,
+                    "no_placeholders": True,
+                    "artifact_integrity": True,
+                },
+                "agent_standard_verification": {
+                    "constraints_read": True,
+                    "plan_before_implementation": True,
+                    "reproducible_verification": True,
+                    "root_cause_repair": True,
+                },
+                "discussion_trace": {
+                    "participants": ["planner", "reviewer"],
+                    "member_statements": [
+                        {"agent": "planner", "summary": "planned repair"},
+                        {"agent": "reviewer", "summary": "verified repair"},
+                    ],
+                    "disagreements": [{"topic": "validation", "resolution": "rerun build/test"}],
+                    "verification_steps": ["rerun generated project validation"],
+                    "final_decision": "ship after generated_project_validation passes",
+                },
+            }
+        if path in {
+            "/api/v1/runs/run-medium-artifact/events",
+            "/api/v1/runs/run-medium-artifact-repair/events",
+        }:
+            if path.endswith("repair/events"):
+                return [{"kind": "deliverable.repair.completed"}]
+            return [{"kind": "run.created"}]
+        if path in {
+            "/api/v1/runs/run-medium-artifact/cancel",
+            "/api/v1/runs/run-medium-artifact-repair/cancel",
+        }:
+            return {"id": path.split("/")[4], "status": "cancelled"}
+        raise AssertionError(f"unexpected JSON request {method} {path}")
+
+    def request_bytes(self, method, path):
+        assert method == "GET"
+        return self.bundle
+
+
+marker = Path(tempfile.mkdtemp()) / "generated-project-repaired"
+client = Client()
+report = execute_project_scale_plan(
+    build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True),
+    client,
+    validate_generated_project=True,
+    generated_project_commands=(
+        (
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                f"p=Path({str(marker)!r}); "
+                "sys.exit(0) if p.exists() else (p.write_text('seen'), sys.exit(7))"
+            ),
+        ),
+    ),
+)
+result = report.results[0]
+repair_message = str(client.submitted_bodies[1]["message"])
+print(
+    "|".join(
+        (
+            str(report.ok).lower(),
+            str(result.evidence["generated_project_validation"]).lower(),
+            str(result.evidence["deliverable_repair_trace"]).lower(),
+            result.run_id or "",
+            str("generated_project_validation: command failed exit=7" in repair_message).lower(),
+        )
+    )
+)
+PY
+  )"; then
+    printf 'fail: generated_project_validation repair contract\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$repair_output" != "true|true|true|run-medium-artifact-repair|true" ]]; then
+    printf 'fail: generated_project_validation should be repaired\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
   set +e
   execute_output="$(
     env -u AGENT_HUB_ACCEPTANCE_BEARER_TOKEN \

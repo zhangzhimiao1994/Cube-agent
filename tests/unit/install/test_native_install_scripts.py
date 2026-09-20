@@ -243,6 +243,9 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "-u AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD" in command
     assert "-u AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID" in command
     assert "ok: project scale execution runner" in command
+    assert "generated_project_validation repair contract" in command
+    assert "generated_project_validation: command failed exit=7" in command
+    assert "generated_project_validation should be repaired" in command
     assert "run_authenticated_project_scale_execution_profile" in command
     assert "profile: authenticated project scale execution runner" in command
     assert (
