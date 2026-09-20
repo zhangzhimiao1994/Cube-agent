@@ -1365,10 +1365,11 @@ class PluginBackend:
 class McpBackend:
     def __init__(self):
         self.calls = []
+        self.available = True
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         self.calls.append(("available", str(tenant_id), name))
-        return True
+        return self.available
 
     async def invoke(
         self,
@@ -1383,6 +1384,16 @@ class McpBackend:
     ) -> Mapping[str, JsonValue]:
         self.calls.append(("invoke", str(tenant_id), str(user_id), str(run_id), actor, name, arguments, idempotency_key))
         return {"content": {"result": "searched"}}
+
+
+class FailedMcpBackend(McpBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.available = False
+
+    def availability_failure_reason(self, tenant_id: UUID, name: str) -> str:
+        self.calls.append(("availability_reason", str(tenant_id), name))
+        return "mcp_server_failed"
 
 
 class FailingAvailabilityPluginBackend(PluginBackend):
@@ -1519,6 +1530,34 @@ async def main():
         "disabled plugin availability reason route mismatch",
     )
 
+    failed_mcp = FailedMcpBackend()
+    failed_mcp_gateway = HarnessToolGateway(
+        RuntimeBackend(),
+        policy_gateway=PolicyGateway(),
+        mcp_backend=failed_mcp,
+    )
+    failed_mcp_result = await failed_mcp_gateway.invoke(
+        TENANT_ID,
+        request(
+            "search.web_search",
+            actor="researcher",
+            arguments={"query": "failed mcp"},
+            sandbox="mcp_remote",
+            key="mcp_failed_acceptance_1",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+    require(failed_mcp_result.status == "failed", "failed MCP must fail closed")
+    require(
+        failed_mcp_result.failure_reason == "MCP tool unavailable: mcp_server_failed",
+        "failed MCP failure reason mismatch",
+    )
+    require(
+        [call[0] for call in failed_mcp.calls] == ["available", "availability_reason"],
+        "failed MCP availability reason route mismatch",
+    )
+
 
 asyncio.run(main())
 PY
@@ -1526,6 +1565,7 @@ PY
     printf 'ok: runtime tool gateway routes plugin and MCP calls\n'
     printf 'ok: runtime tool gateway reports deterministic external failures\n'
     printf 'ok: runtime tool gateway preserves external unavailable reasons\n'
+    printf 'ok: runtime tool gateway preserves MCP unavailable reasons\n'
     return 0
   fi
   printf 'fail: runtime tool gateway invocation contract\n' >&2

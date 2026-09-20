@@ -272,6 +272,35 @@ async def test_runtime_mcp_service_lazy_loads_invocation_tenant() -> None:
     assert clients[OTHER_TENANT_ID].invocations == [("web_search", {"query": "tenant"})]
 
 
+async def test_runtime_mcp_service_reports_stable_unavailability_reasons() -> None:
+    admin_service = TenantMappedAdminService(
+        {
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = RuntimeMcpService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+
+    assert (
+        service.availability_failure_reason(OTHER_TENANT_ID, "search.web_search")
+        == "mcp_server_unavailable"
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+
+    assert service.availability_failure_reason(OTHER_TENANT_ID, "search.web_search") is None
+    assert (
+        service.availability_failure_reason(OTHER_TENANT_ID, "search.missing")
+        == "mcp_tool_unavailable"
+    )
+
+
 async def test_runtime_mcp_reload_without_tenant_refreshes_loaded_tenants() -> None:
     admin_service = TenantMappedAdminService(
         {

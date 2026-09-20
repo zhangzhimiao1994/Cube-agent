@@ -149,6 +149,25 @@ class RuntimeMcpService:
             for capability in capabilities
         )
 
+    def availability_failure_reason(self, tenant_id: UUID, name: str) -> str | None:
+        service = self._services_by_tenant.get(tenant_id)
+        if service is None:
+            return "mcp_server_unavailable"
+        manifest = self.manifests_for_tenant(tenant_id)
+        capabilities = manifest.get("capabilities")
+        if not isinstance(capabilities, tuple | list):
+            return "mcp_server_unavailable"
+        for capability in capabilities:
+            if not isinstance(capability, Mapping) or capability.get("id") != name:
+                continue
+            if capability.get("available") is True:
+                return None
+            reason = capability.get("availability_reason")
+            if type(reason) is str and reason.strip():
+                return reason
+            return "mcp_tool_unavailable"
+        return "mcp_tool_unavailable"
+
     async def invoke(
         self,
         *,
