@@ -3888,6 +3888,8 @@ class Client:
 
     def request_bytes(self, method, path):
         assert method == "GET"
+        if "/artifacts/" in path:
+            raise RuntimeError("artifact download unavailable")
         if self.fail_next_bundle:
             self.fail_next_bundle = False
             raise RuntimeError("workspace bundle unavailable")
