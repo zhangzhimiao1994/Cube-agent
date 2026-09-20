@@ -3651,11 +3651,14 @@ run_authenticated_runtime_lifecycle_profile() {
   local plugin_capability
   local mcp_id
   local mcp_tool
+  local updated_mcp_tool
   local plugin_body
   local mcp_body
+  local updated_mcp_body
   local plugin_registry_response
   local mcp_registry_response
   local manifest_response
+  local updated_manifest_response
   local removed_plugin_registry_response
   local removed_mcp_registry_response
   local removed_manifest_response
@@ -3685,6 +3688,7 @@ run_authenticated_runtime_lifecycle_profile() {
   plugin_capability="acceptance.lifecycle-$suffix"
   mcp_id="acceptance-mcp-$suffix"
   mcp_tool="echo-$suffix"
+  updated_mcp_tool="updated-echo-$suffix"
 
   if ! plugin_body="$(
     ACCEPTANCE_PLUGIN_ID="$plugin_id" \
@@ -3737,6 +3741,29 @@ print(json.dumps({
 PY
   )"; then
     printf 'fail: could not build MCP runtime lifecycle request body\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! updated_mcp_body="$(
+    ACCEPTANCE_MCP_ID="$mcp_id" \
+    ACCEPTANCE_MCP_TOOL="$updated_mcp_tool" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "id": os.environ["ACCEPTANCE_MCP_ID"],
+    "name": "Acceptance MCP Lifecycle Probe",
+    "transport": "streamable_http",
+    "url": "https://example.com/mcp",
+    "domain_allowlist": ["example.com"],
+    "allowed_tools": [os.environ["ACCEPTANCE_MCP_TOOL"]],
+    "timeout_seconds": 1,
+}, ensure_ascii=False))
+PY
+  )"; then
+    printf 'fail: could not build updated MCP runtime lifecycle request body\n' >&2
     failures=$((failures + 1))
     return 1
   fi
@@ -3996,6 +4023,61 @@ PY
     "" \
     "runtime lifecycle plugin reload restores manifest availability" || return 1
 
+  if ! curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    -H "Content-Type: application/json" \
+    -d "$updated_mcp_body" \
+    "$base_url/api/v1/admin/mcp" >/dev/null 2>&1; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle MCP update\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
+  if ! updated_manifest_response="$(curl --noproxy '*' \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    -fsS \
+    -H "Authorization: Bearer $bearer_token" \
+    "$base_url/api/v1/admin/capabilities/manifest" 2>/dev/null)"; then
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle MCP update manifest fetch\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if ACCEPTANCE_RESPONSE="$updated_manifest_response" \
+    ACCEPTANCE_OLD_MCP_CAPABILITY="$mcp_id.$mcp_tool" \
+    ACCEPTANCE_UPDATED_MCP_CAPABILITY="$mcp_id.$updated_mcp_tool" \
+    "$python_bin" - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["ACCEPTANCE_RESPONSE"])
+items = {
+    item.get("id"): item
+    for item in payload.get("capabilities", [])
+    if isinstance(item, dict)
+}
+if os.environ["ACCEPTANCE_OLD_MCP_CAPABILITY"] in items:
+    raise SystemExit("old mcp capability still present")
+updated_capability = items.get(os.environ["ACCEPTANCE_UPDATED_MCP_CAPABILITY"])
+if not isinstance(updated_capability, dict):
+    raise SystemExit("updated mcp capability missing")
+if updated_capability.get("kind") != "mcp":
+    raise SystemExit("updated mcp capability kind mismatch")
+PY
+  then
+    printf 'ok: runtime lifecycle MCP update replaces manifest tool\n'
+  else
+    cleanup_runtime_lifecycle
+    printf 'fail: runtime lifecycle MCP update replaces manifest tool\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+
   cleanup_runtime_lifecycle
   if ! removed_plugin_registry_response="$(curl --noproxy '*' \
     --connect-timeout "$connect_timeout" \
@@ -4057,6 +4139,7 @@ PY
   if ACCEPTANCE_RESPONSE="$removed_manifest_response" \
     ACCEPTANCE_PLUGIN_CAPABILITY="$plugin_capability" \
     ACCEPTANCE_MCP_CAPABILITY="$mcp_id.$mcp_tool" \
+    ACCEPTANCE_UPDATED_MCP_CAPABILITY="$mcp_id.$updated_mcp_tool" \
     "$python_bin" - <<'PY'
 import json
 import os
@@ -4071,6 +4154,8 @@ if os.environ["ACCEPTANCE_PLUGIN_CAPABILITY"] in ids:
     raise SystemExit("plugin capability still present")
 if os.environ["ACCEPTANCE_MCP_CAPABILITY"] in ids:
     raise SystemExit("mcp capability still present")
+if os.environ["ACCEPTANCE_UPDATED_MCP_CAPABILITY"] in ids:
+    raise SystemExit("updated mcp capability still present")
 PY
   then
     printf 'ok: runtime lifecycle removed capabilities disappear from manifest\n'
