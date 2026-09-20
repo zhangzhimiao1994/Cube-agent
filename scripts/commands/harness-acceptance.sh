@@ -3783,6 +3783,146 @@ PY
     failures=$((failures + 1))
     return 1
   fi
+  if ! repair_output="$(PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY' 2>&1
+import json
+import zipfile
+from io import BytesIO
+
+from agent_hub.harness.project_scale import build_project_scale_run_plan
+from agent_hub.harness.project_scale_runner import execute_project_scale_plan
+
+
+def project_bundle() -> bytes:
+    buffer = BytesIO()
+    files = {
+        "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+        "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+        "IMPLEMENTATION_PLAN.md": (
+            "- Read before implementation: AGENTS.md workspace rules, HANDOFF current-state index, "
+            "and PROJECT_REQUIREMENTS.md.\n"
+            "- Skill/rule sources checked before implementation: AGENTS.md workspace rules, "
+            "applicable SKILL.md inventory, and no project-specific SKILL.md required for this fixture.\n"
+            "- Build project\n"
+        ),
+        "VERIFICATION.md": (
+            "- npm run build: passed exit 0; node --check completed\n"
+            "- npm test: passed exit 0; 1 test passed\n"
+            "- interaction smoke: passed\n"
+        ),
+        "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+        "src/main.js": (
+            "export function formatGreeting(name) {\n"
+            "  const value = String(name || '').trim();\n"
+            "  if (!value) return 'Hello, guest';\n"
+            "  return `Hello, ${value}`;\n"
+            "}\n"
+        ),
+        "tests/main.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import { formatGreeting } from '../src/main.js';\n"
+            "assert.equal(formatGreeting(' Ada '), 'Hello, Ada');\n"
+            "assert.equal(formatGreeting(''), 'Hello, guest');\n"
+        ),
+    }
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+class Client:
+    def __init__(self) -> None:
+        self.submitted_bodies = []
+        self.fail_next_bundle = True
+        self.bundle = project_bundle()
+
+    def request_json(self, method, path, *, body=None, idempotency_key=None):
+        if method == "POST" and path == "/api/v1/runs":
+            assert body is not None
+            self.submitted_bodies.append(dict(body))
+            is_repair = "deliverable-repair" in (idempotency_key or "")
+            return {
+                "id": "run-small-direct-repair" if is_repair else "run-small-direct",
+                "status": "completed",
+                "project_id": body["project_id"],
+                "workspace_session_id": body["workspace_session_id"],
+                "mode": body["mode"],
+            }
+        if path in {
+            "/api/v1/runs/run-small-direct/details",
+            "/api/v1/runs/run-small-direct-repair/details",
+        }:
+            return {
+                "id": path.split("/")[4],
+                "status": "completed",
+                "artifacts": [{"id": "artifact-1"}],
+                "mode": self.submitted_bodies[-1]["mode"],
+                "deliverable_quality": {
+                    "requirements_satisfied": True,
+                    "build_passed": True,
+                    "tests_passed": True,
+                    "interactive_checks_passed": True,
+                    "no_placeholders": True,
+                    "artifact_integrity": True,
+                },
+                "agent_standard_verification": {
+                    "constraints_read": True,
+                    "plan_before_implementation": True,
+                    "reproducible_verification": True,
+                    "root_cause_repair": True,
+                },
+            }
+        if path in {
+            "/api/v1/runs/run-small-direct/events",
+            "/api/v1/runs/run-small-direct-repair/events",
+        }:
+            if path.endswith("repair/events"):
+                return [{"kind": "deliverable.repair.completed"}]
+            return [{"kind": "run.created"}]
+        if path in {
+            "/api/v1/runs/run-small-direct/cancel",
+            "/api/v1/runs/run-small-direct-repair/cancel",
+        }:
+            return {"id": path.split("/")[4], "status": "cancelled"}
+        raise AssertionError(f"unexpected JSON request {method} {path}")
+
+    def request_bytes(self, method, path):
+        assert method == "GET"
+        if self.fail_next_bundle:
+            self.fail_next_bundle = False
+            raise RuntimeError("workspace bundle unavailable")
+        return self.bundle
+
+
+client = Client()
+report = execute_project_scale_plan(
+    build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True),
+    client,
+)
+result = report.results[0]
+print(
+    "|".join(
+        (
+            str(report.ok).lower(),
+            str(result.evidence["workspace_bundle"]).lower(),
+            str(result.evidence["deliverable_repair_trace"]).lower(),
+            result.run_id or "",
+            str(len(result.errors)),
+            str(len(client.submitted_bodies)),
+        )
+    )
+)
+PY
+  )"; then
+    printf 'fail: stale workspace_bundle repair contract\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  if [[ "$repair_output" != "true|true|true|run-small-direct-repair|0|2" ]]; then
+    printf 'fail: workspace_bundle stale error should be dropped after repair\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
   set +e
   execute_output="$(
     env -u AGENT_HUB_ACCEPTANCE_BEARER_TOKEN \
