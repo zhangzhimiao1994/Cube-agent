@@ -344,6 +344,7 @@ class DirectRuntime:
                     kind="context.injected", sequence=1, run_id=context.run_id,
                     payload=cast(dict[str, JsonValue], instructions.injection_metadata(
                         logical_model=request.logical_model, request_sha256=request_sha256,
+                        stage="direct", actor="main_agent",
                     )),
                 )
                 injection_offset = 1

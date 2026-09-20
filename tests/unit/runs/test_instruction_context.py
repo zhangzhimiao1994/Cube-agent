@@ -12,10 +12,12 @@ import pytest
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.runs.service import RunService, TaskQueue
+from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.instruction_context import InstructionContext, InstructionContextLoader
 from agent_hub.runtime.registry import RuntimeRegistry
 from tests.contracts.test_runtime_contract import FakeGateway
+from tests.integration.runtime.test_crew_adapter import FastFactory, one_step_plan
 from tests.unit.capabilities.test_scoped_read import project_path, write_file
 from tests.unit.runs.test_terminal_hooks import (
     TENANT_ID,
@@ -25,20 +27,24 @@ from tests.unit.runs.test_terminal_hooks import (
 
 
 @pytest.mark.parametrize('available', [True, False])
+@pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH])
 async def test_service_loads_real_files_and_persists_metadata_before_gateway(
-    tmp_path: Path, available: bool,
+    tmp_path: Path, available: bool, mode: TaskMode,
 ) -> None:
     repository = ExecutableFakeRepository(routing_decision={
         'source': 'manual', 'project_id': 'project-a', 'workspace_session_id': 'session-a',
         'sandbox_profile': 'read_only', 'requested_permissions': ['workspace.read'],
         'instruction_context': {'text': 'FORGED', 'loaded': True},
     })
-    repository.row.mode = TaskMode.DIRECT.value
+    repository.row.mode = mode.value
     if available:
         write_file(tmp_path, f'{project_path(TENANT_ID)}/AGENTS.md', 'PRIVATE-RULES')
     gateway = FakeGateway()
     service = RunService(
-        cast(RunRepository, repository), runtime_registry=RuntimeRegistry((DirectRuntime(gateway, logical_model='main'),)),
+        cast(RunRepository, repository), runtime_registry=RuntimeRegistry((
+            DirectRuntime(gateway, logical_model='main') if mode is TaskMode.DIRECT
+            else CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory()),
+        )),
         router=None, task_queue=cast(TaskQueue, object()),
         instruction_context_loader=InstructionContextLoader(repository=repository, project_root=tmp_path),
     )
@@ -57,10 +63,14 @@ async def test_service_loads_real_files_and_persists_metadata_before_gateway(
     assert [event.sequence for event in repository.event_log] == list(range(1, len(repository.event_log) + 1))
 
 
-async def test_service_does_not_activate_loader_for_dispatch(tmp_path: Path) -> None:
+async def test_service_does_not_activate_loader_for_discuss(tmp_path: Path) -> None:
+    class DiscussCompletes(RuntimeCompletes):
+        mode = TaskMode.DISCUSS
+
     repository = ExecutableFakeRepository(routing_decision={})
+    repository.row.mode = TaskMode.DISCUSS.value
     service = RunService(
-        cast(RunRepository, repository), runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        cast(RunRepository, repository), runtime_registry=RuntimeRegistry((DiscussCompletes(),)),
         router=None, task_queue=cast(TaskQueue, object()),
         instruction_context_loader=InstructionContextLoader(repository=repository, project_root=tmp_path),
     )
@@ -73,8 +83,9 @@ async def test_service_does_not_activate_loader_for_dispatch(tmp_path: Path) -> 
     'cancelled', 'paused', 'waiting_approval', 'completed',
     'lease_token', 'worker_id', 'expired_lease', 'missing_lease',
 ])
+@pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH])
 async def test_control_change_during_load_prevents_evidence_and_model(
-    tmp_path: Path, change: str,
+    tmp_path: Path, change: str, mode: TaskMode,
 ) -> None:
     loaded = asyncio.Event()
     release = asyncio.Event()
@@ -90,12 +101,15 @@ async def test_control_change_during_load_prevents_evidence_and_model(
         'project_id': 'project-a', 'workspace_session_id': 'session-a',
         'sandbox_profile': 'read_only', 'requested_permissions': ['workspace.read'],
     })
-    repository.row.mode = TaskMode.DIRECT.value
+    repository.row.mode = mode.value
     write_file(tmp_path, f'{project_path(TENANT_ID)}/AGENTS.md', 'PRIVATE-RULES')
     gateway = FakeGateway()
     service = RunService(
         cast(RunRepository, repository),
-        runtime_registry=RuntimeRegistry((DirectRuntime(gateway, logical_model='main'),)),
+        runtime_registry=RuntimeRegistry((
+            DirectRuntime(gateway, logical_model='main') if mode is TaskMode.DIRECT
+            else CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory()),
+        )),
         router=None, task_queue=cast(TaskQueue, object()),
         instruction_context_loader=PausingLoader(repository=repository, project_root=tmp_path),
     )
@@ -128,8 +142,9 @@ async def test_control_change_during_load_prevents_evidence_and_model(
 
 
 @pytest.mark.parametrize('change', ['permissions', 'sandbox', 'project', 'session'])
+@pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH])
 async def test_authorization_change_during_load_discards_content_but_completes_chat(
-    tmp_path: Path, change: str,
+    tmp_path: Path, change: str, mode: TaskMode,
 ) -> None:
     loaded = asyncio.Event()
     release = asyncio.Event()
@@ -146,12 +161,15 @@ async def test_authorization_change_during_load_discards_content_but_completes_c
         'project_id': 'project-a', 'workspace_session_id': 'session-a',
         'sandbox_profile': 'read_only', 'requested_permissions': ['workspace.read'],
     })
-    repository.row.mode = TaskMode.DIRECT.value
+    repository.row.mode = mode.value
     write_file(tmp_path, f'{project_path(TENANT_ID)}/AGENTS.md', 'REVOKED-PRIVATE-RULES')
     gateway = FakeGateway()
     service = RunService(
         cast(RunRepository, repository),
-        runtime_registry=RuntimeRegistry((DirectRuntime(gateway, logical_model='main'),)),
+        runtime_registry=RuntimeRegistry((
+            DirectRuntime(gateway, logical_model='main') if mode is TaskMode.DIRECT
+            else CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory()),
+        )),
         router=None, task_queue=cast(TaskQueue, object()),
         instruction_context_loader=PausingLoader(repository=repository, project_root=tmp_path),
     )
@@ -185,8 +203,9 @@ async def test_authorization_change_during_load_discards_content_but_completes_c
 
 
 @pytest.mark.parametrize('change', ['permissions', 'missing_session'])
+@pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH])
 async def test_authorization_change_between_files_discards_first_loaded_source(
-    tmp_path: Path, change: str,
+    tmp_path: Path, change: str, mode: TaskMode,
 ) -> None:
     first_read = asyncio.Event()
     release = asyncio.Event()
@@ -205,13 +224,16 @@ async def test_authorization_change_between_files_discards_first_loaded_source(
         'project_id': 'project-a', 'workspace_session_id': 'session-a',
         'sandbox_profile': 'read_only', 'requested_permissions': ['workspace.read'],
     })
-    repository.row.mode = TaskMode.DIRECT.value
+    repository.row.mode = mode.value
     write_file(tmp_path, f'{project_path(TENANT_ID)}/AGENTS.md', 'FIRST-PRIVATE-RULES')
     write_file(tmp_path, f'{project_path(TENANT_ID)}/SKILL.md', 'SECOND-PRIVATE-RULES')
     gateway = FakeGateway()
     service = RunService(
         cast(RunRepository, repository),
-        runtime_registry=RuntimeRegistry((DirectRuntime(gateway, logical_model='main'),)),
+        runtime_registry=RuntimeRegistry((
+            DirectRuntime(gateway, logical_model='main') if mode is TaskMode.DIRECT
+            else CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory()),
+        )),
         router=None, task_queue=cast(TaskQueue, object()),
         instruction_context_loader=InstructionContextLoader(repository=repository, project_root=tmp_path),
     )

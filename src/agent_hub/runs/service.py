@@ -1380,7 +1380,7 @@ class RunService:
                 await runtime.restore_checkpoint(checkpoint)
             token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
             instructions = None
-            if mode is TaskMode.DIRECT and self._instruction_context_loader is not None:
+            if mode in (TaskMode.DIRECT, TaskMode.DISPATCH) and self._instruction_context_loader is not None:
                 instructions = await self._instruction_context_loader.load(
                     tenant_id=tenant_id, run_id=run_id,
                 )

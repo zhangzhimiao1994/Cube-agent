@@ -5,6 +5,8 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Literal, Self
 from uuid import UUID, uuid4
@@ -17,6 +19,7 @@ from agent_hub.capabilities.scoped_read import (
     authorized_workspace_scope,
     read_scoped_file,
 )
+from agent_hub.models.types import ModelRequest
 
 MAX_SOURCE_BYTES = 8192
 _PATHS: tuple[Literal["AGENTS.md", "SKILL.md"], ...] = ("AGENTS.md", "SKILL.md")
@@ -24,6 +27,24 @@ _PATHS: tuple[Literal["AGENTS.md", "SKILL.md"], ...] = ("AGENTS.md", "SKILL.md")
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _request_json(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _request_json(getattr(value, item.name)) for item in fields(value)}
+    if isinstance(value, Mapping):
+        return {key: _request_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_request_json(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    return value
+
+
+def model_request_sha256(request: ModelRequest) -> str:
+    """Hash the full submitted request, separately from runtime-specific replay digests."""
+    return _sha(json.dumps(_request_json(request), ensure_ascii=False, allow_nan=False,
+                           sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 class InstructionSource(BaseModel):
@@ -84,6 +105,7 @@ class InstructionContext(BaseModel):
 
     def metadata(self) -> dict[str, object]:
         return {"schema_version": 1, "load_id": str(self.load_id),
+                "stage": "session_load", "actor": "context_loader",
                 "tenant_id": str(self.tenant_id), "run_id": str(self.run_id),
                 "source": "session_root", "sources": [item.model_dump() for item in self.sources]}
 
@@ -106,8 +128,13 @@ class InstructionContext(BaseModel):
             ">", "\\u003e"
         ) + "</PROJECT_GUIDANCE_JSON>"
 
-    def injection_metadata(self, *, logical_model: str, request_sha256: str) -> dict[str, object]:
+    def injection_metadata(
+        self, *, logical_model: str, request_sha256: str,
+        stage: Literal["direct", "dispatch_step", "dispatch_review"] = "direct",
+        actor: str = "main_agent",
+    ) -> dict[str, object]:
         return {"schema_version": 1, "load_id": str(self.load_id),
+                "stage": stage, "actor": actor,
                 "tenant_id": str(self.tenant_id), "run_id": str(self.run_id),
                 "boundary": "model_gateway", "logical_model": logical_model,
                 "request_sha256": request_sha256,

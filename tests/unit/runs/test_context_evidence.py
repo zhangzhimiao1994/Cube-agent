@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from uuid import uuid4
@@ -111,3 +112,94 @@ def test_context_projection_rejects_unsafe_paths_and_malformed_evidence(
         "sources": [{"path": "AGENTS.md", "file_sha256": None,
                      "content_sha256": None, "session_id": None}],
     }
+
+
+@pytest.mark.parametrize('project', [_public_event_payload, admin_projection])
+@pytest.mark.parametrize('stage,purpose', [('dispatch_step', 'step'), ('dispatch_review', 'review')])
+def test_dispatch_projection_preserves_trusted_ledger_coordinates(
+    project: Callable[[dict[str, object]], dict[str, object]], stage: str, purpose: str,
+) -> None:
+    run_id = str(uuid4())
+    key = hashlib.sha256(f'{run_id}:draft.v1:17:{purpose}:worker.v1:64'.encode()).hexdigest()
+    metadata: dict[str, object] = {
+        'run_id': run_id, 'stage': stage, 'actor': 'worker.v1', 'step_id': 'draft.v1',
+        'attempt': 17, 'call_index': 64, 'ledger_key': key, 'ledger_request_sha256': 'a' * 64,
+    }
+    result = project({'kind': 'context.injected', 'run_id': run_id, 'payload': metadata,
+                      'actor': 'untrusted-top-level', 'message': 'private-body'})
+    assert result['actor'] == 'worker.v1'
+    assert result['payload'] == metadata
+
+
+@pytest.mark.parametrize('project', [_public_event_payload, admin_projection])
+@pytest.mark.parametrize('stage', ['provider.says.direct', None, [], {}, True])
+def test_unknown_explicit_stage_does_not_fall_back_to_direct(
+    project: Callable[[dict[str, object]], dict[str, object]], stage: object,
+) -> None:
+    result = project({'kind': 'context.injected', 'payload': {'stage': stage, 'actor': 'main_agent'}})
+    assert result.get('actor') != 'direct'
+    assert result.get('actor') != 'main_agent'
+    assert 'stage' not in cast_payload(result)
+    assert 'actor' not in cast_payload(result)
+
+
+def cast_payload(event: dict[str, object]) -> dict[str, object]:
+    value = event['payload']
+    assert isinstance(value, dict)
+    return value
+
+
+@pytest.mark.parametrize('updates', [
+    {'actor': '../private'}, {'step_id': 'private text'}, {'attempt': True},
+    {'attempt': 18}, {'call_index': 65}, {'ledger_key': 'x' * 64},
+    {'ledger_request_sha256': 'private'}, {'run_id': str(uuid4())},
+])
+def test_dispatch_identity_rejects_invalid_or_inconsistent_coordinates(updates: dict[str, object]) -> None:
+    run_id = str(uuid4())
+    key = hashlib.sha256(f'{run_id}:draft:0:step:writer:0'.encode()).hexdigest()
+    metadata: dict[str, object] = {
+        'run_id': run_id, 'stage': 'dispatch_step', 'actor': 'writer', 'step_id': 'draft',
+        'attempt': 0, 'call_index': 0, 'ledger_key': key, 'ledger_request_sha256': 'a' * 64,
+    }
+    metadata.update(updates)
+    result = _public_event_payload({'kind': 'context.injected', 'run_id': run_id, 'payload': metadata})
+    assert 'stage' not in cast_payload(result)
+    assert 'ledger_key' not in cast_payload(result)
+    assert result.get('actor') not in ('writer', 'direct')
+
+
+@pytest.mark.parametrize('identity', [
+    {'stage': 'unknown', 'actor': 'private-body'},
+    {'stage': 'dispatch_step', 'actor': '../private'},
+    {'stage': 'direct', 'actor': 'other_actor'},
+    {'stage': None},
+])
+def test_rejected_identity_survives_public_then_admin_projection(identity: dict[str, object]) -> None:
+    event: dict[str, object] = {'kind': 'context.injected', 'payload': identity}
+    first = _public_event_payload(event)
+    second = admin_projection(first)
+    third = _public_event_payload(second)
+    assert first['actor'] == second['actor'] == third['actor'] == 'context_unknown'
+    assert cast_payload(first) == cast_payload(second) == cast_payload(third)
+    assert 'private' not in json.dumps(third, default=str)
+
+
+@pytest.mark.parametrize('stage', ['legacy', 'direct', 'dispatch_step', 'dispatch_review'])
+def test_valid_identity_survives_public_then_admin_projection(stage: str) -> None:
+    run_id = str(uuid4())
+    metadata: dict[str, object] = {'run_id': run_id}
+    expected_actor = 'direct'
+    if stage == 'direct':
+        metadata.update(stage=stage, actor='main_agent')
+        expected_actor = 'main_agent'
+    elif stage != 'legacy':
+        purpose = 'step' if stage == 'dispatch_step' else 'review'
+        metadata.update(stage=stage, actor='writer', step_id='draft', attempt=0, call_index=0,
+                        ledger_key=hashlib.sha256(f'{run_id}:draft:0:{purpose}:writer:0'.encode()).hexdigest(),
+                        ledger_request_sha256='a' * 64)
+        expected_actor = 'writer'
+    event: dict[str, object] = {'kind': 'context.injected', 'run_id': run_id, 'payload': metadata}
+    first = _public_event_payload(event)
+    second = admin_projection(first)
+    assert first['actor'] == second['actor'] == expected_actor
+    assert first['payload'] == second['payload'] == metadata
