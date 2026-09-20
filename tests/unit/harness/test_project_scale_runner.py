@@ -1706,6 +1706,61 @@ def test_execute_project_scale_plan_fails_when_generated_project_validation_fail
     )
 
 
+def test_execute_project_scale_plan_repairs_generated_project_validation_failure(
+    tmp_path: Path,
+) -> None:
+    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    marker = tmp_path / "validation-repaired"
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact-validation",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+        generated_project_commands=(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    f"p=Path({str(marker)!r}); "
+                    "sys.exit(0) if p.exists() else (p.write_text('seen'), sys.exit(7))"
+                ),
+            ),
+        ),
+    )
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.run_id == "run-medium-artifact-validation-repair"
+    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert len(client.submitted_bodies) == 2
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "generated_project_validation: command failed exit=7" in repair_message
+    assert "rerun build/test/interaction checks" in repair_message
+
+
 def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(

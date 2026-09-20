@@ -606,6 +606,7 @@ def execute_project_scale_plan(
                             *agent_standard_verification.reasons,
                             *discussion_trace.reasons,
                             *plugin_contract.reasons,
+                            *generated_project_validation.reasons,
                         ),
                     ),
                     idempotency_key=_deliverable_repair_idempotency_key(
@@ -2669,6 +2670,7 @@ def _should_attempt_deliverable_repair(
                 _case_requires_plugin_contract(case_id)
                 and evidence.get("plugin_contract") is not True
             )
+            or evidence.get("generated_project_validation") is False
         )
     )
 
