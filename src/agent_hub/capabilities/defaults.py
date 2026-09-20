@@ -263,6 +263,7 @@ def build_runtime_capability_stack(
         workspace_root=workspace_root,
         generated_artifact_dir=generated_artifact_dir,
         project_workspace_dir=project_workspace_dir,
+        run_repository=run_repository,
         tool_registry=tool_registry,
     )
     default_reviewer = (

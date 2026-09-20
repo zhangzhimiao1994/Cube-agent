@@ -17,9 +17,9 @@ from agent_hub.capabilities.manifest import (
     is_safe_manifest_name,
     project_capability_manifest_item,
 )
+from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
 from agent_hub.capabilities.tools.calculator import Calculator
 from agent_hub.capabilities.tools.registry import ToolRegistry
-from agent_hub.capabilities.tools.workspace_read import WorkspaceReader
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
@@ -104,12 +104,15 @@ class RuntimeCapabilityGateway:
         workspace_root: Path | None = None,
         generated_artifact_dir: Path | None = None,
         project_workspace_dir: Path | None = None,
+        run_repository: object | None = None,
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
+        self._project_workspace_dir = project_workspace_dir
+        self._run_repository = run_repository
         self._generated_file_store = (
             GeneratedFileStore(generated_artifact_dir) if generated_artifact_dir is not None else None
         )
@@ -220,9 +223,9 @@ class RuntimeCapabilityGateway:
         if normalized_name in {"calculator", "calculator_evaluate"}:
             return self._execute_calculator(arguments)
         if normalized_name == "read_context":
-            return self._execute_read_context(arguments)
+            return await self._execute_read_context(tenant_id, run_id, arguments)
         if normalized_name == "workspace_read":
-            return self._execute_workspace_read(arguments)
+            return await self._execute_workspace_read(tenant_id, run_id, arguments)
         if normalized_name == _DOCX_TOOL:
             return self._execute_generate_docx(tenant_id, run_id, arguments)
         if normalized_name == _PPTX_TOOL:
@@ -247,10 +250,11 @@ class RuntimeCapabilityGateway:
         result = self._calculator.evaluate(expression)
         return {"value": str(result.value)}
 
-    def _execute_read_context(self, arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-        path = arguments.get("path")
-        if isinstance(path, str):
-            return self._execute_workspace_read(arguments)
+    async def _execute_read_context(
+        self, tenant_id: UUID, run_id: UUID, arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        if "path" in arguments:
+            return await self._execute_workspace_read(tenant_id, run_id, arguments)
         query = arguments.get("query")
         if query is None:
             query = arguments.get("text")
@@ -263,13 +267,20 @@ class RuntimeCapabilityGateway:
             "truncated": False,
         }
 
-    def _execute_workspace_read(self, arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-        if self._workspace_root is None:
-            raise RuntimeCapabilityError("workspace reader is not configured")
+    async def _execute_workspace_read(
+        self, tenant_id: UUID, run_id: UUID, arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
         path = arguments.get("path")
         if not isinstance(path, str):
             raise RuntimeCapabilityError("workspace reader requires path")
-        result = WorkspaceReader(self._workspace_root).read(path)
+        try:
+            result = await read_scoped_file(
+                repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
+                project_root=self._project_workspace_dir, attachment_root=self._workspace_root,
+                path=path,
+            )
+        except ScopedReadError as error:
+            raise RuntimeCapabilityError(str(error)) from None
         return {
             "path": result.relative_path,
             "text": result.text,
@@ -543,8 +554,11 @@ class RuntimeCapabilityGateway:
         }
 
     def _builtin_availability_reason(self, name: str) -> str | None:
-        if name == "workspace.read" and self._workspace_root is None:
-            return "workspace_root_not_configured"
+        if name == "workspace.read":
+            if self._workspace_root is None and self._project_workspace_dir is None:
+                return "workspace_root_not_configured"
+            if not callable(getattr(self._run_repository, "get", None)):
+                return "workspace_scope_not_configured"
         if name == _PROJECT_PREFLIGHT_TOOL and self._project_workspace_store is None:
             return "project_workspace_store_not_configured"
         if name in {_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL} and (

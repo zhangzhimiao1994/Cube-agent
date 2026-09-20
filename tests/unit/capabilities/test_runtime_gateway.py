@@ -12,6 +12,7 @@ from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabi
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource, ToolRegistry
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
+from tests.unit.capabilities.test_scoped_read import FakeRunRepository, stored_run
 from tests.unit.skills.test_package import skill_zip
 
 TENANT_ID = UUID("66666666-6666-4666-8666-666666666666")
@@ -154,9 +155,13 @@ async def test_runtime_gateway_refreshes_manifest_sources_for_tenant(tmp_path: P
 
 async def test_runtime_gateway_reads_only_configured_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "note.txt").write_text("safe", encoding="utf-8")
-    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills", workspace_root=workspace)
+    session = workspace / str(TENANT_ID) / "projects/project-a/sessions/session-a"
+    session.mkdir(parents=True)
+    (session / "note.txt").write_text("safe", encoding="utf-8")
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=workspace,
+        run_repository=FakeRunRepository(stored_run(tenant=TENANT_ID, run=RUN_ID)),
+    )
 
     result = await gateway.execute(
         tenant_id=TENANT_ID,
@@ -172,9 +177,13 @@ async def test_runtime_gateway_reads_only_configured_workspace(tmp_path: Path) -
 
 async def test_runtime_gateway_accepts_harness_builtin_tool_aliases(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "note.txt").write_text("safe", encoding="utf-8")
-    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills", workspace_root=workspace)
+    session = workspace / str(TENANT_ID) / "projects/project-a/sessions/session-a"
+    session.mkdir(parents=True)
+    (session / "note.txt").write_text("safe", encoding="utf-8")
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=workspace,
+        run_repository=FakeRunRepository(stored_run(tenant=TENANT_ID, run=RUN_ID)),
+    )
 
     calculator = await gateway.execute(
         tenant_id=TENANT_ID,
@@ -640,6 +649,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
         skill_store_dir=tmp_path / "skills",
         workspace_root=workspace,
         generated_artifact_dir=tmp_path / "generated",
+        run_repository=FakeRunRepository(stored_run(tenant=TENANT_ID, run=RUN_ID)),
     )
 
     manifest = gateway.capability_manifest(TENANT_ID)

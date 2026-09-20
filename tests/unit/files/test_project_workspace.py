@@ -98,6 +98,66 @@ def test_project_workspace_store_rejects_symlink_escape_on_download(tmp_path: Pa
         store.resolve_file(tenant_id, "project", "session", "leak.txt")
 
 
+@pytest.mark.parametrize("component", ("tenant", "projects", "project", "sessions", "session"))
+def test_project_workspace_rejects_scope_alias_to_another_session(
+    tmp_path: Path, component: str
+) -> None:
+    tenant_id = uuid4()
+    other_tenant_id = uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+    store.write_bytes(other_tenant_id, "project", "session", "private.txt", b"private", "text/plain")
+    names = [str(tenant_id), "projects", "project", "sessions", "session"]
+    target_names = [str(other_tenant_id), "projects", "project", "sessions", "session"]
+    index = ("tenant", "projects", "project", "sessions", "session").index(component)
+    link = tmp_path.joinpath(*names[:index + 1])
+    target = tmp_path.joinpath(*target_names[:index + 1])
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is not available on this platform")
+
+    with pytest.raises(ValueError, match="workspace path"):
+        store.resolve_file(tenant_id, "project", "session", "private.txt")
+    with pytest.raises(ValueError, match="workspace path"):
+        store.list_files(tenant_id, "project", "session")
+    with pytest.raises(ValueError, match="workspace path"):
+        store.write_bytes(tenant_id, "project", "session", "private.txt", b"changed", "text/plain")
+    assert store.resolve_file(other_tenant_id, "project", "session", "private.txt").read_bytes() == b"private"
+
+
+def test_project_workspace_rejects_scope_swap_during_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant_id, other_tenant_id = uuid4(), uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+    expected = store.session_root(tenant_id, "project", "session")
+    other = store.session_root(other_tenant_id, "project", "session")
+    expected.mkdir(parents=True)
+    other.mkdir(parents=True)
+    probe = tmp_path / "link-probe"
+    try:
+        probe.symlink_to(other, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is not available on this platform")
+    probe.unlink()
+    original = Path.resolve
+    swapped = False
+
+    def resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal swapped
+        if path == expected and not swapped:
+            swapped = True
+            expected.rename(expected.with_name("original-session"))
+            expected.symlink_to(other, target_is_directory=True)
+        return original(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(ValueError, match="workspace path"):
+        store.session_root(tenant_id, "project", "session")
+    assert swapped
+
+
 def test_project_workspace_store_creates_bounded_zip_without_hidden_files(
     tmp_path: Path,
 ) -> None:

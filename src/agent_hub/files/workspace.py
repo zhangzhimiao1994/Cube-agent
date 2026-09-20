@@ -168,10 +168,16 @@ class ProjectWorkspaceStore:
     def session_root(self, tenant_id: UUID, project_id: str, session_id: str) -> Path:
         project = _safe_workspace_segment(project_id)
         session = _safe_workspace_segment(session_id)
-        root = (self._root / str(tenant_id) / "projects" / project / "sessions" / session).resolve()
-        if not root.is_relative_to(self._root):
-            raise ValueError("workspace path escapes store root")
-        return root
+        root = self._root
+        # Scope directories must not alias another tenant/project/session inside the store.
+        for component in (str(tenant_id), "projects", project, "sessions", session):
+            root = root / component
+            if root.is_symlink() or root.is_junction():
+                raise ValueError("workspace path aliases another scope")
+        resolved = root.resolve()
+        if resolved != root or not resolved.is_relative_to(self._root):
+            raise ValueError("workspace path escapes authorized scope")
+        return resolved
 
     def _resolve_candidate(
         self,

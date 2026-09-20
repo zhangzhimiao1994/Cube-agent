@@ -30,6 +30,14 @@ from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.runtime.contracts import JsonValue
+from tests.unit.capabilities.test_scoped_read import (
+    ALIASES,
+    ATTACHMENT,
+    OTHER,
+    FakeRunRepository,
+    stored_run,
+    write_file,
+)
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 USER_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -56,6 +64,38 @@ def request(capability: str, operation: str, resource: str) -> CapabilityRequest
         idempotency_key=f"{capability}:{operation}:{resource}",
         run_id=RUN_ID,
     )
+
+
+@pytest.mark.parametrize("name", ALIASES)
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_runtime_stack_scopes_reads_even_after_harness_policy_allows(
+    tmp_path: Path, name: str, allowed: bool,
+) -> None:
+    tenant = TENANT_ID if allowed else OTHER
+    path = f"{tenant}/{ATTACHMENT}.bin"
+    write_file(tmp_path / "attachments", path, "PRIVATE-CONTENT")
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=FakeRunRepository(stored_run(tenant=TENANT_ID, run=RUN_ID)),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "attachments",
+    )
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID, actor="reader", tool_name=name, arguments={"path": path},
+            approval_required=False, sandbox="read_only", idempotency_key="scoped-read",
+        ),
+        user_id=USER_ID, role=Role.OPERATOR,
+    )
+    if allowed:
+        assert result.status == "succeeded"
+        assert result.payload is not None
+        assert result.payload["text"] == "PRIVATE-CONTENT"
+    else:
+        assert result.status == "failed"
+        assert result.failure_reason == "workspace read denied or scoped file unavailable"
+        assert "PRIVATE-CONTENT" not in str(result.payload)
 
 
 def capability_request(
