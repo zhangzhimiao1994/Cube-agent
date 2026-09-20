@@ -3651,8 +3651,19 @@ def project_bundle() -> bytes:
             "- interaction smoke: passed\n"
         ),
         "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
-        "src/main.js": "export function ok() { return true; }\n",
-        "tests/main.test.js": "import assert from 'node:assert/strict';\nassert.equal(true, true);\n",
+        "src/main.js": (
+            "export function formatGreeting(name) {\n"
+            "  const value = String(name || '').trim();\n"
+            "  if (!value) return 'Hello, guest';\n"
+            "  return `Hello, ${value}`;\n"
+            "}\n"
+        ),
+        "tests/main.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import { formatGreeting } from '../src/main.js';\n"
+            "assert.equal(formatGreeting(' Ada '), 'Hello, Ada');\n"
+            "assert.equal(formatGreeting(''), 'Hello, guest');\n"
+        ),
     }
     with zipfile.ZipFile(buffer, mode="w") as archive:
         for path, content in files.items():
