@@ -8,6 +8,7 @@ import stat
 import sys
 from collections.abc import Mapping
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Protocol, cast
 from uuid import UUID
@@ -23,8 +24,50 @@ class ScopedReadError(RuntimeError):
     """A stored run does not authorize this file read."""
 
 
+@dataclass(frozen=True, slots=True)
+class ScopedReadEvidence:
+    relative_path: str
+    text: str = field(repr=False)
+    truncated: bool
+    data: bytes = field(repr=False)
+    project_id: str
+    session_id: str
+
+
 class _RunRepository(Protocol):
     async def get(self, tenant_id: UUID, run_id: UUID) -> object: ...
+
+
+def authorized_workspace_scope(record: object, *, tenant_id: UUID, run_id: UUID) -> tuple[str, str]:
+    """Validate a trusted persisted record without applying implicit read permissions."""
+    from agent_hub.runs.workspace import workspace_selection
+
+    if getattr(record, "tenant_id", None) != tenant_id or getattr(record, "id", None) != run_id:
+        raise ScopedReadError
+    routing = getattr(record, "routing_decision", None)
+    if not isinstance(routing, Mapping):
+        raise ScopedReadError
+    project = routing.get("project_id")
+    session = routing.get("workspace_session_id")
+    profile = routing.get("sandbox_profile")
+    permissions = routing.get("requested_permissions")
+    if (
+        not isinstance(project, str) or _SEGMENT.fullmatch(project) is None
+        or not isinstance(session, str) or _SEGMENT.fullmatch(session) is None
+        or profile not in ("read_only", "restricted", "workspace_write")
+        or not isinstance(permissions, (list, tuple))
+        or not all(isinstance(item, str) for item in permissions)
+        or "workspace.read" not in permissions
+    ):
+        raise ScopedReadError
+    try:
+        workspace_selection(
+            project_id=project, session_id=session, sandbox_profile=profile,
+            requested_permissions=permissions,
+        )
+    except ValueError:
+        raise ScopedReadError from None
+    return project, session
 
 
 async def read_scoped_file(
@@ -35,35 +78,16 @@ async def read_scoped_file(
     project_root: Path | None,
     attachment_root: Path | None,
     path: str,
-) -> WorkspaceReadResult:
-    # Import lazily: runs.__init__ imports the harness gateway, which imports runtime.
-    from agent_hub.runs.workspace import workspace_selection
-
+    include_metadata: bool = False,
+    max_bytes: int = _MAX_BYTES,
+) -> WorkspaceReadResult | ScopedReadEvidence:
     try:
+        if type(max_bytes) is not int or not 1 <= max_bytes <= _MAX_BYTES:
+            raise ScopedReadError
         record = await cast(_RunRepository, repository).get(tenant_id, run_id)
-        if getattr(record, "tenant_id", None) != tenant_id or getattr(record, "id", None) != run_id:
-            raise ScopedReadError
+        project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
         routing = getattr(record, "routing_decision", None)
-        if not isinstance(routing, Mapping):
-            raise ScopedReadError
-        project = routing.get("project_id")
-        session = routing.get("workspace_session_id")
-        profile = routing.get("sandbox_profile")
-        permissions = routing.get("requested_permissions")
-        if (
-            not isinstance(project, str) or _SEGMENT.fullmatch(project) is None
-            or not isinstance(session, str) or _SEGMENT.fullmatch(session) is None
-            or profile not in ("read_only", "restricted", "workspace_write")
-            or not isinstance(permissions, (list, tuple))
-            or not all(isinstance(item, str) for item in permissions)
-            or "workspace.read" not in permissions
-        ):
-            raise ScopedReadError
-        # Reuse the submission policy without allowing its implicit permission defaults.
-        workspace_selection(
-            project_id=project, session_id=session, sandbox_profile=profile,
-            requested_permissions=permissions,
-        )
+        assert isinstance(routing, Mapping)
         parts = _path_parts(path)
         if parts[0] == str(tenant_id):
             attachments = routing.get("attachment_ids")
@@ -88,11 +112,18 @@ async def read_scoped_file(
             scoped_parts = (str(tenant_id), "projects", project, "sessions", session, *parts)
         if root is None:
             raise ScopedReadError
-        data = _read_no_links(root, scoped_parts)
+        data = _read_no_links(root, scoped_parts, max_bytes=max_bytes)
+        if include_metadata:
+            return ScopedReadEvidence(
+                relative_path="/".join(parts),
+                text=data[:max_bytes].decode("utf-8", errors="replace"),
+                truncated=len(data) > max_bytes,
+                data=data, project_id=project, session_id=session,
+            )
         return WorkspaceReadResult(
             relative_path="/".join(parts),
-            text=data[:_MAX_BYTES].decode("utf-8", errors="replace"),
-            truncated=len(data) > _MAX_BYTES,
+            text=data[:max_bytes].decode("utf-8", errors="replace"),
+            truncated=len(data) > max_bytes,
         )
     except Exception:  # noqa: BLE001 - fail closed with a redacted boundary error.
         # Repository, filesystem and parser errors must not disclose other scopes or host paths.
@@ -124,7 +155,7 @@ def _regular_file(value: os.stat_result) -> None:
         raise ScopedReadError
 
 
-def _read_no_links(root: Path, parts: tuple[str, ...]) -> bytes:
+def _read_no_links(root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES) -> bytes:
     if os.name == "posix" and os.open in os.supports_dir_fd:
         # Hold directory descriptors so an ancestor rename/link swap cannot redirect the read.
         with ExitStack() as stack:
@@ -143,13 +174,13 @@ def _read_no_links(root: Path, parts: tuple[str, ...]) -> bytes:
             )
             with os.fdopen(fd, "rb") as handle:
                 _regular_file(os.fstat(handle.fileno()))
-                return handle.read(_MAX_BYTES + 1)
+                return handle.read(max_bytes + 1)
     if os.name != "nt":
         raise ScopedReadError
-    return _read_windows_locked(root, parts)
+    return _read_windows_locked(root, parts, max_bytes=max_bytes)
 
 
-def _read_windows_locked(root: Path, parts: tuple[str, ...]) -> bytes:
+def _read_windows_locked(root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES) -> bytes:
     if sys.platform != "win32":
         raise ScopedReadError
     import ctypes
@@ -233,4 +264,4 @@ def _read_windows_locked(root: Path, parts: tuple[str, ...]) -> bytes:
         # fdopen owns the native file handle; all ancestor handles remain held until it closes.
         with handle:
             _regular_file(os.fstat(handle.fileno()))
-            return handle.read(_MAX_BYTES + 1)
+            return handle.read(max_bytes + 1)

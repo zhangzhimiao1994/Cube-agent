@@ -26,6 +26,7 @@ from agent_hub.db.models import (
     RunUsageRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.failure_reason import (
@@ -1795,6 +1796,9 @@ def _self_repair_recovery_baseline_sequence(
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
+    kind = payload.get("kind")
+    if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
+        return context_event_projection(payload)
     return {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }

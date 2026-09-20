@@ -105,6 +105,7 @@ from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
     ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
 )
+from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
@@ -11004,6 +11005,9 @@ def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
 
 
 def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
+    kind = event.get("kind")
+    if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
+        event = context_event_projection(event)
     sequence = event.get("sequence")
     kind = event.get("kind")
     kind_text = kind if type(kind) is str else "event"

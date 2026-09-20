@@ -45,6 +45,7 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
@@ -407,8 +408,10 @@ class RunService:
         self_repair_policy: SelfRepairPolicy | None = None,
         worker_id: str | None = None,
         run_worker_lease_seconds: float = 60.0,
+        instruction_context_loader: InstructionContextLoader | None = None,
     ) -> None:
         self._repository = repository
+        self._instruction_context_loader = instruction_context_loader
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -1376,6 +1379,30 @@ class RunService:
             if checkpoint is not None:
                 await runtime.restore_checkpoint(checkpoint)
             token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
+            instructions = None
+            if mode is TaskMode.DIRECT and self._instruction_context_loader is not None:
+                instructions = await self._instruction_context_loader.load(
+                    tenant_id=tenant_id, run_id=run_id,
+                )
+                async with await self._repository.run_transaction() as session, session.begin():
+                    locked = await self._repository.get_for_update(session, run_id)
+                    if (
+                        locked.tenant_id != tenant_id
+                        or RunStatus(locked.status) is not RunStatus.RUNNING
+                        or locked.worker_id != self._worker_id
+                        or locked.worker_lease_token != worker_lease_token
+                        or locked.worker_lease_expires_at is None
+                        or locked.worker_lease_expires_at <= datetime.now(UTC)
+                    ):
+                        return _submitted(RunRepository._record(locked))
+                    sequence = await self._repository.next_event_sequence(session, run_id)
+                    await self._repository.persist_event(
+                        session, tenant_id=tenant_id, run_id=run_id,
+                        event=RunEvent(kind="context.loaded", sequence=sequence, run_id=run_id,
+                                       payload=cast(dict[str, JsonValue], instructions.metadata())),
+                    )
+                    if not instructions.authorized_for(locked):
+                        instructions = None
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
@@ -1383,6 +1410,7 @@ class RunService:
                 actor_role=actor_role,
                 mode=mode,
                 request=request,
+                instruction_context=instructions,
                 artifacts=await self._conversation_artifacts(
                     tenant_id=tenant_id,
                     run_id=run_id,

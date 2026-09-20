@@ -118,6 +118,7 @@ from agent_hub.runs.service import (
 )
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
+from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.invalidation import (
     RuntimeConfigInvalidationBus,
     RuntimeConfigInvalidationTarget,
@@ -1151,6 +1152,10 @@ def create_app(
                 )
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
+                    instruction_context_loader=InstructionContextLoader(
+                        repository=RunRepository(active_sessions),
+                        project_root=configured.project_workspace_dir,
+                    ),
                     runtime_registry=active_runtime_registry,
                     router=active_mode_router,
                     task_queue=queue,

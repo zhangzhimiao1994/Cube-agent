@@ -25,6 +25,7 @@ from pydantic import (
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.instruction_context import InstructionContext
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | tuple["JsonValue", ...] | Mapping[str, "JsonValue"]
@@ -926,11 +927,19 @@ class TaskContext(_RuntimeContractModel):
     actor_role: Role | None = None
     mode: TaskMode
     request: str = Field(repr=False)
+    instruction_context: InstructionContext | None = Field(default=None, repr=False, exclude=True)
     artifacts: tuple[Artifact, ...] = Field(default=(), max_length=64)
     checkpoint: RuntimeCheckpoint | None = Field(default=None, repr=False)
     routing_decision: Mapping[str, JsonValue] = Field(default_factory=dict, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
     token_budget: int = Field(default=16_384, ge=1, le=10_000_000)
+
+    @field_validator("instruction_context", mode="before")
+    @classmethod
+    def internal_instructions_only(cls, value: object) -> object:
+        if value is not None and type(value) is not InstructionContext:
+            raise ValueError("instruction context must come from the service loader")
+        return value
 
     @field_validator("mode")
     @classmethod
@@ -972,6 +981,11 @@ class TaskContext(_RuntimeContractModel):
 
     @model_validator(mode="after")
     def context_invariants(self) -> TaskContext:
+        if self.instruction_context is not None and (
+            self.instruction_context.run_id != self.run_id
+            or self.instruction_context.tenant_id != self.tenant_id
+        ):
+            raise ValueError("instruction context run or tenant does not match")
         artifact_ids = [item.id for item in self.artifacts]
         if len(set(artifact_ids)) != len(artifact_ids):
             raise ValueError("task artifacts must be unique")
@@ -982,6 +996,12 @@ class TaskContext(_RuntimeContractModel):
         ):
             raise ValueError("checkpoint run, tenant, or mode does not match task context")
         return self
+
+    def validated_internal_clone(self) -> TaskContext:
+        public = TaskContext.from_payload(self.to_payload())
+        values = {name: getattr(public, name) for name in TaskContext.model_fields}
+        values["instruction_context"] = self.instruction_context
+        return TaskContext.model_validate(values, strict=True)
 
     def to_payload(self) -> dict[str, object]:
         return {

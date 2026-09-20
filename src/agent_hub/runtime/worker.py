@@ -29,6 +29,7 @@ from agent_hub.plugins.runtime import (
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
+from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.invalidation import RuntimeConfigInvalidationBus
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
@@ -341,6 +342,9 @@ def build_worker_service(
     )
     service = RunService(
         run_repository,
+        instruction_context_loader=InstructionContextLoader(
+            repository=run_repository, project_root=settings.project_workspace_dir,
+        ),
         runtime_registry=configured_runtime_registry(
             config_service=config_service,
             secret_service=secret_service,
