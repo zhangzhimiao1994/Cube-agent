@@ -125,7 +125,14 @@ class HarnessToolGateway:
             else None
         )
         if _requires_external_backend(request) and mcp_backend is None and plugin_backend is None:
-            return self._failure(request, "external tool unavailable")
+            return self._failure(
+                request,
+                _external_tool_unavailable_reason(
+                    tenant_id,
+                    request,
+                    backends=_external_backends_for_request(self, request),
+                ),
+            )
         sandbox_mismatch = _external_sandbox_mismatch(
             tenant_id,
             request,
@@ -400,6 +407,7 @@ def _plugin_declared_capability_parts(
 
 
 _SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+_SAFE_AVAILABILITY_REASON = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
 _EXTERNAL_SANDBOX_PROFILES = frozenset(
     {
@@ -438,6 +446,50 @@ def _external_backends_for_request(
     if request.sandbox in _MCP_SANDBOX_PROFILES:
         return (gateway._mcp_backend,)
     return (gateway._plugin_backend,)
+
+
+def _external_tool_unavailable_reason(
+    tenant_id: UUID,
+    request: HarnessToolCallRequest,
+    *,
+    backends: tuple[object | None, ...],
+) -> str:
+    reason = _declared_availability_failure_reason(backends, tenant_id, request.tool_name)
+    if request.sandbox in _MCP_SANDBOX_PROFILES:
+        if reason is None:
+            return "MCP tool unavailable"
+        return f"MCP tool unavailable: {reason}"
+    if reason is None:
+        return "external tool unavailable"
+    return f"Plugin tool unavailable: {reason}"
+
+
+def _declared_availability_failure_reason(
+    backends: tuple[object | None, ...],
+    tenant_id: UUID,
+    tool_name: str,
+) -> str | None:
+    for backend in backends:
+        if backend is None:
+            continue
+        availability_failure_reason = getattr(backend, "availability_failure_reason", None)
+        if not callable(availability_failure_reason):
+            continue
+        try:
+            value = availability_failure_reason(tenant_id, tool_name)
+        except Exception as error:  # noqa: BLE001 - external availability diagnostics must fail closed.
+            _LOGGER.debug(
+                "harness_external_availability_reason_failed backend=%s tenant_id=%s error_type=%s",
+                type(backend).__name__,
+                tenant_id,
+                type(error).__name__,
+            )
+            continue
+        if isinstance(value, str):
+            reason = value.strip()
+            if _SAFE_AVAILABILITY_REASON.fullmatch(reason) is not None:
+                return reason
+    return None
 
 
 def _workspace_write_sandbox_failure(request: HarnessToolCallRequest) -> str | None:

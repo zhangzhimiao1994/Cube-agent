@@ -586,6 +586,9 @@ class RuntimePluginService:
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         return self._available_plugin_capability(tenant_id, name) is not None
 
+    def availability_failure_reason(self, tenant_id: UUID, name: str) -> str | None:
+        return self._unavailable_plugin_capability_reason(tenant_id, name)
+
     def capability_policy_parts(self, tenant_id: UUID, name: str) -> tuple[str, str, str] | None:
         target = self._available_plugin_capability(tenant_id, name)
         if target is None:

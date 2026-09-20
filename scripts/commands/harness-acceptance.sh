@@ -1390,6 +1390,16 @@ class FailingAvailabilityPluginBackend(PluginBackend):
         raise RuntimeError("Bearer sk-secret must not leak")
 
 
+class DisabledPluginBackend(PluginBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.available = False
+
+    def availability_failure_reason(self, tenant_id: UUID, name: str) -> str:
+        self.calls.append(("availability_reason", str(tenant_id), name))
+        return "plugin_disabled"
+
+
 def request(tool_name: str, *, actor: str, arguments: Mapping[str, JsonValue], sandbox: str, key: str) -> HarnessToolCallRequest:
     return HarnessToolCallRequest(
         run_id=RUN_ID,
@@ -1480,12 +1490,41 @@ async def main():
     require(failure_result.failure_reason == "external tool unavailable", "unavailable plugin failure reason mismatch")
     require("sk-secret" not in repr(failure_result), "plugin failure result leaked a secret")
 
+    disabled_plugin = DisabledPluginBackend()
+    disabled_gateway = HarnessToolGateway(
+        RuntimeBackend(),
+        policy_gateway=PolicyGateway(),
+        plugin_backend=disabled_plugin,
+    )
+    disabled_result = await disabled_gateway.invoke(
+        TENANT_ID,
+        request(
+            "calendar.create_event",
+            actor="scheduler",
+            arguments={"title": "disabled plugin"},
+            sandbox="remote_connector",
+            key="plugin_disabled_acceptance_1",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+    require(disabled_result.status == "failed", "disabled plugin must fail closed")
+    require(
+        disabled_result.failure_reason == "Plugin tool unavailable: plugin_disabled",
+        "disabled plugin failure reason mismatch",
+    )
+    require(
+        [call[0] for call in disabled_plugin.calls] == ["available", "availability_reason"],
+        "disabled plugin availability reason route mismatch",
+    )
+
 
 asyncio.run(main())
 PY
   then
     printf 'ok: runtime tool gateway routes plugin and MCP calls\n'
     printf 'ok: runtime tool gateway reports deterministic external failures\n'
+    printf 'ok: runtime tool gateway preserves external unavailable reasons\n'
     return 0
   fi
   printf 'fail: runtime tool gateway invocation contract\n' >&2

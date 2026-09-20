@@ -197,6 +197,16 @@ class FailingAvailabilityPluginToolBackend(FakePluginToolBackend):
         raise RuntimeError("raw plugin discovery failure")
 
 
+class UnavailableReasonPluginToolBackend(FakePluginToolBackend):
+    def __init__(self, *, reason: str) -> None:
+        super().__init__(available=False)
+        self.reason = reason
+
+    def availability_failure_reason(self, tenant_id: UUID, name: str) -> str:
+        self.calls.append(("availability_reason", {"tenant_id": str(tenant_id), "name": name}, ""))
+        return self.reason
+
+
 class ValidationFailurePluginToolBackend(FakePluginToolBackend):
     async def invoke(
         self,
@@ -507,7 +517,7 @@ async def test_harness_tool_gateway_fails_mcp_envelope_closed_when_availability_
     result = await gateway.invoke(TENANT_ID, mcp_request())
 
     assert result.status == "failed"
-    assert result.failure_reason == "external tool unavailable"
+    assert result.failure_reason == "MCP tool unavailable"
     assert runtime.calls == []
 
 
@@ -732,6 +742,19 @@ async def test_harness_tool_gateway_fails_plugin_envelope_closed_when_availabili
 
     assert result.status == "failed"
     assert result.failure_reason == "external tool unavailable"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_reports_plugin_unavailable_reason_before_invoke() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = UnavailableReasonPluginToolBackend(reason="plugin_disabled")
+    gateway = HarnessToolGateway(runtime, plugin_backend=plugin_backend)
+
+    result = await gateway.invoke(TENANT_ID, plugin_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "Plugin tool unavailable: plugin_disabled"
+    assert [call[0] for call in plugin_backend.calls] == ["available", "availability_reason"]
     assert runtime.calls == []
 
 
