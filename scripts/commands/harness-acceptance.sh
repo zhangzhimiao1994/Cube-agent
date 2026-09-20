@@ -1341,10 +1341,11 @@ class PolicyGateway:
 class PluginBackend:
     def __init__(self):
         self.calls = []
+        self.available = True
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         self.calls.append(("available", str(tenant_id), name))
-        return True
+        return self.available
 
     async def invoke(
         self,
