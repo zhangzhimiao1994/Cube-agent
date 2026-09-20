@@ -370,8 +370,8 @@ async def test_parses_provider_usage_integer_strings_and_integral_floats() -> No
     assert result.usage.total_tokens == 5
 
 
-async def test_rejects_malformed_usage_with_field_specific_error() -> None:
-    transport, _, _, close = mock_transport(
+async def test_rejects_malformed_usage_with_safe_contract_error() -> None:
+    transport, _, create, close = mock_transport(
         result=sdk_response(
             usage=SimpleNamespace(
                 prompt_tokens=2,
@@ -381,10 +381,12 @@ async def test_rejects_malformed_usage_with_field_specific_error() -> None:
         )
     )
 
-    with pytest.raises(ModelResponseError, match="usage.completion_tokens") as caught:
+    with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
         await transport.complete(deployment(), request(), API_KEY)
 
+    create.assert_awaited_once()
     close.assert_awaited_once_with()
+    assert caught.value.status_code is None and caught.value.evidence is None
     assert API_KEY not in repr(caught.value)
     assert PROMPT not in repr(caught.value)
 
@@ -1021,12 +1023,14 @@ def test_content_bearing_contract_reprs_are_safe() -> None:
     ],
 )
 async def test_rejects_empty_or_malformed_responses_safely(response: object) -> None:
-    transport, _, _, close = mock_transport(result=response)
+    transport, _, create, close = mock_transport(result=response)
 
-    with pytest.raises(ModelResponseError, match="deployment 'primary-1'") as caught:
+    with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
         await transport.complete(deployment(), request(), API_KEY)
 
+    create.assert_awaited_once()
     close.assert_awaited_once_with()
+    assert caught.value.status_code is None and caught.value.evidence is None
     rendered = repr(caught.value)
     assert API_KEY not in rendered
     assert PROMPT not in rendered
@@ -1038,11 +1042,14 @@ async def test_rejects_malformed_or_nonobject_tool_arguments_without_leaking_the
         id="call_1",
         function=SimpleNamespace(name="lookup", arguments=bad_arguments),
     )
-    transport, _, _, _ = mock_transport(result=sdk_response(tool_calls=[tool]))
+    transport, _, create, close = mock_transport(result=sdk_response(tool_calls=[tool]))
 
-    with pytest.raises(ModelResponseError, match="malformed tool call") as caught:
+    with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
         await transport.complete(deployment(), request(), API_KEY)
 
+    create.assert_awaited_once()
+    close.assert_awaited_once_with()
+    assert caught.value.status_code is None and caught.value.evidence is None
     rendered = "".join(
         traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
     )
@@ -1059,11 +1066,14 @@ async def test_rejects_nonfinite_tool_argument_json_constants(constant: str) -> 
         id="call_1",
         function=SimpleNamespace(name="lookup", arguments=f'{{"value":{constant}}}'),
     )
-    transport, _, _, _ = mock_transport(result=sdk_response(tool_calls=[tool]))
+    transport, _, create, close = mock_transport(result=sdk_response(tool_calls=[tool]))
 
-    with pytest.raises(ModelResponseError, match="malformed tool call") as caught:
+    with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
         await transport.complete(deployment(), request(), API_KEY)
 
+    create.assert_awaited_once()
+    close.assert_awaited_once_with()
+    assert caught.value.status_code is None and caught.value.evidence is None
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 
@@ -1139,15 +1149,17 @@ async def test_provider_error_close_failure_keeps_primary_safe_error() -> None:
 
 
 async def test_parse_error_close_failure_keeps_parse_error() -> None:
-    transport, _, _, close = mock_transport(
+    transport, _, create, close = mock_transport(
         result=sdk_response(choices=[]),
         close_error=RuntimeError("close-" + RAW_ERROR + API_KEY),
     )
 
-    with pytest.raises(ModelResponseError, match="malformed model response") as caught:
+    with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
         await transport.complete(deployment(), sensitive_request(), API_KEY)
 
+    create.assert_awaited_once()
     close.assert_awaited_once_with()
+    assert caught.value.status_code is None and caught.value.evidence is None
     assert caught.value.__context__ is None
     assert RAW_ERROR not in captured_traceback(caught.value)
     assert API_KEY not in captured_traceback(caught.value)

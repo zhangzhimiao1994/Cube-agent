@@ -26,15 +26,49 @@ from agent_hub.models.capacity import (
     CapacityUnavailable,
     CapacityWaitTimeout,
 )
-from agent_hub.models.litellm_client import ModelTransportError
+from agent_hub.models.litellm_client import (
+    ModelResponseCancelled,
+    ModelResponseError,
+    ModelTransportError,
+)
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
-from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, _require_safe_identifier
+from agent_hub.models.types import (
+    Deployment,
+    ModelRequest,
+    ModelResponse,
+    RejectedOutputEvidence,
+    TokenUsage,
+    _require_safe_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
+
+
+class GatewayRejectedOutput(ModelGatewayError):
+    """Rejected model output with selected provenance, not a completion."""
+
+    def __init__(
+        self, *, evidence: RejectedOutputEvidence | None,
+        deployment_id: str, logical_model: str, provider_id: str, provider_model: str,
+        cost_usd: Decimal | None = None, fallback_used: bool = False,
+        fallback_from_logical_model: str | None = None, fallback_reason: str | None = None,
+        attempted_logical_models: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__("model response rejected")
+        self.evidence = evidence
+        self.deployment_id = deployment_id
+        self.logical_model = logical_model
+        self.provider_id = provider_id
+        self.provider_model = provider_model
+        self.cost_usd = cost_usd
+        self.fallback_used = fallback_used
+        self.fallback_from_logical_model = fallback_from_logical_model
+        self.fallback_reason = fallback_reason
+        self.attempted_logical_models = attempted_logical_models
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +156,54 @@ class GatewayCompletion:
 
 @dataclass(frozen=True, slots=True)
 class _SafeTransportFailure:
-    error: ModelTransportError | ModelGatewayError
+    error: ModelTransportError | ModelGatewayError | ModelResponseCancelled
+
+
+class GatewayResponseCancelled(asyncio.CancelledError):
+    """Received model accounting receipt; cancellation still stops execution."""
+
+    def __init__(self, *, receipt: GatewayCompletion | GatewayRejectedOutput) -> None:
+        if not isinstance(receipt, GatewayCompletion | GatewayRejectedOutput):
+            raise TypeError("gateway cancellation receipt must be a received model outcome")
+        super().__init__("model gateway response cancelled")
+        self.receipt = receipt
+
+    def __str__(self) -> str:
+        return "model gateway response cancelled"
+
+    def __repr__(self) -> str:
+        return "GatewayResponseCancelled('model gateway response cancelled')"
+
+
+def _received_result(
+    outcome: ModelResponse | _SafeTransportFailure | None,
+) -> ModelResponse | RejectedOutputEvidence | None:
+    if isinstance(outcome, ModelResponse):
+        return outcome
+    if isinstance(outcome, _SafeTransportFailure):
+        if isinstance(outcome.error, ModelResponseCancelled):
+            return outcome.error.receipt
+        if isinstance(outcome.error, ModelResponseError):
+            return outcome.error.evidence
+    return None
+
+
+async def _settle_cleanup(future: asyncio.Future[Any]) -> BaseException | None:
+    cancellation: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except Exception:  # noqa: BLE001 - caller decides cleanup failure precedence
+            break
+    try:
+        future.result()
+    except asyncio.CancelledError as error:
+        return cancellation or error
+    except Exception as error:  # noqa: BLE001 - preserve cleanup failure for the caller
+        return cancellation or error
+    return cancellation
 
 
 def _utc_now() -> datetime:
@@ -130,6 +211,8 @@ def _utc_now() -> datetime:
 
 
 def _retryable_model_failure(error: BaseException) -> bool:
+    if isinstance(error, ModelResponseError | GatewayRejectedOutput):
+        return False
     if isinstance(error, ModelTransportError):
         return error.status_code is None or error.status_code in {
             408,
@@ -365,6 +448,18 @@ class ModelGateway:
                 raise CapacityBackendError("model capacity returned an unknown deployment")
             try:
                 response = await self._complete_leased(capacity, selected, lease, request)
+            except ModelResponseCancelled as error:
+                cancelled = self._cancelled_output(
+                    selected, request, error.receipt, fallback_from_logical_model,
+                    fallback_reason, attempted_logical_models,
+                )
+                cancelled.args = error.args
+                raise cancelled from None
+            except ModelResponseError as error:
+                raise self._rejected_output(
+                    selected, request, error.evidence, fallback_from_logical_model,
+                    fallback_reason, attempted_logical_models,
+                ) from None
             except (ModelTransportError, ModelGatewayError) as error:
                 if not _retryable_model_failure(error):
                     raise
@@ -469,6 +564,11 @@ class ModelGateway:
                     fallback_from_logical_model = logical_model
                     fallback_reason = _fallback_reason(last_retryable_error)
                     continue
+            except ModelResponseError as error:
+                raise self._rejected_output(
+                    selected, request, error.evidence, fallback_from_logical_model,
+                    fallback_reason, attempted_logical_models,
+                ) from None
             except (ModelTransportError, ModelGatewayError) as error:
                 if yielded or not _retryable_model_failure(error):
                     raise
@@ -563,6 +663,71 @@ class ModelGateway:
         ) / Decimal(1000000)
         return cost.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
 
+    def _rejected_output(
+        self, selected: Deployment, request: ModelRequest,
+        evidence: RejectedOutputEvidence | None, fallback_from_logical_model: str | None,
+        fallback_reason: str | None, attempted_logical_models: Sequence[str],
+    ) -> GatewayRejectedOutput:
+        fallback_used = selected.logical_model != request.logical_model
+        return GatewayRejectedOutput(
+            evidence=evidence,
+            deployment_id=selected.id,
+            logical_model=selected.logical_model,
+            provider_id=selected.provider_model.split("/", 1)[0],
+            provider_model=selected.provider_model,
+            cost_usd=self._receipt_cost_usd(selected, None if evidence is None else evidence.usage),
+            fallback_used=fallback_used,
+            fallback_from_logical_model=fallback_from_logical_model if fallback_used else None,
+            fallback_reason=fallback_reason if fallback_used else None,
+            attempted_logical_models=tuple(dict.fromkeys(attempted_logical_models)),
+        )
+
+    def _cancelled_output(
+        self, selected: Deployment, request: ModelRequest,
+        receipt: ModelResponse | RejectedOutputEvidence, fallback_from_logical_model: str | None,
+        fallback_reason: str | None, attempted_logical_models: Sequence[str],
+    ) -> GatewayResponseCancelled:
+        if isinstance(receipt, RejectedOutputEvidence):
+            return GatewayResponseCancelled(receipt=self._rejected_output(
+                selected, request, receipt, fallback_from_logical_model,
+                fallback_reason, attempted_logical_models,
+            ))
+        fallback_used = selected.logical_model != request.logical_model
+        return GatewayResponseCancelled(receipt=GatewayCompletion(
+            response=receipt,
+            deployment_id=selected.id,
+            logical_model=selected.logical_model,
+            provider_id=selected.provider_model.split("/", 1)[0],
+            provider_model=selected.provider_model,
+            cost_usd=self._receipt_cost_usd(selected, receipt.usage),
+            fallback_used=fallback_used,
+            fallback_from_logical_model=fallback_from_logical_model if fallback_used else None,
+            fallback_reason=fallback_reason if fallback_used else None,
+            attempted_logical_models=tuple(dict.fromkeys(attempted_logical_models)),
+        ))
+
+    def _receipt_cost_usd(
+        self, deployment: Deployment, usage: TokenUsage | None,
+    ) -> Decimal | None:
+        if usage is None:
+            return None
+        pricing = self._pricing.get(deployment.id)
+        if (
+            pricing is None
+            and deployment.input_per_million_usd is not None
+            and deployment.output_per_million_usd is not None
+        ):
+            pricing = DeploymentPricing(
+                deployment.input_per_million_usd, deployment.output_per_million_usd,
+            )
+        if pricing is None:
+            return None
+        cost = (
+            Decimal(usage.prompt_tokens) * pricing.input_per_million_usd
+            + Decimal(usage.completion_tokens) * pricing.output_per_million_usd
+        ) / Decimal(1000000)
+        return cost.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+
     def _fallback_chain(self, primary: str, allow_fallback: bool) -> tuple[str, ...]:
         chain = [primary]
         if allow_fallback:
@@ -631,6 +796,16 @@ class ModelGateway:
                 except asyncio.CancelledError as error:
                     stream_primary_error = error
                     primary_error = error
+                except ModelResponseError as error:
+                    stream_primary_error = error
+                    status_code = error.status_code
+                    primary_error = ModelResponseError(
+                        "model response rejected", status_code=error.status_code,
+                        evidence=error.evidence,
+                    )
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
                 except ModelTransportError as error:
                     stream_primary_error = error
                     status_code = error.status_code
@@ -673,12 +848,16 @@ class ModelGateway:
                         succeeded=succeeded,
                     )
                 except asyncio.CancelledError as error:
-                    if primary_error is None:
+                    if primary_error is None or isinstance(primary_error, ModelResponseError):
                         primary_error = error
                 except Exception:  # noqa: BLE001 - preserve any primary model failure
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
             release_error = await self._release_cleanup(capacity, lease)
+            if isinstance(release_error, asyncio.CancelledError) and isinstance(
+                primary_error, ModelResponseError
+            ):
+                primary_error = release_error
             if release_error is not None and primary_error is None:
                 if isinstance(release_error, asyncio.CancelledError):
                     primary_error = release_error
@@ -767,6 +946,7 @@ class ModelGateway:
     ) -> ModelResponse:
         primary_error: BaseException | None = None
         response: ModelResponse | None = None
+        receipt: ModelResponse | RejectedOutputEvidence | None = None
         transport_started: float | None = None
         should_record = False
         status_code: int | None = None
@@ -784,10 +964,8 @@ class ModelGateway:
                 )
                 del api_key
                 try:
-                    try:
-                        outcome = await invocation
-                    finally:
-                        del invocation
+                    outcome = await invocation
+                    receipt = _received_result(outcome)
                     if isinstance(outcome, _SafeTransportFailure):
                         primary_error = outcome.error
                         if isinstance(outcome.error, ModelTransportError):
@@ -807,12 +985,24 @@ class ModelGateway:
                         status_code = 200
                         should_record = True
                 except asyncio.CancelledError as error:
+                    if isinstance(error, ModelResponseCancelled):
+                        receipt = error.receipt
+                    elif invocation.done() and not invocation.cancelled() and invocation.exception() is None:
+                        receipt = _received_result(invocation.result())
                     primary_error = error
                 except (CapacityBackendError, CapacityConfigurationError) as error:
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
                     should_record = True
                     primary_error = ModelGatewayError("model transport failed")
+                finally:
+                    del invocation
+
+            if isinstance(primary_error, asyncio.CancelledError) and receipt is not None:
+                should_record = True
+                if isinstance(receipt, ModelResponse):
+                    response = receipt
+                    status_code = 200
 
             if should_record:
                 if transport_started is None:  # pragma: no cover - invariant
@@ -826,19 +1016,29 @@ class ModelGateway:
                         succeeded=response is not None,
                     )
                 except asyncio.CancelledError as error:
-                    if primary_error is None:
+                    if primary_error is None or isinstance(
+                        primary_error, ModelResponseError | asyncio.CancelledError
+                    ):
                         primary_error = error
                 except Exception:  # noqa: BLE001 - preserve any primary model failure
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
         finally:
             release_error = await self._release_cleanup(capacity, lease)
+            if isinstance(release_error, asyncio.CancelledError) and isinstance(
+                primary_error, ModelResponseError | asyncio.CancelledError
+            ):
+                primary_error = release_error
             if release_error is not None and primary_error is None:
                 if isinstance(release_error, asyncio.CancelledError):
                     primary_error = release_error
                 else:
                     primary_error = ModelGatewayError("model capacity release failed")
 
+        if isinstance(primary_error, asyncio.CancelledError) and receipt is not None:
+            cancelled = ModelResponseCancelled(receipt=receipt)
+            cancelled.args = primary_error.args
+            raise cancelled from None
         if primary_error is not None:
             raise primary_error from None
         if response is None:  # pragma: no cover - defensive invariant
@@ -858,22 +1058,46 @@ class ModelGateway:
         )
         del api_key
         heartbeat_task = asyncio.create_task(self._heartbeat(capacity, lease))
+        outcome: ModelResponse | _SafeTransportFailure | None = None
+        primary_error: BaseException | None = None
         try:
             done, _pending = await asyncio.wait(
                 {transport_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
             )
             if transport_task in done:
-                heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-                return transport_task.result()
-            transport_task.cancel()
-            await asyncio.gather(transport_task, return_exceptions=True)
-            return await heartbeat_task
+                outcome = transport_task.result()
+            else:
+                await heartbeat_task
+                raise CapacityBackendError("model capacity heartbeat stopped")
+        except asyncio.CancelledError as error:
+            primary_error = error
+        except Exception as error:  # noqa: BLE001 - cleanup before propagating worker failure
+            primary_error = error
         finally:
             for task in (transport_task, heartbeat_task):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(transport_task, heartbeat_task, return_exceptions=True)
+            cleanup_error = await _settle_cleanup(
+                asyncio.gather(transport_task, heartbeat_task, return_exceptions=True)
+            )
+            if cleanup_error is not None and (
+                primary_error is None or isinstance(primary_error, asyncio.CancelledError)
+            ):
+                primary_error = cleanup_error
+        if isinstance(primary_error, asyncio.CancelledError):
+            # Cancellation may arrive after transport completion but before delivery.
+            if outcome is None and not transport_task.cancelled():
+                outcome = transport_task.result()
+            receipt = _received_result(outcome)
+            if receipt is not None:
+                cancelled = ModelResponseCancelled(receipt=receipt)
+                cancelled.args = primary_error.args
+                raise cancelled from None
+        if primary_error is not None:
+            raise primary_error from None
+        if outcome is None:  # pragma: no cover - completed transport invariant
+            raise ModelGatewayError("model transport result unavailable")
+        return outcome
 
     async def _call_transport_safely(
         self,
@@ -884,8 +1108,24 @@ class ModelGateway:
         outcome: ModelResponse | _SafeTransportFailure
         try:
             outcome = await self._transport.complete(deployment, request, api_key)
+        except ModelResponseCancelled as error:
+            # A task-cancelled state/gather can discard a CancelledError subclass's receipt.
+            outcome = _SafeTransportFailure(ModelResponseCancelled(receipt=error.receipt))
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
         except asyncio.CancelledError:
             raise
+        except ModelResponseError as error:
+            _LOGGER.warning("model_response_rejected deployment_id=%s", deployment.id)
+            outcome = _SafeTransportFailure(ModelResponseError(
+                "model response rejected", status_code=error.status_code, evidence=error.evidence,
+            ))
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
         except ModelTransportError as error:
             _LOGGER.exception(
                 "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
@@ -933,14 +1173,4 @@ class ModelGateway:
         self, capacity: CapacityController | CapacityPool, lease: CapacityLease
     ) -> BaseException | None:
         release_task = asyncio.create_task(capacity.release(lease))
-        try:
-            await asyncio.shield(release_task)
-        except asyncio.CancelledError as error:
-            try:
-                await release_task
-            except Exception as cleanup_error:  # noqa: BLE001 - preserve cancellation
-                del cleanup_error
-            return error
-        except Exception as error:  # noqa: BLE001 - caller decides primary precedence
-            return error
-        return None
+        return await _settle_cleanup(release_task)

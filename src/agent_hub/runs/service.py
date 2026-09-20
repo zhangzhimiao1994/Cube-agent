@@ -1703,18 +1703,7 @@ class RunService:
 
     async def _safe_record_self_repair_decision_for_record(self, record: RunRecord) -> None:
         try:
-            events_source = getattr(self._repository, "events", None)
-            if callable(events_source):
-                raw_events = await events_source(record.tenant_id, record.id)
-                events = tuple(
-                    _run_event_from_public_payload(event)
-                    for event in raw_events
-                    if isinstance(event, Mapping)
-                )
-            elif isinstance(events_source, list):
-                events = tuple(event for event in events_source if isinstance(event, RunEvent))
-            else:
-                events = ()
+            events = await self._repository.raw_events(record.tenant_id, record.id)
         except Exception as error:
             _LOGGER.exception(
                 "run_self_repair_event_load_failed run_id=%s error_type=%s",
@@ -1754,15 +1743,7 @@ class RunService:
         if record.status is not RunStatus.FAILED:
             return
         try:
-            events_source = getattr(self._repository, "events", None)
-            if not callable(events_source):
-                return
-            raw_events = await events_source(record.tenant_id, record.id)
-            events = tuple(
-                _run_event_from_public_payload(event)
-                for event in raw_events
-                if isinstance(event, Mapping)
-            )
+            events = await self._repository.raw_events(record.tenant_id, record.id)
         except Exception as error:
             _LOGGER.exception(
                 "run_empty_response_closure_event_load_failed run_id=%s error_type=%s",
@@ -1901,16 +1882,8 @@ class RunService:
         run_id: UUID,
         fallback: tuple[RunEvent, ...],
     ) -> tuple[RunEvent, ...]:
-        events_source = getattr(self._repository, "events", None)
-        if not callable(events_source):
-            return fallback
         try:
-            raw_events = await events_source(tenant_id, run_id)
-            return tuple(
-                _run_event_from_public_payload(event)
-                for event in raw_events
-                if isinstance(event, Mapping)
-            )
+            return await self._repository.raw_events(tenant_id, run_id)
         except Exception as error:
             _LOGGER.exception(
                 "run_event_snapshot_load_failed run_id=%s error_type=%s",
@@ -2698,16 +2671,6 @@ def _needs_empty_response_closure_artifact(events: tuple[RunEvent, ...]) -> bool
         if diagnostic.get("error_code") == "model.empty_response":
             return True
     return False
-
-
-def _run_event_from_public_payload(event: Mapping[str, object]) -> RunEvent:
-    return RunEvent.from_payload(
-        {
-            key: value
-            for key, value in event.items()
-            if key in RunEvent.model_fields
-        }
-    )
 
 
 def _has_delivery_artifact(events: tuple[RunEvent, ...]) -> bool:

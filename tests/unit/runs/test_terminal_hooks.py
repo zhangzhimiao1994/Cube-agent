@@ -288,6 +288,11 @@ class ExecutableFakeRepository:
             for event in self.event_log
         )
 
+    async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[RunEvent, ...]:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        return tuple(self.event_log)
+
     def _record(self) -> RunRecord:
         return RunRecord(
             id=self.row.id,

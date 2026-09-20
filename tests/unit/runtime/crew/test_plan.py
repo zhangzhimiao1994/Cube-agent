@@ -95,6 +95,62 @@ def test_valid_plan_has_deterministic_layers_and_round_trip() -> None:
     assert len(plan.digest) == 64
 
 
+@pytest.mark.parametrize(
+    "budget,serialized",
+    [
+        (10, "10"),
+        (100, "100"),
+        (1000, "1000"),
+        (1000000, "1000000"),
+    ],
+)
+def test_integer_decimal_budgets_round_trip_without_exponent_text(
+    budget: int,
+    serialized: str,
+) -> None:
+    base_payload = DispatchPlan(
+        agents=(agent("writer"),),
+        steps=(DispatchStep(id="final", agent="writer", task="Write answer", final_synthesizer=True),),
+    ).to_payload()
+    steps = base_payload["steps"]
+    assert isinstance(steps, list)
+    payload = dict(base_payload)
+    payload["steps"] = [dict(steps[0], cost_budget_usd=budget)]
+    payload["total_cost_usd"] = budget
+
+    plan = DispatchPlan.from_payload(payload)
+
+    serialized_payload = plan.to_payload()
+    round_tripped = DispatchPlan.from_payload(serialized_payload)
+    revalidated = DispatchPlan.revalidate(plan)
+
+    assert serialized_payload["total_cost_usd"] == serialized
+    assert serialized_payload["steps"][0]["cost_budget_usd"] == serialized
+    assert round_tripped == plan
+    assert DispatchPlan.from_payload(round_tripped.to_payload()) == round_tripped
+    assert revalidated == plan
+    assert revalidated.to_payload() == serialized_payload
+    assert round_tripped.digest == plan.digest
+
+
+@pytest.mark.parametrize("value", ["1E+1", "1e1", "NaN", "Infinity", "-Infinity", True])
+def test_payload_decimal_budgets_reject_exponents_non_finite_and_bool(value: object) -> None:
+    valid = DispatchPlan(
+        agents=(agent("writer"),),
+        steps=(DispatchStep(id="final", agent="writer", task="Write answer", final_synthesizer=True),),
+    ).to_payload()
+
+    invalid_total = dict(valid)
+    invalid_total["total_cost_usd"] = value
+    with pytest.raises(InvalidDispatchPlan):
+        DispatchPlan.from_payload(invalid_total)
+
+    invalid_step = dict(valid)
+    invalid_step["steps"] = [dict(valid["steps"][0], cost_budget_usd=value)]
+    with pytest.raises(InvalidDispatchPlan):
+        DispatchPlan.from_payload(invalid_step)
+
+
 def test_handoff_source_steps_require_structured_output_schema() -> None:
     with pytest.raises((InvalidDispatchPlan, ValidationError), match="output_schema"):
         DispatchPlan(

@@ -5,11 +5,21 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
 
-from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import (
+    Deployment,
+    ModelRequest,
+    ModelResponse,
+    RejectedOutputEvidence,
+    RejectedOutputReason,
+    RejectedOutputStatus,
+    RejectedUsageStatus,
+    TokenUsage,
+    ToolCall,
+)
 
 _MAX_BYTES = 262_144
 _MAX_DEPTH = 64
@@ -18,6 +28,17 @@ _MAX_NODES = 16_384
 
 class ResponsesContractError(ValueError):
     """Safe diagnostic without provider text, schema contents, or credentials."""
+
+    def __init__(self, message: str, *, evidence: RejectedOutputEvidence | None = None) -> None:
+        super().__init__(message)
+        self.evidence = evidence
+
+
+class _RejectOutput(Protocol):
+    def __call__(
+        self, reason: RejectedOutputReason, *, status: RejectedOutputStatus = "unknown",
+        final_text: str | None = None,
+    ) -> ResponsesContractError: ...
 
 
 def _get(value: object, key: str) -> Any:
@@ -174,20 +195,55 @@ def _loads(text: str) -> object:
 
 
 def parse_response(response: object, request: ModelRequest) -> ModelResponse:
+    raw_usage = _get(response, "usage")
+    usage: TokenUsage | None = None
+    usage_status: RejectedUsageStatus = "missing" if raw_usage is None else "invalid"
+    counts = [_get(raw_usage, name) for name in ("input_tokens", "output_tokens", "total_tokens")]
+    if (
+        all(type(value) is int and value >= 0 for value in counts)
+        and counts[0] + counts[1] == counts[2]
+    ):
+        usage = TokenUsage(*counts)
+        usage_status = "known"
+
+    def rejected(
+        reason: RejectedOutputReason, *, status: RejectedOutputStatus = "unknown",
+        final_text: str | None = None,
+    ) -> ResponsesContractError:
+        return ResponsesContractError(
+            "Responses output rejected",
+            evidence=RejectedOutputEvidence(
+                final_text=final_text, usage=usage, usage_status=usage_status,
+                status=status, reason=reason,
+            ),
+        )
+
+    try:
+        schema = _schema(request)
+    except ResponsesContractError:
+        raise rejected("configuration_error") from None
+    try:
+        return _parse_output(response, request, usage, schema, rejected)
+    except ResponsesContractError as error:
+        if error.evidence is not None:
+            raise
+        raise rejected("invalid_output") from None
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        raise rejected("invalid_output") from None
+
+
+def _parse_output(
+    response: object, request: ModelRequest, usage: TokenUsage | None,
+    schema: dict[str, Any], rejected: _RejectOutput,
+) -> ModelResponse:
     if (
         _get(response, "status") != "completed"
         or _get(response, "error") is not None
         or _get(response, "incomplete_details") is not None
     ):
-        raise ResponsesContractError("Responses output did not complete")
-    raw_usage = _get(response, "usage")
-    counts = [_get(raw_usage, name) for name in ("input_tokens", "output_tokens", "total_tokens")]
-    if (
-        any(type(value) is not int or value < 0 for value in counts)
-        or counts[0] + counts[1] != counts[2]
-    ):
-        raise ResponsesContractError("Responses usage is missing or invalid")
-    usage = TokenUsage(*counts)
+        if _get(response, "status") == "incomplete":
+            raise rejected("incomplete", status="incomplete")
+        raise rejected("invalid_output")
     output = _get(response, "output")
     if not isinstance(output, list | tuple) or not 1 <= len(output) <= 128:
         raise ResponsesContractError("Responses output items are invalid")
@@ -202,7 +258,7 @@ def parse_response(response: object, request: ModelRequest) -> ModelResponse:
             or _get(item, "incomplete_details") is not None
             or _get(item, "status") not in {None, "completed"}
         ):
-            raise ResponsesContractError("Responses output item did not complete")
+            raise rejected("incomplete", status="incomplete")
         kind = _get(item, "type")
         if kind == "reasoning":
             continue
@@ -211,12 +267,14 @@ def parse_response(response: object, request: ModelRequest) -> ModelResponse:
             if message_count > 1:
                 raise ResponsesContractError("Responses output has multiple final messages")
             if _get(item, "role") != "assistant" or _get(item, "status") != "completed":
-                raise ResponsesContractError("Responses message did not complete")
+                raise rejected("incomplete", status="incomplete")
             content = _get(item, "content")
             if not isinstance(content, list | tuple) or not 1 <= len(content) <= 128:
                 raise ResponsesContractError("Responses message content is invalid")
             for part in content:
                 text = _get(part, "text")
+                if _get(part, "type") == "refusal":
+                    raise rejected("refusal", status="refused")
                 if _get(part, "type") != "output_text" or type(text) is not str:
                     raise ResponsesContractError("Responses output is refused or unsupported")
                 texts.append(text)
@@ -234,25 +292,36 @@ def parse_response(response: object, request: ModelRequest) -> ModelResponse:
                 or _get(item, "status") not in {None, "completed"}
                 or len(calls) >= 16
             ):
-                raise ResponsesContractError("Responses function call is invalid")
-            parsed = _loads(arguments)
-            if not isinstance(parsed, dict):
-                raise ResponsesContractError("Responses function arguments must be an object")
-            calls.append(ToolCall(id=call_id, name=name, arguments=parsed))
+                raise rejected("invalid_tool")
+            try:
+                parsed = _loads(arguments)
+                if not isinstance(parsed, dict):
+                    raise rejected("invalid_tool")
+                calls.append(ToolCall(id=call_id, name=name, arguments=parsed))
+            except (ValueError, TypeError):
+                raise rejected("invalid_tool") from None
             call_ids.add(call_id)
         else:
             raise ResponsesContractError("Responses output item type is unsupported")
     if sum(len(text.encode()) for text in texts) > 65_536:
-        raise ResponsesContractError("Responses output exceeds byte limit")
+        raise rejected("output_limit", status="completed")
     text = "".join(texts) if texts else None
     if calls and texts:
         raise ResponsesContractError("Responses output mixes final text and function calls")
     if not calls:
         if text is None:
             raise ResponsesContractError("Responses output has no final result")
-        instance = _loads(text)
-        if not Draft202012Validator(_schema(request)).is_valid(instance):
-            raise ResponsesContractError("Responses output does not match the required schema")
+        try:
+            instance = _loads(text)
+        except ResponsesContractError:
+            raise rejected("invalid_json", status="completed", final_text=text) from None
+        if not Draft202012Validator(schema).is_valid(instance):
+            raise rejected("schema_mismatch", status="completed", final_text=text)
+    if usage is None:
+        reason: RejectedOutputReason = (
+            "usage_missing" if _get(response, "usage") is None else "usage_invalid"
+        )
+        raise rejected(reason, status="completed", final_text=text)
     return ModelResponse(
         text=text,
         tool_calls=tuple(calls),

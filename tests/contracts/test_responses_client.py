@@ -338,7 +338,7 @@ async def test_native_stream_and_multimodal_input_fail_before_creating_client() 
             ),
         )
     )
-    with pytest.raises(ValueError, match="input"):
+    with pytest.raises(ModelResponseError, match="configuration rejected"):
         await client.complete(deployment(), req, API_KEY)
     factory.assert_not_called()
 
@@ -407,7 +407,7 @@ async def test_native_tool_arguments_are_strict_json(arguments: str) -> None:
 async def test_unsupported_schema_rejected_before_client_creation(schema: dict[str, Any]) -> None:
     client, factory, _, _, _ = setup_client()
     req = request(response_schema=StructuredResponseSchema(name="Invalid", schema=schema))
-    with pytest.raises(ValueError):
+    with pytest.raises(ModelResponseError, match="configuration rejected"):
         await client.complete(deployment(), req, API_KEY)
     factory.assert_not_called()
 

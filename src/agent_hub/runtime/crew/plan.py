@@ -116,10 +116,12 @@ def _decimal(value: object, name: str) -> Decimal:
     text = str(value)
     if len(text) > 32 or _DECIMAL.fullmatch(text) is None:
         raise ValueError(f"{name} must be a bounded decimal")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     number = Decimal(text)
     if not number.is_finite():
         raise ValueError(f"{name} must be finite")
-    return Decimal(0) if number.is_zero() else number.normalize()
+    return Decimal(0) if number.is_zero() else number
 
 
 class AgentSpec(_PlanModel):

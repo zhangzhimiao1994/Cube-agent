@@ -2,14 +2,54 @@
 
 ## Status And Priority
 
-Design only, 2026-09-21; no implementation or verification is claimed.
+Implemented locally, 2026-09-21; local/adversarial restore and isolated PG gates
+pass. Production release/provider/CI acceptance remains pending.
+Native Responses and dispatch guidance passed actual provider/production acceptance
+and GitHub quality run 35531088347 at revision 240b739.
 
 Mainline order: **current prompt + transport fixes pass real-provider acceptance
 and are pushed, with CI checked -> this strict repair slice -> discuss guidance**.
-Feynman owns Crew prompt/schema precedence; Cicero owns unsupported/ignored schema
-transport rejection. Do not edit their files until integration and ownership
-handover. This order takes precedence over the earlier discuss plan's next-slice
-wording; those two documents remain unchanged.
+The native slice's file ownership has been handed over. This order takes
+precedence over the earlier discuss plan's next-slice wording.
+
+## Rejected Response Prerequisite
+
+Ruling: the original adapter-only scope is insufficient after native validation.
+Codec/gateway currently discard rejected text and usage, and classify the error
+as retryable transport failure. Add a narrow rejected-evidence contract before
+runtime correction; never weaken native validation or return a successful result.
+
+- Internal immutable `RejectedOutputEvidence` contains bounded original final text
+  (private, repr-hidden), its computed digest, actual `TokenUsage | None`, explicit
+  known/missing/invalid usage state and a fixed rejection code. Do not retain SDK
+  objects, headers, credentials, reasoning or reconstructed/coerced JSON.
+- `ModelResponseError` may carry this evidence but remains a rejection. All such
+  response-contract errors are non-retryable by ordinary gateway fallback, even
+  when no recoverable text/usage exists. Genuine network retry policy is unchanged.
+- `GatewayRejectedOutput` supplies gateway-selected deployment/model provenance,
+  the evidence and actual priced cost or None. It is an exception, never a
+  `GatewayCompletion`. Missing price/usage is unknown, not a zero-cost success.
+- Post-response cancellation carries only an actually received result:
+  `ModelResponseCancelled.receipt` is `ModelResponse | RejectedOutputEvidence`;
+  `GatewayResponseCancelled.receipt` is `GatewayCompletion | GatewayRejectedOutput`.
+  Both remain cancellation exceptions. Account the receipt once, then propagate
+  cancellation without business success, correction or fallback. Before-response
+  cancellation has no receipt. Close/record/release/heartbeat cleanup must not
+  discard a known result or synthesize missing usage.
+- Only complete, bounded, no-tool final text with JSON/schema errors is eligible
+  for format correction, and only after trusted usage/budget checks. Refusal,
+  incomplete output, invalid tools, cancellation, unknown outcome and configuration
+  errors are not eligible. Preserve known usage even on ineligible failures.
+- Runtime must record a distinct rejected model outcome, actual consumption and
+  source linkage before considering correction. Private candidate text belongs
+  only in protected runtime state, excluded from public events/projections; public
+  evidence uses digests, codes and IDs. Restore validation must not turn rejected
+  outcomes into successful model or business artifacts.
+- Add real SDK mock-wire tests through the gateway: no fallback after rejection,
+  exact original usage and provenance, no private text in repr/logs, closure and
+  capacity release. Then prove Crew original 129 plus correction 17 totals 146,
+  including rejected correction and zero-charge replay. These numbers are test
+  vectors, not production usage claims.
 
 ## Problem And Boundary
 
@@ -130,11 +170,18 @@ actors cannot claim it. Reserve before the correction call;
 validate linkage and artifact graph on restore. Update strict checkpoint schema/
 version compatibility explicitly; legacy incomplete checkpoints lacking necessary
 repair identity fail closed rather than receiving a fresh allowance.
+Check linkage in both directions: deleting a repair mapping must not erase a
+correction already present in the model ledger. Reviewer repair candidates must
+match the actual response artifact sources and the same step/attempt, not merely
+two mutually consistent metadata fields. Historical valid revise outcomes remain
+valid history; only the completed attempt requires approve.
 
 Replayed succeeded calls cause no new invocation, injected event or usage charge;
 running uncertain calls are not reissued. A prepared-but-unsubmitted correction
 may use the same reserved key. Changed schema/candidate/guidance must not bypass
 request-hash matching. Preserve contiguous cursor and artifact lineage validation.
+Reserve the correction output cap with its request identity; do not recompute a
+different hash from already-charged usage during successful-response replay.
 
 Record actual usage/cost for worker/reviewer originals and correction responses, even when
 schema validation or framework-raw validation fails. Store per-call usage once

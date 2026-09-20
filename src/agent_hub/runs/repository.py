@@ -1291,6 +1291,32 @@ class RunRepository:
                 events.append(payload)
             return tuple(events)
 
+    async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[RunEvent, ...]:
+        """Internal reconstruction only; public consumers must use events()."""
+        async with self._session_factory() as session:
+            await self._assert_run(session, tenant_id, run_id)
+            rows = (
+                await session.scalars(
+                    select(RunEventRow)
+                    .where(RunEventRow.tenant_id == tenant_id, RunEventRow.run_id == run_id)
+                    .order_by(RunEventRow.sequence)
+                )
+            ).all()
+            events: list[RunEvent] = []
+            for row in rows:
+                if row.tenant_id != tenant_id or row.run_id != run_id:
+                    raise RunConflict("stored run event scope mismatch")
+                try:
+                    event = RunEvent.from_payload(dict(row.payload))
+                except (TypeError, ValueError):
+                    raise RunConflict("stored run event is invalid") from None
+                if event.run_id != run_id or (
+                    event.checkpoint is not None and event.checkpoint.tenant_id != tenant_id
+                ):
+                    raise RunConflict("stored run event scope mismatch")
+                events.append(event)
+            return tuple(events)
+
     async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
         async with self._session_factory() as session:
             rows = (
@@ -1799,8 +1825,38 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     kind = payload.get("kind")
     if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
         return context_event_projection(payload)
+    public = {
+        key: _sanitize_public_json(value)
+        for key, value in payload.items()
+        if _is_public_key(key) and key not in {"checkpoint", "checkpoint_summary"}
+    }
+    if "checkpoint" in payload or kind == EventKind.CHECKPOINT_SAVED.value:
+        public["checkpoint"] = None
+    if kind == EventKind.CHECKPOINT_SAVED.value:
+        checkpoint = payload.get("checkpoint")
+        public["checkpoint_summary"] = _public_checkpoint_summary(
+            payload.get("checkpoint_summary") if checkpoint is None else checkpoint
+        )
+    return public
+
+
+def _public_checkpoint_summary(value: object) -> dict[str, str]:
+    # Never manufacture a redacted RuntimeCheckpoint with a misleading resume hash.
+    if not isinstance(value, dict):
+        return {}
+    patterns = {
+        "id": r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+        "runtime_type": r"[a-z0-9][a-z0-9_.-]{0,127}",
+        "runtime_version": r"[0-9]+(?:\.[0-9]+){0,2}",
+        "mode": r"direct|discuss|dispatch|hybrid",
+        "state_sha256": r"[0-9a-f]{64}",
+    }
     return {
-        key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
+        key: item
+        for key, pattern in patterns.items()
+        if type(item := value.get(key)) is str
+        and len(item) <= 128
+        and re.fullmatch(pattern, item) is not None
     }
 
 

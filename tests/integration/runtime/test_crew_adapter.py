@@ -116,7 +116,11 @@ class FakeGateway:
             if "REVIEWER" in prompt:
                 text = self.reviews.pop(0) if self.reviews else '{"verdict":"approve"}'
             elif request.response_schema is not None:
-                text = '{"summary":"safe result","findings":["safe"]}'
+                properties = cast(
+                    Mapping[str, object], request.response_schema.schema["properties"]
+                )
+                values = {"summary": "safe result", "findings": ["safe"], "risks": []}
+                text = json.dumps({key: values[key] for key in properties})
             else:
                 text = f"safe result {len(self.requests)}"
             return GatewayCompletion(
@@ -536,20 +540,56 @@ async def test_reviewer_feedback_causes_only_bounded_retry() -> None:
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
-async def test_invalid_reviewer_response_is_recorded_without_failing_dispatch() -> None:
-    gateway = FakeGateway(reviews=[""])
-    events = await collect(make_runtime(gateway, plan(review=True)), context())
+async def test_invalid_reviewer_response_requires_accounted_correction_and_real_approval() -> None:
+    approved = '{"verdict":"approve"}'
+    gateway = FakeGateway(reviews=["", approved])
+    repository = InMemoryArtifactRepository()
+    runtime = make_runtime(gateway, plan(review=True), artifact_repository=repository)
+    events = await collect(runtime, context())
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
-    assert retrying.actor == "critic"
-    assert retrying.payload["error_code"] == "model.empty_response"
-    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert not any(event.kind is EventKind.STEP_RETRYING for event in events)
+    reviewer_requests = [
+        request for request in gateway.requests
+        if request.response_schema is not None
+        and request.response_schema.name == "DispatchReviewVerdict"
+    ]
+    assert len(reviewer_requests) == 2 and gateway.reviews == []
+    initial, correction = reviewer_requests
+    assert correction.logical_model == initial.logical_model
+    assert correction.response_schema == initial.response_schema
+    assert correction.tools == () and correction.allow_fallback is False
+    assert len(gateway.requests) == 5
     review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review.actor == "critic"
     assert review.payload["verdict"] == "approve"
     assert "review_status" not in review.payload
     assert "warning" not in review.payload
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 10, "cost_usd": "0"}
+    repairs = checkpoint.state["structured_repairs"]
+    assert isinstance(repairs, Mapping) and set(repairs) == {"left"}
+    repair = repairs["left"]
+    assert isinstance(repair, Mapping)
+    assert repair["actor"] == "critic" and repair["status"] == "succeeded"
+    models = checkpoint.state["models"]
+    assert isinstance(models, Mapping)
+    source = models[cast(str, repair["source_key"])]
+    corrected = models[cast(str, repair["correction_key"])]
+    assert isinstance(source, Mapping) and source["status"] == "rejected"
+    assert isinstance(corrected, Mapping) and corrected["status"] == "succeeded"
+    assert any(
+        event.artifact is not None
+        and str(event.artifact.id) == corrected["artifact_id"]
+        and event.artifact.content.get("text") == approved
+        for event in events
+    )
+    replay_gateway = FakeGateway()
+    replay = make_runtime(replay_gateway, plan(review=True), artifact_repository=repository)
+    await replay.restore_checkpoint(checkpoint)
+    resumed = await collect(replay, context(checkpoint=checkpoint))
+    assert [event.kind for event in resumed] == [EventKind.RUNTIME_COMPLETED]
+    assert replay_gateway.requests == []
 
 
 async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:

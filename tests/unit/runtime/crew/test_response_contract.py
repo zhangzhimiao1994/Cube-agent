@@ -184,12 +184,16 @@ async def test_reviewer_contract_counts_toward_size_before_its_ledger_entry(
     ))
     gateway = FakeGateway()
     runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
-    events = [event async for event in runtime.run(context)]
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match='limit'):
+        async for event in runtime.run(context):
+            events.append(event)
     assert all(request.logical_model != 'review' for request in gateway.requests)
-    skipped = next(event for event in events if event.kind == 'review.completed')
-    # The existing outer policy skips review failures; this test checks the submission boundary.
-    assert skipped.payload['review_status'] == 'skipped'
-    assert 'limit' in str(skipped.payload['warning'])
+    failed = next(event for event in events if event.kind == 'review.failed')
+    assert failed.payload['review_status'] == 'unverified'
+    assert 'verdict' not in failed.payload
+    assert not any(event.kind in {'review.completed', 'step.completed'} for event in events)
+    assert not any(event.step_id == 'final_response' for event in events)
     assert all(entry['purpose'] != 'review'
                for event in events if event.checkpoint
                for entry in cast(Mapping[str, Mapping[str, JsonValue]],
@@ -208,10 +212,10 @@ async def test_prose_still_fails_without_fabricated_handoff(
         gateway, _structured_dependent_final_plan(), crew_factory=FastFactory(),
     )
     events: list[RunEvent] = []
-    with pytest.raises(RuntimeExecutionError, match='structured handoff output is not valid json'):
+    with pytest.raises(RuntimeExecutionError, match='structured output invalid'):
         async for event in runtime.run(context):
             events.append(event)
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == 2
     assert_contract(gateway.requests[0])
     assert not any(event.step_id == 'final_response' for event in events)
     assert not any(event.kind == 'step.completed' for event in events)

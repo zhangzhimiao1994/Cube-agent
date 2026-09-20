@@ -20,12 +20,16 @@ import weakref
 from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Never, Protocol, cast
 from uuid import UUID, uuid4
+
+from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
+from jsonschema.protocols import Validator  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
@@ -33,16 +37,22 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import (
+    GatewayCompletion,
+    GatewayRejectedOutput,
+    GatewayResponseCancelled,
+)
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RejectedOutputEvidence,
     StructuredResponseSchema,
     TokenUsage,
     ToolCall,
     ToolDefinition,
+    _require_safe_identifier,
 )
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.artifacts import (
@@ -59,6 +69,9 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+)
+from agent_hub.runtime.contracts import (
+    _freeze_json as _freeze_bounded_json,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.failure_reason import (
@@ -88,7 +101,7 @@ from agent_hub.runtime.self_repair_context import (
 _LOGGER = logging.getLogger(__name__)
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "7"
+_RUNTIME_VERSION = "8"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
@@ -795,6 +808,14 @@ class RuntimeExecutionError(RuntimeError):
     """Stable dispatch failure that never includes model, tool, or plan input."""
 
 
+class _ReviewFailed(RuntimeExecutionError):
+    """A failed review must not restart the worker through outer recovery."""
+
+
+class _ModelContractFailed(RuntimeExecutionError):
+    """A contract failure cannot restart paid business or review work."""
+
+
 class _StableTerminalError(RuntimeExecutionError):
     """A failure already durably recorded in a terminal checkpoint."""
 
@@ -808,8 +829,6 @@ def _fail(message: str) -> Never:
 
 
 def _subagent_model_attempt(retries: int, recovery_attempt: int) -> int:
-    if recovery_attempt == 0:
-        return retries
     return retries * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + recovery_attempt
 
 
@@ -925,80 +944,136 @@ def _validate_structured_role_output(
 ) -> None:
     if not agent.output_schema:
         return
-    diagnostic_prefix = (
-        "structured handoff output"
-        if _step_has_dependents(plan, step)
-        else "structured role output"
+    try:
+        _parse_structured_role_output(agent, text)
+    except RuntimeExecutionError as error:
+        reason = str(error)
+        if _step_has_dependents(plan, step):
+            reason = reason.replace("structured role output", "structured handoff output", 1)
+        _fail(reason)
+
+
+def _structured_validator(schema: StructuredResponseSchema) -> Validator:
+    try:
+        payload = _mutable_json(_freeze_bounded_json(schema.schema))
+    except (ValueError, TypeError, RecursionError):
+        _fail("structured output schema exceeds limits")
+
+    def check(item: object) -> None:
+        if not isinstance(item, dict):
+            return
+        if any(key in item for key in ("$ref", "$dynamicRef", "$recursiveRef", "format")):
+            _fail("structured output schema uses unsupported references or format")
+        if "$schema" in item and item["$schema"] != "https://json-schema.org/draft/2020-12/schema":
+            _fail("structured output schema dialect is unsupported")
+        for key in ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas"):
+            children = item.get(key)
+            if isinstance(children, dict):
+                for child in children.values():
+                    check(child)
+        for key in (
+            "additionalProperties",
+            "unevaluatedProperties",
+            "propertyNames",
+            "items",
+            "unevaluatedItems",
+            "contains",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ):
+            check(item.get(key))
+        for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            children = item.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    check(child)
+
+    check(payload)
+    try:
+        validator = validator_for(payload, default=Draft202012Validator)
+        validator.check_schema(payload)
+    except SchemaError:
+        _fail("structured output schema is invalid")
+    return cast(Validator, validator(payload))
+
+
+def _parse_structured_output(
+    schema: StructuredResponseSchema,
+    text: object,
+    *,
+    prefix: str,
+    max_bytes: int,
+) -> Mapping[str, JsonValue]:
+    validator = _structured_validator(schema)
+    if type(text) is not str:
+        _fail(f"{prefix} is not valid json")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError:
+        _fail(f"{prefix} is not valid json")
+    if size > max_bytes:
+        _fail(f"{prefix} exceeds output limit")
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    def reject_constant(_: str) -> Never:
+        raise ValueError("nonfinite number")
+
+    try:
+        payload = json.loads(text, object_pairs_hook=pairs, parse_constant=reject_constant)
+        frozen = _freeze_bounded_json(payload)
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        _fail(f"{prefix} is not valid json")
+    if not isinstance(frozen, Mapping):
+        _fail(f"{prefix} is not an object")
+    error = next(validator.iter_errors(payload), None)
+    if error is not None:
+        reason = {
+            "required": "missing field",
+            "type": "field type mismatch",
+            "additionalProperties": "has unexpected fields",
+        }.get(error.validator, "does not match schema")
+        _fail(f"{prefix} {reason}")
+    return frozen
+
+
+def _parse_structured_role_output(agent: AgentSpec, text: object) -> Mapping[str, JsonValue]:
+    schema = _agent_response_schema(agent)
+    if schema is None:
+        _fail("structured role output schema is missing")
+    return _parse_structured_output(
+        schema,
+        text,
+        prefix="structured role output",
+        max_bytes=_MAX_OUTPUT_BYTES,
     )
 
-    def fail(reason: str) -> Never:
-        _fail(f"{diagnostic_prefix} {reason}")
 
-    if not isinstance(text, str):
-        fail("is not valid json")
+def _same_json_value(left: JsonValue, right: JsonValue) -> bool:
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return set(left) == set(right) and all(_same_json_value(left[key], right[key]) for key in left)
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(_same_json_value(a, b) for a, b in zip(left, right, strict=True))
+    return type(left) is type(right) and left == right
+
+
+def _check_framework_raw(schema: StructuredResponseSchema, actual: object, raw: object) -> None:
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        fail("is not valid json")
-    if not isinstance(payload, dict):
-        fail("is not an object")
-    for field_name, description in agent.output_schema.items():
-        if field_name not in payload:
-            fail("missing field")
-        if not _structured_handoff_field_matches(payload[field_name], description):
-            fail("field type mismatch")
-
-
-def _reconcile_structured_handoff_completion(
-    plan: DispatchPlan,
-    step: DispatchStep,
-    agent: AgentSpec,
-    completion: GatewayCompletion,
-) -> GatewayCompletion:
-    project_scale_artifact_output = _is_project_scale_artifact_handoff(step)
-    recovery_output = (
-        completion.fallback_used
-        or completion.logical_model != agent.logical_model
-        or project_scale_artifact_output
-    )
-    if not agent.output_schema or not _step_has_dependents(plan, step) or not recovery_output:
-        return completion
-    text = completion.response.text
-    if not isinstance(text, str):
-        return completion
-    try:
-        _validate_structured_role_output(plan, step, agent, text)
+        expected = _parse_structured_output(schema, actual, prefix="model", max_bytes=_MAX_OUTPUT_BYTES)
+        observed = _parse_structured_output(schema, raw, prefix="framework", max_bytes=_MAX_OUTPUT_BYTES)
     except RuntimeExecutionError:
-        pass
-    else:
-        return completion
-    recovered_text = _truncate_prompt_text(text.strip() or "Fallback output was empty.", max_bytes=4_000)
-    payload: dict[str, JsonValue] = {}
-    for field_name, description in agent.output_schema.items():
-        payload[field_name] = _structured_recovery_field_value(
-            field_name,
-            description,
-            recovered_text,
-            project_scale_artifact_output=project_scale_artifact_output,
-        )
-    response = completion.response
-    return GatewayCompletion(
-        response=ModelResponse(
-            text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            tool_calls=response.tool_calls,
-            usage=response.usage,
-            provider_metadata=response.provider_metadata,
-        ),
-        deployment_id=completion.deployment_id,
-        logical_model=completion.logical_model,
-        provider_id=completion.provider_id,
-        provider_model=completion.provider_model,
-        cost_usd=completion.cost_usd,
-        fallback_used=completion.fallback_used,
-        fallback_from_logical_model=completion.fallback_from_logical_model,
-        fallback_reason=completion.fallback_reason,
-        attempted_logical_models=completion.attempted_logical_models,
-    )
+        raise _ModelContractFailed("framework output mismatch") from None
+    if not _same_json_value(expected, observed):
+        raise _ModelContractFailed("framework output mismatch")
 
 
 def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
@@ -1058,55 +1133,12 @@ def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | 
     return None
 
 
-def _structured_recovery_field_value(
-    field_name: str,
-    description: str,
-    recovered_text: str,
-    *,
-    project_scale_artifact_output: bool = False,
-) -> JsonValue:
-    normalized = description.strip().casefold()
-    normalized_field = field_name.casefold()
-    if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
-        if "risk" in normalized_field:
-            if project_scale_artifact_output:
-                return ("Project-scale artifact output did not satisfy the structured response schema.",)
-            return ("Fallback output did not satisfy the structured response schema.",)
-        if project_scale_artifact_output:
-            return ("Recovered non-JSON project-scale artifact output for downstream handoff.",)
-        return ("Recovered non-JSON fallback output for downstream handoff.",)
-    if normalized in {"boolean", "bool"}:
-        return False
-    if normalized in {"integer", "int"}:
-        return 0
-    if normalized in {"number", "float", "decimal"}:
-        return 0
-    if "risk" in normalized_field:
-        if project_scale_artifact_output:
-            return "Project-scale artifact output did not satisfy the structured response schema."
-        return "Fallback output did not satisfy the structured response schema."
-    return recovered_text
-
-
 def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
     return any(step.id in candidate.depends_on for candidate in plan.steps)
 
 
 def _plan_has_orchestration_contracts(plan: DispatchPlan) -> bool:
     return any(step.depends_on for step in plan.steps)
-
-
-def _structured_handoff_field_matches(value: object, description: str) -> bool:
-    normalized = description.strip().casefold()
-    if normalized.endswith("[]") or "array" in normalized or "list" in normalized:
-        return isinstance(value, list) and all(isinstance(item, str) for item in value)
-    if normalized in {"boolean", "bool"}:
-        return isinstance(value, bool)
-    if normalized in {"integer", "int"}:
-        return isinstance(value, int) and not isinstance(value, bool)
-    if normalized in {"number", "float", "decimal"}:
-        return isinstance(value, int | float) and not isinstance(value, bool)
-    return isinstance(value, str)
 
 
 _REVIEW_RESPONSE_SCHEMA = StructuredResponseSchema(
@@ -1299,18 +1331,23 @@ class ToolBoundary(Protocol):
 
 
 class ModelStateBoundary(Protocol):
-    async def __call__(self, key: str, model_state: Mapping[str, JsonValue]) -> None: ...
+    async def __call__(
+        self, key: str, model_state: Mapping[str, JsonValue], *,
+        repair: Mapping[str, JsonValue] | None = None,
+    ) -> None: ...
 
 
 class UsageBoundary(Protocol):
     async def __call__(
         self,
-        completion: GatewayCompletion,
+        completion: GatewayCompletion | GatewayRejectedOutput,
         actor: str,
         step_id: str,
         key: str,
         model_state: Mapping[str, JsonValue],
-        artifact: Artifact,
+        artifact: Artifact | None,
+        *,
+        private_output: Mapping[str, JsonValue] | None = None,
     ) -> None: ...
 
 
@@ -1595,6 +1632,9 @@ class _ToolLedger:
 class _ModelLedger:
     states: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict)
     artifacts: dict[str, Artifact] = field(default_factory=dict)
+    rejected_outputs: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict, repr=False)
+    structured_repairs: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict)
+    usage: _UsageLedger | None = field(default=None, repr=False)
 
 
 @dataclass(slots=True)
@@ -2100,6 +2140,7 @@ class CrewDispatchRuntime:
                 if str(artifact.id) not in artifact_registry
             )
             steps = {step.id: step for step in plan.steps}
+            model_ledger.usage = usage_ledger
             checkpoint_lock = asyncio.Lock()
 
             async def boundary(
@@ -2165,13 +2206,30 @@ class CrewDispatchRuntime:
             async def model_state_boundary(
                 key: str,
                 model_state: Mapping[str, JsonValue],
+                *,
+                repair: Mapping[str, JsonValue] | None = None,
             ) -> None:
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
                         return
                     if usage_ledger.terminal_phase is not None:
                         return
+                    if repair is not None:
+                        repair_step = cast(str, model_state["step_id"])
+                        previous = model_ledger.structured_repairs.get(repair_step)
+                        if previous is not None and previous != repair:
+                            _fail("structured correction allowance exhausted")
+                        model_ledger.structured_repairs[repair_step] = repair
                     model_ledger.states[key] = model_state
+                    repair_step = cast(str, model_state["step_id"])
+                    active_repair = model_ledger.structured_repairs.get(repair_step)
+                    if active_repair is not None and active_repair["correction_key"] == key:
+                        updated_repair = dict(active_repair)
+                        if model_state["status"] == "running":
+                            updated_repair["status"] = "running"
+                        elif model_state["status"] == "failed":
+                            updated_repair["status"] = "uncertain"
+                        model_ledger.structured_repairs[repair_step] = updated_repair
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
@@ -2190,16 +2248,26 @@ class CrewDispatchRuntime:
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
             async def usage_boundary(
-                completion: GatewayCompletion,
+                completion: GatewayCompletion | GatewayRejectedOutput,
                 actor: str,
                 step_id: str,
                 key: str,
                 model_state: Mapping[str, JsonValue],
-                artifact: Artifact,
+                artifact: Artifact | None,
+                *,
+                private_output: Mapping[str, JsonValue] | None = None,
             ) -> None:
-                response_usage = completion.response.usage
+                response_usage = (
+                    completion.response.usage if isinstance(completion, GatewayCompletion)
+                    else completion.evidence.usage if completion.evidence is not None else None
+                )
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
+                        return
+                    previous = model_ledger.states.get(key)
+                    if previous is not None and previous["status"] in {
+                        "succeeded", "rejected", "received_cancelled",
+                    }:
                         return
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
                     response_cost = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
@@ -2229,7 +2297,10 @@ class CrewDispatchRuntime:
                         or step_cost_overflow
                     ):
                         terminal_phase = "audit_overflow"
-                    elif terminal_phase is None and response_usage is None:
+                    elif terminal_phase is None and (
+                        response_usage is None
+                        or (private_output is not None and completion.cost_usd is None)
+                    ):
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
                         new_tokens > min(context.token_budget, plan.total_token_budget)
@@ -2241,9 +2312,22 @@ class CrewDispatchRuntime:
                     candidate_models = _ModelLedger(
                         states=dict(model_ledger.states),
                         artifacts=dict(model_ledger.artifacts),
+                        rejected_outputs=dict(model_ledger.rejected_outputs),
+                        structured_repairs=dict(model_ledger.structured_repairs),
                     )
                     candidate_models.states[key] = model_state
-                    candidate_models.artifacts[key] = artifact
+                    if artifact is not None:
+                        candidate_models.artifacts[key] = artifact
+                    if private_output is not None:
+                        candidate_models.rejected_outputs[key] = private_output
+                    active_repair = candidate_models.structured_repairs.get(step_id)
+                    if active_repair is not None and active_repair["correction_key"] == key:
+                        updated_repair = dict(active_repair)
+                        updated_repair["status"] = (
+                            "uncertain" if model_state["status"] == "received_cancelled"
+                            else model_state["status"]
+                        )
+                        candidate_models.structured_repairs[step_id] = updated_repair
                     candidate_usage = _UsageLedger(
                         tokens=new_tokens,
                         cost_usd=new_cost,
@@ -2265,9 +2349,13 @@ class CrewDispatchRuntime:
                         ),
                     )
                     candidate_registry = dict(artifact_registry)
-                    candidate_registry[str(artifact.id)] = artifact
+                    if artifact is not None:
+                        candidate_registry[str(artifact.id)] = artifact
                     candidate_tools = tool_ledger
-                    if completion.response.tool_calls and model_state["purpose"] == "step":
+                    if (
+                        artifact is not None and isinstance(completion, GatewayCompletion)
+                        and completion.response.tool_calls and model_state["purpose"] == "step"
+                    ):
                         if len(artifact.source_ids) + 1 + len(completion.response.tool_calls) > 63:
                             _fail("artifact lineage exceeds limit")
                         provisional = _ToolLedger(
@@ -2367,18 +2455,20 @@ class CrewDispatchRuntime:
                         ),
                         terminal=terminal_phase is not None,
                         phase=terminal_phase or "running",
-                        artifact_registry={
-                            **artifact_registry,
-                            str(artifact.id): artifact,
+                        artifact_registry=candidate_registry if artifact is None else {
+                            **artifact_registry, str(artifact.id): artifact,
                         },
                         repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
-                    write_id = await store_artifact(artifact)
-                    if not self._accepts_artifact_writes(state):
+                    write_id = await store_artifact(artifact) if artifact is not None else None
+                    if artifact is not None and not self._accepts_artifact_writes(state):
                         raise asyncio.CancelledError
                     model_ledger.states[key] = model_state
-                    model_ledger.artifacts[key] = artifact
-                    artifact_registry[str(artifact.id)] = artifact
+                    if artifact is not None:
+                        model_ledger.artifacts[key] = artifact
+                        artifact_registry[str(artifact.id)] = artifact
+                    model_ledger.rejected_outputs = candidate_models.rejected_outputs
+                    model_ledger.structured_repairs = candidate_models.structured_repairs
                     usage_ledger.tokens = candidate_usage.tokens
                     usage_ledger.cost_usd = candidate_usage.cost_usd
                     usage_ledger.step_tokens = candidate_usage.step_tokens
@@ -2389,8 +2479,10 @@ class CrewDispatchRuntime:
                     usage_ledger.step_token_overflows = candidate_usage.step_token_overflows
                     usage_ledger.step_cost_overflows = candidate_usage.step_cost_overflows
                     self._publish_checkpoint(state, checkpoint)
-                    state.pending_artifact_writes.pop(write_id, None)
-                    await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
+                    if write_id is not None:
+                        state.pending_artifact_writes.pop(write_id, None)
+                    if artifact is not None:
+                        await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                     if response_cost:
                         await emit(
                             kind=EventKind.COST_RECORDED,
@@ -2717,12 +2809,6 @@ class CrewDispatchRuntime:
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
                 )
-                completion = _reconcile_structured_handoff_completion(
-                    plan,
-                    step,
-                    agent,
-                    completion,
-                )
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(
                     step,
@@ -2772,7 +2858,7 @@ class CrewDispatchRuntime:
                             review_diagnostic: dict[str, object] = dict(
                                 runtime_failure_diagnostic_from_reason(review_failure)
                             )
-                            if _can_compact_retry_subagent(
+                            if not isinstance(error, _ModelContractFailed) and _can_compact_retry_subagent(
                                 review_diagnostic,
                                 recovery_attempt=review_recovery_attempt,
                                 remaining_seconds=self._remaining_timeout(
@@ -2829,7 +2915,7 @@ class CrewDispatchRuntime:
                                         strategy="failure_closure",
                                     ),
                                 }
-                            if review_failure_retry < step.reviewer_retries:
+                            if not isinstance(error, _ModelContractFailed) and review_failure_retry < step.reviewer_retries:
                                 review_failure_retry += 1
                                 await event(
                                     kind=EventKind.STEP_RETRYING,
@@ -2849,29 +2935,19 @@ class CrewDispatchRuntime:
                                     },
                                 )
                                 continue
-                            review_status = (
-                                "timeout_skipped"
-                                if review_diagnostic.get("error_code") == "crew.step_timeout"
-                                else "skipped"
-                            )
                             await event(
-                                kind=EventKind.REVIEW_COMPLETED,
-                                actor=step.reviewer,
-                                inputs=(artifact,),
+                                kind="review.failed",
                                 payload={
-                                    "verdict": "approve",
-                                    "review_status": review_status,
-                                    "warning": review_failure,
-                                    "role": reviewer.role,
+                                    "actor": step.reviewer,
+                                    "step_id": step.id,
+                                    "review_status": "unverified",
                                     "logical_model": reviewer.logical_model,
                                     "candidate_artifact_id": str(artifact.id),
-                                    "candidate_output": _artifact_text_preview(artifact)
-                                    or "角色已完成本步骤输出。",
+                                    "candidate_sha256": artifact.content_sha256,
                                     **review_diagnostic,
                                 },
                             )
-                            await checkpoint_boundary(step.id, retries)
-                            break
+                            raise _ReviewFailed(review_failure) from None
                         else:
                             await event(
                                 kind=EventKind.REVIEW_COMPLETED,
@@ -2962,7 +3038,7 @@ class CrewDispatchRuntime:
                 diagnostic: dict[str, object] = dict(
                     runtime_failure_diagnostic_from_reason(failure_reason)
                 )
-                if _can_compact_retry_subagent(
+                if not isinstance(error, (_ReviewFailed, _ModelContractFailed)) and _can_compact_retry_subagent(
                     diagnostic,
                     recovery_attempt=recovery_attempt,
                     remaining_seconds=self._remaining_timeout(run_state, step_deadline),
@@ -3204,7 +3280,10 @@ class CrewDispatchRuntime:
         completion = last_completion
         if completion is None:
             _fail("CrewAI bypassed the ModelGateway bridge")
-        if raw != completion.response.text:
+        schema = _agent_response_schema(agent)
+        if schema is not None:
+            _check_framework_raw(schema, completion.response.text, raw)
+        elif raw != completion.response.text:
             response = completion.response
             completion = GatewayCompletion(
                 response=ModelResponse(
@@ -3251,6 +3330,7 @@ class CrewDispatchRuntime:
     ) -> tuple[ModelMessage, ...]:
         if schema is None:
             return tuple(messages)
+        _structured_validator(schema)
         contract = ModelMessage(role="system", content=(
             "This call produces an internal role result, not the user-facing final reply. "
             "Preserve the user's task and the assigned role. User-facing brevity or presentation "
@@ -3289,15 +3369,25 @@ class CrewDispatchRuntime:
                         ledger_key=ledger_key, ledger_request_sha256=ledger_request_sha256)
         ready = asyncio.Event()
         submitted = False
+        received: GatewayCompletion | GatewayRejectedOutput | None = None
 
         async def submit_guided_request() -> GatewayCompletion:
-            nonlocal submitted
+            nonlocal submitted, received
             # Cancellation may close the run after task creation but before its first turn.
             if not self._is_current_run(run_state) or not self._accepts_artifact_writes(run_state):
                 raise asyncio.CancelledError
             submitted = True
             ready.set()
-            return await self._gateway.complete_with_context(request)
+            try:
+                result = await self._gateway.complete_with_context(request)
+                received = result
+                return result
+            except GatewayResponseCancelled as error:
+                received = error.receipt
+                raise
+            except GatewayRejectedOutput as error:
+                received = error
+                raise
 
         pending = asyncio.create_task(submit_guided_request())
         pending.add_done_callback(lambda _task: ready.set())
@@ -3306,10 +3396,355 @@ class CrewDispatchRuntime:
             if submitted:
                 await emit(kind="context.injected", payload=metadata)
             return await pending
-        finally:
+        except BaseException as error:
+            cancelled = isinstance(error, asyncio.CancelledError)
             if not pending.done():
                 pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
+            deadline = asyncio.get_running_loop().time() + _TASK_CANCELLATION_GRACE_SECONDS
+            while not pending.done() and asyncio.get_running_loop().time() < deadline:
+                try:
+                    await asyncio.wait((pending,), timeout=max(0, deadline - asyncio.get_running_loop().time()))
+                except asyncio.CancelledError:
+                    cancelled = True
+                    pending.cancel()
+            if pending.done():
+                try:
+                    pending.result()
+                except BaseException:  # noqa: BLE001, S110 - received outcome is captured privately above
+                    pass
+            else:
+                pending.add_done_callback(self._retrieve_detached_task)
+            if cancelled:
+                if received is not None:
+                    raise GatewayResponseCancelled(receipt=received) from None
+                raise asyncio.CancelledError from None
+            raise
+
+    @staticmethod
+    def _rejected_private_payload(
+        rejected: GatewayRejectedOutput | GatewayCompletion, sources: tuple[Artifact, ...],
+    ) -> Mapping[str, JsonValue]:
+        evidence = rejected.evidence if isinstance(rejected, GatewayRejectedOutput) else None
+        usage = rejected.response.usage if isinstance(rejected, GatewayCompletion) else evidence.usage if evidence is not None else None
+        text = evidence.final_text if evidence is not None else None
+        return {
+            "version": 1, "disposition": "cancelled" if isinstance(rejected, GatewayCompletion) else "rejected",
+            "final_text": text,
+            "text_sha256": evidence.text_sha256 if evidence is not None else None,
+            "usage": None if usage is None else {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+            "usage_status": evidence.usage_status if evidence is not None else "known" if usage is not None else "missing",
+            "output_status": evidence.status if evidence is not None else "unknown",
+            "reason": evidence.reason if evidence is not None else "cancelled_after_response" if isinstance(rejected, GatewayCompletion) else "invalid_output",
+            "provenance": {
+                "logical_model": rejected.logical_model, "deployment_id": rejected.deployment_id,
+                "provider_id": rejected.provider_id, "provider_model": rejected.provider_model,
+            },
+            "cost_usd": None if rejected.cost_usd is None else str(rejected.cost_usd),
+            "source_ids": tuple(str(source.id) for source in sources),
+            "fallback_used": rejected.fallback_used,
+            "fallback_from_logical_model": rejected.fallback_from_logical_model,
+            "fallback_reason": rejected.fallback_reason,
+            "attempted_logical_models": rejected.attempted_logical_models,
+        }
+
+    @staticmethod
+    def _rejected_from_private(value: Mapping[str, JsonValue]) -> GatewayRejectedOutput:
+        try:
+            if type(value["fallback_used"]) is not bool or not isinstance(value["attempted_logical_models"], tuple):
+                _fail("runtime checkpoint rejected provenance is invalid")
+            for field in ("fallback_from_logical_model", "fallback_reason"):
+                part = value[field]
+                if part is not None:
+                    if type(part) is not str:
+                        _fail("runtime checkpoint rejected provenance is invalid")
+                    _require_safe_identifier(field, part)
+            for part in value["attempted_logical_models"]:
+                if type(part) is not str:
+                    _fail("runtime checkpoint rejected provenance is invalid")
+                _require_safe_identifier("attempted logical model", part)
+            if bool(value["fallback_used"]) != (
+                value["fallback_from_logical_model"] is not None and value["fallback_reason"] is not None
+            ) or (not value["fallback_used"] and (
+                value["fallback_from_logical_model"] is not None or value["fallback_reason"] is not None
+            )):
+                _fail("runtime checkpoint rejected provenance is invalid")
+            raw_usage = value["usage"]
+            usage = None if raw_usage is None else TokenUsage(
+                **cast(Any, dict(cast(Mapping[str, JsonValue], raw_usage)))
+            )
+            evidence = RejectedOutputEvidence(
+                final_text=cast(str | None, value["final_text"]), usage=usage,
+                usage_status=cast(Any, value["usage_status"]),
+                status=cast(Any, value["output_status"]), reason=cast(Any, value["reason"]),
+            )
+            if evidence.text_sha256 != value["text_sha256"]:
+                _fail("runtime checkpoint rejected evidence is invalid")
+            provenance = GatewayProvenance.model_validate(
+                dict(cast(Mapping[str, JsonValue], value["provenance"])), strict=True,
+            )
+            cost = None if value["cost_usd"] is None else Decimal(cast(str, value["cost_usd"]))
+            if cost is not None and (not cost.is_finite() or cost < 0 or cost > _MAX_AUDITED_COST_USD):
+                _fail("runtime checkpoint rejected evidence is invalid")
+            return GatewayRejectedOutput(
+                evidence=evidence, logical_model=provenance.logical_model,
+                deployment_id=provenance.deployment_id, provider_id=provenance.provider_id,
+                provider_model=provenance.provider_model, cost_usd=cost,
+                fallback_used=value["fallback_used"],
+                fallback_from_logical_model=cast(str | None, value["fallback_from_logical_model"]),
+                fallback_reason=cast(str | None, value["fallback_reason"]),
+                attempted_logical_models=cast(tuple[str, ...], value["attempted_logical_models"]),
+            )
+        except (ValueError, TypeError, KeyError, ArithmeticError):
+            _fail("runtime checkpoint rejected evidence is invalid")
+
+    @staticmethod
+    def _reject_invalid_structured(
+        request: ModelRequest, completion: GatewayCompletion,
+    ) -> GatewayRejectedOutput | None:
+        if request.response_schema is None or completion.response.tool_calls:
+            return None
+        try:
+            _parse_structured_output(
+                request.response_schema, completion.response.text,
+                prefix="structured role output", max_bytes=_MAX_OUTPUT_BYTES,
+            )
+        except RuntimeExecutionError as error:
+            text = completion.response.text
+            bounded = None
+            oversized = False
+            if type(text) is str:
+                try:
+                    oversized = len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
+                    if not oversized:
+                        bounded = text
+                except UnicodeError:
+                    bounded = None
+            usage = completion.response.usage
+            return GatewayRejectedOutput(
+                evidence=RejectedOutputEvidence(
+                    final_text=bounded, usage=usage,
+                    usage_status="known" if usage is not None else "missing",
+                    status="completed",
+                    reason=(
+                        "output_limit" if oversized else "invalid_output" if bounded is None
+                        else "invalid_json" if "json" in str(error) else "schema_mismatch"
+                    ),
+                ),
+                deployment_id=completion.deployment_id, logical_model=completion.logical_model,
+                provider_id=completion.provider_id, provider_model=completion.provider_model,
+                cost_usd=completion.cost_usd, fallback_used=completion.fallback_used,
+                fallback_from_logical_model=completion.fallback_from_logical_model,
+                fallback_reason=completion.fallback_reason,
+                attempted_logical_models=completion.attempted_logical_models,
+            )
+        return None
+
+    async def _execute_model_request(
+        self, context: TaskContext, step: DispatchStep, actor: str,
+        request: ModelRequest, *, purpose: Literal["step", "review"], attempt: int,
+        cursor: _ModelCallCursor, ledger: _ModelLedger, sources: tuple[Artifact, ...],
+        emit: EventEmitter, model_boundary: ModelStateBoundary, usage_boundary: UsageBoundary,
+        run_state: _RunState, step_deadline: float,
+        repair: Mapping[str, JsonValue] | None = None,
+    ) -> tuple[GatewayCompletion, Artifact]:
+        if request.response_schema is not None:
+            _structured_validator(request.response_schema)
+        index = cursor.value
+        cursor.value += 1
+        key = self._model_call_key(context.run_id, step.id, attempt, purpose, actor, index)
+        request_sha = self._model_request_sha256(request)
+        existing = ledger.states.get(key)
+        rejected: GatewayRejectedOutput | None = None
+        if existing is not None:
+            if existing["request_sha256"] != request_sha:
+                _fail("model request changed after checkpoint")
+            if existing["status"] == "succeeded":
+                artifact = ledger.artifacts.get(key)
+                if artifact is None:
+                    _fail("model response artifact is unavailable")
+                return self._completion_from_model_artifact(artifact), artifact
+            if existing["status"] in {"running", "received_cancelled"}:
+                raise ModelOutcomeUncertain("model outcome requires confirmation")
+            if existing["status"] == "failed":
+                if not _failed_model_state_can_compact_retry(existing):
+                    raise ModelOutcomeUncertain("model outcome requires confirmation")
+                _fail(cast(str, existing.get("failure_reason") or "model gateway failed"))
+            if existing["status"] == "rejected":
+                private = ledger.rejected_outputs.get(key)
+                if private is None:
+                    _fail("rejected model evidence is unavailable")
+                if private["source_ids"] != tuple(str(source.id) for source in sources):
+                    _fail("model sources changed after checkpoint")
+                rejected = self._rejected_from_private(private)
+            elif existing["status"] != "prepared":
+                _fail("model ledger state is invalid")
+        if rejected is None:
+            prepared: Mapping[str, JsonValue] = existing or {
+                "status": "prepared", "step_id": step.id, "attempt": attempt,
+                "purpose": purpose, "actor": actor, "call_index": index,
+                "request_sha256": request_sha, "artifact_id": None, "sha256": None,
+                "provenance": None, "failure_reason": None,
+            }
+            await model_boundary(key, prepared, repair=repair)
+            running = dict(prepared)
+            running["status"] = "running"
+            if not self._accepts_artifact_writes(run_state):
+                raise asyncio.CancelledError
+            await model_boundary(key, running)
+            completion: GatewayCompletion | None = None
+            try:
+                async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+                    completion = await self._complete_with_guidance(
+                        context, request, emit, run_state, actor=actor, step_id=step.id,
+                        stage="dispatch_step" if purpose == "step" else "dispatch_review",
+                        attempt=attempt, call_index=index, ledger_key=key,
+                        ledger_request_sha256=request_sha,
+                    )
+                if purpose == "step":
+                    completion = _map_completion_tool_names(completion, _tool_name_mapping(step.tools))
+                    completion = _project_scale_artifact_zip_completion(
+                        context, step, completion, completion.response,
+                    )
+                rejected = self._reject_invalid_structured(request, completion)
+                if rejected is None:
+                    self._valid_response(completion)
+                if repair is not None and completion.response.tool_calls:
+                    rejected = GatewayRejectedOutput(
+                        evidence=RejectedOutputEvidence(
+                            final_text=None, usage=completion.response.usage,
+                            usage_status="known" if completion.response.usage is not None else "missing",
+                            status="completed", reason="invalid_tool",
+                        ),
+                        deployment_id=completion.deployment_id, logical_model=completion.logical_model,
+                        provider_id=completion.provider_id, provider_model=completion.provider_model,
+                        cost_usd=completion.cost_usd,
+                    )
+            except GatewayRejectedOutput as error:
+                rejected = error
+            except GatewayResponseCancelled as error:
+                receipt = error.receipt
+                cancelled_private = dict(self._rejected_private_payload(receipt, sources))
+                cancelled_private["disposition"] = "cancelled"
+                cancelled_state = dict(running)
+                cancelled_state.update(
+                    status="received_cancelled", sha256=cancelled_private["text_sha256"],
+                    provenance=cancelled_private["provenance"], failure_reason="model response cancelled",
+                )
+                try:
+                    await self._run_commit(usage_boundary(
+                        receipt, actor, step.id, key, cancelled_state, None,
+                        private_output=cancelled_private,
+                    ), run_state)
+                finally:
+                    raise asyncio.CancelledError from None
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                reason = safe_runtime_failure_reason(error, fallback="model gateway failed")
+                failed = dict(running)
+                failed.update(status="failed", failure_reason=reason)
+                await model_boundary(key, failed)
+                if repair is not None:
+                    raise _ModelContractFailed("structured correction failed") from None
+                _fail(reason)
+            if rejected is None:
+                assert completion is not None
+                artifact = self._model_artifact(completion, actor, sources)
+                succeeded = dict(running)
+                succeeded.update(
+                    status="succeeded", artifact_id=str(artifact.id), sha256=artifact.content_sha256,
+                    provenance={
+                        "logical_model": completion.logical_model, "deployment_id": completion.deployment_id,
+                        "provider_id": completion.provider_id, "provider_model": completion.provider_model,
+                    },
+                )
+                await self._run_commit(
+                    usage_boundary(completion, actor, step.id, key, succeeded, artifact), run_state,
+                )
+                return completion, artifact
+            private = self._rejected_private_payload(rejected, sources)
+            rejected_state = dict(running)
+            rejected_state.update(
+                status="rejected", sha256=private["text_sha256"], provenance=private["provenance"],
+                failure_reason="structured output rejected",
+            )
+            await self._run_commit(usage_boundary(
+                rejected, actor, step.id, key, rejected_state, None, private_output=private,
+            ), run_state)
+        evidence = rejected.evidence
+        if (
+            repair is not None or evidence is None or not evidence.correction_eligible
+            or request.response_schema is None or rejected.cost_usd is None
+        ):
+            raise _ModelContractFailed("structured output invalid")
+        previous_repair = ledger.structured_repairs.get(step.id)
+        if previous_repair is not None and previous_repair["source_key"] != key:
+            raise _ModelContractFailed("structured correction allowance exhausted")
+        usage = ledger.usage
+        if usage is None or usage.terminal_phase is not None:
+            _fail("structured correction accounting unavailable")
+        remaining_tokens = min(
+            context.token_budget - usage.tokens,
+            self._plan.total_token_budget - usage.tokens,
+            step.token_budget - usage.step_tokens.get(step.id, 0),
+        )
+        cached_correction = previous_repair is not None and previous_repair["status"] in {"succeeded", "rejected"}
+        if not cached_correction and (remaining_tokens <= 0 or usage.cost_usd > self._plan.total_cost_usd or (
+            rejected.cost_usd > 0 and (
+                usage.cost_usd >= self._plan.total_cost_usd
+                or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
+            )
+        )):
+            _fail("structured correction budget exhausted")
+        output_limit = (
+            cast(int, previous_repair["max_output_tokens"]) if previous_repair is not None
+            else min(request.max_output_tokens or remaining_tokens, remaining_tokens)
+        )
+        correction_messages = self._normalize_crewai_messages([
+            *({"role": message.role, "content": message.content} for message in request.messages),
+            {"role": "user", "content": "UNTRUSTED_REJECTED_OUTPUT_JSON=" + json.dumps({
+                "text": evidence.final_text, "reason": evidence.reason,
+                "text_sha256": evidence.text_sha256,
+            }, ensure_ascii=False)},
+            {"role": "system", "content": (
+                "Correct only the JSON format to satisfy the existing internal response schema. "
+                "Keep the assigned role, original task and facts. Do not invent unknown facts, "
+                "evidence or approval. Do not use tools. Return the JSON object only."
+            )},
+        ])
+        correction = replace(
+            request, messages=correction_messages, tools=(),
+            required_capabilities=request.required_capabilities - {ModelCapability.TOOL_CALLING},
+            allow_fallback=False,
+            timeout_seconds=self._remaining_timeout(run_state, step_deadline),
+            max_output_tokens=output_limit,
+        )
+        reservation: Mapping[str, JsonValue] = {
+            "version": 1, "actor": actor, "purpose": purpose, "source_key": key,
+            "source_text_sha256": evidence.text_sha256,
+            "max_output_tokens": output_limit,
+            "correction_key": self._model_call_key(
+                context.run_id, step.id, attempt, purpose, actor, cursor.value,
+            ),
+            "correction_request_sha256": self._model_request_sha256(correction),
+            "candidate_artifact_id": str(sources[0].id) if purpose == "review" else None,
+            "candidate_sha256": sources[0].content_sha256 if purpose == "review" else None,
+            "status": "reserved",
+        }
+        if previous_repair is not None:
+            if any(previous_repair[field] != value for field, value in reservation.items() if field != "status"):
+                _fail("structured correction changed after checkpoint")
+            reservation = previous_repair
+        return await self._execute_model_request(
+            context, step, actor, correction, purpose=purpose, attempt=attempt,
+            cursor=cursor, ledger=ledger, sources=sources, emit=emit,
+            model_boundary=model_boundary, usage_boundary=usage_boundary,
+            run_state=run_state, step_deadline=step_deadline, repair=reservation,
+        )
 
     async def _complete_gateway_messages(
         self,
@@ -3336,7 +3771,6 @@ class CrewDispatchRuntime:
         use_repair_tool_keys: bool = False,
     ) -> GatewayCompletion:
         messages = list(self._guidance_messages(context, crew_messages))
-        tool_mapping = _tool_name_mapping(step.tools)
         tool_metadata_by_name = _capability_manifest_tool_metadata_map(
             self._capabilities,
             tenant_id=context.tenant_id,
@@ -3380,131 +3814,16 @@ class CrewDispatchRuntime:
                 response_schema=response_schema,
                 tools=request_tools,
             )
-            call_index = call_cursor.value
-            call_cursor.value += 1
-            request_sha256 = self._model_request_sha256(request)
-            key = self._model_call_key(
-                context.run_id,
-                step.id,
-                model_attempt,
-                "step",
-                agent.id,
-                call_index,
+            model_attempt_index = _subagent_model_attempt(retries, recovery_attempt)
+            completion, model_artifact = await self._execute_model_request(
+                context, step, agent.id, request, purpose="step", attempt=model_attempt_index,
+                cursor=call_cursor, ledger=model_ledger,
+                sources=self._ordered_artifacts((*input_sources, *evidence)),
+                emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
+                run_state=run_state, step_deadline=step_deadline,
             )
-            existing = model_ledger.states.get(key)
-            if existing is not None:
-                if existing.get("request_sha256") != request_sha256:
-                    _fail("model request changed after checkpoint")
-                if existing.get("status") == "succeeded":
-                    model_artifact = model_ledger.artifacts.get(key)
-                    if model_artifact is None:
-                        _fail("model response artifact is unavailable")
-                    completion = self._completion_from_model_artifact(model_artifact)
-                    response = self._valid_response(completion)
-                    completion = _project_scale_artifact_zip_completion(
-                        context,
-                        step,
-                        completion,
-                        response,
-                    )
-                    response = self._valid_response(completion)
-                    evidence.append(model_artifact)
-                elif existing.get("status") == "running":
-                    raise ModelOutcomeUncertain("model outcome requires confirmation")
-                elif existing.get("status") == "prepared":
-                    completion = None
-                    response = None
-                elif existing.get("status") == "failed":
-                    if not _failed_model_state_can_compact_retry(existing):
-                        raise ModelOutcomeUncertain("model outcome requires confirmation")
-                    failure_reason = existing.get("failure_reason")
-                    if type(failure_reason) is str and failure_reason.strip():
-                        _fail(failure_reason)
-                    _fail("model gateway failed")
-                else:
-                    _fail("model ledger state is invalid")
-            else:
-                completion = None
-                response = None
-                prepared: Mapping[str, JsonValue] = {
-                    "status": "prepared",
-                    "step_id": step.id,
-                    "attempt": model_attempt,
-                    "purpose": "step",
-                    "actor": agent.id,
-                    "call_index": call_index,
-                    "request_sha256": request_sha256,
-                    "artifact_id": None,
-                    "sha256": None,
-                    "provenance": None,
-                    "failure_reason": None,
-                }
-                await model_state_boundary(key, prepared)
-                existing = prepared
-            if completion is None:
-                running = dict(existing)
-                running["status"] = "running"
-                await model_state_boundary(key, running)
-                try:
-                    async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                        completion = await self._complete_with_guidance(
-                            context, request, emit, run_state, actor=agent.id, step_id=step.id,
-                            stage="dispatch_step", attempt=model_attempt, call_index=call_index,
-                            ledger_key=key, ledger_request_sha256=request_sha256,
-                        )
-                    completion = _map_completion_tool_names(completion, tool_mapping)
-                    response = self._valid_response(completion)
-                    completion = _project_scale_artifact_zip_completion(
-                        context,
-                        step,
-                        completion,
-                        response,
-                    )
-                    response = self._valid_response(completion)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:  # noqa: BLE001 - normalize the model gateway boundary
-                    failure_reason = safe_runtime_failure_reason(
-                        error, fallback="model gateway failed"
-                    )
-                    failed = dict(running)
-                    failed["status"] = "failed"
-                    failed["failure_reason"] = failure_reason
-                    await model_state_boundary(key, failed)
-                    error.__traceback__ = None
-                    error.__context__ = None
-                    error.__cause__ = None
-                    del error
-                    _fail(failure_reason)
-                model_artifact = self._model_artifact(
-                    completion,
-                    agent.id,
-                    self._ordered_artifacts((*input_sources, *evidence)),
-                )
-                succeeded = dict(running)
-                succeeded.update(
-                    status="succeeded",
-                    artifact_id=str(model_artifact.id),
-                    sha256=model_artifact.content_sha256,
-                    provenance={
-                        "logical_model": completion.logical_model,
-                        "deployment_id": completion.deployment_id,
-                        "provider_id": completion.provider_id,
-                        "provider_model": completion.provider_model,
-                    },
-                )
-                await self._run_commit(
-                    usage_boundary(
-                        completion,
-                        step.agent,
-                        step.id,
-                        key,
-                        succeeded,
-                        model_artifact,
-                    ),
-                    run_state,
-                )
-                evidence.append(model_artifact)
+            evidence.append(model_artifact)
+            response = self._valid_response(completion)
             assert response is not None
             if not response.tool_calls:
                 if step.final_synthesizer:
@@ -4264,116 +4583,15 @@ class CrewDispatchRuntime:
                     max_output_tokens=min(reviewer.max_output_tokens, step.token_budget),
                     response_schema=_REVIEW_RESPONSE_SCHEMA,
                 )
-                call_index = call_cursor.value
-                call_cursor.value += 1
-                request_sha256 = runtime._model_request_sha256(request)
-                review_model_attempt = _subagent_model_attempt(retries, recovery_attempt)
-                key = runtime._model_call_key(
-                    context.run_id,
-                    step.id,
-                    review_model_attempt,
-                    "review",
-                    reviewer.id,
-                    call_index,
+                completion, model_artifact = await runtime._execute_model_request(
+                    context, step, reviewer.id, request, purpose="review",
+                    attempt=_subagent_model_attempt(retries, recovery_attempt),
+                    cursor=call_cursor, ledger=model_ledger,
+                    sources=runtime._ordered_artifacts((artifact, *evidence)),
+                    emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
+                    run_state=run_state, step_deadline=step_deadline,
                 )
-                existing = model_ledger.states.get(key)
-                if existing is not None:
-                    if existing.get("request_sha256") != request_sha256:
-                        _fail("model request changed after checkpoint")
-                    if existing.get("status") == "succeeded":
-                        model_artifact = model_ledger.artifacts.get(key)
-                        if model_artifact is None:
-                            _fail("model response artifact is unavailable")
-                        completion = runtime._completion_from_model_artifact(model_artifact)
-                        evidence.append(model_artifact)
-                    elif existing.get("status") == "running":
-                        raise ModelOutcomeUncertain("model outcome requires confirmation")
-                    elif existing.get("status") == "failed":
-                        if not _failed_model_state_can_compact_retry(existing):
-                            raise ModelOutcomeUncertain("model outcome requires confirmation")
-                        failure_reason = existing.get("failure_reason")
-                        if type(failure_reason) is str and failure_reason.strip():
-                            _fail(failure_reason)
-                        _fail("model gateway failed")
-                    elif existing.get("status") != "prepared":
-                        _fail("model ledger state is invalid")
-                if completion is None:
-                    prepared: Mapping[str, JsonValue]
-                    if existing is None:
-                        prepared = {
-                            "status": "prepared",
-                            "step_id": step.id,
-                            "attempt": review_model_attempt,
-                            "purpose": "review",
-                            "actor": reviewer.id,
-                            "call_index": call_index,
-                            "request_sha256": request_sha256,
-                            "artifact_id": None,
-                            "sha256": None,
-                            "provenance": None,
-                            "failure_reason": None,
-                        }
-                        await model_state_boundary(key, prepared)
-                    else:
-                        prepared = existing
-                    running = dict(prepared)
-                    running["status"] = "running"
-                    await model_state_boundary(key, running)
-                    try:
-                        async with asyncio.timeout(
-                            runtime._remaining_timeout(run_state, step_deadline)
-                        ):
-                            completion = await runtime._complete_with_guidance(
-                                context, request, emit, run_state, actor=reviewer.id, step_id=step.id,
-                                stage="dispatch_review", attempt=review_model_attempt,
-                                call_index=call_index, ledger_key=key,
-                                ledger_request_sha256=request_sha256,
-                            )
-                        runtime._valid_response(completion)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as error:  # noqa: BLE001 - normalize model boundary
-                        failure_reason = safe_runtime_failure_reason(
-                            error, fallback="model gateway failed"
-                        )
-                        failed = dict(running)
-                        failed["status"] = "failed"
-                        failed["failure_reason"] = failure_reason
-                        await model_state_boundary(key, failed)
-                        error.__traceback__ = None
-                        error.__context__ = None
-                        error.__cause__ = None
-                        del error
-                        _fail(failure_reason)
-                    model_artifact = runtime._model_artifact(
-                        completion,
-                        reviewer.id,
-                        runtime._ordered_artifacts((artifact, *evidence)),
-                    )
-                    succeeded = dict(running)
-                    succeeded.update(
-                        status="succeeded",
-                        artifact_id=str(model_artifact.id),
-                        sha256=model_artifact.content_sha256,
-                        provenance={
-                            "logical_model": completion.logical_model,
-                            "deployment_id": completion.deployment_id,
-                            "provider_id": completion.provider_id,
-                            "provider_model": completion.provider_model,
-                        },
-                    )
-                    await runtime._run_commit(
-                        usage_boundary(
-                            completion,
-                            reviewer.id,
-                            step.id,
-                            key,
-                            succeeded,
-                            model_artifact,
-                        ),
-                        run_state,
-                    )
-                    evidence.append(model_artifact)
+                evidence.append(model_artifact)
                 response = runtime._valid_response(completion)
                 if response.text is None and response.tool_calls:
                     _fail("reviewer returned tool calls instead of JSON")
@@ -4418,14 +4636,10 @@ class CrewDispatchRuntime:
             _fail("CrewAI bypassed the ModelGateway bridge")
         if text is None:
             _fail("reviewer returned empty response")
-        if len(text.encode("utf-8")) > 16_384:
-            _fail("review response exceeds output limit")
-        try:
-            value = json.loads(text)
-        except (TypeError, ValueError):
-            _fail("reviewer returned non-json response")
-        if type(value) is not dict or not set(value) <= {"verdict", "feedback"}:
-            _fail("reviewer returned unsupported JSON schema")
+        _check_framework_raw(_REVIEW_RESPONSE_SCHEMA, completion.response.text, text)
+        value = _parse_structured_output(
+            _REVIEW_RESPONSE_SCHEMA, completion.response.text, prefix="review response", max_bytes=16_384,
+        )
         verdict = value.get("verdict")
         feedback = value.get("feedback")
         if verdict not in {"approve", "revise", "reject"}:
@@ -4742,6 +4956,8 @@ class CrewDispatchRuntime:
                 "models": {
                     key: dict(model_ledger.states[key]) for key in sorted(model_ledger.states)
                 },
+                "rejected_outputs": dict(model_ledger.rejected_outputs),
+                "structured_repairs": dict(model_ledger.structured_repairs),
                 "review_refs": {
                     key: {
                         "id": str(review_ledger.artifacts[key].id),
@@ -4790,6 +5006,8 @@ class CrewDispatchRuntime:
             _fail("runtime checkpoint is incompatible")
         state = checkpoint.state
         required_state_keys = {
+            "rejected_outputs",
+            "structured_repairs",
             "plan_digest",
             "completed",
             "retries",
@@ -5121,7 +5339,7 @@ class CrewDispatchRuntime:
             call_index = value["call_index"]
             failure_reason = value.get("failure_reason")
             if (
-                status not in {"prepared", "running", "succeeded", "failed"}
+                status not in {"prepared", "running", "succeeded", "failed", "rejected", "received_cancelled"}
                 or type(model_step_id) is not str
                 or model_step_id not in steps
                 or type(attempt) is not int
@@ -5177,6 +5395,11 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint is incompatible")
                 if failure_reason is not None:
                     _fail("runtime checkpoint is incompatible")
+            elif status in {"rejected", "received_cancelled"}:
+                if value["artifact_id"] is not None or failure_reason != (
+                    "model response cancelled" if status == "received_cancelled" else "structured output rejected"
+                ):
+                    _fail("runtime checkpoint is incompatible")
             elif status == "failed":
                 if (
                     value["artifact_id"] is not None
@@ -5194,6 +5417,7 @@ class CrewDispatchRuntime:
                 or failure_reason is not None
             ):
                 _fail("runtime checkpoint is incompatible")
+        self._validate_structured_checkpoint(checkpoint, plan)
         if any(indices != set(range(max(indices) + 1)) for indices in model_indices.values()):
             _fail("runtime checkpoint is incompatible")
         if any(indices != set(range(max(indices) + 1)) for indices in tool_indices.values()):
@@ -5294,6 +5518,99 @@ class CrewDispatchRuntime:
         for task in pending:
             task.add_done_callback(CrewDispatchRuntime._retrieve_detached_task)
 
+    def _validate_structured_checkpoint(self, checkpoint: RuntimeCheckpoint, plan: DispatchPlan) -> None:
+        models = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
+        registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+        private = checkpoint.state["rejected_outputs"]
+        repairs = checkpoint.state["structured_repairs"]
+        if not isinstance(private, Mapping) or not isinstance(repairs, Mapping):
+            _fail("runtime checkpoint rejected evidence is invalid")
+        expected_private = {key for key, value in models.items()
+                            if value["status"] in {"rejected", "received_cancelled"}}
+        if set(private) != expected_private:
+            _fail("runtime checkpoint rejected evidence is invalid")
+        private_keys = {
+            "version", "disposition", "final_text", "text_sha256", "usage", "usage_status",
+            "output_status", "reason", "provenance", "cost_usd", "source_ids", "fallback_used",
+            "fallback_from_logical_model", "fallback_reason", "attempted_logical_models",
+        }
+        for key, value in private.items():
+            if not isinstance(value, Mapping) or set(value) != private_keys:
+                _fail("runtime checkpoint rejected evidence is invalid")
+            state = models[key]
+            if (
+                type(value["version"]) is not int or value["version"] != 1
+                or value["disposition"] != ("cancelled" if state["status"] == "received_cancelled" else "rejected")
+                or value["text_sha256"] != state["sha256"]
+                or value["provenance"] != state["provenance"]
+                or not isinstance(value["source_ids"], tuple)
+                or len(value["source_ids"]) > 64
+                or any(type(source) is not str or source not in registry for source in value["source_ids"])
+                or type(value["fallback_used"]) is not bool
+                or not isinstance(value["attempted_logical_models"], tuple)
+            ):
+                _fail("runtime checkpoint rejected evidence is invalid")
+            check_value = dict(value)
+            if state["status"] == "received_cancelled" and check_value["reason"] == "cancelled_after_response":
+                # Validate receipt fields without relabeling the persisted cancellation outcome.
+                check_value["reason"] = "invalid_output"
+            self._rejected_from_private(check_value)
+        step_ids = {step.id for step in plan.steps}
+        repair_keys = {
+            "version", "actor", "purpose", "source_key", "source_text_sha256", "correction_key",
+            "correction_request_sha256", "candidate_artifact_id", "candidate_sha256", "status", "max_output_tokens",
+        }
+        for step_id, value in repairs.items():
+            if step_id not in step_ids or not isinstance(value, Mapping) or set(value) != repair_keys:
+                _fail("runtime checkpoint correction linkage is invalid")
+            source_key, correction_key = value["source_key"], value["correction_key"]
+            if type(source_key) is not str or type(correction_key) is not str:
+                _fail("runtime checkpoint correction linkage is invalid")
+            source, correction = models.get(source_key), models.get(correction_key)
+            source_private = private.get(source_key)
+            if (
+                type(value["version"]) is not int or value["version"] != 1
+                or type(value["max_output_tokens"]) is not int
+                or not 0 < value["max_output_tokens"] <= 1_000_000
+                or source is None or correction is None or not isinstance(source_private, Mapping)
+                or source["status"] != "rejected"
+                or any(source[field] != correction[field] for field in ("step_id", "attempt", "actor", "purpose"))
+                or source["step_id"] != step_id
+                or source["actor"] != value["actor"] or source["purpose"] != value["purpose"]
+                or cast(int, correction["call_index"]) != cast(int, source["call_index"]) + 1
+                or source_private["text_sha256"] != value["source_text_sha256"]
+                or correction["request_sha256"] != value["correction_request_sha256"]
+                or value["status"] != {
+                    "prepared": "reserved", "running": "running", "succeeded": "succeeded",
+                    "rejected": "rejected", "received_cancelled": "uncertain", "failed": "uncertain",
+                }[cast(str, correction["status"])]
+            ):
+                _fail("runtime checkpoint correction linkage is invalid")
+            rejected = self._rejected_from_private(source_private)
+            if rejected.evidence is None or not rejected.evidence.correction_eligible:
+                _fail("runtime checkpoint correction linkage is invalid")
+            if value["purpose"] == "review":
+                candidate_id = value["candidate_artifact_id"]
+                if (
+                    type(candidate_id) is not str or registry.get(candidate_id) != value["candidate_sha256"]
+                    or not source_private["source_ids"]
+                    or cast(tuple[str, ...], source_private["source_ids"])[0] != candidate_id
+                ):
+                    _fail("runtime checkpoint correction candidate is invalid")
+            elif value["candidate_artifact_id"] is not None or value["candidate_sha256"] is not None:
+                _fail("runtime checkpoint correction linkage is invalid")
+        for key, model in models.items():
+            if model["status"] != "rejected":
+                continue
+            next_key = self._model_call_key(
+                checkpoint.run_id, cast(str, model["step_id"]), cast(int, model["attempt"]),
+                cast(str, model["purpose"]), cast(str, model["actor"]), cast(int, model["call_index"]) + 1,
+            )
+            if next_key in models:
+                link = repairs.get(cast(str, model["step_id"]))
+                if not isinstance(link, Mapping) or link["source_key"] != key or link["correction_key"] != next_key:
+                    _fail("runtime checkpoint correction linkage is missing")
+
     @staticmethod
     def _validate_checkpoint_metadata_budget(plan: DispatchPlan) -> None:
         # This is a conservative bound for deterministic ledger metadata.
@@ -5338,6 +5655,22 @@ class CrewDispatchRuntime:
         if len(by_id) != len(artifacts):
             _fail("runtime checkpoint artifact graph is invalid")
         agents = {agent.id: agent for agent in plan.agents}
+        steps_by_id = {step.id: step for step in plan.steps}
+        for step_id, repair in model_ledger.structured_repairs.items():
+            if repair["purpose"] != "review":
+                continue
+            source = model_ledger.rejected_outputs[cast(str, repair["source_key"])]
+            correction_state = model_ledger.states[cast(str, repair["correction_key"])]
+            linked_candidate = by_id.get(cast(str, repair["candidate_artifact_id"]))
+            corrected_artifact = model_ledger.artifacts.get(cast(str, repair["correction_key"]))
+            if (
+                linked_candidate is None or linked_candidate.type != "text"
+                or linked_candidate.producer != steps_by_id[step_id].agent
+                or linked_candidate.version != cast(int, correction_state["attempt"]) // (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + 1
+                or linked_candidate.content_sha256 != repair["candidate_sha256"]
+                or (corrected_artifact is not None and corrected_artifact.source_ids != source["source_ids"])
+            ):
+                _fail("runtime checkpoint correction candidate is invalid")
         models: dict[
             tuple[str, int, str], dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]
         ] = {}
@@ -5386,7 +5719,8 @@ class CrewDispatchRuntime:
             first_call[1].source_ids
             for step in plan.steps
             if not step.depends_on
-            for first_call in [models.get((step.id, 0, "step"), {}).get(0)]
+            for first_call in [next((call for _, call in sorted(models.get((step.id, 0, "step"), {}).items())
+                                    if call[1] is not None), None)]
             if first_call is not None and first_call[1] is not None
         }
         if len(root_inputs) > 1:
@@ -5413,7 +5747,7 @@ class CrewDispatchRuntime:
         tool_step_ids = {group[0] for group in tools}
 
         def model_attempt_candidates(business_attempt: int) -> tuple[int, ...]:
-            candidates = [business_attempt]
+            candidates = [_subagent_model_attempt(business_attempt, 0)]
             for recovery_attempt in range(1, _STEP_TIMEOUT_RECOVERY_RETRIES + 1):
                 model_attempt = _subagent_model_attempt(business_attempt, recovery_attempt)
                 if model_attempt not in candidates:
@@ -5484,6 +5818,8 @@ class CrewDispatchRuntime:
                 incomplete = False
                 for call_index in range(len(step_calls)):
                     state, model_artifact = step_calls[call_index]
+                    if state["status"] == "rejected":
+                        continue
                     if model_artifact is None:
                         if call_index != len(step_calls) - 1:
                             _fail("runtime checkpoint artifact graph is invalid")
@@ -5502,7 +5838,7 @@ class CrewDispatchRuntime:
                     consumed_models.add(str(model_artifact.id))
                     last_model = model_artifact
                     evidence_ids.append(str(model_artifact.id))
-                    round_tools = tools.get((step.id, attempt, call_index), {})
+                    round_tools = tools.get((step.id, cast(int, state["attempt"]), call_index), {})
                     calls = completion.response.tool_calls
                     if len(round_tools) > len(calls):
                         _fail("runtime checkpoint capability artifact lineage is invalid")
@@ -5540,9 +5876,17 @@ class CrewDispatchRuntime:
                 review_calls = review_model_calls(step, attempt, output_sources, last_model)
                 candidate: Artifact | None = None
                 if review_calls:
-                    first_review_artifact = review_calls[0][1]
+                    first_review_artifact = next((call[1] for _, call in sorted(review_calls.items())
+                                                  if call[1] is not None), None)
                     if first_review_artifact is not None and first_review_artifact.source_ids:
                         candidate = by_id.get(first_review_artifact.source_ids[0])
+                    else:
+                        first_state = review_calls[0][0]
+                        for receipt_key, receipt in model_ledger.rejected_outputs.items():
+                            if model_ledger.states[receipt_key] == first_state:
+                                source_ids = cast(tuple[str, ...], receipt["source_ids"])
+                                candidate = by_id.get(source_ids[0]) if source_ids else None
+                                break
                     if (
                         candidate is None
                         or candidate.type != "text"
@@ -5557,6 +5901,8 @@ class CrewDispatchRuntime:
                     review_evidence: list[str] = []
                     for call_index in range(len(review_calls)):
                         state, review_model = review_calls[call_index]
+                        if state["status"] == "rejected":
+                            continue
                         if review_model is None:
                             if call_index != len(review_calls) - 1:
                                 _fail("runtime checkpoint artifact graph is invalid")
@@ -5579,7 +5925,25 @@ class CrewDispatchRuntime:
                             _fail("runtime checkpoint review artifact lineage is invalid")
                         consumed_models.add(str(review_model.id))
                         review_evidence.append(str(review_model.id))
+                    if step.id in completed and attempt == retry_count:
+                        if incomplete or not review_evidence:
+                            _fail("runtime checkpoint review is unverified")
+                        last_review = by_id[review_evidence[-1]]
+                        verdict = _parse_structured_output(
+                            _REVIEW_RESPONSE_SCHEMA, last_review.content.get("text"),
+                            prefix="review response", max_bytes=16_384,
+                        )
+                        if verdict.get("verdict") != "approve":
+                            _fail("runtime checkpoint review is unverified")
                     if attempt < retry_count:
+                        if not review_evidence:
+                            _fail("runtime checkpoint historical review is unverified")
+                        historical = _parse_structured_output(
+                            _REVIEW_RESPONSE_SCHEMA, by_id[review_evidence[-1]].content.get("text"),
+                            prefix="review response", max_bytes=16_384,
+                        )
+                        if historical.get("verdict") != "revise":
+                            _fail("runtime checkpoint historical review is unverified")
                         expected_feedback_sources = (str(candidate.id), *review_evidence)
                         matches = feedback_by_sources.get(
                             (cast(str, step.reviewer), expected_feedback_sources), []
@@ -5588,13 +5952,15 @@ class CrewDispatchRuntime:
                             _fail("runtime checkpoint review artifact lineage is invalid")
                         feedback = matches[0]
                         value = feedback.content.get("feedback")
-                        if type(value) is not str or not value.strip():
+                        if type(value) is not str or not value.strip() or value != historical.get("feedback"):
                             _fail("runtime checkpoint review artifact lineage is invalid")
                         feedback_id = str(feedback.id)
                         consumed_feedback.add(feedback_id)
                     elif step.id in completed and completed[step.id].id != candidate.id:
                         _fail("runtime checkpoint completed artifact lineage is invalid")
                 elif step.id in completed and retry_count == attempt:
+                    if step.reviewer is not None:
+                        _fail("runtime checkpoint review is unverified")
                     output = completed[step.id]
                     if (
                         incomplete
@@ -5701,7 +6067,10 @@ class CrewDispatchRuntime:
             key: cast(int, value)
             for key, value in cast(Mapping[str, JsonValue], checkpoint.state["retries"]).items()
         }
-        model_ledger = _ModelLedger()
+        model_ledger = _ModelLedger(
+            rejected_outputs=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["rejected_outputs"])),
+            structured_repairs=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["structured_repairs"])),
+        )
         outcome_error: RuntimeExecutionError | None = None
         model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
         for key, model_state in model_states.items():
@@ -5722,7 +6091,7 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint model artifacts are unavailable")
                 self._completion_from_model_artifact(artifact)
                 model_ledger.artifacts[key] = artifact
-            elif model_state["status"] == "running" or (
+            elif model_state["status"] in {"running", "received_cancelled"} or (
                 model_state["status"] == "failed"
                 and not _failed_model_state_can_compact_retry(model_state)
             ):

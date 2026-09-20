@@ -21,6 +21,7 @@ from agent_hub.models.types import (
     ModelCapability,
     ModelRequest,
     ModelResponse,
+    RejectedOutputEvidence,
     TokenUsage,
     ToolCall,
     ToolDefinition,
@@ -102,9 +103,79 @@ class ModelTransportError(RuntimeError):
 class ModelResponseError(ModelTransportError):
     """Stable error for an invalid provider response contract."""
 
+    def __init__(
+        self, message: str, *, status_code: int | None = None,
+        evidence: RejectedOutputEvidence | None = None,
+    ) -> None:
+        if evidence is not None and not isinstance(evidence, RejectedOutputEvidence):
+            raise TypeError("evidence must be RejectedOutputEvidence or None")
+        super().__init__(
+            "model response rejected" if evidence is not None else message,
+            status_code=status_code,
+        )
+        self.evidence = evidence
+
+
+class ModelResponseCancelled(asyncio.CancelledError):
+    """Cancellation with a received result for accounting only, never continuation."""
+
+    def __init__(self, *, receipt: ModelResponse | RejectedOutputEvidence) -> None:
+        if not isinstance(receipt, ModelResponse | RejectedOutputEvidence):
+            raise TypeError("cancellation receipt must be a received model result")
+        super().__init__("model response cancelled")
+        self.receipt = receipt
+
+    def __str__(self) -> str:
+        return "model response cancelled"
+
+    def __repr__(self) -> str:
+        return "ModelResponseCancelled('model response cancelled')"
+
+
+def _safe_response_error(error: ModelResponseError) -> ModelResponseError:
+    return ModelResponseError(
+        "model response rejected", status_code=error.status_code, evidence=error.evidence,
+    )
+
 
 class _CancelledOutcome:
-    pass
+    def __init__(self, receipt: ModelResponse | RejectedOutputEvidence | None = None) -> None:
+        self.receipt = receipt
+
+
+def _cancelled_outcome(outcome: object) -> _CancelledOutcome:
+    if isinstance(outcome, ModelResponse):
+        return _CancelledOutcome(outcome)
+    if isinstance(outcome, ModelResponseError):
+        return _CancelledOutcome(outcome.evidence)
+    if isinstance(outcome, _CancelledOutcome):
+        return outcome
+    return _CancelledOutcome()
+
+
+async def _close_received_client(
+    close: Callable[[], Awaitable[None]], timeout: float,
+) -> BaseException | None:
+    async def bounded_close() -> None:
+        async with asyncio.timeout(min(2.0, timeout)):
+            await close()
+
+    task = asyncio.create_task(bounded_close())
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except Exception:  # noqa: BLE001 - return cleanup failure without SDK logging
+            break
+    try:
+        task.result()
+    except asyncio.CancelledError as error:
+        return cancellation or error
+    except Exception as error:  # noqa: BLE001 - return sanitized cleanup outcome to caller
+        return cancellation or error
+    return cancellation
 
 
 def _reject_json_constant(_: str) -> object:
@@ -380,6 +451,8 @@ def _transport_error(
     error: Exception,
     sensitive_values: Sequence[str],
 ) -> ModelTransportError:
+    if isinstance(error, ModelResponseError):
+        return _safe_response_error(error)
     details: list[str] = []
     status = _attribute(error, "status_code")
     if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
@@ -460,6 +533,8 @@ class _OpenAICompatibleChunkStream:
             raise
         except ModelTransportError as error:
             await self._close_client_ignoring_failure()
+            if isinstance(error, ModelResponseError):
+                raise _safe_response_error(error) from None
             raise error from None
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
             safe_error = _transport_error(
@@ -545,6 +620,8 @@ class LiteLLMClient:
         outcome = await self._complete_outcome(deployment, request, api_key)
         del deployment, request, api_key
         if isinstance(outcome, _CancelledOutcome):
+            if outcome.receipt is not None:
+                raise ModelResponseCancelled(receipt=outcome.receipt)
             raise asyncio.CancelledError
         if isinstance(outcome, Exception):
             raise outcome
@@ -607,7 +684,7 @@ class LiteLLMClient:
             await _close_ignoring_failures(client)
             return _CANCELLED
         except ModelResponseError as error:
-            safe_failure = ModelResponseError(str(error))
+            safe_failure = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
             if (
                 client is not None
@@ -623,7 +700,7 @@ class LiteLLMClient:
                     await _close_ignoring_failures(client)
                     return _CANCELLED
                 except ModelResponseError as retry_error:
-                    safe_failure = ModelResponseError(str(retry_error))
+                    safe_failure = _safe_response_error(retry_error)
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
                     safe_failure = _transport_error(
                         deployment.id,
@@ -649,7 +726,7 @@ class LiteLLMClient:
                     await _close_ignoring_failures(client)
                     return _CANCELLED
                 except ModelResponseError as retry_error:
-                    safe_failure = ModelResponseError(str(retry_error))
+                    safe_failure = _safe_response_error(retry_error)
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
                     safe_failure = _transport_error(
                         deployment.id,
@@ -660,20 +737,21 @@ class LiteLLMClient:
                 safe_failure = _transport_error(deployment.id, error, sensitive_values)
 
         if safe_failure is not None:
-            if await _close_ignoring_failures(client):
-                return _CANCELLED
+            if client is not None:
+                close_error = await _close_received_client(client.close, request.timeout_seconds)
+                if isinstance(close_error, asyncio.CancelledError):
+                    return _cancelled_outcome(safe_failure)
             return safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
             return ModelTransportError(
                 f"model transport failed for deployment {deployment.id!r}"
             )
 
-        try:
-            await client.close()
-        except asyncio.CancelledError:
-            return _CANCELLED
-        except Exception as error:  # noqa: BLE001 - close failures are provider failures
-            return _transport_error(deployment.id, error, sensitive_values)
+        close_error = await _close_received_client(client.close, request.timeout_seconds)
+        if isinstance(close_error, asyncio.CancelledError):
+            return _cancelled_outcome(parsed)
+        if isinstance(close_error, Exception):
+            return _transport_error(deployment.id, close_error, sensitive_values)
         return parsed
 
     async def _responses_outcome(
@@ -684,8 +762,8 @@ class LiteLLMClient:
     ) -> ModelResponse | Exception | _CancelledOutcome:
         try:
             kwargs = response_create_kwargs(deployment, request)
-        except ResponsesContractError as error:
-            return ValueError(str(error))
+        except ResponsesContractError:
+            return ModelResponseError("model response contract configuration rejected")
         sensitive_values = _sensitive_values(request, api_key)
         client: _OpenAIClient | None = None
         outcome: ModelResponse | Exception | _CancelledOutcome
@@ -701,18 +779,15 @@ class LiteLLMClient:
         except asyncio.CancelledError:
             outcome = _CANCELLED
         except ResponsesContractError as error:
-            outcome = ModelResponseError(str(error))
+            outcome = ModelResponseError("model response rejected", evidence=error.evidence)
         except Exception as error:  # noqa: BLE001 - preserve the safe transport boundary
             outcome = _transport_error(deployment.id, error, sensitive_values)
         if client is not None:
-            try:
-                async with asyncio.timeout(min(2.0, request.timeout_seconds)):
-                    await client.close()
-            except asyncio.CancelledError:
-                outcome = _CANCELLED
-            except Exception as error:  # noqa: BLE001 - cleanup must not leak SDK details
-                if isinstance(outcome, ModelResponse):
-                    outcome = _transport_error(deployment.id, error, sensitive_values)
+            close_error = await _close_received_client(client.close, request.timeout_seconds)
+            if isinstance(close_error, asyncio.CancelledError):
+                outcome = _cancelled_outcome(outcome)
+            elif isinstance(close_error, Exception) and isinstance(outcome, ModelResponse):
+                outcome = _transport_error(deployment.id, close_error, sensitive_values)
         return outcome
 
     async def _start_stream(
@@ -788,6 +863,7 @@ class LiteLLMClient:
     ) -> ModelResponse | Exception | _CancelledOutcome:
         sensitive_values = _sensitive_values(request, api_key)
         client = self._http_client_factory(timeout=request.timeout_seconds)
+        outcome: ModelResponse | Exception | _CancelledOutcome
         try:
             response = await client.post(
                 deployment.api_base,
@@ -798,23 +874,26 @@ class LiteLLMClient:
                 json=_messages_endpoint_payload(deployment, request),
             )
             if response.status_code >= 400:
-                return ModelTransportError(
+                outcome = ModelTransportError(
                     f"messages endpoint failed for deployment {deployment.id!r}",
                     status_code=response.status_code,
                 )
-            return _parse_messages_endpoint_response(
-                response.json(),
-                deployment.id,
-                sensitive_values,
-            )
+            else:
+                outcome = _parse_messages_endpoint_response(
+                    response.json(),
+                    deployment.id,
+                    sensitive_values,
+                )
         except asyncio.CancelledError:
-            return _CANCELLED
+            outcome = _CANCELLED
         except ModelResponseError as error:
-            return ModelResponseError(str(error))
+            outcome = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact direct HTTP/provider failures
-            return _transport_error(deployment.id, error, sensitive_values)
-        finally:
-            await _aclose_ignoring_failures(client)
+            outcome = _transport_error(deployment.id, error, sensitive_values)
+        close_error = await _close_received_client(client.aclose, request.timeout_seconds)
+        if isinstance(close_error, asyncio.CancelledError):
+            return _cancelled_outcome(outcome)
+        return outcome
 
 
 _CANCELLED = _CancelledOutcome()
@@ -913,6 +992,8 @@ def _messages_endpoint_usage(usage: object) -> TokenUsage | None:
 
 
 def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
+    if isinstance(error, ModelResponseError):
+        return False
     message = str(error).lower()
     return any(marker in message for marker in _LEGACY_MAX_TOKENS_MARKERS) and any(
         marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS
@@ -920,6 +1001,8 @@ def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
 
 
 def _should_retry_root_base_with_v1(error: Exception, api_base: str) -> bool:
+    if isinstance(error, ModelResponseError):
+        return False
     return _safe_status_code(error) in {404, 405} and _api_base_with_v1(api_base) is not None
 
 

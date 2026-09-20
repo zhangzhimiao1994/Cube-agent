@@ -1,3 +1,4 @@
+import hashlib
 import math
 import re
 from collections.abc import Iterable, Mapping
@@ -364,6 +365,71 @@ class TokenUsage:
         values = (self.prompt_tokens, self.completion_tokens, self.total_tokens)
         if not all(_is_int(value) and value >= 0 for value in values):
             raise ValueError("token counts must be nonnegative")
+
+
+type RejectedUsageStatus = Literal["known", "missing", "invalid"]
+type RejectedOutputStatus = Literal["completed", "incomplete", "refused", "unknown"]
+type RejectedOutputReason = Literal[
+    "invalid_json", "schema_mismatch", "output_limit", "invalid_output",
+    "invalid_tool", "incomplete", "refusal", "usage_missing", "usage_invalid",
+    "configuration_error",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedOutputEvidence:
+    """Private, bounded provider evidence; never an accepted model result."""
+
+    final_text: str | None = field(repr=False)
+    usage: TokenUsage | None
+    usage_status: RejectedUsageStatus
+    status: RejectedOutputStatus
+    reason: RejectedOutputReason
+    text_sha256: str | None = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.usage_status not in ("known", "missing", "invalid"):
+            raise ValueError("rejected usage status is invalid")
+        if self.status not in ("completed", "incomplete", "refused", "unknown"):
+            raise ValueError("rejected output status is invalid")
+        if self.reason not in (
+            "invalid_json", "schema_mismatch", "output_limit", "invalid_output",
+            "invalid_tool", "incomplete", "refusal", "usage_missing", "usage_invalid",
+            "configuration_error",
+        ):
+            raise ValueError("rejected output reason is invalid")
+        if self.usage_status == "known":
+            if (
+                not isinstance(self.usage, TokenUsage)
+                or self.usage.prompt_tokens + self.usage.completion_tokens != self.usage.total_tokens
+            ):
+                raise ValueError("known rejected usage requires valid token counts")
+        elif self.usage is not None:
+            raise ValueError("unknown rejected usage cannot contain token counts")
+        digest = None
+        if self.final_text is not None:
+            if type(self.final_text) is not str:
+                raise ValueError("rejected final text must be a bounded string")
+            try:
+                encoded = self.final_text.encode("utf-8")
+            except UnicodeError:
+                raise ValueError("rejected final text must be valid UTF-8") from None
+            if len(encoded) > 65_536:
+                raise ValueError("rejected final text exceeds byte limit")
+            if self.status != "completed":
+                raise ValueError("rejected final text requires completed output")
+            digest = hashlib.sha256(encoded).hexdigest()
+        object.__setattr__(self, "text_sha256", digest)
+
+    @property
+    def correction_eligible(self) -> bool:
+        return (
+            self.status == "completed"
+            and self.final_text is not None
+            and self.reason in ("invalid_json", "schema_mismatch")
+            and self.usage_status == "known"
+            and self.usage is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)

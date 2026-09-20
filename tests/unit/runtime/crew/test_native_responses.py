@@ -184,6 +184,20 @@ class NativeRun:
                 await client.close()
 
 
+def assert_single_known_rejected_usage(checkpoint_state: Mapping[str, object]) -> None:
+    usage = cast(Mapping[str, object], checkpoint_state["usage"])
+    assert usage["tokens"] == 21
+    rejected = cast(Mapping[str, Mapping[str, object]], checkpoint_state["rejected_outputs"])
+    assert len(rejected) == 1
+    receipt = next(iter(rejected.values()))
+    assert receipt["usage_status"] == "known"
+    assert receipt["usage"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 9,
+        "total_tokens": 21,
+    }
+
+
 @pytest.mark.parametrize("field", ["result", "format"])
 async def test_native_responses_real_crew_tool_continuation(tmp_path: Path, field: str) -> None:
     context = await task(tmp_path)
@@ -297,7 +311,7 @@ async def test_native_responses_unknown_or_unoffered_tool_never_executes(
     context = await task(tmp_path)
     case = NativeRun(tmp_path, [[tool_item(tool_name)]], step_tools=step_tools)
     events: list[RunEvent] = []
-    with pytest.raises(RuntimeExecutionError, match="(?i)model|responses|provider"):
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
         await case.run(context, events)
     assert len(case.wire) == 1
     assert case.closed_by_transport == [True]
@@ -310,7 +324,10 @@ async def test_native_responses_unknown_or_unoffered_tool_never_executes(
     assert case.policy.requests == []
     assert case.executions() == []
     assert all(event.kind is not EventKind.RUNTIME_COMPLETED for event in events)
-    assert (await case.runtime.save_checkpoint()).state["tools"] == {}
+    assert not any(event.step_id == "final_response" for event in events)
+    checkpoint = await case.runtime.save_checkpoint()
+    assert checkpoint.state["tools"] == {}
+    assert_single_known_rejected_usage(checkpoint.state)
 
 
 @pytest.mark.parametrize("boundary", ["incomplete", "failed", "refusal", "unsupported"])
@@ -327,7 +344,7 @@ async def test_native_responses_mixed_output_cannot_execute_a_valid_tool(
         item = {"type": "web_search_call", "id": "builtin", "status": "completed"}
     case = NativeRun(tmp_path, [[tool_item(), item]])
     events: list[RunEvent] = []
-    with pytest.raises(RuntimeExecutionError, match="(?i)model|responses|provider") as caught:
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid") as caught:
         await case.run(context, events)
     assert "PRIVATE-REFUSAL" not in str(caught.value)
     assert len(case.wire) == 1
@@ -338,4 +355,7 @@ async def test_native_responses_mixed_output_cannot_execute_a_valid_tool(
     assert case.policy.requests == []
     assert case.executions() == []
     assert all(event.kind is not EventKind.RUNTIME_COMPLETED for event in events)
-    assert (await case.runtime.save_checkpoint()).state["tools"] == {}
+    assert not any(event.step_id == "final_response" for event in events)
+    checkpoint = await case.runtime.save_checkpoint()
+    assert checkpoint.state["tools"] == {}
+    assert_single_known_rejected_usage(checkpoint.state)

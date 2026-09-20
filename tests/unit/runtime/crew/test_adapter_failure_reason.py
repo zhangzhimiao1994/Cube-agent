@@ -482,7 +482,9 @@ class RoleAwareGateway:
 
 def _role_output_text(request: ModelRequest, *, fallback: str = "role output") -> str:
     if request.response_schema is not None:
-        return '{"summary":"role output","findings":["ok"],"risks":[]}'
+        properties = cast(Mapping[str, object], request.response_schema.schema["properties"])
+        values = {"summary": "role output", "findings": ["ok"], "risks": []}
+        return json.dumps({key: values[key] for key in properties})
     return fallback
 
 
@@ -707,6 +709,15 @@ class EmptyThenReviewingGateway(EmptyThenRoleAwareGateway):
             provider_model="deepseek/deepseek-v4-flash",
             cost_usd=Decimal(0),
         )
+
+
+class CapacityThenReviewingGateway(EmptyThenReviewingGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if request.logical_model == self.empty_logical_model and not self._empty_returned:
+            self._empty_returned = True
+            self.requests.append(request)
+            raise CapacityUnavailable("model capacity unavailable")
+        return await super().complete_with_context(request)
 
 
 class FailingModelGateway(RoleAwareGateway):
@@ -1410,20 +1421,24 @@ async def test_invalid_dependent_structured_role_output_blocks_handoff(
     events: list[RunEvent] = []
 
     with pytest.raises(RuntimeExecutionError, match=reason):
+        from agent_hub.runtime.crew.adapter import _validate_structured_role_output
+        plan = _structured_dependent_final_plan()
+        _validate_structured_role_output(plan, plan.steps[0], plan.agents[0], writer_output)
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
         async for event in runtime.run(_context()):
             events.append(event)
 
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == 2
     draft_failed = next(
         event for event in events if event.kind is EventKind.STEP_FAILED and event.step_id == "draft"
     )
-    assert draft_failed.reason == reason
+    assert draft_failed.reason == "structured output invalid"
     assert draft_failed.payload["blocked_contract_ids"] == ("draft-to-final_response",)
     assert draft_failed.payload["orchestration_recovery_hint"] == "retry_blocked_contract_chain"
     assert not any(event.step_id == "final_response" for event in events)
 
 
-async def test_fallback_dependent_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+async def test_fallback_dependent_plain_text_output_cannot_fabricate_handoff() -> None:
     gateway = FallbackSequenceGateway("plain fallback evidence", "final answer")
     runtime = CrewDispatchRuntime(
         gateway,
@@ -1431,28 +1446,16 @@ async def test_fallback_dependent_plain_text_output_is_wrapped_for_handoff_recov
         crew_factory=FastFactory(),
     )
 
-    events = await _collect(runtime)
-
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
+        async for event in runtime.run(_context()):
+            events.append(event)
     assert len(gateway.requests) == 2
-    draft_created = next(
-        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
-    )
-    assert draft_created.artifact is not None
-    output = draft_created.artifact.content["text"]
-    assert json.loads(cast(str, output)) == {
-        "summary": "plain fallback evidence",
-        "findings": ["Recovered non-JSON fallback output for downstream handoff."],
-        "risks": ["Fallback output did not satisfy the structured response schema."],
-    }
-    final_completed = next(
-        event
-        for event in events
-        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
-    )
-    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+    assert not any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert not any(event.step_id == "final_response" for event in events)
 
 
-async def test_logical_fallback_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+async def test_logical_fallback_plain_text_output_cannot_fabricate_handoff() -> None:
     gateway = LogicalFallbackSequenceGateway("plain logical fallback evidence", "final answer")
     runtime = CrewDispatchRuntime(
         gateway,
@@ -1460,28 +1463,16 @@ async def test_logical_fallback_plain_text_output_is_wrapped_for_handoff_recover
         crew_factory=FastFactory(),
     )
 
-    events = await _collect(runtime)
-
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
+        async for event in runtime.run(_context()):
+            events.append(event)
     assert len(gateway.requests) == 2
-    draft_created = next(
-        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
-    )
-    assert draft_created.artifact is not None
-    output = draft_created.artifact.content["text"]
-    assert json.loads(cast(str, output)) == {
-        "summary": "plain logical fallback evidence",
-        "findings": ["Recovered non-JSON fallback output for downstream handoff."],
-        "risks": ["Fallback output did not satisfy the structured response schema."],
-    }
-    final_completed = next(
-        event
-        for event in events
-        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
-    )
-    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+    assert not any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert not any(event.step_id == "final_response" for event in events)
 
 
-async def test_project_scale_artifact_plain_text_output_is_wrapped_for_handoff_recovery() -> None:
+async def test_project_scale_artifact_plain_text_output_cannot_fabricate_handoff() -> None:
     gateway = SequenceGateway("plain project-scale evidence", "final answer")
     plan = DispatchPlan(
         agents=(
@@ -1526,25 +1517,13 @@ async def test_project_scale_artifact_plain_text_output_is_wrapped_for_handoff_r
     )
     runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
 
-    events = await _collect(runtime)
-
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
+        async for event in runtime.run(_context()):
+            events.append(event)
     assert len(gateway.requests) == 2
-    draft_created = next(
-        event for event in events if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "writer"
-    )
-    assert draft_created.artifact is not None
-    output = draft_created.artifact.content["text"]
-    assert json.loads(cast(str, output)) == {
-        "summary": "plain project-scale evidence",
-        "findings": ["Recovered non-JSON project-scale artifact output for downstream handoff."],
-        "risks": ["Project-scale artifact output did not satisfy the structured response schema."],
-    }
-    final_completed = next(
-        event
-        for event in events
-        if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response"
-    )
-    assert final_completed.payload["completed_contract_ids"] == ("draft-to-final_response",)
+    assert not any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert not any(event.step_id == "final_response" for event in events)
 
 
 async def test_agent_output_schema_becomes_structured_model_request() -> None:
@@ -1619,13 +1598,13 @@ async def test_final_structured_role_output_must_match_schema() -> None:
     runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
     events: list[RunEvent] = []
 
-    with pytest.raises(RuntimeExecutionError, match="structured role output is not valid json"):
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
         async for event in runtime.run(_context()):
             events.append(event)
 
     failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
     assert failed.step_id == "final"
-    assert failed.reason == "structured role output is not valid json"
+    assert failed.reason == "structured output invalid"
     assert "blocked_contract_ids" not in failed.payload
 
 
@@ -3243,7 +3222,7 @@ async def test_reviewer_timeout_uses_generic_recovery_before_soft_skip() -> None
     await restored.restore_checkpoint(checkpoint)
 
 
-async def test_reviewer_empty_model_response_uses_generic_recovery_before_soft_skip() -> None:
+async def test_reviewer_empty_model_response_uses_shared_format_correction() -> None:
     gateway = EmptyThenRoleAwareGateway(empty_logical_model="review")
     generation = RecordingGeneration()
     repository = InMemoryArtifactRepository()
@@ -3257,25 +3236,28 @@ async def test_reviewer_empty_model_response_uses_generic_recovery_before_soft_s
     events = await _collect(runtime)
 
     reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
-    assert len(reviewer_prompts) == 2
-    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
-    assert retrying.actor == "reviewer"
-    assert retrying.payload["error_code"] == "model.empty_response"
-    assert retrying.payload["recovery_strategy"] == "compact_retry"
-    assert retrying.payload["recovery_attempt"] == 1
-    assert "Keep the retry concise" in reviewer_prompts[1][2]
+    assert len(reviewer_prompts) == 1
+    assert len([request for request in gateway.requests if request.logical_model == "review"]) == 2
+    assert not any(event.kind is EventKind.STEP_RETRYING for event in events)
     review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review_completed.payload["verdict"] == "approve"
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
     checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+    repairs = checkpoint.state["structured_repairs"]
+    assert isinstance(repairs, Mapping) and set(repairs) == {"draft"}
+    repair = repairs["draft"]
+    assert isinstance(repair, Mapping)
+    assert repair["actor"] == "reviewer" and repair["status"] == "succeeded"
     model_states = checkpoint.state["models"]
     assert isinstance(model_states, Mapping)
     assert {state["status"] for state in model_states.values() if isinstance(state, Mapping)} == {
-        "failed",
+        "rejected",
         "succeeded",
     }
+    replay_gateway = RoleAwareGateway()
     restored = CrewDispatchRuntime(
-        RoleAwareGateway(),
+        replay_gateway,
         _reviewed_step_plan(),
         artifact_repository=repository,
         crew_factory=RecordingFactory(RecordingGeneration()),
@@ -3283,6 +3265,8 @@ async def test_reviewer_empty_model_response_uses_generic_recovery_before_soft_s
     await restored.restore_checkpoint(checkpoint)
     resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
     assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+    assert replay_gateway.requests == []
+    assert not any(event.kind is EventKind.COST_RECORDED for event in resumed_events)
 
 
 async def test_reviewer_capacity_unavailable_uses_generic_recovery_before_completing() -> None:
@@ -3310,7 +3294,7 @@ async def test_reviewer_capacity_unavailable_uses_generic_recovery_before_comple
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 
-async def test_reviewer_capacity_unavailable_soft_skips_after_compact_retry() -> None:
+async def test_reviewer_capacity_unavailable_fails_closed_after_compact_retry() -> None:
     gateway = RepeatedCapacityUnavailableGateway(unavailable_logical_model="review", failures=2)
     generation = RecordingGeneration()
     runtime = CrewDispatchRuntime(
@@ -3319,22 +3303,25 @@ async def test_reviewer_capacity_unavailable_soft_skips_after_compact_retry() ->
         crew_factory=RecordingFactory(generation),
     )
 
-    events = await _collect(runtime)
-
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in runtime.run(_context()):
+            events.append(event)
     reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
     assert len(reviewer_prompts) == 2
-    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
-    assert review_completed.actor == "reviewer"
-    assert review_completed.payload["verdict"] == "approve"
-    assert review_completed.payload["review_status"] == "skipped"
-    assert review_completed.payload["error_code"] == "model.capacity_unavailable"
-    assert review_completed.payload["recovery_status"] == "failed_after_compact_retry"
-    assert review_completed.payload["recovery_attempts"] == 1
-    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    review_failed = next(event for event in events if event.kind == "review.failed")
+    assert review_failed.payload["actor"] == "reviewer"
+    assert review_failed.payload["review_status"] == "unverified"
+    assert "verdict" not in review_failed.payload
+    assert review_failed.payload["error_code"] == "model.capacity_unavailable"
+    assert not any(event.kind is EventKind.REVIEW_COMPLETED for event in events)
+    assert not any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert not any(event.step_id == "final_response" for event in events)
+    assert len([item for item in generation.prompts if item[1] != "reviewer"]) == 1
 
 
-async def test_reviewer_revise_checkpoint_after_compact_recovery_resumes() -> None:
-    gateway = EmptyThenReviewingGateway(
+async def test_reviewer_revise_after_compact_recovery_has_distinct_ledger_coordinates() -> None:
+    gateway = CapacityThenReviewingGateway(
         empty_logical_model="review",
         reviews=('{"verdict":"revise","feedback":"tighten"}', '{"verdict":"approve"}'),
     )
@@ -3348,13 +3335,20 @@ async def test_reviewer_revise_checkpoint_after_compact_recovery_resumes() -> No
         crew_factory=RecordingFactory(generation),
     )
 
-    checkpoints = [
-        event.checkpoint
-        async for event in runtime.run(_context())
-        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
-    ]
+    initial_events: list[RunEvent] = []
+    async for event in runtime.run(_context()):
+        initial_events.append(event)
+    assert len(gateway.requests) == 6
+    assert initial_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [
+        event.payload["verdict"]
+        for event in initial_events
+        if event.kind is EventKind.REVIEW_COMPLETED
+    ] == ["revise", "approve"]
     revise_checkpoint = next(
-        checkpoint for checkpoint in checkpoints if checkpoint.state["review_refs"]
+        event.checkpoint
+        for event in initial_events
+        if event.checkpoint is not None and event.checkpoint.state["review_refs"]
     )
     restored_generation = RecordingGeneration()
     restored = CrewDispatchRuntime(
@@ -3365,14 +3359,20 @@ async def test_reviewer_revise_checkpoint_after_compact_recovery_resumes() -> No
     )
     await restored.restore_checkpoint(revise_checkpoint)
 
-    events = [event async for event in restored.run(_context(checkpoint=revise_checkpoint))]
-
+    events: list[RunEvent] = []
+    async for event in restored.run(_context(checkpoint=revise_checkpoint)):
+        events.append(event)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert any(item[0] == "draft" and item[1] == "writer" for item in restored_generation.prompts)
+    assert [event.payload["verdict"] for event in events
+            if event.kind is EventKind.REVIEW_COMPLETED] == ["approve"]
 
 
-async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resume() -> None:
-    gateway = EmptyThenReviewingGateway(
+@pytest.mark.parametrize("recovery", ["capacity", "empty"])
+async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resume(
+    recovery: str,
+) -> None:
+    factory = CapacityThenReviewingGateway if recovery == "capacity" else EmptyThenReviewingGateway
+    gateway = factory(
         empty_logical_model="general",
         reviews=('{"verdict":"revise","feedback":"tighten"}', '{"verdict":"approve"}'),
     )
@@ -3388,8 +3388,19 @@ async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resum
 
     events = await _collect(runtime)
 
-    assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == 2
+    assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == (
+        2 if recovery == "capacity" else 1
+    )
+    assert len([request for request in gateway.requests if request.logical_model == "review"]) == 2
+    assert [event.payload["verdict"] for event in events
+            if event.kind is EventKind.REVIEW_COMPLETED] == ["revise", "approve"]
     checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {
+        "tokens": 10 if recovery == "capacity" else 12, "cost_usd": "0",
+    }
+    repairs = checkpoint.state["structured_repairs"]
+    assert isinstance(repairs, Mapping)
+    assert set(repairs) == (set() if recovery == "capacity" else {"draft"})
     model_states = checkpoint.state["models"]
     assert isinstance(model_states, Mapping)
     draft_step_attempts = {
@@ -3399,9 +3410,10 @@ async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resum
         and state["step_id"] == "draft"
         and state["purpose"] == "step"
     }
-    assert draft_step_attempts == {0, 1, 3}
+    assert draft_step_attempts == ({0, 1, 3} if recovery == "capacity" else {0, 2})
+    replay_gateway = RoleAwareGateway()
     restored = CrewDispatchRuntime(
-        RoleAwareGateway(),
+        replay_gateway,
         plan,
         artifact_repository=repository,
         crew_factory=RecordingFactory(RecordingGeneration()),
@@ -3409,6 +3421,8 @@ async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resum
     await restored.restore_checkpoint(checkpoint)
     resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
     assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+    assert replay_gateway.requests == []
+    assert not any(event.kind is EventKind.COST_RECORDED for event in resumed_events)
 
 
 async def test_reviewer_timeout_retries_before_soft_skip() -> None:
@@ -3429,7 +3443,7 @@ async def test_reviewer_timeout_retries_before_soft_skip() -> None:
     assert "error_code" not in review_completed.payload
 
 
-async def test_reviewer_timeout_skips_after_retry_budget_is_exhausted() -> None:
+async def test_reviewer_timeout_fails_closed_after_retry_budget_is_exhausted() -> None:
     generation = RecordingGeneration(reviewer_timeouts=2)
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
@@ -3437,23 +3451,20 @@ async def test_reviewer_timeout_skips_after_retry_budget_is_exhausted() -> None:
         crew_factory=RecordingFactory(generation),
     )
 
-    events = await _collect(runtime)
-
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in runtime.run(_context()):
+            events.append(event)
     reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
     assert len(reviewer_prompts) == 2
-    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
-    assert review_completed.payload["review_status"] == "timeout_skipped"
-    assert review_completed.payload["error_code"] == "crew.step_timeout"
-    assert review_completed.payload["recovery_status"] == "failed_after_compact_retry"
-    assert review_completed.payload["recovery_attempts"] == 1
-    assert review_completed.payload["recovery_layers"] == (
-        "input_compression",
-        "prompt_decomposition",
-        "model_fallback_marked",
-        "failure_closure",
-    )
-    assert review_completed.payload["model_fallback"] == "not_available_in_crewai_bridge"
-    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    review_failed = next(event for event in events if event.kind == "review.failed")
+    assert review_failed.payload["review_status"] == "unverified"
+    assert review_failed.payload["error_code"] == "crew.step_timeout"
+    assert "verdict" not in review_failed.payload
+    assert not any(event.kind is EventKind.REVIEW_COMPLETED for event in events)
+    assert not any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert not any(event.step_id == "final_response" for event in events)
+    assert len([item for item in generation.prompts if item[1] != "reviewer"]) == 1
 
 
 async def test_dependent_final_step_receives_bounded_review_packets() -> None:

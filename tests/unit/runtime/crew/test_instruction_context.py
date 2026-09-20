@@ -367,7 +367,10 @@ async def test_review_bridge_replay_uses_persisted_candidate_and_guidance_digest
     async def no_checkpoint(step_id: str, retries: int, review_artifact: Artifact | None = None) -> None:
         raise AssertionError('replay must not publish a new checkpoint')
 
-    async def no_state(key: str, model_state: Mapping[str, JsonValue]) -> None:
+    async def no_state(
+        key: str, model_state: Mapping[str, JsonValue], *,
+        repair: Mapping[str, JsonValue] | None = None,
+    ) -> None:
         raise AssertionError('replay must not change model state')
 
     async def no_usage(*args: Any, **kwargs: Any) -> None:
