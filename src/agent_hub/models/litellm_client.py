@@ -9,6 +9,11 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from openai import AsyncOpenAI
 
+from agent_hub.models.responses import (
+    ResponsesContractError,
+    parse_response,
+    response_create_kwargs,
+)
 from agent_hub.models.types import (
     Deployment,
     JsonScalar,
@@ -49,6 +54,7 @@ class _Chat(Protocol):
 
 class _OpenAIClient(Protocol):
     chat: _Chat
+    responses: _Completions
 
     async def close(self) -> None: ...
 
@@ -555,6 +561,8 @@ class LiteLLMClient:
             raise validation_error
         if _is_messages_endpoint(deployment.api_base):
             raise ValueError("messages endpoint streaming is not supported")
+        if request.response_schema is not None and deployment.structured_output_api == "responses":
+            raise ValueError("structured Responses streaming is not supported")
         sensitive_values = _sensitive_values(request, api_key)
         return _OpenAICompatibleChunkStream(
             lambda: self._start_stream(deployment, request, api_key, sensitive_values),
@@ -573,6 +581,8 @@ class LiteLLMClient:
             return validation_error
         if _is_messages_endpoint(deployment.api_base):
             return await self._messages_outcome(deployment, request, api_key)
+        if request.response_schema is not None and deployment.structured_output_api == "responses":
+            return await self._responses_outcome(deployment, request, api_key)
 
         sensitive_values = _sensitive_values(request, api_key)
         client: _OpenAIClient | None = None
@@ -665,6 +675,45 @@ class LiteLLMClient:
         except Exception as error:  # noqa: BLE001 - close failures are provider failures
             return _transport_error(deployment.id, error, sensitive_values)
         return parsed
+
+    async def _responses_outcome(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse | Exception | _CancelledOutcome:
+        try:
+            kwargs = response_create_kwargs(deployment, request)
+        except ResponsesContractError as error:
+            return ValueError(str(error))
+        sensitive_values = _sensitive_values(request, api_key)
+        client: _OpenAIClient | None = None
+        outcome: ModelResponse | Exception | _CancelledOutcome
+        try:
+            async with asyncio.timeout(request.timeout_seconds):
+                client = self._client_factory(
+                    api_key=api_key,
+                    base_url=deployment.api_base,
+                    max_retries=0,
+                )
+                raw = await client.responses.create(**kwargs)
+                outcome = parse_response(raw, request)
+        except asyncio.CancelledError:
+            outcome = _CANCELLED
+        except ResponsesContractError as error:
+            outcome = ModelResponseError(str(error))
+        except Exception as error:  # noqa: BLE001 - preserve the safe transport boundary
+            outcome = _transport_error(deployment.id, error, sensitive_values)
+        if client is not None:
+            try:
+                async with asyncio.timeout(min(2.0, request.timeout_seconds)):
+                    await client.close()
+            except asyncio.CancelledError:
+                outcome = _CANCELLED
+            except Exception as error:  # noqa: BLE001 - cleanup must not leak SDK details
+                if isinstance(outcome, ModelResponse):
+                    outcome = _transport_error(deployment.id, error, sensitive_values)
+        return outcome
 
     async def _start_stream(
         self,

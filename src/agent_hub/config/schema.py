@@ -4,7 +4,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.models.types import Deployment, ModelCapability, StructuredOutputAPI
 
 SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 MAX_IDENTIFIER_LENGTH = 128
@@ -40,6 +40,10 @@ class DeploymentDefinition(StrictConfigModel):
     provider: str = Field(max_length=512)
     model: str = Field(max_length=512)
     api_base: str | None = Field(default=None, max_length=2048)
+    # Rollback materializes defaults; omit the legacy protocol for old readers.
+    structured_output_api: StructuredOutputAPI = Field(
+        default="chat_completions", exclude_if=lambda value: value == "chat_completions"
+    )
     secret_ref: str = Field(alias="credential_ref", max_length=512)
     quota_scope_id: str = Field(max_length=MAX_IDENTIFIER_LENGTH)
     max_concurrency: int = Field(default=1, ge=1, le=1000)
@@ -97,6 +101,7 @@ class DeploymentDefinition(StrictConfigModel):
             "logical_model": logical_model,
             "provider_model": f"{self.provider}/{self.model}",
             "request_model": self.model,
+            "structured_output_api": self.structured_output_api,
             "secret_ref": self.secret_ref,
             "quota_scope_id": self.quota_scope_id,
             "max_concurrency": self.max_concurrency,

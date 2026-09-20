@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -17,6 +17,7 @@ _PROVIDER_METADATA_KEYS = frozenset({
     "created",
     "system_fingerprint",
     "finish_reason",
+    "api_protocol",
 })
 _SAFE_PROVIDER_METADATA_STRING = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
 
@@ -24,6 +25,9 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | tuple[JsonValue, ...] | Mapping[str, JsonValue]
 type ContentPart = Mapping[str, object]
 type MessageContent = str | tuple[ContentPart, ...]
+
+
+StructuredOutputAPI = Literal["chat_completions", "responses"]
 
 
 class ModelCapability(StrEnum):
@@ -147,8 +151,11 @@ class Deployment:
     capabilities: frozenset[ModelCapability] = field(
         default_factory=lambda: frozenset({ModelCapability.TEXT})
     )
+    structured_output_api: StructuredOutputAPI = "chat_completions"
 
     def __post_init__(self) -> None:
+        if self.structured_output_api not in ("chat_completions", "responses"):
+            raise ValueError("structured_output_api must be chat_completions or responses")
         _require_safe_identifier("deployment id", self.id)
         _require_safe_identifier("logical_model", self.logical_model)
         _require_unpadded("provider_model", self.provider_model, max_length=512)
@@ -381,7 +388,12 @@ class ModelResponse:
         for key, value in self.provider_metadata.items():
             if key not in _PROVIDER_METADATA_KEYS:
                 raise ValueError("provider metadata contains an unknown key")
-            if key == "created":
+            if key == "api_protocol":
+                if type(value) is not str or value not in ("chat_completions", "responses"):
+                    raise ValueError(
+                        "provider metadata api_protocol must be chat_completions or responses"
+                    )
+            elif key == "created":
                 if not _is_int(value) or not 0 <= cast(int, value) < 2**63:
                     raise ValueError("provider metadata created must be a bounded integer")
             elif (

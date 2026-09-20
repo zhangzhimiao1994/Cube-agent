@@ -71,7 +71,14 @@ from agent_hub.models.capacity import safe_operational_limit
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
-from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    StructuredOutputAPI,
+    StructuredResponseSchema,
+)
 from agent_hub.multimodal.generation import (
     MultimediaArtifact,
     MultimediaDailyLimitExceeded,
@@ -148,6 +155,7 @@ class ModelDeploymentRequest(BaseModel):
 
     provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     api_base: str = Field(min_length=1, max_length=2048)
+    structured_output_api: StructuredOutputAPI = "chat_completions"
     api_protocol: str = Field(
         default="openai_compatible",
         pattern=r"^(openai_compatible|anthropic_messages)$",
@@ -2506,6 +2514,7 @@ class MainAgentModelConfig(BaseModel):
 
     provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     api_base: str = Field(min_length=1, max_length=2048)
+    structured_output_api: StructuredOutputAPI = "chat_completions"
     api_protocol: str = Field(
         default="openai_compatible",
         pattern=r"^(openai_compatible|anthropic_messages)$",
@@ -5144,6 +5153,10 @@ class InMemoryAdminResourceService:
     ) -> ModelDeploymentResponse:
         if model_id not in self.models:
             raise PublicAPIError(404, "model_not_found", "model not found")
+        if "structured_output_api" not in request.model_fields_set:
+            request = request.model_copy(update={
+                "structured_output_api": self.models[model_id].structured_output_api,
+            })
         request = _normalize_model_request_api_base(request)
         response = ModelDeploymentResponse(
             **request.model_dump(),
@@ -5169,6 +5182,7 @@ class InMemoryAdminResourceService:
         self,
         request: MainAgentConfigRequest,
     ) -> MainAgentConfigResponse:
+        request = _preserve_main_agent_structured_output_api(request, self.main_agent_config)
         response = MainAgentConfigResponse(**_normalize_main_agent_config(request).model_dump())
         self.main_agent_config = response
         return response
@@ -6633,6 +6647,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             for index, deployment in enumerate(deployments):
                 response = self._model_response(logical_model, fallback_model, index, deployment)
                 if response.id == model_id:
+                    if "structured_output_api" not in request.model_fields_set:
+                        request = request.model_copy(update={
+                            "structured_output_api": response.structured_output_api,
+                        })
                     target_logical_model = logical_model
                     target_index = index
                     break
@@ -7170,6 +7188,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self,
         request: MainAgentConfigRequest,
     ) -> MainAgentConfigResponse:
+        if request.model is not None and "structured_output_api" not in request.model.model_fields_set:
+            request = _preserve_main_agent_structured_output_api(
+                request, await self.get_main_agent_config(),
+            )
         request = _normalize_main_agent_config(request)
         if request.model is not None:
             await self._verify_model_availability(
@@ -7180,7 +7202,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not await self._upsert_admin_payload(
             "main_agent",
             "default",
-            request.model_dump(mode="json"),
+            request.model_dump(
+                mode="json",
+                exclude={"model": {"structured_output_api"}}
+                if request.model is not None and request.model.structured_output_api == "chat_completions"
+                else None,
+            ),
         ):
             return await super().update_main_agent_config(request)
         await self._record_audit(
@@ -8682,6 +8709,24 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 reason,
                 details=details,
             )
+        response_schema = None
+        required_capabilities = {ModelCapability.TEXT}
+        prompt = "Reply with the exact text: agent-hub-model-check-ok"
+        if (
+            deployment.structured_output_api == "responses"
+            and ModelCapability.STRUCTURED_OUTPUT in deployment.capabilities
+        ):
+            required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
+            response_schema = StructuredResponseSchema(
+                name="ModelAvailability",
+                schema={
+                    "type": "object",
+                    "properties": {"status": {"type": "string", "enum": ("ok",)}},
+                    "required": ("status",),
+                    "additionalProperties": False,
+                },
+            )
+            prompt = 'Return exactly this JSON object: {"status":"ok"}'
         try:
             api_key = await self._secret_service.resolve(self._tenant_id, deployment.secret_ref)
             await self._model_transport.complete(
@@ -8691,13 +8736,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     messages=(
                         ModelMessage(
                             role="user",
-                            content="Reply with the exact text: agent-hub-model-check-ok",
+                            content=prompt,
                         ),
                     ),
-                    required_capabilities=frozenset({ModelCapability.TEXT}),
+                    required_capabilities=frozenset(required_capabilities),
+                    response_schema=response_schema,
                     timeout_seconds=30,
                     allow_fallback=False,
-                    max_output_tokens=32,
+                    max_output_tokens=256 if response_schema is not None else 32,
                 ),
                 api_key,
             )
@@ -8825,6 +8871,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             id=response_id,
             provider=parsed.provider,
             api_base=parsed.api_base or "http://litellm:4000/v1",
+            structured_output_api=parsed.structured_output_api,
             api_protocol="anthropic_messages"
             if (parsed.api_base or "").rstrip("/").lower().endswith("/messages")
             else "openai_compatible",
@@ -9106,6 +9153,11 @@ def _deployment_document_from_request(request: ModelDeploymentRequest) -> dict[s
         "rpm": request.rpm,
         "tpm": request.tpm,
         "capabilities": request.capabilities,
+        **(
+            {"structured_output_api": request.structured_output_api}
+            if request.structured_output_api != "chat_completions"
+            else {}
+        ),
     }
 
 
@@ -9224,6 +9276,22 @@ def _normalize_main_agent_config(request: MainAgentConfigRequest) -> MainAgentCo
     )
 
 
+def _preserve_main_agent_structured_output_api(
+    request: MainAgentConfigRequest, previous: MainAgentConfigResponse,
+) -> MainAgentConfigRequest:
+    if (
+        request.model is None
+        or previous.model is None
+        or "structured_output_api" in request.model.model_fields_set
+    ):
+        return request
+    return request.model_copy(update={
+        "model": request.model.model_copy(update={
+            "structured_output_api": previous.model.structured_output_api,
+        }),
+    })
+
+
 def _main_agent_model_deployment(model: MainAgentModelConfig) -> Deployment:
     return Deployment(
         id="main_agent_1",
@@ -9231,6 +9299,7 @@ def _main_agent_model_deployment(model: MainAgentModelConfig) -> Deployment:
         provider_model=f"{model.provider}/{model.upstream_model}",
         request_model=model.upstream_model,
         api_base=model.api_base,
+        structured_output_api=model.structured_output_api,
         secret_ref=model.credential_ref,
         quota_scope_id="main-agent",
         max_concurrency=model.max_concurrency,
