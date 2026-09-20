@@ -1273,6 +1273,226 @@ PY
   return 1
 }
 
+check_runtime_tool_gateway_invocation_contract() {
+  local python_bin
+  local script_dir
+  local source_dir
+  printf 'profile: runtime tool gateway invocation contract\n'
+  if ! python_bin="$(detect_python)"; then
+    printf 'fail: runtime tool gateway invocation contract requires python\n' >&2
+    failures=$((failures + 1))
+    return 1
+  fi
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  source_dir="$(cd -- "$script_dir/../.." && pwd -P)"
+  if PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" "$python_bin" - <<'PY'
+import asyncio
+from collections.abc import Mapping
+from uuid import UUID
+
+from agent_hub.auth.models import Role
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
+
+
+TENANT_ID = UUID("44444444-4444-4444-8444-444444444444")
+USER_ID = UUID("66666666-6666-4666-8666-666666666666")
+RUN_ID = UUID("55555555-5555-4555-8555-555555555555")
+
+
+def require(value, label):
+    if not value:
+        raise SystemExit(label)
+
+
+class RuntimeBackend:
+    def __init__(self):
+        self.calls = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.calls.append(("available", str(tenant_id), name))
+        return False
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(("execute", str(tenant_id), str(run_id), actor, name, arguments, idempotency_key))
+        return {"unexpected": True}
+
+
+class PolicyGateway:
+    def __init__(self):
+        self.requests = []
+
+    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        self.requests.append((request, role))
+        return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+
+
+class PluginBackend:
+    def __init__(self):
+        self.calls = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.calls.append(("available", str(tenant_id), name))
+        return True
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(("invoke", str(tenant_id), str(user_id), str(run_id), actor, name, arguments, idempotency_key))
+        return {"content": {"event_id": "evt_acceptance"}}
+
+
+class McpBackend:
+    def __init__(self):
+        self.calls = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.calls.append(("available", str(tenant_id), name))
+        return True
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(("invoke", str(tenant_id), str(user_id), str(run_id), actor, name, arguments, idempotency_key))
+        return {"content": {"result": "searched"}}
+
+
+class FailingAvailabilityPluginBackend(PluginBackend):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        del tenant_id, name
+        raise RuntimeError("Bearer sk-secret must not leak")
+
+
+def request(tool_name: str, *, actor: str, arguments: Mapping[str, JsonValue], sandbox: str, key: str) -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor=actor,
+        tool_name=tool_name,
+        arguments=arguments,
+        approval_required=False,
+        sandbox=sandbox,
+        idempotency_key=key,
+    )
+
+
+async def main():
+    runtime = RuntimeBackend()
+    policy = PolicyGateway()
+    plugin_backend = PluginBackend()
+    mcp_backend = McpBackend()
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+        mcp_backend=mcp_backend,
+    )
+
+    plugin_result = await gateway.invoke(
+        TENANT_ID,
+        request(
+            "calendar.create_event",
+            actor="scheduler",
+            arguments={"title": "Mofang review"},
+            sandbox="remote_connector",
+            key="plugin_acceptance_1",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+    require(plugin_result.status == "succeeded", "plugin invocation must succeed")
+    require(plugin_result.payload == {"content": {"event_id": "evt_acceptance"}}, "plugin payload mismatch")
+    require([call[0] for call in plugin_backend.calls] == ["available", "invoke"], "plugin backend route mismatch")
+    plugin_policy, plugin_role = policy.requests[0]
+    require(plugin_role is Role.OPERATOR, "plugin policy role mismatch")
+    require(plugin_policy.capability == "plugin", "plugin policy capability mismatch")
+    require(plugin_policy.operation == "use", "plugin policy operation mismatch")
+    require(plugin_policy.resource == "plugin/calendar/create_event", "plugin policy resource mismatch")
+    require(plugin_policy.arguments == {"title": "Mofang review"}, "plugin policy arguments mismatch")
+
+    mcp_result = await gateway.invoke(
+        TENANT_ID,
+        request(
+            "search.web_search",
+            actor="researcher",
+            arguments={"query": "mofang"},
+            sandbox="mcp_remote",
+            key="mcp_acceptance_1",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+    require(mcp_result.status == "succeeded", "MCP invocation must succeed")
+    require(mcp_result.payload == {"content": {"result": "searched"}}, "MCP payload mismatch")
+    require([call[0] for call in mcp_backend.calls] == ["available", "invoke"], "MCP backend route mismatch")
+    mcp_policy, mcp_role = policy.requests[1]
+    require(mcp_role is Role.OPERATOR, "MCP policy role mismatch")
+    require(mcp_policy.capability == "mcp", "MCP policy capability mismatch")
+    require(mcp_policy.operation == "invoke", "MCP policy operation mismatch")
+    require(mcp_policy.resource == "mcp/search/web_search", "MCP policy resource mismatch")
+    require(mcp_policy.arguments == {"query": "mofang"}, "MCP policy arguments mismatch")
+    require(runtime.calls == [], "external calls must not fall back to runtime backend")
+
+    failure_gateway = HarnessToolGateway(
+        RuntimeBackend(),
+        policy_gateway=PolicyGateway(),
+        plugin_backend=FailingAvailabilityPluginBackend(),
+    )
+    failure_result = await failure_gateway.invoke(
+        TENANT_ID,
+        request(
+            "calendar.create_event",
+            actor="scheduler",
+            arguments={"title": "Bearer sk-secret must not leak"},
+            sandbox="remote_connector",
+            key="plugin_failure_acceptance_1",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+    require(failure_result.status == "failed", "unavailable plugin must fail closed")
+    require(failure_result.failure_reason == "external tool unavailable", "unavailable plugin failure reason mismatch")
+    require("sk-secret" not in repr(failure_result), "plugin failure result leaked a secret")
+
+
+asyncio.run(main())
+PY
+  then
+    printf 'ok: runtime tool gateway routes plugin and MCP calls\n'
+    printf 'ok: runtime tool gateway reports deterministic external failures\n'
+    return 0
+  fi
+  printf 'fail: runtime tool gateway invocation contract\n' >&2
+  failures=$((failures + 1))
+  return 1
+}
+
 check_interaction_prevention_and_recovery() {
   local python_bin
   local script_dir
@@ -4209,6 +4429,7 @@ run_deepseek_profile() {
   check_url "runtime readiness boundary" "/health/ready" || true
   check_prometheus_metrics || true
   check_runtime_failure_diagnostics || true
+  check_runtime_tool_gateway_invocation_contract || true
   check_model_capability_recovery_contract || true
   check_model_selection_policy_contract || true
   check_model_fallback_capacity_pressure_contract || true
