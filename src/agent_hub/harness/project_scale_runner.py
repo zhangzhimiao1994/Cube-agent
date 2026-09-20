@@ -19,7 +19,11 @@ from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 from agent_hub.harness.project_requirements import validate_small_task_api
-from agent_hub.harness.project_scale import ProjectScaleRunPlan, build_project_scale_run_plan
+from agent_hub.harness.project_scale import (
+    ProjectScaleBenchmarkKind,
+    ProjectScaleRunPlan,
+    build_project_scale_run_plan,
+)
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _QUALITY_KEYS = frozenset(
@@ -275,7 +279,8 @@ class ProjectScaleExecutionReport:
             "verification_scope": (
                 "synthetic fixture regression; not real project capability or recovery proof"
                 if self.benchmark_kind == "fixture"
-                else "build/test and independent business checks; full agent-process review pending"
+                else "actual build/test and per-case independent business checks; "
+                "runtime process evidence unverified"
             ),
             "ok": self.ok,
             "case_count": self.case_count,
@@ -582,6 +587,7 @@ def execute_project_scale_plan(
                 observation.details,
                 observation.events,
                 observation.workspace_bundle,
+                benchmark_kind=plan.benchmark_kind,
             )
             evidence["agent_standard_verification"] = agent_standard_verification.passed
             discussion_trace = _evaluate_discussion_trace(
@@ -617,6 +623,7 @@ def execute_project_scale_plan(
                 status=status,
                 evidence=evidence,
                 case_id=run_request.case_id,
+                benchmark_kind=plan.benchmark_kind,
             ):
                 repair_response = client.request_json(
                     "POST",
@@ -690,6 +697,7 @@ def execute_project_scale_plan(
                     repair_observation.details,
                     repair_observation.events,
                     repair_observation.workspace_bundle,
+                    benchmark_kind=plan.benchmark_kind,
                 )
                 evidence["agent_standard_verification"] = agent_standard_verification.passed
                 discussion_trace = _evaluate_discussion_trace(
@@ -1872,8 +1880,12 @@ def _has_agent_standard_verification(
     details: dict[str, object] | None,
     events: list[object] | None,
     workspace_bundle: bytes | None,
+    *,
+    benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> bool:
-    return _evaluate_agent_standard_verification(details, events, workspace_bundle).passed
+    return _evaluate_agent_standard_verification(
+        details, events, workspace_bundle, benchmark_kind=benchmark_kind
+    ).passed
 
 
 def _evaluate_deliverable_quality(
@@ -1896,7 +1908,17 @@ def _evaluate_agent_standard_verification(
     details: dict[str, object] | None,
     events: list[object] | None,
     workspace_bundle: bytes | None,
+    *,
+    benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> _EvidenceCheck:
+    if benchmark_kind == "capability":
+        # No runtime contract yet binds context reads and plan ordering to model requests.
+        return _EvidenceCheck(
+            passed=False,
+            reasons=(
+                "agent_standard_verification: trusted runtime context/plan evidence unavailable",
+            ),
+        )
     reasons: list[str] = []
     has_structured_evidence = _has_agent_standard_payload(
         details, events
@@ -2757,6 +2779,7 @@ def _should_attempt_deliverable_repair(
     status: str | None,
     evidence: dict[str, bool],
     case_id: str,
+    benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> bool:
     return (
         status in {"completed", "failed"}
@@ -2764,7 +2787,10 @@ def _should_attempt_deliverable_repair(
         and (
             evidence.get("workspace_bundle") is not True
             or evidence.get("deliverable_quality") is not True
-            or evidence.get("agent_standard_verification") is not True
+            or (
+                benchmark_kind == "fixture"
+                and evidence.get("agent_standard_verification") is not True
+            )
             or (
                 _case_requires_discussion_trace(case_id)
                 and evidence.get("discussion_trace") is not True

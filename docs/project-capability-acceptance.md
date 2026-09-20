@@ -44,12 +44,17 @@ those scales fail that gate explicitly. Do not count them as verified capability
 checks in capability mode. Author-written pass claims cannot substitute for those
 checks. File completeness and meaningful implementation checks remain required.
 
-`agent_standard_verification` is a separate gate. Business behavior may pass while
-constraint/skill reading or planning evidence remains missing. `ok=false` retains
-such failures. `capability_verified` remains false: neither one business scenario
-nor the existing process-evidence flags establish overall agent capability.
+`agent_standard_verification` is a separate gate. In capability mode, model text,
+event payload pass flags, and ZIP-authored reading/verification claims cannot
+establish this gate. A trusted runtime contract binding actual context loading,
+model-request injection, and planning before implementation is not available yet,
+so this gate fails explicitly. Business behavior may still pass independently;
+`ok=false` retains the process failure. `capability_verified` remains false.
 
 Capability repair requests preserve the original business requirements and pass
 concrete failures back to the agent. They never request fabricated passing flags;
 if requirements cannot fit the planner limit, repair fails explicitly instead of
-silently truncating them.
+silently truncating them. Missing runtime process instrumentation alone does not
+trigger another generation request: a model cannot repair the absence of trusted
+server records by changing its project. Real deliverable failures still trigger
+the bounded repair attempt.

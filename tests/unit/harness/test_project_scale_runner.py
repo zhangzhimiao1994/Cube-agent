@@ -16,6 +16,7 @@ from agent_hub.harness import project_scale_runner as project_scale_runner_modul
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_FLOW_KINDS,
     PROJECT_SCALE_TIERS,
+    ProjectScaleBenchmarkKind,
     ProjectScaleRunPlan,
     build_project_scale_run_plan,
 )
@@ -28,10 +29,12 @@ from agent_hub.harness.project_scale_runner import (
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
     _evaluate_agent_standard_verification,
+    _has_agent_standard_verification,
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
     _plugin_contract_payload_passes,
     _safe_zip_member_path,
+    _should_attempt_deliverable_repair,
     _workspace_bundle_agent_standard_reasons,
     execute_project_scale_plan,
     format_project_scale_result_line,
@@ -57,7 +60,9 @@ def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_project_scale_runner_prints_dry_run_plan_json() -> None:
-    result = run_project_scale_runner("--scale", "ultra", "--flow", "self_repair", "--json")
+    result = run_project_scale_runner(
+        "--scale", "ultra", "--flow", "self_repair", "--json", "--benchmark-kind", "fixture"
+    )
 
     assert result.returncode == 0
     payload = json.loads(result.stdout)
@@ -76,7 +81,7 @@ def test_project_scale_runner_prints_dry_run_plan_json() -> None:
 
 
 def test_project_scale_runner_defaults_to_full_matrix_plan_json() -> None:
-    result = run_project_scale_runner("--json")
+    result = run_project_scale_runner("--json", "--benchmark-kind", "fixture")
 
     assert result.returncode == 0
     payload = json.loads(result.stdout)
@@ -96,7 +101,7 @@ def test_project_scale_runner_defaults_to_full_matrix_plan_json() -> None:
 
 
 def test_fixture_execution_report_does_not_claim_real_capability() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     report = execute_project_scale_plan(plan, FakeAcceptanceClient())
 
     payload = report.to_payload()
@@ -199,6 +204,160 @@ def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records
     assert not project_scale_runner_module._executed_capability_quality(bundle, failed).passed
 
 
+@pytest.mark.parametrize("claimed_standard", (False, True))
+@pytest.mark.parametrize("validation_failure", (None, "build failed", "requirements failed"))
+def test_capability_standard_stays_unverified_after_delivery_validation_and_repair(
+    monkeypatch: pytest.MonkeyPatch,
+    claimed_standard: bool,
+    validation_failure: str | None,
+) -> None:
+    outcomes = [False, True] if validation_failure else [True]
+
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        passed = outcomes.pop(0)
+        return project_scale_runner_module._EvidenceCheck(
+            passed=passed, reasons=() if passed else (str(validation_failure),)
+        )
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    plan = build_project_scale_run_plan(
+        scales=("small",), flows=("direct",), execute=True, benchmark_kind="capability"
+    )
+    client = FakeAcceptanceClient(
+        status="completed", artifacts=[{"id": "artifact-1"}], agent_standard=claimed_standard
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert len(client.submitted_bodies) == (2 if validation_failure else 1)
+    assert result.evidence["agent_standard_verification"] is False
+    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["requirements_validation"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.missing_evidence == ("agent_standard_verification",)
+    assert result.errors == (
+        "agent_standard_verification: trusted runtime context/plan evidence unavailable",
+    )
+    assert report.ok is False
+    assert report.to_payload()["capability_verified"] is False
+    assert result.repair_attempted is (validation_failure is not None)
+    assert outcomes == []
+    if validation_failure:
+        assert result.run_id == client.repair_run_id
+        assert validation_failure in str(client.submitted_bodies[1]["message"])
+
+
+@pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
+@pytest.mark.parametrize(
+    "failure", (None, "workspace_bundle", "deliverable_quality", "generated_project_validation")
+)
+def test_process_evidence_only_triggers_fixture_repair(
+    benchmark_kind: ProjectScaleBenchmarkKind, failure: str | None
+) -> None:
+    evidence = {
+        "final_artifacts": True,
+        "workspace_bundle": True,
+        "deliverable_quality": True,
+        "generated_project_validation": True,
+        "agent_standard_verification": False,
+    }
+    if failure:
+        evidence[failure] = False
+
+    assert _should_attempt_deliverable_repair(
+        status="completed", evidence=evidence, case_id="small:direct", benchmark_kind=benchmark_kind
+    ) is (benchmark_kind == "fixture" or failure is not None)
+
+
+@pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
+@pytest.mark.parametrize(
+    "source", ("details", "model_text", "event_flags", "zip_flags", "zip_reading", "zip_plan")
+)
+def test_agent_standard_self_reports_are_fixture_only(
+    benchmark_kind: ProjectScaleBenchmarkKind, source: str
+) -> None:
+    claim: dict[str, object] = {"agent_standard_verification": {
+        "constraints_read": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }}
+    details: dict[str, object] | None = None
+    events: list[object] | None = None
+    files: dict[str, str] = {}
+    if source == "details":
+        details = claim
+    elif source == "model_text":
+        details = {"artifact": {"content": {"text": json.dumps(claim)}}}
+    elif source == "event_flags":
+        events = [{"kind": "tool.completed", "tool_name": "project.generate_zip", "payload": claim}]
+    elif source == "zip_flags":
+        files["verification.json"] = json.dumps(claim)
+    else:
+        files["IMPLEMENTATION_PLAN.md"] = _AGENT_STANDARD_IMPLEMENTATION_PLAN if (
+            source == "zip_plan"
+        ) else "Implement the API."
+        files["VERIFICATION.md"] = "All checks passed."
+        if source == "zip_reading":
+            files["constraints_reading_evidence.json"] = json.dumps({
+                "read_before_implementation": True,
+                "constraints": ["AGENTS.md", "HANDOFF.md", "PROJECT_REQUIREMENTS.md"],
+                "skills": ["SKILL.md"],
+            })
+    bundle = _project_bundle(files) if files else None
+
+    check = _evaluate_agent_standard_verification(
+        details, events, bundle, benchmark_kind=benchmark_kind
+    )
+
+    assert check.passed is (benchmark_kind == "fixture")
+    assert _has_agent_standard_verification(
+        details, events, bundle, benchmark_kind=benchmark_kind
+    ) is check.passed
+    if benchmark_kind == "capability":
+        assert check.reasons == (
+            "agent_standard_verification: trusted runtime context/plan evidence unavailable",
+        )
+
+
+@pytest.mark.parametrize("events", (
+    None,
+    [],
+    [{"kind": "tool.completed", "tool_name": "workspace.read", "payload": {
+        "status": "succeeded", "workspace_files": [{"path": "AGENTS.md", "sha256": "a" * 64}],
+    }}],
+    [{"kind": "checkpoint.saved", "checkpoint": {"state": {"plan_digest": "a" * 64}}}],
+))
+def test_capability_standard_requires_runtime_contract(events: list[object] | None) -> None:
+    check = _evaluate_agent_standard_verification(
+        None, events, None, benchmark_kind="capability"
+    )
+
+    assert check.passed is False
+    assert check.reasons == (
+        "agent_standard_verification: trusted runtime context/plan evidence unavailable",
+    )
+
+
+@pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
+def test_execution_report_describes_benchmark_verification_scope(
+    benchmark_kind: ProjectScaleBenchmarkKind,
+) -> None:
+    payload = ProjectScaleExecutionReport(results=(), benchmark_kind=benchmark_kind).to_payload()
+
+    assert payload["capability_verified"] is False
+    if benchmark_kind == "capability":
+        assert payload["verification_scope"] == (
+            "actual build/test and per-case independent business checks; "
+            "runtime process evidence unverified"
+        )
+    else:
+        assert payload["verification_scope"] == (
+            "synthetic fixture regression; not real project capability or recovery proof"
+        )
+
+
 def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -210,7 +369,7 @@ def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     ) -> ProjectScaleExecutionReport:
         captured["plan"] = args[0]
         captured["kwargs"] = kwargs
-        return ProjectScaleExecutionReport(results=())
+        return ProjectScaleExecutionReport(results=(), benchmark_kind="fixture")
 
     monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "test-token")
     monkeypatch.setattr(
@@ -219,7 +378,9 @@ def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
         fake_execute_project_scale_plan,
     )
 
-    exit_code = project_scale_runner_module.main(["--execute", "--json"])
+    exit_code = project_scale_runner_module.main(
+        ["--execute", "--json", "--benchmark-kind", "fixture"]
+    )
 
     output = capsys.readouterr()
     payload = json.loads(output.out)
@@ -250,7 +411,7 @@ def test_project_scale_runner_execute_can_enable_generated_project_validation(
     ) -> ProjectScaleExecutionReport:
         captured["plan"] = args[0]
         captured["kwargs"] = kwargs
-        return ProjectScaleExecutionReport(results=())
+        return ProjectScaleExecutionReport(results=(), benchmark_kind="fixture")
 
     monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "test-token")
     monkeypatch.setenv("AGENT_HUB_PROJECT_SCALE_VERIFY_ARTIFACT_BUILD", "1")
@@ -261,7 +422,7 @@ def test_project_scale_runner_execute_can_enable_generated_project_validation(
     )
 
     exit_code = project_scale_runner_module.main(
-        ["--execute", "--artifact-build-timeout", "9", "--json"]
+        ["--execute", "--artifact-build-timeout", "9", "--json", "--benchmark-kind", "fixture"]
     )
 
     output = capsys.readouterr()
@@ -275,7 +436,9 @@ def test_project_scale_runner_execute_can_enable_generated_project_validation(
 
 
 def test_project_scale_runner_prints_dry_run_plan_focus_in_text() -> None:
-    result = run_project_scale_runner("--scale", "small", "--flow", "capability_validation")
+    result = run_project_scale_runner(
+        "--scale", "small", "--flow", "capability_validation", "--benchmark-kind", "fixture"
+    )
 
     assert result.returncode == 0
     assert (
@@ -432,6 +595,8 @@ def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) 
         "--json",
         "--output",
         str(output_path),
+        "--benchmark-kind",
+        "fixture",
     )
 
     assert result.returncode == 0
@@ -442,7 +607,9 @@ def test_project_scale_runner_writes_json_report_to_output_path(tmp_path: Path) 
 
 
 def test_project_scale_runner_rejects_execute_without_token() -> None:
-    result = run_project_scale_runner("--execute", "--scale", "small", "--flow", "direct")
+    result = run_project_scale_runner(
+        "--execute", "--scale", "small", "--flow", "direct", "--benchmark-kind", "fixture"
+    )
 
     assert result.returncode == 2
     assert (
@@ -464,7 +631,7 @@ def test_project_scale_runner_accepts_harness_login_env_aliases(monkeypatch: pyt
 
 
 def test_project_scale_runner_rejects_unknown_filters() -> None:
-    result = run_project_scale_runner("--scale", "tiny", "--json")
+    result = run_project_scale_runner("--scale", "tiny", "--json", "--benchmark-kind", "fixture")
 
     assert result.returncode == 2
     assert "unknown project scale: tiny" in result.stderr
@@ -614,7 +781,7 @@ def test_urllib_acceptance_client_retries_busy_acceptance_login(
 
 
 def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])
 
     report = execute_project_scale_plan(plan, client)
@@ -652,7 +819,7 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
 
 
 def test_execute_project_scale_plan_accepts_production_events_envelope_and_artifact_ids() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[],
@@ -670,6 +837,7 @@ def test_execute_project_scale_plan_accepts_production_events_envelope_and_artif
 
 def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
     plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
         scales=("small",),
         flows=("capability_validation",),
         execute=True,
@@ -697,7 +865,7 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
 
 
 def test_execute_project_scale_plan_requires_plugin_contract_evidence() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("plugin",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-plugin",
         session_id="project-scale-small-plugin",
@@ -721,7 +889,7 @@ def test_execute_project_scale_plan_requires_plugin_contract_evidence() -> None:
 
 
 def test_deliverable_repair_body_keeps_dispatch_task_bounded_for_plugin_flow() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("plugin",), execute=True)
     body = dict(plan.requests[0].body)
     body["message"] = f"{body['message']}\n" + ("original context " * 220)
 
@@ -732,6 +900,7 @@ def test_deliverable_repair_body_keeps_dispatch_task_bounded_for_plugin_flow() -
             "plugin_contract: missing or incomplete plugin capability contract evidence",
             "discussion_trace: missing hybrid/discussion process evidence",
         ),
+        benchmark_kind="fixture",
     )
 
     message = repair_body["message"]
@@ -777,7 +946,7 @@ def test_simple_passed_lines_do_not_count_as_reproducible_execution_evidence() -
 
 
 def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_repair() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("plugin",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("plugin",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-plugin",
         session_id="project-scale-small-plugin",
@@ -797,6 +966,7 @@ def test_execute_project_scale_plan_fails_plugin_flow_without_contract_after_rep
 
 def test_execute_project_scale_plan_rejects_silent_mode_downgrade() -> None:
     plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
         scales=("small",),
         flows=("capability_validation",),
         execute=True,
@@ -817,6 +987,7 @@ def test_execute_project_scale_plan_rejects_silent_mode_downgrade() -> None:
 
 def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -> None:
     report = ProjectScaleExecutionReport(
+        benchmark_kind="fixture",
         results=(
             ProjectScaleCaseResult(
                 case_id="medium:artifact_production",
@@ -885,7 +1056,7 @@ def test_project_scale_execution_report_summarizes_failed_evidence_and_focus() -
 
 
 def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -933,7 +1104,7 @@ def test_project_scale_repair_attempted_counts_self_repair_trace() -> None:
 
 
 def test_execute_project_scale_plan_repairs_failed_deliverable_quality() -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact",
         session_id="project-scale-medium-artifact_production",
@@ -960,7 +1131,7 @@ def test_execute_project_scale_plan_repairs_failed_deliverable_quality() -> None
 
 
 def test_execute_project_scale_plan_repairs_missing_agent_standard_verification() -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact",
         session_id="project-scale-medium-artifact_production",
@@ -986,7 +1157,7 @@ def test_execute_project_scale_plan_repairs_missing_agent_standard_verification(
 
 
 def test_execute_project_scale_plan_repairs_missing_build_test_execution_evidence() -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact",
         session_id="project-scale-medium-artifact_production",
@@ -1007,7 +1178,7 @@ def test_execute_project_scale_plan_repairs_missing_build_test_execution_evidenc
 
 
 def test_execute_project_scale_plan_repairs_missing_hybrid_discussion_trace() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("hybrid",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("hybrid",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-hybrid",
         session_id="project-scale-small-hybrid",
@@ -1028,7 +1199,7 @@ def test_execute_project_scale_plan_repairs_missing_hybrid_discussion_trace() ->
 
 
 def test_execute_project_scale_plan_explains_quality_and_standard_repair_reasons() -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact",
         session_id="project-scale-medium-artifact_production",
@@ -1051,7 +1222,7 @@ def test_execute_project_scale_plan_explains_quality_and_standard_repair_reasons
 
 
 def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact",
         session_id="project-scale-medium-artifact_production",
@@ -1079,7 +1250,7 @@ def test_execute_project_scale_plan_reports_failed_deliverable_repair_outcome() 
 
 
 def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         response_project_id="project-scale-acceptance",
         response_session_id="project-scale-stale-direct",
@@ -1099,7 +1270,7 @@ def test_execute_project_scale_plan_rejects_scope_mismatch_from_replayed_run() -
 
 
 def test_execute_project_scale_plan_rejects_detail_scope_mismatch() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -1116,7 +1287,7 @@ def test_execute_project_scale_plan_rejects_detail_scope_mismatch() -> None:
 
 
 def test_execute_project_scale_plan_requires_non_empty_event_stream() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}], events=[])
 
     report = execute_project_scale_plan(plan, client)
@@ -1127,7 +1298,7 @@ def test_execute_project_scale_plan_requires_non_empty_event_stream() -> None:
 
 
 def test_execute_project_scale_plan_rejects_event_scope_mismatch_when_present() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -1144,7 +1315,7 @@ def test_execute_project_scale_plan_rejects_event_scope_mismatch_when_present() 
 
 
 def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(fail_bundle=True)
 
     report = execute_project_scale_plan(plan, client)
@@ -1160,7 +1331,7 @@ def test_execute_project_scale_plan_records_case_failure_and_continues_cleanup()
 
 
 def test_execute_project_scale_plan_attempts_repair_when_workspace_bundle_is_missing() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         fail_bundle=True,
         status="completed",
@@ -1176,7 +1347,7 @@ def test_execute_project_scale_plan_attempts_repair_when_workspace_bundle_is_mis
 
 
 def test_execute_project_scale_plan_drops_stale_workspace_bundle_error_after_repair() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         fail_bundle_once=True,
         status="completed",
@@ -1194,7 +1365,7 @@ def test_execute_project_scale_plan_drops_stale_workspace_bundle_error_after_rep
 
 
 def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         fail_bundle=True,
         status="completed",
@@ -1212,7 +1383,7 @@ def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:
 
 
 def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     embedded_bundle = {
         "workspace_bundle": {
             "files": {
@@ -1257,7 +1428,7 @@ def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() ->
 
 
 def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     embedded_bundle = {
         "deliverable_quality": {
             "requirements_satisfied": True,
@@ -1318,7 +1489,7 @@ def test_execute_project_scale_plan_reads_quality_flags_from_json_artifact() -> 
 
 
 def test_execute_project_scale_plan_uses_markdown_file_bundle_artifact() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     markdown_bundle = """
 # Direct Deliverable
 
@@ -1401,7 +1572,7 @@ assert.equal(formatGreeting(''), 'Hello, guest');
 
 
 def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_artifact() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     downloaded_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -1456,7 +1627,7 @@ def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_ar
 
 
 def test_execute_project_scale_plan_reads_quality_from_markdown_metadata_file() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     metadata = {
         "deliverable_quality": {
             "requirements_satisfied": True,
@@ -1571,7 +1742,7 @@ python -m compileall direct_ledger tests
 
 
 def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     metadata = {
         "deliverable_quality": {
             "requirements_satisfied": True,
@@ -1623,7 +1794,7 @@ def test_execute_project_scale_plan_requires_interaction_evidence_when_claimed()
 
 
 def test_execute_project_scale_plan_rejects_todo_dummy_project_markers() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": (
@@ -1664,7 +1835,7 @@ def test_execute_project_scale_plan_rejects_todo_dummy_project_markers() -> None
 
 
 def test_execute_project_scale_plan_rejects_constant_only_source_bundle() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -1702,7 +1873,7 @@ def test_execute_project_scale_plan_rejects_constant_only_source_bundle() -> Non
 
 
 def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     functional_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -1744,7 +1915,7 @@ def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> 
 
 
 def test_execute_project_scale_plan_can_validate_generated_project_bundle() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -1788,7 +1959,7 @@ def test_execute_project_scale_plan_can_validate_generated_project_bundle() -> N
 
 
 def test_execute_project_scale_plan_fails_when_generated_project_validation_fails() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -1831,7 +2002,7 @@ def test_execute_project_scale_plan_fails_when_generated_project_validation_fail
 def test_execute_project_scale_plan_repairs_generated_project_validation_failure(
     tmp_path: Path,
 ) -> None:
-    plan = build_project_scale_run_plan(scales=("medium",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     marker = tmp_path / "validation-repaired"
     client = FakeAcceptanceClient(
         run_id="run-medium-artifact-validation",
@@ -1884,7 +2055,7 @@ def test_execute_project_scale_plan_repairs_generated_project_validation_failure
 
 
 def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         status="completed",
         artifacts=[{"id": "artifact-1"}],
@@ -2075,14 +2246,14 @@ def test_agent_standard_verification_accepts_public_tool_event_evidence() -> Non
         },
     }
 
-    check = _evaluate_agent_standard_verification(None, [event], bundle)
+    check = _evaluate_agent_standard_verification(None, [event], bundle, benchmark_kind="fixture")
 
     assert check.passed is True
     assert check.reasons == ()
 
 
 def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -2113,7 +2284,7 @@ def test_execute_project_scale_plan_rejects_package_only_shell_bundle() -> None:
 
 
 def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -2146,7 +2317,7 @@ def test_execute_project_scale_plan_rejects_source_bundle_without_test_files() -
 
 
 def test_execute_project_scale_plan_rejects_import_only_test_files() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     shell_bundle = _project_bundle(
         {
             "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
@@ -2180,7 +2351,7 @@ def test_execute_project_scale_plan_rejects_import_only_test_files() -> None:
 
 
 def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="failed", artifacts=[{"id": "artifact-1"}])
 
     report = execute_project_scale_plan(plan, client)
@@ -2193,7 +2364,7 @@ def test_execute_project_scale_plan_rejects_failed_terminal_status() -> None:
 
 
 def test_execute_project_scale_plan_approves_large_project_preflight() -> None:
-    plan = build_project_scale_run_plan(scales=("large",), flows=("direct",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("large",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-large-direct",
         session_id="project-scale-large-direct",
@@ -2213,7 +2384,7 @@ def test_execute_project_scale_plan_approves_large_project_preflight() -> None:
 
 
 def test_execute_project_scale_plan_approves_waiting_capability_tool() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("artifact_production",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-artifact",
         session_id="project-scale-small-artifact_production",
@@ -2235,7 +2406,7 @@ def test_execute_project_scale_plan_approves_waiting_capability_tool() -> None:
 
 
 def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("self_repair",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("self_repair",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-self-repair",
         session_id="project-scale-small-self_repair",
@@ -2255,7 +2426,7 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
 
 
 def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("dispatch",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("dispatch",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-dispatch",
         session_id="project-scale-small-dispatch",
@@ -2286,7 +2457,7 @@ def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
 
 
 def test_execute_project_scale_plan_repairs_failed_run_with_artifacts() -> None:
-    plan = build_project_scale_run_plan(scales=("small",), flows=("dispatch",), execute=True)
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("dispatch",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-small-dispatch",
         session_id="project-scale-small-dispatch",
