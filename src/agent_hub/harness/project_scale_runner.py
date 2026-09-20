@@ -689,6 +689,8 @@ def execute_project_scale_plan(
                     evidence["generated_project_validation"] = (
                         generated_project_validation.passed
                     )
+                if evidence["workspace_bundle"]:
+                    _drop_recovered_workspace_bundle_errors(errors)
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
@@ -959,6 +961,14 @@ def _extend_unique(target: list[str], items: Sequence[str]) -> None:
     for item in items:
         if item not in target:
             target.append(item)
+
+
+def _drop_recovered_workspace_bundle_errors(errors: list[str]) -> None:
+    errors[:] = [
+        error
+        for error in errors
+        if not error.startswith("workspace_bundle: workspace bundle unavailable")
+    ]
 
 
 def _workspace_bundle_path(body: dict[str, object]) -> str:

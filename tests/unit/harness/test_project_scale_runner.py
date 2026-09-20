@@ -1071,6 +1071,24 @@ def test_execute_project_scale_plan_attempts_repair_when_workspace_bundle_is_mis
     assert "workspace_bundle: workspace bundle unavailable" in report.results[0].errors
 
 
+def test_execute_project_scale_plan_drops_stale_workspace_bundle_error_after_repair() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient(
+        fail_bundle_once=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-small-direct-repair"
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.errors == ()
+
+
 def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:
     plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
@@ -2265,6 +2283,7 @@ class FakeAcceptanceClient:
         self,
         *,
         fail_bundle: bool = False,
+        fail_bundle_once: bool = False,
         run_id: str = "run-small-direct",
         session_id: str = "project-scale-small-direct",
         create_status: str | None = None,
@@ -2299,6 +2318,7 @@ class FakeAcceptanceClient:
         artifact_downloads: Mapping[str, bytes] | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
+        self.fail_bundle_once = fail_bundle_once
         self.run_id = run_id
         self.session_id = session_id
         self.create_status = create_status
@@ -2516,6 +2536,9 @@ class FakeAcceptanceClient:
                 return self.artifact_downloads[artifact_id]
             raise RuntimeError("artifact download unavailable")
         if self.fail_bundle:
+            raise RuntimeError("workspace bundle unavailable")
+        if self.fail_bundle_once:
+            self.fail_bundle_once = False
             raise RuntimeError("workspace bundle unavailable")
         if self.workspace_bundle is not None:
             return self.workspace_bundle
