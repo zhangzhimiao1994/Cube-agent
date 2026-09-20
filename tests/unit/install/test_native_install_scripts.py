@@ -442,6 +442,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "fail: run detail schema safe projection" in command
     assert "fail: runtime failure diagnostics" in command
     assert '"plugin.adapter_unavailable"' in command
+    assert (
+        '("Plugin tool unavailable: plugin_disabled", "plugin_runtime", "disabled", '
+        '"plugin.disabled", False)'
+        in command
+    )
     assert '"plugin.timeout"' in command
     assert '"plugin.credential_unavailable"' in command
     assert '"plugin.endpoint_unavailable"' in command
@@ -451,6 +456,11 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert '"mcp.server_timeout"' in command
     assert '"mcp.server_failed"' in command
     assert '"mcp.server_unavailable"' in command
+    assert (
+        '("MCP tool unavailable: mcp_server_failed", "mcp_runtime", "server_failed", '
+        '"mcp.server_failed", True)'
+        in command
+    )
 
     assert "PluginConfigCapabilityManifestSource" in command
     assert '"plugin_package_adapter_unavailable"' in command

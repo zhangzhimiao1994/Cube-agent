@@ -1095,6 +1095,7 @@ cases = [
         "plugin.credential_unavailable",
         False,
     ),
+    ("Plugin tool unavailable: plugin_disabled", "plugin_runtime", "disabled", "plugin.disabled", False),
     (
         "Plugin arguments do not match input schema: invalid type",
         "plugin_runtime",
@@ -1128,6 +1129,7 @@ cases = [
     ("mcp_server_timeout", "mcp_runtime", "server_timeout", "mcp.server_timeout", True),
     ("mcp.server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
     ("mcp_server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
+    ("MCP tool unavailable: mcp_server_failed", "mcp_runtime", "server_failed", "mcp.server_failed", True),
     ("mcp.server_unavailable", "mcp_runtime", "server_unavailable", "mcp.server_unavailable", True),
     ("mcp_server_unavailable", "mcp_runtime", "server_unavailable", "mcp.server_unavailable", True),
 ]

@@ -407,6 +407,16 @@ def _plugin_runtime_diagnostic(
             suggested_action="插件凭证不可用；检查插件 secret 引用、凭证解析配置和租户授权后重试。",
             status_code=status_code,
         )
+    if lowered in {"plugin_disabled", "plugin.disabled"} or "plugin_disabled" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="plugin_runtime",
+            error_category="disabled",
+            error_code="plugin.disabled",
+            retryable=False,
+            suggested_action="插件当前被禁用；请启用插件、启动插件运行时并刷新插件/MCP 能力清单后重试。",
+            status_code=status_code,
+        )
     if lowered.startswith("plugin arguments do not match input schema"):
         return _base_diagnostic(
             reason,
@@ -469,6 +479,46 @@ def _mcp_runtime_diagnostic(
     *,
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic | None:
+    if "mcp_server_not_discovered" in lowered or "mcp.server_not_discovered" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_not_discovered",
+            error_code="mcp.server_not_discovered",
+            retryable=False,
+            suggested_action="MCP server 已配置但尚未完成工具发现；检查 server 启动、发现协议和 allowlist 配置后 reload。",
+            status_code=status_code,
+        )
+    if "mcp_server_timeout" in lowered or "mcp.server_timeout" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_timeout",
+            error_code="mcp.server_timeout",
+            retryable=True,
+            suggested_action="MCP server 健康检查或工具发现超时；检查连接、降低负载或恢复服务后重试。",
+            status_code=status_code,
+        )
+    if "mcp_server_unavailable" in lowered or "mcp.server_unavailable" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_unavailable",
+            error_code="mcp.server_unavailable",
+            retryable=True,
+            suggested_action="MCP server 不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
+            status_code=status_code,
+        )
+    if "mcp_server_failed" in lowered or "mcp.server_failed" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="mcp_runtime",
+            error_category="server_failed",
+            error_code="mcp.server_failed",
+            retryable=True,
+            suggested_action="MCP server 不健康或不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
+            status_code=status_code,
+        )
     if "mcp tool unavailable" in lowered or "mcp.tool_unavailable" in lowered:
         return _base_diagnostic(
             reason,
@@ -487,49 +537,6 @@ def _mcp_runtime_diagnostic(
             error_code="mcp.timeout",
             retryable=True,
             suggested_action="MCP 工具调用超时；检查 MCP server 健康、网络/stdio 连接和请求规模，恢复后可重试。",
-            status_code=status_code,
-        )
-    if lowered in {"mcp_server_not_discovered", "mcp.server_not_discovered"}:
-        return _base_diagnostic(
-            reason,
-            error_stage="mcp_runtime",
-            error_category="server_not_discovered",
-            error_code="mcp.server_not_discovered",
-            retryable=False,
-            suggested_action="MCP server 已配置但尚未完成工具发现；检查 server 启动、发现协议和 allowlist 配置后 reload。",
-            status_code=status_code,
-        )
-    if lowered in {"mcp_server_timeout", "mcp.server_timeout"}:
-        return _base_diagnostic(
-            reason,
-            error_stage="mcp_runtime",
-            error_category="server_timeout",
-            error_code="mcp.server_timeout",
-            retryable=True,
-            suggested_action="MCP server 健康检查或工具发现超时；检查连接、降低负载或恢复服务后重试。",
-            status_code=status_code,
-        )
-    if lowered in {"mcp_server_unavailable", "mcp.server_unavailable"}:
-        return _base_diagnostic(
-            reason,
-            error_stage="mcp_runtime",
-            error_category="server_unavailable",
-            error_code="mcp.server_unavailable",
-            retryable=True,
-            suggested_action="MCP server 不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
-            status_code=status_code,
-        )
-    if lowered in {
-        "mcp_server_failed",
-        "mcp.server_failed",
-    }:
-        return _base_diagnostic(
-            reason,
-            error_stage="mcp_runtime",
-            error_category="server_failed",
-            error_code="mcp.server_failed",
-            retryable=True,
-            suggested_action="MCP server 不健康或不可用；检查 server 进程、传输配置和运行时 reload 状态，恢复后可重试。",
             status_code=status_code,
         )
     return None

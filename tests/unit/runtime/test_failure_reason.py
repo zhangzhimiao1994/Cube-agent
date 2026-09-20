@@ -301,6 +301,12 @@ def test_runtime_failure_diagnostic_classifies_plugin_adapter_unavailable() -> N
             False,
         ),
         (
+            "Plugin tool unavailable: plugin_disabled",
+            "disabled",
+            "plugin.disabled",
+            False,
+        ),
+        (
             "Plugin arguments do not match input schema: invalid type",
             "invalid_arguments",
             "plugin.invalid_arguments",
@@ -361,8 +367,15 @@ def test_runtime_failure_diagnostic_classifies_plugin_runtime_failures(
         ("mcp_server_timeout", "server_timeout", "mcp.server_timeout", True),
         ("mcp.server_failed", "server_failed", "mcp.server_failed", True),
         ("mcp_server_failed", "server_failed", "mcp.server_failed", True),
+        ("MCP tool unavailable: mcp_server_failed", "server_failed", "mcp.server_failed", True),
         ("mcp.server_unavailable", "server_unavailable", "mcp.server_unavailable", True),
         ("mcp_server_unavailable", "server_unavailable", "mcp.server_unavailable", True),
+        (
+            "MCP tool unavailable: mcp_server_unavailable",
+            "server_unavailable",
+            "mcp.server_unavailable",
+            True,
+        ),
     ],
 )
 def test_runtime_failure_diagnostic_classifies_mcp_runtime_failures(
