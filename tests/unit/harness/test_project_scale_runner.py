@@ -95,6 +95,110 @@ def test_project_scale_runner_defaults_to_full_matrix_plan_json() -> None:
     assert "ultra:capability_validation" in actual_case_ids
 
 
+def test_fixture_execution_report_does_not_claim_real_capability() -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    report = execute_project_scale_plan(plan, FakeAcceptanceClient())
+
+    payload = report.to_payload()
+    assert payload["benchmark_kind"] == "fixture"
+    assert payload["capability_verified"] is False
+    assert "synthetic" in str(payload["verification_scope"])
+
+
+def test_capability_plan_cli_does_not_trigger_preseed_runtime() -> None:
+    result = run_project_scale_runner(
+        "--benchmark-kind", "capability", "--scale", "small", "--flow", "direct", "--json"
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["benchmark_kind"] == "capability"
+    assert payload["capability_verified"] is False
+    message = payload["requests"][0]["body"]["message"].lower()
+    assert "project-scale acceptance fixture" not in message
+
+
+def test_capability_benchmark_can_be_selected_by_acceptance_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_HUB_PROJECT_SCALE_BENCHMARK_KIND", "capability")
+    result = run_project_scale_runner("--scale", "small", "--flow", "direct", "--json")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["benchmark_kind"] == "capability"
+
+
+def test_capability_repair_preserves_business_request_without_claiming_success() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("small",), flows=("direct",), benchmark_kind="capability"
+    )
+    body = plan.requests[0].body
+    repaired = _deliverable_repair_body(
+        body, "small:direct", failed_reasons=("requirements: GET /tasks returns 404",),
+        benchmark_kind="capability",
+    )
+    message = str(repaired["message"])
+    assert str(body["message"]) in message
+    assert "GET /tasks returns 404" in message
+    assert "all true" not in message
+    assert len(message) <= 2_000
+    RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
+
+
+def test_capability_execution_enforces_generated_project_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validations: list[bytes | None] = []
+
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        validations.append(bundle)
+        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    plan = build_project_scale_run_plan(
+        scales=("small",), flows=("direct",), execute=True, benchmark_kind="capability"
+    )
+    report = execute_project_scale_plan(plan, FakeAcceptanceClient())
+
+    assert validations
+    assert report.results[0].evidence["generated_project_validation"] is True
+    assert report.to_payload()["benchmark_kind"] == "capability"
+    assert report.to_payload()["capability_verified"] is False
+
+
+def test_capability_build_success_cannot_replace_independent_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        project_scale_runner_module, "validate_small_task_api",
+        lambda root, timeout_seconds: ("requirements: task API missing",),
+        raising=False,
+    )
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}),
+        commands=((sys.executable, "-c", "pass"),),
+        timeout_seconds=10,
+        requirements_case_id="small:direct",
+    )
+    assert result.passed is False
+    assert "requirements: task API missing" in result.reasons
+
+
+def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records() -> None:
+    bundle = _project_bundle({
+        "README.md": "# Task API",
+        "src/main.js": _functional_js_source(),
+        "tests/main.test.js": _functional_js_test() + "\n// input example: hello world\n",
+        "VERIFICATION.md": "Not executed by the author; run independent verification.",
+    })
+    passed = project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+    failed = project_scale_runner_module._EvidenceCheck(
+        passed=False, reasons=("requirements: persistence lost",)
+    )
+    assert project_scale_runner_module._executed_capability_quality(bundle, passed).passed
+    assert not project_scale_runner_module._executed_capability_quality(bundle, failed).passed
+
+
 def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

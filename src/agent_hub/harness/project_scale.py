@@ -16,6 +16,7 @@ ProjectScaleFlow = Literal[
     "capability_validation",
 ]
 ProjectScaleRunMode = Literal["direct", "dispatch", "hybrid"]
+ProjectScaleBenchmarkKind = Literal["fixture", "capability"]
 
 PROJECT_SCALE_TIERS: tuple[ProjectScaleTier, ...] = ("small", "medium", "large", "ultra")
 PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
@@ -94,6 +95,7 @@ class ProjectScaleRunPlan:
     dry_run: bool = True
     execute: bool = False
     requires_bearer_token: bool = True
+    benchmark_kind: ProjectScaleBenchmarkKind = "fixture"
 
     @property
     def case_count(self) -> int:
@@ -104,6 +106,8 @@ class ProjectScaleRunPlan:
             "dry_run": self.dry_run,
             "execute": self.execute,
             "requires_bearer_token": self.requires_bearer_token,
+            "benchmark_kind": self.benchmark_kind,
+            "capability_verified": False,
             "case_count": self.case_count,
             "required_evidence": list(self.required_evidence),
             "cleanup_actions": list(self.cleanup_actions),
@@ -184,11 +188,15 @@ def describe_project_scale_matrix(matrix: ProjectScaleMatrix | None = None) -> s
     )
 
 
-def build_project_scale_run_request(case: ProjectScaleCase) -> ProjectScaleRunRequest:
+def build_project_scale_run_request(
+    case: ProjectScaleCase,
+    *,
+    benchmark_kind: ProjectScaleBenchmarkKind = "fixture",
+) -> ProjectScaleRunRequest:
     mode = _FLOW_RUN_MODES[case.flow]
     session_id = f"project-scale-{case.scale}-{case.flow}"
     body: dict[str, object] = {
-        "message": _fixture_message(case),
+        "message": _request_message(case, benchmark_kind=benchmark_kind),
         "mode": mode,
         "project_id": "project-scale-acceptance",
         "workspace_session_id": session_id,
@@ -205,7 +213,10 @@ def build_project_scale_run_plan(
     scales: tuple[str, ...] | None = None,
     flows: tuple[str, ...] | None = None,
     execute: bool = False,
+    benchmark_kind: ProjectScaleBenchmarkKind = "fixture",
 ) -> ProjectScaleRunPlan:
+    if benchmark_kind not in ("fixture", "capability"):
+        raise ValueError(f"unknown project scale benchmark kind: {benchmark_kind}")
     selected_scales = _validated_filter(
         values=scales,
         allowed=PROJECT_SCALE_TIERS,
@@ -217,7 +228,7 @@ def build_project_scale_run_plan(
         label="project scale flow",
     )
     requests = tuple(
-        build_project_scale_run_request(case)
+        build_project_scale_run_request(case, benchmark_kind=benchmark_kind)
         for case in ProjectScaleMatrix.default().cases
         if case.scale in selected_scales and case.flow in selected_flows
     )
@@ -225,6 +236,7 @@ def build_project_scale_run_plan(
         requests=requests,
         dry_run=not execute,
         execute=execute,
+        benchmark_kind=benchmark_kind,
     )
 
 
@@ -283,6 +295,12 @@ def _validated_filter(
     return selected
 
 
+def _request_message(case: ProjectScaleCase, *, benchmark_kind: ProjectScaleBenchmarkKind) -> str:
+    if benchmark_kind == "capability":
+        return _capability_message(case)
+    return _fixture_message(case)
+
+
 def _fixture_message(case: ProjectScaleCase) -> str:
     scale_label = {
         "small": "small project",
@@ -324,11 +342,71 @@ def _fixture_message(case: ProjectScaleCase) -> str:
     )
 
 
+def _capability_message(case: ProjectScaleCase) -> str:
+    requirements = {
+        "small": (
+            "Build a TypeScript/Node persistent task management API for a small team. "
+            "Use file-backed JSON persistence, expose a documented HTTP interface, and "
+            "implement exactly these endpoints: POST /tasks, GET /tasks, PATCH /tasks/:id, "
+            "DELETE /tasks/:id, and POST /tasks/:id/restore. npm start must listen on the "
+            "PORT environment variable, and DATA_DIR must choose the persistence directory "
+            "so an independent black-box test can restart the process and verify tasks persist. "
+            "Required response contracts: create returns 201 with {id,title,status,created_at}; "
+            "GET /tasks returns 200 with {items:[...]}; PATCH /tasks/:id accepts todo|doing|done "
+            "and returns the updated task; DELETE /tasks/:id marks the task deleted; "
+            "POST /tasks/:id/restore restores it; missing ids return 404 with "
+            "{error:{code,message}}."
+        ),
+        "medium": (
+            "Build a TypeScript/Node tenant-aware CRM-lite service for accounts, contacts, "
+            "opportunities, and follow-up reminders. Include validation, tenant isolation, "
+            "search/filter endpoints, deterministic seed data, and integration tests that "
+            "prove one tenant cannot read or mutate another tenant's records."
+        ),
+        "large": (
+            "Build a large project: a TypeScript/Node multi-service order operations platform "
+            "with catalog, "
+            "inventory reservation, order workflow, payment-state simulation, fulfillment "
+            "queue, audit log, and admin reporting modules. Keep modules independently "
+            "testable, document service boundaries, and include failure-path tests for "
+            "stock conflicts, duplicate submissions, and cancelled fulfillment."
+        ),
+        "ultra": (
+            "Build an ultra-large project: a TypeScript/Node enterprise project portfolio "
+            "operating system with "
+            "programs, projects, milestones, budgets, staffing, risk registers, dependency "
+            "maps, approval workflows, analytics exports, and role-based access checks. "
+            "Include architecture notes, migration-ready storage boundaries, end-to-end "
+            "scenario tests, and load-oriented tests for high-volume portfolio reads."
+        ),
+    }[case.scale]
+    flow_instruction = {
+        "direct": "Use direct mode and return a complete project bundle without pretending to run tools.",
+        "dispatch": "Use dispatch coordination and preserve clear assignment evidence.",
+        "hybrid": "Use hybrid planning plus execution and preserve decision evidence.",
+        "multi_agent": "Use multi-agent decomposition with explicit role ownership.",
+        "plugin": "Use plugin-style integration boundaries where appropriate.",
+        "model_failure": "Exercise failure recovery without hiding the failed attempt.",
+        "self_repair": "Exercise self-repair when verification exposes a defect.",
+        "artifact_production": "Produce inspectable source artifacts and generated files.",
+        "capability_validation": "Validate mode control and capability fit without silent downgrade.",
+    }[case.flow]
+    return (
+        f"Build a real {case.scale} business project for flow={case.flow}. {requirements} "
+        "Include npm run build, npm test, source, tests, README, plan and verification instructions. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content), or fenced "
+        "file blocks headed ### `path/to/file`. Acceptance conditions: independently test API "
+        "behavior and errors with reproducible verification evidence. Do not prefill pass records "
+        f"or fabricate execution. {flow_instruction}"
+    )
+
+
 __all__ = [
     "PROJECT_SCALE_CLEANUP_ACTIONS",
     "PROJECT_SCALE_FLOW_KINDS",
     "PROJECT_SCALE_REQUIRED_EVIDENCE",
     "PROJECT_SCALE_TIERS",
+    "ProjectScaleBenchmarkKind",
     "ProjectScaleCase",
     "ProjectScaleFlow",
     "ProjectScaleMatrix",

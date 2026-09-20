@@ -18,6 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
+from agent_hub.harness.project_requirements import validate_small_task_api
 from agent_hub.harness.project_scale import ProjectScaleRunPlan, build_project_scale_run_plan
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -204,6 +205,8 @@ class ProjectScaleCaseResult:
             required = (*required, "self_repair_trace")
         if "generated_project_validation" in self.evidence:
             required = (*required, "generated_project_validation")
+        if "requirements_validation" in self.evidence:
+            required = (*required, "requirements_validation")
         return required
 
     @property
@@ -248,6 +251,7 @@ class ProjectScaleCaseResult:
 @dataclass(frozen=True, slots=True)
 class ProjectScaleExecutionReport:
     results: tuple[ProjectScaleCaseResult, ...]
+    benchmark_kind: str = "fixture"
 
     @property
     def case_count(self) -> int:
@@ -266,6 +270,13 @@ class ProjectScaleExecutionReport:
         return {
             "execute": True,
             "dry_run": False,
+            "benchmark_kind": self.benchmark_kind,
+            "capability_verified": False,
+            "verification_scope": (
+                "synthetic fixture regression; not real project capability or recovery proof"
+                if self.benchmark_kind == "fixture"
+                else "build/test and independent business checks; full agent-process review pending"
+            ),
             "ok": self.ok,
             "case_count": self.case_count,
             "failed_case_count": len(failed_results),
@@ -424,6 +435,7 @@ def execute_project_scale_plan(
     generated_project_commands: Sequence[Sequence[str]] | None = None,
     generated_project_timeout_seconds: float = 120,
 ) -> ProjectScaleExecutionReport:
+    validate_generated_project = validate_generated_project or plan.benchmark_kind == "capability"
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
         request_body = _scoped_execution_body(run_request.body, execution_id=execution_id)
@@ -444,6 +456,8 @@ def execute_project_scale_plan(
         }
         if validate_generated_project:
             evidence["generated_project_validation"] = False
+        if plan.benchmark_kind == "capability":
+            evidence["requirements_validation"] = False
         errors: list[str] = []
         run_id: str | None = None
         status: str | None = None
@@ -588,8 +602,17 @@ def execute_project_scale_plan(
                     observation.workspace_bundle,
                     commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
                     timeout_seconds=generated_project_timeout_seconds,
+                    requirements_case_id=(
+                        run_request.case_id if plan.benchmark_kind == "capability" else None
+                    ),
                 )
                 evidence["generated_project_validation"] = generated_project_validation.passed
+                if plan.benchmark_kind == "capability":
+                    evidence["requirements_validation"] = generated_project_validation.passed
+                    deliverable_quality = _executed_capability_quality(
+                        observation.workspace_bundle, generated_project_validation
+                    )
+                    evidence["deliverable_quality"] = deliverable_quality.passed
             if _should_attempt_deliverable_repair(
                 status=status,
                 evidence=evidence,
@@ -601,6 +624,7 @@ def execute_project_scale_plan(
                     body=_deliverable_repair_body(
                         request_body,
                         run_request.case_id,
+                        benchmark_kind=plan.benchmark_kind,
                         failed_reasons=(
                             *deliverable_quality.reasons,
                             *agent_standard_verification.reasons,
@@ -685,10 +709,19 @@ def execute_project_scale_plan(
                         repair_observation.workspace_bundle,
                         commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
                         timeout_seconds=generated_project_timeout_seconds,
+                        requirements_case_id=(
+                            run_request.case_id if plan.benchmark_kind == "capability" else None
+                        ),
                     )
                     evidence["generated_project_validation"] = (
                         generated_project_validation.passed
                     )
+                    if plan.benchmark_kind == "capability":
+                        evidence["requirements_validation"] = generated_project_validation.passed
+                        deliverable_quality = _executed_capability_quality(
+                            repair_observation.workspace_bundle, generated_project_validation
+                        )
+                        evidence["deliverable_quality"] = deliverable_quality.passed
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
             if (
@@ -751,7 +784,7 @@ def execute_project_scale_plan(
                 errors=tuple(errors),
             )
         )
-    return ProjectScaleExecutionReport(results=tuple(results))
+    return ProjectScaleExecutionReport(results=tuple(results), benchmark_kind=plan.benchmark_kind)
 
 
 def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | None]:
@@ -775,10 +808,16 @@ def _env_flag(name: str) -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agent_hub.harness.project_scale_runner",
-        description="Build a safe project-scale acceptance fixture run plan.",
+        description="Build or execute fixture regression or real project capability probes.",
     )
     parser.add_argument("--scale", action="append", dest="scales", default=None)
     parser.add_argument("--flow", action="append", dest="flows", default=None)
+    parser.add_argument(
+        "--benchmark-kind",
+        choices=("fixture", "capability"),
+        default=os.environ.get("AGENT_HUB_PROJECT_SCALE_BENCHMARK_KIND", "fixture"),
+        help="Fixture uses synthetic evidence; capability uses real requirements and build checks.",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
         "--base-url",
@@ -846,6 +885,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scales=tuple(args.scales) if args.scales is not None else None,
             flows=tuple(args.flows) if args.flows is not None else None,
             execute=args.execute,
+            benchmark_kind=args.benchmark_kind,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -878,6 +918,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json_output:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
+        print(f"benchmark_kind={plan.benchmark_kind} capability_verified=false")
         if args.execute:
             print(f"project-scale execution cases={report.case_count} ok={str(report.ok).lower()}")
             for result in report.results:
@@ -1087,6 +1128,7 @@ def _validate_generated_project_bundle(
     *,
     commands: Sequence[Sequence[str]],
     timeout_seconds: float,
+    requirements_case_id: str | None = None,
 ) -> _EvidenceCheck:
     if workspace_bundle is None:
         return _EvidenceCheck(
@@ -1110,6 +1152,15 @@ def _validate_generated_project_bundle(
                 )
                 if reason is not None:
                     return _EvidenceCheck(passed=False, reasons=(reason,))
+            if requirements_case_id is not None:
+                if not requirements_case_id.startswith("small:"):
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=("requirements: independent evaluator unavailable for this scale",),
+                    )
+                failures = validate_small_task_api(root, timeout_seconds=timeout_seconds)
+                if failures:
+                    return _EvidenceCheck(passed=False, reasons=failures)
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         return _EvidenceCheck(
             passed=False,
@@ -1666,9 +1717,25 @@ def _deliverable_repair_body(
     case_id: str,
     *,
     failed_reasons: Sequence[str] = (),
+    benchmark_kind: str = "fixture",
 ) -> dict[str, object]:
     repair_body = dict(body)
     original_message = body.get("message")
+    if benchmark_kind == "capability":
+        original = original_message if isinstance(original_message, str) else ""
+        guidance = (
+            "Repair this same business project; preserve every original requirement. "
+            "Fix the reported defects and provide the complete corrected files. "
+            "Report only checks actually executed; never manufacture passing evidence.\n"
+        )
+        suffix = f"\nOriginal request:\n{original}"
+        available = 2_000 - len(guidance) - len(suffix)
+        if available < 80:
+            raise ValueError("capability repair cannot preserve requirements within planner limit")
+        reasons = _format_failed_reasons(failed_reasons)[:available]
+        repair_body["message"] = " ".join((guidance + reasons + suffix).split())
+        repair_body["skip_evolution_proposal"] = True
+        return repair_body
     reason_text = _format_failed_reasons(failed_reasons)
     direct_guidance = (
         " This is a direct run: do not call tools, do not emit DSML/tool-call syntax, and "
@@ -2082,6 +2149,32 @@ def _value_has_present_text(value: object) -> bool:
 
 def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> bool:
     return not _workspace_bundle_project_quality_reasons(workspace_bundle)
+
+
+def _executed_capability_quality(
+    workspace_bundle: bytes | None, validation: _EvidenceCheck
+) -> _EvidenceCheck:
+    if not validation.passed:
+        return validation
+    # Actual build and independent HTTP checks supersede author-written pass claims.
+    claimed_evidence = {
+        "workspace_bundle: missing build/test execution evidence",
+        "workspace_bundle: missing interaction execution evidence",
+        "workspace_bundle: contains placeholder or stub markers",
+    }
+    reasons = [
+        reason for reason in _workspace_bundle_project_quality_reasons(workspace_bundle)
+        if reason not in claimed_evidence
+    ]
+    if workspace_bundle is not None:
+        try:
+            with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+                source = _workspace_bundle_source_text(archive, archive.namelist()).lower()
+            if any(marker in source for marker in _PLACEHOLDER_MARKERS):
+                reasons.append("workspace_bundle: source contains placeholder or stub markers")
+        except (OSError, zipfile.BadZipFile):
+            pass  # The structural check above already reports invalid archives.
+    return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
 
 
 def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) -> tuple[str, ...]:
