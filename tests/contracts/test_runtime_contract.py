@@ -1016,6 +1016,59 @@ async def test_invalid_model_text_is_redacted() -> None:
     assert sentinel not in exception_graph_text(caught.value)
 
 
+async def test_direct_rejects_ordinary_response_over_output_byte_limit() -> None:
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text="x" * 70_000, usage=TokenUsage(1, 1, 2))),
+        logical_model="general",
+    )
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        await collect(runtime, context(request="Return a very long ordinary answer."))
+
+    assert str(caught.value) == "model response is invalid"
+
+
+async def test_direct_allows_project_scale_capability_bundle_over_default_output_limit() -> None:
+    request = (
+        "Build a real medium business project for flow=direct. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content). "
+        "Acceptance conditions: independently test API behavior and errors with "
+        "reproducible verification evidence."
+    )
+    source_files = {
+        f"src/module_{index}.ts": "export const data = "
+        + json.dumps("Complete project implementation.\n" * 650)
+        + ";\n"
+        for index in range(5)
+    }
+    bundle = {
+        "workspace_bundle": {
+            "files": {
+                "README.md": "# CRM Lite\n\nComplete project evidence.\n",
+                **source_files,
+                "tests/server.test.ts": "import { expect, it } from 'vitest';\n"
+                "it('works', () => expect(true).toBe(true));\n",
+                "IMPLEMENTATION_PLAN.md": "Read before implementation: AGENTS.md, HANDOFF, "
+                "PROJECT_REQUIREMENTS.md, applicable SKILL.md.\n",
+                "VERIFICATION.md": "npm run build: passed\nnpm test: passed\n"
+                "interaction smoke: passed\n",
+                "constraints_reading_evidence.json": '{"read_before_implementation":true}\n',
+            }
+        }
+    }
+    text = json.dumps(bundle)
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=text, usage=TokenUsage(1, 1, 2))),
+        logical_model="general",
+    )
+
+    events = await collect(runtime, context(request=request, token_budget=100_000))
+
+    assert len(text.encode("utf-8")) > 65_536
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].inputs
+
+
 @pytest.mark.parametrize(
     ("usage", "expected_reason"),
     [

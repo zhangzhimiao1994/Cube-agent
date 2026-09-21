@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
@@ -43,6 +43,9 @@ from agent_hub.runtime.self_repair_context import self_repair_context_text
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
 _MAX_OUTPUT_BYTES = 65_536
+_MAX_PROJECT_SCALE_OUTPUT_BYTES = 1_048_576
+_MAX_PROJECT_SCALE_BUNDLE_BYTES = 240_000
+_MAX_PROJECT_SCALE_BUNDLE_FILES = 200
 _MAX_CONTEXT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
@@ -144,6 +147,124 @@ def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
         context.mode is TaskMode.DIRECT
         and is_project_scale_artifact_request(context.request)
     )
+
+
+def _is_project_scale_capability_request(request: object) -> bool:
+    text = str(request).casefold()
+    return (
+        "build a real " in text
+        and " business project for flow=" in text
+        and "workspace_bundle.files" in text
+        and "acceptance conditions" in text
+    ) or (
+        "repair this same business project" in text
+        and "original request: build a real " in text
+        and "workspace_bundle.files" in text
+    )
+
+
+def _max_output_bytes_for_context(context: TaskContext) -> int:
+    if _is_project_scale_capability_request(context.request):
+        return _MAX_PROJECT_SCALE_OUTPUT_BYTES
+    return _MAX_OUTPUT_BYTES
+
+
+def _project_scale_workspace_bundle_from_model_text(
+    text: str,
+) -> dict[str, JsonValue] | None:
+    parsed = _json_mapping_from_model_text(text)
+    if parsed is not None:
+        bundle = _workspace_bundle_from_mapping(parsed)
+        if bundle is not None:
+            return bundle
+    return _workspace_bundle_from_markdown_file_blocks(text)
+
+
+def _json_mapping_from_model_text(text: str) -> Mapping[str, object] | None:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        first = candidate.find("{")
+        last = candidate.rfind("}")
+        if first >= 0 and last > first:
+            candidate = candidate[first : last + 1]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def _workspace_bundle_from_mapping(mapping: Mapping[str, object]) -> dict[str, JsonValue] | None:
+    raw_bundle = mapping.get("workspace_bundle")
+    if isinstance(raw_bundle, Mapping):
+        return _normalized_workspace_bundle(raw_bundle)
+    return _normalized_workspace_bundle(mapping)
+
+
+def _workspace_bundle_from_markdown_file_blocks(text: str) -> dict[str, JsonValue] | None:
+    lines = text.splitlines()
+    files: dict[str, str] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not (line.startswith("### `") and line.endswith("`")):
+            index += 1
+            continue
+        path = _safe_workspace_bundle_path(line[5:-1])
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if path is None or index >= len(lines) or not lines[index].lstrip().startswith("```"):
+            continue
+        index += 1
+        content_lines: list[str] = []
+        while index < len(lines) and not lines[index].lstrip().startswith("```"):
+            content_lines.append(lines[index])
+            index += 1
+        if index < len(lines):
+            index += 1
+        files[path] = "\n".join(content_lines).rstrip() + "\n"
+    return _normalized_workspace_bundle({"files": files})
+
+
+def _normalized_workspace_bundle(bundle: Mapping[str, object]) -> dict[str, JsonValue] | None:
+    raw_files = bundle.get("files")
+    if not isinstance(raw_files, Mapping) or not raw_files:
+        return None
+    if len(raw_files) > _MAX_PROJECT_SCALE_BUNDLE_FILES:
+        return None
+    files: dict[str, str] = {}
+    total_bytes = 0
+    for raw_path, raw_content in raw_files.items():
+        if not isinstance(raw_path, str) or not isinstance(raw_content, str):
+            return None
+        path = _safe_workspace_bundle_path(raw_path)
+        if path is None:
+            return None
+        content_bytes = len(raw_content.encode("utf-8"))
+        total_bytes += content_bytes
+        if total_bytes > _MAX_PROJECT_SCALE_BUNDLE_BYTES:
+            return None
+        files[path] = raw_content
+    if not files:
+        return None
+    return {"files": files}
+
+
+def _safe_workspace_bundle_path(value: str) -> str | None:
+    candidate = value.replace("\\", "/")
+    if candidate.startswith("/") or "\x00" in candidate:
+        return None
+    path = candidate.strip("/")
+    if not path:
+        return None
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    normalized = "/".join(parts)
+    if len(normalized) > 512:
+        return None
+    return normalized
 
 
 def _project_scale_direct_artifact_text(request: object) -> str:
@@ -470,7 +591,7 @@ class DirectRuntime:
                     gateway_task = None
                     del text, response, completion, request, included_source_ids, context
                     _raise_execution_error("model response text is empty")
-            if len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+            if len(text.encode("utf-8")) > _max_output_bytes_for_context(context):
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
@@ -506,14 +627,30 @@ class DirectRuntime:
                 budget_outcome.completion_exceeded_request
             )
 
+            project_scale_workspace_bundle = (
+                _project_scale_workspace_bundle_from_model_text(text)
+                if _is_project_scale_capability_request(context.request)
+                else None
+            )
+            artifact_text_preview = _event_text_preview(text)
             artifact_failed = False
             artifact: Artifact | None = None
             try:
+                artifact_content: dict[str, JsonValue]
+                artifact_type = "text"
+                if project_scale_workspace_bundle is not None:
+                    artifact_type = "tool_result"
+                    artifact_content = {
+                        "workspace_bundle": project_scale_workspace_bundle,
+                        "summary": artifact_text_preview,
+                    }
+                else:
+                    artifact_content = {"text": text}
                 artifact = Artifact(
                     id=uuid4(),
-                    type="text",
+                    type=artifact_type,
                     producer="main",
-                    content={"text": text},
+                    content=artifact_content,
                     version=1,
                     source_ids=included_source_ids,
                     provenance=GatewayProvenance(
@@ -533,7 +670,19 @@ class DirectRuntime:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
-                del artifact, text, response, completion, request, included_source_ids, context
+                del (
+                    artifact,
+                    text,
+                    response,
+                    completion,
+                    request,
+                    included_source_ids,
+                    context,
+                    project_scale_workspace_bundle,
+                    artifact_text_preview,
+                    artifact_content,
+                    artifact_type,
+                )
                 _raise_execution_error("model response is invalid")
             completion_logical_model = completion.logical_model
             completion_deployment_id = completion.deployment_id
@@ -552,10 +701,9 @@ class DirectRuntime:
             completion_fallback_used = completion.fallback_used
             completion_fallback_from_logical_model = completion.fallback_from_logical_model
             completion_fallback_reason = completion.fallback_reason
-            artifact_text_preview = _event_text_preview(artifact.content.get("text"))
             detected_agent_standard_verification: dict[str, JsonValue] | None = (
                 dict(project_scale_artifact_agent_standard_verification())
-                if _model_output_has_agent_standard_evidence(artifact.content.get("text"))
+                if _model_output_has_agent_standard_evidence(text)
                 else None
             )
             await self._consume_task_terminal(gateway_task)
@@ -601,6 +749,9 @@ class DirectRuntime:
                 completed_payload["agent_standard_verification"] = (
                     detected_agent_standard_verification
                 )
+            if project_scale_workspace_bundle is not None:
+                artifact_payload["workspace_bundle"] = project_scale_workspace_bundle
+                completed_payload["workspace_bundle"] = project_scale_workspace_bundle
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2 + injection_offset,
