@@ -478,6 +478,67 @@ def test_execution_report_describes_benchmark_verification_scope(
         )
 
 
+def test_execution_report_marks_capability_verified_when_all_capability_cases_pass() -> None:
+    result = ProjectScaleCaseResult(
+        case_id="small:direct",
+        run_id="run-1",
+        status="completed",
+        evidence={
+            "agent_standard_verification": True,
+            "cleanup_cancel": True,
+            "deliverable_quality": True,
+            "final_artifacts": True,
+            "generated_project_validation": True,
+            "requirements_validation": True,
+            "run_details": True,
+            "run_events": True,
+            "terminal_status": True,
+            "workspace_bundle": True,
+        },
+    )
+
+    payload = ProjectScaleExecutionReport(
+        results=(result,), benchmark_kind="capability"
+    ).to_payload()
+
+    assert payload["ok"] is True
+    assert payload["capability_verified"] is True
+
+
+def test_plain_execution_output_uses_report_capability_verified(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = ProjectScaleCaseResult(
+        case_id="small:direct",
+        run_id="run-1",
+        status="completed",
+        evidence={
+            "agent_standard_verification": True,
+            "cleanup_cancel": True,
+            "deliverable_quality": True,
+            "final_artifacts": True,
+            "run_details": True,
+            "run_events": True,
+            "terminal_status": True,
+            "workspace_bundle": True,
+        },
+    )
+
+    def execute(*args: object, **kwargs: object) -> ProjectScaleExecutionReport:
+        return ProjectScaleExecutionReport(results=(result,), benchmark_kind="capability")
+
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "token")
+    monkeypatch.setattr(project_scale_runner_module, "execute_project_scale_plan", execute)
+
+    exit_code = project_scale_runner_module.main(
+        ["--benchmark-kind", "capability", "--scale", "small", "--flow", "direct", "--execute"]
+    )
+
+    assert exit_code == 0
+    assert "benchmark_kind=capability capability_verified=true" in capsys.readouterr().out
+
+
 def test_project_scale_runner_execute_defaults_to_full_matrix_without_network(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -932,7 +932,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json_output:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
-        print(f"benchmark_kind={plan.benchmark_kind} capability_verified=false")
+        capability_verified = str(bool(payload.get("capability_verified"))).lower()
+        print(f"benchmark_kind={plan.benchmark_kind} capability_verified={capability_verified}")
         if args.execute:
             print(f"project-scale execution cases={report.case_count} ok={str(report.ok).lower()}")
             for result in report.results:
