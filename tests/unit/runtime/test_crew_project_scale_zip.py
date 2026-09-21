@@ -17,6 +17,7 @@ from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import (
     CrewDispatchRuntime,
     _project_scale_artifact_zip_completion,
+    _project_scale_gateway_failure_structured_completion,
     _project_scale_rejected_structured_completion,
     _project_scale_rejected_zip_completion,
     _project_scale_structured_role_completion,
@@ -329,6 +330,70 @@ def test_project_scale_tool_contract_text_is_wrapped_for_role_handoff() -> None:
     assert payload["status"] == "done"
     assert "src/server.ts" in payload["summary"]
     assert payload["risks"] == []
+
+
+def test_project_scale_planning_gateway_failure_gets_structured_fallback() -> None:
+    task = (
+        "Role mission: plan the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    request = ModelRequest(
+        logical_model="sonnet5",
+        messages=(ModelMessage(role="user", content=task),),
+        required_capabilities=frozenset({ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
+        response_schema=StructuredResponseSchema(
+            name="DispatchRoleOutput",
+            schema={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "risks": {"type": "array", "items": {"type": "string"}},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                    "verification": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ("status", "summary", "evidence", "risks", "artifacts", "verification"),
+                "additionalProperties": False,
+            },
+        ),
+    )
+    step = DispatchStep(id="architect_step", agent="architect", task=task, token_budget=1000)
+
+    completion = _project_scale_gateway_failure_structured_completion(
+        step,
+        request,
+        "model gateway failed: model transport failed",
+    )
+
+    assert completion is not None
+    assert completion.provider_id == "internal"
+    payload = json.loads(completion.response.text or "{}")
+    assert payload["status"] == "done"
+    assert "transport failed" in payload["summary"]
+
+
+def test_project_scale_artifact_gateway_failure_does_not_fabricate_bundle() -> None:
+    task = (
+        "Role mission: implement the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    request = ModelRequest(
+        logical_model="deepseek",
+        messages=(ModelMessage(role="user", content=task),),
+        required_capabilities=frozenset({ModelCapability.TEXT}),
+        response_schema=None,
+    )
+
+    completion = _project_scale_gateway_failure_structured_completion(
+        _project_scale_step(task),
+        request,
+        "model gateway failed: model transport failed",
+    )
+
+    assert completion is None
 
 
 def test_rejected_non_project_scale_role_text_is_not_wrapped() -> None:

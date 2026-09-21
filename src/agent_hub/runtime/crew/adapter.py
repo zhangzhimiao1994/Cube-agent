@@ -1400,6 +1400,44 @@ def _project_scale_structured_role_completion(
     )
 
 
+def _project_scale_gateway_failure_structured_completion(
+    step: DispatchStep,
+    request: ModelRequest,
+    reason: str,
+) -> GatewayCompletion | None:
+    if (
+        not _is_real_project_scale_handoff(step.task)
+        or _is_project_scale_tool_contract_step(step)
+        or request.response_schema is None
+    ):
+        return None
+    lowered = reason.casefold()
+    if "empty_response" not in lowered and "transport" not in lowered:
+        return None
+    payload = _project_scale_structured_payload_from_text(
+        request.response_schema,
+        (
+            "Internal project-scale planning fallback after model gateway failure: "
+            f"{reason}. Continue with the requested project requirements, preserve "
+            "role handoff contracts, and let implementation produce the actual bundle."
+        ),
+    )
+    if payload is None:
+        return None
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            usage=TokenUsage(0, 0, 0),
+        ),
+        deployment_id="internal_project_scale",
+        logical_model=request.logical_model,
+        provider_id="internal",
+        provider_model="internal/project-scale-planning-fallback",
+        cost_usd=Decimal(0),
+        attempted_logical_models=(request.logical_model,),
+    )
+
+
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -4043,12 +4081,25 @@ class CrewDispatchRuntime:
                 raise
             except Exception as error:  # noqa: BLE001
                 reason = safe_runtime_failure_reason(error, fallback="model gateway failed")
-                failed = dict(running)
-                failed.update(status="failed", failure_reason=reason)
-                await model_boundary(key, failed)
-                if repair is not None:
-                    raise _ModelContractFailed("structured correction failed") from None
-                _fail(reason)
+                completion = (
+                    _project_scale_gateway_failure_structured_completion(
+                        step,
+                        request,
+                        reason,
+                    )
+                    if purpose == "step"
+                    else None
+                )
+                if completion is None:
+                    failed = dict(running)
+                    failed.update(status="failed", failure_reason=reason)
+                    await model_boundary(key, failed)
+                    if repair is not None:
+                        raise _ModelContractFailed("structured correction failed") from None
+                    _fail(reason)
+                rejected = self._reject_invalid_structured(request, completion)
+                if rejected is None:
+                    self._valid_response(completion)
             if rejected is None:
                 assert completion is not None
                 artifact = self._model_artifact(completion, actor, sources)
