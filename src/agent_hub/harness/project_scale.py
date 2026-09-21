@@ -361,7 +361,15 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "Build a TypeScript/Node tenant-aware CRM-lite service for accounts, contacts, "
             "opportunities, and follow-up reminders. Include validation, tenant isolation, "
             "search/filter endpoints, deterministic seed data, and integration tests that "
-            "prove one tenant cannot read or mutate another tenant's records."
+            "prove one tenant cannot read or mutate another tenant's records. npm start must "
+            "listen on the PORT environment variable, and DATA_DIR must choose the persistence "
+            "directory. Required HTTP contract: POST /tenants/:tenant_id/accounts and "
+            "GET /tenants/:tenant_id/accounts?search=...; POST /tenants/:tenant_id/contacts "
+            "and GET /tenants/:tenant_id/contacts?account_id=...; "
+            "POST /tenants/:tenant_id/opportunities and PATCH "
+            "/tenants/:tenant_id/opportunities/:id; POST /tenants/:tenant_id/reminders and "
+            "GET /tenants/:tenant_id/reminders. Cross-tenant references and missing ids must "
+            "return 404 with {error:{code,message}}."
         ),
         "large": (
             "Build a large project: a TypeScript/Node multi-service order operations platform "

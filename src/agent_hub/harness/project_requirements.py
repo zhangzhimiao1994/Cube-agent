@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
@@ -196,6 +196,88 @@ def _check_missing(api: _TaskAPI) -> None:
             )
 
 
+class _TenantCRMAPI:
+    def __init__(self, port: int, deadline: float) -> None:
+        self.port = port
+        self.deadline = deadline
+
+    def request(
+        self, method: str, path: str, body: Mapping[str, object] | None = None
+    ) -> tuple[int, object]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=min(2.0, _remaining(self.deadline))
+        )
+        try:
+            connection.connect()
+            connection.request(
+                method,
+                path,
+                body=None if body is None else json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Connection": "close"},
+            )
+            response = connection.getresponse()
+            raw = response.read(_MAX_RESPONSE_BYTES + 1)
+            _remaining(self.deadline)
+            _require(len(raw) <= _MAX_RESPONSE_BYTES, f"{method} {path}: response exceeds 1 MiB")
+            try:
+                payload: object = json.loads(raw) if raw else None
+            except (ValueError, UnicodeError) as exc:
+                raise _ValidationFailure(f"{method} {path}: invalid JSON response") from exc
+            return response.status, payload
+        finally:
+            connection.close()
+
+    def tenant_path(self, tenant: str, resource: str, suffix: str = "") -> str:
+        return f"/tenants/{quote(tenant, safe='')}/{resource}{suffix}"
+
+    def create(
+        self,
+        tenant: str,
+        resource: str,
+        body: Mapping[str, object],
+    ) -> dict[str, object]:
+        status, payload = self.request("POST", self.tenant_path(tenant, resource), body)
+        _require(status == 201, f"POST {resource}: expected 201, got {status}")
+        _require(isinstance(payload, dict), f"POST {resource}: expected object")
+        assert isinstance(payload, dict)
+        item = dict(payload)
+        _require(
+            isinstance(item.get("id"), (str, int)) and not isinstance(item.get("id"), bool),
+            f"POST {resource}: missing id",
+        )
+        return item
+
+    def list_items(self, tenant: str, resource: str, query: str = "") -> list[dict[str, object]]:
+        status, payload = self.request("GET", self.tenant_path(tenant, resource, query))
+        _require(status == 200, f"GET {resource}: expected 200, got {status}")
+        _require(isinstance(payload, dict), f"GET {resource}: expected object")
+        assert isinstance(payload, dict)
+        items = payload.get("items")
+        _require(isinstance(items, list), f"GET {resource}: expected items array")
+        assert isinstance(items, list)
+        _require(all(isinstance(item, dict) for item in items), f"GET {resource}: invalid item")
+        return [dict(item) for item in items]
+
+    def expect_error_404(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, object] | None = None,
+        *,
+        context: str,
+    ) -> None:
+        status, payload = self.request(method, path, body)
+        _require(status == 404, f"{context}: expected 404, got {status}")
+        error = payload.get("error") if isinstance(payload, dict) else None
+        _require(isinstance(error, dict), f"{context}: expected error object")
+        assert isinstance(error, dict)
+        for field in ("code", "message"):
+            _require(
+                isinstance(error.get(field), str) and bool(error[field]),
+                f"{context}: error.{field} must be nonempty",
+            )
+
+
 def _environment(data: str) -> dict[str, str]:
     # Do not expose host/provider credentials or the host's npm user configuration.
     env = {
@@ -312,3 +394,178 @@ def validate_small_task_api(root: Path, timeout_seconds: float) -> tuple[str, ..
             except OSError as exc:
                 failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
     return tuple(failures)
+
+
+def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    """Check the medium CRM-lite contract with tenant isolation and persistence."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        return ("timeout_seconds must be finite and positive",)
+    if _PLATFORM not in ("posix", "nt"):
+        return (f"unsupported platform for process-tree cleanup: {_PLATFORM}",)
+    npm = shutil.which("npm")
+    if npm is None:
+        return ("npm executable unavailable; medium CRM API was not validated",)
+    taskkill = shutil.which("taskkill") if _PLATFORM == "nt" else None
+    if _PLATFORM == "nt" and taskkill is None:
+        return ("unsupported Windows environment: taskkill unavailable for process-tree cleanup",)
+
+    failures: list[str] = []
+    process: subprocess.Popen[bytes] | None = None
+    data: tempfile.TemporaryDirectory[str] | None = None
+    deadline = time.monotonic() + timeout_seconds
+    phase = "startup"
+    tenant_a = f"tenant-a-{uuid4().hex[:8]}"
+    tenant_b = f"tenant-b-{uuid4().hex[:8]}"
+    account_a: dict[str, object] = {}
+    account_b: dict[str, object] = {}
+    contact_a: dict[str, object] = {}
+    opportunity_a: dict[str, object] = {}
+    reminder_a: dict[str, object] = {}
+    try:
+        root = root.resolve(strict=True)
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        scripts = package.get("scripts") if isinstance(package, dict) else None
+        _require(
+            isinstance(scripts, dict)
+            and isinstance(scripts.get("start"), str)
+            and bool(scripts["start"].strip()),
+            "package.json must provide an npm start script",
+        )
+        data = tempfile.TemporaryDirectory(prefix="medium-crm-api-")
+        env = _environment(data.name)
+        for cycle in range(2):
+            phase = "CRM workflow" if cycle == 0 else "CRM persistence after restart"
+            port = _free_port()
+            env["PORT"] = str(port)
+            _remaining(deadline)
+            process = subprocess.Popen(
+                [npm, "start"],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=_PLATFORM == "posix",
+            )
+            api = _TenantCRMAPI(port, deadline)
+            _ready_crm(api, process, tenant_a)
+            if cycle == 0:
+                account_a = api.create(tenant_a, "accounts", {"name": "Acme Alpha"})
+                account_b = api.create(tenant_b, "accounts", {"name": "Acme Beta"})
+                _require(account_a["id"] != account_b["id"], "accounts: ids must be unique")
+                _require(
+                    _contains_id(api.list_items(tenant_a, "accounts", "?search=Acme"), account_a),
+                    "tenant A search must include tenant A account",
+                )
+                _require(
+                    not _contains_id(api.list_items(tenant_a, "accounts", "?search=Beta"), account_b),
+                    "tenant A search must not expose tenant B account",
+                )
+                contact_a = api.create(
+                    tenant_a,
+                    "contacts",
+                    {"account_id": account_a["id"], "name": "Ava Buyer", "email": "ava@example.test"},
+                )
+                _require(
+                    _contains_id(
+                        api.list_items(tenant_a, "contacts", f"?account_id={quote(str(account_a['id']), safe='')}"),
+                        contact_a,
+                    ),
+                    "contacts: account filter must include tenant-owned contact",
+                )
+                api.expect_error_404(
+                    "POST",
+                    api.tenant_path(tenant_b, "contacts"),
+                    {"account_id": account_a["id"], "name": "Cross Tenant"},
+                    context="cross-tenant contact account reference",
+                )
+                opportunity_a = api.create(
+                    tenant_a,
+                    "opportunities",
+                    {"account_id": account_a["id"], "name": "Renewal", "amount": 4200, "stage": "open"},
+                )
+                status, payload = api.request(
+                    "PATCH",
+                    api.tenant_path(
+                        tenant_a,
+                        "opportunities",
+                        f"/{quote(str(opportunity_a['id']), safe='')}",
+                    ),
+                    {"stage": "won"},
+                )
+                _require(status == 200, f"PATCH opportunity: expected 200, got {status}")
+                _require(isinstance(payload, dict), "PATCH opportunity: expected object")
+                assert isinstance(payload, dict)
+                opportunity_a = dict(payload)
+                _require(opportunity_a.get("stage") == "won", "PATCH opportunity: stage mismatch")
+                reminder_a = api.create(
+                    tenant_a,
+                    "reminders",
+                    {"contact_id": contact_a["id"], "due_at": "2030-01-01", "note": "Follow up"},
+                )
+                _require(
+                    _contains_id(api.list_items(tenant_a, "reminders"), reminder_a),
+                    "reminders: created reminder must be visible",
+                )
+                api.expect_error_404(
+                    "PATCH",
+                    api.tenant_path(
+                        tenant_b,
+                        "opportunities",
+                        f"/{quote(str(opportunity_a['id']), safe='')}",
+                    ),
+                    {"stage": "lost"},
+                    context="cross-tenant opportunity mutation",
+                )
+            else:
+                _require(
+                    _contains_id(api.list_items(tenant_a, "accounts", "?search=Acme"), account_a),
+                    "accounts: tenant A account must persist",
+                )
+                _require(
+                    _contains_id(api.list_items(tenant_a, "contacts"), contact_a),
+                    "contacts: tenant A contact must persist",
+                )
+                _require(
+                    _contains_id(api.list_items(tenant_a, "opportunities"), opportunity_a),
+                    "opportunities: tenant A opportunity must persist",
+                )
+                _require(
+                    _contains_id(api.list_items(tenant_a, "reminders"), reminder_a),
+                    "reminders: tenant A reminder must persist",
+                )
+            _stop_tree(process, taskkill)
+            process = None
+    except (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
+            subprocess.SubprocessError) as exc:
+        label = "timeout" if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) else phase
+        failures.append(f"{label}: {exc}")
+    finally:
+        if process is not None:
+            try:
+                _stop_tree(process, taskkill)
+            except (_ValidationFailure, OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"process-tree cleanup failed: {exc}")
+        if data is not None:
+            try:
+                data.cleanup()
+            except OSError as exc:
+                failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
+    return tuple(failures)
+
+
+def _ready_crm(api: _TenantCRMAPI, process: subprocess.Popen[bytes], tenant: str) -> None:
+    path = api.tenant_path(tenant, "accounts")
+    while True:
+        _remaining(api.deadline)
+        _require(process.poll() is None, "startup: npm start exited before CRM API became ready")
+        try:
+            api.request("GET", path)
+            return
+        except (OSError, http.client.HTTPException):
+            time.sleep(min(0.05, _remaining(api.deadline)))
+
+
+def _contains_id(items: Sequence[Mapping[str, object]], expected: Mapping[str, object]) -> bool:
+    expected_id = expected.get("id")
+    return any(item.get("id") == expected_id for item in items)

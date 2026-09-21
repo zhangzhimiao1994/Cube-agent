@@ -18,7 +18,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
-from agent_hub.harness.project_requirements import validate_small_task_api
+from agent_hub.harness.project_requirements import (
+    validate_medium_crm_api,
+    validate_small_task_api,
+)
 from agent_hub.harness.project_scale import (
     ProjectScaleBenchmarkKind,
     ProjectScaleRunPlan,
@@ -1170,12 +1173,18 @@ def _validate_generated_project_bundle(
                 if reason is not None:
                     return _EvidenceCheck(passed=False, reasons=(reason,))
             if requirements_case_id is not None:
-                if not requirements_case_id.startswith("small:"):
+                scale = requirements_case_id.split(":", 1)[0]
+                validators = {
+                    "small": validate_small_task_api,
+                    "medium": validate_medium_crm_api,
+                }
+                validator = validators.get(scale)
+                if validator is None:
                     return _EvidenceCheck(
                         passed=False,
                         reasons=("requirements: independent evaluator unavailable for this scale",),
                     )
-                failures = validate_small_task_api(root, timeout_seconds=timeout_seconds)
+                failures = validator(root, timeout_seconds=timeout_seconds)
                 if failures:
                     return _EvidenceCheck(passed=False, reasons=failures)
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:

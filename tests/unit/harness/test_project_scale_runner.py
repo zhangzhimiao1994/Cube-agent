@@ -197,6 +197,25 @@ def test_capability_build_success_cannot_replace_independent_requirements(
     assert "requirements: task API missing" in result.reasons
 
 
+def test_capability_medium_uses_independent_crm_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "validate_medium_crm_api",
+        lambda root, timeout_seconds: ("requirements: tenant isolation missing",),
+        raising=False,
+    )
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}),
+        commands=((sys.executable, "-c", "pass"),),
+        timeout_seconds=10,
+        requirements_case_id="medium:direct",
+    )
+    assert result.passed is False
+    assert "requirements: tenant isolation missing" in result.reasons
+
+
 def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records() -> None:
     bundle = _project_bundle({
         "README.md": "# Task API",
