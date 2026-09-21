@@ -5014,6 +5014,8 @@ def test_dispatch_plan_stages_approved_project_preflight_before_build_steps() ->
     )
     assert "stage-by-stage implementation status" in steps["final_response_step"].task
     assert "self-repair actions" in steps["final_response_step"].task
+    assert all(step.cost_budget_usd == Decimal(10) for step in steps.values())
+    assert plan.total_cost_usd == Decimal(40)
 
 
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
@@ -5103,6 +5105,8 @@ def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> No
     assert plan.max_parallelism == 1
     assert all(step.token_budget == 16_384 for step in plan.steps)
     assert plan.total_token_budget == 16_384
+    assert all(step.cost_budget_usd == Decimal(10) for step in plan.steps)
+    assert plan.total_cost_usd == Decimal(70)
 
 
 def test_dispatch_plan_exposes_only_available_role_tools_and_skills() -> None:

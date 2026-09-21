@@ -86,6 +86,8 @@ from agent_hub.security.secrets import SecretService
 
 _LOGGER = logging.getLogger(__name__)
 
+_DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
+
 
 class SecretResolver(Protocol):
     async def resolve(self, secret_ref: str) -> str: ...
@@ -1326,6 +1328,7 @@ def _dispatch_plan(
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
+    step_cost_budget = _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD
     producer_step_timeout = _producer_step_timeout(context, selected_roles)
     post_product_step_timeout = _post_product_step_timeout(context, selected_roles)
     final_step_timeout = _final_step_timeout(
@@ -1355,7 +1358,7 @@ def _dispatch_plan(
                 tools=preflight_tools,
                 token_budget=role_token_budget,
                 timeout_seconds=producer_step_timeout,
-                cost_budget_usd=Decimal(0),
+                cost_budget_usd=step_cost_budget,
             ),
         )
         if preflight_context
@@ -1384,7 +1387,7 @@ def _dispatch_plan(
             timeout_seconds=(
                 post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
             ),
-            cost_budget_usd=Decimal(0),
+            cost_budget_usd=step_cost_budget,
         )
         for role in selected_roles
     )
@@ -1405,18 +1408,17 @@ def _dispatch_plan(
         final_synthesizer=True,
         token_budget=final_token_budget,
         timeout_seconds=final_step_timeout,
-        cost_budget_usd=Decimal(0),
+        cost_budget_usd=step_cost_budget,
     )
+    steps = (*preflight_steps, *role_steps, final_step)
     return DispatchPlan(
         agents=tuple(agents),
-        steps=(*preflight_steps, *role_steps, final_step),
+        steps=steps,
         allowed_tools=plan_allowed_tools,
         max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
         total_token_budget=context.token_budget,
-        total_timeout_seconds=sum(
-            step.timeout_seconds for step in (*preflight_steps, *role_steps, final_step)
-        ),
-        total_cost_usd=Decimal(0),
+        total_timeout_seconds=sum(step.timeout_seconds for step in steps),
+        total_cost_usd=sum((step.cost_budget_usd for step in steps), Decimal(0)),
     )
 
 
