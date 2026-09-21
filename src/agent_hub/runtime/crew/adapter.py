@@ -1164,7 +1164,23 @@ def _check_framework_raw(schema: StructuredResponseSchema, actual: object, raw: 
 
 
 def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
-    return is_project_scale_artifact_request(step.task)
+    return is_project_scale_artifact_request(step.task) or _is_real_project_scale_handoff(
+        step.task
+    )
+
+
+def _is_real_project_scale_handoff(task: object) -> bool:
+    text = str(task).casefold()
+    return (
+        "build a real " in text
+        and "business project for flow=" in text
+        and "workspace_bundle.files" in text
+    ) or (
+        "repair this same business project" in text
+        and "original request:" in text
+        and "build a real " in text
+        and "workspace_bundle.files" in text
+    )
 
 
 def _project_scale_artifact_zip_completion(
@@ -1181,6 +1197,10 @@ def _project_scale_artifact_zip_completion(
     workspace_session_id = _routing_text(context.routing_decision, "workspace_session_id")
     if project_id is None or workspace_session_id is None:
         return completion
+    generated_files = _project_scale_generated_files_from_text(response.text)
+    if generated_files is None and _is_real_project_scale_handoff(step.task):
+        return completion
+    files = generated_files or project_scale_artifact_zip_files(step.task)
     return GatewayCompletion(
         response=ModelResponse(
             text=None,
@@ -1194,7 +1214,7 @@ def _project_scale_artifact_zip_completion(
                         "presentation": "final_attachment",
                         "project_id": project_id,
                         "workspace_session_id": workspace_session_id,
-                        "files": project_scale_artifact_zip_files(step.task),
+                        "files": files,
                     },
                 ),
             ),
@@ -1211,6 +1231,79 @@ def _project_scale_artifact_zip_completion(
         fallback_reason=completion.fallback_reason,
         attempted_logical_models=completion.attempted_logical_models,
     )
+
+
+def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return _project_scale_generated_files_from_json(text) or _project_scale_generated_files_from_blocks(text)
+
+
+def _project_scale_generated_files_from_json(text: str) -> Mapping[str, str] | None:
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    workspace_bundle = parsed.get("workspace_bundle")
+    if not isinstance(workspace_bundle, Mapping):
+        return None
+    return _safe_generated_project_files(workspace_bundle.get("files"))
+
+
+def _project_scale_generated_files_from_blocks(text: str) -> Mapping[str, str] | None:
+    files: dict[str, str] = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not (line.startswith("### `") and line.endswith("`")):
+            index += 1
+            continue
+        path = line[5:-1].strip()
+        index += 1
+        if index >= len(lines) or not lines[index].lstrip().startswith("```"):
+            continue
+        index += 1
+        body: list[str] = []
+        while index < len(lines) and not lines[index].lstrip().startswith("```"):
+            body.append(lines[index])
+            index += 1
+        if index < len(lines):
+            index += 1
+        if _safe_generated_project_path(path):
+            files[path] = "\n".join(body).rstrip() + "\n"
+    return files or None
+
+
+def _safe_generated_project_files(value: object) -> Mapping[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    files: dict[str, str] = {}
+    total_bytes = 0
+    for raw_path, raw_content in value.items():
+        if not isinstance(raw_path, str) or not isinstance(raw_content, str):
+            return None
+        path = raw_path.strip()
+        if not _safe_generated_project_path(path):
+            return None
+        content_bytes = len(raw_content.encode("utf-8"))
+        total_bytes += content_bytes
+        if content_bytes > _MAX_OUTPUT_BYTES or total_bytes > _MAX_OUTPUT_BYTES * 6:
+            return None
+        files[path] = raw_content
+    return files or None
+
+
+def _safe_generated_project_path(path: str) -> bool:
+    if not path or len(path.encode("utf-8")) > 240:
+        return False
+    normalized = path.replace("\\", "/")
+    if normalized != path or normalized.startswith("/") or normalized.endswith("/"):
+        return False
+    parts = normalized.split("/")
+    return all(part not in {"", ".", ".."} and "\x00" not in part for part in parts)
 
 
 def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | None:
