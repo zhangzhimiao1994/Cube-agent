@@ -5546,15 +5546,21 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
         ),
     )
 
-    for request in (
+    for request, expected_budget in (
         (
-            "Build a real small business project for flow=dispatch. "
-            "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            (
+                "Build a real small business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            3_000_000,
         ),
         (
-            "Repair this same business project; preserve every original requirement. "
-            "Original request: Build a real small business project for flow=dispatch. "
-            "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            (
+                "Repair this same business project; preserve every original requirement. "
+                "Original request: Build a real small business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            3_500_000,
         ),
     ):
         plan = _dispatch_plan(
@@ -5574,7 +5580,7 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
         assert architect_step.tools == ()
         assert implementer_step.tools == ("project.generate_zip",)
         assert implementer_step.tool_argument_budget_bytes == {
-            "project.generate_zip": 3_000_000
+            "project.generate_zip": expected_budget
         }
         assert implementer_agent.max_output_tokens == 24_576
         assert (
@@ -5642,6 +5648,86 @@ def test_project_scale_zip_argument_budget_scales_with_project_size(
     implementer_step = next(step for step in plan.steps if step.agent == "implementer")
     assert implementer_step.tool_argument_budget_bytes == {
         "project.generate_zip": expected_budget
+    }
+
+
+def test_project_scale_zip_argument_budget_uses_planner_complexity_signals() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Build a real small business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content). "
+                "Include auth, admin, upload, download, database persistence, search, "
+                "actual build/test evidence, generated_project_validation, and repair."
+            ),
+            timeout_seconds=900,
+            token_budget=1_000_000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert implementer_step.tool_argument_budget_bytes == {
+        "project.generate_zip": 9_000_000
+    }
+
+
+def test_project_scale_zip_argument_budget_caps_complex_large_projects() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Build a real large business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content). "
+                "Include auth, admin, database, upload, download, worker, queue, websocket, "
+                "payment, billing, build/test, generated_project_validation, and self-repair."
+            ),
+            timeout_seconds=1800,
+            token_budget=2_000_000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert implementer_step.tool_argument_budget_bytes == {
+        "project.generate_zip": 10_000_000
     }
 
 

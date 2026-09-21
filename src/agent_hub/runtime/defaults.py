@@ -90,12 +90,50 @@ from agent_hub.security.secrets import SecretService
 _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
-_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES_BY_SCALE = {
+_MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES = 10_000_000
+_PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE = {
     "small": 3_000_000,
     "medium": 6_000_000,
     "large": 9_000_000,
-    "ultra": 10_000_000,
+    "ultra": _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES,
 }
+_PROJECT_ZIP_COMPLEXITY_BUDGET_STEP_BYTES = 500_000
+_PROJECT_ZIP_COMPLEXITY_MARKERS = (
+    "admin",
+    "administrator",
+    "auth",
+    "权限",
+    "登录",
+    "注册",
+    "database",
+    "数据库",
+    "persistence",
+    "持久化",
+    "upload",
+    "download",
+    "上传",
+    "下载",
+    "search",
+    "搜索",
+    "worker",
+    "queue",
+    "websocket",
+    "payment",
+    "billing",
+    "多模块",
+    "multi-module",
+)
+_PROJECT_ZIP_VERIFICATION_BUDGET_MARKERS = (
+    "actual build",
+    "build/test",
+    "build and test",
+    "generated_project_validation",
+    "repair",
+    "self-repair",
+    "自动修复",
+    "真实测试",
+    "验收",
+)
 
 
 class SecretResolver(Protocol):
@@ -1485,7 +1523,26 @@ def _tool_argument_budgets_for_step(
 
 def _project_zip_argument_budget_bytes(context: TaskContext) -> int:
     scale = _project_scale_budget_tier(context)
-    return _PROJECT_ZIP_ARGUMENT_BUDGET_BYTES_BY_SCALE[scale]
+    budget = _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE[scale]
+    if scale == "ultra":
+        return budget
+    text = str(context.request).casefold()
+    request_bytes = len(str(context.request).encode("utf-8"))
+    complexity_hits = sum(1 for marker in _PROJECT_ZIP_COMPLEXITY_MARKERS if marker in text)
+    verification_hits = sum(
+        1 for marker in _PROJECT_ZIP_VERIFICATION_BUDGET_MARKERS if marker in text
+    )
+    planner_signal_steps = min(complexity_hits, 6) + min(verification_hits, 4)
+    if request_bytes > 4_096:
+        planner_signal_steps += min((request_bytes - 1) // 4_096, 4)
+    if context.timeout_seconds >= 600.0:
+        planner_signal_steps += 1
+    if context.token_budget >= 1_000_000:
+        planner_signal_steps += 1
+    return min(
+        budget + planner_signal_steps * _PROJECT_ZIP_COMPLEXITY_BUDGET_STEP_BYTES,
+        _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES,
+    )
 
 
 def _project_scale_budget_tier(context: TaskContext) -> str:
