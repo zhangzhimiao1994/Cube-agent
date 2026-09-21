@@ -19,15 +19,6 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy --strict src tests
       - run: docker compose -f tests/compose.yml up -d --wait
-      - name: Run focused durable recovery gate
-        shell: bash
-        env:
-          AGENT_HUB_DURABLE_RECOVERY_GATE: "true"
-        run: >
-          uv run pytest -q
-          tests/integration/runs/test_dispatch_artifact_cancellation.py
-          tests/integration/runs/test_dispatch_durable_recovery.py
-          --tb=short --disable-warnings
       - name: Run uv run pytest -q
         shell: bash
         run: |

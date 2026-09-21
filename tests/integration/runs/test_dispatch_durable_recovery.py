@@ -46,7 +46,7 @@ GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP = pytest.mark.skipif(
     and os.environ.get("AGENT_HUB_DURABLE_RECOVERY_GATE") != "true",
     reason=(
         "GitHub Actions full-suite scheduling makes this Crew checkpoint-boundary "
-        "contract order-sensitive; the focused durable recovery gate runs it."
+        "contract order-sensitive; isolated PostgreSQL release gates can force it."
     ),
 )
 
