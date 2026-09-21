@@ -3927,6 +3927,15 @@ class CrewDispatchRuntime:
                         context, step, completion, completion.response,
                     )
                 rejected = self._reject_invalid_structured(request, completion)
+                if rejected is not None and purpose == "step":
+                    recovered_completion = _project_scale_rejected_structured_completion(
+                        step,
+                        request,
+                        rejected,
+                    )
+                    if recovered_completion is not None:
+                        completion = recovered_completion
+                        rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
                     self._valid_response(completion)
                 if repair is not None and completion.response.tool_calls:

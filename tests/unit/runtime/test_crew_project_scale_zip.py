@@ -15,6 +15,7 @@ from agent_hub.models.types import (
 )
 from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import (
+    CrewDispatchRuntime,
     _project_scale_artifact_zip_completion,
     _project_scale_rejected_structured_completion,
     _project_scale_rejected_zip_completion,
@@ -247,6 +248,50 @@ def test_rejected_real_project_scale_role_text_is_wrapped_as_internal_json() -> 
     assert payload["status"] == "done"
     assert "tenant isolation" in payload["summary"]
     assert payload["verification"] == []
+
+
+def test_invalid_real_project_scale_role_completion_is_recovered_before_checkpoint() -> None:
+    task = (
+        "Role mission: implement the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    request = ModelRequest(
+        logical_model="deepseek",
+        messages=(ModelMessage(role="user", content=task),),
+        required_capabilities=frozenset({ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
+        response_schema=StructuredResponseSchema(
+            name="DispatchRoleOutput",
+            schema={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "risks": {"type": "array", "items": {"type": "string"}},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                    "verification": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ("status", "summary", "evidence", "risks", "artifacts", "verification"),
+                "additionalProperties": False,
+            },
+        ),
+    )
+    completion = _completion("Implementation notes: create API files and package tests.")
+
+    rejected = CrewDispatchRuntime._reject_invalid_structured(request, completion)
+    assert rejected is not None
+    recovered = _project_scale_rejected_structured_completion(
+        _project_scale_step(task),
+        request,
+        rejected,
+    )
+
+    assert recovered is not None
+    assert CrewDispatchRuntime._reject_invalid_structured(request, recovered) is None
+    payload = json.loads(recovered.response.text or "{}")
+    assert payload["status"] == "done"
+    assert "create API files" in payload["summary"]
 
 
 def test_rejected_non_project_scale_role_text_is_not_wrapped() -> None:
