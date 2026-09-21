@@ -1093,6 +1093,42 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
     assert events[-1].inputs
 
 
+async def test_direct_extracts_project_scale_markdown_bundle_with_level_two_headings() -> None:
+    request = (
+        "Build a real medium business project for flow=direct. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content). "
+        "Acceptance conditions: independently test API behavior and errors with "
+        "reproducible verification evidence."
+    )
+    text = """
+Below is the bundle.
+
+## `README.md`
+
+```markdown
+# CRM Lite
+```
+
+## `src/server.ts`
+
+```ts
+export const ok = true;
+```
+""".strip()
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=text, usage=TokenUsage(1, 1, 2))),
+        logical_model="general",
+    )
+
+    events = await collect(runtime, context(request=request, token_budget=100_000))
+
+    assert events[1].artifact is not None
+    assert events[1].artifact.type == "tool_result"
+    assert events[1].payload["workspace_bundle"] == {
+        "files": {"README.md": "# CRM Lite\n", "src/server.ts": "export const ok = true;\n"}
+    }
+
+
 @pytest.mark.parametrize(
     ("usage", "expected_reason"),
     [

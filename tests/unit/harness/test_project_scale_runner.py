@@ -1788,7 +1788,7 @@ def test_execute_project_scale_plan_uses_markdown_file_bundle_artifact() -> None
     markdown_bundle = """
 # Direct Deliverable
 
-### `README.md`
+## `README.md`
 
 ```markdown
 # Acceptance Fixture
@@ -1796,7 +1796,7 @@ def test_execute_project_scale_plan_uses_markdown_file_bundle_artifact() -> None
 Implements the requested project scope.
 ```
 
-### `PROJECT_REQUIREMENTS.md`
+## `PROJECT_REQUIREMENTS.md`
 
 ```markdown
 - Requirement satisfied

@@ -207,10 +207,10 @@ def _workspace_bundle_from_markdown_file_blocks(text: str) -> dict[str, JsonValu
     index = 0
     while index < len(lines):
         line = lines[index].strip()
-        if not (line.startswith("### `") and line.endswith("`")):
+        if not _is_workspace_file_heading(line):
             index += 1
             continue
-        path = _safe_workspace_bundle_path(line[5:-1])
+        path = _safe_workspace_bundle_path(line.split("`", 1)[1][:-1])
         index += 1
         while index < len(lines) and not lines[index].strip():
             index += 1
@@ -225,6 +225,12 @@ def _workspace_bundle_from_markdown_file_blocks(text: str) -> dict[str, JsonValu
             index += 1
         files[path] = "\n".join(content_lines).rstrip() + "\n"
     return _normalized_workspace_bundle({"files": files})
+
+
+def _is_workspace_file_heading(line: str) -> bool:
+    if not line.endswith("`"):
+        return False
+    return any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####"))
 
 
 def _normalized_workspace_bundle(bundle: Mapping[str, object]) -> dict[str, JsonValue] | None:

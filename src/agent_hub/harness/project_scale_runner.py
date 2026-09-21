@@ -1531,10 +1531,10 @@ def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
     index = 0
     while index < len(lines):
         line = lines[index].strip()
-        if not (line.startswith("### `") and line.endswith("`")):
+        if not _is_markdown_file_heading(line):
             index += 1
             continue
-        path = _safe_embedded_workspace_path(line[5:-1])
+        path = _safe_embedded_workspace_path(line.split("`", 1)[1][:-1])
         index += 1
         while index < len(lines) and not lines[index].strip():
             index += 1
@@ -1551,6 +1551,12 @@ def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
     if not files:
         return None
     return _workspace_bundle_mapping_to_zip({"files": files})
+
+
+def _is_markdown_file_heading(line: str) -> bool:
+    if not line.endswith("`"):
+        return False
+    return any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####"))
 
 
 def _safe_embedded_workspace_path(value: str) -> str | None:
