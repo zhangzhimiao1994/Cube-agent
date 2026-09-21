@@ -254,6 +254,30 @@ def test_artifact_freezes_nested_json_and_computes_hash() -> None:
     json.loads(artifact.model_dump_json())
 
 
+def test_artifact_accepts_large_structured_workspace_bundle_without_raising_text_limit() -> None:
+    files = {
+        f"src/module_{index}.ts": "export const value = "
+        + json.dumps("implementation\n" * 4_000)
+        + ";\n"
+        for index in range(6)
+    }
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="main",
+        content={"workspace_bundle": {"files": files}},
+    )
+
+    assert len(json.dumps(artifact.model_dump(mode="json"))) > 262_144
+    with pytest.raises(ValidationError):
+        Artifact(
+            id=uuid4(),
+            type="text",
+            producer="main",
+            content={"text": "x" * 70_000},
+        )
+
+
 def test_artifact_hash_binds_metadata_sources_and_provenance() -> None:
     source = str(uuid4())
     provenance = GatewayProvenance(
