@@ -28,6 +28,7 @@ from agent_hub.harness.project_scale_runner import (
     _bundle_has_build_test_execution_evidence,
     _deliverable_repair_body,
     _discussion_trace_payload_passes,
+    _drop_recovered_workspace_bundle_errors,
     _evaluate_agent_standard_verification,
     _has_agent_standard_verification,
     _has_deliverable_repair_trace,
@@ -1543,6 +1544,22 @@ def test_execute_project_scale_plan_drops_stale_workspace_bundle_error_after_rep
     assert result.evidence["workspace_bundle"] is True
     assert result.evidence["deliverable_repair_trace"] is True
     assert result.errors == ()
+
+
+def test_drop_recovered_workspace_bundle_errors_keeps_quality_failures() -> None:
+    errors = [
+        "workspace_bundle: GET /api/v1/workspaces/projects/p/sessions/s/bundle/download failed status=404",
+        "workspace_bundle: workspace bundle unavailable",
+        "workspace_bundle: missing source files",
+        "generated_project_validation: command failed exit=1 command=npm test",
+    ]
+
+    _drop_recovered_workspace_bundle_errors(errors)
+
+    assert errors == [
+        "workspace_bundle: missing source files",
+        "generated_project_validation: command failed exit=1 command=npm test",
+    ]
 
 
 def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:

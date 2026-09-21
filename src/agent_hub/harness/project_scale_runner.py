@@ -1023,7 +1023,9 @@ def _drop_recovered_workspace_bundle_errors(errors: list[str]) -> None:
     errors[:] = [
         error
         for error in errors
-        if not error.startswith("workspace_bundle: workspace bundle unavailable")
+        if not error.startswith(
+            ("workspace_bundle: workspace bundle unavailable", "workspace_bundle: GET ")
+        )
     ]
 
 
