@@ -372,6 +372,57 @@ def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
     assert audit_payload["automatic_execution"] is True
 
 
+def test_structured_output_invalid_builds_bounded_repair_context() -> None:
+    run_id = uuid4()
+
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.STEP_FAILED,
+                sequence=3,
+                run_id=run_id,
+                actor="architect",
+                step_id="architect_step",
+                reason="structured output invalid",
+                payload={
+                    "error_code": "model.structured_output_invalid",
+                    "orchestration_recovery_hint": "retry_blocked_contract_chain",
+                    "blocked_contract_ids": ("architect_step-to-final_response_step",),
+                    "suggested_action": "Return JSON only; do not leak secret://token.",
+                },
+            ),
+        ),
+        policy=SelfRepairPolicy(requires_approval=False),
+    )
+
+    assert decision is not None
+    assert decision.failure_category == "structured_output_invalid"
+    assert decision.recovery_strategy == "retry_blocked_contract_chain_after_replanning"
+    assert decision.requires_approval is False
+    assert decision.automatic_execution is True
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["failure_kind"] == "structured_output_invalid"
+    assert proposal["error_code"] == "model.structured_output_invalid"
+    assert "JSON" in str(proposal["instruction"])
+    assert "secret" not in repr(proposal)
+    context = repair_context_from_proposal(proposal)
+    assert context["failure_kind"] == "structured_output_invalid"
+    assert context["automatic_execution"] is True
+    routing_decision = {"source": "self_repair", "self_repair_context": context}
+    prompt_context = self_repair_context_text(routing_decision)
+    assert "structured_output_invalid" in prompt_context
+    assert "model.structured_output_invalid" in prompt_context
+    assert "secret" not in prompt_context
+    recovery_plan = self_repair_recovery_plan_payload(routing_decision)
+    assert recovery_plan is not None
+    assert recovery_plan["replan_scope"] == "blocked_contract_chain"
+    assert recovery_plan["automatic_execution"] is True
+
+
 def test_repair_projection_rejects_spoofed_automatic_execution_with_approval() -> None:
     projected = repair_proposal_projection(
         {

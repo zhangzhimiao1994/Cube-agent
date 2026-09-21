@@ -354,6 +354,18 @@ def runtime_failure_diagnostic_from_reason(
             retryable=False,
             suggested_action="产物写入回滚失败；请检查文件存储/对象存储状态，确认残留产物后再重试。",
         )
+    elif normalized == "structured output invalid":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="model_response",
+            error_category="structured_output_invalid",
+            error_code="model.structured_output_invalid",
+            retryable=True,
+            suggested_action=(
+                "模型返回内容不符合结构化输出契约；请压缩上下文，强调只返回 JSON，"
+                "必要时切换支持结构化输出的备用模型或重规划被阻塞的角色交接链后重试。"
+            ),
+        )
     elif normalized == "dispatch execution failed":
         diagnostic = _base_diagnostic(
             normalized,

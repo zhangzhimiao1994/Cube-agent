@@ -61,6 +61,16 @@ _EMPTY_RESPONSE_MARKERS = frozenset(
         "empty model response",
     }
 )
+_STRUCTURED_OUTPUT_INVALID_MARKERS = frozenset(
+    {
+        "model.structured_output_invalid",
+        "structured output invalid",
+        "structured output rejected",
+        "structured handoff output missing field",
+        "structured handoff output field type mismatch",
+        "structured handoff output is not valid json",
+    }
+)
 _MODEL_CAPABILITY_ROUTING_MARKERS = frozenset(
     {
         "capability.planned_unavailable",
@@ -606,6 +616,11 @@ def repair_proposal_projection(proposal: Mapping[str, object] | None) -> dict[st
 
 def _repair_instruction(failure_category: str, *, recovery_strategy: str | None = None) -> str:
     if recovery_strategy == ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY:
+        if failure_category == "structured_output_invalid":
+            return (
+                "重规划角色交接契约链，只重试被阻塞的交接链路；压缩上下文，"
+                "要求失败角色只返回满足 schema 的 JSON，并保留原始交付目标和审批边界。"
+            )
         return "重规划角色交接契约链，只重试被阻塞的交接链路，并保留原始交付目标和审批边界。"
     if failure_category == "capacity_pressure":
         return "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。"
@@ -613,6 +628,11 @@ def _repair_instruction(failure_category: str, *, recovery_strategy: str | None 
         return (
             "先压缩输入和历史上下文，再拆分提示或降负载重试；必要时标记模型 "
             "fallback/切换备用模型，重试后仍为空则保留中断前输出并闭环失败。"
+        )
+    if failure_category == "structured_output_invalid":
+        return (
+            "压缩上下文并重试失败步骤，明确要求只返回满足 schema 的 JSON；"
+            "必要时重规划被阻塞的角色交接链或切换支持结构化输出的备用模型。"
         )
     if failure_category == "model_capability_routing_unavailable":
         return "检查工具角色的模型能力要求，将工具角色改派给支持工具调用的模型后再受控重试。"
@@ -1014,6 +1034,8 @@ def _failure_category(event: RunEvent) -> str:
         return "outcome_uncertain"
     if _contains_marker(text, _EMPTY_RESPONSE_MARKERS):
         return "empty_model_response"
+    if _contains_marker(text, _STRUCTURED_OUTPUT_INVALID_MARKERS):
+        return "structured_output_invalid"
     if _contains_marker(text, _MODEL_CAPABILITY_ROUTING_MARKERS):
         return "model_capability_routing_unavailable"
     if _contains_marker(text, _MODEL_CREDENTIAL_UNAVAILABLE_MARKERS):

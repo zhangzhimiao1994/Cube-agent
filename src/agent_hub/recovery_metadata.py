@@ -23,6 +23,7 @@ RECOVERY_STRATEGY_BY_FAILURE_CATEGORY = MappingProxyType(
         "mcp_tool_unavailable": "manual_review_mcp_configuration",
         "mcp_server_not_discovered": "manual_review_mcp_configuration",
         "empty_model_response": "retry_with_fallback_or_reassign_model",
+        "structured_output_invalid": "retry_structured_output_after_compaction",
         "runtime_recovery_blocked": "manual_review_recovery_checkpoint",
         "runtime_failure": "preserve_outputs_and_retry_scope",
         "step_failure": "retry_failed_step_after_context_compaction",

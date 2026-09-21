@@ -562,3 +562,14 @@ def test_runtime_failure_diagnostic_classifies_runtime_infrastructure_failures(
     assert diagnostic["error_category"] == error_category
     assert diagnostic["error_code"] == error_code
     assert diagnostic["retryable"] is False
+
+
+def test_runtime_failure_diagnostic_classifies_structured_output_invalid() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason("structured output invalid")
+
+    assert diagnostic["error_summary"] == "structured output invalid"
+    assert diagnostic["error_stage"] == "model_response"
+    assert diagnostic["error_category"] == "structured_output_invalid"
+    assert diagnostic["error_code"] == "model.structured_output_invalid"
+    assert diagnostic["retryable"] is True
+    assert "JSON" in str(diagnostic["suggested_action"])
