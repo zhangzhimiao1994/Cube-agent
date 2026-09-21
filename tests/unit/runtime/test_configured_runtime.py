@@ -5573,11 +5573,76 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
         implementer_agent = next(agent for agent in plan.agents if agent.id == "implementer")
         assert architect_step.tools == ()
         assert implementer_step.tools == ("project.generate_zip",)
+        assert implementer_step.tool_argument_budget_bytes == {
+            "project.generate_zip": 3_000_000
+        }
         assert implementer_agent.max_output_tokens == 24_576
         assert (
             "If read_context has no additional runtime context, continue with the requested files"
             in implementer_step.task
         )
+
+
+@pytest.mark.parametrize(
+    ("project_request", "expected_budget"),
+    (
+        (
+            (
+                "Build a real medium business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            6_000_000,
+        ),
+        (
+            (
+                "Build a real large business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            9_000_000,
+        ),
+        (
+            (
+                "Build a real ultra-large business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            10_000_000,
+        ),
+    ),
+)
+def test_project_scale_zip_argument_budget_scales_with_project_size(
+    project_request: str,
+    expected_budget: int,
+) -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=project_request,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert implementer_step.tool_argument_budget_bytes == {
+        "project.generate_zip": expected_budget
+    }
 
 
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:

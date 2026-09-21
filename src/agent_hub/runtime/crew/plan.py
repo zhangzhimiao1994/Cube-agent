@@ -191,6 +191,7 @@ class DispatchStep(_PlanModel):
     task: str = Field(repr=False)
     depends_on: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
+    tool_argument_budget_bytes: dict[str, int] = Field(default_factory=dict)
     reviewer: str | None = None
     reviewer_retries: int = Field(default=0, ge=0, le=8)
     final_synthesizer: bool = False
@@ -222,6 +223,23 @@ class DispatchStep(_PlanModel):
     @classmethod
     def step_tools(cls, value: object) -> tuple[str, ...]:
         return _id_tuple(value, "step tools")
+
+    @field_validator("tool_argument_budget_bytes", mode="before")
+    @classmethod
+    def tool_argument_budgets(cls, value: object) -> dict[str, int]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise TypeError("tool argument budgets must be a mapping")
+        normalized: dict[str, int] = {}
+        for raw_tool, raw_budget in value.items():
+            if type(raw_tool) is not str:
+                raise ValueError("tool argument budget keys must be strings")
+            tool = _identifier(raw_tool, "tool argument budget key")
+            if type(raw_budget) is not int or raw_budget <= 0 or raw_budget > 10_000_000:
+                raise ValueError("tool argument budget values must be bounded integers")
+            normalized[tool] = raw_budget
+        return normalized
 
     @field_validator("reviewer_retries", "token_budget")
     @classmethod

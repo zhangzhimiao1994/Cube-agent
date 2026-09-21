@@ -69,7 +69,10 @@ from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
-from agent_hub.runtime.project_scale_artifact import ProjectScaleArtifactPreseedRuntime
+from agent_hub.runtime.project_scale_artifact import (
+    PROJECT_SCALE_ARTIFACT_TOOL_NAME,
+    ProjectScaleArtifactPreseedRuntime,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
@@ -87,6 +90,12 @@ from agent_hub.security.secrets import SecretService
 _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
+_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES_BY_SCALE = {
+    "small": 3_000_000,
+    "medium": 6_000_000,
+    "large": 9_000_000,
+    "ultra": 10_000_000,
+}
 
 
 class SecretResolver(Protocol):
@@ -1361,6 +1370,10 @@ def _dispatch_plan(
                 ),
                 depends_on=(),
                 tools=preflight_tools,
+                tool_argument_budget_bytes=_tool_argument_budgets_for_step(
+                    context,
+                    preflight_tools,
+                ),
                 token_budget=role_token_budget,
                 timeout_seconds=producer_step_timeout,
                 cost_budget_usd=step_cost_budget,
@@ -1388,6 +1401,10 @@ def _dispatch_plan(
                 else preflight_dependencies
             ),
             tools=role_tools_by_id[role.id],
+            tool_argument_budget_bytes=_tool_argument_budgets_for_step(
+                context,
+                role_tools_by_id[role.id],
+            ),
             token_budget=role_token_budget,
             timeout_seconds=(
                 post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
@@ -1450,6 +1467,36 @@ def _role_max_output_tokens(
     if _is_post_product_role(role):
         return 8_192
     return 6_144
+
+
+def _tool_argument_budgets_for_step(
+    context: TaskContext,
+    tools: tuple[str, ...],
+) -> dict[str, int]:
+    if (
+        PROJECT_SCALE_ARTIFACT_TOOL_NAME not in tools
+        or not _is_project_scale_generated_project_request(context)
+    ):
+        return {}
+    return {
+        PROJECT_SCALE_ARTIFACT_TOOL_NAME: _project_zip_argument_budget_bytes(context),
+    }
+
+
+def _project_zip_argument_budget_bytes(context: TaskContext) -> int:
+    scale = _project_scale_budget_tier(context)
+    return _PROJECT_ZIP_ARGUMENT_BUDGET_BYTES_BY_SCALE[scale]
+
+
+def _project_scale_budget_tier(context: TaskContext) -> str:
+    text = str(context.request).casefold()
+    if "ultra-large" in text or "ultra large" in text or "real ultra" in text:
+        return "ultra"
+    if "real large" in text or "large project" in text:
+        return "large"
+    if "real medium" in text or "medium project" in text:
+        return "medium"
+    return "small"
 
 
 def _producer_step_timeout(

@@ -49,6 +49,7 @@ def _project_scale_step(task: str) -> DispatchStep:
         agent="implementer",
         task=task,
         tools=("project.generate_zip",),
+        tool_argument_budget_bytes={"project.generate_zip": 3_000_000},
         token_budget=10_000,
         cost_budget_usd=Decimal(10),
     )
@@ -153,8 +154,23 @@ def test_project_zip_tool_uses_project_bundle_argument_limit() -> None:
     )
 
     assert encoded_size > _MAX_TOOL_ARGUMENT_BYTES
-    assert encoded_size <= _tool_argument_byte_limit("project.generate_zip")
-    assert encoded_size > _tool_argument_byte_limit("workspace.read")
+    step = _project_scale_step("Build a real small business project for flow=dispatch.")
+
+    assert encoded_size <= _tool_argument_byte_limit(step, "project.generate_zip")
+    assert encoded_size > _tool_argument_byte_limit(step, "workspace.read")
+
+
+def test_project_zip_tool_uses_default_limit_without_planner_budget() -> None:
+    step = DispatchStep(
+        id="implementer_step",
+        agent="implementer",
+        task="Build a project.",
+        tools=("project.generate_zip",),
+        token_budget=10_000,
+        cost_budget_usd=Decimal(10),
+    )
+
+    assert _tool_argument_byte_limit(step, "project.generate_zip") == _MAX_TOOL_ARGUMENT_BYTES
 
 
 def test_real_project_scale_does_not_use_fixture_zip_without_model_files() -> None:
