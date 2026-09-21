@@ -876,6 +876,13 @@ _SOFTWARE_DELIVERY_REDUNDANT_CATALOG_ROLE_IDS = frozenset(
         "quality_reviewer",
     }
 )
+_SOFTWARE_DELIVERY_CREATIVE_CATALOG_ROLE_IDS = frozenset(
+    {
+        "director",
+        "video_editor",
+        "multimedia_generator",
+    }
+)
 
 _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
@@ -1065,6 +1072,8 @@ def _is_redundant_software_delivery_catalog_spec(
     ):
         return False
     role_id = spec[0]
+    if role_id in _SOFTWARE_DELIVERY_CREATIVE_CATALOG_ROLE_IDS:
+        return not _is_multimedia_generation_request(request.task)
     if role_id not in _SOFTWARE_DELIVERY_REDUNDANT_CATALOG_ROLE_IDS:
         return False
     if role_id == "product_manager":

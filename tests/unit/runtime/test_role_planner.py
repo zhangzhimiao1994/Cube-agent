@@ -117,6 +117,29 @@ def test_software_artifact_production_keeps_general_planning_roles_out_of_delive
     assert "quality_reviewer" not in role_ids
 
 
+def test_software_project_with_video_feature_does_not_select_creative_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "编写一个网盘网站源码，包含用户登录、文件上传下载、视频文件预览、"
+                "目录管理和管理员后台，并生成可下载项目源码。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            profiles=(TaskProfile.SOFTWARE, TaskProfile.GENERAL),
+            default_model="code-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {"architect", "implementer", "tester", "security_reviewer"}.issubset(role_ids)
+    assert "project.generate_zip" in plan.role("implementer").allowed_tools
+    assert "director" not in role_ids
+    assert "video_editor" not in role_ids
+    assert "multimedia_generator" not in role_ids
+
+
 def test_research_discussion_includes_data_source_and_writer_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
