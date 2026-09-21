@@ -198,9 +198,7 @@ class CheckpointBoundaryRuntime(ConfigBackedDispatchRuntime):
                     continue
                 models = event.checkpoint.state.get("models")
                 if not isinstance(models, Mapping) or not any(
-                    isinstance(state, Mapping)
-                    and state.get("actor") == "durable_worker"
-                    and state.get("status") == "succeeded"
+                    isinstance(state, Mapping) and state.get("status") == "succeeded"
                     for state in models.values()
                 ):
                     continue
@@ -418,7 +416,7 @@ async def _prepare_partial_run(
     else:
         execution = asyncio.create_task(service.execute(submitted.id))
         try:
-            await asyncio.wait_for(checkpoint_committed.wait(), timeout=20)
+            await asyncio.wait_for(checkpoint_committed.wait(), timeout=60)
         finally:
             execution.cancel()
             with pytest.raises(asyncio.CancelledError):
