@@ -97,6 +97,7 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("npm", "run", "build"),
     ("npm", "test"),
 )
+_GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
         "dispatch",
@@ -1263,11 +1264,24 @@ def _run_generated_project_command(
             f"command={_format_command(command)} reason={error}"
         )
     if completed.returncode != 0:
+        output_tail = _generated_project_output_tail(
+            f"{completed.stdout or ''}\n{completed.stderr or ''}"
+        )
+        output_note = f" output_tail={output_tail}" if output_tail else ""
         return (
             "generated_project_validation: command failed "
-            f"exit={completed.returncode} command={_format_command(command)}"
+            f"exit={completed.returncode} command={_format_command(command)}{output_note}"
         )
     return None
+
+
+def _generated_project_output_tail(value: str) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return ""
+    if len(text) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS:
+        text = "..." + text[-_GENERATED_PROJECT_OUTPUT_TAIL_CHARS:]
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _generated_project_command_env() -> dict[str, str]:

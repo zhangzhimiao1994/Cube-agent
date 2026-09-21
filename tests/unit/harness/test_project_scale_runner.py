@@ -2239,7 +2239,13 @@ def test_execute_project_scale_plan_fails_when_generated_project_validation_fail
         plan,
         client,
         validate_generated_project=True,
-        generated_project_commands=((sys.executable, "-c", "raise SystemExit(7)"),),
+        generated_project_commands=(
+            (
+                sys.executable,
+                "-c",
+                "print('src/app.ts(1,1): error TS2322: type mismatch'); raise SystemExit(7)",
+            ),
+        ),
     )
 
     assert report.ok is False
@@ -2249,7 +2255,9 @@ def test_execute_project_scale_plan_fails_when_generated_project_validation_fail
     assert result.errors == (
         (
             "generated_project_validation: command failed exit=7 command="
-            f"{sys.executable} -c raise SystemExit(7)"
+            f"{sys.executable} -c print('src/app.ts(1,1): error TS2322: type mismatch'); "
+            "raise SystemExit(7) output_tail="
+            '"src/app.ts(1,1): error TS2322: type mismatch"'
         ),
     )
 
