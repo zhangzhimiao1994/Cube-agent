@@ -15,12 +15,14 @@ from agent_hub.models.types import (
 )
 from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import (
+    _MAX_TOOL_ARGUMENT_BYTES,
     CrewDispatchRuntime,
     _project_scale_artifact_zip_completion,
     _project_scale_gateway_failure_structured_completion,
     _project_scale_rejected_structured_completion,
     _project_scale_rejected_zip_completion,
     _project_scale_structured_role_completion,
+    _tool_argument_byte_limit,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchStep
 
@@ -130,6 +132,29 @@ def test_real_project_scale_markdown_blocks_are_converted_to_zip_tool_call() -> 
         "README.md": "# Real Project\n",
         "src/main.js": "export function health() { return 'ok'; }\n",
     }
+
+
+def test_project_zip_tool_uses_project_bundle_argument_limit() -> None:
+    large_project_arguments = {
+        "title": "Task API",
+        "files": {
+            "README.md": "# Task API\n",
+            "src/server.ts": "export const value = '" + ("x" * 50_000) + "';\n",
+        },
+    }
+    encoded_size = len(
+        json.dumps(
+            large_project_arguments,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+    assert encoded_size > _MAX_TOOL_ARGUMENT_BYTES
+    assert encoded_size <= _tool_argument_byte_limit("project.generate_zip")
+    assert encoded_size > _tool_argument_byte_limit("workspace.read")
 
 
 def test_real_project_scale_does_not_use_fixture_zip_without_model_files() -> None:

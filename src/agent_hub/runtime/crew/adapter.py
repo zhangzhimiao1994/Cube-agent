@@ -110,6 +110,7 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
+_MAX_PROJECT_ZIP_TOOL_ARGUMENT_BYTES = 3_000_000
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _STEP_TIMEOUT_RECOVERY_RETRIES = 1
@@ -1167,6 +1168,12 @@ def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
     return is_project_scale_artifact_request(step.task) or _is_real_project_scale_handoff(
         step.task
     )
+
+
+def _tool_argument_byte_limit(tool_name: str) -> int:
+    if tool_name == PROJECT_SCALE_ARTIFACT_TOOL_NAME:
+        return _MAX_PROJECT_ZIP_TOOL_ARGUMENT_BYTES
+    return _MAX_TOOL_ARGUMENT_BYTES
 
 
 def _is_project_scale_tool_contract_step(step: DispatchStep) -> bool:
@@ -2785,7 +2792,9 @@ class CrewDispatchRuntime:
                                 )
                             except (TypeError, ValueError):
                                 _fail("capability arguments are invalid")
-                            if len(canonical_arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
+                            if len(canonical_arguments.encode("utf-8")) > _tool_argument_byte_limit(
+                                tool_call.name
+                            ):
                                 _fail("capability arguments exceed limit")
                             arguments_sha256 = hashlib.sha256(
                                 canonical_arguments.encode("utf-8")
@@ -4310,7 +4319,9 @@ class CrewDispatchRuntime:
                     )
                 except (TypeError, ValueError):
                     _fail("capability arguments are invalid")
-                if len(canonical_arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
+                if len(canonical_arguments.encode("utf-8")) > _tool_argument_byte_limit(
+                    tool_call.name
+                ):
                     _fail("capability arguments exceed limit")
                 arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
                 idempotency_key = self._tool_call_key(
