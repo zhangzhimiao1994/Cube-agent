@@ -224,6 +224,8 @@ def _workspace_bundle_from_markdown_file_blocks(text: str) -> dict[str, JsonValu
         if index < len(lines):
             index += 1
         files[path] = "\n".join(content_lines).rstrip() + "\n"
+    if not files:
+        files = _workspace_bundle_from_markdown_file_block_regex(text)
     return _normalized_workspace_bundle({"files": files})
 
 
@@ -231,6 +233,20 @@ def _is_workspace_file_heading(line: str) -> bool:
     if not line.endswith("`"):
         return False
     return any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####"))
+
+
+def _workspace_bundle_from_markdown_file_block_regex(text: str) -> dict[str, str]:
+    files: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?ms)^#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
+        r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
+    )
+    for match in pattern.finditer(text):
+        path = _safe_workspace_bundle_path(match.group(1))
+        if path is None:
+            continue
+        files[path] = match.group(2).rstrip() + "\n"
+    return files
 
 
 def _normalized_workspace_bundle(bundle: Mapping[str, object]) -> dict[str, JsonValue] | None:

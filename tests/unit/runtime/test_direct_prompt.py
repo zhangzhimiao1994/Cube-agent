@@ -14,7 +14,7 @@ from agent_hub.harness.project_scale_runner import (
 )
 from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
-from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.direct import DirectRuntime, _project_scale_workspace_bundle_from_model_text
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from tests.contracts.test_runtime_contract import FakeGateway
 
@@ -50,6 +50,37 @@ def test_project_scale_fixture_files_include_buildable_node_type_config() -> Non
     assert "ES2022" in compiler_options["lib"]
     assert "ESNext.Disposable" in compiler_options["lib"]
     assert "DOM" in compiler_options["lib"]
+
+
+def test_direct_project_scale_parser_accepts_inline_fence_file_blocks() -> None:
+    text = """### `package.json` ```json
+{"scripts":{"build":"node --check src/main.js","test":"node --test"}}
+```
+
+### `src/main.js` ```js
+function add(a, b) {
+  return a + b;
+}
+
+module.exports = { add };
+```
+"""
+
+    bundle = _project_scale_workspace_bundle_from_model_text(text)
+
+    assert bundle == {
+        "files": {
+            "package.json": (
+                '{"scripts":{"build":"node --check src/main.js","test":"node --test"}}\n'
+            ),
+            "src/main.js": (
+                "function add(a, b) {\n"
+                "  return a + b;\n"
+                "}\n\n"
+                "module.exports = { add };\n"
+            ),
+        }
+    }
 
 
 def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -> None:

@@ -1578,6 +1578,8 @@ def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
             index += 1
         files[path] = "\n".join(content_lines).rstrip() + "\n"
     if not files:
+        files = _markdown_file_blocks_to_files_regex(text)
+    if not files:
         return None
     return _workspace_bundle_mapping_to_zip({"files": files})
 
@@ -1586,6 +1588,20 @@ def _is_markdown_file_heading(line: str) -> bool:
     if not line.endswith("`"):
         return False
     return any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####"))
+
+
+def _markdown_file_blocks_to_files_regex(text: str) -> dict[str, str]:
+    files: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?ms)^#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
+        r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
+    )
+    for match in pattern.finditer(text):
+        path = _safe_embedded_workspace_path(match.group(1))
+        if path is None:
+            continue
+        files[path] = match.group(2).rstrip() + "\n"
+    return files
 
 
 def _safe_embedded_workspace_path(value: str) -> str | None:
