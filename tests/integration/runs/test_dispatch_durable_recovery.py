@@ -14,18 +14,22 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import CursorResult, MetaData, Table, select, update
+from sqlalchemy import CursorResult, MetaData, Table, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
-from agent_hub.db.models import RunEventRow, RunRow
+from agent_hub.db.models import RunEventRow, RunRow, RuntimeArtifactWriteRow
 from agent_hub.db.session import Database, build_database
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import RunService
-from agent_hub.runtime.artifacts import ArtifactRepository
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepository,
+    ArtifactRepositoryError,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -508,6 +512,23 @@ def _assert_worker_model_succeeded_with_known_usage(checkpoint: RuntimeCheckpoin
     assert isinstance(worker_states[0]["sha256"], str)
 
 
+def _worker_model_artifact_reference(checkpoint: RuntimeCheckpoint) -> ArtifactReference:
+    models = checkpoint.state["models"]
+    assert isinstance(models, Mapping)
+    for state in models.values():
+        if (
+            isinstance(state, Mapping)
+            and state.get("actor") == "durable_worker"
+            and state.get("step_id") == "durable_worker_step"
+            and state.get("status") == "succeeded"
+        ):
+            return ArtifactReference(
+                id=UUID(str(state["artifact_id"])),
+                sha256=str(state["sha256"]),
+            )
+    raise AssertionError("worker model artifact reference not found")
+
+
 def _checkpoint_input_references(checkpoint: RuntimeCheckpoint) -> tuple[Mapping[str, str], ...]:
     raw = checkpoint.state["input_refs"]
     assert isinstance(raw, tuple)
@@ -585,6 +606,28 @@ async def _corrupt_one_checkpoint_private_artifact(
             ),
         )
         assert result.rowcount == 1
+
+
+async def _delete_private_artifact_write_owners(
+    database: Database,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    reference: ArtifactReference,
+) -> None:
+    async with database.session_factory() as session, session.begin():
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                delete(RuntimeArtifactWriteRow).where(
+                    RuntimeArtifactWriteRow.tenant_id == tenant_id,
+                    RuntimeArtifactWriteRow.run_id == run_id,
+                    RuntimeArtifactWriteRow.artifact_id == reference.id,
+                    RuntimeArtifactWriteRow.content_sha256 == reference.sha256,
+                )
+            ),
+        )
+        assert result.rowcount and result.rowcount >= 1
 
 
 async def _event_kinds(database: Database, tenant_id: UUID, run_id: UUID) -> list[str]:
@@ -805,6 +848,54 @@ async def test_fresh_service_configured_runtime_recovers_partial_checkpoint_with
         assert len(original_input_artifacts) == 1
         original_input_artifact = original_input_artifacts[0]
         original_input_text = str(original_input_artifact.content["text"])
+        private_repository = _private_repository(database)
+        worker_reference = _worker_model_artifact_reference(partial.checkpoint)
+        worker_artifact = (
+            await private_repository.get_many(
+                partial.tenant_id,
+                partial.run_id,
+                (worker_reference,),
+            )
+        )[0]
+        await _delete_private_artifact_write_owners(
+            database,
+            tenant_id=partial.tenant_id,
+            run_id=partial.run_id,
+            reference=worker_reference,
+        )
+        old_writer, replacement_writer = uuid4(), uuid4()
+        await private_repository.put(
+            partial.tenant_id,
+            partial.run_id,
+            worker_artifact,
+            write_id=old_writer,
+        )
+        await private_repository.put(
+            partial.tenant_id,
+            partial.run_id,
+            worker_artifact,
+            write_id=replacement_writer,
+        )
+        assert not await private_repository.abort_write(
+            partial.tenant_id,
+            partial.run_id,
+            worker_reference,
+            write_id=old_writer,
+        )
+        with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+            await private_repository.put(
+                partial.tenant_id,
+                partial.run_id,
+                worker_artifact,
+                write_id=old_writer,
+            )
+        assert (
+            await private_repository.get_many(
+                partial.tenant_id,
+                partial.run_id,
+                (worker_reference,),
+            )
+        ) == (worker_artifact,)
 
         fresh_database = build_database(database_url())
         fresh_transport = ScriptedTransport(label="fresh")
