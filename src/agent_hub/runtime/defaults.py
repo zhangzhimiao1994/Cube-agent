@@ -1610,6 +1610,11 @@ def _role_allowed_tools(
         and _is_project_scale_generated_project_request(context)
     ):
         filtered = [name for name in filtered if name != "read_context"]
+    if (
+        role.purpose is RolePurpose.PLAN
+        and _is_project_scale_generated_project_request(context)
+    ):
+        filtered = [name for name in filtered if name != "read_context"]
     return tuple(dict.fromkeys(filtered))
 
 

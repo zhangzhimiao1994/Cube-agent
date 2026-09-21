@@ -5521,6 +5521,18 @@ def test_project_scale_artifact_implementer_does_not_loop_on_empty_context() -> 
 def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> None:
     roles = (
         RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the requested project.",
+            must_answer=("What should be built?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
             id="implementer",
             role="Implementer",
             purpose=RolePurpose.EXECUTE,
@@ -5556,8 +5568,10 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
             capability_gateway=FakeCapabilityAvailability({"read_context", "project.generate_zip"}),
         )
 
+        architect_step = next(step for step in plan.steps if step.agent == "architect")
         implementer_step = next(step for step in plan.steps if step.agent == "implementer")
         implementer_agent = next(agent for agent in plan.agents if agent.id == "implementer")
+        assert architect_step.tools == ()
         assert implementer_step.tools == ("project.generate_zip",)
         assert implementer_agent.max_output_tokens == 24_576
         assert (
