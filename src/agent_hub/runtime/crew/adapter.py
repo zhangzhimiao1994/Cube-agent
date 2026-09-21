@@ -1262,6 +1262,89 @@ def _project_scale_rejected_zip_completion(
     return updated if updated.response.tool_calls else None
 
 
+def _project_scale_rejected_structured_completion(
+    step: DispatchStep,
+    request: ModelRequest,
+    rejected: GatewayRejectedOutput,
+) -> GatewayCompletion | None:
+    evidence = rejected.evidence
+    if (
+        not _is_real_project_scale_handoff(step.task)
+        or request.response_schema is None
+        or evidence is None
+        or not isinstance(evidence.final_text, str)
+        or not evidence.final_text.strip()
+    ):
+        return None
+    payload = _project_scale_structured_payload_from_text(
+        request.response_schema,
+        evidence.final_text,
+    )
+    if payload is None:
+        return None
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            usage=evidence.usage,
+        ),
+        deployment_id=rejected.deployment_id,
+        logical_model=rejected.logical_model,
+        provider_id=rejected.provider_id,
+        provider_model=rejected.provider_model,
+        cost_usd=rejected.cost_usd,
+        fallback_used=rejected.fallback_used,
+        fallback_from_logical_model=rejected.fallback_from_logical_model,
+        fallback_reason=rejected.fallback_reason,
+        attempted_logical_models=rejected.attempted_logical_models,
+    )
+
+
+def _project_scale_structured_payload_from_text(
+    schema: StructuredResponseSchema,
+    text: str,
+) -> Mapping[str, JsonValue] | None:
+    raw_schema = schema.schema
+    properties = raw_schema.get("properties")
+    required = raw_schema.get("required")
+    if not isinstance(properties, Mapping) or not isinstance(required, Sequence):
+        return None
+    summary = _truncate_prompt_text(" ".join(text.split()), max_bytes=2_000)
+    payload: dict[str, JsonValue] = {}
+    for raw_key in required:
+        if not isinstance(raw_key, str):
+            return None
+        raw_property = properties.get(raw_key)
+        if not isinstance(raw_property, Mapping):
+            return None
+        property_type = raw_property.get("type")
+        if raw_key == "status" and property_type == "string":
+            payload[raw_key] = "done"
+        elif raw_key == "summary" and property_type == "string":
+            payload[raw_key] = summary
+        elif raw_key == "evidence" and property_type == "array":
+            payload[raw_key] = ("Model returned unstructured role text; content captured in summary.",)
+        elif property_type == "array":
+            payload[raw_key] = ()
+        elif property_type == "boolean":
+            payload[raw_key] = False
+        elif property_type == "number" or property_type == "integer":
+            payload[raw_key] = 0
+        elif property_type == "string":
+            payload[raw_key] = ""
+        else:
+            return None
+    try:
+        _parse_structured_output(
+            schema,
+            json.dumps(payload, ensure_ascii=False),
+            prefix="structured role output",
+            max_bytes=_MAX_OUTPUT_BYTES,
+        )
+    except RuntimeExecutionError:
+        return None
+    return payload
+
+
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -3863,6 +3946,12 @@ class CrewDispatchRuntime:
                     if purpose == "step"
                     else None
                 )
+                if completion is None and purpose == "step":
+                    completion = _project_scale_rejected_structured_completion(
+                        step,
+                        request,
+                        error,
+                    )
                 if completion is None:
                     rejected = error
                 else:

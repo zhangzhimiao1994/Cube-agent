@@ -4,10 +4,19 @@ from uuid import UUID
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
-from agent_hub.models.types import ModelResponse, RejectedOutputEvidence, TokenUsage
+from agent_hub.models.types import (
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RejectedOutputEvidence,
+    StructuredResponseSchema,
+    TokenUsage,
+)
 from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import (
     _project_scale_artifact_zip_completion,
+    _project_scale_rejected_structured_completion,
     _project_scale_rejected_zip_completion,
 )
 from agent_hub.runtime.crew.plan import DispatchStep
@@ -182,3 +191,98 @@ def test_rejected_real_project_scale_bundle_is_converted_to_zip_tool_call() -> N
         "README.md": "# Real rejected bundle\n",
         "tests/main.test.js": "import test from 'node:test';\n",
     }
+
+
+def test_rejected_real_project_scale_role_text_is_wrapped_as_internal_json() -> None:
+    task = (
+        "Role mission: split architecture.\n"
+        "User task: Repair this same business project; preserve every original requirement. "
+        "Original request: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    rejected = GatewayRejectedOutput(
+        evidence=RejectedOutputEvidence(
+            final_text="Plan: keep tenant isolation, add build tests, then regenerate the bundle.",
+            usage=TokenUsage(10, 8, 18),
+            usage_status="known",
+            status="completed",
+            reason="schema_mismatch",
+        ),
+        deployment_id="primary",
+        logical_model="deepseek",
+        provider_id="deepseek",
+        provider_model="deepseek/chat",
+        cost_usd=Decimal(0),
+    )
+    request = ModelRequest(
+        logical_model="deepseek",
+        messages=(ModelMessage(role="user", content=task),),
+        required_capabilities=frozenset({ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
+        response_schema=StructuredResponseSchema(
+            name="DispatchRoleOutput",
+            schema={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "risks": {"type": "array", "items": {"type": "string"}},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                    "verification": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ("status", "summary", "evidence", "risks", "artifacts", "verification"),
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    updated = _project_scale_rejected_structured_completion(
+        _project_scale_step(task),
+        request,
+        rejected,
+    )
+
+    assert updated is not None
+    payload = json.loads(updated.response.text or "{}")
+    assert payload["status"] == "done"
+    assert "tenant isolation" in payload["summary"]
+    assert payload["verification"] == []
+
+
+def test_rejected_non_project_scale_role_text_is_not_wrapped() -> None:
+    rejected = GatewayRejectedOutput(
+        evidence=RejectedOutputEvidence(
+            final_text="plain role text",
+            usage=TokenUsage(1, 1, 2),
+            usage_status="known",
+            status="completed",
+            reason="schema_mismatch",
+        ),
+        deployment_id="primary",
+        logical_model="deepseek",
+        provider_id="deepseek",
+        provider_model="deepseek/chat",
+        cost_usd=Decimal(0),
+    )
+    request = ModelRequest(
+        logical_model="deepseek",
+        messages=(ModelMessage(role="user", content="Summarize."),),
+        required_capabilities=frozenset({ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
+        response_schema=StructuredResponseSchema(
+            name="DispatchRoleOutput",
+            schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ("summary",),
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    updated = _project_scale_rejected_structured_completion(
+        _project_scale_step("Summarize this ordinary task."),
+        request,
+        rejected,
+    )
+
+    assert updated is None
