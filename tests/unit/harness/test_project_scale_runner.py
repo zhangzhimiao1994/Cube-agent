@@ -363,7 +363,7 @@ def test_capability_standard_accepts_public_event_with_workspace_plan_evidence()
             "tests/main.test.js": _functional_js_test(),
         }
     )
-    events = [
+    events: list[object] = [
         {
             "kind": "artifact.created",
             "payload": {
@@ -394,7 +394,7 @@ def test_capability_standard_rejects_details_only_self_report() -> None:
             "tests/main.test.js": _functional_js_test(),
         }
     )
-    details = {
+    details: dict[str, object] = {
         "agent_standard_verification": {
             "constraints_read": True,
             "plan_before_implementation": True,
