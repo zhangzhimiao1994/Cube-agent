@@ -5518,6 +5518,52 @@ def test_project_scale_artifact_implementer_does_not_loop_on_empty_context() -> 
     assert "If read_context has no additional runtime context, continue with the requested files" in implementer_step.task
 
 
+def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("read_context", "project.generate_zip"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    for request in (
+        (
+            "Build a real small business project for flow=dispatch. "
+            "Return strict JSON workspace_bundle.files (relative paths to full content)."
+        ),
+        (
+            "Repair this same business project; preserve every original requirement. "
+            "Original request: Build a real small business project for flow=dispatch. "
+            "Return strict JSON workspace_bundle.files (relative paths to full content)."
+        ),
+    ):
+        plan = _dispatch_plan(
+            roles,
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request=request,
+            ),
+            capability_gateway=FakeCapabilityAvailability({"read_context", "project.generate_zip"}),
+        )
+
+        implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+        assert implementer_step.tools == ("project.generate_zip",)
+        assert (
+            "If read_context has no additional runtime context, continue with the requested files"
+            in implementer_step.task
+        )
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(

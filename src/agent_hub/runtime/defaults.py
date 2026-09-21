@@ -1124,7 +1124,7 @@ def _deployment_routing_constraint(
 def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
     if (
         TaskProfile.SOFTWARE not in _task_profiles(context.request)
-        and not _is_project_scale_artifact_request(context)
+        and not _is_project_scale_generated_project_request(context)
     ):
         return ""
     lines = [
@@ -1138,7 +1138,7 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
         lines.append(
             "Use project.generate_zip only after verification; set presentation to final_attachment for the user-downloadable ZIP."
         )
-        if _is_project_scale_artifact_request(context):
+        if _is_project_scale_generated_project_request(context):
             lines.append(
                 "If read_context has no additional runtime context, continue with the requested files and call project.generate_zip instead of rereading context."
             )
@@ -1587,10 +1587,21 @@ def _role_allowed_tools(
     if (
         role.id == "implementer"
         and "project.generate_zip" in filtered
-        and _is_project_scale_artifact_request(context)
+        and _is_project_scale_generated_project_request(context)
     ):
         filtered = [name for name in filtered if name != "read_context"]
     return tuple(dict.fromkeys(filtered))
+
+
+def _is_project_scale_generated_project_request(context: TaskContext) -> bool:
+    if _is_project_scale_artifact_request(context):
+        return True
+    text = str(context.request).casefold()
+    return (
+        "build a real " in text
+        and "business project for flow=" in text
+        and "workspace_bundle.files" in text
+    )
 
 
 def _is_project_scale_artifact_request(context: TaskContext) -> bool:
