@@ -192,6 +192,7 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
     message = str(repaired["message"])
 
     assert "Repair same project" in message
+    assert "GET accounts: expected object" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)

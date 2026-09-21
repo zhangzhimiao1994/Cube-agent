@@ -1773,10 +1773,11 @@ def _deliverable_repair_body(
             "IMPLEMENTATION_PLAN.md, VERIFICATION.md, constraints_reading_evidence.json. "
             "Report only executed checks.\n"
         )
-        suffix = f"\nOriginal request:\n{original}"
-        available = 2_000 - len(guidance) - len(suffix)
-        reasons = _format_failed_reasons(failed_reasons)[: max(available, 0)]
-        repair_body["message"] = _bounded_role_planning_task_text(guidance + reasons + suffix)
+        reasons = _format_failed_reasons(failed_reasons)
+        prefix = guidance + reasons + "\nOriginal request:\n"
+        available = 2_000 - len(" ".join(prefix.split())) - 1
+        bounded_original = original[: max(available, 0)]
+        repair_body["message"] = _bounded_role_planning_task_text(prefix + bounded_original)
         repair_body["skip_evolution_proposal"] = True
         return repair_body
     reason_text = _format_failed_reasons(failed_reasons)
