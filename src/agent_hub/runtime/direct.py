@@ -50,6 +50,31 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 
+def _model_output_has_agent_standard_evidence(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    lowered = value.casefold()
+    return (
+        ("implementation_plan.md" in lowered or "implementation plan" in lowered)
+        and ("verification.md" in lowered or "verification report" in lowered)
+        and "agents.md" in lowered
+        and "handoff" in lowered
+        and (
+            "project_requirements.md" in lowered
+            or "requirements.md" in lowered
+            or "project requirements" in lowered
+            or "需求" in lowered
+        )
+        and ("skill.md" in lowered or "agent-standard" in lowered or "技能" in lowered)
+        and (
+            "read before implementation" in lowered
+            or "read_before_implementation" in lowered
+            or "before implementation" in lowered
+            or "先读" in lowered
+        )
+    )
+
+
 class Gateway(Protocol):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion: ...
 
@@ -483,34 +508,61 @@ class DirectRuntime:
             completion_fallback_from_logical_model = completion.fallback_from_logical_model
             completion_fallback_reason = completion.fallback_reason
             artifact_text_preview = _event_text_preview(artifact.content.get("text"))
+            detected_agent_standard_verification: dict[str, JsonValue] | None = (
+                dict(project_scale_artifact_agent_standard_verification())
+                if _model_output_has_agent_standard_evidence(artifact.content.get("text"))
+                else None
+            )
             await self._consume_task_terminal(gateway_task)
             self._active_task = None
             gateway_task = None
             del text, response, completion, request, budget_usage
+            artifact_payload: dict[str, JsonValue] = {
+                "requested_logical_model": completion_requested_logical_model,
+                "logical_model": completion_logical_model,
+                "model": completion_logical_model,
+                "deployment": completion_deployment_id,
+                "provider": completion_provider_id,
+                "upstream_model": completion_provider_model,
+                "fallback_used": completion_fallback_used,
+                "fallback_from_logical_model": completion_fallback_from_logical_model,
+                "fallback_reason": completion_fallback_reason,
+                "attempted_logical_models": completion_attempted_logical_models,
+                "fallback_attempt_count": completion_fallback_attempt_count,
+                "usage_estimated": usage_estimated,
+                "usage_completion_exceeded_request": usage_completion_exceeded_request,
+                "artifact_id": str(artifact.id),
+                "output": artifact_text_preview,
+                "result": artifact_text_preview,
+            }
+            completed_payload: dict[str, JsonValue] = {
+                "requested_logical_model": completion_requested_logical_model,
+                "logical_model": completion_logical_model,
+                "model": completion_logical_model,
+                "fallback_used": completion_fallback_used,
+                "fallback_from_logical_model": completion_fallback_from_logical_model,
+                "fallback_reason": completion_fallback_reason,
+                "attempted_logical_models": completion_attempted_logical_models,
+                "fallback_attempt_count": completion_fallback_attempt_count,
+                "usage_estimated": usage_estimated,
+                "usage_completion_exceeded_request": usage_completion_exceeded_request,
+                "artifact_id": str(artifact.id),
+                "summary": artifact_text_preview,
+            }
+            if detected_agent_standard_verification is not None:
+                artifact_payload["agent_standard_verification"] = (
+                    detected_agent_standard_verification
+                )
+                completed_payload["agent_standard_verification"] = (
+                    detected_agent_standard_verification
+                )
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2 + injection_offset,
                 run_id=context.run_id,
                 actor="main_agent",
                 message="模型已返回直连回答。",
-                payload={
-                    "requested_logical_model": completion_requested_logical_model,
-                    "logical_model": completion_logical_model,
-                    "model": completion_logical_model,
-                    "deployment": completion_deployment_id,
-                    "provider": completion_provider_id,
-                    "upstream_model": completion_provider_model,
-                    "fallback_used": completion_fallback_used,
-                    "fallback_from_logical_model": completion_fallback_from_logical_model,
-                    "fallback_reason": completion_fallback_reason,
-                    "attempted_logical_models": completion_attempted_logical_models,
-                    "fallback_attempt_count": completion_fallback_attempt_count,
-                    "usage_estimated": usage_estimated,
-                    "usage_completion_exceeded_request": usage_completion_exceeded_request,
-                    "artifact_id": str(artifact.id),
-                    "output": artifact_text_preview,
-                    "result": artifact_text_preview,
-                },
+                payload=artifact_payload,
                 artifact=artifact,
             )
             checkpoint = RuntimeCheckpoint(
@@ -540,20 +592,7 @@ class DirectRuntime:
                 run_id=context.run_id,
                 actor="main_agent",
                 message="本次直连对话已完成。",
-                payload={
-                    "requested_logical_model": completion_requested_logical_model,
-                    "logical_model": completion_logical_model,
-                    "model": completion_logical_model,
-                    "fallback_used": completion_fallback_used,
-                    "fallback_from_logical_model": completion_fallback_from_logical_model,
-                    "fallback_reason": completion_fallback_reason,
-                    "attempted_logical_models": completion_attempted_logical_models,
-                    "fallback_attempt_count": completion_fallback_attempt_count,
-                    "usage_estimated": usage_estimated,
-                    "usage_completion_exceeded_request": usage_completion_exceeded_request,
-                    "artifact_id": str(artifact.id),
-                    "summary": artifact_text_preview,
-                },
+                payload=completed_payload,
                 inputs=(artifact,),
             )
         finally:

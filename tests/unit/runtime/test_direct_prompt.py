@@ -12,9 +12,11 @@ from agent_hub.harness.project_scale_runner import (
     _workspace_bundle_agent_standard_reasons,
     _workspace_bundle_project_quality_reasons,
 )
+from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
+from tests.contracts.test_runtime_contract import FakeGateway
 
 
 class UnusedGateway:
@@ -312,3 +314,71 @@ async def test_direct_project_scale_fixture_emits_verified_artifact_without_pref
             "and flow=direct."
         )
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_model_output_with_plan_reading_evidence_emits_agent_standard_payload() -> None:
+    response_text = """
+### `PROJECT_REQUIREMENTS.md`
+```md
+- Build the requested task API.
+```
+
+### `IMPLEMENTATION_PLAN.md`
+```md
+- Read before implementation: AGENTS.md workspace rules, HANDOFF current-state index,
+  and PROJECT_REQUIREMENTS.md.
+- Skill/rule sources checked before implementation: applicable SKILL.md inventory
+  and agent-standard rules.
+- Plan before implementation, then build and verify.
+```
+
+### `constraints_reading_evidence.json`
+```json
+{"read_before_implementation":true,"constraints":["AGENTS.md workspace rules","HANDOFF current-state index","PROJECT_REQUIREMENTS.md"],"skills":["applicable SKILL.md","agent-standard rules"]}
+```
+
+### `VERIFICATION.md`
+```md
+- npm run build: passed exit 0; vite build completed
+- npm test: passed exit 0; 1 test passed
+- interaction smoke: passed
+```
+"""
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=response_text, usage=TokenUsage(100, 80, 180))),
+        logical_model="main",
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="Build a real small business project for flow=direct.",
+                timeout_seconds=60,
+                token_budget=10_000,
+            )
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    completed_event = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    expected = {
+        "constraints_read": True,
+        "constraint_sources": (
+            "AGENTS.md workspace rules; HANDOFF current-state index; PROJECT_REQUIREMENTS.md"
+        ),
+        "skill_rule_sources": (
+            "AGENTS.md workspace rules; applicable SKILL.md inventory; "
+            "project-scale agent-standard rules"
+        ),
+        "read_before_implementation": True,
+        "plan_before_implementation": True,
+        "reproducible_verification": True,
+        "root_cause_repair": True,
+    }
+    assert artifact_event.payload["agent_standard_verification"] == expected
+    assert completed_event.payload["agent_standard_verification"] == expected

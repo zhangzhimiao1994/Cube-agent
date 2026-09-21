@@ -394,6 +394,10 @@ def _capability_message(case: ProjectScaleCase) -> str:
     return (
         f"Build a real {case.scale} business project for flow={case.flow}. {requirements} "
         "Include npm run build, npm test, source, tests, README, plan and verification instructions. "
+        "The bundle must include IMPLEMENTATION_PLAN.md saying it read before implementation: "
+        "AGENTS.md workspace rules, HANDOFF current-state index, PROJECT_REQUIREMENTS.md, and "
+        "applicable SKILL.md or agent-standard rules. Include constraints_reading_evidence.json "
+        "with read_before_implementation true and those constraints/skills. "
         "Return strict JSON workspace_bundle.files (relative paths to full content), or fenced "
         "file blocks headed ### `path/to/file`. Acceptance conditions: independently test API "
         "behavior and errors with reproducible verification evidence. Do not prefill pass records "

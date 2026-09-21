@@ -119,8 +119,15 @@ def test_capability_plan_cli_does_not_trigger_preseed_runtime() -> None:
     payload = json.loads(result.stdout)
     assert payload["benchmark_kind"] == "capability"
     assert payload["capability_verified"] is False
-    message = payload["requests"][0]["body"]["message"].lower()
-    assert "project-scale acceptance fixture" not in message
+    message = payload["requests"][0]["body"]["message"]
+    lowered = message.lower()
+    assert "project-scale acceptance fixture" not in lowered
+    assert "task management API" in message
+    assert "constraints_reading_evidence.json" in message
+    assert "AGENTS.md workspace rules" in message
+    assert "HANDOFF current-state index" in message
+    assert "PROJECT_REQUIREMENTS.md" in message
+    assert "applicable SKILL.md" in message
 
 
 def test_capability_benchmark_can_be_selected_by_acceptance_environment(
