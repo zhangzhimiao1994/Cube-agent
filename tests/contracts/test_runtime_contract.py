@@ -94,6 +94,25 @@ class FakeGateway:
             raise
 
 
+class CompatibleGatewayCompletion(GatewayCompletion):
+    pass
+
+
+class SubclassGateway(FakeGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        self.started.set()
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return CompatibleGatewayCompletion(
+            response=self.response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-chat",
+        )
+
+
 def context(**changes: object) -> TaskContext:
     values: dict[str, object] = {
         "run_id": RUN_ID,
@@ -120,6 +139,14 @@ def test_task_context_preserves_trusted_actor_identity() -> None:
 
 async def collect(runtime: DirectRuntime, value: TaskContext) -> list[RunEvent]:
     return [event async for event in runtime.run(value)]
+
+
+async def test_direct_runtime_accepts_gateway_completion_subclasses() -> None:
+    runtime = DirectRuntime(SubclassGateway(), logical_model="deepseek")
+
+    events = await collect(runtime, context(request="Build a medium project."))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 def test_contract_module_is_framework_neutral() -> None:

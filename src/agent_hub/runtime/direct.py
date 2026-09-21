@@ -799,10 +799,10 @@ class DirectRuntime:
         failed = False
         validated: GatewayCompletion | None = None
         try:
-            if type(completion) is not GatewayCompletion:
+            if not isinstance(completion, GatewayCompletion):
                 raise TypeError
             response = completion.response
-            if type(response) is not ModelResponse:
+            if not isinstance(response, ModelResponse):
                 raise TypeError
             usage = response.usage
             strict_usage = None
