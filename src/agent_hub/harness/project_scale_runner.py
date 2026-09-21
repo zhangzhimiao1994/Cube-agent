@@ -19,6 +19,7 @@ from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 from agent_hub.harness.project_requirements import (
+    validate_large_order_ops_api,
     validate_medium_crm_api,
     validate_small_task_api,
 )
@@ -1175,6 +1176,7 @@ def _validate_generated_project_bundle(
             if requirements_case_id is not None:
                 scale = requirements_case_id.split(":", 1)[0]
                 validators = {
+                    "large": validate_large_order_ops_api,
                     "small": validate_small_task_api,
                     "medium": validate_medium_crm_api,
                 }

@@ -377,7 +377,14 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "inventory reservation, order workflow, payment-state simulation, fulfillment "
             "queue, audit log, and admin reporting modules. Keep modules independently "
             "testable, document service boundaries, and include failure-path tests for "
-            "stock conflicts, duplicate submissions, and cancelled fulfillment."
+            "stock conflicts, duplicate submissions, and cancelled fulfillment. npm start must "
+            "listen on PORT and use DATA_DIR for persistence. Required HTTP contract: "
+            "POST /catalog/items and GET /catalog/items; POST /inventory/stock; "
+            "POST /inventory/reservations; POST /orders, GET /orders/:id, and "
+            "POST /orders/:id/payment; POST /fulfillment/jobs and PATCH "
+            "/fulfillment/jobs/:id; GET /audit?entity_id=...; GET /admin/reports/summary. "
+            "Stock conflicts, duplicate client_request_id order submissions, and completing "
+            "cancelled fulfillment jobs must return 409 with {error:{code,message}}."
         ),
         "ultra": (
             "Build an ultra-large project: a TypeScript/Node enterprise project portfolio "

@@ -278,6 +278,76 @@ class _TenantCRMAPI:
             )
 
 
+class _OrderOpsAPI:
+    def __init__(self, port: int, deadline: float) -> None:
+        self.port = port
+        self.deadline = deadline
+
+    def request(
+        self, method: str, path: str, body: Mapping[str, object] | None = None
+    ) -> tuple[int, object]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=min(2.0, _remaining(self.deadline))
+        )
+        try:
+            connection.connect()
+            connection.request(
+                method,
+                path,
+                body=None if body is None else json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Connection": "close"},
+            )
+            response = connection.getresponse()
+            raw = response.read(_MAX_RESPONSE_BYTES + 1)
+            _remaining(self.deadline)
+            _require(len(raw) <= _MAX_RESPONSE_BYTES, f"{method} {path}: response exceeds 1 MiB")
+            try:
+                payload: object = json.loads(raw) if raw else None
+            except (ValueError, UnicodeError) as exc:
+                raise _ValidationFailure(f"{method} {path}: invalid JSON response") from exc
+            return response.status, payload
+        finally:
+            connection.close()
+
+    def create(self, path: str, body: Mapping[str, object]) -> dict[str, object]:
+        status, payload = self.request("POST", path, body)
+        _require(status == 201, f"POST {path}: expected 201, got {status}")
+        _require(isinstance(payload, dict), f"POST {path}: expected object")
+        assert isinstance(payload, dict)
+        item = dict(payload)
+        _require(
+            isinstance(item.get("id"), (str, int)) and not isinstance(item.get("id"), bool),
+            f"POST {path}: missing id",
+        )
+        return item
+
+    def get_object(self, path: str) -> dict[str, object]:
+        status, payload = self.request("GET", path)
+        _require(status == 200, f"GET {path}: expected 200, got {status}")
+        _require(isinstance(payload, dict), f"GET {path}: expected object")
+        assert isinstance(payload, dict)
+        return dict(payload)
+
+    def expect_conflict(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, object] | None = None,
+        *,
+        context: str,
+    ) -> None:
+        status, payload = self.request(method, path, body)
+        _require(status == 409, f"{context}: expected 409, got {status}")
+        error = payload.get("error") if isinstance(payload, dict) else None
+        _require(isinstance(error, dict), f"{context}: expected error object")
+        assert isinstance(error, dict)
+        for field in ("code", "message"):
+            _require(
+                isinstance(error.get(field), str) and bool(error[field]),
+                f"{context}: error.{field} must be nonempty",
+            )
+
+
 def _environment(data: str) -> dict[str, str]:
     # Do not expose host/provider credentials or the host's npm user configuration.
     env = {
@@ -554,6 +624,160 @@ def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ..
     return tuple(failures)
 
 
+def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    """Check the large order-operations contract with failure paths and persistence."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        return ("timeout_seconds must be finite and positive",)
+    if _PLATFORM not in ("posix", "nt"):
+        return (f"unsupported platform for process-tree cleanup: {_PLATFORM}",)
+    npm = shutil.which("npm")
+    if npm is None:
+        return ("npm executable unavailable; large order API was not validated",)
+    taskkill = shutil.which("taskkill") if _PLATFORM == "nt" else None
+    if _PLATFORM == "nt" and taskkill is None:
+        return ("unsupported Windows environment: taskkill unavailable for process-tree cleanup",)
+
+    failures: list[str] = []
+    process: subprocess.Popen[bytes] | None = None
+    data: tempfile.TemporaryDirectory[str] | None = None
+    deadline = time.monotonic() + timeout_seconds
+    phase = "startup"
+    sku = f"SKU-{uuid4().hex[:8]}"
+    order: dict[str, object] = {}
+    fulfillment: dict[str, object] = {}
+    try:
+        root = root.resolve(strict=True)
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        scripts = package.get("scripts") if isinstance(package, dict) else None
+        _require(
+            isinstance(scripts, dict)
+            and isinstance(scripts.get("start"), str)
+            and bool(scripts["start"].strip()),
+            "package.json must provide an npm start script",
+        )
+        data = tempfile.TemporaryDirectory(prefix="large-order-api-")
+        env = _environment(data.name)
+        for cycle in range(2):
+            phase = "order operations workflow" if cycle == 0 else "order persistence after restart"
+            port = _free_port()
+            env["PORT"] = str(port)
+            _remaining(deadline)
+            process = subprocess.Popen(
+                [npm, "start"],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=_PLATFORM == "posix",
+            )
+            api = _OrderOpsAPI(port, deadline)
+            _ready_order_ops(api, process)
+            if cycle == 0:
+                item = api.create(
+                    "/catalog/items",
+                    {"sku": sku, "name": "Acceptance Widget", "price": 1200},
+                )
+                _require(str(item.get("sku")) == sku, "catalog: sku was not preserved")
+                stock = api.create("/inventory/stock", {"sku": sku, "quantity": 2})
+                _require(str(stock.get("sku")) == sku, "inventory stock: sku mismatch")
+                reservation = api.create(
+                    "/inventory/reservations",
+                    {"sku": sku, "quantity": 1, "reason": "acceptance"},
+                )
+                _require(str(reservation.get("sku")) == sku, "reservation: sku mismatch")
+                api.expect_conflict(
+                    "POST",
+                    "/inventory/reservations",
+                    {"sku": sku, "quantity": 99, "reason": "conflict"},
+                    context="stock conflict reservation",
+                )
+                request_id = f"order-{uuid4().hex[:8]}"
+                order = api.create(
+                    "/orders",
+                    {
+                        "customer_id": "customer-acceptance",
+                        "client_request_id": request_id,
+                        "lines": [{"sku": sku, "quantity": 1}],
+                    },
+                )
+                _require(order.get("status") in {"created", "reserved", "pending"}, "order: invalid status")
+                api.expect_conflict(
+                    "POST",
+                    "/orders",
+                    {
+                        "customer_id": "customer-acceptance",
+                        "client_request_id": request_id,
+                        "lines": [{"sku": sku, "quantity": 1}],
+                    },
+                    context="duplicate order submission",
+                )
+                status, payload = api.request(
+                    "POST",
+                    f"/orders/{quote(str(order['id']), safe='')}/payment",
+                    {"state": "authorized", "amount": 1200},
+                )
+                _require(status == 200, f"payment: expected 200, got {status}")
+                _require(isinstance(payload, dict), "payment: expected object")
+                assert isinstance(payload, dict)
+                order = dict(payload)
+                _require(
+                    order.get("payment_state") == "authorized",
+                    "payment: payment_state must be authorized",
+                )
+                fulfillment = api.create(
+                    "/fulfillment/jobs",
+                    {"order_id": order["id"], "warehouse": "main"},
+                )
+                status, payload = api.request(
+                    "PATCH",
+                    f"/fulfillment/jobs/{quote(str(fulfillment['id']), safe='')}",
+                    {"status": "cancelled"},
+                )
+                _require(status == 200, f"cancel fulfillment: expected 200, got {status}")
+                _require(isinstance(payload, dict), "cancel fulfillment: expected object")
+                assert isinstance(payload, dict)
+                fulfillment = dict(payload)
+                _require(
+                    fulfillment.get("status") == "cancelled",
+                    "fulfillment: status must be cancelled",
+                )
+                api.expect_conflict(
+                    "PATCH",
+                    f"/fulfillment/jobs/{quote(str(fulfillment['id']), safe='')}",
+                    {"status": "completed"},
+                    context="cancelled fulfillment completion",
+                )
+            persisted_order = api.get_object(f"/orders/{quote(str(order['id']), safe='')}")
+            _require(
+                persisted_order.get("payment_state") == "authorized",
+                "orders: authorized payment must persist",
+            )
+            audit = api.get_object(f"/audit?entity_id={quote(str(order['id']), safe='')}")
+            _require(_payload_has_items(audit), "audit: expected nonempty items")
+            report = api.get_object("/admin/reports/summary")
+            for key in ("orders", "inventory", "fulfillment"):
+                _require(key in report, f"admin report: missing {key}")
+            _stop_tree(process, taskkill)
+            process = None
+    except (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
+            subprocess.SubprocessError) as exc:
+        label = "timeout" if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) else phase
+        failures.append(f"{label}: {exc}")
+    finally:
+        if process is not None:
+            try:
+                _stop_tree(process, taskkill)
+            except (_ValidationFailure, OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"process-tree cleanup failed: {exc}")
+        if data is not None:
+            try:
+                data.cleanup()
+            except OSError as exc:
+                failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
+    return tuple(failures)
+
+
 def _ready_crm(api: _TenantCRMAPI, process: subprocess.Popen[bytes], tenant: str) -> None:
     path = api.tenant_path(tenant, "accounts")
     while True:
@@ -569,3 +793,22 @@ def _ready_crm(api: _TenantCRMAPI, process: subprocess.Popen[bytes], tenant: str
 def _contains_id(items: Sequence[Mapping[str, object]], expected: Mapping[str, object]) -> bool:
     expected_id = expected.get("id")
     return any(item.get("id") == expected_id for item in items)
+
+
+def _ready_order_ops(api: _OrderOpsAPI, process: subprocess.Popen[bytes]) -> None:
+    while True:
+        _remaining(api.deadline)
+        _require(
+            process.poll() is None,
+            "startup: npm start exited before order operations API became ready",
+        )
+        try:
+            api.request("GET", "/catalog/items")
+            return
+        except (OSError, http.client.HTTPException):
+            time.sleep(min(0.05, _remaining(api.deadline)))
+
+
+def _payload_has_items(payload: Mapping[str, object]) -> bool:
+    items = payload.get("items")
+    return isinstance(items, list) and bool(items)

@@ -35,10 +35,13 @@ unsupported platforms, or cleanup failures cannot produce a passing result.
 
 Medium capability checks validate the CRM-lite HTTP contract independently:
 tenant-isolated accounts, contacts, opportunities, reminders, search/filtering,
-cross-tenant 404 errors, and restart persistence. Large and ultra prompts have
-distinct business requirements, but their independent requirement evaluators are
-not implemented yet. Capability runs for those scales fail that gate explicitly.
-Do not count them as verified capability.
+cross-tenant 404 errors, and restart persistence. Large capability checks
+validate the order-operations HTTP contract independently: catalog, inventory
+reservation, orders, payment-state simulation, fulfillment, audit logs, admin
+reports, stock conflicts, duplicate submissions, cancelled fulfillment conflicts,
+and restart persistence. Ultra prompts have distinct business requirements, but
+their independent requirement evaluator is not implemented yet. Capability runs
+for ultra fail that gate explicitly. Do not count ultra as verified capability.
 
 ## Reading Results
 

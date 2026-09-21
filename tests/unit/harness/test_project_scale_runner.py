@@ -216,6 +216,25 @@ def test_capability_medium_uses_independent_crm_requirements(
     assert "requirements: tenant isolation missing" in result.reasons
 
 
+def test_capability_large_uses_independent_order_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "validate_large_order_ops_api",
+        lambda root, timeout_seconds: ("requirements: stock conflict missing",),
+        raising=False,
+    )
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}),
+        commands=((sys.executable, "-c", "pass"),),
+        timeout_seconds=10,
+        requirements_case_id="large:direct",
+    )
+    assert result.passed is False
+    assert "requirements: stock conflict missing" in result.reasons
+
+
 def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records() -> None:
     bundle = _project_bundle({
         "README.md": "# Task API",
