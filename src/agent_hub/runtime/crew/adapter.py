@@ -1169,6 +1169,13 @@ def _is_project_scale_artifact_handoff(step: DispatchStep) -> bool:
     )
 
 
+def _is_project_scale_tool_contract_step(step: DispatchStep) -> bool:
+    return (
+        PROJECT_SCALE_ARTIFACT_TOOL_NAME in step.tools
+        and _is_real_project_scale_handoff(step.task)
+    )
+
+
 def _is_real_project_scale_handoff(task: object) -> bool:
     text = str(task).casefold()
     return (
@@ -1343,6 +1350,54 @@ def _project_scale_structured_payload_from_text(
     except RuntimeExecutionError:
         return None
     return payload
+
+
+def _project_scale_structured_role_completion(
+    step: DispatchStep,
+    agent: AgentSpec,
+    completion: GatewayCompletion,
+) -> GatewayCompletion:
+    if (
+        not _is_project_scale_tool_contract_step(step)
+        or not agent.output_schema
+        or completion.response.tool_calls
+    ):
+        return completion
+    schema = _agent_response_schema(agent)
+    if schema is None:
+        return completion
+    try:
+        _parse_structured_output(
+            schema,
+            completion.response.text,
+            prefix="structured role output",
+            max_bytes=_MAX_OUTPUT_BYTES,
+        )
+        return completion
+    except RuntimeExecutionError:
+        pass
+    text = completion.response.text
+    if not isinstance(text, str) or not text.strip():
+        return completion
+    payload = _project_scale_structured_payload_from_text(schema, text)
+    if payload is None:
+        return completion
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            usage=completion.response.usage,
+            provider_metadata=completion.response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
+    )
 
 
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
@@ -3125,6 +3180,7 @@ class CrewDispatchRuntime:
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
                 )
+                completion = _project_scale_structured_role_completion(step, agent, completion)
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
                 artifact = self._artifact(
                     step,
@@ -4126,7 +4182,11 @@ class CrewDispatchRuntime:
         )
         if unavailable_tools:
             _fail("planned capability is unavailable")
-        response_schema = _agent_response_schema(agent)
+        response_schema = (
+            None
+            if _is_project_scale_tool_contract_step(step)
+            else _agent_response_schema(agent)
+        )
         required_capabilities = {ModelCapability.TEXT}
         if request_tools:
             required_capabilities.add(ModelCapability.TOOL_CALLING)

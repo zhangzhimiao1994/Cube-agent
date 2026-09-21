@@ -19,8 +19,9 @@ from agent_hub.runtime.crew.adapter import (
     _project_scale_artifact_zip_completion,
     _project_scale_rejected_structured_completion,
     _project_scale_rejected_zip_completion,
+    _project_scale_structured_role_completion,
 )
-from agent_hub.runtime.crew.plan import DispatchStep
+from agent_hub.runtime.crew.plan import AgentSpec, DispatchStep
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000021")
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000022")
@@ -292,6 +293,42 @@ def test_invalid_real_project_scale_role_completion_is_recovered_before_checkpoi
     payload = json.loads(recovered.response.text or "{}")
     assert payload["status"] == "done"
     assert "create API files" in payload["summary"]
+
+
+def test_project_scale_tool_contract_text_is_wrapped_for_role_handoff() -> None:
+    task = (
+        "Role mission: implement the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    agent = AgentSpec(
+        id="implementer",
+        role="Implementer",
+        goal="Build the project.",
+        logical_model="deepseek",
+        allowed_tools=("project.generate_zip",),
+        output_schema={
+            "status": "string",
+            "summary": "string",
+            "evidence": "string[]",
+            "risks": "string[]",
+            "artifacts": "string[]",
+            "verification": "string[]",
+        },
+    )
+    completion = _completion("Created package.json, src/server.ts, tests, and README.")
+
+    updated = _project_scale_structured_role_completion(
+        _project_scale_step(task),
+        agent,
+        completion,
+    )
+
+    assert updated is not completion
+    payload = json.loads(updated.response.text or "{}")
+    assert payload["status"] == "done"
+    assert "src/server.ts" in payload["summary"]
+    assert payload["risks"] == []
 
 
 def test_rejected_non_project_scale_role_text_is_not_wrapped() -> None:
