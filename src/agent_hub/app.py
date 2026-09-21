@@ -109,6 +109,7 @@ from agent_hub.routing.types import (
     RouteDecision,
     RouteSource,
 )
+from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import (
     HarnessSchedulerProtocol,
@@ -1126,6 +1127,7 @@ def create_app(
                         redis_client=active_redis,
                         capability_gateway=runtime_capability_stack.runtime_gateway,
                         harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
+                        artifact_repository=PostgresArtifactRepository(active_sessions),
                     )
                 if active_mode_router is None and active_secret_service is not None:
                     assert active_redis is not None

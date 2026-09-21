@@ -249,6 +249,48 @@ class RunArtifactRow(Base):
     )
 
 
+class RuntimeArtifactRow(Base):
+    """Private hydration storage, never a public artifact publication."""
+
+    __tablename__ = "agent_hub_runtime_artifacts"
+    __table_args__ = (
+        CheckConstraint("byte_size > 0", name="ck_runtime_artifact_byte_size"),
+        Index("ix_runtime_artifacts_run", "run_id"),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[str] = mapped_column(Text)
+    byte_size: Mapped[int] = mapped_column(BigInteger)
+    permanent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+
+class RuntimeArtifactWriteRow(Base):
+    """Durable owners and abort fences, independent of artifact row lifetime."""
+
+    __tablename__ = "agent_hub_runtime_artifact_writes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('reserved', 'written', 'aborted')", name="ck_runtime_artifact_write_status"
+        ),
+        Index("ix_runtime_artifact_writes_run", "run_id"),
+        Index("ix_runtime_artifact_write_owners", "tenant_id", "run_id", "artifact_id", "status"),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    write_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    artifact_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16))
+
+
 class RunCheckpointRow(Base):
     __tablename__ = "agent_hub_run_checkpoints"
     __table_args__ = (

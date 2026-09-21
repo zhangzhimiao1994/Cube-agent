@@ -12,11 +12,11 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
     Artifact,
     JsonValue,
     RunEvent,
-    RuntimeCheckpoint,
     TaskContext,
 )
 from agent_hub.runtime.crew.adapter import (
@@ -127,24 +127,27 @@ async def test_tool_continuation_has_guidance_once_without_changing_authority(tm
 async def test_partial_replay_uses_content_digest_not_random_load_id(tmp_path: Path, changed: bool) -> None:
     context = await task(tmp_path)
     gateway = FakeGateway()
-    runtime = CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory())
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway, one_step_plan(), crew_factory=FastFactory(), artifact_repository=repository,
+    )
     events = [event async for event in runtime.run(context)]
-    checkpoint = await runtime.save_checkpoint()
-    payload = checkpoint.to_payload()
-    state = cast(dict[str, object], payload['state'])
-    state.update(completed=[], artifact_refs={}, frontier=['final'], phase='running', terminal=False)
-    payload['state_sha256'] = ''
-    resumable = RuntimeCheckpoint.from_payload(payload)
+    resumable = next(
+        event.checkpoint for event in events
+        if event.checkpoint is not None
+        and event.checkpoint.state['phase'] == 'running'
+        and event.checkpoint.state['completed'] == ()
+        and event.checkpoint.state['usage'] == {'tokens': 2, 'cost_usd': '0'}
+    )
     fresh = await task(tmp_path, tenant=context.tenant_id, run=context.run_id,
                        marker='CHANGED-GUIDANCE' if changed else 'PRIVATE-GUIDANCE')
     assert fresh.instruction_context is not None and context.instruction_context is not None
     assert fresh.instruction_context.load_id != context.instruction_context.load_id
-    fresh = fresh.model_copy(update={
-        'checkpoint': resumable,
-        'artifacts': tuple(event.artifact for event in events if event.artifact is not None),
-    })
+    fresh = fresh.model_copy(update={'checkpoint': resumable})
     second_gateway = FakeGateway()
-    replay = CrewDispatchRuntime(second_gateway, one_step_plan(), crew_factory=FastFactory())
+    replay = CrewDispatchRuntime(
+        second_gateway, one_step_plan(), crew_factory=FastFactory(), artifact_repository=repository,
+    )
     await replay.restore_checkpoint(resumable)
     replay_events: list[RunEvent] = []
 

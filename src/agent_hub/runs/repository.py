@@ -1473,6 +1473,8 @@ class RunRepository:
         event: RunEvent,
     ) -> None:
         event = _event_with_failure_diagnostic(event)
+        if event.kind == EventKind.RUNTIME_FAILED:
+            event = RunEvent.model_validate(event)
         payload = event.to_payload()
         inserted_event_id = await session.scalar(
             insert(RunEventRow)

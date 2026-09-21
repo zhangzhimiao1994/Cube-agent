@@ -49,6 +49,7 @@ from agent_hub.models.types import (
     effective_capabilities_for_api_base,
 )
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
+from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
@@ -353,6 +354,15 @@ def _renumber_event(event: RunEvent, offset: int, *, run_id: UUID) -> RunEvent:
     return event.model_copy(update={"sequence": event.sequence + offset, "run_id": run_id})
 
 
+async def _cancel_active_run(
+    active: Mapping[UUID, ExecutionRuntime],
+    run_id: UUID,
+) -> None:
+    runtime = active.get(run_id)
+    if runtime is not None:
+        await runtime.cancel()
+
+
 class ConfigBackedDirectRuntime:
     """Build a fresh DirectRuntime from the published model config for each run."""
 
@@ -399,6 +409,9 @@ class ConfigBackedDirectRuntime:
         for runtime in active:
             await runtime.cancel()
 
+    async def cancel_run(self, run_id: UUID) -> None:
+        await _cancel_active_run(self._active, run_id)
+
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         current = await self._config_service.get_current(context.tenant_id)
         if current is None:
@@ -435,6 +448,7 @@ class ConfigBackedDispatchRuntime:
         role_planner: RolePlanner | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
         harness_tool_gateway: HarnessToolInvoker | None = None,
+        artifact_repository: ArtifactRepository | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -443,6 +457,7 @@ class ConfigBackedDispatchRuntime:
         self._role_planner = role_planner or RolePlanner()
         self._capability_gateway = capability_gateway
         self._harness_tool_gateway = harness_tool_gateway
+        self._artifact_repository = artifact_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -470,6 +485,9 @@ class ConfigBackedDispatchRuntime:
     async def cancel(self) -> None:
         for runtime in tuple(self._active.values()):
             await runtime.cancel()
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        await _cancel_active_run(self._active, run_id)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
@@ -568,6 +586,7 @@ class ConfigBackedDispatchRuntime:
             plan,
             capability_gateway=self._capability_gateway,
             harness_tool_gateway=self._harness_tool_gateway,
+            artifact_repository=self._artifact_repository,
         )
         if (
             self._harness_tool_gateway is not None
@@ -650,6 +669,9 @@ class ConfigBackedDiscussionRuntime:
     async def cancel(self) -> None:
         for runtime in tuple(self._active.values()):
             await runtime.cancel()
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        await _cancel_active_run(self._active, run_id)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
@@ -804,6 +826,9 @@ class ConfigBackedHybridRuntime:
     async def cancel(self) -> None:
         for runtime in tuple(self._active.values()):
             await runtime.cancel()
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        await _cancel_active_run(self._active, run_id)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
@@ -3333,6 +3358,7 @@ def configured_runtime_registry(
     transport: ModelTransport | None = None,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     harness_tool_gateway: HarnessToolInvoker | None = None,
+    artifact_repository: ArtifactRepository | None = None,
 ) -> RuntimeRegistry:
     async def capacity_factory(
         tenant_id: UUID,
@@ -3362,6 +3388,7 @@ def configured_runtime_registry(
                 transport=transport,
                 capability_gateway=capability_gateway,
                 harness_tool_gateway=harness_tool_gateway,
+                artifact_repository=artifact_repository,
             ),
             ConfigBackedDiscussionRuntime(
                 config_service=config_service,

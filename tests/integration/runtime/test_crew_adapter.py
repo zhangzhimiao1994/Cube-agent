@@ -626,10 +626,12 @@ async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:
             del args, kwargs
             return generation
 
+    repository = InMemoryArtifactRepository()
     first = make_runtime(
         FakeGateway(reviews=['{"verdict":"revise","feedback":"persist me"}']),
         plan(review=True),
         crew_factory=Factory(),
+        artifact_repository=repository,
     )
     first_events: list[RunEvent] = []
 
@@ -695,16 +697,20 @@ async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:
             del args, kwargs
             return resumed_generation
 
+    resumed_gateway = FakeGateway(reviews=['{"verdict":"approve"}'])
     resumed = make_runtime(
-        FakeGateway(reviews=['{"verdict":"approve"}']),
+        resumed_gateway,
         plan(review=True),
         crew_factory=ResumedFactory(),
+        artifact_repository=repository,
     )
     await resumed.restore_checkpoint(checkpoint)
-    events = await collect(resumed, context(checkpoint=checkpoint, artifacts=artifacts))
+    events = await collect(resumed, context(checkpoint=checkpoint))
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert any("persist me" in prompt for prompt in resumed_generation.prompts)
+    assert [event.payload["verdict"] for event in events
+            if event.kind is EventKind.REVIEW_COMPLETED] == ["approve"]
 
 
 async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -> None:
@@ -725,21 +731,17 @@ async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -
 
 
 async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None:
-    first = make_runtime(FakeGateway())
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(FakeGateway(), artifact_repository=repository)
     events = await collect(first, context())
     checkpoint = next(
         event.checkpoint for event in reversed(events) if event.kind is EventKind.CHECKPOINT_SAVED
     )
     assert checkpoint is not None
     second_gateway = FakeGateway()
-    second = make_runtime(second_gateway)
+    second = make_runtime(second_gateway, artifact_repository=repository)
     await second.restore_checkpoint(checkpoint)
-    stored_artifacts = tuple(
-        event.artifact
-        for event in events
-        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
-    )
-    resumed = await collect(second, context(checkpoint=checkpoint, artifacts=stored_artifacts))
+    resumed = await collect(second, context(checkpoint=checkpoint))
     assert [event.kind for event in resumed] == [EventKind.RUNTIME_COMPLETED]
     assert not second_gateway.requests
 
@@ -777,10 +779,12 @@ async def test_succeeded_model_call_resumes_before_final_artifact_without_replay
             return generation
 
     first_gateway = FakeGateway()
+    repository = InMemoryArtifactRepository()
     first = make_runtime(
         first_gateway,
         one_step_plan(),
         crew_factory=BlockingFactory(),
+        artifact_repository=repository,
     )
     first_events: list[RunEvent] = []
 
@@ -806,11 +810,11 @@ async def test_succeeded_model_call_resumes_before_final_artifact_without_replay
     assert len(model_artifacts) == 1
 
     resumed_gateway = FakeGateway()
-    resumed = make_runtime(resumed_gateway, one_step_plan())
+    resumed = make_runtime(resumed_gateway, one_step_plan(), artifact_repository=repository)
     await resumed.restore_checkpoint(checkpoint)
     events = await collect(
         resumed,
-        context(checkpoint=checkpoint, artifacts=model_artifacts),
+        context(checkpoint=checkpoint),
     )
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
@@ -839,27 +843,24 @@ async def test_changed_model_request_hash_never_reuses_succeeded_response() -> N
             return ChangedGeneration()
 
     first_gateway = FakeGateway()
-    first = make_runtime(first_gateway, one_step_plan())
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(first_gateway, one_step_plan(), artifact_repository=repository)
     events = await collect(first, context())
-    checkpoint = next(
-        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    resumable = next(
+        event.checkpoint for event in events
+        if event.checkpoint is not None
+        and event.checkpoint.state["phase"] == "running"
+        and event.checkpoint.state["completed"] == ()
+        and event.checkpoint.state["usage"] == {"tokens": 2, "cost_usd": "0"}
     )
-    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
-    payload = checkpoint.to_payload()
-    state = cast(dict[str, object], payload["state"])
-    state["completed"] = []
-    state["artifact_refs"] = {}
-    state["frontier"] = ["final"]
-    state["phase"] = "running"
-    state["terminal"] = False
-    payload["state_sha256"] = ""
-    resumable = RuntimeCheckpoint.from_payload(payload)
     gateway = FakeGateway()
-    resumed = make_runtime(gateway, one_step_plan(), crew_factory=ChangedFactory())
+    resumed = make_runtime(
+        gateway, one_step_plan(), crew_factory=ChangedFactory(), artifact_repository=repository,
+    )
     await resumed.restore_checkpoint(resumable)
 
     with pytest.raises(RuntimeExecutionError, match="model request"):
-        await collect(resumed, context(checkpoint=resumable, artifacts=artifacts))
+        await collect(resumed, context(checkpoint=resumable))
     assert gateway.requests == []
 
 
@@ -999,18 +1000,19 @@ async def test_parallel_tool_calls_share_trigger_and_feed_next_model_in_order() 
 @pytest.mark.parametrize("tamper", ("round", "tool_index", "trigger"))
 async def test_checkpoint_rejects_tampered_tool_call_coordinates(tamper: str) -> None:
     dispatch_plan = one_step_plan(tools=("web.search",))
+    repository = InMemoryArtifactRepository()
     events = await collect(
         make_runtime(
             ToolGateway(),
             dispatch_plan,
             capability_gateway=FakeCapabilities(),
+            artifact_repository=repository,
         ),
         context(),
     )
     checkpoint = next(
         event.checkpoint for event in reversed(events) if event.checkpoint is not None
     )
-    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
     payload = checkpoint.to_payload()
     state = cast(dict[str, object], payload["state"])
     tool_states = cast(dict[str, dict[str, object]], state["tools"])
@@ -1038,49 +1040,50 @@ async def test_checkpoint_rejects_tampered_tool_call_coordinates(tamper: str) ->
         tool_states[new_key] = tool_states.pop(old_key)
     payload["state_sha256"] = ""
     tampered = RuntimeCheckpoint.from_payload(payload)
-    resumed = make_runtime(
-        FakeGateway(),
-        dispatch_plan,
-        capability_gateway=FakeCapabilities(),
-    )
-
-    try:
-        await resumed.restore_checkpoint(tampered)
-    except RuntimeExecutionError:
-        return
-    with pytest.raises(RuntimeExecutionError, match="artifact"):
-        await collect(
-            resumed,
-            context(checkpoint=tampered, artifacts=artifacts),
-        )
-
-
-async def test_completed_parallel_tool_graph_restores_without_replay() -> None:
-    dispatch_plan = one_step_plan(tools=("web.search",))
-    events = await collect(
-        make_runtime(
-            ParallelToolGateway(),
-            dispatch_plan,
-            capability_gateway=FakeCapabilities(),
-        ),
-        context(),
-    )
-    checkpoint = next(
-        event.checkpoint for event in reversed(events) if event.checkpoint is not None
-    )
-    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
     gateway = FakeGateway()
     capabilities = FakeCapabilities()
     resumed = make_runtime(
         gateway,
         dispatch_plan,
         capability_gateway=capabilities,
+        artifact_repository=repository,
+    )
+
+    with pytest.raises(RuntimeExecutionError):
+        await resumed.restore_checkpoint(tampered)
+        await collect(resumed, context(checkpoint=tampered))
+    assert gateway.requests == []
+    assert capabilities.calls == []
+
+
+async def test_completed_parallel_tool_graph_restores_without_replay() -> None:
+    dispatch_plan = one_step_plan(tools=("web.search",))
+    repository = InMemoryArtifactRepository()
+    events = await collect(
+        make_runtime(
+            ParallelToolGateway(),
+            dispatch_plan,
+            capability_gateway=FakeCapabilities(),
+            artifact_repository=repository,
+        ),
+        context(),
+    )
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    gateway = FakeGateway()
+    capabilities = FakeCapabilities()
+    resumed = make_runtime(
+        gateway,
+        dispatch_plan,
+        capability_gateway=capabilities,
+        artifact_repository=repository,
     )
     await resumed.restore_checkpoint(checkpoint)
 
     restored_events = await collect(
         resumed,
-        context(checkpoint=checkpoint, artifacts=artifacts),
+        context(checkpoint=checkpoint),
     )
 
     assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
@@ -1167,16 +1170,23 @@ async def test_checkpoint_rejects_review_feedback_with_false_lineage(
     state = cast(dict[str, object], payload["state"])
     review_refs = cast(dict[str, dict[str, object]], state["review_refs"])
     review_refs["left"]["sha256"] = tampered_feedback.content_sha256
+    registry = cast(dict[str, str], state["artifact_registry"])
+    registry[str(tampered_feedback.id)] = tampered_feedback.content_sha256
     payload["state_sha256"] = ""
     tampered = RuntimeCheckpoint.from_payload(payload)
-    resumed = make_runtime(FakeGateway(), plan(review=True))
+    repository = InMemoryArtifactRepository()
+    for artifact in artifacts:
+        await repository.put(TENANT_ID, RUN_ID, artifact)
+    replay_gateway = FakeGateway()
+    resumed = make_runtime(replay_gateway, plan(review=True), artifact_repository=repository)
     await resumed.restore_checkpoint(tampered)
 
     with pytest.raises(RuntimeExecutionError, match="review artifact"):
         await collect(
             resumed,
-            context(checkpoint=tampered, artifacts=tuple(artifacts)),
+            context(checkpoint=tampered),
         )
+    assert replay_gateway.requests == []
 
 
 @pytest.mark.parametrize(
@@ -1298,20 +1308,38 @@ async def test_checkpoint_rejects_rehashed_artifact_with_false_lineage(target: s
             item for item in model_states.values() if item["artifact_id"] == str(artifact.id)
         )
         model_state["sha256"] = tampered_artifact.content_sha256
+    registry = cast(dict[str, str], state["artifact_registry"])
+    registry[str(tampered_artifact.id)] = tampered_artifact.content_sha256
     payload["state_sha256"] = ""
     tampered = RuntimeCheckpoint.from_payload(payload)
-    resumed = make_runtime(FakeGateway(), dispatch_plan, capability_gateway=FakeCapabilities())
+    repository = InMemoryArtifactRepository()
+    for stored_artifact in artifacts:
+        await repository.put(TENANT_ID, RUN_ID, stored_artifact)
+    replay_gateway = FakeGateway()
+    replay_capabilities = FakeCapabilities()
+    resumed = make_runtime(
+        replay_gateway, dispatch_plan, capability_gateway=replay_capabilities,
+        artifact_repository=repository,
+    )
     await resumed.restore_checkpoint(tampered)
 
-    with pytest.raises(RuntimeExecutionError, match="artifact"):
+    expected_reason = (
+        "^runtime checkpoint review is unverified$"
+        if target in {"retry_model", "retry_model_omit"}
+        else "artifact"
+    )
+    with pytest.raises(RuntimeExecutionError, match=expected_reason):
         await collect(
             resumed,
-            context(checkpoint=tampered, artifacts=tuple(artifacts)),
+            context(checkpoint=tampered),
         )
+    assert replay_gateway.requests == []
+    assert replay_capabilities.calls == []
 
 
 async def test_completed_reviewed_dag_restores_without_replay() -> None:
     dispatch_plan = plan(review=True)
+    repository = InMemoryArtifactRepository()
     events = await collect(
         make_runtime(
             FakeGateway(
@@ -1321,20 +1349,20 @@ async def test_completed_reviewed_dag_restores_without_replay() -> None:
                 ]
             ),
             dispatch_plan,
+            artifact_repository=repository,
         ),
         context(),
     )
     checkpoint = next(
         event.checkpoint for event in reversed(events) if event.checkpoint is not None
     )
-    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
     gateway = FakeGateway()
-    resumed = make_runtime(gateway, dispatch_plan)
+    resumed = make_runtime(gateway, dispatch_plan, artifact_repository=repository)
     await resumed.restore_checkpoint(checkpoint)
 
     restored_events = await collect(
         resumed,
-        context(checkpoint=checkpoint, artifacts=artifacts),
+        context(checkpoint=checkpoint),
     )
 
     assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
@@ -1346,11 +1374,13 @@ async def test_completed_reviewed_dag_restores_without_replay() -> None:
     ("artifact_id", "sha256", "call_index", "provenance"),
 )
 async def test_checkpoint_rejects_tampered_model_ledger(tamper: str) -> None:
-    events = await collect(make_runtime(FakeGateway(), one_step_plan()), context())
+    repository = InMemoryArtifactRepository()
+    events = await collect(
+        make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository), context(),
+    )
     checkpoint = next(
         event.checkpoint for event in reversed(events) if event.checkpoint is not None
     )
-    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
     payload = checkpoint.to_payload()
     state = cast(dict[str, object], payload["state"])
     models = cast(dict[str, dict[str, object]], state["models"])
@@ -1368,7 +1398,7 @@ async def test_checkpoint_rejects_tampered_model_ledger(tamper: str) -> None:
     payload["state_sha256"] = ""
     tampered = RuntimeCheckpoint.from_payload(payload)
     gateway = FakeGateway()
-    resumed = make_runtime(gateway, one_step_plan())
+    resumed = make_runtime(gateway, one_step_plan(), artifact_repository=repository)
 
     if tamper == "call_index":
         with pytest.raises(RuntimeExecutionError):
@@ -1378,7 +1408,7 @@ async def test_checkpoint_rejects_tampered_model_ledger(tamper: str) -> None:
         with pytest.raises(RuntimeExecutionError, match="model artifacts"):
             await collect(
                 resumed,
-                context(checkpoint=tampered, artifacts=artifacts),
+                context(checkpoint=tampered),
             )
     assert gateway.requests == []
 
@@ -1413,7 +1443,8 @@ async def test_parallel_model_failure_preserves_sibling_and_requires_confirmatio
                 raise RuntimeError("provider detail must be redacted")
             return await super().complete_with_context(request)
 
-    first = make_runtime(PartialGateway())
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(PartialGateway(), artifact_repository=repository)
     first_events: list[RunEvent] = []
     with pytest.raises(RuntimeExecutionError):
         async for event in first.run(context()):
@@ -1426,18 +1457,13 @@ async def test_parallel_model_failure_preserves_sibling_and_requires_confirmatio
         for model_state in model_states.values()
     )
 
-    stored_artifacts = tuple(
-        event.artifact
-        for event in first_events
-        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
-    )
     gateway = FakeGateway()
-    resumed_runtime = make_runtime(gateway)
+    resumed_runtime = make_runtime(gateway, artifact_repository=repository)
     await resumed_runtime.restore_checkpoint(checkpoint)
     with pytest.raises(ModelOutcomeUncertain, match="model outcome requires confirmation"):
         await collect(
             resumed_runtime,
-            context(checkpoint=checkpoint, artifacts=stored_artifacts),
+            context(checkpoint=checkpoint),
         )
     assert gateway.requests == []
 
@@ -1772,8 +1798,10 @@ async def test_succeeded_tool_is_preserved_when_following_model_is_uncertain() -
         total_token_budget=100,
     )
     first_capabilities = FakeCapabilities()
+    repository = InMemoryArtifactRepository()
     first = make_runtime(
-        FailingAfterToolGateway(), tool_plan, capability_gateway=first_capabilities
+        FailingAfterToolGateway(), tool_plan, capability_gateway=first_capabilities,
+        artifact_repository=repository,
     )
     first_events: list[RunEvent] = []
     with pytest.raises(RuntimeExecutionError):
@@ -1789,15 +1817,20 @@ async def test_succeeded_tool_is_preserved_when_following_model_is_uncertain() -
     assert len(tool_artifacts) == 1
 
     second_capabilities = FakeCapabilities()
-    resumed = make_runtime(ToolGateway(), tool_plan, capability_gateway=second_capabilities)
+    second_gateway = ToolGateway()
+    resumed = make_runtime(
+        second_gateway, tool_plan, capability_gateway=second_capabilities,
+        artifact_repository=repository,
+    )
     await resumed.restore_checkpoint(checkpoint)
     with pytest.raises(ModelOutcomeUncertain, match="model outcome requires confirmation"):
         await collect(
             resumed,
-            context(checkpoint=checkpoint, artifacts=persisted_artifacts),
+            context(checkpoint=checkpoint),
         )
 
     assert second_capabilities.calls == []
+    assert second_gateway.requests == []
     checkpoint_2 = await resumed.save_checkpoint()
     assert checkpoint_2.state["models"] == checkpoint.state["models"]
     assert checkpoint_2.state["tools"] == checkpoint.state["tools"]
@@ -1849,7 +1882,10 @@ async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
     )
     first_capabilities = RecordingCapabilities(block=True)
     gateway = ToolGateway()
-    first = make_runtime(gateway, tool_plan, capability_gateway=first_capabilities)
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(
+        gateway, tool_plan, capability_gateway=first_capabilities, artifact_repository=repository,
+    )
     first_events: list[RunEvent] = []
 
     async def consume() -> None:
@@ -1869,14 +1905,13 @@ async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
         await task
 
     second_capabilities = RecordingCapabilities(block=False)
-    resumed = make_runtime(gateway, tool_plan, capability_gateway=second_capabilities)
-    await resumed.restore_checkpoint(checkpoint)
-    persisted_artifacts = tuple(
-        event.artifact for event in first_events if event.artifact is not None
+    resumed = make_runtime(
+        gateway, tool_plan, capability_gateway=second_capabilities, artifact_repository=repository,
     )
+    await resumed.restore_checkpoint(checkpoint)
     events = await collect(
         resumed,
-        context(checkpoint=checkpoint, artifacts=persisted_artifacts),
+        context(checkpoint=checkpoint),
     )
 
     assert second_capabilities.keys == first_capabilities.keys
@@ -1950,7 +1985,7 @@ async def test_detached_old_tool_cannot_overwrite_new_run_checkpoint() -> None:
 async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
     class UncertainCapabilities(FakeCapabilities):
         async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
-            del kwargs
+            self.calls.append((kwargs["actor"], kwargs["name"]))
             raise RuntimeError("commit status unavailable")
 
         def is_replay_safe(self, name: str) -> bool:
@@ -2006,33 +2041,38 @@ async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
                 )
             return completion
 
+    repository = InMemoryArtifactRepository()
+    first_capabilities = UncertainCapabilities()
     first = make_runtime(
         RestrictedToolGateway(),
         tool_plan,
-        capability_gateway=UncertainCapabilities(),
+        capability_gateway=first_capabilities,
+        artifact_repository=repository,
     )
     first_events: list[RunEvent] = []
     with pytest.raises(CapabilityOutcomeUncertain):
         async for event in first.run(context()):
             first_events.append(event)
     checkpoint = await first.save_checkpoint()
-    persisted_artifacts = tuple(
-        event.artifact for event in first_events if event.artifact is not None
-    )
+    assert first_capabilities.calls == [("writer", "account.update")]
     second_capabilities = UncertainCapabilities()
+    second_gateway = RestrictedToolGateway()
     resumed = make_runtime(
-        RestrictedToolGateway(),
+        second_gateway,
         tool_plan,
         capability_gateway=second_capabilities,
+        artifact_repository=repository,
     )
     await resumed.restore_checkpoint(checkpoint)
 
     with pytest.raises(CapabilityOutcomeUncertain):
         await collect(
             resumed,
-            context(checkpoint=checkpoint, artifacts=persisted_artifacts),
+            context(checkpoint=checkpoint),
         )
 
+    assert second_gateway.requests == []
+    assert second_capabilities.calls == []
     checkpoint_2 = await resumed.save_checkpoint()
     assert checkpoint_2.state["models"] == checkpoint.state["models"]
     assert checkpoint_2.state["tools"] == checkpoint.state["tools"]
@@ -2042,12 +2082,13 @@ async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
         third_gateway,
         tool_plan,
         capability_gateway=third_capabilities,
+        artifact_repository=repository,
     )
     await third.restore_checkpoint(checkpoint_2)
     with pytest.raises(CapabilityOutcomeUncertain):
         await collect(
             third,
-            context(checkpoint=checkpoint_2, artifacts=persisted_artifacts),
+            context(checkpoint=checkpoint_2),
         )
 
     assert third_gateway.requests == []
@@ -2443,10 +2484,12 @@ async def test_restored_step_usage_prevents_cost_cap_bypass_without_replay() -> 
         total_cost_usd=Decimal("0.10"),
     )
     first_capabilities = BlockingCapabilities(block=True)
+    repository = InMemoryArtifactRepository()
     first = make_runtime(
         CostToolGateway(),
         tool_plan,
         capability_gateway=first_capabilities,
+        artifact_repository=repository,
     )
     first_events: list[RunEvent] = []
 
@@ -2469,15 +2512,13 @@ async def test_restored_step_usage_prevents_cost_cap_bypass_without_replay() -> 
         resumed_gateway,
         tool_plan,
         capability_gateway=resumed_capabilities,
+        artifact_repository=repository,
     )
     await resumed.restore_checkpoint(checkpoint)
-    persisted_artifacts = tuple(
-        event.artifact for event in first_events if event.artifact is not None
-    )
     with pytest.raises(RuntimeExecutionError):
         await collect(
             resumed,
-            context(checkpoint=checkpoint, artifacts=persisted_artifacts),
+            context(checkpoint=checkpoint),
         )
     exhausted = await resumed.save_checkpoint()
 

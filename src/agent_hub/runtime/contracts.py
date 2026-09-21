@@ -196,6 +196,40 @@ def _safe_identifier(value: str, *, name: str) -> str:
     return value
 
 
+def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
+    required = {
+        "error_code", "error_stage", "error_category", "error_summary", "retryable", "suggested_action",
+    }
+    optional = {"status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor"}
+    if not required <= set(payload) or set(payload) - required - optional:
+        raise ValueError("runtime failure diagnostic fields are invalid")
+    for name in ("error_code", "error_stage", "error_category", "step_id", "actor"):
+        if name in payload:
+            value = payload[name]
+            if type(value) is not str:
+                raise ValueError("runtime failure diagnostic identifier is invalid")
+            _safe_identifier(value, name="runtime failure diagnostic identifier")
+    for name, limit in (("error_summary", 240), ("suggested_action", 1024)):
+        value = payload[name]
+        if type(value) is not str or len(value) > limit:
+            raise ValueError("runtime failure diagnostic text is invalid")
+        _safe_free_text(value, name="runtime failure diagnostic text", max_bytes=limit * 4)
+    if type(payload["retryable"]) is not bool:
+        raise ValueError("runtime failure diagnostic retryable must be boolean")
+    if "status_code" in payload:
+        status_code = payload["status_code"]
+        if type(status_code) is not int or not 100 <= status_code <= 599:
+            raise ValueError("runtime failure diagnostic status code is invalid")
+    if "hybrid_child_mode" in payload:
+        mode = payload["hybrid_child_mode"]
+        if type(mode) is not str or mode not in {"direct", "dispatch", "discuss"}:
+            raise ValueError("runtime failure diagnostic child mode is invalid")
+    if "orchestration_recovery_hint" in payload and (
+        payload["orchestration_recovery_hint"] != "retry_blocked_contract_chain"
+    ):
+        raise ValueError("runtime failure diagnostic recovery hint is invalid")
+
+
 def _preflight_payload(value: object) -> None:
     nodes = 0
     estimated_bytes = 0
@@ -689,6 +723,8 @@ class RunEvent(_RuntimeContractModel):
         elif self.kind is EventKind.RUNTIME_FAILED:
             if self.reason is None or self.artifact is not None or self.checkpoint is not None:
                 raise ValueError("runtime.failed requires only a reason")
+            if self.payload:
+                _validate_failure_diagnostic(self.payload)
         elif self.kind in {EventKind.MODEL_STARTED, EventKind.RUNTIME_CANCELLED}:
             if self.artifact is not None or self.checkpoint is not None:
                 raise ValueError("event kind forbids artifact and checkpoint")
@@ -847,7 +883,7 @@ class RunEvent(_RuntimeContractModel):
             EventKind.ARTIFACT_CREATED: frozenset({"artifact", "actor", "message", "payload"}),
             EventKind.CHECKPOINT_SAVED: frozenset({"checkpoint"}),
             EventKind.RUNTIME_COMPLETED: frozenset({"actor", "message", "payload", "inputs", "reason"}),
-            EventKind.RUNTIME_FAILED: frozenset({"reason"}),
+            EventKind.RUNTIME_FAILED: frozenset({"reason", "payload"}),
             EventKind.RUNTIME_CANCELLED: frozenset(),
         }
         if (

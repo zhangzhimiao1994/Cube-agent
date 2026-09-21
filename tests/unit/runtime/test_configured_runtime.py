@@ -20,8 +20,10 @@ from agent_hub.models.capacity import CapacityLease, CapacityWaitTimeout
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.routing_policy import DeploymentRoutingConstraint
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
     EventKind,
+    ExecutionRuntime,
     JsonValue,
     RunEvent,
     RuntimeCheckpoint,
@@ -403,10 +405,12 @@ class ProbeDispatchRuntime:
         *,
         capability_gateway: object | None = None,
         harness_tool_gateway: object | None = None,
+        artifact_repository: object | None = None,
     ) -> None:
         del gateway, capability_gateway
         self.plan = plan
         self.harness_tool_gateway = harness_tool_gateway
+        self.artifact_repository = artifact_repository
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
 
@@ -446,6 +450,26 @@ class ProbeHybridRuntime(ProbeDispatchRuntime):
         self.discussion = discussion
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
+
+
+class CancellableProbeRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.cancel_count = 0
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        raise AssertionError(f"not used: {context.run_id}")
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise AssertionError(f"not used: {checkpoint.id}")
+
+    async def cancel(self) -> None:
+        self.cancel_count += 1
 
 
 @pytest.mark.asyncio
@@ -2314,6 +2338,77 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_injects_artifact_repository_into_each_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    artifact_repository = InMemoryArtifactRepository()
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft concise text.",
+                        "model": "main",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        artifact_repository=artifact_repository,
+    )
+
+    for _ in range(2):
+        events = [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.DISPATCH,
+                    request="Draft a short note.",
+                    routing_decision={
+                        "selected_agent_ids": ("writer",),
+                        "main_agent_model": "main",
+                    },
+                )
+            )
+        ]
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+    assert len(ProbeDispatchRuntime.instances) == 2
+    assert all(
+        child.artifact_repository is artifact_repository
+        for child in ProbeDispatchRuntime.instances
+    )
 
 
 @pytest.mark.asyncio
@@ -4385,6 +4480,94 @@ async def _immediate_capacity(
 ) -> CapacityController:
     assert tenant_id == TENANT_ID
     return ImmediateCapacity(deployments)
+
+
+async def _assert_cancel_run_targets_only_matching_active_child(
+    *,
+    active: dict[UUID, ExecutionRuntime],
+    cancel_run: Callable[[UUID], Awaitable[None]],
+    cancel_all: Callable[[], Awaitable[None]],
+) -> None:
+    selected_run_id, unrelated_run_id = uuid4(), uuid4()
+    selected = CancellableProbeRuntime()
+    unrelated = CancellableProbeRuntime()
+    active[selected_run_id] = selected
+    active[unrelated_run_id] = unrelated
+
+    await cancel_run(selected_run_id)
+    await cancel_run(uuid4())
+
+    assert selected.cancel_count == 1
+    assert unrelated.cancel_count == 0
+
+    await cancel_all()
+
+    assert selected.cancel_count == 2
+    assert unrelated.cancel_count == 1
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_cancel_run_cancels_only_matching_child() -> None:
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(None),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=_immediate_capacity,
+        transport=FakeTransport(),
+    )
+
+    await _assert_cancel_run_targets_only_matching_active_child(
+        active=runtime._active,
+        cancel_run=runtime.cancel_run,
+        cancel_all=runtime.cancel,
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_cancel_run_cancels_only_matching_child() -> None:
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(None),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=_immediate_capacity,
+        transport=FakeTransport(),
+    )
+
+    await _assert_cancel_run_targets_only_matching_active_child(
+        active=runtime._active,
+        cancel_run=runtime.cancel_run,
+        cancel_all=runtime.cancel,
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_cancel_run_cancels_only_matching_child() -> None:
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(None),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=_immediate_capacity,
+        transport=FakeTransport(),
+    )
+
+    await _assert_cancel_run_targets_only_matching_active_child(
+        active=runtime._active,
+        cancel_run=runtime.cancel_run,
+        cancel_all=runtime.cancel,
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_cancel_run_cancels_only_matching_child() -> None:
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(None),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=_immediate_capacity,
+        transport=FakeTransport(),
+    )
+
+    await _assert_cancel_run_targets_only_matching_active_child(
+        active=runtime._active,
+        cancel_run=runtime.cancel_run,
+        cancel_all=runtime.cancel,
+    )
 
 
 @pytest.mark.asyncio
@@ -6655,3 +6838,85 @@ def test_configured_runtime_registry_registers_all_production_modes() -> None:
     assert not isinstance(registry.get(TaskMode.DISPATCH), UnavailableRuntime)
     assert not isinstance(registry.get(TaskMode.DISCUSS), UnavailableRuntime)
     assert not isinstance(registry.get(TaskMode.HYBRID), UnavailableRuntime)
+
+
+@pytest.mark.asyncio
+async def test_configured_runtime_registry_injects_artifact_repository_into_dispatch_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+
+    class SpyCapacityPool(ImmediateCapacity):
+        def __init__(
+            self,
+            redis_client: object,
+            *,
+            deployments: Sequence[Deployment],
+            fingerprint_resolver: Callable[[str], Awaitable[str]],
+        ) -> None:
+            del redis_client, fingerprint_resolver
+            super().__init__(tuple(deployments))
+
+    monkeypatch.setattr(defaults_module, "CapacityPool", SpyCapacityPool)
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    artifact_repository = InMemoryArtifactRepository()
+    registry = configured_runtime_registry(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "structured_output"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft concise text.",
+                        "model": "main",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        redis_client=object(),
+        transport=FakeTransport(),
+        artifact_repository=artifact_repository,
+    )
+
+    for _ in range(2):
+        events = [
+            event
+            async for event in registry.get(TaskMode.DISPATCH).run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.DISPATCH,
+                    request="Draft a short note.",
+                    routing_decision={
+                        "selected_agent_ids": ("writer",),
+                        "main_agent_model": "main",
+                    },
+                )
+            )
+        ]
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+    assert len(ProbeDispatchRuntime.instances) == 2
+    assert all(
+        child.artifact_repository is artifact_repository
+        for child in ProbeDispatchRuntime.instances
+    )

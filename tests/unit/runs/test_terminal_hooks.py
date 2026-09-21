@@ -431,6 +431,36 @@ class CompletedBeforeRuntimeEventRepository(ExecutableFakeRepository):
         return row
 
 
+class CancelledBeforeRuntimeEventRepository(ExecutableFakeRepository):
+    async def get_for_update(self, session: FakeTransaction, run_id: UUID) -> FakeRunRow:
+        row = await super().get_for_update(session, run_id)
+        if row.status == RunStatus.RUNNING.value:
+            row.status = RunStatus.CANCELLED.value
+            row.version += 1
+        return row
+
+
+class HeartbeatLeaseLostRepository(ExecutableFakeRepository):
+    def __init__(self, *, routing_decision: dict[str, object]) -> None:
+        super().__init__(routing_decision=routing_decision)
+        self.heartbeat_attempted = asyncio.Event()
+
+    async def renew_active_worker_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        worker_id: str,
+        worker_lease_token: UUID,
+        worker_lease_expires_at: datetime,
+    ) -> bool:
+        del worker_id, worker_lease_token, worker_lease_expires_at
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        self.heartbeat_attempted.set()
+        return False
+
+
 class RuntimeCompletes:
     mode = TaskMode.DISPATCH
 
@@ -512,6 +542,33 @@ class RuntimeYieldsStaleToolEvent:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RuntimeRequiresRunScopedCancel(RuntimeYieldsStaleToolEvent):
+    def __init__(self) -> None:
+        self.cancelled_run_ids: list[UUID] = []
+
+    async def cancel(self) -> None:
+        raise AssertionError("global cancel must not be used for a single run")
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        self.cancelled_run_ids.append(run_id)
+
+
+class RuntimeBlocksUntilRunScopedCancel(RuntimeRequiresRunScopedCancel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.started.set()
+        await self.release.wait()
+        yield RunEvent(kind=EventKind.RUNTIME_CANCELLED, sequence=1, run_id=context.run_id)
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        await super().cancel_run(run_id)
+        self.release.set()
 
 
 class RuntimeRecordsRestoredCheckpointCompletes(RuntimeRecordsRepairContextCompletes):
@@ -953,6 +1010,24 @@ async def test_execute_drops_runtime_events_after_stale_worker_loses_terminal_ra
 
 
 @pytest.mark.asyncio
+async def test_execute_cancelled_status_uses_run_scoped_runtime_cancel() -> None:
+    repository = CancelledBeforeRuntimeEventRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeRequiresRunScopedCancel()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.CANCELLED
+    assert runtime.cancelled_run_ids == [repository.run_id]
+    assert repository.event_log == []
+
+
+@pytest.mark.asyncio
 async def test_execute_renews_worker_lease_while_runtime_is_waiting() -> None:
     repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
     runtime = RuntimeBlocksUntilReleased()
@@ -975,6 +1050,34 @@ async def test_execute_renews_worker_lease_while_runtime_is_waiting() -> None:
 
     assert submitted.status is RunStatus.COMPLETED
     assert repository.lease_renewals
+
+
+@pytest.mark.asyncio
+async def test_worker_lease_heartbeat_lost_uses_run_scoped_runtime_cancel() -> None:
+    repository = HeartbeatLeaseLostRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeBlocksUntilRunScopedCancel()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        worker_id="worker-lost",
+        run_worker_lease_seconds=1,
+    )
+
+    submitted_task = asyncio.create_task(service.execute(repository.run_id))
+    try:
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        await asyncio.wait_for(repository.heartbeat_attempted.wait(), timeout=2)
+        submitted = await asyncio.wait_for(submitted_task, timeout=2)
+    finally:
+        runtime.release.set()
+        if not submitted_task.done():
+            submitted_task.cancel()
+        await asyncio.gather(submitted_task, return_exceptions=True)
+
+    assert submitted.status is RunStatus.CANCELLED
+    assert runtime.cancelled_run_ids == [repository.run_id]
 
 
 @pytest.mark.asyncio

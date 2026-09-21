@@ -101,7 +101,7 @@ from agent_hub.runtime.self_repair_context import (
 _LOGGER = logging.getLogger(__name__)
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "8"
+_RUNTIME_VERSION = "9"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
@@ -1993,6 +1993,7 @@ class CrewDispatchRuntime:
         restored = self._restored_checkpoint
         protected_checkpoint = restored or context.checkpoint
         hydrating_restored = protected_checkpoint is not None
+        input_snapshot_ready = False
         terminal_item: _Terminal | None = None
         repair_tool_key_steps: frozenset[str] = frozenset()
         repair_reopened_contract_ids: tuple[str, ...] = ()
@@ -2024,6 +2025,21 @@ class CrewDispatchRuntime:
             return write_id
 
         async def emit(**values: object) -> None:
+            event_inputs = values.get("inputs", ())
+            if isinstance(event_inputs, tuple) and all(isinstance(item, Artifact) for item in event_inputs):
+                private_ids = {item.id for item in context.artifacts}
+                if any(isinstance(item, Artifact) and item.id in private_ids for item in event_inputs):
+                    # Keep private root inputs in the model context, not public event bodies.
+                    values["inputs"] = tuple(
+                        item for item in event_inputs if isinstance(item, Artifact) and item.id not in private_ids
+                    )
+                    values["payload"] = {
+                        **cast(Mapping[str, JsonValue], values.get("payload", {})),
+                        "input_refs": tuple(
+                            {"id": str(item.id), "sha256": item.content_sha256}
+                            for item in event_inputs if isinstance(item, Artifact)
+                        ),
+                    }
             artifact = values.get("artifact")
             if type(artifact) is Artifact and str(artifact.id) not in artifact_registry:
                 write_id = await store_artifact(artifact)
@@ -2063,6 +2079,11 @@ class CrewDispatchRuntime:
                     restored_artifacts,
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
                 artifact_registry.update(restored_artifacts)
+                input_refs = cast(tuple[Mapping[str, str], ...], restored.state["input_refs"])
+                context = self._strict_context(context.model_copy(update={
+                    "artifacts": tuple(restored_artifacts[reference["id"]] for reference in input_refs),
+                }))
+                input_snapshot_ready = True
                 restored_repair_contract_ids = restored.state.get("repair_reopened_contract_ids")
                 if isinstance(restored_repair_contract_ids, tuple) and all(
                     type(item) is str for item in restored_repair_contract_ids
@@ -2134,11 +2155,17 @@ class CrewDispatchRuntime:
                     await emit(kind=EventKind.RUNTIME_CANCELLED)
                     terminal_item = _Terminal()
                     return
-            initial_artifacts = tuple(
-                artifact
-                for artifact in context.artifacts
-                if str(artifact.id) not in artifact_registry
-            )
+            if restored is None:
+                if len({artifact.id for artifact in context.artifacts}) != len(context.artifacts):
+                    _fail("runtime input snapshot contains duplicate identities")
+                for artifact in context.artifacts:
+                    write_id = await store_artifact(artifact)
+                    if not self._accepts_artifact_writes(state):
+                        raise asyncio.CancelledError
+                    artifact_registry[str(artifact.id)] = artifact
+                    state.pending_artifact_writes.pop(write_id, None)
+                input_snapshot_ready = True
+            initial_artifacts = context.artifacts
             steps = {step.id: step for step in plan.steps}
             model_ledger.usage = usage_ledger
             checkpoint_lock = asyncio.Lock()
@@ -2604,7 +2631,7 @@ class CrewDispatchRuntime:
                 try:
                     if hydrating_restored and protected_checkpoint is not None:
                         self._publish_checkpoint(state, protected_checkpoint)
-                    elif plan is not None:
+                    elif plan is not None and input_snapshot_ready:
                         checkpoint = self._make_checkpoint(
                             context,
                             plan,
@@ -4939,6 +4966,10 @@ class CrewDispatchRuntime:
             mode=self.mode,
             state={
                 "plan_digest": plan.digest,
+                "input_refs": tuple(
+                    {"id": str(artifact.id), "sha256": artifact.content_sha256}
+                    for artifact in context.artifacts
+                ),
                 "completed": completed_ids,
                 "retries": {key: retries[key] for key in sorted(retries)},
                 "artifact_refs": {
@@ -5006,6 +5037,7 @@ class CrewDispatchRuntime:
             _fail("runtime checkpoint is incompatible")
         state = checkpoint.state
         required_state_keys = {
+            "input_refs",
             "rejected_outputs",
             "structured_repairs",
             "plan_digest",
@@ -5085,6 +5117,22 @@ class CrewDispatchRuntime:
             except ValueError:
                 _fail("runtime checkpoint is incompatible")
             registry_ids.add(artifact_id)
+        input_refs = state["input_refs"]
+        if not isinstance(input_refs, tuple) or len(input_refs) > 64:
+            _fail("runtime checkpoint input snapshot is invalid")
+        input_ids: set[str] = set()
+        for reference in input_refs:
+            if (
+                not isinstance(reference, Mapping)
+                or set(reference) != {"id", "sha256"}
+                or type(reference["id"]) is not str
+                or type(reference["sha256"]) is not str
+                or reference["id"] in input_ids
+                or reference["id"] not in registry_ids
+                or artifact_registry[reference["id"]] != reference["sha256"]
+            ):
+                _fail("runtime checkpoint input snapshot is invalid")
+            input_ids.add(reference["id"])
         if (
             set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
@@ -5650,6 +5698,7 @@ class CrewDispatchRuntime:
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
         review_ledger: _ReviewLedger,
+        input_ids: tuple[str, ...],
     ) -> None:
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
@@ -5723,15 +5772,17 @@ class CrewDispatchRuntime:
                                     if call[1] is not None), None)]
             if first_call is not None and first_call[1] is not None
         }
-        if len(root_inputs) > 1:
+        if len(root_inputs) > 1 or any(sources != input_ids for sources in root_inputs):
             _fail("runtime checkpoint artifact graph is invalid")
-        external_ids = next(iter(root_inputs), ())
-        if any(source_id not in external_pool for source_id in external_ids):
+        external_ids = input_ids
+        if external_pool != set(external_ids):
             _fail("runtime checkpoint artifact graph is invalid")
         if {
-            str(artifact.id) for artifact in artifacts if artifact.type == "model_response"
+            str(artifact.id) for artifact in artifacts
+            if artifact.type == "model_response" and str(artifact.id) not in external_ids
         } != model_ids or {
-            str(artifact.id) for artifact in artifacts if artifact.type == "tool_result"
+            str(artifact.id) for artifact in artifacts
+            if artifact.type == "tool_result" and str(artifact.id) not in external_ids
         } != tool_ids:
             _fail("runtime checkpoint artifact graph is invalid")
         feedback_by_sources: dict[tuple[str, tuple[str, ...]], list[Artifact]] = {}
@@ -6005,29 +6056,21 @@ class CrewDispatchRuntime:
             ArtifactReference(id=UUID(artifact_id), sha256=sha256)
             for artifact_id, sha256 in raw_registry.items()
         )
-        supplemental = {str(artifact.id): artifact for artifact in context.artifacts}
         try:
             async with asyncio.timeout(self._remaining_timeout(run_state)):
                 stored = await self._artifact_repository.get_many(
                     context.tenant_id, context.run_id, references
                 )
         except ArtifactRepositoryError:
-            compatible = tuple(supplemental.get(str(reference.id)) for reference in references)
-            if any(
-                artifact is None or artifact.content_sha256 != reference.sha256
-                for artifact, reference in zip(compatible, references, strict=True)
-            ):
-                review_ids = {
-                    item["id"]
-                    for item in cast(
-                        Mapping[str, Mapping[str, str]],
-                        checkpoint.state["review_refs"],
-                    ).values()
-                }
-                if any(str(reference.id) in review_ids for reference in references):
-                    _fail("runtime checkpoint review artifact is unavailable")
-                _fail("runtime checkpoint artifacts are unavailable")
-            stored = cast(tuple[Artifact, ...], compatible)
+            review_ids = {
+                item["id"]
+                for item in cast(
+                    Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"],
+                ).values()
+            }
+            if any(str(reference.id) in review_ids for reference in references):
+                _fail("runtime checkpoint review artifact is unavailable")
+            _fail("runtime checkpoint artifacts are unavailable")
         if (
             type(stored) is not tuple
             or len(stored) != len(references)
@@ -6040,13 +6083,7 @@ class CrewDispatchRuntime:
             )
         ):
             _fail("runtime checkpoint artifacts are unavailable")
-        by_id = dict(supplemental)
-        for stored_artifact in stored:
-            artifact_id = str(stored_artifact.id)
-            existing = by_id.get(artifact_id)
-            if existing is not None and existing.content_sha256 != stored_artifact.content_sha256:
-                _fail("runtime checkpoint artifacts are unavailable")
-            by_id[artifact_id] = stored_artifact
+        by_id = {str(artifact.id): artifact for artifact in stored}
         registry = {str(artifact.id): artifact for artifact in stored}
         agents = {agent.id: agent for agent in plan.agents}
         steps = {step.id: step for step in plan.steps}
@@ -6196,6 +6233,9 @@ class CrewDispatchRuntime:
             tool_ledger,
             model_ledger,
             review_ledger,
+            tuple(reference["id"] for reference in cast(
+                tuple[Mapping[str, str], ...], checkpoint.state["input_refs"],
+            )),
         )
         if outcome_error is not None:
             raise outcome_error

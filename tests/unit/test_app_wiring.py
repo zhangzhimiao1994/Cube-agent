@@ -501,6 +501,10 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
         runtime_gateway = object()
         harness_tool_gateway = object()
 
+    class FakePostgresArtifactRepository:
+        def __init__(self, session_factory: object) -> None:
+            captured["artifact_session_factory"] = session_factory
+
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
         captured["mcp_service_kwargs"] = kwargs
         return FakeMcpService()
@@ -512,6 +516,10 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
         captured["runtime_stack_kwargs"] = kwargs
         return FakeRuntimeStack()
+
+    def fake_configured_runtime_registry(**kwargs: object) -> object:
+        captured["runtime_registry_kwargs"] = kwargs
+        return object()
 
     monkeypatch.setattr(
         app_module,
@@ -528,7 +536,8 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
         "build_runtime_capability_stack",
         fake_build_runtime_capability_stack,
     )
-    monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
+    monkeypatch.setattr(app_module, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
+    monkeypatch.setattr(app_module, "configured_runtime_registry", fake_configured_runtime_registry)
 
     application = create_app(
         settings=valid_settings(tmp_path),
@@ -566,6 +575,9 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     assert getattr(application.state, "plugin_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
     assert callable(getattr(application.state, "reload_plugin_runtime_config", None))
+    registry_kwargs = cast(dict[str, object], captured["runtime_registry_kwargs"])
+    assert captured["artifact_session_factory"] is FakeSession
+    assert isinstance(registry_kwargs["artifact_repository"], FakePostgresArtifactRepository)
 
 
 def test_create_app_registers_enabled_plugin_package_subprocess_adapters(

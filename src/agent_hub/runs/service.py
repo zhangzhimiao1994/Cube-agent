@@ -40,7 +40,14 @@ from agent_hub.runs.self_repair import (
     classify_terminal_run,
 )
 from agent_hub.runs.workspace import DEFAULT_PROJECT_ID, REQUESTED_PERMISSIONS, workspace_selection
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    ExecutionRuntime,
+    JsonValue,
+    RunEvent,
+    TaskContext,
+)
 from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
@@ -66,6 +73,17 @@ _MAX_REQUIRED_CAPABILITIES = 8
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
 _TERMINAL_HOOK_NOTIFIED_KIND = "terminal.notified"
+
+
+def _runtime_cancel_for_run(
+    runtime: ExecutionRuntime,
+    run_id: UUID,
+) -> Callable[[], Awaitable[None]]:
+    cancel_run = getattr(runtime, "cancel_run", None)
+    if cancel_run is not None:
+        run_scoped_cancel = cast(Callable[[UUID], Awaitable[None]], cancel_run)
+        return lambda: run_scoped_cancel(run_id)
+    return runtime.cancel
 
 
 @dataclass(frozen=True, slots=True)
@@ -1449,42 +1467,49 @@ class RunService:
                         run_id=run_id,
                         event=_event_at_sequence(started_event, run_id=run_id, sequence=sequence),
                     )
+            runtime_cancel = _runtime_cancel_for_run(runtime, run_id)
             heartbeat_task = asyncio.create_task(
                 self._heartbeat_worker_lease(
                     tenant_id=tenant_id,
                     run_id=run_id,
                     worker_lease_token=worker_lease_token,
                     stop=heartbeat_stop,
-                    runtime_cancel=runtime.cancel,
+                    runtime_cancel=runtime_cancel,
                 )
             )
             try:
                 async for event in runtime.run(context):
+                    cancel_runtime = False
+                    stop_runtime_loop = False
                     async with await self._repository.run_transaction() as session, session.begin():
                         locked = await self._repository.get_for_update(session, run_id)
                         current_status = RunStatus(locked.status)
                         if current_status is RunStatus.CANCELLED:
-                            await runtime.cancel()
+                            cancel_runtime = True
                             terminal = RunStatus.CANCELLED
-                            break
+                            stop_runtime_loop = True
                         if current_status is RunStatus.PAUSED:
                             terminal = RunStatus.PAUSED
-                            break
+                            stop_runtime_loop = True
                         if current_status is RunStatus.WAITING_APPROVAL:
                             terminal = RunStatus.WAITING_APPROVAL
-                            break
+                            stop_runtime_loop = True
                         if current_status in {
                             RunStatus.COMPLETED,
                             RunStatus.FAILED,
                             RunStatus.CANCELLED,
                         }:
                             terminal = current_status
-                            break
-                        if current_status is RunStatus.RUNNING and not RunRepository.renew_worker_lease(
-                            locked,
-                            worker_id=self._worker_id,
-                            worker_lease_token=worker_lease_token,
-                            worker_lease_expires_at=self._worker_lease_expires_at(),
+                            stop_runtime_loop = True
+                        if (
+                            not stop_runtime_loop
+                            and current_status is RunStatus.RUNNING
+                            and not RunRepository.renew_worker_lease(
+                                locked,
+                                worker_id=self._worker_id,
+                                worker_lease_token=worker_lease_token,
+                                worker_lease_expires_at=self._worker_lease_expires_at(),
+                            )
                         ):
                             _LOGGER.warning(
                                 "run_worker_lease_lost run_id=%s worker_id=%s",
@@ -1492,29 +1517,34 @@ class RunService:
                                 self._worker_id,
                             )
                             lease_lost = True
-                            break
-                        sequence = await self._repository.next_event_sequence(session, run_id)
-                        event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
-                        await self._repository.persist_event(
-                            session,
-                            tenant_id=tenant_id,
-                            run_id=run_id,
-                            event=event,
-                        )
-                        observed_events.append(event)
-                        observer_decision = monitor.observe(event)
-                        if observer_decision is not None:
-                            observer_decisions.append(observer_decision)
-                        if event.kind is EventKind.RUNTIME_COMPLETED:
-                            terminal = RunStatus.COMPLETED
-                        elif event.kind is EventKind.RUNTIME_CANCELLED:
-                            terminal = RunStatus.CANCELLED
-                        elif event.kind is EventKind.RUNTIME_FAILED:
-                            terminal = RunStatus.FAILED
-                        if terminal is not RunStatus.RUNNING:
-                            locked.status = terminal.value
-                            RunRepository.clear_worker_lease(locked)
-                            locked.version += 1
+                            stop_runtime_loop = True
+                        if not stop_runtime_loop:
+                            sequence = await self._repository.next_event_sequence(session, run_id)
+                            event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
+                            await self._repository.persist_event(
+                                session,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                event=event,
+                            )
+                            observed_events.append(event)
+                            observer_decision = monitor.observe(event)
+                            if observer_decision is not None:
+                                observer_decisions.append(observer_decision)
+                            if event.kind is EventKind.RUNTIME_COMPLETED:
+                                terminal = RunStatus.COMPLETED
+                            elif event.kind is EventKind.RUNTIME_CANCELLED:
+                                terminal = RunStatus.CANCELLED
+                            elif event.kind is EventKind.RUNTIME_FAILED:
+                                terminal = RunStatus.FAILED
+                            if terminal is not RunStatus.RUNNING:
+                                locked.status = terminal.value
+                                RunRepository.clear_worker_lease(locked)
+                                locked.version += 1
+                    if cancel_runtime:
+                        await runtime_cancel()
+                    if stop_runtime_loop:
+                        break
                     if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                         return await self._submitted_by_run_id(tenant_id, run_id)
             finally:

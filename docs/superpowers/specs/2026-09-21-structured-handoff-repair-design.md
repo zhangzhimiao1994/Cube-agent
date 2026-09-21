@@ -2,15 +2,15 @@
 
 ## Status And Priority
 
-Implemented locally, 2026-09-21; local/adversarial restore and isolated PG gates
-pass. Production release/provider/CI acceptance remains pending.
-Native Responses and dispatch guidance passed actual provider/production acceptance
-and GitHub quality run 35531088347 at revision 240b739.
+Released as 808757f, 2026-09-21; local/adversarial restore, isolated PG,
+production all-profile acceptance and GitHub quality run 35537419684 passed.
+The real short dispatch passed actual review and guidance injection without
+fallback. It exercised ordinary output, not live-provider correction.
 
-Mainline order: **current prompt + transport fixes pass real-provider acceptance
-and are pushed, with CI checked -> this strict repair slice -> discuss guidance**.
-The native slice's file ownership has been handed over. This order takes
-precedence over the earlier discuss plan's next-slice wording.
+Next gate: durable dispatch artifacts/input snapshots, then acknowledged DB
+reservation/result boundaries and discuss/hybrid guidance and recovery. See
+`2026-09-21-durable-dispatch-artifacts-design.md`. This order supersedes the older
+discuss-next wording; normal-flow correction does not prove process-crash safety.
 
 ## Rejected Response Prerequisite
 

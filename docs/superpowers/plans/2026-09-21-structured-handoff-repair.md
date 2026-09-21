@@ -203,12 +203,20 @@ python -m ruff check --no-cache src/agent_hub/runtime/crew/adapter.py tests/unit
 python -m mypy --strict src/agent_hub/runtime/crew/adapter.py tests/unit/runtime/crew/test_adapter_failure_reason.py tests/unit/runtime/crew/test_structured_handoff_repair.py tests/integration/runs/test_structured_handoff_repair.py
 ```
 
-- [ ] Main agent authorizes real-provider acceptance: actual wire schema preserved,
+- [x] Main agent authorizes real-provider acceptance: actual wire schema preserved,
   real Crew/role schema precedence intact, actual responses strictly validated;
   report ordinary success separately from a genuinely observed correction. Do not
   claim provider correction tested when only the deterministic capture exercised it.
-- [ ] Main agent owns deployment, push and CI check. Only then continue discuss.
+- [x] Main agent owns deployment, push and CI check. Only then continue durability/discuss.
   Report tests, provider evidence, omitted checks and the DB-ack limitation below.
+
+Release result: `808757f` passed server release verification, authenticated all-profile
+acceptance with plugin/MCP lifecycle, and a real short multi-model dispatch with
+actual review, rule injection, no skipped review, no fallback and no failure events.
+The live probe exercised ordinary valid output, not an observed correction.
+GitHub quality run `35537419684` passed. Stress and real business-project generation
+were not enabled. Continue the durability gate below without reclassifying these
+normal-flow results as process-crash or large-project acceptance.
 
 ## Unfinished Follow-Up: Crash / DB Commit Acknowledgement
 

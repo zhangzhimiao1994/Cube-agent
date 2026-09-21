@@ -59,6 +59,10 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         runtime_gateway = object()
         harness_tool_gateway = object()
 
+    class FakePostgresArtifactRepository:
+        def __init__(self, session_factory: object) -> None:
+            captured["artifact_session_factory"] = session_factory
+
     class Source:
         def __init__(self, capability_id: str, kind: str) -> None:
             self.capability_id = capability_id
@@ -95,6 +99,10 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         captured["runtime_stack"] = kwargs
         return FakeRuntimeStack()
 
+    def fake_configured_runtime_registry(**kwargs: object) -> object:
+        captured["runtime_registry"] = kwargs
+        return object()
+
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
@@ -103,7 +111,8 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
     monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
     monkeypatch.setattr(worker, "_evolution_terminal_hooks", lambda **kwargs: ())
-    monkeypatch.setattr(worker, "configured_runtime_registry", lambda **kwargs: object())
+    monkeypatch.setattr(worker, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
+    monkeypatch.setattr(worker, "configured_runtime_registry", fake_configured_runtime_registry)
     monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
     monkeypatch.setattr(worker, "RuntimeMcpService", FakeMcpService)
     monkeypatch.setattr(worker, "RuntimePluginService", FakePluginService)
@@ -140,6 +149,9 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     }
     assert runtime_stack["mcp_backend"] is resources.runtime_mcp_service
     assert runtime_stack["plugin_backend"] is resources.runtime_plugin_service
+    runtime_registry = cast(dict[str, object], captured["runtime_registry"])
+    assert captured["artifact_session_factory"] is FakeDatabase.session_factory
+    assert isinstance(runtime_registry["artifact_repository"], FakePostgresArtifactRepository)
 
 
 def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
