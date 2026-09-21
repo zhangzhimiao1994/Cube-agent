@@ -51,6 +51,16 @@ _AGENT_STANDARD_IMPLEMENTATION_PLAN = (
 )
 
 
+def test_default_generated_project_install_disables_dependency_lifecycle_scripts() -> None:
+    assert project_scale_runner_module._DEFAULT_GENERATED_PROJECT_COMMANDS[0] == (
+        "npm",
+        "install",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    )
+
+
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "agent_hub.harness.project_scale_runner", *args],

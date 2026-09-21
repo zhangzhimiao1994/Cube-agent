@@ -93,7 +93,7 @@ _GENERATED_PROJECT_MAX_FILES = 200
 _GENERATED_PROJECT_MAX_FILE_BYTES = 2_000_000
 _GENERATED_PROJECT_MAX_TOTAL_BYTES = 20_000_000
 _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
-    ("npm", "install", "--no-audit", "--no-fund"),
+    ("npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"),
     ("npm", "run", "build"),
     ("npm", "test"),
 )
