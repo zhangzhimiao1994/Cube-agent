@@ -318,6 +318,33 @@ def runtime_failure_diagnostic_from_reason(
             retryable=False,
             suggested_action="派单运行的账本或预算记录已耗尽，系统已停止交付；请检查任务预算、模型用量记录和产物提交记录。",
         )
+    elif normalized == "dispatch budget exhausted":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="budget_exhausted",
+            error_code="runtime.dispatch_budget_exhausted",
+            retryable=False,
+            suggested_action="派单运行已达到任务或步骤预算上限；请拆分任务、提高交互预算或降低并发/输出规模后重试。",
+        )
+    elif normalized == "dispatch usage unaccounted":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="unaccounted_usage",
+            error_code="runtime.dispatch_usage_unaccounted",
+            retryable=False,
+            suggested_action="派单运行的模型用量或成本记录缺失；请检查模型网关用量回传和产物入账链路后重试。",
+        )
+    elif normalized == "dispatch accounting audit overflow":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="audit_overflow",
+            error_code="runtime.dispatch_accounting_audit_overflow",
+            retryable=False,
+            suggested_action="派单账本审计值超出安全上限；请检查模型用量/成本是否异常放大，并拆分任务后重试。",
+        )
     elif normalized == "artifact rollback failed":
         diagnostic = _base_diagnostic(
             normalized,

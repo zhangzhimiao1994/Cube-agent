@@ -452,6 +452,21 @@ def test_runtime_failure_diagnostic_classifies_common_provider_statuses(
             "runtime_accounting",
             "runtime.dispatch_accounting_exhausted",
         ),
+        (
+            "dispatch budget exhausted",
+            "runtime_accounting",
+            "runtime.dispatch_budget_exhausted",
+        ),
+        (
+            "dispatch usage unaccounted",
+            "runtime_accounting",
+            "runtime.dispatch_usage_unaccounted",
+        ),
+        (
+            "dispatch accounting audit overflow",
+            "runtime_accounting",
+            "runtime.dispatch_accounting_audit_overflow",
+        ),
         ("artifact rollback failed", "artifact_storage", "artifact.rollback_failed"),
     ],
 )
@@ -508,6 +523,24 @@ def test_runtime_failure_diagnostic_classifies_provider_status_codes(
             "runtime_accounting",
             "accounting_guardrail",
             "runtime.dispatch_accounting_exhausted",
+        ),
+        (
+            "dispatch budget exhausted",
+            "runtime_accounting",
+            "budget_exhausted",
+            "runtime.dispatch_budget_exhausted",
+        ),
+        (
+            "dispatch usage unaccounted",
+            "runtime_accounting",
+            "unaccounted_usage",
+            "runtime.dispatch_usage_unaccounted",
+        ),
+        (
+            "dispatch accounting audit overflow",
+            "runtime_accounting",
+            "audit_overflow",
+            "runtime.dispatch_accounting_audit_overflow",
         ),
         (
             "artifact rollback failed",

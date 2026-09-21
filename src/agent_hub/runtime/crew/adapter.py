@@ -123,6 +123,11 @@ _STEP_TIMEOUT_RECOVERY_LAYERS = (
     "failure_closure",
 )
 _MODEL_FALLBACK_UNAVAILABLE = "not_available_in_crewai_bridge"
+_ACCOUNTING_TERMINAL_REASONS = {
+    "budget_exhausted": "dispatch budget exhausted",
+    "unaccounted": "dispatch usage unaccounted",
+    "audit_overflow": "dispatch accounting audit overflow",
+}
 _COMPACT_RETRY_SOURCE_PREVIEW_BYTES = 512
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_DEADLINE_SECONDS = 5.0
@@ -162,6 +167,12 @@ _CREWAI_STORAGE_MODULES = (
     "crewai.rag.qdrant.constants",
     "crewai_core.user_data",
 )
+
+
+def _accounting_terminal_reason(phase: object) -> str:
+    if isinstance(phase, str):
+        return _ACCOUNTING_TERMINAL_REASONS.get(phase, "dispatch accounting exhausted")
+    return "dispatch accounting exhausted"
 
 
 def _contextual_crewai_storage_path() -> str:
@@ -2143,13 +2154,12 @@ class CrewDispatchRuntime:
                     "unaccounted",
                     "audit_overflow",
                 }:
+                    failure_reason = _accounting_terminal_reason(restored_phase)
                     await emit(
                         kind=EventKind.RUNTIME_FAILED,
-                        reason="dispatch accounting exhausted",
+                        reason=failure_reason,
                     )
-                    terminal_item = _Terminal(
-                        RuntimeExecutionError("dispatch accounting exhausted")
-                    )
+                    terminal_item = _Terminal(RuntimeExecutionError(failure_reason))
                     return
                 if restored_phase == "cancelled":
                     await emit(kind=EventKind.RUNTIME_CANCELLED)
@@ -2520,7 +2530,7 @@ class CrewDispatchRuntime:
                         )
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
                     if terminal_phase is not None:
-                        raise _StableTerminalError("dispatch accounting exhausted")
+                        raise _StableTerminalError(_accounting_terminal_reason(terminal_phase))
 
             while len(completed) < len(steps):
                 ready = tuple(
@@ -2675,6 +2685,7 @@ class CrewDispatchRuntime:
             run_open = False
             raise
         except _StableTerminalError as error:
+            failure_reason = safe_runtime_failure_reason(error, fallback="dispatch accounting exhausted")
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -2682,7 +2693,7 @@ class CrewDispatchRuntime:
             try:
                 await emit(
                     kind=EventKind.RUNTIME_FAILED,
-                    reason="dispatch accounting exhausted",
+                    reason=failure_reason,
                 )
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
