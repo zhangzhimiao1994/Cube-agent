@@ -633,6 +633,82 @@ def _map_completion_tool_names(
     )
 
 
+def _completion_with_estimated_usage(
+    completion: GatewayCompletion,
+    request: ModelRequest,
+) -> GatewayCompletion:
+    response = completion.response
+    if response.usage is not None:
+        return completion
+    if response.text in (None, "") and not response.tool_calls:
+        return completion
+    usage = _estimated_model_usage(request, response)
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=response.text,
+            tool_calls=response.tool_calls,
+            usage=usage,
+            provider_metadata=response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
+    )
+
+
+def _estimated_model_usage(request: ModelRequest, response: ModelResponse) -> TokenUsage:
+    prompt_payload: dict[str, object] = {
+        "messages": [
+            {"role": message.role, "content": _mutable_json(message.content)}
+            for message in request.messages
+        ],
+        "max_output_tokens": request.max_output_tokens,
+    }
+    if request.response_schema is not None:
+        prompt_payload["response_schema"] = {
+            "name": request.response_schema.name,
+            "schema": _mutable_json(request.response_schema.schema),
+        }
+    if request.tools:
+        prompt_payload["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": _mutable_json(tool.parameters),
+            }
+            for tool in request.tools
+        ]
+    output_payload: dict[str, object] = {}
+    if response.text not in (None, ""):
+        output_payload["text"] = response.text
+    if response.tool_calls:
+        output_payload["tool_calls"] = [
+            {
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": _mutable_json(tool_call.arguments),
+            }
+            for tool_call in response.tool_calls
+        ]
+    prompt_tokens = len(
+        json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    completion_tokens = len(
+        json.dumps(output_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    return TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+
 def _generated_file_ready_completion(
     completion: GatewayCompletion,
     response: ModelResponse,
@@ -3642,6 +3718,7 @@ class CrewDispatchRuntime:
                         attempt=attempt, call_index=index, ledger_key=key,
                         ledger_request_sha256=request_sha,
                     )
+                completion = _completion_with_estimated_usage(completion, request)
                 if purpose == "step":
                     completion = _map_completion_tool_names(completion, _tool_name_mapping(step.tools))
                     completion = _project_scale_artifact_zip_completion(

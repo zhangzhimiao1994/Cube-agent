@@ -2562,6 +2562,75 @@ async def test_agent_empty_model_response_retries_with_agent_fallback_model() ->
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_missing_usage_after_empty_response_retry_is_estimated() -> None:
+    class EmptyThenMissingUsageGateway(RoleAwareGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self._empty_returned = False
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if request.logical_model == "primary" and not self._empty_returned:
+                self._empty_returned = True
+                response = ModelResponse(text="", usage=TokenUsage(1, 1, 2))
+            else:
+                response = ModelResponse(text=_role_output_text(request), usage=None)
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="primary",
+                fallback_models=("backup",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=1_000,
+            ),
+        ),
+        total_token_budget=1_000,
+    )
+    gateway = EmptyThenMissingUsageGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    events = await _collect(runtime)
+    checkpoint = await runtime.save_checkpoint()
+
+    assert [request.logical_model for request in gateway.requests] == ["primary", "backup"]
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert retrying.payload["model_fallback"] == "backup"
+    assert not any(
+        event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
+        for event in events
+    )
+    assert checkpoint.state["phase"] == "completed"
+    usage = checkpoint.state["usage"]
+    assert isinstance(usage, Mapping)
+    tokens = usage.get("tokens")
+    assert type(tokens) is int and tokens > 0
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_agent_fallback_provider_bad_request_retries_next_fallback_model() -> None:
     gateway = CapacityThenBadRequestThenRoleAwareGateway(
         unavailable_logical_model="primary",

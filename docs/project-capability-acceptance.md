@@ -46,11 +46,11 @@ checks. File completeness and meaningful implementation checks remain required.
 
 `agent_standard_verification` is a separate gate. In capability mode, model text,
 event payload pass flags, and ZIP-authored reading/verification claims cannot
-establish this gate. Direct mode records actual session guidance loading and
-model-request injection, but the complete contract still lacks approved-skill,
-all-mode context, and planning-before-implementation coverage. The process gate
-therefore still fails explicitly. Business behavior may pass independently;
-`ok=false` retains the process failure. `capability_verified` remains false.
+establish this gate by themselves. A run may satisfy the gate only when trusted
+runtime/tool evidence is present and the generated workspace bundle also contains
+plan, reading, and verification evidence tied to the actual project. Business
+behavior may pass independently while this gate fails; `capability_verified`
+becomes true only when all required evidence and validators pass.
 
 Capability repair requests preserve the original business requirements and pass
 concrete failures back to the agent. They never request fabricated passing flags;

@@ -2371,10 +2371,10 @@ async def test_audit_overflow_is_saturated_terminal_and_never_replayed() -> None
                 agent="writer",
                 task="Answer",
                 final_synthesizer=True,
-                token_budget=100,
+                token_budget=1_000,
             ),
         ),
-        total_token_budget=100,
+        total_token_budget=1_000,
     )
     gateway = OverflowGateway()
     runtime = make_runtime(gateway, overflow_plan)
@@ -2572,7 +2572,7 @@ async def test_unknown_cost_with_token_usage_does_not_fail_dispatch_accounting()
     assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0"}}
 
 
-async def test_missing_gateway_usage_still_fails_closed_with_audit_checkpoint() -> None:
+async def test_missing_gateway_usage_is_estimated_for_valid_dispatch_response() -> None:
     class MissingUsageGateway(FakeGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             completion = await super().complete_with_context(request)
@@ -2600,18 +2600,29 @@ async def test_missing_gateway_usage_still_fails_closed_with_audit_checkpoint() 
                 agent="writer",
                 task="Answer",
                 final_synthesizer=True,
-                token_budget=100,
+                token_budget=100_000,
             ),
         ),
-        total_token_budget=100,
+        total_token_budget=100_000,
     )
     runtime = make_runtime(MissingUsageGateway(), single_plan)
-    with pytest.raises(RuntimeExecutionError):
-        await collect(runtime, context())
+    events = await collect(runtime, context(token_budget=100_000))
     checkpoint = await runtime.save_checkpoint()
 
     assert checkpoint.state["terminal"] is True
-    assert checkpoint.state["phase"] == "unaccounted"
+    assert checkpoint.state["phase"] == "completed"
+    usage = checkpoint.state["usage"]
+    step_usage = checkpoint.state["step_usage"]
+    assert isinstance(usage, Mapping)
+    assert isinstance(step_usage, Mapping)
+    tokens = usage.get("tokens")
+    assert type(tokens) is int and tokens > 0
+    assert usage["cost_usd"] == "0"
+    final_usage = step_usage.get("final")
+    assert isinstance(final_usage, Mapping)
+    assert final_usage["tokens"] == tokens
+    assert final_usage["cost_usd"] == "0"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_private_factory_receives_locked_down_framework_generation() -> None:
