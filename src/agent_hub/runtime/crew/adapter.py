@@ -2410,10 +2410,7 @@ class CrewDispatchRuntime:
                         or step_cost_overflow
                     ):
                         terminal_phase = "audit_overflow"
-                    elif terminal_phase is None and (
-                        response_usage is None
-                        or (private_output is not None and completion.cost_usd is None)
-                    ):
+                    elif terminal_phase is None and response_usage is None:
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
                         new_tokens > min(context.token_budget, plan.total_token_budget)
@@ -3793,7 +3790,7 @@ class CrewDispatchRuntime:
         evidence = rejected.evidence
         if (
             repair is not None or evidence is None or not evidence.correction_eligible
-            or request.response_schema is None or rejected.cost_usd is None
+            or request.response_schema is None
         ):
             raise _ModelContractFailed("structured output invalid")
         previous_repair = ledger.structured_repairs.get(step.id)
@@ -3809,7 +3806,7 @@ class CrewDispatchRuntime:
         )
         cached_correction = previous_repair is not None and previous_repair["status"] in {"succeeded", "rejected"}
         if not cached_correction and (remaining_tokens <= 0 or usage.cost_usd > self._plan.total_cost_usd or (
-            rejected.cost_usd > 0 and (
+            (rejected.cost_usd or Decimal(0)) > 0 and (
                 usage.cost_usd >= self._plan.total_cost_usd
                 or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
             )

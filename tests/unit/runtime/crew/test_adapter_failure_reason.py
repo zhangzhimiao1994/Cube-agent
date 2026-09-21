@@ -1608,6 +1608,56 @@ async def test_final_structured_role_output_must_match_schema() -> None:
     assert "blocked_contract_ids" not in failed.payload
 
 
+async def test_invalid_structured_output_without_provider_cost_is_not_usage_unaccounted() -> None:
+    class MissingCostInvalidStructuredGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            return GatewayCompletion(
+                response=ModelResponse(text="plain text", usage=TokenUsage(1, 1, 2)),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=None,
+            )
+
+    gateway = MissingCostInvalidStructuredGateway()
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                output_schema={"summary": "string", "risks": "string[]"},
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert not any(
+        event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
+        for event in events
+    )
+    failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
+    assert failed.reason == "structured output invalid"
+
+
 async def test_reviewer_verdict_uses_structured_model_request() -> None:
     gateway = RoleAwareGateway()
     runtime = CrewDispatchRuntime(gateway, _reviewed_step_plan(), crew_factory=FastFactory())
@@ -2619,6 +2669,125 @@ async def test_missing_usage_after_empty_response_retry_is_estimated() -> None:
     retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
     assert retrying.payload["error_code"] == "model.empty_response"
     assert retrying.payload["model_fallback"] == "backup"
+    assert not any(
+        event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
+        for event in events
+    )
+    assert checkpoint.state["phase"] == "completed"
+    usage = checkpoint.state["usage"]
+    assert isinstance(usage, Mapping)
+    tokens = usage.get("tokens")
+    assert type(tokens) is int and tokens > 0
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_missing_usage_after_capacity_retry_project_zip_tool_call_is_estimated() -> None:
+    class CapacityThenZipMissingUsageGateway(RoleAwareGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self._capacity_returned = False
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if not self._capacity_returned:
+                self._capacity_returned = True
+                raise CapacityUnavailable("model capacity unavailable")
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="provider-zip",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Task API",
+                                "files": {"package.json": "{}\n"},
+                            },
+                        ),
+                    ),
+                    usage=None,
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    class ZipHarnessToolGateway:
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            artifact_id = str(uuid4())
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={
+                    "artifact_id": artifact_id,
+                    "file": {
+                        "artifact_id": artifact_id,
+                        "filename": "task-api.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "download_url": f"/api/v1/admin/runs/{RUN_ID}/artifacts/{artifact_id}/download",
+                    },
+                    "metadata": {
+                        "artifact_id": artifact_id,
+                        "filename": "task-api.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "storage_key": f"{TENANT_ID}/{RUN_ID}/{artifact_id}/task-api.zip",
+                        "download_url": f"/api/v1/admin/runs/{RUN_ID}/artifacts/{artifact_id}/download",
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated project ZIP artifact task-api.zip.",
+                },
+            )
+
+    gateway = CapacityThenZipMissingUsageGateway()
+    plan = DispatchPlan(
+        agents=_project_zip_plan().agents,
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("project.generate_zip",),
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(100),
+            ),
+        ),
+        allowed_tools=("project.generate_zip",),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(100),
+    )
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=ZipHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(token_budget=100_000))]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) >= 2
+    assert any(event.kind is EventKind.STEP_RETRYING for event in events)
     assert not any(
         event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
         for event in events
