@@ -2826,10 +2826,7 @@ def _should_attempt_deliverable_repair(
         and (
             evidence.get("workspace_bundle") is not True
             or evidence.get("deliverable_quality") is not True
-            or (
-                benchmark_kind == "fixture"
-                and evidence.get("agent_standard_verification") is not True
-            )
+            or evidence.get("agent_standard_verification") is not True
             or (
                 _case_requires_discussion_trace(case_id)
                 and evidence.get("discussion_trace") is not True

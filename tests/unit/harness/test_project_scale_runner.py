@@ -219,7 +219,7 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     claimed_standard: bool,
     validation_failure: str | None,
 ) -> None:
-    outcomes = [False, True] if validation_failure else [True]
+    outcomes = [False, True] if validation_failure else [True, True]
 
     def validate(bundle: bytes | None, **kwargs: object) -> object:
         passed = outcomes.pop(0)
@@ -238,7 +238,7 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     report = execute_project_scale_plan(plan, client)
 
     result = report.results[0]
-    assert len(client.submitted_bodies) == (2 if validation_failure else 1)
+    assert len(client.submitted_bodies) == 2
     assert result.evidence["agent_standard_verification"] is False
     assert result.evidence["generated_project_validation"] is True
     assert result.evidence["requirements_validation"] is True
@@ -250,10 +250,10 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     )
     assert report.ok is False
     assert report.to_payload()["capability_verified"] is False
-    assert result.repair_attempted is (validation_failure is not None)
+    assert result.repair_attempted is True
+    assert result.run_id == client.repair_run_id
     assert outcomes == []
     if validation_failure:
-        assert result.run_id == client.repair_run_id
         assert validation_failure in str(client.submitted_bodies[1]["message"])
 
 
@@ -276,7 +276,7 @@ def test_process_evidence_only_triggers_fixture_repair(
 
     assert _should_attempt_deliverable_repair(
         status="completed", evidence=evidence, case_id="small:direct", benchmark_kind=benchmark_kind
-    ) is (benchmark_kind == "fixture" or failure is not None)
+    ) is True
 
 
 @pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
