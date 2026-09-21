@@ -113,6 +113,24 @@ class SubclassGateway(FakeGateway):
         )
 
 
+class SequencedGateway(FakeGateway):
+    def __init__(self, responses: tuple[ModelResponse, ...]) -> None:
+        super().__init__(responses[0])
+        self._responses = list(responses)
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        self.started.set()
+        response = self._responses.pop(0)
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-chat",
+        )
+
+
 def context(**changes: object) -> TaskContext:
     values: dict[str, object] = {
         "run_id": RUN_ID,
@@ -147,6 +165,21 @@ async def test_direct_runtime_accepts_gateway_completion_subclasses() -> None:
     events = await collect(runtime, context(request="Build a medium project."))
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_direct_runtime_retries_once_after_empty_model_text() -> None:
+    gateway = SequencedGateway(
+        (
+            ModelResponse(text="", usage=TokenUsage(10, 0, 10)),
+            ModelResponse(text="Recovered answer", usage=TokenUsage(10, 2, 12)),
+        )
+    )
+    runtime = DirectRuntime(gateway, logical_model="deepseek")
+
+    events = await collect(runtime, context(request="Build a medium project."))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 2
 
 
 def test_contract_module_is_framework_neutral() -> None:

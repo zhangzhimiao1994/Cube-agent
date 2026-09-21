@@ -425,7 +425,52 @@ class DirectRuntime:
                 del response, completion, request, included_source_ids, context
                 _raise_execution_error("model response is unsupported")
             text = response.text
-            if not text.strip() or len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+            if not text.strip():
+                await self._consume_task_terminal(gateway_task)
+                gateway_task = asyncio.create_task(submit_model(request))
+                gateway_task.add_done_callback(lambda _task: submission_ready.set())
+                self._active_task = gateway_task
+                retry_gateway_failed = False
+                retry_failure_reason = "model gateway failed"
+                retry_completion: GatewayCompletion | None = None
+                try:
+                    retry_completion = await gateway_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - redact retry boundary
+                    retry_failure_reason = _gateway_failure_reason(error)
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                    retry_gateway_failed = True
+                if retry_gateway_failed or retry_completion is None:
+                    self._active_task = None
+                    gateway_task = None
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error(retry_failure_reason)
+                retry_validated = self._strict_completion(retry_completion)
+                del retry_completion
+                if retry_validated is None:
+                    self._active_task = None
+                    gateway_task = None
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error("model response is invalid")
+                completion = retry_validated
+                del retry_validated
+                response = completion.response
+                if response.tool_calls or response.text is None:
+                    self._active_task = None
+                    gateway_task = None
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error("model response is unsupported")
+                text = response.text
+                if not text.strip():
+                    self._active_task = None
+                    gateway_task = None
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error("model response text is empty")
+            if len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
