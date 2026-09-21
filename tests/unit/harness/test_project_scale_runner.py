@@ -179,6 +179,24 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
 
 
+def test_capability_repair_bounds_long_medium_request_without_blocking_repair() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("medium",), flows=("direct",), benchmark_kind="capability"
+    )
+    repaired = _deliverable_repair_body(
+        plan.requests[0].body,
+        "medium:direct",
+        failed_reasons=("CRM workflow: GET accounts: expected object",),
+        benchmark_kind="capability",
+    )
+    message = str(repaired["message"])
+
+    assert "Repair same project" in message
+    assert "Original request:" in message
+    assert len(message) <= 2_000
+    RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
+
+
 def test_capability_execution_enforces_generated_project_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

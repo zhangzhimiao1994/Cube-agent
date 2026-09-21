@@ -1775,10 +1775,8 @@ def _deliverable_repair_body(
         )
         suffix = f"\nOriginal request:\n{original}"
         available = 2_000 - len(guidance) - len(suffix)
-        if available < 80:
-            raise ValueError("capability repair cannot preserve requirements within planner limit")
-        reasons = _format_failed_reasons(failed_reasons)[:available]
-        repair_body["message"] = " ".join((guidance + reasons + suffix).split())
+        reasons = _format_failed_reasons(failed_reasons)[: max(available, 0)]
+        repair_body["message"] = _bounded_role_planning_task_text(guidance + reasons + suffix)
         repair_body["skip_evolution_proposal"] = True
         return repair_body
     reason_text = _format_failed_reasons(failed_reasons)
