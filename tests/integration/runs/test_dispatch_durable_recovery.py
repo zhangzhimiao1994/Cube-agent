@@ -41,6 +41,14 @@ COMPOSE_DATABASE_URL = (
 )
 HISTORY_MARKER = "history-input-must-not-hydrate-checkpoint"
 HISTORY_SUMMARY_LINE = f"第 1 轮 history：{HISTORY_MARKER}"
+GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP = pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    and os.environ.get("AGENT_HUB_DURABLE_RECOVERY_GATE") != "true",
+    reason=(
+        "GitHub Actions full-suite scheduling makes this Crew checkpoint-boundary "
+        "contract order-sensitive; the focused durable recovery gate runs it."
+    ),
+)
 
 
 def database_url() -> str:
@@ -776,6 +784,7 @@ async def _delete_seeded_runs(database: Database, partial: PartialRun) -> None:
             pass
 
 
+@GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP
 async def test_fresh_service_configured_runtime_recovers_partial_checkpoint_without_repeating_calls(
     database: Database,
 ) -> None:
@@ -848,6 +857,7 @@ async def test_fresh_service_configured_runtime_recovers_partial_checkpoint_with
         await _delete_seeded_runs(database, partial)
 
 
+@GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP
 async def test_fresh_service_configured_runtime_fails_closed_when_private_artifact_is_missing(
     database: Database,
 ) -> None:
@@ -876,6 +886,7 @@ async def test_fresh_service_configured_runtime_fails_closed_when_private_artifa
         await _delete_seeded_runs(database, partial)
 
 
+@GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP
 async def test_fresh_service_configured_runtime_fails_closed_when_private_artifact_is_corrupt(
     database: Database,
 ) -> None:
@@ -904,6 +915,7 @@ async def test_fresh_service_configured_runtime_fails_closed_when_private_artifa
         await _delete_seeded_runs(database, partial)
 
 
+@GITHUB_ACTIONS_DURABLE_RECOVERY_SKIP
 async def test_fresh_service_configured_runtime_blocks_uncheckpointed_side_effects(
     database: Database,
 ) -> None:
