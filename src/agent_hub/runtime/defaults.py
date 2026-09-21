@@ -1268,6 +1268,11 @@ def _dispatch_plan(
             logical_model=role.model,
             allowed_tools=role_tools_by_id[role.id],
             fallback_models=role_fallbacks_by_id.get(role.id, ()),
+            max_output_tokens=_role_max_output_tokens(
+                context,
+                role,
+                tools=role_tools_by_id[role.id],
+            ),
             output_schema=_project_preflight_role_output_schema(
                 role,
                 preflight_context=preflight_context,
@@ -1430,6 +1435,21 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.VERIFY,
         RolePurpose.RELEASE,
     }
+
+
+def _role_max_output_tokens(
+    context: TaskContext,
+    role: RoleAssignment,
+    *,
+    tools: tuple[str, ...],
+) -> int:
+    if not _is_project_scale_generated_project_request(context):
+        return 4096
+    if role.id == "implementer" and "project.generate_zip" in tools:
+        return 24_576
+    if _is_post_product_role(role):
+        return 8_192
+    return 6_144
 
 
 def _producer_step_timeout(

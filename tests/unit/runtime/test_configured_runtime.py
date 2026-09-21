@@ -5557,7 +5557,9 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
         )
 
         implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+        implementer_agent = next(agent for agent in plan.agents if agent.id == "implementer")
         assert implementer_step.tools == ("project.generate_zip",)
+        assert implementer_agent.max_output_tokens == 24_576
         assert (
             "If read_context has no additional runtime context, continue with the requested files"
             in implementer_step.task
