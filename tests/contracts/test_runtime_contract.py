@@ -1061,11 +1061,12 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
     )
     source_files = {
         f"src/module_{index}.ts": "export const data = "
-        + json.dumps("Complete project implementation.\n" * 650)
+        + json.dumps("Complete project implementation.\n" * 4_500)
         + ";\n"
-        for index in range(5)
+        for index in range(6)
     }
     bundle = {
+        "notes": "n" * 350_000,
         "workspace_bundle": {
             "files": {
                 "README.md": "# CRM Lite\n\nComplete project evidence.\n",
@@ -1088,7 +1089,7 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
 
     events = await collect(runtime, context(request=request, token_budget=100_000))
 
-    assert len(text.encode("utf-8")) > 65_536
+    assert len(text.encode("utf-8")) > 1_048_576
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].inputs
 
