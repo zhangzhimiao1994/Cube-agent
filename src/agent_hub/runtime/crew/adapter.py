@@ -1233,6 +1233,35 @@ def _project_scale_artifact_zip_completion(
     )
 
 
+def _project_scale_rejected_zip_completion(
+    context: TaskContext,
+    step: DispatchStep,
+    rejected: GatewayRejectedOutput,
+) -> GatewayCompletion | None:
+    evidence = rejected.evidence
+    if evidence is None:
+        return None
+    completion = GatewayCompletion(
+        response=ModelResponse(text=evidence.final_text, usage=evidence.usage),
+        deployment_id=rejected.deployment_id,
+        logical_model=rejected.logical_model,
+        provider_id=rejected.provider_id,
+        provider_model=rejected.provider_model,
+        cost_usd=rejected.cost_usd,
+        fallback_used=rejected.fallback_used,
+        fallback_from_logical_model=rejected.fallback_from_logical_model,
+        fallback_reason=rejected.fallback_reason,
+        attempted_logical_models=rejected.attempted_logical_models,
+    )
+    updated = _project_scale_artifact_zip_completion(
+        context,
+        step,
+        completion,
+        completion.response,
+    )
+    return updated if updated.response.tool_calls else None
+
+
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -3829,7 +3858,17 @@ class CrewDispatchRuntime:
                         cost_usd=completion.cost_usd,
                     )
             except GatewayRejectedOutput as error:
-                rejected = error
+                completion = (
+                    _project_scale_rejected_zip_completion(context, step, error)
+                    if purpose == "step"
+                    else None
+                )
+                if completion is None:
+                    rejected = error
+                else:
+                    rejected = self._reject_invalid_structured(request, completion)
+                    if rejected is None:
+                        self._valid_response(completion)
             except GatewayResponseCancelled as error:
                 receipt = error.receipt
                 cancelled_private = dict(self._rejected_private_payload(receipt, sources))

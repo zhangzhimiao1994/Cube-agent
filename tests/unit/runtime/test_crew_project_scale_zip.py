@@ -3,10 +3,13 @@ from decimal import Decimal
 from uuid import UUID
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelResponse, TokenUsage
+from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
+from agent_hub.models.types import ModelResponse, RejectedOutputEvidence, TokenUsage
 from agent_hub.runtime.contracts import TaskContext
-from agent_hub.runtime.crew.adapter import _project_scale_artifact_zip_completion
+from agent_hub.runtime.crew.adapter import (
+    _project_scale_artifact_zip_completion,
+    _project_scale_rejected_zip_completion,
+)
 from agent_hub.runtime.crew.plan import DispatchStep
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000021")
@@ -133,3 +136,49 @@ def test_real_project_scale_does_not_use_fixture_zip_without_model_files() -> No
     )
 
     assert updated is completion
+
+
+def test_rejected_real_project_scale_bundle_is_converted_to_zip_tool_call() -> None:
+    task = (
+        "Role mission: implement.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    text = json.dumps(
+        {
+            "workspace_bundle": {
+                "files": {
+                    "README.md": "# Real rejected bundle\n",
+                    "tests/main.test.js": "import test from 'node:test';\n",
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    rejected = GatewayRejectedOutput(
+        evidence=RejectedOutputEvidence(
+            final_text=text,
+            usage=TokenUsage(10, 5, 15),
+            usage_status="known",
+            status="completed",
+            reason="schema_mismatch",
+        ),
+        deployment_id="primary",
+        logical_model="deepseek",
+        provider_id="deepseek",
+        provider_model="deepseek/chat",
+        cost_usd=Decimal(0),
+    )
+
+    updated = _project_scale_rejected_zip_completion(
+        _project_scale_context(),
+        _project_scale_step(task),
+        rejected,
+    )
+
+    assert updated is not None
+    assert len(updated.response.tool_calls) == 1
+    assert updated.response.tool_calls[0].arguments["files"] == {
+        "README.md": "# Real rejected bundle\n",
+        "tests/main.test.js": "import test from 'node:test';\n",
+    }
