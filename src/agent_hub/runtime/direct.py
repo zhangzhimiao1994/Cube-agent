@@ -238,7 +238,7 @@ def _is_workspace_file_heading(line: str) -> bool:
 def _workspace_bundle_from_markdown_file_block_regex(text: str) -> dict[str, str]:
     files: dict[str, str] = {}
     pattern = re.compile(
-        r"(?ms)^#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
+        r"(?ms)#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
         r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
     )
     for match in pattern.finditer(text):

@@ -53,7 +53,7 @@ def test_project_scale_fixture_files_include_buildable_node_type_config() -> Non
 
 
 def test_direct_project_scale_parser_accepts_inline_fence_file_blocks() -> None:
-    text = """### `package.json` ```json
+    text = """No external commands were executed in this environment. ### `package.json` ```json
 {"scripts":{"build":"node --check src/main.js","test":"node --test"}}
 ```
 

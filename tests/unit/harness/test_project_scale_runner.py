@@ -1923,7 +1923,7 @@ def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_ar
 
 
 def test_embedded_workspace_bundle_accepts_inline_fence_file_blocks() -> None:
-    text = """### `package.json` ```json
+    text = """No external commands were executed in this environment. ### `package.json` ```json
 {"scripts":{"build":"node --check src/main.js","test":"node --test"}}
 ```
 

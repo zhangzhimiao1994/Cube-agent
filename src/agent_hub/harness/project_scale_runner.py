@@ -1593,7 +1593,7 @@ def _is_markdown_file_heading(line: str) -> bool:
 def _markdown_file_blocks_to_files_regex(text: str) -> dict[str, str]:
     files: dict[str, str] = {}
     pattern = re.compile(
-        r"(?ms)^#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
+        r"(?ms)#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
         r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
     )
     for match in pattern.finditer(text):
