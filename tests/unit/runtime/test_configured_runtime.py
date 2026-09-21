@@ -5731,6 +5731,62 @@ def test_project_scale_zip_argument_budget_caps_complex_large_projects() -> None
     }
 
 
+@pytest.mark.parametrize(
+    ("routing_decision", "expected_budget"),
+    (
+        ({"project_zip_argument_budget_bytes": 7_500_000}, 7_500_000),
+        (
+            {
+                "tool_argument_budget_bytes": {
+                    "project.generate_zip": 8_250_000,
+                }
+            },
+            8_250_000,
+        ),
+        ({"project_zip_argument_budget_bytes": 99_000_000}, 10_000_000),
+        ({"project_zip_argument_budget_bytes": "9000000"}, 3_000_000),
+    ),
+)
+def test_project_scale_zip_argument_budget_accepts_bounded_planner_override(
+    routing_decision: Mapping[str, JsonValue],
+    expected_budget: int,
+) -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Build a real small business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content)."
+            ),
+            routing_decision=routing_decision,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert implementer_step.tool_argument_budget_bytes == {
+        "project.generate_zip": expected_budget
+    }
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(

@@ -1522,6 +1522,9 @@ def _tool_argument_budgets_for_step(
 
 
 def _project_zip_argument_budget_bytes(context: TaskContext) -> int:
+    override = _project_zip_argument_budget_override(context)
+    if override is not None:
+        return override
     scale = _project_scale_budget_tier(context)
     budget = _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE[scale]
     if scale == "ultra":
@@ -1543,6 +1546,19 @@ def _project_zip_argument_budget_bytes(context: TaskContext) -> int:
         budget + planner_signal_steps * _PROJECT_ZIP_COMPLEXITY_BUDGET_STEP_BYTES,
         _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES,
     )
+
+
+def _project_zip_argument_budget_override(context: TaskContext) -> int | None:
+    direct = context.routing_decision.get("project_zip_argument_budget_bytes")
+    if type(direct) is int and direct > 0:
+        return min(direct, _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES)
+    raw_budgets = context.routing_decision.get("tool_argument_budget_bytes")
+    if not isinstance(raw_budgets, Mapping):
+        return None
+    value = raw_budgets.get(PROJECT_SCALE_ARTIFACT_TOOL_NAME)
+    if type(value) is int and value > 0:
+        return min(value, _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES)
+    return None
 
 
 def _project_scale_budget_tier(context: TaskContext) -> str:
