@@ -1768,9 +1768,10 @@ def _deliverable_repair_body(
     if benchmark_kind == "capability":
         original = original_message if isinstance(original_message, str) else ""
         guidance = (
-            "Repair this same business project; preserve every original requirement. "
-            "Fix the reported defects and provide the complete corrected files. "
-            "Report only checks actually executed; never manufacture passing evidence.\n"
+            "Repair same project; preserve requirements. Fix defects. Return full bundle: "
+            "source/tests/package config, README, PROJECT_REQUIREMENTS.md, "
+            "IMPLEMENTATION_PLAN.md, VERIFICATION.md, constraints_reading_evidence.json. "
+            "Report only executed checks.\n"
         )
         suffix = f"\nOriginal request:\n{original}"
         available = 2_000 - len(guidance) - len(suffix)

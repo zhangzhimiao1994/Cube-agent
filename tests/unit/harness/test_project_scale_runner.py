@@ -151,6 +151,15 @@ def test_capability_benchmark_can_be_selected_by_acceptance_environment(
     assert json.loads(result.stdout)["benchmark_kind"] == "capability"
 
 
+def test_medium_capability_message_declares_list_response_envelope() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("medium",), flows=("direct",), benchmark_kind="capability"
+    )
+    message = str(plan.requests[0].body["message"])
+
+    assert "All GET list endpoints must return 200 with {items:[...]}" in message
+
+
 def test_capability_repair_preserves_business_request_without_claiming_success() -> None:
     plan = build_project_scale_run_plan(
         scales=("small",), flows=("direct",), benchmark_kind="capability"
@@ -163,6 +172,8 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
     message = str(repaired["message"])
     assert str(body["message"]) in message
     assert "GET /tasks returns 404" in message
+    assert "VERIFICATION.md" in message
+    assert "constraints_reading_evidence.json" in message
     assert "all true" not in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)

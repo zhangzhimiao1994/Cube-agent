@@ -369,7 +369,8 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "POST /tenants/:tenant_id/opportunities and PATCH "
             "/tenants/:tenant_id/opportunities/:id; POST /tenants/:tenant_id/reminders and "
             "GET /tenants/:tenant_id/reminders. Cross-tenant references and missing ids must "
-            "return 404 with {error:{code,message}}."
+            "return 404 with {error:{code,message}}. All GET list endpoints must return "
+            "200 with {items:[...]} rather than a bare array."
         ),
         "large": (
             "Build a large project: a TypeScript/Node multi-service order operations platform "
