@@ -39,9 +39,11 @@ cross-tenant 404 errors, and restart persistence. Large capability checks
 validate the order-operations HTTP contract independently: catalog, inventory
 reservation, orders, payment-state simulation, fulfillment, audit logs, admin
 reports, stock conflicts, duplicate submissions, cancelled fulfillment conflicts,
-and restart persistence. Ultra prompts have distinct business requirements, but
-their independent requirement evaluator is not implemented yet. Capability runs
-for ultra fail that gate explicitly. Do not count ultra as verified capability.
+and restart persistence. Ultra capability checks validate the portfolio-OS HTTP
+contract independently: programs, projects, milestones, budgets, staffing, risks,
+dependencies, approvals, RBAC denial, analytics CSV export, high-volume read
+model, invalid dependency rejection, viewer approval rejection, and restart
+persistence.
 
 ## Reading Results
 

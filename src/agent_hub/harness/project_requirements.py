@@ -348,6 +348,83 @@ class _OrderOpsAPI:
             )
 
 
+class _PortfolioAPI:
+    def __init__(self, port: int, deadline: float) -> None:
+        self.port = port
+        self.deadline = deadline
+
+    def request(
+        self, method: str, path: str, body: Mapping[str, object] | None = None
+    ) -> tuple[int, object]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=min(2.0, _remaining(self.deadline))
+        )
+        try:
+            connection.connect()
+            connection.request(
+                method,
+                path,
+                body=None if body is None else json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Connection": "close"},
+            )
+            response = connection.getresponse()
+            raw = response.read(_MAX_RESPONSE_BYTES + 1)
+            _remaining(self.deadline)
+            _require(len(raw) <= _MAX_RESPONSE_BYTES, f"{method} {path}: response exceeds 1 MiB")
+            content_type = response.getheader("Content-Type", "")
+            if "text/csv" in content_type or path.startswith("/analytics/portfolio.csv"):
+                try:
+                    payload: object = raw.decode("utf-8")
+                except UnicodeError as exc:
+                    raise _ValidationFailure(f"{method} {path}: invalid CSV encoding") from exc
+            else:
+                try:
+                    payload = json.loads(raw) if raw else None
+                except (ValueError, UnicodeError) as exc:
+                    raise _ValidationFailure(f"{method} {path}: invalid JSON response") from exc
+            return response.status, payload
+        finally:
+            connection.close()
+
+    def create(self, path: str, body: Mapping[str, object]) -> dict[str, object]:
+        status, payload = self.request("POST", path, body)
+        _require(status == 201, f"POST {path}: expected 201, got {status}")
+        _require(isinstance(payload, dict), f"POST {path}: expected object")
+        assert isinstance(payload, dict)
+        item = dict(payload)
+        _require(
+            isinstance(item.get("id"), (str, int)) and not isinstance(item.get("id"), bool),
+            f"POST {path}: missing id",
+        )
+        return item
+
+    def get_object(self, path: str) -> dict[str, object]:
+        status, payload = self.request("GET", path)
+        _require(status == 200, f"GET {path}: expected 200, got {status}")
+        _require(isinstance(payload, dict), f"GET {path}: expected object")
+        assert isinstance(payload, dict)
+        return dict(payload)
+
+    def expect_blocked(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, object] | None = None,
+        *,
+        context: str,
+    ) -> None:
+        status, payload = self.request(method, path, body)
+        _require(status in {403, 409}, f"{context}: expected 403 or 409, got {status}")
+        error = payload.get("error") if isinstance(payload, dict) else None
+        _require(isinstance(error, dict), f"{context}: expected error object")
+        assert isinstance(error, dict)
+        for field in ("code", "message"):
+            _require(
+                isinstance(error.get(field), str) and bool(error[field]),
+                f"{context}: error.{field} must be nonempty",
+            )
+
+
 def _environment(data: str) -> dict[str, str]:
     # Do not expose host/provider credentials or the host's npm user configuration.
     env = {
@@ -778,6 +855,178 @@ def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[st
     return tuple(failures)
 
 
+def validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    """Check the ultra portfolio-OS contract with RBAC, analytics and persistence."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        return ("timeout_seconds must be finite and positive",)
+    if _PLATFORM not in ("posix", "nt"):
+        return (f"unsupported platform for process-tree cleanup: {_PLATFORM}",)
+    npm = shutil.which("npm")
+    if npm is None:
+        return ("npm executable unavailable; ultra portfolio API was not validated",)
+    taskkill = shutil.which("taskkill") if _PLATFORM == "nt" else None
+    if _PLATFORM == "nt" and taskkill is None:
+        return ("unsupported Windows environment: taskkill unavailable for process-tree cleanup",)
+
+    failures: list[str] = []
+    process: subprocess.Popen[bytes] | None = None
+    data: tempfile.TemporaryDirectory[str] | None = None
+    deadline = time.monotonic() + timeout_seconds
+    phase = "startup"
+    program: dict[str, object] = {}
+    project: dict[str, object] = {}
+    dependency: dict[str, object] = {}
+    approval: dict[str, object] = {}
+    try:
+        root = root.resolve(strict=True)
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        scripts = package.get("scripts") if isinstance(package, dict) else None
+        _require(
+            isinstance(scripts, dict)
+            and isinstance(scripts.get("start"), str)
+            and bool(scripts["start"].strip()),
+            "package.json must provide an npm start script",
+        )
+        data = tempfile.TemporaryDirectory(prefix="ultra-portfolio-api-")
+        env = _environment(data.name)
+        for cycle in range(2):
+            phase = "portfolio workflow" if cycle == 0 else "portfolio persistence after restart"
+            port = _free_port()
+            env["PORT"] = str(port)
+            _remaining(deadline)
+            process = subprocess.Popen(
+                [npm, "start"],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=_PLATFORM == "posix",
+            )
+            api = _PortfolioAPI(port, deadline)
+            _ready_portfolio(api, process)
+            if cycle == 0:
+                program = api.create("/programs", {"name": "Transformation Portfolio"})
+                project = api.create(
+                    "/projects",
+                    {
+                        "program_id": program["id"],
+                        "name": "Customer Migration",
+                        "owner": "pm@example.test",
+                    },
+                )
+                sibling = api.create(
+                    "/projects",
+                    {
+                        "program_id": program["id"],
+                        "name": "Billing Modernization",
+                        "owner": "pm2@example.test",
+                    },
+                )
+                api.create(
+                    f"/projects/{quote(str(project['id']), safe='')}/milestones",
+                    {"name": "Pilot", "due_at": "2030-03-01"},
+                )
+                api.create(
+                    f"/projects/{quote(str(project['id']), safe='')}/budgets",
+                    {"category": "engineering", "amount": 125000},
+                )
+                api.create(
+                    f"/projects/{quote(str(project['id']), safe='')}/staffing",
+                    {"person": "Ava", "role": "lead", "allocation": 0.5},
+                )
+                api.create(
+                    f"/projects/{quote(str(project['id']), safe='')}/risks",
+                    {"title": "Data readiness", "severity": "high"},
+                )
+                dependency = api.create(
+                    "/dependencies",
+                    {"from_project_id": project["id"], "to_project_id": sibling["id"]},
+                )
+                api.expect_blocked(
+                    "POST",
+                    "/dependencies",
+                    {"from_project_id": project["id"], "to_project_id": "missing-project"},
+                    context="invalid dependency",
+                )
+                approval = api.create(
+                    "/approvals",
+                    {
+                        "project_id": project["id"],
+                        "requested_by": "pm@example.test",
+                        "action": "launch",
+                    },
+                )
+                api.expect_blocked(
+                    "PATCH",
+                    f"/approvals/{quote(str(approval['id']), safe='')}",
+                    {"decision": "approved", "role": "viewer"},
+                    context="viewer approval",
+                )
+                status, payload = api.request(
+                    "PATCH",
+                    f"/approvals/{quote(str(approval['id']), safe='')}",
+                    {"decision": "approved", "role": "portfolio_admin"},
+                )
+                _require(status == 200, f"admin approval: expected 200, got {status}")
+                _require(isinstance(payload, dict), "admin approval: expected object")
+                assert isinstance(payload, dict)
+                approval = dict(payload)
+                _require(approval.get("decision") == "approved", "admin approval: decision mismatch")
+                status, payload = api.request(
+                    "POST",
+                    "/access/check",
+                    {"project_id": project["id"], "role": "viewer", "action": "approve"},
+                )
+                _require(status == 200, f"access check: expected 200, got {status}")
+                _require(isinstance(payload, dict), "access check: expected object")
+                assert isinstance(payload, dict)
+                _require(payload.get("allowed") is False, "access check: viewer approve must deny")
+            persisted_project = api.get_object(f"/projects/{quote(str(project['id']), safe='')}")
+            _require(
+                persisted_project.get("program_id") == program["id"],
+                "projects: program link must persist",
+            )
+            persisted_dependency = api.get_object(
+                f"/dependencies/{quote(str(dependency['id']), safe='')}"
+            )
+            _require(
+                persisted_dependency.get("from_project_id") == project["id"],
+                "dependencies: from project must persist",
+            )
+            status, csv_payload = api.request(
+                "GET",
+                f"/analytics/portfolio.csv?program_id={quote(str(program['id']), safe='')}",
+            )
+            _require(status == 200, f"portfolio CSV: expected 200, got {status}")
+            _require(
+                isinstance(csv_payload, str) and "Customer Migration" in csv_payload,
+                "portfolio CSV: expected project row",
+            )
+            read_model = api.get_object(
+                f"/portfolio/read-model?program_id={quote(str(program['id']), safe='')}&limit=100"
+            )
+            _require(_payload_has_items(read_model), "portfolio read model: expected nonempty items")
+            _stop_tree(process, taskkill)
+            process = None
+    except (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
+            subprocess.SubprocessError) as exc:
+        label = "timeout" if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) else phase
+        failures.append(f"{label}: {exc}")
+    finally:
+        if process is not None:
+            try:
+                _stop_tree(process, taskkill)
+            except (_ValidationFailure, OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"process-tree cleanup failed: {exc}")
+        if data is not None:
+            try:
+                data.cleanup()
+            except OSError as exc:
+                failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
+    return tuple(failures)
+
+
 def _ready_crm(api: _TenantCRMAPI, process: subprocess.Popen[bytes], tenant: str) -> None:
     path = api.tenant_path(tenant, "accounts")
     while True:
@@ -812,3 +1061,14 @@ def _ready_order_ops(api: _OrderOpsAPI, process: subprocess.Popen[bytes]) -> Non
 def _payload_has_items(payload: Mapping[str, object]) -> bool:
     items = payload.get("items")
     return isinstance(items, list) and bool(items)
+
+
+def _ready_portfolio(api: _PortfolioAPI, process: subprocess.Popen[bytes]) -> None:
+    while True:
+        _remaining(api.deadline)
+        _require(process.poll() is None, "startup: npm start exited before portfolio API became ready")
+        try:
+            api.request("GET", "/programs")
+            return
+        except (OSError, http.client.HTTPException):
+            time.sleep(min(0.05, _remaining(api.deadline)))

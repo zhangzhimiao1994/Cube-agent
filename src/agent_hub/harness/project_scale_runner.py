@@ -22,6 +22,7 @@ from agent_hub.harness.project_requirements import (
     validate_large_order_ops_api,
     validate_medium_crm_api,
     validate_small_task_api,
+    validate_ultra_portfolio_api,
 )
 from agent_hub.harness.project_scale import (
     ProjectScaleBenchmarkKind,
@@ -1179,6 +1180,7 @@ def _validate_generated_project_bundle(
                     "large": validate_large_order_ops_api,
                     "small": validate_small_task_api,
                     "medium": validate_medium_crm_api,
+                    "ultra": validate_ultra_portfolio_api,
                 }
                 validator = validators.get(scale)
                 if validator is None:

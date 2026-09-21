@@ -392,7 +392,15 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "programs, projects, milestones, budgets, staffing, risk registers, dependency "
             "maps, approval workflows, analytics exports, and role-based access checks. "
             "Include architecture notes, migration-ready storage boundaries, end-to-end "
-            "scenario tests, and load-oriented tests for high-volume portfolio reads."
+            "scenario tests, and load-oriented tests for high-volume portfolio reads. npm start "
+            "must listen on PORT and use DATA_DIR for persistence. Required HTTP contract: "
+            "POST /programs and GET /programs; POST /projects and GET /projects/:id; "
+            "POST /projects/:id/milestones, /budgets, /staffing, and /risks; "
+            "POST /dependencies; POST /approvals and PATCH /approvals/:id; "
+            "POST /access/check; GET /analytics/portfolio.csv?program_id=...; "
+            "GET /portfolio/read-model?program_id=...&limit=100. Denied RBAC checks, "
+            "invalid dependencies, and approving with a viewer role must return 403 or 409 "
+            "with {error:{code,message}}."
         ),
     }[case.scale]
     flow_instruction = {
