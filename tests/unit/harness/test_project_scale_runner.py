@@ -1921,6 +1921,63 @@ def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_ar
     ]
 
 
+def test_execute_project_scale_plan_recovers_workspace_bundle_from_admin_artifacts() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    bundle_payload = {
+        "workspace_bundle": {
+            "files": {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; vite build completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps(
+                    {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                    sort_keys=True,
+                ),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        }
+    }
+    artifact_text = json.dumps(bundle_payload, ensure_ascii=False)
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        admin_artifacts=[{"id": "artifact-1", "kind": "text", "text": artifact_text}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "payload": {
+                    "artifact_id": "artifact-1",
+                    "output": artifact_text[:240],
+                },
+            }
+        ],
+        artifact_downloads={},
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+    assert ("GET", "/api/v1/admin/runs/run-small-direct", None) in client.calls
+
+
 def test_execute_project_scale_plan_reads_quality_from_markdown_metadata_file() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     metadata = {
@@ -2870,6 +2927,7 @@ class FakeAcceptanceClient:
         status: str = "queued",
         statuses: tuple[str, ...] | None = None,
         artifacts: list[dict[str, object]] | None = None,
+        admin_artifacts: list[dict[str, object]] | None = None,
         events: list[dict[str, object]] | None = None,
         events_envelope: bool = False,
         artifact_ids: list[str] | None = None,
@@ -2904,6 +2962,7 @@ class FakeAcceptanceClient:
         self.decision_version = decision_version
         self.statuses = list(statuses or (status,))
         self.artifacts = artifacts or []
+        self.admin_artifacts = admin_artifacts
         self.events = [{"kind": "run.created"}] if events is None else events
         self.events_envelope = events_envelope
         self.artifact_ids = artifact_ids or []
@@ -2993,6 +3052,7 @@ class FakeAcceptanceClient:
                 "id": self.run_id,
                 "status": self.statuses[0],
                 "version": self.capability_approval_version,
+                "artifacts": self.admin_artifacts if self.admin_artifacts is not None else [],
                 "explicit_details": {
                     "approval_id": self.capability_approval_id,
                     "version": str(self.capability_approval_version),

@@ -1371,6 +1371,19 @@ def _collect_run_observation(
         )
         if downloaded_bundle is not None:
             workspace_bundle = downloaded_bundle
+        if workspace_bundle is None:
+            admin_details = _admin_run_details(client, run_id=run_id)
+            if admin_details is not None:
+                workspace_bundle = _embedded_workspace_bundle_from_observation(admin_details, events)
+                if workspace_bundle is None:
+                    downloaded_bundle = _downloaded_workspace_bundle_from_artifacts(
+                        client,
+                        run_id=run_id,
+                        details=admin_details,
+                        events=events,
+                    )
+                    if downloaded_bundle is not None:
+                        workspace_bundle = downloaded_bundle
         if workspace_bundle is not None:
             evidence["workspace_bundle"] = True
         else:
@@ -1400,6 +1413,22 @@ def _run_events_items(response: dict[str, object] | list[object]) -> list[object
         return response
     items = response.get("items") if isinstance(response, dict) else None
     return items if isinstance(items, list) else None
+
+
+def _admin_run_details(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+) -> dict[str, object] | None:
+    try:
+        response = client.request_json("GET", f"/api/v1/admin/runs/{quote(run_id)}")
+    except Exception:  # noqa: BLE001 - admin detail is a best-effort recovery path.
+        return None
+    if not isinstance(response, dict):
+        return None
+    if response.get("id") != run_id:
+        return None
+    return response
 
 
 def _embedded_workspace_bundle_from_observation(
