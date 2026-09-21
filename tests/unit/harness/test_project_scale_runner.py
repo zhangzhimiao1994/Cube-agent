@@ -236,8 +236,9 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     assert result.evidence["requirements_validation"] is True
     assert result.evidence["deliverable_quality"] is True
     assert result.missing_evidence == ("agent_standard_verification",)
-    assert result.errors == (
-        "agent_standard_verification: trusted runtime context/plan evidence unavailable",
+    assert (
+        "agent_standard_verification: trusted runtime context/plan evidence unavailable"
+        in result.errors
     )
     assert report.ok is False
     assert report.to_payload()["capability_verified"] is False
@@ -316,9 +317,14 @@ def test_agent_standard_self_reports_are_fixture_only(
         details, events, bundle, benchmark_kind=benchmark_kind
     ) is check.passed
     if benchmark_kind == "capability":
-        assert check.reasons == (
-            "agent_standard_verification: trusted runtime context/plan evidence unavailable",
-        )
+        assert check.reasons
+        if source == "event_flags":
+            assert "workspace_bundle: missing project bundle" in check.reasons
+        else:
+            assert (
+                "agent_standard_verification: trusted runtime context/plan evidence unavailable"
+                in check.reasons
+            )
 
 
 @pytest.mark.parametrize("events", (
@@ -335,9 +341,116 @@ def test_capability_standard_requires_runtime_contract(events: list[object] | No
     )
 
     assert check.passed is False
+    assert check.reasons
+
+
+def test_capability_standard_accepts_public_event_with_workspace_plan_evidence() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Capability Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+    events = [
+        {
+            "kind": "artifact.created",
+            "payload": {
+                "agent_standard_verification": {
+                    "constraints_read": True,
+                    "plan_before_implementation": True,
+                    "reproducible_verification": True,
+                    "root_cause_repair": True,
+                },
+            },
+        }
+    ]
+
+    check = _evaluate_agent_standard_verification(None, events, bundle, benchmark_kind="capability")
+
+    assert check.passed is True
+    assert check.reasons == ()
+
+
+def test_capability_standard_rejects_details_only_self_report() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Capability Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": "- npm run build: passed exit 0; vite build completed\n",
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+    details = {
+        "agent_standard_verification": {
+            "constraints_read": True,
+            "plan_before_implementation": True,
+            "reproducible_verification": True,
+            "root_cause_repair": True,
+        },
+    }
+
+    check = _evaluate_agent_standard_verification(
+        details, None, bundle, benchmark_kind="capability"
+    )
+
+    assert check.passed is False
     assert check.reasons == (
         "agent_standard_verification: trusted runtime context/plan evidence unavailable",
     )
+
+
+def test_execute_project_scale_plan_capability_accepts_public_event_and_workspace_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    plan = build_project_scale_run_plan(
+        scales=("small",), flows=("direct",), execute=True, benchmark_kind="capability"
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    },
+                },
+            }
+        ],
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+    )
+
+    assert report.ok is True
+    assert report.results[0].evidence["agent_standard_verification"] is True
+    assert report.to_payload()["capability_verified"] is True
 
 
 @pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))

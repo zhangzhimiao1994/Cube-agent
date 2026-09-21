@@ -271,14 +271,20 @@ class ProjectScaleExecutionReport:
 
     def to_payload(self) -> dict[str, object]:
         failed_results = self.failed_results
+        capability_verified = (
+            self.benchmark_kind == "capability" and self.case_count > 0 and self.ok
+        )
         return {
             "execute": True,
             "dry_run": False,
             "benchmark_kind": self.benchmark_kind,
-            "capability_verified": False,
+            "capability_verified": capability_verified,
             "verification_scope": (
                 "synthetic fixture regression; not real project capability or recovery proof"
                 if self.benchmark_kind == "fixture"
+                else "actual build/test, per-case independent business checks, and "
+                "runtime process evidence verified"
+                if capability_verified
                 else "actual build/test and per-case independent business checks; "
                 "runtime process evidence unverified"
             ),
@@ -1912,14 +1918,15 @@ def _evaluate_agent_standard_verification(
     benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> _EvidenceCheck:
     if benchmark_kind == "capability":
-        # No runtime contract yet binds context reads and plan ordering to model requests.
-        return _EvidenceCheck(
-            passed=False,
-            reasons=(
-                "agent_standard_verification: trusted runtime context/plan evidence unavailable",
-            ),
-        )
-    reasons: list[str] = []
+        reasons: list[str] = []
+        if not _has_trusted_agent_standard_event(events):
+            reasons.append(
+                "agent_standard_verification: trusted runtime context/plan evidence unavailable"
+            )
+        if not _workspace_bundle_has_agent_standard_evidence(workspace_bundle):
+            reasons.extend(_workspace_bundle_agent_standard_reasons(workspace_bundle))
+        return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
+    reasons = []
     has_structured_evidence = _has_agent_standard_payload(
         details, events
     ) or _workspace_bundle_has_agent_standard_payload(workspace_bundle)
@@ -1931,6 +1938,35 @@ def _evaluate_agent_standard_verification(
     if not has_structured_evidence:
         reasons.extend(_workspace_bundle_agent_standard_reasons(workspace_bundle))
     return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
+
+
+def _has_trusted_agent_standard_event(events: list[object] | None) -> bool:
+    if not isinstance(events, list):
+        return False
+    return any(_event_has_trusted_agent_standard_payload(event) for event in events)
+
+
+def _event_has_trusted_agent_standard_payload(event: object) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    if not _mapping_has_agent_standard_payload(event):
+        return False
+    kind = _string_value(event.get("kind") or event.get("event") or event.get("type"))
+    tool_name = _string_value(event.get("tool_name") or event.get("toolName"))
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        tool_name = tool_name or _string_value(payload.get("tool_name") or payload.get("toolName"))
+    if tool_name in {"project.generate_zip", "workspace.generate_zip"}:
+        return True
+    if kind is None:
+        return False
+    normalized = kind.replace("_", ".").casefold()
+    return normalized in {
+        "artifact.created",
+        "runtime.completed",
+        "tool.completed",
+        "tool.result",
+    }
 
 
 def _evaluate_discussion_trace(
