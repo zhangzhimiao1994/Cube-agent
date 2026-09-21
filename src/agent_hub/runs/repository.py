@@ -39,6 +39,8 @@ _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
         EventKind.APPROVAL_REQUESTED.value,
         EventKind.APPROVAL_RESOLVED.value,
         "harness.started",
+        "observer.notice",
+        "repair.classified",
         "repair.started",
         "runtime.recovered",
     }

@@ -264,6 +264,11 @@ def test_approval_events_are_recovery_replayable_observability() -> None:
     assert _is_recovery_replayable_event_kind(EventKind.APPROVAL_RESOLVED.value)
 
 
+def test_observer_and_repair_classification_are_recovery_replayable_observability() -> None:
+    assert _is_recovery_replayable_event_kind("observer.notice")
+    assert _is_recovery_replayable_event_kind("repair.classified")
+
+
 def test_runtime_and_tool_events_remain_recovery_blocking() -> None:
     assert not _is_recovery_replayable_event_kind("runtime.completed")
     assert not _is_recovery_replayable_event_kind("tool.completed")
