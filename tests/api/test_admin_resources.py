@@ -12965,6 +12965,54 @@ async def test_persistent_download_matches_nested_generated_file_artifact_id(tmp
 
 
 @pytest.mark.asyncio
+async def test_persistent_download_serves_workspace_bundle_without_redacting_source(
+    tmp_path: Path,
+) -> None:
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    test_source = (
+        "test('tenant auth', () => {\n"
+        "  const header = 'Authorization: Bearer token_demo';\n"
+        "  expect(header).toContain('Bearer token_demo');\n"
+        "});\n"
+    )
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=GeneratedArtifactRunRepository(
+            run_id,
+            (
+                {
+                    "id": str(artifact_id),
+                    "type": "tool_result",
+                    "producer": "main",
+                    "content": {
+                        "workspace_bundle": {
+                            "files": {
+                                "README.md": "# Generated project\n",
+                                "tests/tenant-isolation.test.ts": test_source,
+                            }
+                        },
+                        "summary": "project generated",
+                    },
+                },
+            ),
+        ),  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    download = await service.download_run_artifact(run_id, artifact_id)
+
+    assert download.filename == "workspace-bundle.zip"
+    assert download.mime_type == "application/zip"
+    with zipfile.ZipFile(download.path) as archive:
+        assert archive.read("tests/tenant-isolation.test.ts").decode("utf-8") == test_source
+    assert "[redacted]" not in download.path.read_bytes().decode("latin1")
+
+
+@pytest.mark.asyncio
 async def test_persistent_delete_run_cleans_generated_artifact_files(tmp_path: Path) -> None:
     from agent_hub.files.generated import DOCX_MIME_TYPE, PPTX_MIME_TYPE, GeneratedFileStore
 

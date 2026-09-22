@@ -1930,6 +1930,73 @@ def test_execute_project_scale_plan_recovers_workspace_bundle_from_downloaded_ar
     ]
 
 
+def test_execute_project_scale_plan_prefers_downloaded_bundle_over_redacted_event_bundle() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True
+    )
+    downloaded_bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+    redacted_event_bundle = {
+        "files": {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": "[redacted]",
+        }
+    }
+    client = FakeAcceptanceClient(
+        fail_bundle=True,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "run_id": "run-small-direct",
+                "payload": {
+                    "artifact_id": "artifact-1",
+                    "workspace_bundle": redacted_event_bundle,
+                },
+            }
+        ],
+        artifact_downloads={"artifact-1": downloaded_bundle},
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.evidence["workspace_bundle"] is True
+    assert result.evidence["deliverable_quality"] is True
+    assert result.evidence["agent_standard_verification"] is True
+    assert result.errors == ()
+
+
 def test_embedded_workspace_bundle_accepts_inline_fence_file_blocks() -> None:
     text = """No external commands were executed in this environment. ### `package.json` ```json
 {"scripts":{"build":"node --check src/main.js","test":"node --test"}}

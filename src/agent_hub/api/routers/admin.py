@@ -64,7 +64,11 @@ from agent_hub.evolution import (
     create_evolution_run_response,
     plan_evolution_next_round,
 )
-from agent_hub.files.generated import GeneratedFileStore, validate_generated_filename
+from agent_hub.files.generated import (
+    ZIP_MIME_TYPE,
+    GeneratedFileStore,
+    validate_generated_filename,
+)
 from agent_hub.mcp.manifest import McpConfigCapabilityManifestSource
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.capacity import safe_operational_limit
@@ -6392,7 +6396,25 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             artifacts = await self._run_repository.raw_artifacts(self._tenant_id, run_id)
         except RunNotFound:
             raise KeyError(run_id) from None
-        metadata = _find_generated_file_metadata(artifacts, artifact_id)
+        try:
+            metadata = _find_generated_file_metadata(artifacts, artifact_id)
+        except KeyError:
+            workspace_bundle = _workspace_bundle_zip_artifact(artifacts, artifact_id)
+            if workspace_bundle is None:
+                raise KeyError(artifact_id) from None
+            stored = self._generated_file_store.store_bytes(
+                self._tenant_id,
+                run_id,
+                artifact_id,
+                "workspace-bundle.zip",
+                ZIP_MIME_TYPE,
+                workspace_bundle,
+            )
+            metadata = {
+                "filename": stored.filename,
+                "mime_type": stored.mime_type,
+                "storage_key": stored.storage_key,
+            }
         try:
             path = self._generated_file_store.resolve_for(
                 self._tenant_id,
@@ -11653,6 +11675,67 @@ def _find_generated_file_metadata(
             "storage_key": storage_key,
         }
     raise KeyError(artifact_id)
+
+
+_WORKSPACE_BUNDLE_DOWNLOAD_MAX_FILES = 200
+_WORKSPACE_BUNDLE_DOWNLOAD_MAX_FILE_BYTES = 512_000
+_WORKSPACE_BUNDLE_DOWNLOAD_MAX_TOTAL_BYTES = 2_000_000
+
+
+def _workspace_bundle_zip_artifact(
+    artifacts: Iterable[Mapping[str, object]], artifact_id: UUID
+) -> bytes | None:
+    for artifact in artifacts:
+        if str(artifact.get("id")) != str(artifact_id):
+            continue
+        content = _artifact_result_content(artifact.get("content"))
+        if content is None:
+            continue
+        workspace_bundle = content.get("workspace_bundle")
+        if not isinstance(workspace_bundle, Mapping):
+            continue
+        return _workspace_bundle_mapping_to_zip_bytes(workspace_bundle)
+    return None
+
+
+def _workspace_bundle_mapping_to_zip_bytes(workspace_bundle: Mapping[str, object]) -> bytes | None:
+    files = workspace_bundle.get("files")
+    if not isinstance(files, Mapping) or not files:
+        return None
+    if len(files) > _WORKSPACE_BUNDLE_DOWNLOAD_MAX_FILES:
+        return None
+    normalized: dict[str, bytes] = {}
+    total_bytes = 0
+    for raw_path, raw_content in files.items():
+        if type(raw_path) is not str or type(raw_content) is not str:
+            return None
+        path = _safe_workspace_bundle_download_path(raw_path)
+        if path is None:
+            return None
+        content_bytes = raw_content.encode("utf-8")
+        if len(content_bytes) > _WORKSPACE_BUNDLE_DOWNLOAD_MAX_FILE_BYTES:
+            return None
+        total_bytes += len(content_bytes)
+        if total_bytes > _WORKSPACE_BUNDLE_DOWNLOAD_MAX_TOTAL_BYTES:
+            return None
+        normalized[path] = content_bytes
+    if not normalized:
+        return None
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w") as archive:
+        for path, content in sorted(normalized.items()):
+            archive.writestr(path, content)
+    return buffer.getvalue()
+
+
+def _safe_workspace_bundle_download_path(value: str) -> str | None:
+    normalized = value.replace("\\", "/").strip()
+    if not normalized or normalized.startswith("/"):
+        return None
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix()
 
 
 def _generated_file_artifact_ids(
