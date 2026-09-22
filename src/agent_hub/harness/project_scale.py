@@ -374,7 +374,8 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "open, won, and lost. Request body contracts: accounts must accept {name}; "
             "contacts must accept {account_id,name,email}; opportunities must accept "
             "{account_id,name,amount,stage}; PATCH opportunities must accept {stage}; "
-            "reminders must accept {contact_id,due_at,note}."
+            "reminders must accept {contact_id,due_at,note}. The service must not require "
+            "pre-created tenant records; any tenant_id in the URL is a valid isolated namespace."
         ),
         "large": (
             "Build a large project: a TypeScript/Node multi-service order operations platform "
