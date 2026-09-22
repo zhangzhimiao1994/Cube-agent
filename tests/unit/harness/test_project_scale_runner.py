@@ -207,6 +207,11 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
     assert "read_before_implementation:true" in message
     assert "AGENTS.md workspace rules" in message
     assert "GET /tenants/:tenant_id/opportunities" in message
+    assert "top-level id" in message
+    assert "never {item:...}, {data:...}" in message
+    assert "opportunities {account_id,name,amount,stage}" in message
+    assert "reminders {contact_id,due_at,note}" in message
+    assert "stages exactly open, won, lost" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)

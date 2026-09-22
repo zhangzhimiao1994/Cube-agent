@@ -1857,7 +1857,12 @@ def _deliverable_repair_body(
             "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
             "and skills/rules naming applicable SKILL.md or agent-standard rules. "
             "For medium CRM repairs, include GET /tenants/:tenant_id/opportunities returning "
-            "{items:[...]} and verify created/patched opportunities persist after restart. "
+            "{items:[...]} and verify created/patched opportunities persist after restart; "
+            "POST create and PATCH responses must be the object itself with top-level id, "
+            "never {item:...}, {data:...}, or any wrapper. Medium CRM body fields are exact: "
+            "accounts {name}; contacts {account_id,name,email}; opportunities "
+            "{account_id,name,amount,stage}; PATCH opportunities {stage}; reminders "
+            "{contact_id,due_at,note}; stages exactly open, won, lost. "
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
             "Report executed checks only.\n"
         )
