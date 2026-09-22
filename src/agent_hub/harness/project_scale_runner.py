@@ -480,6 +480,7 @@ def execute_project_scale_plan(
         errors: list[str] = []
         run_id: str | None = None
         status: str | None = None
+        case_deadline = time.monotonic() + max(wait_seconds, 0)
         try:
             response = client.request_json(
                 "POST",
@@ -523,7 +524,7 @@ def execute_project_scale_plan(
                 client,
                 run_id=run_id,
                 body=request_body,
-                wait_seconds=wait_seconds,
+                wait_seconds=_remaining_wait_seconds(case_deadline, wait_seconds),
                 poll_interval_seconds=poll_interval_seconds,
                 current_status=status,
                 evidence=evidence,
@@ -572,7 +573,7 @@ def execute_project_scale_plan(
                         client,
                         run_id=run_id,
                         body=request_body,
-                        wait_seconds=wait_seconds,
+                        wait_seconds=_remaining_wait_seconds(case_deadline, wait_seconds),
                         poll_interval_seconds=poll_interval_seconds,
                         current_status=status,
                         evidence=evidence,
@@ -697,7 +698,7 @@ def execute_project_scale_plan(
                     client,
                     run_id=run_id,
                     body=request_body,
-                    wait_seconds=wait_seconds,
+                    wait_seconds=_remaining_wait_seconds(case_deadline, wait_seconds),
                     poll_interval_seconds=poll_interval_seconds,
                     current_status=status,
                     evidence=evidence,
@@ -1321,6 +1322,12 @@ def _format_command(command: Sequence[str]) -> str:
     return " ".join(command)
 
 
+def _remaining_wait_seconds(deadline: float, configured_wait_seconds: float) -> float:
+    if configured_wait_seconds <= 0:
+        return 0
+    return max(deadline - time.monotonic(), 0)
+
+
 def _collect_run_observation(
     client: AcceptanceClient,
     *,
@@ -1359,10 +1366,11 @@ def _collect_run_observation(
         if _is_terminal_status(status):
             evidence["terminal_status"] = True
             break
-        if wait_seconds <= 0 or time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if wait_seconds <= 0 or remaining <= 0:
             break
         if poll_interval_seconds > 0:
-            time.sleep(poll_interval_seconds)
+            time.sleep(min(poll_interval_seconds, remaining))
 
     events_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
     normalized_events = _run_events_items(events_response)
