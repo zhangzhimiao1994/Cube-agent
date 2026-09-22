@@ -3240,6 +3240,46 @@ async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_fallback_model_checkpoint_lineage_uses_actual_provenance() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _one_step_plan_with_model_fallback()
+    runtime = CrewDispatchRuntime(
+        CapacityUnavailableThenRoleAwareGateway(unavailable_logical_model="primary"),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    completed_checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(checkpoints)
+        if checkpoint.state["phase"] == "completed"
+    )
+    model_states = cast(Mapping[str, Mapping[str, JsonValue]], completed_checkpoint.state["models"])
+    assert any(
+        state["status"] == "succeeded"
+        and cast(Mapping[str, JsonValue], state["provenance"])["logical_model"] == "backup"
+        for state in model_states.values()
+    )
+
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(completed_checkpoint)
+
+    events = [event async for event in restored.run(_context(checkpoint=completed_checkpoint))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_blocked_contract_self_repair_uses_checkpoint_frontier_and_repair_policy() -> None:
     repository = InMemoryArtifactRepository()
     plan = _dependent_final_plan()

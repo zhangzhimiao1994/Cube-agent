@@ -6218,7 +6218,6 @@ class CrewDispatchRuntime:
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
             _fail("runtime checkpoint artifact graph is invalid")
-        agents = {agent.id: agent for agent in plan.agents}
         steps_by_id = {step.id: step for step in plan.steps}
         for step_id, repair in model_ledger.structured_repairs.items():
             if repair["purpose"] != "review":
@@ -6362,6 +6361,18 @@ class CrewDispatchRuntime:
                     return calls
             return {}
 
+        def model_artifact_matches_state(
+            artifact: Artifact,
+            state: Mapping[str, JsonValue],
+        ) -> bool:
+            provenance = artifact.provenance
+            state_provenance = state.get("provenance")
+            return (
+                provenance is not None
+                and isinstance(state_provenance, Mapping)
+                and provenance.to_payload() == dict(state_provenance)
+            )
+
         for step in plan.steps:
             if step.depends_on and any(
                 dependency not in completed for dependency in step.depends_on
@@ -6395,9 +6406,7 @@ class CrewDispatchRuntime:
                     if (
                         model_artifact.source_ids != expected_model_sources
                         or model_artifact.producer != step.agent
-                        or model_artifact.provenance is None
-                        or model_artifact.provenance.logical_model
-                        != agents[step.agent].logical_model
+                        or not model_artifact_matches_state(model_artifact, state)
                     ):
                         _fail("runtime checkpoint model artifact lineage is invalid")
                     completion = self._completion_from_model_artifact(model_artifact)
@@ -6477,10 +6486,8 @@ class CrewDispatchRuntime:
                         if (
                             review_model.source_ids != (str(candidate.id), *review_evidence)
                             or review_model.producer != step.reviewer
-                            or review_model.provenance is None
                             or step.reviewer is None
-                            or review_model.provenance.logical_model
-                            != agents[step.reviewer].logical_model
+                            or not model_artifact_matches_state(review_model, state)
                         ):
                             _fail("runtime checkpoint review artifact lineage is invalid")
                         review_completion = self._completion_from_model_artifact(review_model)
