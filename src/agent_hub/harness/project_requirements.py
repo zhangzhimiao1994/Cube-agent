@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import http.client
 import json
 import math
@@ -21,15 +22,58 @@ from uuid import uuid4
 
 _PLATFORM = os.name
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_TH32CS_SNAPPROCESS = 0x00000002
 
 
 class _ValidationFailure(Exception):
     pass
 
 
+class _WindowsProcessEntry32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise _ValidationFailure(message)
+
+
+def _payload_summary(payload: object, *, limit: int = 500) -> str:
+    try:
+        text = (
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+    except (TypeError, ValueError):
+        text = repr(payload)
+    summary = " ".join(text.split())
+    if len(summary) > limit:
+        return f"{summary[:limit - 3]}..."
+    return summary
+
+
+def _status_message(
+    context: str,
+    *,
+    expected: str,
+    actual: int,
+    payload: object,
+) -> str:
+    if payload is None:
+        return f"{context}: expected {expected}, got {actual}"
+    return f"{context}: expected {expected}, got {actual}; body={_payload_summary(payload)}"
 
 
 def _remaining(deadline: float) -> float:
@@ -45,6 +89,47 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _windows_descendant_pids(root_pid: int) -> list[int]:
+    if sys.platform != "win32":
+        return []
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        return []
+    children: dict[int, list[int]] = {}
+    entry = _WindowsProcessEntry32()
+    entry.dwSize = ctypes.sizeof(_WindowsProcessEntry32)
+    try:
+        has_entry = kernel32.Process32First(snapshot, ctypes.byref(entry))
+        while has_entry:
+            parent = int(entry.th32ParentProcessID)
+            pid = int(entry.th32ProcessID)
+            children.setdefault(parent, []).append(pid)
+            has_entry = kernel32.Process32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    descendants: list[int] = []
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(children.get(pid, ()))
+    return descendants
+
+
+def _kill_windows_process_tree(root_pid: int) -> tuple[str, ...]:
+    errors: list[str] = []
+    for pid in (*reversed(_windows_descendant_pids(root_pid)), root_pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            errors.append(f"pid {pid}: {exc}")
+    return tuple(errors)
+
+
 def _stop_tree(process: subprocess.Popen[bytes], taskkill: str | None) -> None:
     if sys.platform != "win32":
         # The group survives an exited npm parent; always target the entire group.
@@ -58,20 +143,30 @@ def _stop_tree(process: subprocess.Popen[bytes], taskkill: str | None) -> None:
         except ProcessLookupError:
             pass
     else:
-        if process.poll() is not None:
-            raise _ValidationFailure(
-                "cleanup: npm exited before Windows process-tree cleanup could be confirmed"
+        taskkill_error = ""
+        if process.poll() is None and taskkill is not None:
+            result = subprocess.run(
+                [taskkill, "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                check=False,
             )
-        if taskkill is None:
-            raise _ValidationFailure("cleanup: taskkill unavailable")
-        result = subprocess.run(
-            [taskkill, "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-        _require(result.returncode == 0, "cleanup: taskkill failed to terminate npm process tree")
+            if result.returncode == 0:
+                process.wait(timeout=3)
+                return
+            taskkill_error = (
+                result.stderr.decode("utf-8", errors="replace")
+                or result.stdout.decode("utf-8", errors="replace")
+            ).strip()
+        elif taskkill is None:
+            taskkill_error = "taskkill unavailable"
+        kill_errors = _kill_windows_process_tree(process.pid)
+        if kill_errors:
+            detail = f": {taskkill_error}" if taskkill_error else ""
+            kill_detail = "; ".join(kill_errors)
+            raise _ValidationFailure(
+                f"cleanup: taskkill failed and process tree kill failed{detail}; {kill_detail}"
+            )
     process.wait(timeout=3)
 
 
@@ -237,7 +332,10 @@ class _TenantCRMAPI:
         body: Mapping[str, object],
     ) -> dict[str, object]:
         status, payload = self.request("POST", self.tenant_path(tenant, resource), body)
-        _require(status == 201, f"POST {resource}: expected 201, got {status}")
+        _require(
+            status == 201,
+            _status_message(f"POST {resource}", expected="201", actual=status, payload=payload),
+        )
         _require(isinstance(payload, dict), f"POST {resource}: expected object")
         assert isinstance(payload, dict)
         item = dict(payload)
@@ -249,7 +347,10 @@ class _TenantCRMAPI:
 
     def list_items(self, tenant: str, resource: str, query: str = "") -> list[dict[str, object]]:
         status, payload = self.request("GET", self.tenant_path(tenant, resource, query))
-        _require(status == 200, f"GET {resource}: expected 200, got {status}")
+        _require(
+            status == 200,
+            _status_message(f"GET {resource}", expected="200", actual=status, payload=payload),
+        )
         _require(isinstance(payload, dict), f"GET {resource}: expected object")
         assert isinstance(payload, dict)
         items = payload.get("items")
@@ -267,7 +368,10 @@ class _TenantCRMAPI:
         context: str,
     ) -> None:
         status, payload = self.request(method, path, body)
-        _require(status == 404, f"{context}: expected 404, got {status}")
+        _require(
+            status == 404,
+            _status_message(context, expected="404", actual=status, payload=payload),
+        )
         error = payload.get("error") if isinstance(payload, dict) else None
         _require(isinstance(error, dict), f"{context}: expected error object")
         assert isinstance(error, dict)
@@ -640,7 +744,15 @@ def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ..
                     ),
                     {"stage": "won"},
                 )
-                _require(status == 200, f"PATCH opportunity: expected 200, got {status}")
+                _require(
+                    status == 200,
+                    _status_message(
+                        "PATCH opportunity",
+                        expected="200",
+                        actual=status,
+                        payload=payload,
+                    ),
+                )
                 _require(isinstance(payload, dict), "PATCH opportunity: expected object")
                 assert isinstance(payload, dict)
                 opportunity_a = dict(payload)

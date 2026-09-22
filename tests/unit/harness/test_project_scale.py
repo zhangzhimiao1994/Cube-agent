@@ -51,6 +51,7 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "PORT environment variable" in messages["small:direct"]
     assert "DATA_DIR" in messages["small:direct"]
     assert "tenant-aware CRM-lite" in messages["medium:direct"]
+    assert "opportunity stages must accept open, won, and lost" in messages["medium:direct"]
     assert "large project" in messages["large:direct"]
     assert "multi-service order operations platform" in messages["large:direct"]
     assert "ultra-large project" in messages["ultra:direct"]

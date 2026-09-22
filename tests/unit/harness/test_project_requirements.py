@@ -231,6 +231,23 @@ def test_missing_project_fails_without_starting_npm(tmp_path: Path) -> None:
     assert _validate(tmp_path)
 
 
+def test_medium_crm_create_failure_includes_response_payload() -> None:
+    module = importlib.import_module('agent_hub.harness.project_requirements')
+    api = module._TenantCRMAPI(port=1, deadline=time.monotonic() + 30)
+    api.request = lambda method, path, body=None: (
+        400,
+        {'error': {'code': 'INVALID_STAGE', 'message': 'stage must be open|won|lost'}},
+    )
+
+    with pytest.raises(module._ValidationFailure) as excinfo:
+        api.create('tenant-a', 'opportunities', {'stage': 'open'})
+
+    message = str(excinfo.value)
+    assert 'expected 201, got 400' in message
+    assert 'INVALID_STAGE' in message
+    assert 'open|won|lost' in message
+
+
 @pytest.mark.parametrize('timeout', [0.0, -1.0, math.inf, math.nan])
 def test_invalid_timeout_fails(tmp_path: Path, timeout: float) -> None:
     failures = _validate(tmp_path, timeout)
