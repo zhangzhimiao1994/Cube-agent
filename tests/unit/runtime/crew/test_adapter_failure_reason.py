@@ -46,6 +46,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _step_timeout_recovery_window_seconds,
     _tool_definitions,
     _tool_sandbox,
 )
@@ -3161,6 +3162,29 @@ async def test_agent_capacity_recovery_gets_bounded_step_deadline_window() -> No
     assert any(event.kind is EventKind.STEP_RETRYING for event in events)
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_project_scale_tool_step_gets_extended_recovery_window() -> None:
+    step = DispatchStep(
+        id="implementer_step",
+        agent="implementer",
+        task=(
+            "Build a real small business project for flow=dispatch. "
+            "Return strict JSON workspace_bundle.files."
+        ),
+        tools=("project.generate_zip",),
+        token_budget=1000,
+    )
+    ordinary = DispatchStep(
+        id="writer_step",
+        agent="writer",
+        task="Write a short answer",
+        token_budget=1000,
+    )
+
+    assert _step_timeout_recovery_window_seconds(step) > _step_timeout_recovery_window_seconds(
+        ordinary
+    )
 
 
 async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -> None:

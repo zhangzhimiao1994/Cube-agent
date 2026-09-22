@@ -117,6 +117,7 @@ _MAX_AUDITED_COST_USD = Decimal(64000000)
 _STEP_TIMEOUT_RECOVERY_RETRIES = 1
 _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
 _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS = 60.0
+_PROJECT_SCALE_STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS = 300.0
 _ORCHESTRATION_PROTOCOL_ID = "role_handoff_contract_v1"
 _STEP_TIMEOUT_RECOVERY_LAYERS = (
     "input_compression",
@@ -1216,6 +1217,12 @@ def _is_project_scale_tool_contract_step(step: DispatchStep) -> bool:
         PROJECT_SCALE_ARTIFACT_TOOL_NAME in step.tools
         and _is_real_project_scale_handoff(step.task)
     )
+
+
+def _step_timeout_recovery_window_seconds(step: DispatchStep) -> float:
+    if _is_project_scale_tool_contract_step(step):
+        return _PROJECT_SCALE_STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
+    return _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
 
 
 def _is_real_project_scale_handoff(task: object) -> bool:
@@ -3327,6 +3334,7 @@ class CrewDispatchRuntime:
                                 step_deadline = self._recovery_step_deadline(
                                     run_state,
                                     step_deadline,
+                                    step,
                                 )
                                 await event(
                                     kind=EventKind.STEP_RETRYING,
@@ -3502,7 +3510,7 @@ class CrewDispatchRuntime:
                     max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
                 ):
                     recovery_attempt += 1
-                    step_deadline = self._recovery_step_deadline(run_state, step_deadline)
+                    step_deadline = self._recovery_step_deadline(run_state, step_deadline, step)
                     await event(
                         kind=EventKind.STEP_RETRYING,
                         step_id=step.id,
@@ -5334,12 +5342,16 @@ class CrewDispatchRuntime:
         return remaining
 
     @staticmethod
-    def _recovery_step_deadline(run_state: _RunState, step_deadline: float) -> float:
+    def _recovery_step_deadline(
+        run_state: _RunState,
+        step_deadline: float,
+        step: DispatchStep,
+    ) -> float:
         run_deadline = run_state.deadline
         if run_deadline is None:
             _fail("dispatch deadline is unavailable")
         loop_time = asyncio.get_running_loop().time()
-        recovery_deadline = loop_time + _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
+        recovery_deadline = loop_time + _step_timeout_recovery_window_seconds(step)
         return min(max(step_deadline, recovery_deadline), run_deadline)
 
     @staticmethod
