@@ -56,6 +56,8 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "GET /tenants/:tenant_id/opportunities" in messages["medium:direct"]
     assert "opportunities list endpoint is required" in messages["medium:direct"]
     assert "opportunities must accept {account_id,name,amount,stage}" in messages["medium:direct"]
+    assert "resolve account_id/contact_id inside the URL tenant before validating" in messages["medium:direct"]
+    assert "foreign or missing reference must return 404 NOT_FOUND" in messages["medium:direct"]
     assert "opportunity stages must accept open, won, and lost" in messages["medium:direct"]
     assert "POST create endpoints must return the created object directly with a top-level id" in messages["medium:direct"]
     assert "large project" in messages["large:direct"]

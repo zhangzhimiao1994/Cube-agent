@@ -212,6 +212,8 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
     assert "opportunities {account_id,name,amount,stage}" in message
     assert "reminders {contact_id,due_at,note}" in message
     assert "stages exactly open, won, lost" in message
+    assert "Reference validation order is frozen" in message
+    assert "missing or foreign reference returns 404 NOT_FOUND" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
