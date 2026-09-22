@@ -43,6 +43,8 @@ if ! [[ -f "$SOURCE_DIR/web/dist/index.html" ]]; then
   exit 1
 fi
 
+revision="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+
 mkdir -p "$(dirname -- "$output")"
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -54,5 +56,6 @@ staging_dir="$tmp_dir/source"
 mkdir -p "$staging_dir/web/dist"
 git -C "$SOURCE_DIR" archive --format=tar HEAD | tar -xf - -C "$staging_dir"
 cp -a "$SOURCE_DIR/web/dist/." "$staging_dir/web/dist/"
+printf '%s\n' "$revision" > "$staging_dir/REVISION"
 
 tar -cf "$output" -C "$staging_dir" .

@@ -36,9 +36,11 @@ def test_release_packager_includes_built_web_dist() -> None:
     assert "package-release" in launcher
     assert "npm --prefix \"$SOURCE_DIR/web\" run build" in command
     assert '[[ -f "$SOURCE_DIR/web/dist/index.html" ]]' in command
+    assert 'revision="$(git -C "$SOURCE_DIR" rev-parse HEAD)"' in command
     assert 'git -C "$SOURCE_DIR" archive --format=tar HEAD' in command
     assert 'tar -xf - -C "$staging_dir"' in command
     assert 'cp -a "$SOURCE_DIR/web/dist/." "$staging_dir/web/dist/"' in command
+    assert 'printf \'%s\\n\' "$revision" > "$staging_dir/REVISION"' in command
     assert 'tar -cf "$output" -C "$staging_dir" .' in command
 
 
