@@ -1560,10 +1560,11 @@ def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
     index = 0
     while index < len(lines):
         line = lines[index].strip()
-        if not _is_markdown_file_heading(line):
+        path_text = _markdown_file_heading_path(line)
+        if path_text is None:
             index += 1
             continue
-        path = _safe_embedded_workspace_path(line.split("`", 1)[1][:-1])
+        path = _safe_embedded_workspace_path(path_text)
         index += 1
         while index < len(lines) and not lines[index].strip():
             index += 1
@@ -1584,23 +1585,38 @@ def _markdown_file_blocks_to_zip(text: str) -> bytes | None:
     return _workspace_bundle_mapping_to_zip({"files": files})
 
 
-def _is_markdown_file_heading(line: str) -> bool:
-    if not line.endswith("`"):
-        return False
-    return any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####"))
+def _markdown_file_heading_path(line: str) -> str | None:
+    if any(line.startswith(f"{prefix} `") for prefix in ("##", "###", "####")) and line.endswith("`"):
+        return line.split("`", 1)[1][:-1]
+    match = re.match(r"^#{2,4}\s+([A-Za-z0-9._/-]+)\s*$", line)
+    if match is None:
+        return None
+    candidate = match.group(1)
+    name = candidate.rsplit("/", 1)[-1]
+    if "/" not in candidate and "." not in name and name not in {"Dockerfile", "Makefile", "README", "LICENSE"}:
+        return None
+    return candidate
 
 
 def _markdown_file_blocks_to_files_regex(text: str) -> dict[str, str]:
     files: dict[str, str] = {}
     pattern = re.compile(
-        r"(?ms)#{2,4}\s+`([^`\r\n]+)`[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
+        r"(?ms)#{2,4}\s+(?:`([^`\r\n]+)`|([A-Za-z0-9._/-]+))[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
         r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
     )
     for match in pattern.finditer(text):
-        path = _safe_embedded_workspace_path(match.group(1))
+        path_text = match.group(1) or match.group(2)
+        if (
+            match.group(2)
+            and "/" not in path_text
+            and "." not in path_text.rsplit("/", 1)[-1]
+            and path_text not in {"Dockerfile", "Makefile", "README", "LICENSE"}
+        ):
+            continue
+        path = _safe_embedded_workspace_path(path_text)
         if path is None:
             continue
-        files[path] = match.group(2).rstrip() + "\n"
+        files[path] = match.group(3).rstrip() + "\n"
     return files
 
 

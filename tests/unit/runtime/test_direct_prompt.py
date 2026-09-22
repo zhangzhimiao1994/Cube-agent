@@ -83,6 +83,43 @@ module.exports = { add };
     }
 
 
+def test_direct_project_scale_parser_accepts_plain_file_headings() -> None:
+    text = """Executed checks: none.
+
+## Bundle
+
+### package.json
+```json
+{"scripts":{"build":"node --check src/main.js","test":"node --test"}}
+```
+
+### src/main.js
+```js
+function add(a, b) {
+  return a + b;
+}
+
+module.exports = { add };
+```
+"""
+
+    bundle = _project_scale_workspace_bundle_from_model_text(text)
+
+    assert bundle == {
+        "files": {
+            "package.json": (
+                '{"scripts":{"build":"node --check src/main.js","test":"node --test"}}\n'
+            ),
+            "src/main.js": (
+                "function add(a, b) {\n"
+                "  return a + b;\n"
+                "}\n\n"
+                "module.exports = { add };\n"
+            ),
+        }
+    }
+
+
 def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -> None:
     original_text = "长文本" * 1_000
     artifact = Artifact(

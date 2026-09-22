@@ -1946,6 +1946,36 @@ module.exports = { add };
         assert "module.exports = { add };" in archive.read("src/main.js").decode("utf-8")
 
 
+def test_embedded_workspace_bundle_accepts_plain_file_headings() -> None:
+    text = """Executed checks: none.
+
+## Bundle
+
+### package.json
+```json
+{"scripts":{"build":"node --check src/main.js","test":"node --test"}}
+```
+
+### src/main.js
+```js
+function add(a, b) {
+  return a + b;
+}
+
+module.exports = { add };
+```
+"""
+
+    bundle = _embedded_workspace_bundle_from_text(text)
+
+    assert bundle is not None
+    with zipfile.ZipFile(BytesIO(bundle)) as archive:
+        assert archive.read("package.json").decode("utf-8") == (
+            '{"scripts":{"build":"node --check src/main.js","test":"node --test"}}\n'
+        )
+        assert "module.exports = { add };" in archive.read("src/main.js").decode("utf-8")
+
+
 def test_execute_project_scale_plan_recovers_workspace_bundle_from_admin_artifacts() -> None:
     plan = build_project_scale_run_plan(
         benchmark_kind="fixture",
