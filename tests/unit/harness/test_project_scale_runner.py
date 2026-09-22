@@ -2582,6 +2582,121 @@ def test_execute_project_scale_plan_repairs_generated_project_validation_failure
     assert "rerun build/test/interaction checks" in repair_message
 
 
+def test_capability_generated_project_repair_can_use_second_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=7 "
+                    'command=npm run build output_tail="src/app.ts(1,1): error TS2322"'
+                ),
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=2 "
+                    'command=npm run build output_tail="tests/unit.test.ts(41,16): '
+                    'error TS2554: Expected 2 arguments, but got 1."'
+                ),
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-direct-validation",
+        session_id="project-scale-medium-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# CRM Lite\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- CRM requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed by real HTTP checks\n"
+                ),
+                "constraints_reading_evidence.json": json.dumps(
+                    {
+                        "read_before_implementation": True,
+                        "constraints": [
+                            "AGENTS.md workspace rules",
+                            "HANDOFF",
+                            "PROJECT_REQUIREMENTS.md",
+                        ],
+                        "skills": ["applicable SKILL.md or agent-standard rules"],
+                    }
+                ),
+                "package.json": json.dumps({"scripts": {"build": "tsc", "test": "node --test"}}),
+                "src/app.ts": _functional_ts_source(),
+                "tests/unit.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    result = report.results[0]
+    assert result.run_id == "run-medium-direct-validation-repair"
+    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert len(client.submitted_bodies) == 3
+    repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
+    assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
+    assert "Expected 2 arguments, but got 1" in repair_messages[1]
+    assert "validator helpers that require a field argument" in repair_messages[1]
+    repair_keys = [
+        call[2]
+        for call in client.calls
+        if call[0] == "POST"
+        and call[1] == "/api/v1/runs"
+        and call[2] is not None
+        and "deliverable-repair" in call[2]
+    ]
+    assert repair_keys == [
+        "project-scale-medium-direct-0-deliverable-repair",
+        "project-scale-medium-direct-0-deliverable-repair-2",
+    ]
+
+
 def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
@@ -3321,7 +3436,15 @@ class FakeAcceptanceClient:
         }:
             events = list(self.events)
             if path == f"/api/v1/runs/{self.repair_run_id}/events":
-                events = []
+                events = [
+                    {
+                        **event,
+                        "run_id": self.repair_run_id,
+                    }
+                    if isinstance(event, dict) and event.get("run_id") == self.run_id
+                    else event
+                    for event in events
+                ]
                 events.append({"kind": "deliverable.repair.completed", "run_id": self.repair_run_id})
             if self.events_envelope:
                 return {"items": events}

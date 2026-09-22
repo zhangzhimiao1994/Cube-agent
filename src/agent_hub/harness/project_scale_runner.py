@@ -98,6 +98,8 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("npm", "test"),
 )
 _GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
+_CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 2
+_FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
         "dispatch",
@@ -631,12 +633,27 @@ def execute_project_scale_plan(
                         observation.workspace_bundle, generated_project_validation
                     )
                     evidence["deliverable_quality"] = deliverable_quality.passed
-            if _should_attempt_deliverable_repair(
-                status=status,
-                evidence=evidence,
-                case_id=run_request.case_id,
-                benchmark_kind=plan.benchmark_kind,
+            deliverable_repair_attempts = 0
+            max_deliverable_repair_attempts = (
+                _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS
+                if plan.benchmark_kind == "capability"
+                else _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
+            )
+            while (
+                deliverable_repair_attempts < max_deliverable_repair_attempts
+                and _should_attempt_deliverable_repair(
+                    status=status,
+                    evidence=evidence,
+                    case_id=run_request.case_id,
+                    benchmark_kind=plan.benchmark_kind,
+                )
             ):
+                if deliverable_repair_attempts > 0 and not _has_followup_deliverable_repair_reason(
+                    evidence,
+                    case_id=run_request.case_id,
+                ):
+                    break
+                deliverable_repair_attempts += 1
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
@@ -656,6 +673,7 @@ def execute_project_scale_plan(
                         run_request.case_id,
                         index,
                         execution_id=execution_id,
+                        repair_attempt=deliverable_repair_attempts,
                     ),
                 )
                 if not isinstance(repair_response, dict):
@@ -1834,8 +1852,12 @@ def _deliverable_repair_idempotency_key(
     index: int,
     *,
     execution_id: str | None = None,
+    repair_attempt: int = 1,
 ) -> str:
-    return f"{_idempotency_key(case_id, index, execution_id=execution_id)}-deliverable-repair"[:90]
+    suffix = "deliverable-repair"
+    if repair_attempt > 1:
+        suffix = f"{suffix}-{repair_attempt}"
+    return f"{_idempotency_key(case_id, index, execution_id=execution_id)}-{suffix}"[:90]
 
 
 def _deliverable_repair_body(
@@ -1863,6 +1885,8 @@ def _deliverable_repair_body(
             "accounts {name}; contacts {account_id,name,email}; opportunities "
             "{account_id,name,amount,stage}; PATCH opportunities {stage}; reminders "
             "{contact_id,due_at,note}; stages exactly open, won, lost. "
+            "Generated tests must compile: validator helpers that require a field argument "
+            "must be called with that field name, or define safe defaults before testing. "
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
             "Report executed checks only.\n"
         )
@@ -2957,6 +2981,26 @@ def _should_attempt_deliverable_repair(
             )
             or evidence.get("generated_project_validation") is False
         )
+    )
+
+
+def _has_followup_deliverable_repair_reason(
+    evidence: dict[str, bool],
+    *,
+    case_id: str,
+) -> bool:
+    return (
+        evidence.get("workspace_bundle") is not True
+        or evidence.get("deliverable_quality") is not True
+        or (
+            _case_requires_discussion_trace(case_id)
+            and evidence.get("discussion_trace") is not True
+        )
+        or (
+            _case_requires_plugin_contract(case_id)
+            and evidence.get("plugin_contract") is not True
+        )
+        or evidence.get("generated_project_validation") is False
     )
 
 
