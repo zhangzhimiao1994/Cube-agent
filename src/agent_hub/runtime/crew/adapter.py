@@ -364,6 +364,34 @@ def _tool_description(internal_name: str) -> str:
     return f"Approved Agent Hub capability: {internal_name}"
 
 
+def _is_read_context_tool(name: str) -> bool:
+    return name in {"read_context", "workspace_read", "workspace.read"}
+
+
+def _is_optional_read_context_unavailable(name: str, reason: str) -> bool:
+    return name == "read_context" and reason == "workspace read denied or scoped file unavailable"
+
+
+def _read_context_unavailable_result(
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    result: dict[str, JsonValue] = {
+        "matches": (),
+        "summary": "Requested runtime context is unavailable for this query or path.",
+        "truncated": False,
+        "unavailable": True,
+    }
+    query = arguments.get("query")
+    if query is None:
+        query = arguments.get("text")
+    if isinstance(query, str) and query.strip():
+        result["query"] = query.strip()
+    path = arguments.get("path")
+    if isinstance(path, str) and path.strip():
+        result["path"] = path.strip()
+    return result
+
+
 def _tool_parameters(
     internal_name: str,
     metadata: Mapping[str, JsonValue] | None = None,
@@ -428,7 +456,7 @@ def _tool_sandbox(
         and _routing_sandbox_profile(routing_decision) == "workspace_write"
     ):
         return "workspace_write"
-    if name in {"read_context", "workspace_read", "workspace.read"}:
+    if _is_read_context_tool(name):
         return "read_only"
     if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "none"
@@ -4599,6 +4627,42 @@ class CrewDispatchRuntime:
                     error.__context__ = None
                     error.__cause__ = None
                     del error
+                    if _is_optional_read_context_unavailable(tool_call.name, failed_reason):
+                        result = cast(
+                            Mapping[str, JsonValue],
+                            _mutable_json(_read_context_unavailable_result(tool_call.arguments)),
+                        )
+                        artifact = Artifact(
+                            id=uuid4(),
+                            type="tool_result",
+                            producer=step.agent,
+                            content={"result": result},
+                            source_ids=(str(trigger_model_artifact.id),),
+                        )
+                        await emit(
+                            kind=EventKind.TOOL_COMPLETED,
+                            actor=step.agent,
+                            tool_call_id=call_id,
+                            tool_name=tool_call.name,
+                            payload=safe_tool_event_payload(
+                                name=tool_call.name,
+                                status="succeeded",
+                                result=result,
+                                artifact_id=str(artifact.id),
+                                replay_safe=replay_safe,
+                            ),
+                            artifact=artifact,
+                        )
+                        succeeded = dict(tool_running)
+                        succeeded.update(
+                            status="succeeded",
+                            artifact_id=str(artifact.id),
+                            sha256=artifact.content_sha256,
+                        )
+                        await tool_boundary(idempotency_key, succeeded, artifact)
+                        evidence.append(artifact)
+                        results.append({"name": tool_call.name, "result": result})
+                        continue
                     await emit(
                         kind=EventKind.TOOL_FAILED,
                         actor=step.agent,
@@ -4660,6 +4724,43 @@ class CrewDispatchRuntime:
                         "capability outcome requires confirmation"
                     ) from None
                 if tool_result.status != "succeeded":
+                    failed_reason = tool_result.failure_reason or "capability execution failed"
+                    if _is_optional_read_context_unavailable(tool_call.name, failed_reason):
+                        result = cast(
+                            Mapping[str, JsonValue],
+                            _mutable_json(_read_context_unavailable_result(tool_call.arguments)),
+                        )
+                        artifact = Artifact(
+                            id=uuid4(),
+                            type="tool_result",
+                            producer=step.agent,
+                            content={"result": result},
+                            source_ids=(str(trigger_model_artifact.id),),
+                        )
+                        await emit(
+                            kind=EventKind.TOOL_COMPLETED,
+                            actor=step.agent,
+                            tool_call_id=call_id,
+                            tool_name=tool_call.name,
+                            payload=safe_tool_event_payload(
+                                name=tool_call.name,
+                                status="succeeded",
+                                result=result,
+                                artifact_id=str(artifact.id),
+                                replay_safe=replay_safe,
+                            ),
+                            artifact=artifact,
+                        )
+                        succeeded = dict(tool_running)
+                        succeeded.update(
+                            status="succeeded",
+                            artifact_id=str(artifact.id),
+                            sha256=artifact.content_sha256,
+                        )
+                        await tool_boundary(idempotency_key, succeeded, artifact)
+                        evidence.append(artifact)
+                        results.append({"name": tool_call.name, "result": result})
+                        continue
                     reusable_result = reusable_generated_file_result(tool_call.name, evidence)
                     if reusable_result is not None:
                         reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
@@ -4694,7 +4795,6 @@ class CrewDispatchRuntime:
                         evidence.append(artifact)
                         results.append({"name": tool_call.name, "result": reusable_result})
                         continue
-                    failed_reason = tool_result.failure_reason or "capability execution failed"
                     await emit(
                         kind=EventKind.TOOL_FAILED,
                         actor=step.agent,

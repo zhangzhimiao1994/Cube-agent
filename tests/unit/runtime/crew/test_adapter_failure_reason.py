@@ -96,6 +96,37 @@ class ToolGateway:
         )
 
 
+class ReadContextToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call",
+                        name="read_context",
+                        arguments={"path": "missing/generated-project.zip"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="review can continue", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ManifestToolGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -281,6 +312,26 @@ class ReplaySafeRaisingCapabilities(RaisingCapabilities):
     def is_replay_safe(self, name: str) -> bool:
         del name
         return True
+
+
+class ScopedReadUnavailableCapabilities(FakeCapabilities):
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, idempotency_key
+        self.calls.append((actor, name))
+        assert arguments == {"path": "missing/generated-project.zip"}
+        raise RuntimeCapabilityError("workspace read denied or scoped file unavailable")
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "read_context"
 
 
 class RecordingHarnessToolGateway:
@@ -900,6 +951,32 @@ def _tool_plan() -> DispatchPlan:
             ),
         ),
         allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+
+
+def _read_context_tool_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="security_reviewer",
+                role="security_reviewer",
+                goal="Review generated project evidence",
+                logical_model="general",
+                allowed_tools=("read_context",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="security_reviewer_step",
+                agent="security_reviewer",
+                task="Review generated project evidence",
+                tools=("read_context",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("read_context",),
         total_token_budget=100,
     )
 
@@ -2401,6 +2478,36 @@ async def test_replay_safe_harness_backend_error_records_failed_not_uncertain() 
     state = next(iter(tool_states.values()))
     assert isinstance(state, Mapping)
     assert state["status"] == "failed"
+
+
+async def test_read_context_scoped_unavailable_does_not_fail_dispatch_step() -> None:
+    capabilities = ScopedReadUnavailableCapabilities()
+    runtime = CrewDispatchRuntime(
+        ReadContextToolGateway(),
+        _read_context_tool_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(actor_id=uuid4(), actor_role=Role.OPERATOR)
+        )
+    ]
+
+    assert capabilities.calls == [("security_reviewer", "read_context")]
+    assert not any(event.kind is EventKind.TOOL_FAILED for event in events)
+    completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.payload["status"] == "succeeded"
+    artifact = completed.artifact
+    assert artifact is not None
+    result = artifact.content["result"]
+    assert isinstance(result, Mapping)
+    assert result["unavailable"] is True
+    assert result["matches"] == ()
+    assert result["path"] == "missing/generated-project.zip"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_deterministic_harness_errors_record_failed_not_uncertain() -> None:
