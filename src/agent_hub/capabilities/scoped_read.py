@@ -243,11 +243,17 @@ def _read_windows_locked(root: Path, parts: tuple[str, ...], *, max_bytes: int =
             kernel.CloseHandle(handle)
             raise
 
-    # Lock from the drive anchor, not just root: a junction above root must not redirect opens.
+    # Lock the configured root's parent, the root, and every descendant we
+    # traverse. Drive roots are commonly held by the OS or security tools with
+    # broader sharing flags, so treating the drive itself as part of the
+    # exclusive chain makes legitimate workspace reads fail closed before
+    # reaching the scoped root.
     with ExitStack() as stack:
-        current = Path(absolute_root.anchor)
+        current = absolute_root.parent
         stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
-        for part in (*absolute_root.parts[1:], *parts[:-1]):
+        current = absolute_root
+        stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
+        for part in parts[:-1]:
             current = current / part
             stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
         raw_file = open_locked(current / parts[-1], directory=False)

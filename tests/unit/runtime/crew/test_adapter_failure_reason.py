@@ -3083,6 +3083,80 @@ async def test_project_scale_rejected_structured_output_missing_usage_is_estimat
     assert type(tokens) is int and tokens > 0
 
 
+async def test_project_scale_empty_rejected_structured_output_uses_internal_fallback() -> None:
+    task = (
+        "Role mission: synthesize the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+
+    class EmptyRejectedProjectScaleGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise GatewayRejectedOutput(
+                evidence=RejectedOutputEvidence(
+                    final_text=None,
+                    usage=None,
+                    usage_status="missing",
+                    status="completed",
+                    reason="invalid_output",
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="qwen",
+                provider_model="qwen/qwen3-coder",
+                cost_usd=Decimal(0),
+            )
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize the verified project result.",
+                logical_model="qwen",
+                output_schema={
+                    "status": "string",
+                    "summary": "string",
+                    "evidence": "string[]",
+                    "risks": "string[]",
+                    "artifacts": "string[]",
+                    "verification": "string[]",
+                },
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final_response_step",
+                agent="final_synthesizer",
+                task=task,
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(10),
+            ),
+        ),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(10),
+    )
+    gateway = EmptyRejectedProjectScaleGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    events = [
+        event async for event in runtime.run(_context(token_budget=100_000))
+    ]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) == 1
+    assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert checkpoint.state["phase"] == "completed"
+
+
 async def test_project_scale_rejected_structured_recovery_tolerates_framework_raw() -> None:
     task = (
         "Role mission: implement the project.\n"

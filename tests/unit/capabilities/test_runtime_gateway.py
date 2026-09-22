@@ -46,6 +46,16 @@ class FakeManifestSource:
         return self.manifest
 
 
+class FakeArtifactRepository:
+    def __init__(self, artifacts: tuple[dict[str, object], ...]) -> None:
+        self._artifacts = artifacts
+
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert tenant_id == TENANT_ID
+        assert run_id == RUN_ID
+        return self._artifacts
+
+
 class TenantAwareManifestSource:
     def __init__(self) -> None:
         self.tenants: list[UUID] = []
@@ -592,6 +602,75 @@ async def test_runtime_gateway_read_context_accepts_query_without_workspace(tmp_
     assert result["query"] == "activity plan constraints"
     assert result["matches"] == ()
     assert result["truncated"] is False
+
+
+async def test_runtime_gateway_read_context_exposes_project_artifact_context(
+    tmp_path: Path,
+) -> None:
+    repository = FakeArtifactRepository((
+        {
+            "id": "artifact-1",
+            "type": "tool_result",
+            "content": {
+                "result": {
+                    "artifact_id": "zip-1",
+                    "summary": "Generated project ZIP artifact task-api.zip.",
+                    "presentation": "final_attachment",
+                    "file": {
+                        "filename": "task-api.zip",
+                        "mime_type": "application/zip",
+                        "download_url": "/download/task-api.zip",
+                    },
+                    "workspace_files": (
+                        {
+                            "path": "package.json",
+                            "mime_type": "application/json",
+                            "download_url": "/files/package.json",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "path": "src/server.ts",
+                            "mime_type": "text/typescript",
+                            "download_url": "/files/src/server.ts",
+                            "sha256": "b" * 64,
+                        },
+                    ),
+                    "deliverable_quality": {
+                        "requirements_satisfied": True,
+                        "build_passed": True,
+                    },
+                }
+            },
+        },
+    ))
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="tester",
+        name="read_context",
+        arguments={"query": "workspace_bundle files from implementer artifact"},
+        idempotency_key="context_artifact_1",
+    )
+
+    assert result["query"] == "workspace_bundle files from implementer artifact"
+    assert result["summary"] == (
+        "Generated project artifact context is available: package.json, src/server.ts"
+    )
+    matches = result["matches"]
+    assert isinstance(matches, tuple)
+    match = matches[0]
+    assert isinstance(match, Mapping)
+    assert match["artifact_id"] == "zip-1"
+    assert match["file_paths"] == ("package.json", "src/server.ts")
+    assert match["deliverable_quality"] == {
+        "requirements_satisfied": True,
+        "build_passed": True,
+    }
 
 
 async def test_runtime_gateway_invokes_installed_skill_through_sandbox(tmp_path: Path) -> None:

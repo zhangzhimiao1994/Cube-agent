@@ -260,12 +260,54 @@ class RuntimeCapabilityGateway:
             query = arguments.get("text")
         if query is not None and (not isinstance(query, str) or not query.strip()):
             raise RuntimeCapabilityError("read_context query must be a nonblank string")
+        normalized_query = query.strip() if isinstance(query, str) else None
+        matches = await self._read_context_artifact_matches(tenant_id, run_id, normalized_query)
+        if matches:
+            paths = _artifact_context_paths(matches)
+            summary = (
+                "Generated project artifact context is available."
+                if not paths
+                else "Generated project artifact context is available: "
+                + ", ".join(paths[:12])
+                + (" ..." if len(paths) > 12 else "")
+            )
+            return {
+                "query": normalized_query,
+                "matches": matches,
+                "summary": summary,
+                "truncated": False,
+            }
         return {
-            "query": query.strip() if isinstance(query, str) else None,
+            "query": normalized_query,
             "matches": (),
             "summary": "No additional runtime context is available for this query.",
             "truncated": False,
         }
+
+    async def _read_context_artifact_matches(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        query: str | None,
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        if not _read_context_query_requests_artifacts(query):
+            return ()
+        artifacts_method = getattr(self._run_repository, "artifacts", None)
+        if not callable(artifacts_method):
+            return ()
+        artifact_result = artifacts_method(tenant_id, run_id)
+        if isawaitable(artifact_result):
+            artifact_result = await cast(Awaitable[object], artifact_result)
+        if not isinstance(artifact_result, tuple | list):
+            return ()
+        matches: list[Mapping[str, JsonValue]] = []
+        for artifact in artifact_result:
+            if not isinstance(artifact, Mapping):
+                continue
+            match = _project_artifact_context_match(artifact)
+            if match is not None:
+                matches.append(match)
+        return tuple(matches[:8])
 
     async def _execute_workspace_read(
         self, tenant_id: UUID, run_id: UUID, arguments: Mapping[str, JsonValue],
@@ -968,6 +1010,138 @@ def _workspace_file_download_url(
     bundle_url = store.bundle_download_url(project_id, session_id)
     base_url = bundle_url.rsplit("/bundle/download", 1)[0]
     return f"{base_url}/files/download?path={path}"
+
+
+def _read_context_query_requests_artifacts(query: str | None) -> bool:
+    if query is None:
+        return True
+    lowered = query.casefold()
+    markers = (
+        "artifact",
+        "bundle",
+        "file",
+        "implementer",
+        "package",
+        "project",
+        "source",
+        "test",
+        "workspace",
+        "workspace_bundle",
+        "zip",
+        "产物",
+        "文件",
+        "源码",
+        "项目",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _project_artifact_context_match(
+    artifact: Mapping[object, object],
+) -> Mapping[str, JsonValue] | None:
+    content = artifact.get("content")
+    if not isinstance(content, Mapping):
+        return None
+    result = content.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    file_payload = _public_string_mapping(result.get("file"))
+    workspace_files = _public_workspace_files(result.get("workspace_files"))
+    flags = _public_artifact_flags(result)
+    if file_payload is None and not workspace_files and not flags:
+        return None
+    artifact_id = result.get("artifact_id") or artifact.get("id")
+    match: dict[str, JsonValue] = {
+        "kind": "generated_project_artifact",
+        "summary": _public_string(result.get("summary"))
+        or "Generated project artifact is available.",
+    }
+    if isinstance(artifact_id, str) and artifact_id.strip():
+        match["artifact_id"] = artifact_id.strip()
+    if file_payload is not None:
+        match["file"] = file_payload
+    if workspace_files:
+        match["workspace_files"] = workspace_files
+        paths = tuple(
+            path
+            for item in workspace_files
+            if isinstance(path := item.get("path"), str) and path
+        )
+        if paths:
+            match["file_paths"] = paths
+    match.update(flags)
+    return match
+
+
+def _artifact_context_paths(matches: tuple[Mapping[str, JsonValue], ...]) -> list[str]:
+    paths: list[str] = []
+    for match in matches:
+        raw_paths = match.get("file_paths")
+        if not isinstance(raw_paths, tuple):
+            continue
+        for path in raw_paths:
+            if isinstance(path, str) and path not in paths:
+                paths.append(path)
+    return paths
+
+
+def _public_artifact_flags(result: Mapping[object, object]) -> dict[str, JsonValue]:
+    flags: dict[str, JsonValue] = {}
+    for key in (
+        "deliverable_quality",
+        "agent_standard_verification",
+        "discussion_trace",
+        "plugin_contract",
+    ):
+        value = result.get(key)
+        if isinstance(value, Mapping):
+            public = _public_string_mapping(value)
+            if public:
+                flags[key] = public
+    return flags
+
+
+def _public_workspace_files(value: object) -> tuple[Mapping[str, JsonValue], ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    files: list[Mapping[str, JsonValue]] = []
+    for item in value[:64]:
+        if not isinstance(item, Mapping):
+            continue
+        public: dict[str, JsonValue] = {}
+        for key in ("path", "relative_path", "filename", "mime_type", "download_url", "sha256"):
+            raw = item.get(key)
+            if isinstance(raw, str) and raw.strip():
+                public["path" if key == "relative_path" else key] = raw.strip()
+        size = item.get("size", item.get("size_bytes"))
+        if type(size) is int:
+            public["size"] = size
+        if public:
+            files.append(public)
+    return tuple(files)
+
+
+def _public_string_mapping(value: object) -> Mapping[str, JsonValue] | None:
+    if not isinstance(value, Mapping):
+        return None
+    public: dict[str, JsonValue] = {}
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str):
+            continue
+        if isinstance(raw_value, str | bool | int):
+            public[raw_key] = raw_value
+        elif isinstance(raw_value, tuple | list):
+            string_items = tuple(item for item in raw_value if isinstance(item, str))
+            if len(string_items) == len(raw_value):
+                public[raw_key] = string_items
+    return public or None
+
+
+def _public_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _file_result(

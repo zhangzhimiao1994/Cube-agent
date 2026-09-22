@@ -1494,6 +1494,26 @@ def _project_scale_gateway_failure_structured_completion(
     ))
 
 
+def _project_scale_empty_rejected_structured_completion(
+    step: DispatchStep,
+    request: ModelRequest,
+    rejected: GatewayRejectedOutput,
+) -> GatewayCompletion | None:
+    evidence = rejected.evidence
+    if evidence is None:
+        return None
+    if isinstance(evidence.final_text, str) and evidence.final_text.strip():
+        return None
+    reason = evidence.reason.strip() if isinstance(evidence.reason, str) else ""
+    if "empty" not in reason.casefold():
+        reason = "empty_response"
+    return _project_scale_gateway_failure_structured_completion(
+        step,
+        request,
+        f"model gateway failed: {reason}",
+    )
+
+
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -4114,6 +4134,12 @@ class CrewDispatchRuntime:
                 )
                 if completion is None and purpose == "step":
                     completion = _project_scale_rejected_structured_completion(
+                        step,
+                        request,
+                        error,
+                    )
+                if completion is None and purpose == "step":
+                    completion = _project_scale_empty_rejected_structured_completion(
                         step,
                         request,
                         error,
