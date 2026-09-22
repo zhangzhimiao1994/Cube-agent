@@ -1225,6 +1225,13 @@ def _step_timeout_recovery_window_seconds(step: DispatchStep) -> float:
     return _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
 
 
+def _should_check_framework_raw(step: DispatchStep, completion: GatewayCompletion) -> bool:
+    return (
+        not _is_project_scale_recovery_completion(completion)
+        and not _is_project_scale_tool_contract_step(step)
+    )
+
+
 def _is_real_project_scale_handoff(task: object) -> bool:
     text = str(task).casefold()
     return (
@@ -3747,7 +3754,7 @@ class CrewDispatchRuntime:
             _fail("CrewAI bypassed the ModelGateway bridge")
         schema = _agent_response_schema(agent)
         if schema is not None:
-            if not _is_project_scale_recovery_completion(completion):
+            if _should_check_framework_raw(step, completion):
                 _check_framework_raw(schema, completion.response.text, raw)
         elif raw != completion.response.text:
             response = completion.response

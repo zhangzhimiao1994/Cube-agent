@@ -46,6 +46,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
     _tool_definitions,
     _tool_sandbox,
@@ -3185,6 +3186,36 @@ def test_project_scale_tool_step_gets_extended_recovery_window() -> None:
     assert _step_timeout_recovery_window_seconds(step) > _step_timeout_recovery_window_seconds(
         ordinary
     )
+
+
+def test_project_scale_tool_step_skips_framework_raw_check() -> None:
+    step = DispatchStep(
+        id="implementer_step",
+        agent="implementer",
+        task=(
+            "Build a real small business project for flow=dispatch. "
+            "Return strict JSON workspace_bundle.files."
+        ),
+        tools=("project.generate_zip",),
+        token_budget=1000,
+    )
+    ordinary = DispatchStep(
+        id="writer_step",
+        agent="writer",
+        task="Return strict JSON.",
+        token_budget=1000,
+    )
+    completion = GatewayCompletion(
+        response=ModelResponse(text='{"status":"done"}', usage=TokenUsage(1, 1, 2)),
+        deployment_id="primary",
+        logical_model="qwen",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    assert not _should_check_framework_raw(step, completion)
+    assert _should_check_framework_raw(ordinary, completion)
 
 
 async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -> None:
