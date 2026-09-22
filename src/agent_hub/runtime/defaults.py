@@ -5,7 +5,7 @@ from __future__ import annotations
 import keyword
 import logging
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal
 from typing import Literal, Protocol, cast
@@ -378,6 +378,10 @@ class _PlannedRuntime:
                         fallback_policy=self._fallback_policy,
                         config=self._config,
                         required_capabilities_by_role=self._required_capabilities_by_role,
+                    ),
+                    "dispatch_discussion_trace": _dispatch_discussion_trace_payload(
+                        roles=self._roles,
+                        steps=self._steps,
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
@@ -2422,6 +2426,70 @@ def _model_execution_plan_payload(
     if deployment_constraints is not None:
         payload["deployment_constraints"] = deployment_constraints
     return payload
+
+
+def _dispatch_discussion_trace_payload(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    role_by_id = {
+        str(role["id"]): role
+        for role in roles
+        if isinstance(role.get("id"), str)
+    }
+    participants = tuple(role_by_id) or ("main_agent",)
+    member_statements: list[Mapping[str, JsonValue]] = [
+        {
+            "member": "main_agent",
+            "position": (
+                "Select the runtime mode, role graph, model routing, tools, "
+                "and handoff contracts before execution starts."
+            ),
+        }
+    ]
+    for role_id, role in role_by_id.items():
+        role_name = str(role.get("role") or role_id)
+        purpose = str(role.get("purpose") or "execute")
+        logical_model = str(role.get("logical_model") or "unspecified")
+        tools = role.get("tools")
+        tool_note = (
+            ", tools=" + ", ".join(str(item) for item in tools)
+            if isinstance(tools, Sequence) and not isinstance(tools, str | bytes) and tools
+            else ""
+        )
+        member_statements.append({
+            "member": role_id,
+            "position": (
+                f"{role_name} handles {purpose} work with logical_model={logical_model}"
+                f"{tool_note}."
+            ),
+        })
+    verification_steps: tuple[str, ...] = (
+        "Check role_model_assignments for every selected participant.",
+        "Check orchestration_handoffs and orchestration_contracts before dependent steps run.",
+        "Check capability_execution_plan for tool availability, sandbox and approval boundaries.",
+    )
+    if steps:
+        verification_steps = (
+            *verification_steps,
+            "Check step dependencies, final synthesizer selection and blocked-contract recovery hints.",
+        )
+    return {
+        "participants": ("main_agent", *participants),
+        "member_statements": tuple(member_statements),
+        "disagreement_summary": (
+            "Potential tradeoffs are resolved before execution: use the selected runtime mode, "
+            "preserve role handoff contracts, keep tool execution within the capability plan, "
+            "and route downstream validation through the planned reviewer/tester roles."
+        ),
+        "verification_steps": verification_steps,
+        "final_decision": (
+            "Proceed with the selected dispatch plan and use the recorded handoff contracts, "
+            "model assignments and capability plan as the coordination baseline."
+        ),
+    }
+
 
 def _orchestration_handoffs_payload(
     *,

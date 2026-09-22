@@ -16,6 +16,7 @@ import agent_hub.runtime.defaults as defaults_module
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.project_scale_runner import _discussion_trace_payload_passes
 from agent_hub.models.capacity import CapacityLease, CapacityWaitTimeout
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.routing_policy import DeploymentRoutingConstraint
@@ -2335,6 +2336,9 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
             "final_synthesizer": True,
             "tools": (),
         },
+    )
+    assert _discussion_trace_payload_passes(
+        events[0].payload["dispatch_discussion_trace"]
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
