@@ -1600,24 +1600,39 @@ def _markdown_file_heading_path(line: str) -> str | None:
 
 def _markdown_file_blocks_to_files_regex(text: str) -> dict[str, str]:
     files: dict[str, str] = {}
-    pattern = re.compile(
+    heading_pattern = re.compile(
         r"(?ms)#{2,4}\s+(?:`([^`\r\n]+)`|([A-Za-z0-9._/-]+))[ \t]*```[a-zA-Z0-9_-]*[ \t]*"
         r"(?:\r?\n)?(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
     )
-    for match in pattern.finditer(text):
+    for match in heading_pattern.finditer(text):
         path_text = match.group(1) or match.group(2)
         if (
             match.group(2)
-            and "/" not in path_text
-            and "." not in path_text.rsplit("/", 1)[-1]
-            and path_text not in {"Dockerfile", "Makefile", "README", "LICENSE"}
+            and not _is_plain_markdown_file_path(path_text)
         ):
             continue
         path = _safe_embedded_workspace_path(path_text)
         if path is None:
             continue
         files[path] = match.group(3).rstrip() + "\n"
+    comment_pattern = re.compile(
+        r"(?ms)^```[a-zA-Z0-9_-]*[ \t]*\r?\n[ \t]*(?://|#)\s*([A-Za-z0-9._/-]+)\s*\r?\n"
+        r"(.*?)(?:\r?\n)?^[ \t]*```[ \t]*$"
+    )
+    for match in comment_pattern.finditer(text):
+        path_text = match.group(1)
+        if not _is_plain_markdown_file_path(path_text):
+            continue
+        path = _safe_embedded_workspace_path(path_text)
+        if path is None or path in files:
+            continue
+        files[path] = match.group(2).rstrip() + "\n"
     return files
+
+
+def _is_plain_markdown_file_path(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return "/" in path or "." in name or name in {"Dockerfile", "Makefile", "README", "LICENSE"}
 
 
 def _safe_embedded_workspace_path(value: str) -> str | None:
