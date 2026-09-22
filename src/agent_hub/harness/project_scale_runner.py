@@ -2553,7 +2553,12 @@ def _flatten_present_text(value: object) -> str:
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, Mapping):
-        return " ".join(_flatten_present_text(item) for item in value.values())
+        chunks: list[str] = []
+        for key, item in value.items():
+            if isinstance(key, str):
+                chunks.append(key)
+            chunks.append(_flatten_present_text(item))
+        return " ".join(chunks)
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         return " ".join(_flatten_present_text(item) for item in value)
     return ""

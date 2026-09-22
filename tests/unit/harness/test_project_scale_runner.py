@@ -2857,6 +2857,46 @@ def test_workspace_bundle_agent_standard_rejects_generic_json_reading_evidence()
     )
 
 
+def test_workspace_bundle_agent_standard_accepts_json_source_names_as_keys() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Build project\n",
+            "constraints_reading_evidence.json": json.dumps(
+                {
+                    "read_before_implementation": True,
+                    "constraints": {
+                        "AGENTS.md": {"kind": "workspace rules", "status": "read"},
+                        "HANDOFF": {"kind": "handoff", "status": "read"},
+                        "PROJECT_REQUIREMENTS.md": {"kind": "requirements", "status": "read"},
+                    },
+                    "skills": {
+                        "SKILL.md": {
+                            "kind": "agent-standard rules",
+                            "status": "applied",
+                        }
+                    },
+                },
+                sort_keys=True,
+            ),
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; vite build completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert _workspace_bundle_agent_standard_reasons(bundle) == ()
+
+
 def test_agent_standard_verification_accepts_public_tool_event_evidence() -> None:
     bundle = _project_bundle(
         {
