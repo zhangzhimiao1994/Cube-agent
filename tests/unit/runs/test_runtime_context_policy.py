@@ -66,6 +66,36 @@ def test_conversation_history_stays_full_when_inside_budget() -> None:
     assert "first answer" in text
 
 
+def test_conversation_history_full_artifact_identity_is_deterministic() -> None:
+    item = ConversationContextItem(
+        run_id=uuid4(),
+        request="first request",
+        artifacts=(
+            {
+                "producer": "main_agent",
+                "content": {"text": "first answer"},
+            },
+        ),
+    )
+
+    first = _conversation_history_artifact(
+        conversation_id="conv-stable",
+        current_request="continue",
+        context_items=(item,),
+        history_token_budget=4096,
+    )
+    second = _conversation_history_artifact(
+        conversation_id="conv-stable",
+        current_request="continue",
+        context_items=(item,),
+        history_token_budget=4096,
+    )
+
+    assert first is not None and second is not None
+    assert first.id == second.id
+    assert first.content_sha256 == second.content_sha256
+
+
 def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None:
     old_noise = "old implementation detail " * 2000
     latest_decision = "latest important conclusion: use framework-level context compression"

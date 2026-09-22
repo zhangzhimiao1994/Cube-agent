@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
@@ -3861,18 +3862,19 @@ def _conversation_history_artifact(
     bounded_budget = max(1, min(history_token_budget, _MAX_CONVERSATION_HISTORY_TOKENS))
     estimated_tokens = estimate_tokens(history_text)
     if estimated_tokens <= bounded_budget:
+        content: Mapping[str, JsonValue] = {
+            "text": history_text,
+            "conversation_id": conversation_id,
+            "trust": "internal_conversation_summary",
+            "context_policy": "full_history",
+            "estimated_tokens": estimated_tokens,
+            "history_token_budget": bounded_budget,
+        }
         return Artifact(
-            id=uuid4(),
+            id=_stable_conversation_history_artifact_id(content),
             type="text",
             producer="conversation_history",
-            content={
-                "text": history_text,
-                "conversation_id": conversation_id,
-                "trust": "internal_conversation_summary",
-                "context_policy": "full_history",
-                "estimated_tokens": estimated_tokens,
-                "history_token_budget": bounded_budget,
-            },
+            content=content,
         )
 
     compacted = ContextCompactor().compact(
@@ -3898,6 +3900,11 @@ def _conversation_history_artifact(
             "history_token_budget": bounded_budget,
         },
     )
+
+
+def _stable_conversation_history_artifact_id(content: Mapping[str, JsonValue]) -> UUID:
+    payload = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return uuid5(NAMESPACE_URL, f"agent-hub:conversation-history:{payload}")
 
 
 def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:
