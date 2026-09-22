@@ -1853,6 +1853,11 @@ def _deliverable_repair_body(
             "Repair same project; preserve requirements. Return full workspace_bundle.files "
             "or ### `path` fences: source/tests/README/PROJECT_REQUIREMENTS.md/"
             "IMPLEMENTATION_PLAN.md/VERIFICATION.md/constraints_reading_evidence.json. "
+            "constraints_reading_evidence.json must include read_before_implementation:true, "
+            "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
+            "and skills/rules naming applicable SKILL.md or agent-standard rules. "
+            "For medium CRM repairs, include GET /tenants/:tenant_id/opportunities returning "
+            "{items:[...]} and verify created/patched opportunities persist after restart. "
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
             "Report executed checks only.\n"
         )

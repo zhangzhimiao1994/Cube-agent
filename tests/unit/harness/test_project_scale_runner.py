@@ -159,6 +159,8 @@ def test_medium_capability_message_declares_list_response_envelope() -> None:
     message = str(plan.requests[0].body["message"])
 
     assert "All GET list endpoints must return 200 with {items:[...]}" in message
+    assert "GET /tenants/:tenant_id/opportunities" in message
+    assert "opportunities list endpoint is required" in message
 
 
 def test_capability_repair_preserves_business_request_without_claiming_success() -> None:
@@ -202,6 +204,9 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
     assert "GET accounts: expected object" in message
     assert "workspace_bundle.files" in message
     assert "build, test, start" in message
+    assert "read_before_implementation:true" in message
+    assert "AGENTS.md workspace rules" in message
+    assert "GET /tenants/:tenant_id/opportunities" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
