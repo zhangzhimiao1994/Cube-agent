@@ -375,7 +375,10 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "contacts must accept {account_id,name,email}; opportunities must accept "
             "{account_id,name,amount,stage}; PATCH opportunities must accept {stage}; "
             "reminders must accept {contact_id,due_at,note}. The service must not require "
-            "pre-created tenant records; any tenant_id in the URL is a valid isolated namespace."
+            "pre-created tenant records; any tenant_id in the URL is a valid isolated namespace. "
+            "POST create endpoints must return the created object directly with a top-level id, "
+            "and PATCH endpoints must return the updated object directly rather than wrapping "
+            "objects in {data}."
         ),
         "large": (
             "Build a large project: a TypeScript/Node multi-service order operations platform "

@@ -55,6 +55,7 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "contacts must accept {account_id,name,email}" in messages["medium:direct"]
     assert "opportunities must accept {account_id,name,amount,stage}" in messages["medium:direct"]
     assert "opportunity stages must accept open, won, and lost" in messages["medium:direct"]
+    assert "POST create endpoints must return the created object directly with a top-level id" in messages["medium:direct"]
     assert "large project" in messages["large:direct"]
     assert "multi-service order operations platform" in messages["large:direct"]
     assert "ultra-large project" in messages["ultra:direct"]
