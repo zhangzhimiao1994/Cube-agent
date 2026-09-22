@@ -391,6 +391,19 @@ class FailingFactory(CrewObjectFactory):
         return FailingGeneration()
 
 
+class BuildFailingFactory(CrewObjectFactory):
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> FailingGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        raise ValueError("private crew runtime refused storage path")
+
+
 class TimeoutGeneration:
     async def execute(
         self,
@@ -2454,6 +2467,24 @@ async def test_dispatch_framework_failure_records_safe_root_cause() -> None:
     assert any(
         event.kind is EventKind.STEP_FAILED and event.reason == expected for event in events
     )
+
+
+async def test_dispatch_generation_build_failure_records_safe_root_cause() -> None:
+    runtime = CrewDispatchRuntime(
+        UnusedGateway(),
+        _one_step_plan(),
+        crew_factory=BuildFailingFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    expected = "CrewAI generation failed: private crew runtime refused storage path"
+    assert str(caught.value) == expected
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == expected
 
 
 async def test_dispatch_framework_timeout_names_the_step_and_actor() -> None:

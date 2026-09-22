@@ -5340,9 +5340,12 @@ class CrewDispatchRuntime:
         try:
             return self._factory.build(agents, tasks, share_crew=False, telemetry_disabled=True)
         except Exception as error:  # noqa: BLE001
+            failure_reason = _framework_failure_reason("CrewAI generation failed", error)
             error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
             del error
-            _fail("CrewAI generation failed")
+            _fail(failure_reason)
 
     def _is_current_run(self, state: _RunState) -> bool:
         return state.open and self._current_token is state.token
