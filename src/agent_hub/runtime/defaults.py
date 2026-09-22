@@ -1444,8 +1444,12 @@ def _dispatch_plan(
                 role_tools_by_id[role.id],
             ),
             token_budget=role_token_budget,
-            timeout_seconds=(
-                post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
+            timeout_seconds=_role_step_timeout(
+                context,
+                role,
+                tools=role_tools_by_id[role.id],
+                producer_step_timeout=producer_step_timeout,
+                post_product_step_timeout=post_product_step_timeout,
             ),
             cost_budget_usd=step_cost_budget,
         )
@@ -1603,6 +1607,32 @@ def _post_product_step_timeout(
         + role_count_bonus,
         600.0,
     )
+
+
+def _role_step_timeout(
+    context: TaskContext,
+    role: RoleAssignment,
+    *,
+    tools: tuple[str, ...],
+    producer_step_timeout: float,
+    post_product_step_timeout: float,
+) -> float:
+    if _is_post_product_role(role):
+        return post_product_step_timeout
+    if (
+        role.id == "implementer"
+        and PROJECT_SCALE_ARTIFACT_TOOL_NAME in tools
+        and _is_project_scale_generated_project_request(context)
+    ):
+        scale = _project_scale_budget_tier(context)
+        cap = {
+            "small": 600.0,
+            "medium": 900.0,
+            "large": 1200.0,
+            "ultra": 1800.0,
+        }[scale]
+        return max(producer_step_timeout, min(context.timeout_seconds * (2.0 / 3.0), cap))
+    return producer_step_timeout
 
 
 def _final_step_timeout(

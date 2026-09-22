@@ -5589,6 +5589,81 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
         )
 
 
+def test_project_scale_zip_implementer_gets_extended_step_timeout() -> None:
+    roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the requested project.",
+            must_answer=("What architecture is needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="tester",
+            role="Tester",
+            purpose=RolePurpose.VERIFY,
+            mission="Verify the generated project.",
+            must_answer=("What verification passed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="security_reviewer",
+            role="Security Reviewer",
+            purpose=RolePurpose.RISK_REVIEW,
+            mission="Review the generated project risks.",
+            must_answer=("What risks remain?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Build a real small business project for flow=dispatch. "
+                "Return strict JSON workspace_bundle.files (relative paths to full content). "
+                "Include npm run build, npm test, source, tests, README, plan and verification instructions."
+            ),
+            timeout_seconds=900,
+            token_budget=1_000_000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+    assert steps["architect"].timeout_seconds == 405
+    assert steps["implementer"].timeout_seconds == 600
+    assert steps["implementer"].timeout_seconds > steps["architect"].timeout_seconds
+
+
 @pytest.mark.parametrize(
     ("project_request", "expected_budget"),
     (
