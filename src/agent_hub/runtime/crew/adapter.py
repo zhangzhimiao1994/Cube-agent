@@ -4071,6 +4071,7 @@ class CrewDispatchRuntime:
                 if completion is None:
                     rejected = error
                 else:
+                    completion = _completion_with_estimated_usage(completion, request)
                     rejected = self._reject_invalid_structured(request, completion)
                     if rejected is None:
                         self._valid_response(completion)
@@ -4110,6 +4111,7 @@ class CrewDispatchRuntime:
                     if repair is not None:
                         raise _ModelContractFailed("structured correction failed") from None
                     _fail(reason)
+                completion = _completion_with_estimated_usage(completion, request)
                 rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
                     self._valid_response(completion)
