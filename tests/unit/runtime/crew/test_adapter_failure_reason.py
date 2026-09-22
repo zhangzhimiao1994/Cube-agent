@@ -2934,6 +2934,162 @@ async def test_project_scale_rejected_structured_output_missing_usage_is_estimat
     assert type(tokens) is int and tokens > 0
 
 
+async def test_project_scale_rejected_structured_recovery_tolerates_framework_raw() -> None:
+    task = (
+        "Role mission: implement the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+
+    class RewriteRecoveredRaw(RecordingGeneration):
+        async def execute(
+            self,
+            step_id: str,
+            prompt: str,
+            bridge: CrewLLMBridge,
+            *,
+            agent_id: str | None = None,
+            storage_scope: tuple[UUID, UUID],
+        ) -> str:
+            await super().execute(
+                step_id,
+                prompt,
+                bridge,
+                agent_id=agent_id,
+                storage_scope=storage_scope,
+            )
+            return "Created the requested task API files, tests, and verification notes."
+
+    class RejectedProjectScaleGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise GatewayRejectedOutput(
+                evidence=RejectedOutputEvidence(
+                    final_text=(
+                        "Created package.json, src/server.ts, tests, README, "
+                        "and verification notes for the requested task API."
+                    ),
+                    usage=TokenUsage(10, 5, 15),
+                    usage_status="known",
+                    status="completed",
+                    reason="schema_mismatch",
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="implementer",
+                role="Implementer",
+                goal="Build the project.",
+                logical_model="qwen",
+                output_schema={
+                    "status": "string",
+                    "summary": "string",
+                    "evidence": "string[]",
+                    "risks": "string[]",
+                    "artifacts": "string[]",
+                    "verification": "string[]",
+                },
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="implementer_step",
+                agent="implementer",
+                task=task,
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(10),
+            ),
+        ),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(10),
+    )
+    runtime = CrewDispatchRuntime(
+        RejectedProjectScaleGateway(),
+        plan,
+        crew_factory=RecordingFactory(RewriteRecoveredRaw()),
+    )
+
+    events = [event async for event in runtime.run(_context(token_budget=100_000))]
+
+    assert not any(
+        event.payload.get("error_summary") == "framework output mismatch"
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_project_scale_recovered_fallback_model_preserves_checkpoint_lineage() -> None:
+    task = (
+        "Role mission: plan the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+
+    class CapacityThenTransportFallbackGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if request.logical_model == "qwen":
+                raise CapacityUnavailable("model capacity unavailable")
+            raise ModelTransportError("model transport failed", status_code=500)
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="architect",
+                role="Architect",
+                goal="Plan the project.",
+                logical_model="qwen",
+                fallback_models=("sonnet5",),
+                output_schema={
+                    "status": "string",
+                    "summary": "string",
+                    "evidence": "string[]",
+                    "risks": "string[]",
+                    "artifacts": "string[]",
+                    "verification": "string[]",
+                },
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="architect_step",
+                agent="architect",
+                task=task,
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(10),
+            ),
+        ),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(10),
+    )
+    gateway = CapacityThenTransportFallbackGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    events = [event async for event in runtime.run(_context(token_budget=100_000))]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert [request.logical_model for request in gateway.requests] == ["qwen", "sonnet5"]
+    assert not any(
+        event.payload.get("error_summary") == "runtime checkpoint model artifact lineage is invalid"
+        for event in events
+    )
+    assert checkpoint.state["phase"] == "completed"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_agent_fallback_provider_bad_request_retries_next_fallback_model() -> None:
     gateway = CapacityThenBadRequestThenRoleAwareGateway(
         unavailable_logical_model="primary",

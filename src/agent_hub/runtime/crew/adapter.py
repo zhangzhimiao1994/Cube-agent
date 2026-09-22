@@ -43,6 +43,7 @@ from agent_hub.models.gateway import (
     GatewayResponseCancelled,
 )
 from agent_hub.models.types import (
+    JsonScalar,
     ModelCapability,
     ModelMessage,
     ModelRequest,
@@ -124,6 +125,7 @@ _STEP_TIMEOUT_RECOVERY_LAYERS = (
     "failure_closure",
 )
 _MODEL_FALLBACK_UNAVAILABLE = "not_available_in_crewai_bridge"
+_PROJECT_SCALE_RECOVERY_FINISH_REASON = "project_scale_recovery"
 _ACCOUNTING_TERMINAL_REASONS = {
     "budget_exhausted": "dispatch budget exhausted",
     "unaccounted": "dispatch usage unaccounted",
@@ -660,6 +662,38 @@ def _completion_with_estimated_usage(
         fallback_from_logical_model=completion.fallback_from_logical_model,
         fallback_reason=completion.fallback_reason,
         attempted_logical_models=completion.attempted_logical_models,
+    )
+
+
+def _project_scale_recovery_completion(
+    completion: GatewayCompletion,
+) -> GatewayCompletion:
+    response = completion.response
+    metadata = dict(response.provider_metadata)
+    metadata["finish_reason"] = _PROJECT_SCALE_RECOVERY_FINISH_REASON
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=response.text,
+            tool_calls=response.tool_calls,
+            usage=response.usage,
+            provider_metadata=metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+        fallback_used=completion.fallback_used,
+        fallback_from_logical_model=completion.fallback_from_logical_model,
+        fallback_reason=completion.fallback_reason,
+        attempted_logical_models=completion.attempted_logical_models,
+    )
+
+
+def _is_project_scale_recovery_completion(completion: GatewayCompletion) -> bool:
+    return (
+        completion.response.provider_metadata.get("finish_reason")
+        == _PROJECT_SCALE_RECOVERY_FINISH_REASON
     )
 
 
@@ -1297,7 +1331,7 @@ def _project_scale_rejected_structured_completion(
     )
     if payload is None:
         return None
-    return GatewayCompletion(
+    return _project_scale_recovery_completion(GatewayCompletion(
         response=ModelResponse(
             text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             usage=evidence.usage,
@@ -1311,7 +1345,7 @@ def _project_scale_rejected_structured_completion(
         fallback_from_logical_model=rejected.fallback_from_logical_model,
         fallback_reason=rejected.fallback_reason,
         attempted_logical_models=rejected.attempted_logical_models,
-    )
+    ))
 
 
 def _project_scale_structured_payload_from_text(
@@ -1432,7 +1466,7 @@ def _project_scale_gateway_failure_structured_completion(
     )
     if payload is None:
         return None
-    return GatewayCompletion(
+    return _project_scale_recovery_completion(GatewayCompletion(
         response=ModelResponse(
             text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
             usage=TokenUsage(0, 0, 0),
@@ -1443,7 +1477,7 @@ def _project_scale_gateway_failure_structured_completion(
         provider_model="internal/project-scale-planning-fallback",
         cost_usd=Decimal(0),
         attempted_logical_models=(request.logical_model,),
-    )
+    ))
 
 
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
@@ -3705,7 +3739,8 @@ class CrewDispatchRuntime:
             _fail("CrewAI bypassed the ModelGateway bridge")
         schema = _agent_response_schema(agent)
         if schema is not None:
-            _check_framework_raw(schema, completion.response.text, raw)
+            if not _is_project_scale_recovery_completion(completion):
+                _check_framework_raw(schema, completion.response.text, raw)
         elif raw != completion.response.text:
             response = completion.response
             completion = GatewayCompletion(
@@ -4823,6 +4858,7 @@ class CrewDispatchRuntime:
             "fallback_from_logical_model": completion.fallback_from_logical_model,
             "fallback_reason": completion.fallback_reason,
             "attempted_logical_models": completion.attempted_logical_models,
+            "provider_metadata": dict(response.provider_metadata),
         }
         encoded = json.dumps(_mutable_json(content), ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > _MAX_PROMPT_BYTES:
@@ -4864,6 +4900,7 @@ class CrewDispatchRuntime:
                     "fallback_from_logical_model",
                     "fallback_reason",
                     "attempted_logical_models",
+                    "provider_metadata",
                 }
             )
         ):
@@ -4876,6 +4913,7 @@ class CrewDispatchRuntime:
         raw_fallback_from = content.get("fallback_from_logical_model")
         raw_fallback_reason = content.get("fallback_reason")
         raw_attempted_logical_models = content.get("attempted_logical_models", ())
+        raw_provider_metadata = content.get("provider_metadata", {})
         if text is not None and type(text) is not str:
             _fail("model response artifact is invalid")
         if not isinstance(raw_calls, tuple):
@@ -4931,10 +4969,28 @@ class CrewDispatchRuntime:
             type(item) is str for item in raw_attempted_logical_models
         ):
             _fail("model response artifact is invalid")
+        if (
+            not isinstance(raw_provider_metadata, Mapping)
+            or not all(
+                type(key) is str
+                and (
+                    value is None
+                    or type(value) in {str, int, float, bool}
+                )
+                for key, value in raw_provider_metadata.items()
+            )
+        ):
+            _fail("model response artifact is invalid")
         attempted_logical_models = cast(tuple[str, ...], raw_attempted_logical_models)
+        provider_metadata = cast(Mapping[str, JsonScalar], raw_provider_metadata)
         try:
             return GatewayCompletion(
-                response=ModelResponse(text=text, tool_calls=tuple(calls), usage=usage),
+                response=ModelResponse(
+                    text=text,
+                    tool_calls=tuple(calls),
+                    usage=usage,
+                    provider_metadata=provider_metadata,
+                ),
                 deployment_id=provenance.deployment_id,
                 logical_model=provenance.logical_model,
                 provider_id=provenance.provider_id,
