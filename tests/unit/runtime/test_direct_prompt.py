@@ -14,7 +14,11 @@ from agent_hub.harness.project_scale_runner import (
 )
 from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
-from agent_hub.runtime.direct import DirectRuntime, _project_scale_workspace_bundle_from_model_text
+from agent_hub.runtime.direct import (
+    DirectRuntime,
+    RuntimeExecutionError,
+    _project_scale_workspace_bundle_from_model_text,
+)
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from tests.contracts.test_runtime_contract import FakeGateway
 
@@ -182,6 +186,57 @@ def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -
     assert request.max_output_tokens <= 8192
     assert len(user_content.encode("utf-8")) < len(original_text.encode("utf-8"))
     assert artifact.content["text"] == original_text
+
+
+def test_direct_capability_repair_request_uses_project_sized_output_budget() -> None:
+    request = (
+        "Repair same project; preserve requirements. Return full bundle as "
+        "workspace_bundle.files with package.json build/test/start scripts. "
+        "Original request: Build a real medium business project for flow=direct. "
+        "Acceptance conditions: source, tests, verification, and interaction evidence."
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request=request,
+        token_budget=100_000,
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    model_request = runtime._build_request(context).request
+
+    assert model_request is not None
+    assert model_request.max_output_tokens > 8_192
+
+
+@pytest.mark.asyncio
+async def test_direct_capability_request_rejects_summary_without_workspace_bundle() -> None:
+    request = (
+        "Repair same project; preserve requirements. Return full bundle as "
+        "workspace_bundle.files with package.json build/test/start scripts. "
+        "Original request: Build a real medium business project for flow=direct. "
+        "Acceptance conditions: source, tests, verification, and interaction evidence."
+    )
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text="Here is a short summary only.", usage=TokenUsage(20, 8, 28))),
+        logical_model="main",
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle"):
+        [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=uuid4(),
+                    mode=TaskMode.DIRECT,
+                    request=request,
+                    timeout_seconds=60,
+                    token_budget=100_000,
+                )
+            )
+        ]
 
 
 def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:

@@ -49,6 +49,7 @@ _MAX_PROJECT_SCALE_BUNDLE_FILES = 200
 _MAX_CONTEXT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
+_MAX_PROJECT_SCALE_DIRECT_OUTPUT_TOKENS = 65_536
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
@@ -160,6 +161,10 @@ def _is_project_scale_capability_request(request: object) -> bool:
         "repair this same business project" in text
         and "original request: build a real " in text
         and "workspace_bundle.files" in text
+    ) or (
+        "repair same project" in text
+        and "preserve requirements" in text
+        and "workspace_bundle.files" in text
     )
 
 
@@ -167,6 +172,12 @@ def _max_output_bytes_for_context(context: TaskContext) -> int:
     if _is_project_scale_capability_request(context.request):
         return _MAX_PROJECT_SCALE_OUTPUT_BYTES
     return _MAX_OUTPUT_BYTES
+
+
+def _max_direct_output_tokens_for_context(context: TaskContext) -> int:
+    if _is_project_scale_capability_request(context.request):
+        return _MAX_PROJECT_SCALE_DIRECT_OUTPUT_TOKENS
+    return _MAX_DIRECT_OUTPUT_TOKENS
 
 
 def _project_scale_workspace_bundle_from_model_text(
@@ -680,11 +691,18 @@ class DirectRuntime:
                 budget_outcome.completion_exceeded_request
             )
 
+            is_project_scale_capability = _is_project_scale_capability_request(context.request)
             project_scale_workspace_bundle = (
                 _project_scale_workspace_bundle_from_model_text(text)
-                if _is_project_scale_capability_request(context.request)
+                if is_project_scale_capability
                 else None
             )
+            if is_project_scale_capability and project_scale_workspace_bundle is None:
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del text, response, completion, request, included_source_ids, context
+                _raise_execution_error("project-scale workspace bundle is missing")
             artifact_text_preview = _event_text_preview(text)
             artifact_failed = False
             artifact: Artifact | None = None
@@ -731,6 +749,7 @@ class DirectRuntime:
                     request,
                     included_source_ids,
                     context,
+                    is_project_scale_capability,
                     project_scale_workspace_bundle,
                     artifact_text_preview,
                     artifact_content,
@@ -868,7 +887,7 @@ class DirectRuntime:
             return outcome
         max_output_tokens = min(
             context.token_budget - prompt.prompt_estimate,
-            _MAX_DIRECT_OUTPUT_TOKENS,
+            _max_direct_output_tokens_for_context(context),
         )
         if max_output_tokens <= 0:
             del prompt, context, messages

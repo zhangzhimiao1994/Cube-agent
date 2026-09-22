@@ -171,8 +171,14 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
         benchmark_kind="capability",
     )
     message = str(repaired["message"])
-    assert str(body["message"]) in message
+    assert "Build a real small business project for flow=direct" in message
+    assert "persistent task management API" in message
+    assert "POST /tasks" in message
+    assert "npm start must listen on the PORT environment variable" in message
     assert "GET /tasks returns 404" in message
+    assert "workspace_bundle.files" in message
+    assert "build, test, start" in message
+    assert "No ellipses" in message
     assert "VERIFICATION.md" in message
     assert "constraints_reading_evidence.json" in message
     assert "all true" not in message
@@ -194,6 +200,8 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
 
     assert "Repair same project" in message
     assert "GET accounts: expected object" in message
+    assert "workspace_bundle.files" in message
+    assert "build, test, start" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)

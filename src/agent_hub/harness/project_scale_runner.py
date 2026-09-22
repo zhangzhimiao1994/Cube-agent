@@ -1850,10 +1850,11 @@ def _deliverable_repair_body(
     if benchmark_kind == "capability":
         original = original_message if isinstance(original_message, str) else ""
         guidance = (
-            "Repair same project; preserve requirements. Fix defects. Return full bundle: "
-            "source/tests/package config, README, PROJECT_REQUIREMENTS.md, "
-            "IMPLEMENTATION_PLAN.md, VERIFICATION.md, constraints_reading_evidence.json. "
-            "Report only executed checks.\n"
+            "Repair same project; preserve requirements. Return full workspace_bundle.files "
+            "or ### `path` fences: source/tests/README/PROJECT_REQUIREMENTS.md/"
+            "IMPLEMENTATION_PLAN.md/VERIFICATION.md/constraints_reading_evidence.json. "
+            "package.json scripts: build, test, start. No ellipses or summaries in files. "
+            "Report executed checks only.\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
         prefix = guidance + reasons + "\nOriginal request:\n"
