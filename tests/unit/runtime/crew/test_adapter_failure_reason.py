@@ -392,6 +392,9 @@ class FailingFactory(CrewObjectFactory):
 
 
 class BuildFailingFactory(CrewObjectFactory):
+    def __init__(self, message: str = "private crew runtime refused storage path") -> None:
+        self.message = message
+
     def build(
         self,
         agents: tuple[CrewAgentDefinition, ...],
@@ -401,7 +404,7 @@ class BuildFailingFactory(CrewObjectFactory):
         telemetry_disabled: bool,
     ) -> FailingGeneration:
         del agents, tasks, share_crew, telemetry_disabled
-        raise ValueError("private crew runtime refused storage path")
+        raise ValueError(self.message)
 
 
 class TimeoutGeneration:
@@ -2482,6 +2485,24 @@ async def test_dispatch_generation_build_failure_records_safe_root_cause() -> No
             events.append(event)
 
     expected = "CrewAI generation failed: private crew runtime refused storage path"
+    assert str(caught.value) == expected
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == expected
+
+
+async def test_dispatch_generation_build_failure_records_error_type_for_sensitive_cause() -> None:
+    runtime = CrewDispatchRuntime(
+        UnusedGateway(),
+        _one_step_plan(),
+        crew_factory=BuildFailingFactory("api_key credential lookup failed"),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    expected = "CrewAI generation failed: ValueError"
     assert str(caught.value) == expected
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == expected

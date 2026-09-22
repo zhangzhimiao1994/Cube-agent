@@ -1611,7 +1611,9 @@ def _failed_model_state_can_compact_retry(model_state: Mapping[str, JsonValue]) 
 
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
     reason = safe_runtime_failure_reason(error, fallback=prefix)
-    return prefix if reason == prefix else f"{prefix}: {reason}"
+    if reason == prefix:
+        return f"{prefix}: {type(error).__name__}"
+    return f"{prefix}: {reason}"
 
 
 def _deterministic_capability_failure_reason(error: RuntimeCapabilityError) -> str:
