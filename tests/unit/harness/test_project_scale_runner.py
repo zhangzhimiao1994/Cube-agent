@@ -63,7 +63,7 @@ def test_default_generated_project_install_disables_dependency_lifecycle_scripts
 
 
 def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(project_scale_runner_module.time, "monotonic", lambda: 120.0)
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 120.0)
 
     assert project_scale_runner_module._remaining_wait_seconds(150.0, 60.0) == 30.0
     assert project_scale_runner_module._remaining_wait_seconds(110.0, 60.0) == 0
