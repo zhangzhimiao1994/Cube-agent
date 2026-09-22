@@ -98,7 +98,7 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("npm", "test"),
 )
 _GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
-_CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 2
+_CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 3
 _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
@@ -1878,6 +1878,8 @@ def _deliverable_repair_body(
             "constraints_reading_evidence.json must include read_before_implementation:true, "
             "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
             "and skills/rules naming applicable SKILL.md or agent-standard rules. "
+        )
+        medium_guidance = (
             "For medium CRM repairs, include GET /tenants/:tenant_id/opportunities returning "
             "{items:[...]} and verify created/patched opportunities persist after restart; "
             "POST create and PATCH responses must be the object itself with top-level id, "
@@ -1889,8 +1891,15 @@ def _deliverable_repair_body(
             "the URL tenant before validating unrelated fields; a missing or foreign "
             "reference returns 404 NOT_FOUND even if email, due_at, note, amount, or stage "
             "is absent or invalid. "
+            "Strict TypeScript must compile: when using Express, type route params "
+            "with Request<{tenant_id:string,...}> or an equivalent explicit params type "
+            "instead of reading tenant_id from default {} params. "
             "Generated tests must compile: validator helpers that require a field argument "
             "must be called with that field name, or define safe defaults before testing. "
+        )
+        if case_id.startswith("medium:"):
+            guidance += medium_guidance
+        guidance += (
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
             "Report executed checks only.\n"
         )

@@ -214,6 +214,7 @@ def test_capability_repair_bounds_long_medium_request_without_blocking_repair() 
     assert "stages exactly open, won, lost" in message
     assert "Reference validation order is frozen" in message
     assert "missing or foreign reference returns 404 NOT_FOUND" in message
+    assert "Request<{tenant_id:string" in message
     assert "Original request:" in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
@@ -2613,6 +2614,17 @@ def test_capability_generated_project_repair_can_use_second_round(
                 ),
             ),
         ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=2 "
+                    "command=npm run build output_tail="
+                    '"src/routes/accounts.ts(10,34): error TS2339: '
+                    "Property 'tenant_id' does not exist on type '{}'.\""
+                ),
+            ),
+        ),
         project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
     ]
 
@@ -2680,11 +2692,13 @@ def test_capability_generated_project_repair_can_use_second_round(
     assert result.run_id == "run-medium-direct-validation-repair"
     assert result.evidence["generated_project_validation"] is True
     assert result.evidence["deliverable_repair_trace"] is True
-    assert len(client.submitted_bodies) == 3
+    assert len(client.submitted_bodies) == 4
     repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
     assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
     assert "Expected 2 arguments, but got 1" in repair_messages[1]
     assert "validator helpers that require a field argument" in repair_messages[1]
+    assert "Property 'tenant_id' does not exist" in repair_messages[2]
+    assert "Request<{tenant_id:string" in repair_messages[2]
     repair_keys = [
         call[2]
         for call in client.calls
@@ -2696,6 +2710,7 @@ def test_capability_generated_project_repair_can_use_second_round(
     assert repair_keys == [
         "project-scale-medium-direct-0-deliverable-repair",
         "project-scale-medium-direct-0-deliverable-repair-2",
+        "project-scale-medium-direct-0-deliverable-repair-3",
     ]
 
 
