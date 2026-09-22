@@ -4118,6 +4118,17 @@ class CrewDispatchRuntime:
                         request,
                         error,
                     )
+                if (
+                    completion is None
+                    and purpose == "step"
+                    and _is_project_scale_tool_contract_step(step)
+                    and (
+                        error.evidence is None
+                        or not isinstance(error.evidence.final_text, str)
+                        or not error.evidence.final_text.strip()
+                    )
+                ):
+                    _fail("model gateway failed: model response text is empty")
                 if completion is None:
                     rejected = error
                 else:

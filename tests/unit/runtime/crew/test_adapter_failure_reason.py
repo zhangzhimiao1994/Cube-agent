@@ -2855,6 +2855,153 @@ async def test_missing_usage_after_capacity_retry_project_zip_tool_call_is_estim
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_project_scale_tool_contract_rejected_without_text_retries_instead_of_unaccounted() -> None:
+    task = (
+        "Role mission: implement the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+
+    class RejectedThenZipMissingUsageGateway(RoleAwareGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self._rejected = False
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if not self._rejected:
+                self._rejected = True
+                raise GatewayRejectedOutput(
+                    evidence=RejectedOutputEvidence(
+                        final_text=None,
+                        usage=None,
+                        usage_status="missing",
+                        status="completed",
+                        reason="invalid_output",
+                    ),
+                    deployment_id="primary",
+                    logical_model=request.logical_model,
+                    provider_id="deepseek",
+                    provider_model="deepseek/deepseek-v4-flash",
+                    cost_usd=Decimal(0),
+                )
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="provider-zip",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Task API",
+                                "files": {"package.json": "{}\n"},
+                            },
+                        ),
+                    ),
+                    usage=None,
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    class ZipHarnessToolGateway:
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            artifact_id = str(uuid4())
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={
+                    "artifact_id": artifact_id,
+                    "file": {
+                        "artifact_id": artifact_id,
+                        "filename": "task-api.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "download_url": f"/api/v1/admin/runs/{RUN_ID}/artifacts/{artifact_id}/download",
+                    },
+                    "metadata": {
+                        "artifact_id": artifact_id,
+                        "filename": "task-api.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "storage_key": f"{TENANT_ID}/{RUN_ID}/{artifact_id}/task-api.zip",
+                        "download_url": f"/api/v1/admin/runs/{RUN_ID}/artifacts/{artifact_id}/download",
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated project ZIP artifact task-api.zip.",
+                },
+            )
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="implementer",
+                role="Implementer",
+                goal="Build the project.",
+                logical_model="qwen",
+                allowed_tools=("project.generate_zip",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="implementer_step",
+                agent="implementer",
+                task=task,
+                tools=("project.generate_zip",),
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(100),
+            ),
+        ),
+        allowed_tools=("project.generate_zip",),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(100),
+    )
+    gateway = RejectedThenZipMissingUsageGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=ZipHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(token_budget=100_000))]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) >= 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert not any(
+        event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
+        for event in events
+    )
+    assert checkpoint.state["phase"] == "completed"
+    usage = checkpoint.state["usage"]
+    assert isinstance(usage, Mapping)
+    tokens = usage.get("tokens")
+    assert type(tokens) is int and tokens > 0
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_project_scale_rejected_structured_output_missing_usage_is_estimated() -> None:
     task = (
         "Role mission: implement the project.\n"
