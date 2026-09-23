@@ -60,10 +60,35 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.process-detail-modal dl\s*{[\s\S]*min-width:\s*0;[\s\S]*width:\s*100%;/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal dd\s*{[\s\S]*overflow-wrap:\s*anywhere;[\s\S]*word-break:\s*normal;/,
+    /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
   );
   expect(stylesCss).toMatch(
     /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*max-height:\s*92dvh;[\s\S]*width:\s*100vw;/,
+  );
+});
+
+it("lays out process detail modal fields as readable label-value rows", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal dl\s*{[\s\S]*grid-template-columns:\s*minmax\(7rem,\s*0\.28fr\)\s+minmax\(0,\s*1fr\);/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*white-space:\s*pre-wrap;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal dl\s*{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/,
+  );
+});
+
+it("renders action metadata as compact chips so operation targets stay visible", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-action-meta\s*{[\s\S]*display:\s*flex;[\s\S]*flex-wrap:\s*wrap;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-action-meta span\s*{[\s\S]*max-width:\s*100%;[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/,
   );
 });
 

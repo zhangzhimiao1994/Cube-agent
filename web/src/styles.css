@@ -2653,6 +2653,34 @@ article:hover {
   width: 100%;
 }
 
+.agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge),
+.agent-workbench-action-row .agent-workbench-action-meta {
+  grid-column: 3;
+}
+
+.agent-workbench-action-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.22rem;
+  min-width: 0;
+}
+
+.agent-workbench-action-meta span {
+  background: rgba(85, 215, 255, 0.08);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 850;
+  line-height: 1.15;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0.14rem 0.38rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-workbench-action-files {
   display: grid;
   gap: 0.22rem;
@@ -3066,6 +3094,7 @@ article:hover {
 .process-detail-modal dl {
   display: grid;
   gap: 0.42rem;
+  grid-template-columns: minmax(7rem, 0.28fr) minmax(0, 1fr);
   margin: 0;
   min-width: 0;
   padding: 0.1rem 0 0;
@@ -3082,10 +3111,11 @@ article:hover {
   color: var(--text);
   font-size: 0.86rem;
   line-height: 1.48;
-  margin: -0.28rem 0 0;
+  margin: 0;
   max-width: 100%;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-x: auto;
+  overflow-wrap: normal;
   white-space: pre-wrap;
   word-break: normal;
 }
@@ -5317,6 +5347,11 @@ article:hover {
     max-width: 100%;
   }
 
+  .agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge),
+  .agent-workbench-action-row .agent-workbench-action-meta {
+    grid-column: 2;
+  }
+
   .process-detail-modal-backdrop {
     align-items: flex-end;
     padding: 0;
@@ -5332,13 +5367,15 @@ article:hover {
 
   .process-detail-modal dl {
     gap: 0.3rem;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .process-detail-modal dd {
     font-size: 0.9rem;
     line-height: 1.55;
-    margin: -0.16rem 0 0;
+    margin: 0;
     overflow-x: auto;
+    overflow-wrap: normal;
   }
 
   .chat-session-toolbar {

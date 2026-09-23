@@ -1202,7 +1202,61 @@ function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[
   return items.filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)));
 }
 
+function processTargetRowValue(item: ProcessDetailTarget, labelPattern: RegExp) {
+  return item.rows.find((row) => labelPattern.test(row.label))?.value.trim() ?? "";
+}
+
+function processTargetActionOperation(item: ProcessDetailTarget) {
+  const operationKind = processTargetRowValue(item, /操作类别/);
+  const operationLabel = operationKind ? toolOperationKindLabel(operationKind) : "";
+  if (operationLabel) return operationLabel;
+  if (/运行终端|创建文件|编辑文件|读取文件|浏览操作/.test(item.badge)) return item.badge;
+  if (/运行终端|创建文件|编辑文件|读取文件|浏览操作/.test(item.title)) return item.title;
+  if (item.sourceKind?.startsWith("tool.")) return "工具动作";
+  if (item.sourceKind?.startsWith("model.")) return "模型过程";
+  return "";
+}
+
+function processTargetActionTarget(item: ProcessDetailTarget) {
+  const rowTarget =
+    processTargetRowValue(item, /^(关联文件|文件|路径|工作区文件|命令|目标|工具|步骤)$/) ||
+    processTargetRowValue(item, /command|path|file|target|step/i);
+  if (rowTarget) return conciseProcessText(rowTarget, "");
+  if (item.artifact) return artifactFileName(item.artifact);
+  if (item.sourceStepId) return `步骤 ${item.sourceStepId}`;
+  return "";
+}
+
+function processTargetActionMeta(item: ProcessDetailTarget) {
+  const chips = [
+    processTargetRowValue(item, /^执行者$/) || (item.sourceActor === "main_agent" || item.sourceActor === "main" ? "主 Agent" : item.sourceActor ?? ""),
+    processTargetActionOperation(item),
+    processTargetActionTarget(item),
+  ];
+  const seen = new Set<string>();
+  return chips
+    .map((chip) => conciseProcessText(chip, "").trim())
+    .filter((chip) => {
+      if (!chip || seen.has(chip)) return false;
+      seen.add(chip);
+      return true;
+    })
+    .slice(0, 3);
+}
+
+function isWorkbenchExecutionItem(item: ProcessDetailTarget) {
+  const kind = item.sourceKind ?? "";
+  if ((item.sourceActor === "main_agent" || item.sourceActor === "main") && item.sourceStepId === "main_agent_plan") return false;
+  if (item.artifact) return true;
+  if (item.rows.some((row) => row.label === "关联文件")) return true;
+  if (processTargetActionOperation(item)) return true;
+  if (kind.startsWith("tool.") || kind.startsWith("model.") || kind.startsWith("artifact.") || kind.startsWith("message.")) return true;
+  if (kind.startsWith("step.") || kind.startsWith("review.")) return !/调度|讨论|决策/.test(`${item.badge} ${item.title} ${item.message}`);
+  return false;
+}
+
 function isWorkbenchCoordinationItem(item: ProcessDetailTarget) {
+  if (isWorkbenchExecutionItem(item)) return false;
   return (
     item.badge === "调度判断" ||
     item.badge === "调度过程" ||
@@ -3648,12 +3702,20 @@ function WorkbenchActionRow({
   onOpen: (target: ProcessDetailTarget) => void;
   onOpenFile: (file: WorkbenchFileItem) => void;
 }) {
+  const actionMeta = processTargetActionMeta(item);
   return (
     <article className="agent-workbench-action-row">
       <button type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
         <span aria-hidden="true">›</span>
         <small className="process-card-badge">{item.badge}</small>
         <strong>{item.message}</strong>
+        {actionMeta.length > 0 ? (
+          <span className="agent-workbench-action-meta">
+            {actionMeta.map((meta) => (
+              <span key={meta}>{meta}</span>
+            ))}
+          </span>
+        ) : null}
         {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
       </button>
       {files.length > 0 ? (

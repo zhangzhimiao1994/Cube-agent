@@ -1185,8 +1185,10 @@ function detailWorkbenchStatusCounts(cards: DetailProcessCard[]) {
 }
 
 function isDetailCoordinationCard(card: DetailProcessCard) {
+  if (isDetailExecutionCard(card)) return false;
   const kind = card.sourceKind ?? "";
   return (
+    ((card.sourceActor === "main_agent" || card.sourceActor === "main") && card.sourceStepId === "main_agent_plan") ||
     kind.startsWith("dispatch.") ||
     kind.startsWith("discussion.") ||
     kind.startsWith("decision.") ||
@@ -1194,6 +1196,61 @@ function isDetailCoordinationCard(card: DetailProcessCard) {
     card.label === "讨论过程" ||
     card.label === "决策过程"
   );
+}
+
+function detailCardRowValue(card: DetailProcessCard, labelPattern: RegExp) {
+  return card.rows.find((row) => labelPattern.test(row.label))?.value.trim() ?? "";
+}
+
+function detailCardActionOperation(card: DetailProcessCard) {
+  const operationKind = detailCardRowValue(card, /操作类别/);
+  const operationLabel = operationKind ? displayToolOperation(operationKind) : "";
+  if (operationLabel && operationLabel !== operationKind && operationLabel !== "工具") return operationLabel;
+  if (/运行终端|创建文件|编辑文件|读取文件|浏览器|浏览操作/.test(card.label)) return card.label;
+  if (/运行终端|创建文件|编辑文件|读取文件|浏览器|浏览操作/.test(card.title)) return card.title;
+  if (card.sourceKind?.startsWith("tool.")) return "工具动作";
+  if (card.sourceKind?.startsWith("model.")) return "模型过程";
+  return "";
+}
+
+function detailCardActionTarget(card: DetailProcessCard) {
+  const fileTarget = card.workspaceFiles?.[0]?.title || card.workspaceFiles?.[0]?.filename || "";
+  if (fileTarget) return fileTarget;
+  const rowTarget =
+    detailCardRowValue(card, /^(关联文件|文件|路径|工作区文件|命令|目标|工具|步骤)$/) ||
+    detailCardRowValue(card, /command|path|file|target|step/i);
+  if (rowTarget) return conciseProcessText(rowTarget, "");
+  if (card.artifact) return artifactFileName(card.artifact);
+  if (card.sourceStepId) return `步骤 ${card.sourceStepId}`;
+  return "";
+}
+
+function detailCardActionMeta(card: DetailProcessCard) {
+  const chips = [
+    detailCardRowValue(card, /^执行者$/) || displayDetailActor(card.sourceActor),
+    detailCardActionOperation(card),
+    detailCardActionTarget(card),
+  ];
+  const seen = new Set<string>();
+  return chips
+    .map((chip) => conciseProcessText(chip, "").trim())
+    .filter((chip) => {
+      if (!chip || seen.has(chip)) return false;
+      seen.add(chip);
+      return true;
+    })
+    .slice(0, 3);
+}
+
+function isDetailExecutionCard(card: DetailProcessCard) {
+  const kind = card.sourceKind ?? "";
+  if ((card.sourceActor === "main_agent" || card.sourceActor === "main") && card.sourceStepId === "main_agent_plan") return false;
+  if (card.artifact || (card.workspaceFiles?.length ?? 0) > 0) return true;
+  if (card.rows.some((row) => row.label === "关联文件")) return true;
+  if (detailCardActionOperation(card)) return true;
+  if (kind.startsWith("tool.") || kind.startsWith("model.") || kind.startsWith("artifact.") || kind.startsWith("message.")) return true;
+  if (kind.startsWith("step.") || kind.startsWith("review.")) return !/调度|讨论|决策/.test(`${card.label} ${card.title} ${card.detail}`);
+  return false;
 }
 
 function minutePart(value: string, label: string) {
@@ -2505,6 +2562,7 @@ function DetailWorkbenchActionRow({
   onOpen: (card: DetailProcessCard) => void;
   onOpenFile: (file: DetailWorkbenchFileItem) => void;
 }) {
+  const actionMeta = detailCardActionMeta(card);
   return (
     <article className="agent-workbench-action-row">
       <button
@@ -2515,6 +2573,13 @@ function DetailWorkbenchActionRow({
         <span aria-hidden="true">›</span>
         <small className="process-card-badge">{card.label}</small>
         <strong>{card.title}</strong>
+        {actionMeta.length > 0 ? (
+          <span className="agent-workbench-action-meta">
+            {actionMeta.map((meta) => (
+              <span key={meta}>{meta}</span>
+            ))}
+          </span>
+        ) : null}
         {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
       </button>
       {files.length > 0 ? (
