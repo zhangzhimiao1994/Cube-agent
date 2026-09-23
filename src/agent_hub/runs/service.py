@@ -1396,7 +1396,25 @@ class RunService:
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
-                await runtime.restore_checkpoint(checkpoint)
+                try:
+                    await runtime.restore_checkpoint(checkpoint)
+                except Exception as error:
+                    if not _should_drop_incompatible_self_repair_checkpoint(
+                        error,
+                        routing_decision,
+                    ):
+                        raise
+                    _LOGGER.warning(
+                        "self_repair_checkpoint_restore_incompatible_dropped "
+                        "run_id=%s error_type=%s",
+                        run_id,
+                        type(error).__name__,
+                    )
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                    checkpoint = None
             token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
             instructions = None
             if mode in (TaskMode.DIRECT, TaskMode.DISPATCH) and self._instruction_context_loader is not None:
@@ -2484,6 +2502,20 @@ def _routing_source(routing_decision: Mapping[str, object] | None) -> str | None
         return None
     source = routing_decision.get("source")
     return source if isinstance(source, str) else None
+
+
+def _should_drop_incompatible_self_repair_checkpoint(
+    error: Exception,
+    routing_decision: Mapping[str, object] | None,
+) -> bool:
+    if (
+        _routing_source(routing_decision) != "self_repair"
+        or routing_decision is None
+        or routing_decision.get("self_repair_accepted") is not True
+    ):
+        return False
+    reason = safe_runtime_failure_reason(error).casefold()
+    return "runtime checkpoint is incompatible" in reason
 
 
 def _self_repair_execution_payload(

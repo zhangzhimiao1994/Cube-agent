@@ -580,6 +580,16 @@ class RuntimeRecordsRestoredCheckpointCompletes(RuntimeRecordsRepairContextCompl
         self.restored_checkpoints.append(checkpoint)
 
 
+class RuntimeDropsIncompatibleSelfRepairCheckpoint(RuntimeRecordsRepairContextCompletes):
+    def __init__(self) -> None:
+        super().__init__()
+        self.restored_checkpoints: list[RuntimeCheckpoint] = []
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored_checkpoints.append(checkpoint)
+        raise RuntimeError("runtime checkpoint is incompatible")
+
+
 class RuntimeReportsCapacityPressure:
     mode = TaskMode.DISPATCH
 
@@ -2173,6 +2183,40 @@ async def test_accepted_self_repair_execute_restores_latest_checkpoint() -> None
     assert repaired.status is RunStatus.COMPLETED
     assert repair_runtime.restored_checkpoints == [repository.checkpoint]
     assert repair_runtime.contexts[0].checkpoint == repository.checkpoint
+    assert repair_runtime.contexts[0].routing_decision["self_repair_accepted"] is True
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_drops_incompatible_checkpoint_and_retries_fresh() -> None:
+    repository = SelfRepairCheckpointRepository(routing_decision={"source": "manual"})
+    failure_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    failed = await failure_service.execute(repository.run_id)
+    assert failed.decision_token is not None
+    await failure_service.accept_self_repair(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=repository.run_id,
+        decision_token=failed.decision_token,
+        version=failed.version,
+    )
+    repair_runtime = RuntimeDropsIncompatibleSelfRepairCheckpoint()
+    repair_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((repair_runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    repaired = await repair_service.execute(repository.run_id)
+
+    assert repaired.status is RunStatus.COMPLETED
+    assert repair_runtime.restored_checkpoints == [repository.checkpoint]
+    assert repair_runtime.contexts[0].checkpoint is None
     assert repair_runtime.contexts[0].routing_decision["self_repair_accepted"] is True
 
 
