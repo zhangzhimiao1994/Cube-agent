@@ -1529,6 +1529,43 @@ def _project_scale_gateway_failure_structured_completion(
     ))
 
 
+def _project_scale_tool_round_limit_structured_completion(
+    step: DispatchStep,
+    request: ModelRequest,
+    evidence: Sequence[Artifact],
+) -> GatewayCompletion | None:
+    if (
+        not _is_real_project_scale_handoff(step.task)
+        or _is_project_scale_tool_contract_step(step)
+        or request.response_schema is None
+        or not any(artifact.type == "tool_result" for artifact in evidence)
+    ):
+        return None
+    payload = _project_scale_structured_payload_from_text(
+        request.response_schema,
+        (
+            "Internal project-scale tool-loop fallback after repeated capability "
+            "requests reached the round limit. Existing tool evidence was collected; "
+            "finish this role from the available verification evidence without "
+            "requesting additional tools."
+        ),
+    )
+    if payload is None:
+        return None
+    return _project_scale_recovery_completion(GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            usage=TokenUsage(0, 0, 0),
+        ),
+        deployment_id="internal_project_scale",
+        logical_model=request.logical_model,
+        provider_id="internal",
+        provider_model="internal/project-scale-tool-loop-fallback",
+        cost_usd=Decimal(0),
+        attempted_logical_models=(request.logical_model,),
+    ))
+
+
 def _project_scale_empty_rejected_structured_completion(
     step: DispatchStep,
     request: ModelRequest,
@@ -4428,6 +4465,13 @@ class CrewDispatchRuntime:
                 )
                 if reusable_results and all(result is not None for result in reusable_results):
                     return _generated_file_ready_completion(completion, response)
+                round_limit_completion = _project_scale_tool_round_limit_structured_completion(
+                    step,
+                    request,
+                    evidence,
+                )
+                if round_limit_completion is not None:
+                    return round_limit_completion
                 _fail("step capability round limit exceeded")
             trigger_model_artifact = evidence[-1]
             if trigger_model_artifact.type != "model_response":

@@ -127,6 +127,32 @@ class ReadContextToolGateway:
         )
 
 
+class RepeatingReadContextToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id=f"provider-call-{len(self.requests)}",
+                        name="read_context",
+                        arguments={"query": "generated project verification evidence"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ManifestToolGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -330,6 +356,11 @@ class ScopedReadUnavailableCapabilities(FakeCapabilities):
         assert arguments == {"path": "missing/generated-project.zip"}
         raise RuntimeCapabilityError("workspace read denied or scoped file unavailable")
 
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "read_context"
+
+
+class ReadContextCapabilities(FakeCapabilities):
     def is_replay_safe(self, name: str) -> bool:
         return name == "read_context"
 
@@ -978,6 +1009,47 @@ def _read_context_tool_plan() -> DispatchPlan:
         ),
         allowed_tools=("read_context",),
         total_token_budget=100,
+    )
+
+
+def _project_scale_repeating_read_context_plan() -> DispatchPlan:
+    task = (
+        "Role mission: verify generated project evidence.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="tester",
+                role="tester",
+                goal="Verify generated project evidence",
+                logical_model="general",
+                allowed_tools=("read_context",),
+                output_schema={
+                    "status": "string",
+                    "summary": "string",
+                    "evidence": "string[]",
+                    "risks": "string[]",
+                    "artifacts": "string[]",
+                    "verification": "string[]",
+                },
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="tester_step",
+                agent="tester",
+                task=task,
+                tools=("read_context",),
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(10),
+            ),
+        ),
+        allowed_tools=("read_context",),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(10),
     )
 
 
@@ -2508,6 +2580,36 @@ async def test_read_context_scoped_unavailable_does_not_fail_dispatch_step() -> 
     assert result["matches"] == ()
     assert result["path"] == "missing/generated-project.zip"
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_project_scale_repeating_read_context_round_limit_completes_from_tool_evidence() -> None:
+    capabilities = ReadContextCapabilities()
+    gateway = RepeatingReadContextToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _project_scale_repeating_read_context_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                actor_id=uuid4(),
+                actor_role=Role.OPERATOR,
+                token_budget=100_000,
+            )
+        )
+    ]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) > 1
+    assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert checkpoint.state["phase"] == "completed"
 
 
 async def test_deterministic_harness_errors_record_failed_not_uncertain() -> None:
