@@ -670,6 +670,14 @@ def execute_project_scale_plan(
                         ),
                     )
                     break
+                if run_id is not None and not _is_terminal_status(status):
+                    try:
+                        cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")
+                        evidence["cleanup_cancel"] = isinstance(cleanup, dict)
+                        if isinstance(cleanup, dict):
+                            status = _string_value(cleanup.get("status")) or status
+                    except Exception as error:  # noqa: BLE001 - repair can still supersede it.
+                        errors.append(f"cleanup_cancel: {error}")
                 deliverable_repair_attempts += 1
                 repair_response = client.request_json(
                     "POST",
@@ -3013,8 +3021,12 @@ def _should_attempt_deliverable_repair(
     case_id: str,
     benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> bool:
+    has_observable_deliverable = (
+        evidence.get("final_artifacts") is True
+        and evidence.get("workspace_bundle") is True
+    )
     return (
-        status in {"completed", "failed"}
+        (status in {"completed", "failed"} or has_observable_deliverable)
         and evidence.get("final_artifacts") is True
         and (
             evidence.get("workspace_bundle") is not True

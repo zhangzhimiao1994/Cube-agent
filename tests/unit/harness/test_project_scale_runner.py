@@ -406,6 +406,23 @@ def test_process_evidence_only_triggers_fixture_repair(
     ) is True
 
 
+def test_running_run_with_final_bundle_and_failed_validation_triggers_repair() -> None:
+    evidence = {
+        "final_artifacts": True,
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "generated_project_validation": False,
+        "agent_standard_verification": False,
+    }
+
+    assert _should_attempt_deliverable_repair(
+        status="running",
+        evidence=evidence,
+        case_id="small:dispatch",
+        benchmark_kind="capability",
+    ) is True
+
+
 @pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
 @pytest.mark.parametrize(
     "source", ("details", "model_text", "event_flags", "zip_flags", "zip_reading", "zip_plan")
@@ -2591,6 +2608,66 @@ def test_execute_project_scale_plan_repairs_generated_project_validation_failure
     repair_message = str(client.submitted_bodies[1]["message"])
     assert "generated_project_validation: command failed exit=7" in repair_message
     assert "rerun build/test/interaction checks" in repair_message
+
+
+def test_execute_project_scale_plan_repairs_running_run_with_invalid_generated_project(
+    tmp_path: Path,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("medium",),
+        flows=("artifact_production",),
+        execute=True,
+    )
+    marker = tmp_path / "running-validation-repaired"
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact-running-validation",
+        session_id="project-scale-medium-artifact_production",
+        statuses=("running", "completed"),
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=30,
+        poll_interval_seconds=0,
+        validate_generated_project=True,
+        generated_project_commands=(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    f"p=Path({str(marker)!r}); "
+                    "sys.exit(0) if p.exists() else (p.write_text('seen'), sys.exit(7))"
+                ),
+            ),
+        ),
+    )
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-medium-artifact-running-validation-repair"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["generated_project_validation"] is True
+    repair_message = str(client.submitted_bodies[1]["message"])
+    assert "generated_project_validation: command failed exit=7" in repair_message
 
 
 def test_execute_project_scale_plan_does_not_start_unobservable_repair_after_wait_budget_expires(
