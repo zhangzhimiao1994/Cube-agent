@@ -1579,6 +1579,59 @@ def _project_scale_tool_round_limit_structured_completion(
     ))
 
 
+def _project_scale_forbidden_tool_structured_completion(
+    step: DispatchStep,
+    request: ModelRequest,
+    evidence: Sequence[Artifact],
+) -> GatewayCompletion | None:
+    if (
+        not _is_real_project_scale_handoff(step.task)
+        or _is_project_scale_tool_contract_step(step)
+        or request.response_schema is None
+        or not any(artifact.type == "tool_result" for artifact in evidence)
+    ):
+        return None
+    payload = _project_scale_structured_payload_from_text(
+        request.response_schema,
+        (
+            "Internal project-scale tool-scope fallback after the role requested a "
+            "capability outside its allowed step tools. Existing tool evidence was "
+            "already collected; finish this role from the available verification "
+            "evidence without requesting additional tools."
+        ),
+    )
+    if payload is None:
+        return None
+    return _project_scale_recovery_completion(GatewayCompletion(
+        response=ModelResponse(
+            text=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            usage=TokenUsage(0, 0, 0),
+        ),
+        deployment_id="internal_project_scale",
+        logical_model=request.logical_model,
+        provider_id="internal",
+        provider_model="internal/project-scale-tool-scope-fallback",
+        cost_usd=Decimal(0),
+        attempted_logical_models=(request.logical_model,),
+    ))
+
+
+def _project_scale_can_skip_forbidden_tool_placeholders(
+    step: DispatchStep,
+    tool_ledger: _ToolLedger,
+    tool_calls: Sequence[ToolCall],
+) -> bool:
+    return (
+        _is_real_project_scale_handoff(step.task)
+        and not _is_project_scale_tool_contract_step(step)
+        and any(tool_call.name not in step.tools for tool_call in tool_calls)
+        and any(
+            state.get("step_id") == step.id and state.get("status") == "succeeded"
+            for state in tool_ledger.states.values()
+        )
+    )
+
+
 def _project_scale_empty_rejected_structured_completion(
     step: DispatchStep,
     request: ModelRequest,
@@ -3000,6 +3053,12 @@ class CrewDispatchRuntime:
                         round_index = cast(int, model_state["call_index"])
                         for tool_index, tool_call in enumerate(completion.response.tool_calls):
                             if tool_call.name not in steps[step_id].tools:
+                                if _project_scale_can_skip_forbidden_tool_placeholders(
+                                    steps[step_id],
+                                    tool_ledger,
+                                    completion.response.tool_calls,
+                                ):
+                                    continue
                                 _fail("step requested a forbidden capability")
                             try:
                                 canonical_arguments = json.dumps(
@@ -4614,6 +4673,13 @@ class CrewDispatchRuntime:
             reused_generated_file_results = 0
             for tool_index, tool_call in enumerate(response.tool_calls):
                 if tool_call.name not in step.tools:
+                    fallback_completion = _project_scale_forbidden_tool_structured_completion(
+                        step,
+                        request,
+                        evidence,
+                    )
+                    if fallback_completion is not None:
+                        return fallback_completion
                     _fail("step requested a forbidden capability")
                 try:
                     canonical_arguments = json.dumps(

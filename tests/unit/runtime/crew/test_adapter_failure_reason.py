@@ -153,6 +153,47 @@ class RepeatingReadContextToolGateway:
         )
 
 
+class ReadContextThenForbiddenToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call-read-context",
+                        name="read_context",
+                        arguments={"query": "generated project verification evidence"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call-forbidden",
+                        name="project.generate_zip",
+                        arguments={"title": "tester should not write"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ManifestToolGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -2605,6 +2646,36 @@ async def test_project_scale_repeating_read_context_round_limit_completes_from_t
     checkpoint = await runtime.save_checkpoint()
 
     assert len(gateway.requests) > 1
+    assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert checkpoint.state["phase"] == "completed"
+
+
+async def test_project_scale_tester_forbidden_tool_after_evidence_completes_from_tool_evidence() -> None:
+    capabilities = ReadContextCapabilities()
+    gateway = ReadContextThenForbiddenToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _project_scale_repeating_read_context_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                actor_id=uuid4(),
+                actor_role=Role.OPERATOR,
+                token_budget=100_000,
+            )
+        )
+    ]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) == 2
     assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
     assert not any(event.kind is EventKind.STEP_FAILED for event in events)
     assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
