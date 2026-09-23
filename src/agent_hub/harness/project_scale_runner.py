@@ -1880,9 +1880,10 @@ def _scoped_execution_body(
     scoped = dict(body)
     session_id = _string_value(scoped.get("workspace_session_id"))
     if session_id:
-        scoped["workspace_session_id"] = (
-            f"{session_id}-{_safe_idempotency_token(execution_id)}"
-        )[:120]
+        scoped["workspace_session_id"] = _safe_workspace_session_token(
+            session_id,
+            execution_id,
+        )
     return scoped
 
 
@@ -2022,6 +2023,15 @@ def _safe_idempotency_token(value: str) -> str:
         for character in value.strip()
     ).strip("-")
     return (safe or "run")[:48]
+
+
+def _safe_workspace_session_token(session_id: str, execution_id: str) -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "-", execution_id.casefold())
+    token = re.sub(r"[-_]{2,}", "-", token).strip("-_")
+    scoped = f"{session_id}-{token or 'run'}"
+    scoped = re.sub(r"[^a-z0-9_-]+", "-", scoped.casefold())
+    scoped = re.sub(r"[-_]{2,}", "-", scoped).strip("-_")
+    return (scoped or "project-scale-run")[:64].rstrip("-_") or "project-scale-run"
 
 
 def _case_requires_project_preflight(case_id: str) -> bool:

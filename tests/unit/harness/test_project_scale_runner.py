@@ -1402,6 +1402,28 @@ def test_execute_project_scale_plan_can_scope_idempotency_to_execution_id() -> N
     )
 
 
+def test_execute_project_scale_plan_keeps_scoped_workspace_session_safe() -> None:
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("dispatch",), execute=True)
+    expected_session = "project-scale-small-dispatch-8775fe0-small-dispatch-auth-1790174"
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        session_id=expected_session,
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        execution_id="8775fe0-small-dispatch-auth-1790174660",
+    )
+
+    submitted_session = client.submitted_bodies[0]["workspace_session_id"]
+    assert report.ok is True
+    assert isinstance(submitted_session, str)
+    assert submitted_session == expected_session
+    assert len(submitted_session) <= 64
+
+
 def test_project_scale_repair_attempted_counts_self_repair_trace() -> None:
     result = ProjectScaleCaseResult(
         case_id="small:self_repair",
