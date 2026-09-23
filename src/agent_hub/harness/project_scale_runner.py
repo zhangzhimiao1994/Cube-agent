@@ -891,11 +891,19 @@ def _effective_execute_wait_seconds(
             runtime_timeouts.append(float(value))
     if runtime_timeouts:
         runtime_wait_seconds = max(runtime_timeouts)
+        repair_attempts = (
+            _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS
+            if plan.benchmark_kind == "capability"
+            else _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
+        )
         validation_grace_seconds = max(
             _EXECUTE_QUEUE_GRACE_SECONDS,
             max(generated_project_timeout_seconds, 0.0) * 2,
         )
-        wait_seconds = max(wait_seconds, runtime_wait_seconds + validation_grace_seconds)
+        wait_seconds = max(
+            wait_seconds,
+            runtime_wait_seconds * (1 + repair_attempts) + validation_grace_seconds,
+        )
     return wait_seconds
 
 

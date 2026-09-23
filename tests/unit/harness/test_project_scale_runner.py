@@ -95,7 +95,7 @@ def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPat
     assert project_scale_runner_module._remaining_wait_seconds(150.0, 0) == 0
 
 
-def test_effective_execute_wait_seconds_respects_case_runtime_timeout() -> None:
+def test_effective_execute_wait_seconds_reserves_capability_repair_budget() -> None:
     plan = build_project_scale_run_plan(
         benchmark_kind="capability",
         scales=("small",),
@@ -109,15 +109,15 @@ def test_effective_execute_wait_seconds_respects_case_runtime_timeout() -> None:
             120,
             generated_project_timeout_seconds=240,
         )
-        == 1800
+        == 4500
     )
     assert (
         project_scale_runner_module._effective_execute_wait_seconds(
             plan,
-            2100,
+            5000,
             generated_project_timeout_seconds=240,
         )
-        == 2100
+        == 5000
     )
 
 
