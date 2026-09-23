@@ -531,6 +531,7 @@ def execute_project_scale_plan(
                 current_status=status,
                 evidence=evidence,
                 errors=errors,
+                defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
             )
             status = observation.status
             initial_self_repair_trace = _has_self_repair_trace(observation.events)
@@ -588,6 +589,7 @@ def execute_project_scale_plan(
                             current_status=status,
                             evidence=evidence,
                             errors=errors,
+                            defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                         )
                         observation = self_repair_observation
                         status = self_repair_observation.status
@@ -729,6 +731,7 @@ def execute_project_scale_plan(
                     current_status=status,
                     evidence=evidence,
                     errors=errors,
+                    defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                 )
                 status = repair_observation.status
                 _extend_unique(
@@ -841,6 +844,8 @@ def execute_project_scale_plan(
             if run_id is not None:
                 if _is_terminal_status(status):
                     evidence["cleanup_cancel"] = True
+                elif plan.benchmark_kind == "capability" and not evidence["final_artifacts"]:
+                    pass
                 else:
                     try:
                         cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")
@@ -1430,6 +1435,7 @@ def _collect_run_observation(
     current_status: str | None,
     evidence: dict[str, bool],
     errors: list[str],
+    defer_artifacts_until_terminal: bool = False,
 ) -> _RunObservation:
     status = current_status
     details: dict[str, object] | None = None
@@ -1475,6 +1481,17 @@ def _collect_run_observation(
         errors.append("run_events: empty event stream")
     else:
         errors.append("run_events: returned non-list JSON")
+
+    if defer_artifacts_until_terminal and not _is_terminal_status(status) and not evidence["final_artifacts"]:
+        errors.append(
+            f"run_observation: status {status or 'unknown'} before terminal artifact collection"
+        )
+        return _RunObservation(
+            status=status,
+            details=details,
+            events=events,
+            workspace_bundle=None,
+        )
 
     try:
         workspace_bundle = client.request_bytes("GET", _workspace_bundle_path(body))

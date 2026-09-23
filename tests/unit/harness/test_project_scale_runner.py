@@ -3429,6 +3429,36 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     assert client.calls.count(("GET", "/api/v1/runs/run-small-self-repair/details", None)) == 2
 
 
+def test_execute_project_scale_plan_does_not_cancel_or_fetch_bundle_for_running_timeout() -> None:
+    plan = build_project_scale_run_plan(benchmark_kind="capability", scales=("medium",), flows=("hybrid",), execute=True)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-hybrid",
+        session_id="project-scale-medium-hybrid",
+        status="running",
+        events=[{"kind": "discussion.completed", "run_id": "run-medium-hybrid"}],
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=0, poll_interval_seconds=0)
+
+    result = report.results[0]
+    assert result.status == "running"
+    assert result.evidence["run_details"] is True
+    assert result.evidence["run_events"] is True
+    assert result.evidence["terminal_status"] is False
+    assert result.evidence["workspace_bundle"] is False
+    assert result.evidence["cleanup_cancel"] is False
+    assert (
+        "run_observation: status running before terminal artifact collection"
+        in result.errors
+    )
+    assert (
+        "GET",
+        "/api/v1/workspaces/projects/project-scale-acceptance/sessions/project-scale-medium-hybrid/bundle/download",
+        None,
+    ) not in client.calls
+    assert ("POST", "/api/v1/runs/run-medium-hybrid/cancel", None) not in client.calls
+
+
 def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("dispatch",), execute=True)
     client = FakeAcceptanceClient(
