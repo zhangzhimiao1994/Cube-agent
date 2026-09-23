@@ -66,22 +66,26 @@ def provider_events_to_run_events(
         payload = _provider_event_payload(event)
         if event.kind in {"model.fallback", "tool.requested"} and not payload:
             continue
-        tool_fields: dict[str, str] = {}
         if event.kind == "tool.requested":
             tool_call_id = _safe_text(event.payload.get("id"))
             tool_name = _safe_text(event.payload.get("name"))
             if tool_call_id is not None and tool_name is not None:
-                tool_fields = {
-                    "actor": "provider",
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                }
+                yield RunEvent(
+                    kind=event.kind,
+                    sequence=sequence,
+                    run_id=run_id,
+                    actor="provider",
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    payload=payload,
+                )
+                sequence += 1
+                continue
         yield RunEvent(
             kind=event.kind,
             sequence=sequence,
             run_id=run_id,
             payload=payload,
-            **tool_fields,
         )
         sequence += 1
 
