@@ -99,6 +99,7 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
 )
 _DEFAULT_GENERATED_PROJECT_NPM_REGISTRY = "https://registry.npmmirror.com"
 _GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
+_EXECUTE_QUEUE_GRACE_SECONDS = 900.0
 _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 3
 _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
 _DISCUSSION_TRACE_FLOWS = frozenset(
@@ -867,6 +868,8 @@ def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | No
 def _effective_execute_wait_seconds(
     plan: ProjectScaleRunPlan,
     configured_wait_seconds: float,
+    *,
+    generated_project_timeout_seconds: float = 0.0,
 ) -> float:
     wait_seconds = max(configured_wait_seconds, 0.0)
     runtime_timeouts: list[float] = []
@@ -875,7 +878,12 @@ def _effective_execute_wait_seconds(
         if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
             runtime_timeouts.append(float(value))
     if runtime_timeouts:
-        wait_seconds = max(wait_seconds, max(runtime_timeouts))
+        runtime_wait_seconds = max(runtime_timeouts)
+        validation_grace_seconds = max(
+            _EXECUTE_QUEUE_GRACE_SECONDS,
+            max(generated_project_timeout_seconds, 0.0) * 2,
+        )
+        wait_seconds = max(wait_seconds, runtime_wait_seconds + validation_grace_seconds)
     return wait_seconds
 
 
@@ -980,7 +988,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 password=password,
                 tenant_id=tenant_id,
             ),
-            wait_seconds=_effective_execute_wait_seconds(plan, args.wait_seconds),
+            wait_seconds=_effective_execute_wait_seconds(
+                plan,
+                args.wait_seconds,
+                generated_project_timeout_seconds=args.artifact_build_timeout,
+            ),
             poll_interval_seconds=args.poll_interval,
             execution_id=args.execution_id or _default_execution_id(),
             validate_generated_project=args.validate_generated_project,

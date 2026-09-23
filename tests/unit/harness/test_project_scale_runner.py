@@ -103,8 +103,22 @@ def test_effective_execute_wait_seconds_respects_case_runtime_timeout() -> None:
         execute=True,
     )
 
-    assert project_scale_runner_module._effective_execute_wait_seconds(plan, 120) == 900
-    assert project_scale_runner_module._effective_execute_wait_seconds(plan, 1200) == 1200
+    assert (
+        project_scale_runner_module._effective_execute_wait_seconds(
+            plan,
+            120,
+            generated_project_timeout_seconds=240,
+        )
+        == 1800
+    )
+    assert (
+        project_scale_runner_module._effective_execute_wait_seconds(
+            plan,
+            2100,
+            generated_project_timeout_seconds=240,
+        )
+        == 2100
+    )
 
 
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
