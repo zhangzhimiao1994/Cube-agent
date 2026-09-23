@@ -1599,6 +1599,69 @@ def _project_scale_empty_rejected_structured_completion(
     )
 
 
+def _final_synthesis_fallback_text(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: Sequence[Artifact],
+    reason: str,
+) -> str:
+    source_lines: list[str] = []
+    for artifact in sources[:8]:
+        preview = _artifact_text_preview(artifact, max_bytes=360)
+        if preview is None:
+            preview = f"{artifact.type} artifact"
+        source_lines.append(f"- {artifact.producer}: {preview}")
+    if not source_lines:
+        source_lines.append("- no upstream artifact preview was available")
+    return "\n".join((
+        "内部恢复：最终汇总模型连续返回空响应，系统已基于已完成的上游产物生成保守汇总。",
+        f"原始请求：{_truncate_prompt_text(context.request, max_bytes=700)}",
+        f"最终任务：{_truncate_prompt_text(step.task, max_bytes=500)}",
+        f"恢复原因：{_truncate_prompt_text(reason, max_bytes=300)}",
+        "上游证据：",
+        *source_lines,
+        "请以上游产物和附件作为主要验收依据；该汇总不新增未验证结论。",
+    ))
+
+
+def _final_synthesis_fallback_artifact(
+    context: TaskContext,
+    step: DispatchStep,
+    agent: AgentSpec,
+    sources: tuple[Artifact, ...],
+    reason: str,
+    *,
+    version: int,
+) -> Artifact | None:
+    if not step.final_synthesizer or not sources:
+        return None
+    text = _final_synthesis_fallback_text(context, step, sources, reason)
+    schema = _agent_response_schema(agent)
+    if schema is not None:
+        payload = _project_scale_structured_payload_from_text(schema, text)
+        if payload is None:
+            return None
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return Artifact(
+        id=uuid4(),
+        version=version,
+        type="text",
+        producer=step.agent,
+        content={
+            "text": text,
+            "recovery_status": "internal_final_synthesis_fallback",
+            "recovery_reason": _truncate_prompt_text(reason, max_bytes=300),
+        },
+        source_ids=tuple(str(item.id) for item in sources),
+        provenance=GatewayProvenance(
+            logical_model=agent.logical_model,
+            deployment_id="internal_final_synthesis_fallback",
+            provider_id="internal",
+            provider_model="internal/final-synthesis-fallback",
+        ),
+    )
+
+
 def _project_scale_generated_files_from_text(text: object) -> Mapping[str, str] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -3670,6 +3733,60 @@ class CrewDispatchRuntime:
                             strategy="failure_closure",
                         ),
                     }
+                if (
+                    recovery_status == "failed_after_compact_retry"
+                    and diagnostic.get("error_code") == "model.empty_response"
+                ):
+                    fallback_artifact = _final_synthesis_fallback_artifact(
+                        context,
+                        step,
+                        agent,
+                        attempt_sources,
+                        failure_reason,
+                        version=retries + 1,
+                    )
+                    if fallback_artifact is not None:
+                        await event(
+                            kind=EventKind.ARTIFACT_CREATED,
+                            artifact=fallback_artifact,
+                            actor=step.agent,
+                            message=f"{agent.role} 已通过内部恢复生成最终汇总。",
+                            payload={
+                                "role": agent.role,
+                                "task": step.task,
+                                "logical_model": agent.logical_model,
+                                "artifact_id": str(fallback_artifact.id),
+                                "output": _artifact_text_preview(fallback_artifact)
+                                or "最终汇总已通过内部恢复生成。",
+                                **diagnostic,
+                            },
+                        )
+                        await event(
+                            kind=EventKind.STEP_COMPLETED,
+                            step_id=step.id,
+                            actor=step.agent,
+                            inputs=(fallback_artifact,),
+                            payload={
+                                "attempts": retries + 1,
+                                "task": step.task,
+                                "role": agent.role,
+                                "logical_model": agent.logical_model,
+                                "artifact_id": str(fallback_artifact.id),
+                                "output": _artifact_text_preview(fallback_artifact)
+                                or "final synthesis recovered",
+                                **diagnostic,
+                                **_step_orchestration_payload(
+                                    plan,
+                                    step,
+                                    terminal_status="completed",
+                                ),
+                            },
+                        )
+                        return _StepResult(
+                            step=step,
+                            artifact=fallback_artifact,
+                            retries=retries,
+                        )
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,

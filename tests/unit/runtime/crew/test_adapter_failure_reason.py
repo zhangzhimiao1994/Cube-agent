@@ -2876,6 +2876,56 @@ async def test_agent_empty_model_response_retries_with_agent_fallback_model() ->
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_final_synthesizer_empty_response_falls_back_to_dependency_evidence() -> None:
+    class FinalSynthesizerAlwaysEmptyGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if request.response_schema is not None:
+                text = _role_output_text(request)
+            else:
+                text = ""
+            return GatewayCompletion(
+                response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    gateway = FinalSynthesizerAlwaysEmptyGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _structured_dependent_final_plan(),
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    events = await _collect(runtime)
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) == 3
+    retrying = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_RETRYING and event.actor == "final_synthesizer"
+    )
+    assert retrying.payload["error_code"] == "model.empty_response"
+    fallback_artifact = next(
+        event.artifact
+        for event in events
+        if (
+            event.kind is EventKind.ARTIFACT_CREATED
+            and event.actor == "final_synthesizer"
+            and event.artifact is not None
+        )
+    )
+    assert fallback_artifact.content["recovery_status"] == "internal_final_synthesis_fallback"
+    assert fallback_artifact.source_ids
+    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert checkpoint.state["phase"] == "completed"
+
+
 async def test_missing_usage_after_empty_response_retry_is_estimated() -> None:
     class EmptyThenMissingUsageGateway(RoleAwareGateway):
         def __init__(self) -> None:
