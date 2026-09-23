@@ -4356,7 +4356,11 @@ class CrewDispatchRuntime:
                         or not error.evidence.final_text.strip()
                     )
                 ):
-                    _fail("model gateway failed: model response text is empty")
+                    reason = "model gateway failed: model response text is empty"
+                    failed = dict(running)
+                    failed.update(status="failed", failure_reason=reason)
+                    await model_boundary(key, failed)
+                    _fail(reason)
                 if completion is None:
                     rejected = error
                 else:

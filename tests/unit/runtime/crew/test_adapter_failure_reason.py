@@ -3254,6 +3254,16 @@ async def test_project_scale_tool_contract_rejected_without_text_retries_instead
         for event in events
     )
     assert checkpoint.state["phase"] == "completed"
+    restored = CrewDispatchRuntime(
+        RejectedThenZipMissingUsageGateway(),
+        plan,
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=ZipHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
+    assert {state["status"] for state in model_states.values()} == {"failed", "succeeded"}
     usage = checkpoint.state["usage"]
     assert isinstance(usage, Mapping)
     tokens = usage.get("tokens")
