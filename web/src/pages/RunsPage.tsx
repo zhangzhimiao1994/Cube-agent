@@ -88,6 +88,13 @@ type RunSubmissionOverride = {
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  running: "进行中",
+  started: "进行中",
+  completed: "已完成",
+  succeeded: "已完成",
+  failed: "异常",
+};
 const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
 const ARCHIVE_EXTENSIONS = [
   ".zip",
@@ -3455,6 +3462,58 @@ function processItemsForToolLifecycle(
   ];
 }
 
+function processItemsForApiToolLifecycles(
+  detail: RunDetail,
+  coveredToolKeys: Set<string>,
+): ProcessDetailTarget[] {
+  return detail.tool_lifecycle.flatMap((lifecycle, index) => {
+    if (coveredToolKeys.has(lifecycle.tool_call_id)) return [];
+    const operation = toolOperationKindLabel(lifecycle.operation_kind) || toolOperationLabel(lifecycle.tool_name);
+    const status = TOOL_STATUS_LABELS[lifecycle.status] ?? lifecycle.status;
+    const sequenceRange =
+      lifecycle.sequences.length > 0
+        ? `#${lifecycle.sequences[0]}${lifecycle.sequences.length > 1 ? `-#${lifecycle.sequences.at(-1)}` : ""}`
+        : "";
+    const artifact =
+      lifecycle.artifact_id?.trim()
+        ? detail.artifacts.find((item) => item.id === lifecycle.artifact_id) ?? null
+        : null;
+    const rows = [
+      lifecycle.step_id ? { label: "目标", value: lifecycle.step_id } : null,
+      { label: "工具", value: lifecycle.tool_name },
+      { label: "操作类别", value: lifecycle.operation_kind },
+      { label: "状态", value: status },
+      lifecycle.actor ? { label: "执行者", value: lifecycle.actor } : null,
+      lifecycle.step_id ? { label: "步骤", value: lifecycle.step_id } : null,
+      sequenceRange ? { label: "事件范围", value: sequenceRange } : null,
+      lifecycle.argument_bytes !== null ? { label: "参数字节数", value: String(lifecycle.argument_bytes) } : null,
+      lifecycle.output_bytes !== null ? { label: "输出字节数", value: String(lifecycle.output_bytes) } : null,
+      lifecycle.exit_code !== null ? { label: "退出码", value: String(lifecycle.exit_code) } : null,
+      lifecycle.failure_kind ? { label: "失败类型", value: lifecycle.failure_kind } : null,
+      lifecycle.approval_id ? { label: "审批 ID", value: lifecycle.approval_id } : null,
+      lifecycle.replay_safe !== null ? { label: "可重放", value: lifecycle.replay_safe ? "是" : "否" } : null,
+      ...eventArtifactRows(artifact),
+    ].filter((row): row is { label: string; value: string } => Boolean(row));
+    return [
+      {
+        id: `${detail.id}-tool-lifecycle-${lifecycle.tool_call_id}-${index}`,
+        runId: detail.id,
+        conversationId: runConversationId(detail),
+        title: `${operation} ${status}`,
+        message: `${operation} ${status}`,
+        badge: operation,
+        rows,
+        createdAt: null,
+        artifact: artifactDetailDownload(artifact),
+        sourceKind: "tool.lifecycle",
+        sourceSequence: lifecycle.terminal_sequence ?? lifecycle.started_sequence ?? undefined,
+        sourceStepId: lifecycle.step_id ?? null,
+        sourceActor: lifecycle.actor ?? null,
+      },
+    ];
+  });
+}
+
 function processItemsForEvent(
   detail: RunDetail,
   event: RunEvent,
@@ -3592,7 +3651,11 @@ export function runProcessItems(
     if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) continue;
     eventItems.push(...processItemsForEvent(orderedDetail, event, eventIndex, agentNames, artifact));
   }
-  return [...routingItem, ...eventItems];
+  return [
+    ...routingItem,
+    ...eventItems,
+    ...processItemsForApiToolLifecycles(orderedDetail, new Set(toolGroups.keys())),
+  ];
 }
 
 function RunFailureDiagnosticsPanel({ diagnostics }: { diagnostics: RunFailureDiagnostic[] }) {

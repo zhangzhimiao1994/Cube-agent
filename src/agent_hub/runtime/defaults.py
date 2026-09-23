@@ -90,6 +90,8 @@ from agent_hub.security.secrets import SecretService
 _LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
+_ROLE_PLANNING_TASK_MAX_CHARS = 2_000
+_ROLE_PLANNING_TASK_SUFFIX_CHARS = 360
 _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES = 10_000_000
 _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE = {
     "small": 3_000_000,
@@ -574,7 +576,7 @@ class ConfigBackedDispatchRuntime:
         else:
             planned_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=str(context.request),
+                    task=_role_planning_task(context.request),
                     mode=TaskMode.DISPATCH,
                     profile=_task_profile(context.request),
                     profiles=_task_profiles(context.request),
@@ -758,7 +760,7 @@ class ConfigBackedDiscussionRuntime:
         else:
             planned_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=str(context.request),
+                    task=_role_planning_task(context.request),
                     mode=TaskMode.DISCUSS,
                     profile=_task_profile(context.request),
                     profiles=_task_profiles(context.request),
@@ -924,7 +926,7 @@ class ConfigBackedHybridRuntime:
         else:
             dispatch_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=str(context.request),
+                    task=_role_planning_task(context.request),
                     mode=TaskMode.DISPATCH,
                     profile=profile,
                     profiles=profiles,
@@ -948,7 +950,7 @@ class ConfigBackedHybridRuntime:
         else:
             discussion_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=str(context.request),
+                    task=_role_planning_task(context.request),
                     mode=TaskMode.DISCUSS,
                     profile=profile,
                     profiles=profiles,
@@ -3481,6 +3483,16 @@ def _autogen_participant_ids(roles: tuple[RoleAssignment, ...]) -> tuple[str, ..
         seen.add(candidate)
         identifiers.append(candidate)
     return tuple(identifiers)
+
+
+def _role_planning_task(task: object) -> str:
+    text = " ".join(str(task).split())
+    if len(text) <= _ROLE_PLANNING_TASK_MAX_CHARS:
+        return text
+    suffix_length = min(_ROLE_PLANNING_TASK_SUFFIX_CHARS, _ROLE_PLANNING_TASK_MAX_CHARS // 3)
+    marker = " ... "
+    prefix_length = _ROLE_PLANNING_TASK_MAX_CHARS - suffix_length - len(marker)
+    return f"{text[:prefix_length].rstrip()}{marker}{text[-suffix_length:].lstrip()}"
 
 
 def _task_profile(task: object) -> TaskProfile:

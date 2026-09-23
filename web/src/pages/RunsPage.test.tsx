@@ -278,6 +278,43 @@ describe("conversation ordering", () => {
     expect(JSON.stringify(recovery?.rows)).not.toContain("checkpoint_id");
   });
 
+  it("surfaces tool lifecycle fallback actions when tool events are absent", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [],
+      tool_lifecycle: [
+        {
+          tool_call_id: "tool-terminal-1",
+          tool_name: "run_safe_command",
+          status: "completed",
+          operation_kind: "terminal",
+          actor: "implementer",
+          step_id: "install-deps",
+          started_sequence: 10,
+          terminal_sequence: 12,
+          sequences: [10, 11, 12],
+          approval_id: null,
+          replay_safe: true,
+          argument_bytes: 82,
+          output_bytes: 4096,
+          exit_code: 0,
+          artifact_id: null,
+          failure_kind: null,
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map());
+    const terminal = items.find((item) => item.badge === "运行终端");
+    const rows = terminal?.rows.map((row) => `${row.label}:${row.value}`).join("\n") ?? "";
+
+    expect(terminal?.message).toBe("运行终端 已完成");
+    expect(terminal?.sourceActor).toBe("implementer");
+    expect(terminal?.sourceStepId).toBe("install-deps");
+    expect(rows).toContain("事件范围:#10-#12");
+    expect(rows).toContain("退出码:0");
+  });
+
   it("projects nested discussion traces into chat workbench process rows", () => {
     const discussionRun: RunDetail = {
       ...baseRun,

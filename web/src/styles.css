@@ -2365,6 +2365,7 @@ article:hover {
   line-height: 1.55;
   margin: 0;
   max-height: min(52dvh, 34rem);
+  max-width: 100%;
   min-height: 12rem;
   overflow: auto;
   padding: 0.75rem;
@@ -2509,23 +2510,35 @@ article:hover {
 
 .agent-workbench-actions-header {
   align-items: center;
-  display: flex;
+  display: grid;
   gap: 0.45rem;
-  justify-content: space-between;
+  grid-template-columns: minmax(0, 1fr) auto;
   min-width: 0;
 }
 
 .agent-workbench-actions-header strong {
   color: var(--text);
   font-weight: 950;
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-workbench-actions-header small {
   color: var(--muted);
   font-weight: 800;
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-workbench-actions-header .secondary-action {
+  grid-column: 2;
+  grid-row: 1 / span 2;
   min-height: 2rem;
   padding: 0.32rem 0.58rem;
   white-space: nowrap;
@@ -5317,9 +5330,13 @@ article:hover {
   }
 
   .agent-workbench-tabs button {
-    flex: 0 0 7.25rem;
-    min-height: 3.1rem;
+    flex: 0 0 auto;
+    min-height: 2.45rem;
     scroll-snap-align: start;
+  }
+
+  .agent-workbench-tabs button small {
+    display: none;
   }
 
   .agent-workbench-file-layout,

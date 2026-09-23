@@ -92,6 +92,20 @@ it("renders action metadata as compact chips so operation targets stay visible",
   );
 });
 
+it("keeps mobile workbench headers compact without squeezing action cards", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-actions-header\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-tabs button small\s*{[\s\S]*display:\s*none;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.agent-workbench-file-code\s*{[\s\S]*max-width:\s*100%;/,
+  );
+});
+
 const runDetail: RunDetail = {
   id: runId,
   status: "completed",
@@ -409,6 +423,81 @@ describe("RunDetailPage", () => {
     await user.click(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ }));
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).toContain("reviewer 子 Agent 调度");
     expect((drawer.querySelector(".run-process-detail") as HTMLElement).textContent).not.toContain("critic 子 Agent 已下班");
+  });
+
+  it("shows tool lifecycle fallback actions in the workbench when tool events are absent", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [],
+      artifacts: [],
+      tool_lifecycle: [
+        {
+          tool_call_id: "tool-terminal-1",
+          tool_name: "run_safe_command",
+          status: "completed",
+          operation_kind: "terminal",
+          actor: "implementer",
+          step_id: "install-deps",
+          started_sequence: 10,
+          terminal_sequence: 12,
+          sequences: [10, 11, 12],
+          approval_id: null,
+          replay_safe: true,
+          argument_bytes: 82,
+          output_bytes: 4096,
+          exit_code: 0,
+          artifact_id: null,
+          failure_kind: null,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+
+    expect(within(drawer).getByRole("button", { name: "实际动作" }).textContent).toContain("1 条");
+    expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
+    await user.click(within(drawer).getByRole("button", { name: "终端" }));
+    const terminalWindow = within(drawer).getByLabelText("终端窗口");
+    const terminalAction = within(terminalWindow).getByRole("button", { name: /运行终端 已完成/ });
+    expect(terminalAction.textContent).toContain("implementer");
+    expect(terminalAction.textContent).toContain("install-deps");
+
+    await user.click(terminalAction);
+
+    const detail = drawer.querySelector(".run-process-detail") as HTMLElement;
+    expect(detail.textContent).toContain("run_safe_command");
+    expect(detail.textContent).toContain("install-deps");
+    await user.click(within(detail).getByRole("button", { name: /证据/ }));
+    const evidenceDetail = await screen.findByRole("dialog", { name: "证据详情" });
+    expect(evidenceDetail.textContent).toContain("事件范围");
+    expect(evidenceDetail.textContent).toContain("#10-#12");
+    await user.click(within(evidenceDetail).getByRole("button", { name: "关闭" }));
+    await user.click(within(detail).getByRole("button", { name: /阻塞/ }));
+    const blockerDetail = await screen.findByRole("dialog", { name: "阻塞详情" });
+    expect(blockerDetail.textContent).toContain("退出码");
+    expect(blockerDetail.textContent).toContain("0");
   });
 
   it("shows structured discussion evidence in the run detail workbench coordination view", async () => {

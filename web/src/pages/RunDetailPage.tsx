@@ -1106,6 +1106,75 @@ function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[
   });
 }
 
+function detailLifecycleOperationLabel(lifecycle: ToolLifecycle) {
+  const operation = lifecycle.operationKind.toLowerCase().replace(/[.\s-]+/g, "_");
+  if (operation === "terminal" || operation === "server_command") return "运行终端";
+  if (operation === "file_create") return "创建文件";
+  if (operation === "file_edit" || operation === "file_write") return "编辑文件";
+  if (operation === "file_read") return "读取文件";
+  if (operation === "browser" || operation === "screen_read" || operation === "desktop_action") return "浏览操作";
+  return displayDetailToolName(lifecycle.toolName, lifecycle.operationKind);
+}
+
+function detailToolLifecycleCards(
+  detail: RunDetail,
+  lifecycles: ToolLifecycle[],
+  artifacts: RunArtifact[],
+): DetailProcessCard[] {
+  const coveredKeys = new Set(
+    detail.events
+      .filter((event) => event.kind.startsWith("tool."))
+      .map((event) => toolLifecycleKey(event)),
+  );
+  return lifecycles.flatMap((lifecycle) => {
+    if (coveredKeys.has(lifecycle.key)) return [];
+    const operation = detailLifecycleOperationLabel(lifecycle);
+    const status = displayToolStatus(lifecycle.status);
+    const artifact = lifecycle.artifactId
+      ? artifacts.find((item) => item.id === lifecycle.artifactId) ?? null
+      : null;
+    const sequenceRange =
+      lifecycle.sequences.length > 0
+        ? `#${lifecycle.sequences[0]}${lifecycle.sequences.length > 1 ? `-#${lifecycle.sequences.at(-1)}` : ""}`
+        : "";
+    const rows = [
+      lifecycle.stepId ? { label: "目标", value: lifecycle.stepId } : null,
+      { label: "工具", value: lifecycle.toolName },
+      { label: "操作类别", value: lifecycle.operationKind },
+      { label: "状态", value: status },
+      lifecycle.actor ? { label: "执行者", value: displayDetailActor(lifecycle.actor) || lifecycle.actor } : null,
+      lifecycle.stepId ? { label: "步骤", value: lifecycle.stepId } : null,
+      sequenceRange ? { label: "事件范围", value: sequenceRange } : null,
+      lifecycle.argumentBytes !== null ? { label: "参数字节数", value: String(lifecycle.argumentBytes) } : null,
+      lifecycle.outputBytes !== null ? { label: "输出字节数", value: String(lifecycle.outputBytes) } : null,
+      lifecycle.exitCode !== null ? { label: "退出码", value: String(lifecycle.exitCode) } : null,
+      lifecycle.failureKind ? { label: "失败类型", value: lifecycle.failureKind } : null,
+      lifecycle.approvalId ? { label: "审批 ID", value: lifecycle.approvalId } : null,
+      lifecycle.replaySafe !== null ? { label: "可重放", value: lifecycle.replaySafe ? "是" : "否" } : null,
+      ...artifactRows(artifact),
+    ].filter((row): row is DetailProcessRow => Boolean(row));
+    return [
+      {
+        id: `tool-lifecycle-${lifecycle.key}`,
+        label: operation,
+        title: `${operation} ${status}`,
+        detail: `${operation} ${status}`,
+        meta: [
+          lifecycle.actor ? displayDetailActor(lifecycle.actor) || lifecycle.actor : "",
+          lifecycle.stepId ? `步骤 ${lifecycle.stepId}` : "",
+          sequenceRange ? `事件 ${sequenceRange}` : "",
+        ].filter(Boolean),
+        rows,
+        createdAt: null,
+        artifact: downloadableArtifact(artifact),
+        sourceKind: "tool.lifecycle",
+        sourceStepId: lifecycle.stepId,
+        sourceActor: lifecycle.actor,
+      },
+    ];
+  });
+}
+
 function refreshedDetailProcessCard(currentCard: DetailProcessCard, candidates: DetailProcessCard[]) {
   const matchedByStableSource =
     currentCard.sourceKind || currentCard.sourceStepId || currentCard.sourceActor
@@ -3110,8 +3179,11 @@ export function RunDetailPage() {
   const repairApproval = repairApprovalFromRunDetail(orderedRunData);
   const observerNotices = collectObserverNotices(orderedRunData.events);
   const timelineItems = detailTimelineItems(orderedRunData.events);
-  const processCards = detailProcessCards(timelineItems, orderedRunData.artifacts);
   const toolLifecycles = toolLifecycleFromApi(orderedRunData);
+  const processCards = [
+    ...detailProcessCards(timelineItems, orderedRunData.artifacts),
+    ...detailToolLifecycleCards(orderedRunData, toolLifecycles, orderedRunData.artifacts),
+  ];
   const posture = detailPosture(orderedRunData);
   const explicitRows = explicitDetailRows(orderedRunData.explicit_details);
   const executionIntents = executionIntentsForDetail(orderedRunData);

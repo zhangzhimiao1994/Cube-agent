@@ -16,6 +16,7 @@ import agent_hub.runtime.defaults as defaults_module
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.project_scale import build_project_scale_run_plan
 from agent_hub.harness.project_scale_runner import _discussion_trace_payload_passes
 from agent_hub.models.capacity import CapacityLease, CapacityWaitTimeout
 from agent_hub.models.gateway import CapacityController
@@ -52,7 +53,12 @@ from agent_hub.runtime.defaults import (
     configured_runtime_registry,
 )
 from agent_hub.runtime.direct import RuntimeExecutionError
-from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
+from agent_hub.runtime.role_planner import (
+    RoleAssignment,
+    RolePlanningRequest,
+    RolePurpose,
+    TaskProfile,
+)
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -64,6 +70,25 @@ def test_python_project_zip_request_is_profiled_as_software() -> None:
     )
 
     assert TaskProfile.SOFTWARE in profiles
+
+
+def test_project_scale_medium_capability_task_is_bounded_for_role_planning() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("hybrid",),
+        execute=True,
+    )
+    message = str(plan.requests[0].body["message"])
+
+    planning_task = defaults_module._role_planning_task(message)
+
+    assert len(message) > 2_000
+    assert planning_task == planning_task.strip()
+    assert len(planning_task) <= 2_000
+    assert planning_task.startswith("Build a real medium business project")
+    assert "preserve decision evidence" in planning_task
+    RolePlanningRequest(task=planning_task, mode=TaskMode.DISPATCH)
 
 
 class FakeConfigService:
