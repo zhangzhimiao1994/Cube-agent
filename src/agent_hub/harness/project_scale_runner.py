@@ -547,48 +547,56 @@ def execute_project_scale_plan(
                     details=observation.details,
                 )
                 if repair_body is not None:
-                    repair_response = client.request_json(
-                        "POST",
-                        f"/api/v1/runs/{quote(run_id)}/accept-repair",
-                        body=repair_body,
-                    )
-                    if not isinstance(repair_response, dict):
-                        raise TypeError("self repair acceptance returned non-object JSON")
-                    _validate_run_submission_scope(repair_response, request_body)
-                    _extend_unique(
-                        errors,
-                        _validate_mode_control(
-                            repair_response,
-                            requested_body=request_body,
-                            validation_focus=run_request.validation_focus,
-                        ),
-                    )
-                    repair_run_id = repair_response.get("id")
-                    if not isinstance(repair_run_id, str) or not repair_run_id:
-                        raise RuntimeError("self repair acceptance response missing id")
-                    run_id = repair_run_id
-                    status = _string_value(repair_response.get("status")) or status
-                    evidence["deliverable_repair_trace"] = True
-                    self_repair_observation = _collect_run_observation(
-                        client,
-                        run_id=run_id,
-                        body=request_body,
-                        wait_seconds=_remaining_wait_seconds(case_deadline, wait_seconds),
-                        poll_interval_seconds=poll_interval_seconds,
-                        current_status=status,
-                        evidence=evidence,
-                        errors=errors,
-                    )
-                    observation = self_repair_observation
-                    status = self_repair_observation.status
-                    _extend_unique(
-                        errors,
-                        _validate_mode_control(
-                            self_repair_observation.details,
-                            requested_body=request_body,
-                            validation_focus=run_request.validation_focus,
-                        ),
-                    )
+                    if not _has_remaining_repair_wait_budget(case_deadline, wait_seconds):
+                        _extend_unique(
+                            errors,
+                            (
+                                "self_repair: wait budget exhausted before repair run could be observed",
+                            ),
+                        )
+                    else:
+                        repair_response = client.request_json(
+                            "POST",
+                            f"/api/v1/runs/{quote(run_id)}/accept-repair",
+                            body=repair_body,
+                        )
+                        if not isinstance(repair_response, dict):
+                            raise TypeError("self repair acceptance returned non-object JSON")
+                        _validate_run_submission_scope(repair_response, request_body)
+                        _extend_unique(
+                            errors,
+                            _validate_mode_control(
+                                repair_response,
+                                requested_body=request_body,
+                                validation_focus=run_request.validation_focus,
+                            ),
+                        )
+                        repair_run_id = repair_response.get("id")
+                        if not isinstance(repair_run_id, str) or not repair_run_id:
+                            raise RuntimeError("self repair acceptance response missing id")
+                        run_id = repair_run_id
+                        status = _string_value(repair_response.get("status")) or status
+                        evidence["deliverable_repair_trace"] = True
+                        self_repair_observation = _collect_run_observation(
+                            client,
+                            run_id=run_id,
+                            body=request_body,
+                            wait_seconds=_remaining_wait_seconds(case_deadline, wait_seconds),
+                            poll_interval_seconds=poll_interval_seconds,
+                            current_status=status,
+                            evidence=evidence,
+                            errors=errors,
+                        )
+                        observation = self_repair_observation
+                        status = self_repair_observation.status
+                        _extend_unique(
+                            errors,
+                            _validate_mode_control(
+                                self_repair_observation.details,
+                                requested_body=request_body,
+                                validation_focus=run_request.validation_focus,
+                            ),
+                        )
             evidence["self_repair_trace"] = initial_self_repair_trace or _has_self_repair_trace(
                 observation.events
             )
@@ -653,6 +661,14 @@ def execute_project_scale_plan(
                     evidence,
                     case_id=run_request.case_id,
                 ):
+                    break
+                if not _has_remaining_repair_wait_budget(case_deadline, wait_seconds):
+                    _extend_unique(
+                        errors,
+                        (
+                            "deliverable_repair: wait budget exhausted before follow-up repair could be observed",
+                        ),
+                    )
                     break
                 deliverable_repair_attempts += 1
                 repair_response = client.request_json(
@@ -1326,6 +1342,13 @@ def _remaining_wait_seconds(deadline: float, configured_wait_seconds: float) -> 
     if configured_wait_seconds <= 0:
         return 0
     return max(deadline - time.monotonic(), 0)
+
+
+def _has_remaining_repair_wait_budget(deadline: float, configured_wait_seconds: float) -> bool:
+    return configured_wait_seconds <= 0 or _remaining_wait_seconds(
+        deadline,
+        configured_wait_seconds,
+    ) > 0
 
 
 def _collect_run_observation(

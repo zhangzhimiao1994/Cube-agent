@@ -2593,6 +2593,79 @@ def test_execute_project_scale_plan_repairs_generated_project_validation_failure
     assert "rerun build/test/interaction checks" in repair_message
 
 
+def test_execute_project_scale_plan_does_not_start_unobservable_repair_after_wait_budget_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                'generated_project_validation: command failed exit=7 command=npm test output_tail="boom"',
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    ticks = iter((0.0, 0.0, 0.0, 2.0, 2.0))
+
+    def monotonic() -> float:
+        return next(ticks, 2.0)
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate_generated_project_bundle)
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", monotonic)
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact-validation",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+        validate_generated_project=True,
+    )
+
+    result = report.results[0]
+    assert report.ok is False
+    assert result.run_id == "run-medium-artifact-validation"
+    assert result.evidence["deliverable_repair_trace"] is False
+    assert result.evidence["generated_project_validation"] is False
+    assert len(client.submitted_bodies) == 1
+    assert not any(
+        call[0] == "POST" and call[1] == "/api/v1/runs" and "deliverable-repair" in (call[2] or "")
+        for call in client.calls
+    )
+    assert set(result.errors) == {
+        'generated_project_validation: command failed exit=7 command=npm test output_tail="boom"',
+        "deliverable_repair: wait budget exhausted before follow-up repair could be observed",
+    }
+
+
 def test_capability_generated_project_repair_can_use_second_round(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
