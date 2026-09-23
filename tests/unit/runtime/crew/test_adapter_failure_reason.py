@@ -469,6 +469,29 @@ class DeterministicErrorHarnessToolGateway:
         raise RuntimeCapabilityError("files must be an object")
 
 
+class WaitingApprovalHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[HarnessToolCallRequest] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        del tenant_id, user_id, role
+        self.calls.append(request)
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="failed",
+            payload={"approval_id": "approval_project_zip"},
+            failure_reason="capability requires approval",
+        )
+
+
 class IdentityRecordingHarnessToolGateway:
     def __init__(self) -> None:
         self.calls: list[tuple[UUID, HarnessToolCallRequest, UUID | None, Role | None]] = []
@@ -2329,6 +2352,40 @@ async def test_project_zip_workspace_write_uses_run_sandbox_for_harness_request(
     assert request.sandbox == "workspace_write"
     started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
     assert started.payload["sandbox"] == "workspace_write"
+
+
+async def test_approval_pending_project_zip_does_not_leave_started_lifecycle() -> None:
+    harness = WaitingApprovalHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ProjectZipWorkspaceGateway(),
+        _project_zip_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(
+            _context(routing_decision={"sandbox_profile": "workspace_write"})
+        ):
+            events.append(event)
+
+    assert len(harness.calls) == 1
+    assert [event.kind for event in events if event.kind == "tool.requested"] == [
+        "tool.requested"
+    ]
+    assert [event.kind for event in events if event.kind is EventKind.TOOL_STARTED] == []
+    failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed.payload["status"] == "waiting_approval"
+    assert failed.payload["failure_kind"] == "waiting_approval"
+    assert failed.payload["approval_id"] == "approval_project_zip"
+    checkpoint = await runtime.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    state = next(iter(tool_states.values()))
+    assert isinstance(state, Mapping)
+    assert state["status"] == "waiting_approval"
 
 
 async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() -> None:

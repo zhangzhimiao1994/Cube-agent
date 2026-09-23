@@ -1892,6 +1892,13 @@ def _deterministic_capability_failure_reason(error: RuntimeCapabilityError) -> s
     return _truncate_prompt_text(reason, max_bytes=512)
 
 
+def _tool_result_requires_capability_approval(result: HarnessToolCallResult) -> bool:
+    if result.status != "failed" or result.failure_reason != "capability requires approval":
+        return False
+    approval_id = result.payload.get("approval_id")
+    return type(approval_id) is str and bool(approval_id.strip())
+
+
 class ModelGateway(Protocol):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion: ...
 
@@ -4815,13 +4822,13 @@ class CrewDispatchRuntime:
                     ),
                 )
                 await emit(
-                    kind=EventKind.TOOL_STARTED,
+                    kind=EventKind.TOOL_REQUESTED,
                     actor=step.agent,
                     tool_call_id=call_id,
                     tool_name=tool_call.name,
                     payload=safe_tool_event_payload(
                         name=tool_call.name,
-                        status="running",
+                        status="requested",
                         arguments=tool_call.arguments,
                         sandbox=tool_sandbox,
                         replay_safe=replay_safe,
@@ -4829,7 +4836,6 @@ class CrewDispatchRuntime:
                 )
                 tool_running = dict(tool_prepared)
                 tool_running["status"] = "running"
-                await tool_boundary(idempotency_key, tool_running, None)
                 try:
                     tool_request = HarnessToolCallRequest(
                         run_id=context.run_id,
@@ -4864,6 +4870,21 @@ class CrewDispatchRuntime:
                     failed["status"] = "failed"
                     await tool_boundary(idempotency_key, failed, None)
                     raise RuntimeExecutionError("capability execution failed") from None
+                if not tool_request.approval_required:
+                    await emit(
+                        kind=EventKind.TOOL_STARTED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="running",
+                            arguments=tool_call.arguments,
+                            sandbox=tool_sandbox,
+                            replay_safe=replay_safe,
+                        ),
+                    )
+                    await tool_boundary(idempotency_key, tool_running, None)
                 try:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         tool_result = await self._tool_gateway.invoke(
@@ -4976,6 +4997,31 @@ class CrewDispatchRuntime:
                     ) from None
                 if tool_result.status != "succeeded":
                     failed_reason = tool_result.failure_reason or "capability execution failed"
+                    if _tool_result_requires_capability_approval(tool_result):
+                        approval_id = cast(str, tool_result.payload["approval_id"])
+                        await emit(
+                            kind=EventKind.TOOL_FAILED,
+                            actor=step.agent,
+                            tool_call_id=call_id,
+                            tool_name=tool_call.name,
+                            payload={
+                                **safe_tool_event_payload(
+                                    name=tool_call.name,
+                                    status="waiting_approval",
+                                    arguments=tool_call.arguments,
+                                    sandbox=tool_sandbox,
+                                    replay_safe=replay_safe,
+                                    failure_kind="waiting_approval",
+                                ),
+                                "approval_id": approval_id,
+                            },
+                            reason=failed_reason,
+                        )
+                        waiting = dict(tool_prepared)
+                        waiting["status"] = "waiting_approval"
+                        waiting["approval_id"] = approval_id
+                        await tool_boundary(idempotency_key, waiting, None)
+                        raise RuntimeExecutionError("capability execution failed") from None
                     if _is_optional_read_context_unavailable(tool_call.name, failed_reason):
                         result = cast(
                             Mapping[str, JsonValue],
@@ -5110,6 +5156,21 @@ class CrewDispatchRuntime:
                     raise CapabilityOutcomeUncertain(
                         "capability outcome requires confirmation"
                     ) from None
+                if tool_request.approval_required:
+                    await emit(
+                        kind=EventKind.TOOL_STARTED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="running",
+                            arguments=tool_call.arguments,
+                            sandbox=tool_sandbox,
+                            replay_safe=replay_safe,
+                        ),
+                    )
+                    await tool_boundary(idempotency_key, tool_running, None)
                 artifact = Artifact(
                     id=uuid4(),
                     type="tool_result",

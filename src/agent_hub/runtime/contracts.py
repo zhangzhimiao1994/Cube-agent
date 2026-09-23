@@ -74,6 +74,7 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "exit_code",
         "truncated",
         "artifact_id",
+        "approval_id",
         "failure_kind",
         "deliverable_quality",
         "agent_standard_verification",
@@ -566,6 +567,7 @@ class EventKind(StrEnum):
     REVIEW_COMPLETED = "review.completed"
     DISCUSSION_STARTED = "discussion.started"
     MESSAGE_CREATED = "message.created"
+    TOOL_REQUESTED = "tool.requested"
     TOOL_STARTED = "tool.started"
     TOOL_COMPLETED = "tool.completed"
     TOOL_FAILED = "tool.failed"
@@ -768,6 +770,7 @@ class RunEvent(_RuntimeContractModel):
         ):
             raise ValueError("discussion.started requires actor, session, and participants")
         tool_kinds = {
+            EventKind.TOOL_REQUESTED,
             EventKind.TOOL_STARTED,
             EventKind.TOOL_COMPLETED,
             EventKind.TOOL_FAILED,
@@ -852,6 +855,9 @@ class RunEvent(_RuntimeContractModel):
             ),
             EventKind.MESSAGE_CREATED: frozenset(
                 {"actor", "session_id", "message", "inputs", "payload"}
+            ),
+            EventKind.TOOL_REQUESTED: frozenset(
+                {"actor", "tool_call_id", "tool_name", "payload"}
             ),
             EventKind.TOOL_STARTED: frozenset(
                 {"actor", "tool_call_id", "tool_name", "payload"}

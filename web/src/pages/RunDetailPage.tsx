@@ -333,8 +333,10 @@ const RUN_MODE_LABELS: Record<string, string> = {
 };
 
 const TOOL_STATUS_LABELS: Record<string, string> = {
+  requested: "已请求",
   running: "进行中",
   started: "进行中",
+  waiting_approval: "待确认",
   completed: "已完成",
   succeeded: "已完成",
   failed: "异常",

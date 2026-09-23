@@ -87,14 +87,15 @@ def test_provider_events_project_to_runtime_extension_events_with_sequences() ->
     assert [event.sequence for event in events] == [5, 6]
     assert [event.kind for event in events] == ["model.text_delta", "tool.requested"]
     assert events[0].run_id == RUN_ID
+    assert events[1].actor == "provider"
+    assert events[1].tool_call_id == "call_1"
+    assert events[1].tool_name == "workspace_read"
     assert events[0].payload == {
         "schema_version": 1,
         "delta_kind": "visible_text",
         "text_bytes": len(b"hello"),
     }
     assert events[1].payload == {
-        "id": "call_1",
-        "name": "workspace_read",
         "argument_keys": ("path",),
         "argument_key_count": 1,
         "redacted_argument_key_count": 0,

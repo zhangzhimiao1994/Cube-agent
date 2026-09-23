@@ -64,13 +64,24 @@ def provider_events_to_run_events(
         if not isinstance(event, NormalizedProviderEvent):
             raise TypeError("provider events must be NormalizedProviderEvent values")
         payload = _provider_event_payload(event)
-        if event.kind == "model.fallback" and not payload:
+        if event.kind in {"model.fallback", "tool.requested"} and not payload:
             continue
+        tool_fields: dict[str, str] = {}
+        if event.kind == "tool.requested":
+            tool_call_id = _safe_text(event.payload.get("id"))
+            tool_name = _safe_text(event.payload.get("name"))
+            if tool_call_id is not None and tool_name is not None:
+                tool_fields = {
+                    "actor": "provider",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                }
         yield RunEvent(
             kind=event.kind,
             sequence=sequence,
             run_id=run_id,
             payload=payload,
+            **tool_fields,
         )
         sequence += 1
 
@@ -216,8 +227,6 @@ def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, Json
     argument_keys = tuple(sorted(key for key in arguments if isinstance(key, str)))
     safe_argument_keys = tuple(key for key in argument_keys if _safe_text(key) is not None)
     return {
-        "id": identifier,
-        "name": name,
         "argument_keys": safe_argument_keys,
         "argument_key_count": len(argument_keys),
         "redacted_argument_key_count": len(argument_keys) - len(safe_argument_keys),

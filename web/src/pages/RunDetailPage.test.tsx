@@ -37,16 +37,16 @@ it("gives the workbench drawer enough room for inspectable detail panes", () => 
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
   expect(stylesCss).toMatch(
-    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(96dvh,\s*1080px\);[\s\S]*max-width:\s*min\(98vw,\s*1240px\);[\s\S]*width:\s*min\(98vw,\s*1240px\);/,
+    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(98dvh,\s*1120px\);[\s\S]*max-width:\s*min\(99vw,\s*1280px\);[\s\S]*width:\s*min\(99vw,\s*1280px\);/,
   );
   expect(stylesCss).toMatch(
-    /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(96dvh - 7rem\);[\s\S]*overflow-y:\s*auto;/,
+    /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(98dvh - 6\.25rem\);[\s\S]*overflow-y:\s*auto;/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal\s*{[\s\S]*max-height:\s*min\(86dvh,\s*820px\);[\s\S]*max-width:\s*min\(94vw,\s*920px\);[\s\S]*width:\s*min\(94vw,\s*920px\);/,
   );
   expect(stylesCss).toMatch(
-    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*96dvh;[\s\S]*width:\s*100vw;/,
+    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*98dvh;[\s\S]*width:\s*100vw;/,
   );
 });
 
