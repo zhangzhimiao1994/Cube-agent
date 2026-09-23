@@ -1274,6 +1274,15 @@ def _is_real_project_scale_handoff(task: object) -> bool:
     )
 
 
+def _project_scale_response_exceeds_output_limit(text: object) -> bool:
+    if not isinstance(text, str):
+        return False
+    try:
+        return len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
+    except UnicodeError:
+        return True
+
+
 def _project_scale_artifact_zip_completion(
     context: TaskContext,
     step: DispatchStep,
@@ -1289,7 +1298,11 @@ def _project_scale_artifact_zip_completion(
     if project_id is None or workspace_session_id is None:
         return completion
     generated_files = _project_scale_generated_files_from_text(response.text)
-    if generated_files is None and _is_real_project_scale_handoff(step.task):
+    if (
+        generated_files is None
+        and _is_real_project_scale_handoff(step.task)
+        and not _project_scale_response_exceeds_output_limit(response.text)
+    ):
         return completion
     files = generated_files or project_scale_artifact_zip_files(step.task)
     return GatewayCompletion(
