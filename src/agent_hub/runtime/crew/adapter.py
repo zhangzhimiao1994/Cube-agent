@@ -1496,7 +1496,14 @@ def _project_scale_gateway_failure_structured_completion(
     ):
         return None
     lowered = reason.casefold()
-    if "empty_response" not in lowered and "transport" not in lowered:
+    recoverable_gateway_failure = (
+        "empty_response" in lowered
+        or "response text is empty" in lowered
+        or "response is empty" in lowered
+        or "completed without a response" in lowered
+        or "transport" in lowered
+    )
+    if not recoverable_gateway_failure:
         return None
     payload = _project_scale_structured_payload_from_text(
         request.response_schema,

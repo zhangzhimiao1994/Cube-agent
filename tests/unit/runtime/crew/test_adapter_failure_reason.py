@@ -14,7 +14,7 @@ from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import CapacityUnavailable
-from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
+from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput, ModelGatewayError
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
@@ -3246,6 +3246,67 @@ async def test_project_scale_empty_rejected_structured_output_uses_internal_fall
         total_cost_usd=Decimal(10),
     )
     gateway = EmptyRejectedProjectScaleGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    events = [
+        event async for event in runtime.run(_context(token_budget=100_000))
+    ]
+    checkpoint = await runtime.save_checkpoint()
+
+    assert len(gateway.requests) == 1
+    assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert checkpoint.state["phase"] == "completed"
+
+
+async def test_project_scale_finalizer_gateway_empty_text_uses_internal_fallback() -> None:
+    task = (
+        "Role mission: synthesize the project.\n"
+        "User task: Build a real small business project for flow=dispatch. "
+        "Return strict JSON workspace_bundle.files (relative paths to full content)."
+    )
+
+    class EmptyErrorProjectScaleGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise ModelGatewayError("model response text is empty")
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize the verified project result.",
+                logical_model="qwen",
+                output_schema={
+                    "status": "string",
+                    "summary": "string",
+                    "evidence": "string[]",
+                    "risks": "string[]",
+                    "artifacts": "string[]",
+                    "verification": "string[]",
+                },
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final_response_step",
+                agent="final_synthesizer",
+                task=task,
+                final_synthesizer=True,
+                token_budget=100_000,
+                cost_budget_usd=Decimal(10),
+            ),
+        ),
+        total_token_budget=100_000,
+        total_cost_usd=Decimal(10),
+    )
+    gateway = EmptyErrorProjectScaleGateway()
     runtime = CrewDispatchRuntime(
         gateway,
         plan,
