@@ -97,6 +97,7 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("npm", "run", "build"),
     ("npm", "test"),
 )
+_DEFAULT_GENERATED_PROJECT_NPM_REGISTRY = "https://registry.npmmirror.com"
 _GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
 _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 3
 _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
@@ -1339,7 +1340,20 @@ def _generated_project_command_env() -> dict[str, str]:
         "TMP",
         "NPM_CONFIG_REGISTRY",
     }
-    return {key: value for key, value in os.environ.items() if key.upper() in keep_keys}
+    env = {key: value for key, value in os.environ.items() if key.upper() in keep_keys}
+    registry = (
+        os.environ.get("AGENT_HUB_GENERATED_PROJECT_NPM_REGISTRY")
+        or env.get("NPM_CONFIG_REGISTRY")
+        or _DEFAULT_GENERATED_PROJECT_NPM_REGISTRY
+    )
+    env["NPM_CONFIG_REGISTRY"] = registry
+    env.setdefault("NPM_CONFIG_AUDIT", "false")
+    env.setdefault("NPM_CONFIG_FUND", "false")
+    env.setdefault("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+    env.setdefault("NPM_CONFIG_FETCH_RETRIES", "2")
+    env.setdefault("NPM_CONFIG_FETCH_RETRY_MINTIMEOUT", "1000")
+    env.setdefault("NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT", "10000")
+    return env
 
 
 def _format_command(command: Sequence[str]) -> str:

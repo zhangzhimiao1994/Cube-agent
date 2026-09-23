@@ -62,6 +62,31 @@ def test_default_generated_project_install_disables_dependency_lifecycle_scripts
     )
 
 
+def test_generated_project_command_env_uses_stable_default_npm_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NPM_CONFIG_REGISTRY", raising=False)
+    monkeypatch.delenv("AGENT_HUB_GENERATED_PROJECT_NPM_REGISTRY", raising=False)
+
+    env = project_scale_runner_module._generated_project_command_env()
+
+    assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmmirror.com"
+    assert env["NPM_CONFIG_AUDIT"] == "false"
+    assert env["NPM_CONFIG_FUND"] == "false"
+    assert env["NPM_CONFIG_UPDATE_NOTIFIER"] == "false"
+
+
+def test_generated_project_command_env_allows_npm_registry_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NPM_CONFIG_REGISTRY", raising=False)
+    monkeypatch.setenv("AGENT_HUB_GENERATED_PROJECT_NPM_REGISTRY", "https://registry.npmjs.org/")
+
+    env = project_scale_runner_module._generated_project_command_env()
+
+    assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org/"
+
+
 def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 120.0)
 
