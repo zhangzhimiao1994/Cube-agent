@@ -2522,7 +2522,10 @@ function DetailWorkbenchActionRow({
           {files.map((file) => (
             <button key={file.id} type="button" onClick={() => onOpenFile(file)} aria-label={`预览文件 ${file.path || file.filename}`}>
               <small>{file.operation}</small>
-              <span>{file.path || file.filename}</span>
+              <strong>{file.path || file.filename}</strong>
+              {file.source ? (
+                <span>{[file.source.sourceActor, file.source.label, file.source.title].filter(Boolean).join(" · ")}</span>
+              ) : null}
             </button>
           ))}
         </div>

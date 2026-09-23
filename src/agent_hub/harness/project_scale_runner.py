@@ -825,8 +825,16 @@ def execute_project_scale_plan(
                     errors.extend(plugin_contract.reasons)
                 if validate_generated_project and not evidence["generated_project_validation"]:
                     errors.extend(generated_project_validation.reasons)
-            if evidence["terminal_status"] and status != "completed":
-                errors.append(f"terminal_status: {status or 'unknown'}")
+            if run_id is not None and not _is_terminal_status(status):
+                try:
+                    status = _refresh_run_terminal_status(
+                        client,
+                        run_id=run_id,
+                        current_status=status,
+                        evidence=evidence,
+                    )
+                except Exception as error:  # noqa: BLE001 - cleanup can still cancel stale runs.
+                    errors.append(f"terminal_status_refresh: {error}")
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
             errors.append(str(error))
         finally:
@@ -837,8 +845,12 @@ def execute_project_scale_plan(
                     try:
                         cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")
                         evidence["cleanup_cancel"] = isinstance(cleanup, dict)
+                        if isinstance(cleanup, dict):
+                            status = _string_value(cleanup.get("status")) or status
                     except Exception as error:  # noqa: BLE001 - cleanup failure is evidence.
                         errors.append(f"cleanup_cancel: {error}")
+        if evidence["terminal_status"] and status != "completed":
+            errors.append(f"terminal_status: {status or 'unknown'}")
         results.append(
             ProjectScaleCaseResult(
                 case_id=run_request.case_id,
@@ -1493,6 +1505,26 @@ def _collect_run_observation(
         events=events,
         workspace_bundle=workspace_bundle,
     )
+
+
+def _refresh_run_terminal_status(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    current_status: str | None,
+    evidence: dict[str, bool],
+) -> str | None:
+    details_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/details")
+    evidence["run_details"] = isinstance(details_response, dict)
+    if not isinstance(details_response, dict):
+        return current_status
+    _validate_run_details_scope(details_response, run_id)
+    status = _string_value(details_response.get("status")) or current_status
+    if _has_final_artifacts(details_response):
+        evidence["final_artifacts"] = True
+    if _is_terminal_status(status):
+        evidence["terminal_status"] = True
+    return status
 
 
 def _validate_run_submission_scope(response: dict[str, object], body: dict[str, object]) -> None:

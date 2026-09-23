@@ -50,6 +50,23 @@ it("gives the workbench drawer enough room for inspectable detail panes", () => 
   );
 });
 
+it("keeps nested process detail modals full-width and readable on mobile", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal\s*{[\s\S]*min-width:\s*0;[\s\S]*width:\s*min\(94vw,\s*920px\);/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal dl\s*{[\s\S]*min-width:\s*0;[\s\S]*width:\s*100%;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal dd\s*{[\s\S]*overflow-wrap:\s*anywhere;[\s\S]*word-break:\s*normal;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*max-height:\s*92dvh;[\s\S]*width:\s*100vw;/,
+  );
+});
+
 const runDetail: RunDetail = {
   id: runId,
   status: "completed",
@@ -562,7 +579,17 @@ describe("RunDetailPage", () => {
     await user.click(within(drawer).getByRole("button", { name: "结果" }));
     const resultWindow = within(drawer).getByLabelText("结果窗口");
     expect(resultWindow.querySelectorAll(".agent-workbench-action-row")).toHaveLength(1);
-    expect(within(resultWindow).getByRole("button", { name: "预览文件 final-script.md" })).not.toBeNull();
+    const finalResultFileButton = within(resultWindow).getByRole("button", { name: "预览文件 final-script.md" });
+    expect(finalResultFileButton).not.toBeNull();
+    expect(finalResultFileButton.textContent).toContain("创建文件");
+    expect(finalResultFileButton.textContent).toContain("final-script.md");
+    expect(finalResultFileButton.textContent).toContain("工具动作");
+
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    const actionWindow = within(drawer).getByLabelText("Agent 工作席动作");
+    const writeAppFileButton = within(actionWindow).getAllByRole("button", { name: "预览文件 src/app.ts" })[0];
+    expect(writeAppFileButton.textContent).toContain("writer");
+    expect(writeAppFileButton.textContent).toContain("创建文件 src/app.ts");
   });
 
   it("shows checkpoint recovery as a clear workbench action without leaking checkpoint internals", async () => {

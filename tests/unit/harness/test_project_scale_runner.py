@@ -1241,6 +1241,79 @@ def test_execute_project_scale_plan_reports_case_validation_focus() -> None:
     ]
 
 
+def test_execute_project_scale_plan_reports_cancelled_status_after_cleanup() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        status="running",
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "run.created"}, {"kind": "artifact.created"}],
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=0)
+
+    result = report.results[0]
+    assert result.status == "cancelled"
+    assert result.evidence["cleanup_cancel"] is True
+    assert "terminal_status: running" not in result.errors
+
+
+def test_execute_project_scale_plan_refreshes_terminal_status_after_generated_project_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_calls: list[bytes | None] = []
+
+    def validate(bundle: bytes | None, **_kwargs: object) -> object:
+        validation_calls.append(bundle)
+        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    client = FakeAcceptanceClient(
+        status="running",
+        statuses=("running", "completed"),
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "run.created"}, {"kind": "artifact.created"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0; node --check completed\n"
+                    "- npm test: passed exit 0; 1 test passed\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=0,
+        validate_generated_project=True,
+    )
+
+    result = report.results[0]
+    assert validation_calls
+    assert result.status == "completed"
+    assert result.evidence["terminal_status"] is True
+    assert result.errors == ()
+
+
 def test_execute_project_scale_plan_requires_plugin_contract_evidence() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("plugin",), execute=True)
     client = FakeAcceptanceClient(
