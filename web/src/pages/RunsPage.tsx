@@ -929,6 +929,7 @@ type ProcessDetailTarget = {
   createdAt: string | null;
   artifact?: DownloadableArtifact;
   sourceKind?: string;
+  sourceSequence?: number;
   sourceStepId?: string | null;
   sourceActor?: string | null;
 };
@@ -2583,6 +2584,11 @@ export function workbenchFileItems(
   const processByDownloadUrl = new Map(
     processItems.flatMap((item) => (item.artifact ? [[item.artifact.download_url.trim(), item] as const] : [])),
   );
+  const processBySourceSequence = new Map(
+    processItems.flatMap((item) =>
+      typeof item.sourceSequence === "number" ? [[`${item.runId}:${item.sourceSequence}`, item] as const] : [],
+    ),
+  );
   const append = (artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | DownloadableFile | null | undefined, source: ProcessDetailTarget | null) => {
     const downloadUrl = artifact?.download_url?.trim();
     if (!artifact || !downloadUrl) return;
@@ -2595,7 +2601,8 @@ export function workbenchFileItems(
   orderedConversationRuns(runs).forEach((run) => {
     run.artifacts.forEach((artifact) => append(artifact, null));
     orderedRunEvents(run.events).forEach((event) => {
-      workspaceFileArtifactsForEvent(event).forEach((artifact) => append(artifact, null));
+      const eventSource = processBySourceSequence.get(`${run.id}:${event.sequence}`) ?? null;
+      workspaceFileArtifactsForEvent(event).forEach((artifact) => append(artifact, eventSource));
       append(event.artifact, null);
     });
   });
@@ -3308,6 +3315,7 @@ function processItemsForModelDeltaGroup(
       rows,
       createdAt: lastEvent.created_at,
       sourceKind: lastEvent.kind,
+      sourceSequence: lastEvent.sequence,
       sourceStepId: lastEvent.step_id,
       sourceActor: lastEvent.actor,
     },
@@ -3384,6 +3392,7 @@ function processItemsForToolLifecycle(
       createdAt: lastEvent.created_at,
       artifact: artifactDetailDownload(artifact),
       sourceKind: lastEvent.kind,
+      sourceSequence: lastEvent.sequence,
       sourceStepId: lastEvent.step_id,
       sourceActor: lastEvent.actor,
     },
@@ -3415,6 +3424,7 @@ function processItemsForEvent(
     createdAt: event.created_at,
     artifact: artifactDetailDownload(artifact),
     sourceKind: event.kind,
+    sourceSequence: event.sequence,
     sourceStepId: event.step_id,
     sourceActor: event.actor,
   };
@@ -3625,6 +3635,39 @@ function AgentCoordinationEvidence({
   );
 }
 
+function WorkbenchActionRow({
+  files,
+  item,
+  onOpen,
+  onOpenFile,
+}: {
+  files: WorkbenchFileItem[];
+  item: ProcessDetailTarget;
+  onOpen: (target: ProcessDetailTarget) => void;
+  onOpenFile: (file: WorkbenchFileItem) => void;
+}) {
+  return (
+    <article className="agent-workbench-action-row">
+      <button type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+        <span aria-hidden="true">›</span>
+        <small className="process-card-badge">{item.badge}</small>
+        <strong>{item.message}</strong>
+        {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
+      </button>
+      {files.length > 0 ? (
+        <div className="agent-workbench-action-files" aria-label={`${item.message}关联文件`}>
+          {files.map((file) => (
+            <button key={file.id} type="button" onClick={() => onOpenFile(file)} aria-label={`预览文件 ${file.path || file.filename}`}>
+              <small>{file.operation}</small>
+              <span>{file.path || file.filename}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function AgentWorkbenchDrawer({
   dispatchCards,
   executionIntents,
@@ -3659,6 +3702,17 @@ function AgentWorkbenchDrawer({
   const recoveryCount = failureDiagnostics.length + executionIntents.length;
   const defaultFile = files.find(isTextPreviewCandidate) ?? files[0] ?? null;
   const selectedFile = files.find((file) => file.id === selectedFileId) ?? defaultFile;
+  const filesBySourceId = new Map<string, WorkbenchFileItem[]>();
+  files.forEach((file) => {
+    if (!file.source) return;
+    filesBySourceId.set(file.source.id, [...(filesBySourceId.get(file.source.id) ?? []), file]);
+  });
+  const filesForAction = (item: ProcessDetailTarget) => filesBySourceId.get(item.id) ?? [];
+  const openFile = (file: WorkbenchFileItem) => {
+    setSelectedFileId(file.id);
+    setSelectedAgentId(null);
+    setActiveView("files");
+  };
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -3705,12 +3759,13 @@ function AgentWorkbenchDrawer({
               ) : null}
               <div className="agent-cluster-actions">
                 {actionPreview.visible.map((item) => (
-                  <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                    <span aria-hidden="true">›</span>
-                    <small className="process-card-badge">{item.badge}</small>
-                    <strong>{item.message}</strong>
-                    {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
-                  </button>
+                  <WorkbenchActionRow
+                    key={item.id}
+                    files={filesForAction(item)}
+                    item={item}
+                    onOpen={onOpen}
+                    onOpenFile={openFile}
+                  />
                 ))}
               </div>
             </section>
@@ -3875,11 +3930,13 @@ function AgentWorkbenchDrawer({
                   <AgentCoordinationEvidence sections={coordinationSections} onOpen={onOpen} />
                   <div className="agent-cluster-actions">
                     {coordinationItems.map((item) => (
-                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{item.badge}</small>
-                        <strong>{item.message}</strong>
-                      </button>
+                      <WorkbenchActionRow
+                        key={item.id}
+                        files={filesForAction(item)}
+                        item={item}
+                        onOpen={onOpen}
+                        onOpenFile={openFile}
+                      />
                     ))}
                   </div>
                 </section>
@@ -3892,12 +3949,13 @@ function AgentWorkbenchDrawer({
                   </div>
                   <div className="agent-cluster-actions">
                     {actionItems.map((item) => (
-                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{item.badge}</small>
-                        <strong>{item.message}</strong>
-                        {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
-                      </button>
+                      <WorkbenchActionRow
+                        key={item.id}
+                        files={filesForAction(item)}
+                        item={item}
+                        onOpen={onOpen}
+                        onOpenFile={openFile}
+                      />
                     ))}
                   </div>
                 </section>
@@ -3947,11 +4005,13 @@ function AgentWorkbenchDrawer({
                   </div>
                   <div className="agent-cluster-actions">
                     {terminalItems.map((item) => (
-                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{item.badge}</small>
-                        <strong>{item.message}</strong>
-                      </button>
+                      <WorkbenchActionRow
+                        key={item.id}
+                        files={filesForAction(item)}
+                        item={item}
+                        onOpen={onOpen}
+                        onOpenFile={openFile}
+                      />
                     ))}
                   </div>
                   {terminalItems.length === 0 ? <p className="agent-workbench-compressed-note">暂无终端记录</p> : null}
@@ -3965,12 +4025,13 @@ function AgentWorkbenchDrawer({
                   </div>
                   <div className="agent-cluster-actions">
                     {resultItems.map((item) => (
-                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{item.badge}</small>
-                        <strong>{item.message}</strong>
-                        {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
-                      </button>
+                      <WorkbenchActionRow
+                        key={item.id}
+                        files={filesForAction(item)}
+                        item={item}
+                        onOpen={onOpen}
+                        onOpenFile={openFile}
+                      />
                     ))}
                   </div>
                   {resultItems.length === 0 ? <p className="agent-workbench-compressed-note">暂无结果记录</p> : null}

@@ -2627,6 +2627,62 @@ article:hover {
   padding-left: 0;
 }
 
+.agent-workbench-action-row {
+  display: grid;
+  gap: 0.28rem;
+  min-width: 0;
+}
+
+.agent-workbench-action-row .run-process-toggle {
+  width: 100%;
+}
+
+.agent-workbench-action-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem;
+  min-width: 0;
+  padding-left: 1.55rem;
+}
+
+.agent-workbench-action-files button {
+  align-items: center;
+  background: rgba(27, 178, 226, 0.12);
+  border: 1px solid rgba(123, 225, 255, 0.22);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  gap: 0.28rem;
+  max-width: min(100%, 22rem);
+  min-height: 1.8rem;
+  min-width: 0;
+  padding: 0.2rem 0.48rem;
+}
+
+.agent-workbench-action-files button:hover,
+.agent-workbench-action-files button:focus-visible {
+  background: rgba(27, 178, 226, 0.2);
+  border-color: rgba(123, 225, 255, 0.38);
+  outline: none;
+}
+
+.agent-workbench-action-files small {
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.agent-workbench-action-files span {
+  font-size: 0.76rem;
+  font-weight: 850;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-recruitment {
   border: 1px solid rgba(123, 225, 255, 0.12);
   border-radius: 8px;
@@ -5214,6 +5270,14 @@ article:hover {
   .agent-workbench-file-code {
     max-height: 46dvh;
     min-height: 14rem;
+  }
+
+  .agent-workbench-action-files {
+    padding-left: 0;
+  }
+
+  .agent-workbench-action-files button {
+    max-width: 100%;
   }
 
   .process-detail-modal-backdrop {

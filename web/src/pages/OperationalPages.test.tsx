@@ -2540,6 +2540,62 @@ describe("operational management pages", () => {
     expect(within(fileWindow).getByRole("button", { name: "下载 app.py" })).not.toBeNull();
   });
 
+  it("opens a workspace file preview from the producing agent action row", async () => {
+    const user = userEvent.setup();
+    const fileRunDetail: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "implementer 创建文件 src/app.py",
+          created_at: conversationCreatedAt,
+          actor: "implementer",
+          participants: [],
+          tool_name: "workspace.write_file",
+          tool_call_id: "call-write-app",
+          step_id: "write-app",
+          payload: {
+            operation_kind: "file_create",
+            workspace_files: [
+              {
+                path: "src/app.py",
+                filename: "app.py",
+                operation_kind: "file_create",
+                mime_type: "text/x-python",
+                size_bytes: 21,
+                sha256: "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+                download_url:
+                  "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=src%2Fapp.py",
+              },
+            ],
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = fileRunDetail;
+    visibleConversationRuns = [fileRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const workbench = await openAgentWorkbench(user, stream);
+    await openWorkbenchView(user, workbench, "实际动作");
+
+    const workbenchActions = within(workbench).getByLabelText("过程轨迹");
+    expect(within(workbenchActions).getByRole("button", { name: /implementer 创建文件 src\/app\.py/ })).not.toBeNull();
+    await user.click(within(workbenchActions).getByRole("button", { name: "预览文件 src/app.py" }));
+
+    const fileWindow = within(workbench).getByRole("region", { name: "文件窗口" });
+    expect(within(workbench).getByRole("button", { name: "文件" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(fileWindow).getByRole("button", { name: /src\/app\.py/ }).getAttribute("aria-pressed")).toBe("true");
+    expect(await within(fileWindow).findByText("print('hello from workspace')")).not.toBeNull();
+  });
+
   it("places current conversation workspace files after the conversation messages", async () => {
     visibleWorkspaceFiles = {
       items: [

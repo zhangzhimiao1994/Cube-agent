@@ -2478,6 +2478,43 @@ function DetailCoordinationEvidence({
   );
 }
 
+function DetailWorkbenchActionRow({
+  card,
+  files,
+  onOpen,
+  onOpenFile,
+}: {
+  card: DetailProcessCard;
+  files: DetailWorkbenchFileItem[];
+  onOpen: (card: DetailProcessCard) => void;
+  onOpenFile: (file: DetailWorkbenchFileItem) => void;
+}) {
+  return (
+    <article className="agent-workbench-action-row">
+      <button
+        type="button"
+        className="run-process-toggle process-intermediate-card"
+        onClick={() => onOpen(card)}
+      >
+        <span aria-hidden="true">›</span>
+        <small className="process-card-badge">{card.label}</small>
+        <strong>{card.title}</strong>
+        {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
+      </button>
+      {files.length > 0 ? (
+        <div className="agent-workbench-action-files" aria-label={`${card.title}关联文件`}>
+          {files.map((file) => (
+            <button key={file.id} type="button" onClick={() => onOpenFile(file)} aria-label={`预览文件 ${file.path || file.filename}`}>
+              <small>{file.operation}</small>
+              <span>{file.path || file.filename}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function DetailWorkbenchFilePreview({
   file,
   onOpenSource,
@@ -2582,6 +2619,17 @@ function DetailProcessDrawer({
   const resultCards = actionCards.filter(isDetailResultCard);
   const defaultFile = fileItems.find(isDetailTextPreviewCandidate) ?? fileItems[0] ?? null;
   const selectedFile = fileItems.find((file) => file.id === selectedFileId) ?? defaultFile;
+  const filesBySourceId = new Map<string, DetailWorkbenchFileItem[]>();
+  fileItems.forEach((file) => {
+    if (!file.source) return;
+    filesBySourceId.set(file.source.id, [...(filesBySourceId.get(file.source.id) ?? []), file]);
+  });
+  const filesForCard = (card: DetailProcessCard) => filesBySourceId.get(card.id) ?? [];
+  const openFile = (file: DetailWorkbenchFileItem) => {
+    setSelectedFileId(file.id);
+    setActiveView("files");
+    setShowAllActions(false);
+  };
   const visibleCards =
     activeView === "coordination"
       ? coordinationCards
@@ -2788,17 +2836,13 @@ function DetailProcessDrawer({
                   ) : null}
                   <div className="agent-cluster-actions" aria-label={visibleAria}>
                     {visiblePreview.visible.map((card) => (
-                      <button
+                      <DetailWorkbenchActionRow
                         key={card.id}
-                        type="button"
-                        className="run-process-toggle process-intermediate-card"
-                        onClick={() => onSelectCard(card)}
-                      >
-                        <span aria-hidden="true">›</span>
-                        <small className="process-card-badge">{card.label}</small>
-                        <strong>{card.title}</strong>
-                        {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
-                      </button>
+                        card={card}
+                        files={filesForCard(card)}
+                        onOpen={onSelectCard}
+                        onOpenFile={openFile}
+                      />
                     ))}
                   </div>
                   {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}

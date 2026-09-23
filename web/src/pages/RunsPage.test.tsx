@@ -422,6 +422,46 @@ describe("workspace and sandbox submission helpers", () => {
     expect(files[0]?.text).toBe("");
   });
 
+  it("links workspace file previews back to the agent action that produced them", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "implementer 创建文件 src/app.ts",
+          created_at: "2026-09-02T00:01:30Z",
+          actor: "implementer",
+          participants: [],
+          tool_name: "workspace.write_file",
+          step_id: "write-app",
+          payload: {
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                operation_kind: "file_create",
+                mime_type: "text/typescript",
+                size_bytes: 512,
+                sha256: "b".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map());
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, items);
+
+    expect(files[0]?.source?.sourceActor).toBe("implementer");
+    expect(files[0]?.source?.sourceStepId).toBe("write-app");
+    expect(files[0]?.source?.message).toContain("src/app.ts");
+  });
+
   it("uses workspace file operation metadata before event text fallbacks", () => {
     const run: RunDetail = {
       ...baseRun,
