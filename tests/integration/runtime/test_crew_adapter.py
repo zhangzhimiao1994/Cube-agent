@@ -1649,9 +1649,16 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
     )
     assert [tool.name for tool in gateway.requests[0].tools] == ["web_search"]
     assert [event.kind for event in events if str(event.kind).startswith("tool.")] == [
+        EventKind.TOOL_REQUESTED,
         EventKind.TOOL_STARTED,
         EventKind.TOOL_COMPLETED,
     ]
+    tool_requested = next(event for event in events if event.kind is EventKind.TOOL_REQUESTED)
+    assert tool_requested.payload["schema_version"] == 1
+    assert tool_requested.payload["status"] == "requested"
+    assert tool_requested.payload["argument_keys"] == ("q",)
+    assert "arguments" not in tool_requested.payload
+    assert '"safe"' not in json.dumps(dict(tool_requested.payload))
     tool_started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
     assert tool_started.payload["schema_version"] == 1
     assert tool_started.payload["status"] == "running"
