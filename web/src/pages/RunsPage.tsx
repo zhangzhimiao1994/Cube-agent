@@ -2592,10 +2592,12 @@ export function workbenchFileItems(
   const append = (artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | DownloadableFile | null | undefined, source: ProcessDetailTarget | null) => {
     const downloadUrl = artifact?.download_url?.trim();
     if (!artifact || !downloadUrl) return;
-    const key = downloadUrl;
+    const resolvedSource = source ?? processByDownloadUrl.get(downloadUrl) ?? null;
+    const keepPerAction = artifact.kind === "workspace_file";
+    const key = `${keepPerAction ? resolvedSource?.id ?? "global" : "global"}:${downloadUrl}`;
     if (!key || seen.has(key)) return;
     seen.add(key);
-    files.push(workbenchFileFromArtifact({ ...artifact, download_url: key }, source ?? processByDownloadUrl.get(key) ?? null));
+    files.push(workbenchFileFromArtifact({ ...artifact, download_url: downloadUrl }, resolvedSource));
   };
 
   orderedConversationRuns(runs).forEach((run) => {
@@ -3695,7 +3697,11 @@ function AgentWorkbenchDrawer({
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
   const actionItems = items.filter((item) => !isWorkbenchCoordinationItem(item));
   const terminalItems = actionItems.filter((item) => item.badge === "运行终端" || /运行终端/.test(`${item.title} ${item.message}`));
-  const resultItems = actionItems.filter((item) => item.artifact || /输出|产物|结果|完成/.test(`${item.badge} ${item.title} ${item.message}`));
+  const resultItems = actionItems.filter((item) => {
+    if (item.rows.some((row) => row.label === "关联文件")) return false;
+    if (/创建文件|编辑文件|读取文件/.test(`${item.badge} ${item.title} ${item.message}`)) return false;
+    return item.artifact || /输出|产物|结果/.test(`${item.badge} ${item.title} ${item.message}`);
+  });
   const coordinationSections = coordinationEvidenceSections(coordinationItems);
   const selectedAgentItems = selectedAgent ? agentActivityItems(selectedAgent, items) : [];
   const actionPreview = recentPreview(selectedAgentItems, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);

@@ -462,6 +462,72 @@ describe("workspace and sandbox submission helpers", () => {
     expect(files[0]?.source?.message).toContain("src/app.ts");
   });
 
+  it("keeps repeated workspace file operations on the same path tied to each producing action", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "implementer 创建文件 src/app.ts",
+          created_at: "2026-09-02T00:01:30Z",
+          actor: "implementer",
+          participants: [],
+          tool_name: "workspace.write_file",
+          step_id: "write-app",
+          payload: {
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                operation_kind: "file_create",
+                mime_type: "text/typescript",
+                size_bytes: 512,
+                sha256: "b".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "tester 编辑文件 src/app.ts",
+          created_at: "2026-09-02T00:02:30Z",
+          actor: "tester",
+          participants: [],
+          tool_name: "workspace.patch_file",
+          step_id: "patch-app",
+          payload: {
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                operation_kind: "file_edit",
+                mime_type: "text/typescript",
+                size_bytes: 768,
+                sha256: "c".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map());
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, items);
+
+    expect(files.map((file) => `${file.operation}:${file.source?.sourceActor}:${file.source?.sourceStepId}`)).toEqual([
+      "创建文件:implementer:write-app",
+      "编辑文件:tester:patch-app",
+    ]);
+  });
+
   it("uses workspace file operation metadata before event text fallbacks", () => {
     const run: RunDetail = {
       ...baseRun,

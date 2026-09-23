@@ -95,6 +95,18 @@ def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPat
     assert project_scale_runner_module._remaining_wait_seconds(150.0, 0) == 0
 
 
+def test_effective_execute_wait_seconds_respects_case_runtime_timeout() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("hybrid",),
+        execute=True,
+    )
+
+    assert project_scale_runner_module._effective_execute_wait_seconds(plan, 120) == 900
+    assert project_scale_runner_module._effective_execute_wait_seconds(plan, 1200) == 1200
+
+
 def run_project_scale_runner(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "agent_hub.harness.project_scale_runner", *args],

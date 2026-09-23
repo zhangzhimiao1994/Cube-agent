@@ -1301,8 +1301,22 @@ function isDetailTerminalCard(card: DetailProcessCard) {
 
 function isDetailResultCard(card: DetailProcessCard) {
   if (isDetailTerminalCard(card)) return false;
+  if (card.workspaceFiles && card.workspaceFiles.length > 0 && !card.artifact) return false;
+  if (/文件创建|文件编辑|文件读取|创建文件|编辑文件|读取文件/i.test(card.label)) return false;
   const text = detailWorkbenchCardText(card);
-  return Boolean(card.artifact) || /产物|输出|结果|完成|final|artifact/i.test(text);
+  return Boolean(card.artifact) || /产物|输出|结果|final|artifact/i.test(text);
+}
+
+function dedupeDetailResultCards(cards: DetailProcessCard[]) {
+  const seen = new Set<string>();
+  return cards.filter((card) => {
+    const artifact = card.artifact;
+    if (!artifact) return true;
+    const key = artifact.download_url?.trim() || artifact.id || `${artifact.kind}:${artifact.title}`;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function asDetailWorkbenchFileOperation(value: string): DetailWorkbenchFileItem["operation"] | null {
@@ -1332,8 +1346,10 @@ function detailWorkbenchFiles(cards: DetailProcessCard[]) {
   cards.forEach((card) => {
     const append = (artifact: DownloadableArtifact) => {
       const downloadUrl = artifact.download_url?.trim();
-      if (!downloadUrl || seen.has(downloadUrl)) return;
-      seen.add(downloadUrl);
+      const keepPerAction = artifact.kind === "workspace_file";
+      const key = `${keepPerAction ? card.id : "global"}:${downloadUrl}`;
+      if (!downloadUrl || seen.has(key)) return;
+      seen.add(key);
       const filename = artifactFileName(artifact);
       files.push({
         id: `${downloadUrl}:${card.id}`,
@@ -2616,7 +2632,7 @@ function DetailProcessDrawer({
   const actionCards = detailActionCards(cards);
   const fileItems = detailWorkbenchFiles(cards);
   const terminalCards = actionCards.filter(isDetailTerminalCard);
-  const resultCards = actionCards.filter(isDetailResultCard);
+  const resultCards = dedupeDetailResultCards(actionCards.filter(isDetailResultCard));
   const defaultFile = fileItems.find(isDetailTextPreviewCandidate) ?? fileItems[0] ?? null;
   const selectedFile = fileItems.find((file) => file.id === selectedFileId) ?? defaultFile;
   const filesBySourceId = new Map<string, DetailWorkbenchFileItem[]>();

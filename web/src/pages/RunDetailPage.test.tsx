@@ -37,7 +37,7 @@ it("gives the workbench drawer enough room for inspectable detail panes", () => 
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
   expect(stylesCss).toMatch(
-    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(96dvh,\s*1080px\);[\s\S]*max-width:\s*min\(96vw,\s*1180px\);[\s\S]*width:\s*min\(96vw,\s*1180px\);/,
+    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(96dvh,\s*1080px\);[\s\S]*max-width:\s*min\(98vw,\s*1240px\);[\s\S]*width:\s*min\(98vw,\s*1240px\);/,
   );
   expect(stylesCss).toMatch(
     /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(96dvh - 7rem\);[\s\S]*overflow-y:\s*auto;/,
@@ -461,6 +461,30 @@ describe("RunDetailPage", () => {
         {
           ...runDetail.events[0],
           sequence: 2,
+          kind: "tool.completed",
+          message: "created app source",
+          summary: "创建文件 src/app.ts",
+          actor: "writer",
+          step_id: "write-app",
+          payload: {
+            operation_kind: "file_create",
+            workspace_files: [
+              {
+                path: "src/app.ts",
+                filename: "app.ts",
+                operation_kind: "file_create",
+                mime_type: "text/typescript",
+                size_bytes: 256,
+                sha256: "a".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/app.ts",
+              },
+            ],
+          },
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 3,
           kind: "artifact.created",
           message: "created final script",
           summary: "创建文件 final-script.md",
@@ -511,7 +535,7 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
 
-    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("2 个");
+    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("3 个");
     expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
     expect(within(drawer).getByRole("button", { name: "结果" }).textContent).toContain("1 条");
 
@@ -519,10 +543,13 @@ describe("RunDetailPage", () => {
     const filesWindow = within(drawer).getByLabelText("文件窗口");
     const fileList = within(filesWindow).getByLabelText("文件操作列表");
     const finalScriptButton = within(fileList).getByRole("button", { name: /final-script\.md/ });
-    const workspaceFileButton = within(fileList).getByRole("button", { name: /src\/app\.ts/ });
+    const workspaceFileButtons = within(fileList).getAllByRole("button", { name: /src\/app\.ts/ });
     expect(finalScriptButton).not.toBeNull();
-    expect(workspaceFileButton).not.toBeNull();
-    await user.click(workspaceFileButton);
+    expect(workspaceFileButtons).toHaveLength(2);
+    await user.click(workspaceFileButtons[0]);
+    const createdPreview = within(filesWindow).getByLabelText("app.ts预览");
+    expect(within(createdPreview).getByText("创建文件")).not.toBeNull();
+    await user.click(workspaceFileButtons[1]);
     const workspacePreview = within(filesWindow).getByLabelText("app.ts预览");
     expect(within(workspacePreview).getByText("编辑文件")).not.toBeNull();
     await user.click(finalScriptButton);
@@ -534,7 +561,8 @@ describe("RunDetailPage", () => {
 
     await user.click(within(drawer).getByRole("button", { name: "结果" }));
     const resultWindow = within(drawer).getByLabelText("结果窗口");
-    expect(within(resultWindow).getByRole("button", { name: /创建文件 final-script\.md/ })).not.toBeNull();
+    expect(resultWindow.querySelectorAll(".agent-workbench-action-row")).toHaveLength(1);
+    expect(within(resultWindow).getByRole("button", { name: "预览文件 final-script.md" })).not.toBeNull();
   });
 
   it("shows checkpoint recovery as a clear workbench action without leaking checkpoint internals", async () => {

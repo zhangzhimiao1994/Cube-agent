@@ -290,6 +290,13 @@ def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_ch
     assert "agent_hub.harness.project_scale_runner" in command
     assert "--base-url \"$base_url\"" in command
     assert "--execute" in command
+    assert (
+        'AGENT_HUB_ACCEPTANCE_BEARER_TOKEN="$bearer_token" \\\n'
+        '      AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME="$acceptance_login_username" \\\n'
+        '      AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD="$acceptance_login_password" \\\n'
+        '      AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID="$acceptance_login_tenant_id" \\\n'
+        '      "$python_bin" "${args[@]}"'
+    ) in command
     assert "IFS=',' read -r -a scale_values <<< \"$project_scale_scales\"" in command
     assert "args+=(--scale \"$value\")" in command
     assert "IFS=',' read -r -a flow_values <<< \"$project_scale_flows\"" in command

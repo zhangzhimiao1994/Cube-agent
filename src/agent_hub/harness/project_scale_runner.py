@@ -864,6 +864,21 @@ def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | No
     return username, password, tenant_id
 
 
+def _effective_execute_wait_seconds(
+    plan: ProjectScaleRunPlan,
+    configured_wait_seconds: float,
+) -> float:
+    wait_seconds = max(configured_wait_seconds, 0.0)
+    runtime_timeouts: list[float] = []
+    for request in plan.requests:
+        value = request.body.get("runtime_timeout_seconds")
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            runtime_timeouts.append(float(value))
+    if runtime_timeouts:
+        wait_seconds = max(wait_seconds, max(runtime_timeouts))
+    return wait_seconds
+
+
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name, "")
     return value.strip().casefold() in {"1", "true", "yes", "on"}
@@ -965,7 +980,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 password=password,
                 tenant_id=tenant_id,
             ),
-            wait_seconds=args.wait_seconds,
+            wait_seconds=_effective_execute_wait_seconds(plan, args.wait_seconds),
             poll_interval_seconds=args.poll_interval,
             execution_id=args.execution_id or _default_execution_id(),
             validate_generated_project=args.validate_generated_project,

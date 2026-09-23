@@ -2215,8 +2215,8 @@ article:hover {
 
 .agent-workbench-drawer {
   max-height: min(96dvh, 1080px);
-  max-width: min(96vw, 1180px);
-  width: min(96vw, 1180px);
+  max-width: min(98vw, 1240px);
+  width: min(98vw, 1240px);
 }
 
 .agent-workbench-agent-card {
@@ -2628,36 +2628,54 @@ article:hover {
 }
 
 .agent-workbench-action-row {
+  border-left: 1px solid rgba(123, 225, 255, 0.18);
   display: grid;
-  gap: 0.28rem;
+  gap: 0.24rem;
   min-width: 0;
+  padding-left: 0.72rem;
+  position: relative;
+}
+
+.agent-workbench-action-row::before {
+  background: var(--accent);
+  border: 2px solid rgba(3, 10, 20, 0.92);
+  border-radius: 999px;
+  content: "";
+  height: 0.42rem;
+  left: -0.25rem;
+  position: absolute;
+  top: 1rem;
+  width: 0.42rem;
 }
 
 .agent-workbench-action-row .run-process-toggle {
+  max-width: none;
   width: 100%;
 }
 
 .agent-workbench-action-files {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.28rem;
+  display: grid;
+  gap: 0.22rem;
   min-width: 0;
-  padding-left: 1.55rem;
+  padding-left: 0;
 }
 
 .agent-workbench-action-files button {
   align-items: center;
-  background: rgba(27, 178, 226, 0.12);
-  border: 1px solid rgba(123, 225, 255, 0.22);
-  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 8px;
   color: var(--text);
   cursor: pointer;
-  display: inline-flex;
-  gap: 0.28rem;
-  max-width: min(100%, 22rem);
-  min-height: 1.8rem;
+  display: grid;
+  gap: 0.34rem;
+  grid-template-columns: auto minmax(0, 1fr);
+  justify-content: stretch;
+  max-width: 100%;
+  min-height: 2rem;
   min-width: 0;
-  padding: 0.2rem 0.48rem;
+  padding: 0.34rem 0.48rem;
+  text-align: left;
 }
 
 .agent-workbench-action-files button:hover,
@@ -2675,7 +2693,7 @@ article:hover {
 }
 
 .agent-workbench-action-files span {
-  font-size: 0.76rem;
+  font-size: 0.78rem;
   font-weight: 850;
   min-width: 0;
   overflow: hidden;
@@ -5270,6 +5288,8 @@ article:hover {
   .agent-workbench-file-code {
     max-height: 46dvh;
     min-height: 14rem;
+    overflow-x: auto;
+    white-space: pre;
   }
 
   .agent-workbench-action-files {
@@ -5277,6 +5297,7 @@ article:hover {
   }
 
   .agent-workbench-action-files button {
+    grid-template-columns: auto minmax(0, 1fr);
     max-width: 100%;
   }
 

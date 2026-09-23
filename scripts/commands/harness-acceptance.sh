@@ -4017,6 +4017,9 @@ run_authenticated_project_scale_execution_profile() {
   if ! output="$(
     PYTHONPATH="$source_dir/src:${PYTHONPATH:-}" \
       AGENT_HUB_ACCEPTANCE_BEARER_TOKEN="$bearer_token" \
+      AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME="$acceptance_login_username" \
+      AGENT_HUB_ACCEPTANCE_LOGIN_PASSWORD="$acceptance_login_password" \
+      AGENT_HUB_ACCEPTANCE_LOGIN_TENANT_ID="$acceptance_login_tenant_id" \
       "$python_bin" "${args[@]}" 2>&1
   )"; then
     printf 'fail: authenticated project scale execution runner scales=%s flows=%s\n' \
