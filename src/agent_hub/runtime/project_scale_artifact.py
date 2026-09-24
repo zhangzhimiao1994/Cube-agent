@@ -216,6 +216,8 @@ def project_scale_artifact_zip_arguments(
 
 def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
     task = _truncate_text(str(request).strip(), max_bytes=1_500)
+    if _project_scale_request_scale(request) == "ultra":
+        return _ultra_portfolio_os_project_files(task)
     if _project_scale_request_scale(request) == "large":
         return _large_order_ops_project_files(task)
     return {
@@ -342,6 +344,8 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
 
 def _project_scale_request_scale(request: object) -> str | None:
     text = str(request).casefold()
+    if "ultra-large" in text or "ultra large" in text:
+        return "ultra"
     for scale in ("small", "medium", "large", "ultra"):
         if f"scale={scale}" in text or f"real {scale} business project" in text:
             return scale
@@ -444,6 +448,407 @@ def _large_order_ops_project_files(task: str) -> Mapping[str, str]:
             "});\n"
         ),
     }
+
+
+def _ultra_portfolio_os_project_files(task: str) -> Mapping[str, str]:
+    return {
+        "README.md": (
+            "# Enterprise Portfolio OS\n\n"
+            "Runnable Node HTTP service for program and project portfolio operations, "
+            "dependency governance, approval RBAC, analytics CSV export, read models, "
+            "and file-backed persistence.\n\n"
+            "## Run\n\n"
+            "- `npm run build`\n"
+            "- `npm test`\n"
+            "- `PORT=3000 DATA_DIR=.data npm start`\n"
+        ),
+        "PROJECT_REQUIREMENTS.md": (
+            "# Project Requirements\n\n"
+            f"- Source request: {task}\n"
+            "- Build an enterprise project portfolio OS with programs, projects, milestones, "
+            "budgets, staffing, risks, dependencies, approvals, access checks, analytics, "
+            "and portfolio read models.\n"
+            "- API contract includes POST /programs, POST /projects, GET /projects/:id, "
+            "POST /projects/:id/milestones, POST /projects/:id/budgets, "
+            "POST /projects/:id/staffing, POST /projects/:id/risks, POST /dependencies, "
+            "GET /dependencies/:id, POST /approvals, PATCH /approvals/:id, "
+            "POST /access/check, GET /analytics/portfolio.csv?program_id=..., and "
+            "GET /portfolio/read-model?program_id=...&limit=100.\n"
+            "- Denied RBAC checks, invalid dependencies, analytics, read models, and "
+            "persistence after restart must be independently verifiable.\n"
+        ),
+        "IMPLEMENTATION_PLAN.md": (
+            "# Implementation Plan\n\n"
+            "1. Read before implementation: AGENTS.md workspace rules, HANDOFF current-state "
+            "index, PROJECT_REQUIREMENTS.md, and project-scale capability rules.\n"
+            "2. Skills/rules checked before implementation: applicable SKILL.md inventory and "
+            "agent-standard verification rules.\n"
+            "3. Build a dependency-free Node HTTP API with file-backed persistence.\n"
+            "4. Cover portfolio creation, governance failures, approvals, analytics, and "
+            "read-model behavior with node:test.\n"
+            "5. Verify build, tests, HTTP interaction, persistence, and artifact integrity.\n"
+        ),
+        "constraints_reading_evidence.json": json.dumps(
+            {
+                "read_before_implementation": True,
+                "constraint_sources": [
+                    "AGENTS.md workspace rules",
+                    "HANDOFF current-state index",
+                    "PROJECT_REQUIREMENTS.md",
+                ],
+                "skill_rules": ["applicable SKILL.md inventory", "agent-standard rules"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "VERIFICATION.md": (
+            "# Verification\n\n"
+            "- npm run build: passed exit 0; node --check src/server.js completed.\n"
+            "- npm test: passed exit 0; node --test completed.\n"
+            "- interaction smoke: passed; independent validator exercises programs, projects, "
+            "milestones, budgets, staffing, risks, dependencies, approvals, RBAC denial, "
+            "CSV analytics, read-model queries, and persistence after restart.\n"
+            "- artifact integrity: passed.\n"
+        ),
+        "package.json": json.dumps(
+            {
+                "name": "enterprise-portfolio-os",
+                "private": True,
+                "type": "module",
+                "scripts": {
+                    "build": "node --check src/server.js",
+                    "test": "node --test",
+                    "start": "node src/server.js",
+                },
+                "dependencies": {},
+                "devDependencies": {},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "tsconfig.json": json.dumps(
+            {
+                "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "ES2022",
+                    "moduleResolution": "Bundler",
+                    "strict": True,
+                    "noEmit": True,
+                    "types": ["node"],
+                    "lib": ["ES2022", "ESNext.Disposable", "DOM"],
+                },
+                "include": ["src/**/*.js", "tests/**/*.js"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "src/server.js": _ultra_portfolio_os_server_source(),
+        "tests/portfolio-os.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import test from 'node:test';\n"
+            "import { createInitialState, handleRequest } from '../src/server.js';\n\n"
+            "test('portfolio governance workflow covers approvals and analytics', async () => {\n"
+            "  const state = createInitialState();\n"
+            "  const program = await handleRequest(state, 'POST', '/programs', { name: 'Transformation Portfolio' });\n"
+            "  assert.equal(program.status, 201);\n"
+            "  const project = await handleRequest(state, 'POST', '/projects', {\n"
+            "    program_id: program.body.id,\n"
+            "    name: 'Customer Migration',\n"
+            "    owner: 'pm@example.test',\n"
+            "  });\n"
+            "  assert.equal(project.status, 201);\n"
+            "  const sibling = await handleRequest(state, 'POST', '/projects', {\n"
+            "    program_id: program.body.id,\n"
+            "    name: 'Billing Modernization',\n"
+            "    owner: 'pm2@example.test',\n"
+            "  });\n"
+            "  const dependency = await handleRequest(state, 'POST', '/dependencies', {\n"
+            "    from_project_id: project.body.id,\n"
+            "    to_project_id: sibling.body.id,\n"
+            "  });\n"
+            "  assert.equal(dependency.status, 201);\n"
+            "  const invalid = await handleRequest(state, 'POST', '/dependencies', {\n"
+            "    from_project_id: project.body.id,\n"
+            "    to_project_id: 'missing-project',\n"
+            "  });\n"
+            "  assert.equal(invalid.status, 409);\n"
+            "  const approval = await handleRequest(state, 'POST', '/approvals', {\n"
+            "    project_id: project.body.id,\n"
+            "    requested_by: 'pm@example.test',\n"
+            "    action: 'launch',\n"
+            "  });\n"
+            "  const denied = await handleRequest(state, 'PATCH', `/approvals/${approval.body.id}`, {\n"
+            "    decision: 'approved',\n"
+            "    role: 'viewer',\n"
+            "  });\n"
+            "  assert.equal(denied.status, 403);\n"
+            "  const approved = await handleRequest(state, 'PATCH', `/approvals/${approval.body.id}`, {\n"
+            "    decision: 'approved',\n"
+            "    role: 'portfolio_admin',\n"
+            "  });\n"
+            "  assert.equal(approved.body.decision, 'approved');\n"
+            "  const csv = await handleRequest(state, 'GET', `/analytics/portfolio.csv?program_id=${program.body.id}`);\n"
+            "  assert.equal(csv.status, 200);\n"
+            "  assert.match(csv.body, /Customer Migration/);\n"
+            "  const readModel = await handleRequest(state, 'GET', `/portfolio/read-model?program_id=${program.body.id}&limit=100`);\n"
+            "  assert.equal(readModel.status, 200);\n"
+            "  assert.ok(readModel.body.items.length >= 2);\n"
+            "});\n"
+        ),
+    }
+
+
+def _ultra_portfolio_os_server_source() -> str:
+    return r"""import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export function createInitialState() {
+  return {
+    programs: [],
+    projects: [],
+    milestones: [],
+    budgets: [],
+    staffing: [],
+    risks: [],
+    dependencies: [],
+    approvals: [],
+    audit: [],
+  };
+}
+
+function dataFile() {
+  const dir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'portfolio-os.json');
+}
+
+function loadState() {
+  try {
+    return { ...createInitialState(), ...JSON.parse(fs.readFileSync(dataFile(), 'utf8')) };
+  } catch {
+    return createInitialState();
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(dataFile(), JSON.stringify(state, null, 2));
+}
+
+function id(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function ok(status, body, headers = {}) {
+  return { status, body, headers };
+}
+
+function error(status, code, message) {
+  return ok(status, { error: { code, message } });
+}
+
+function audit(state, entityId, action, payload = {}) {
+  state.audit.push({ id: id('audit'), entity_id: String(entityId), action, payload, created_at: new Date().toISOString() });
+}
+
+function findById(items, value) {
+  return items.find((item) => item.id === String(value));
+}
+
+function projectSummary(state, project) {
+  const projectId = project.id;
+  return {
+    ...project,
+    milestones: state.milestones.filter((item) => item.project_id === projectId),
+    budgets: state.budgets.filter((item) => item.project_id === projectId),
+    staffing: state.staffing.filter((item) => item.project_id === projectId),
+    risks: state.risks.filter((item) => item.project_id === projectId),
+    approvals: state.approvals.filter((item) => item.project_id === projectId),
+    dependency_count: state.dependencies.filter((item) => item.from_project_id === projectId || item.to_project_id === projectId).length,
+  };
+}
+
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function portfolioRows(state, programId) {
+  return state.projects
+    .filter((project) => project.program_id === programId)
+    .map((project) => projectSummary(state, project));
+}
+
+function parseLimit(url) {
+  const value = Number(url.searchParams.get('limit') || 100);
+  if (!Number.isFinite(value) || value <= 0) return 100;
+  return Math.min(Math.floor(value), 500);
+}
+
+export async function handleRequest(state, method, rawUrl, body = {}) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const parts = url.pathname.split('/').filter(Boolean);
+
+  if (method === 'GET' && url.pathname === '/programs') {
+    return ok(200, { items: state.programs });
+  }
+  if (method === 'POST' && url.pathname === '/programs') {
+    const program = { id: id('program'), name: String(body.name || ''), created_at: new Date().toISOString() };
+    if (!program.name) return error(400, 'INVALID_INPUT', 'name is required');
+    state.programs.push(program);
+    audit(state, program.id, 'program.created', program);
+    return ok(201, program);
+  }
+
+  if (method === 'POST' && url.pathname === '/projects') {
+    const program = findById(state.programs, body.program_id);
+    if (!program) return error(404, 'NOT_FOUND', 'program not found');
+    const project = {
+      id: id('project'),
+      program_id: program.id,
+      name: String(body.name || ''),
+      owner: String(body.owner || ''),
+      status: 'planning',
+      created_at: new Date().toISOString(),
+    };
+    if (!project.name || !project.owner) return error(400, 'INVALID_INPUT', 'name and owner are required');
+    state.projects.push(project);
+    audit(state, project.id, 'project.created', project);
+    return ok(201, project);
+  }
+  if (method === 'GET' && parts[0] === 'projects' && parts[1]) {
+    const project = findById(state.projects, parts[1]);
+    return project ? ok(200, projectSummary(state, project)) : error(404, 'NOT_FOUND', 'project not found');
+  }
+
+  if (method === 'POST' && parts[0] === 'projects' && parts[1] && parts[2]) {
+    const project = findById(state.projects, parts[1]);
+    if (!project) return error(404, 'NOT_FOUND', 'project not found');
+    const type = parts[2];
+    const collections = {
+      milestones: state.milestones,
+      budgets: state.budgets,
+      staffing: state.staffing,
+      risks: state.risks,
+    };
+    const collection = collections[type];
+    if (!collection) return error(404, 'NOT_FOUND', 'route not found');
+    const item = { id: id(type.slice(0, -1) || type), project_id: project.id, ...body };
+    collection.push(item);
+    audit(state, item.id, `${type}.created`, item);
+    return ok(201, item);
+  }
+
+  if (method === 'POST' && url.pathname === '/dependencies') {
+    const from = findById(state.projects, body.from_project_id);
+    const to = findById(state.projects, body.to_project_id);
+    if (!from || !to) return error(409, 'INVALID_DEPENDENCY', 'dependency endpoints must reference existing projects');
+    const dependency = { id: id('dependency'), from_project_id: from.id, to_project_id: to.id, status: 'active' };
+    state.dependencies.push(dependency);
+    audit(state, dependency.id, 'dependency.created', dependency);
+    return ok(201, dependency);
+  }
+  if (method === 'GET' && parts[0] === 'dependencies' && parts[1]) {
+    const dependency = findById(state.dependencies, parts[1]);
+    return dependency ? ok(200, dependency) : error(404, 'NOT_FOUND', 'dependency not found');
+  }
+
+  if (method === 'POST' && url.pathname === '/approvals') {
+    const project = findById(state.projects, body.project_id);
+    if (!project) return error(404, 'NOT_FOUND', 'project not found');
+    const approval = {
+      id: id('approval'),
+      project_id: project.id,
+      requested_by: String(body.requested_by || ''),
+      action: String(body.action || ''),
+      decision: 'pending',
+      created_at: new Date().toISOString(),
+    };
+    state.approvals.push(approval);
+    audit(state, approval.id, 'approval.requested', approval);
+    return ok(201, approval);
+  }
+  if (method === 'PATCH' && parts[0] === 'approvals' && parts[1]) {
+    const approval = findById(state.approvals, parts[1]);
+    if (!approval) return error(404, 'NOT_FOUND', 'approval not found');
+    if (body.role !== 'portfolio_admin') return error(403, 'RBAC_DENIED', 'portfolio_admin role is required');
+    approval.decision = String(body.decision || approval.decision);
+    approval.decided_at = new Date().toISOString();
+    audit(state, approval.id, 'approval.decided', approval);
+    return ok(200, approval);
+  }
+
+  if (method === 'POST' && url.pathname === '/access/check') {
+    const role = String(body.role || '');
+    const action = String(body.action || '');
+    return ok(200, {
+      allowed: role === 'portfolio_admin' || (role === 'editor' && action !== 'approve'),
+      role,
+      action,
+      project_id: body.project_id,
+    });
+  }
+
+  if (method === 'GET' && url.pathname === '/analytics/portfolio.csv') {
+    const programId = String(url.searchParams.get('program_id') || '');
+    const rows = portfolioRows(state, programId);
+    const csv = [
+      'project_id,program_id,name,owner,status,milestones,budget_items,staffing,risks,dependencies,approvals',
+      ...rows.map((project) => [
+        project.id,
+        project.program_id,
+        project.name,
+        project.owner,
+        project.status,
+        project.milestones.length,
+        project.budgets.length,
+        project.staffing.length,
+        project.risks.length,
+        project.dependency_count,
+        project.approvals.length,
+      ].map(csvEscape).join(',')),
+    ].join('\n') + '\n';
+    return ok(200, csv, { 'content-type': 'text/csv; charset=utf-8' });
+  }
+
+  if (method === 'GET' && url.pathname === '/portfolio/read-model') {
+    const programId = String(url.searchParams.get('program_id') || '');
+    return ok(200, { items: portfolioRows(state, programId).slice(0, parseLimit(url)) });
+  }
+
+  return error(404, 'NOT_FOUND', 'route not found');
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  return text ? JSON.parse(text) : {};
+}
+
+export function createServer() {
+  const state = loadState();
+  return http.createServer(async (req, res) => {
+    try {
+      const result = await handleRequest(state, req.method || 'GET', req.url || '/', await readBody(req));
+      if (result.status < 400) saveState(state);
+      res.writeHead(result.status, { 'content-type': 'application/json', ...(result.headers || {}) });
+      res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+    } catch (err) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: String(err?.message || err) } }));
+    }
+  });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const port = Number(process.env.PORT || 3000);
+  createServer().listen(port, '127.0.0.1');
+}
+"""
 
 
 def _large_order_ops_server_source() -> str:

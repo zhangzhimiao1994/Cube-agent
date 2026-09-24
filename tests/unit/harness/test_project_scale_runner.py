@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -41,6 +42,7 @@ from agent_hub.harness.project_scale_runner import (
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
+from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from agent_hub.runtime.role_planner import RolePlanningRequest
 
 _AGENT_STANDARD_IMPLEMENTATION_PLAN = (
@@ -373,6 +375,30 @@ def test_capability_ultra_uses_independent_portfolio_requirements(
     )
     assert result.passed is False
     assert "requirements: RBAC approval missing" in result.reasons
+
+
+def test_controlled_ultra_project_bundle_passes_independent_validation() -> None:
+    if shutil.which("npm") is None:
+        pytest.skip("npm is required for generated project validation")
+    bundle = _project_bundle(
+        dict(
+            project_scale_artifact_zip_files(
+                "Build a real ultra-large business project for flow=direct. "
+                "Acceptance conditions require enterprise portfolio OS APIs, analytics, "
+                "RBAC, persistence, tests, and verification evidence."
+            )
+        )
+    )
+
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        bundle,
+        commands=project_scale_runner_module._DEFAULT_GENERATED_PROJECT_COMMANDS,
+        timeout_seconds=30,
+        requirements_case_id="ultra:direct",
+    )
+
+    assert result.passed is True
+    assert result.reasons == ()
 
 
 def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records() -> None:

@@ -170,7 +170,14 @@ def _is_project_scale_capability_request(request: object) -> bool:
 
 def _can_recover_project_scale_capability_request(request: object) -> bool:
     text = str(request).casefold()
-    return "real large business project" in text or "scale=large" in text
+    return (
+        "real large business project" in text
+        or "scale=large" in text
+        or "real ultra-large business project" in text
+        or "real ultra business project" in text
+        or "ultra-large project" in text
+        or "scale=ultra" in text
+    )
 
 
 def _max_output_bytes_for_context(context: TaskContext) -> int:

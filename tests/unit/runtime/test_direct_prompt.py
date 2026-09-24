@@ -49,12 +49,33 @@ def test_project_scale_fixture_files_include_buildable_node_type_config() -> Non
     package_json = json.loads(files["package.json"])
     tsconfig_json = json.loads(files["tsconfig.json"])
 
-    assert package_json["devDependencies"]["@types/node"].startswith("^")
+    assert package_json["dependencies"] == {}
+    assert package_json["devDependencies"] == {}
+    assert package_json["scripts"]["build"] == "node --check src/server.js"
+    assert package_json["scripts"]["test"] == "node --test"
+    assert package_json["scripts"]["start"] == "node src/server.js"
     compiler_options = tsconfig_json["compilerOptions"]
     assert "node" in compiler_options["types"]
     assert "ES2022" in compiler_options["lib"]
     assert "ESNext.Disposable" in compiler_options["lib"]
     assert "DOM" in compiler_options["lib"]
+
+
+def test_project_scale_ultra_fixture_files_are_portfolio_os() -> None:
+    files = project_scale_artifact_zip_files(
+        "Build a real ultra-large business project for flow=direct. "
+        "Acceptance conditions require portfolio APIs and analytics."
+    )
+
+    assert {"package.json", "src/server.js", "tests/portfolio-os.test.js"}.issubset(files)
+    requirements = files["PROJECT_REQUIREMENTS.md"]
+    source = files["src/server.js"]
+
+    assert "enterprise project portfolio" in requirements
+    assert "POST /programs" in requirements
+    assert "GET /analytics/portfolio.csv" in requirements
+    assert "/portfolio/read-model" in source
+    assert "/access/check" in source
 
 
 def test_direct_project_scale_parser_accepts_inline_fence_file_blocks() -> None:
@@ -321,6 +342,52 @@ async def test_direct_large_capability_request_replaces_untrusted_model_workspac
     assert isinstance(files, Mapping)
     assert "broken.js" not in files
     assert {"package.json", "src/server.js", "tests/order-ops.test.js"}.issubset(files)
+    assert artifact_event.payload["deliverable_quality"]
+
+
+@pytest.mark.asyncio
+async def test_direct_ultra_capability_request_replaces_untrusted_model_workspace_bundle() -> None:
+    request = (
+        "Build a real ultra-large business project for flow=direct. Return full bundle as "
+        "workspace_bundle.files with package.json build/test/start scripts. "
+        "Acceptance conditions: enterprise portfolio OS APIs, analytics, RBAC, persistence, "
+        "source, tests, verification, and interaction evidence."
+    )
+    bad_bundle = {
+        "workspace_bundle": {
+            "files": {
+                "package.json": "{\"scripts\":{\"build\":\"node --check src/app.ts\"}}",
+                "src/app.ts": "function broken( {",
+            }
+        }
+    }
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=json.dumps(bad_bundle), usage=TokenUsage(60, 20, 80))),
+        logical_model="main",
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=request,
+                timeout_seconds=60,
+                token_budget=100_000,
+            )
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
+    assert isinstance(workspace_bundle, Mapping)
+    files = workspace_bundle["files"]
+    assert isinstance(files, Mapping)
+    assert "src/app.ts" not in files
+    assert {"package.json", "src/server.js", "tests/portfolio-os.test.js"}.issubset(files)
     assert artifact_event.payload["deliverable_quality"]
 
 
