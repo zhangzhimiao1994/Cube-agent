@@ -515,7 +515,15 @@ function hasWorkspaceFilePayload(event: RunDetail["events"][number]) {
 
 function isActionEvent(event: RunDetail["events"][number]) {
   if (isNoiseEvent(event)) return false;
-  if (event.kind.startsWith("model.") && event.kind !== "model.failed") return false;
+  if (event.kind.startsWith("model.")) {
+    if (["model.started", "model.reasoning_delta", "model.text_delta", "model.failed"].includes(event.kind)) {
+      return Boolean(event.actor || event.step_id || hasUsefulPayload(event));
+    }
+    return false;
+  }
+  if (event.kind.startsWith("harness.")) {
+    return Boolean(hasUsefulPayload(event) || event.message);
+  }
   if (event.kind === "message.created") return Boolean(event.artifact || hasWorkspaceFilePayload(event));
   if (event.kind === "artifact.created") {
     return Boolean(
@@ -2690,12 +2698,14 @@ function RunInteractionArtifactSummary({
   const sourceFiles = visibleFiles.filter((file) =>
     /\.(?:js|jsx|ts|tsx|py|css|html|json|md|sql|sh)$/i.test(file.path || file.filename),
   );
-  const primaryText = preferredReplyArtifact(dedupeTextArtifacts(detail.artifacts))?.text?.trim() ?? "";
-  const outcome = conciseProcessText(
-    primaryText || failureSummaryForChat(detail) || detail.request,
-    detail.status === "completed" ? "主 Agent 已完成本轮交付。" : "主 Agent 正在整理本轮交付。",
-  );
-  if (files.length === 0 && !primaryText && detail.status !== "completed") return null;
+  const failureText = detail.status === "failed" ? failureSummaryForChat(detail) : null;
+  const outcome =
+    failureText && failureText.trim()
+      ? conciseProcessText(failureText, "本轮运行中断，已保留可查看的阶段产物。")
+      : detail.status === "completed"
+        ? "主 Agent 已整理本轮交付，文件可直接预览。"
+        : "主 Agent 正在整理本轮交付，已生成的文件会在这里汇总。";
+  if (files.length === 0) return null;
   return (
     <section className="conversation-artifact-summary" aria-label="本轮产物摘要">
       <div className="conversation-artifact-summary-header">
@@ -6480,14 +6490,6 @@ export function RunsPage() {
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{repairApproval.proposal.title}</h3>
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
-                <div className="composer-card-actions">
-                  <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
-                    {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
-                  </button>
-                  <button type="button" className="secondary-action" disabled={acceptSelfRepair.isPending} onClick={cancelSelfRepair}>
-                    取消修复
-                  </button>
-                </div>
               </article>
             ) : null}
             {messages.map((item, index) => (
