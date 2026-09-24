@@ -1365,7 +1365,9 @@ def _safe_zip_member_path(value: str) -> PurePosixPath:
         raise RuntimeError(f"workspace bundle has unsafe path: {value}")
     if any(part in {"", ".", ".."} for part in path.parts):
         raise RuntimeError(f"workspace bundle has unsafe path: {value}")
-    if ":" in path.parts[0]:
+    if any(":" in part for part in path.parts):
+        raise RuntimeError(f"workspace bundle has unsafe path: {value}")
+    if path.parts[0].strip().upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
         raise RuntimeError(f"workspace bundle has unsafe path: {value}")
     return path
 
@@ -2053,6 +2055,7 @@ def _deliverable_repair_body(
             "Repair same project; preserve requirements. Return full workspace_bundle.files "
             "or ### `path` fences: source/tests/README/PROJECT_REQUIREMENTS.md/"
             "IMPLEMENTATION_PLAN.md/VERIFICATION.md/constraints_reading_evidence.json. "
+            "File keys must be safe relative paths, not endpoints/URLs/HTTP methods. "
             "constraints_reading_evidence.json must include read_before_implementation:true, "
             "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
             "and skills/rules naming applicable SKILL.md or agent-standard rules. "
@@ -2098,7 +2101,7 @@ def _deliverable_repair_body(
         "source files, tests or build scripts, implementation plan, and verification report "
         "with reproducible build, test, and interaction evidence. Avoid credential-like terms "
         "and avoid package, file, variable, or fixture names that contain the sk- prefix so "
-        "public evidence stays visible."
+        "public evidence stays visible. File keys must be safe relative paths, not endpoints."
         if body.get("mode") == "direct" or case_id.endswith(":direct")
         else ""
     )

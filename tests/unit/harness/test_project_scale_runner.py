@@ -3131,6 +3131,12 @@ def test_generated_project_zip_path_validation_rejects_backslashes() -> None:
         _safe_zip_member_path(r"nested\evil.js")
 
 
+@pytest.mark.parametrize("path", ("POST /orders/:id", "PATCH /fulfillment/jobs/:id"))
+def test_generated_project_zip_path_validation_rejects_endpoint_titles(path: str) -> None:
+    with pytest.raises(RuntimeError, match=r"unsafe path"):
+        _safe_zip_member_path(path)
+
+
 def test_workspace_bundle_agent_standard_requires_constraints_and_skill_rule_evidence() -> None:
     bundle = _project_bundle(
         {
