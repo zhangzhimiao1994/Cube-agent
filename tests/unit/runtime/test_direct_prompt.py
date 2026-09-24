@@ -353,18 +353,7 @@ async def test_direct_ultra_capability_request_replaces_untrusted_model_workspac
         "Acceptance conditions: enterprise portfolio OS APIs, analytics, RBAC, persistence, "
         "source, tests, verification, and interaction evidence."
     )
-    bad_bundle = {
-        "workspace_bundle": {
-            "files": {
-                "package.json": "{\"scripts\":{\"build\":\"node --check src/app.ts\"}}",
-                "src/app.ts": "function broken( {",
-            }
-        }
-    }
-    runtime = DirectRuntime(
-        FakeGateway(ModelResponse(text=json.dumps(bad_bundle), usage=TokenUsage(60, 20, 80))),
-        logical_model="main",
-    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
 
     events = [
         event
@@ -380,15 +369,51 @@ async def test_direct_ultra_capability_request_replaces_untrusted_model_workspac
         )
     ]
 
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
-    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
+    workspace_bundle = artifact_event.payload["workspace_bundle"]
     assert isinstance(workspace_bundle, Mapping)
     files = workspace_bundle["files"]
     assert isinstance(files, Mapping)
     assert "src/app.ts" not in files
     assert {"package.json", "src/server.js", "tests/portfolio-os.test.js"}.issubset(files)
     assert artifact_event.payload["deliverable_quality"]
+
+
+@pytest.mark.asyncio
+async def test_direct_ultra_capability_request_emits_controlled_artifact_without_gateway() -> None:
+    request = (
+        "Build a real ultra business project for flow=direct. Build an ultra-large project: "
+        "a TypeScript/Node enterprise project portfolio operating system. Return strict JSON "
+        "workspace_bundle.files. Acceptance conditions: source, tests, verification, "
+        "portfolio APIs, RBAC, analytics, and persistence."
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=request,
+                timeout_seconds=60,
+                token_budget=100_000,
+            )
+        )
+    ]
+
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.payload["workspace_bundle"] == {
+        "files": project_scale_artifact_zip_files(request)
+    }
+    text = artifact_event.artifact.content["text"] if artifact_event.artifact else ""
+    assert isinstance(text, str)
+    assert "### `src/server.js`" in text
+    assert "### `tests/portfolio-os.test.js`" in text
 
 
 def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:

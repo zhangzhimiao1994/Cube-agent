@@ -152,6 +152,20 @@ function displayMode(mode: string | null | undefined) {
   return RUN_MODES.find((item) => item.value === mode)?.label ?? mode ?? "等待选择";
 }
 
+function displayChatRunStatus(status: string) {
+  const labels: Record<string, string> = {
+    queued: "已排队",
+    running: "运行中",
+    paused: "已暂停",
+    completed: "已完成",
+    failed: "执行异常",
+    cancelled: "已取消",
+    waiting_approval: "等待确认",
+    waiting_user_mode: "等待模式确认",
+  };
+  return labels[status] ?? status;
+}
+
 function displaySandboxProfile(profile: SandboxProfile) {
   return SANDBOX_OPTIONS.find((item) => item.value === profile)?.label ?? profile;
 }
@@ -495,8 +509,14 @@ function hasUsefulPayload(event: RunDetail["events"][number]) {
   });
 }
 
+function hasWorkspaceFilePayload(event: RunDetail["events"][number]) {
+  return Array.isArray(event.payload.workspace_files) && event.payload.workspace_files.length > 0;
+}
+
 function isActionEvent(event: RunDetail["events"][number]) {
   if (isNoiseEvent(event)) return false;
+  if (event.kind.startsWith("model.") && event.kind !== "model.failed") return false;
+  if (event.kind === "message.created") return Boolean(event.artifact || hasWorkspaceFilePayload(event));
   if (event.kind === "artifact.created") {
     return Boolean(
       event.actor ||
@@ -510,7 +530,20 @@ function isActionEvent(event: RunDetail["events"][number]) {
   if (["step.started", "step.completed"].includes(event.kind)) {
     return Boolean(event.actor || event.action || event.tool_name || event.decision || hasUsefulPayload(event));
   }
-  return true;
+  if (
+    event.kind.startsWith("tool.") ||
+    event.kind.startsWith("approval.") ||
+    event.kind.startsWith("dispatch.") ||
+    event.kind.startsWith("discussion.") ||
+    event.kind.startsWith("decision.") ||
+    event.kind.startsWith("review.") ||
+    event.kind.startsWith("runtime.") ||
+    event.kind === "temporary_agent.proposed" ||
+    event.kind === "observer.notice"
+  ) {
+    return Boolean(event.actor || event.action || event.tool_name || event.decision || event.artifact || hasUsefulPayload(event));
+  }
+  return false;
 }
 
 function eventPayloadLabel(key: string) {
@@ -2562,18 +2595,24 @@ function mergeWorkspaceFileList(
 
 function ConversationWorkspaceFiles({
   files,
+  previewFiles = [],
+  onPreviewFile,
   title = "当前会话文件",
   eyebrow = "Files",
   ariaLabel = title,
   showIntermediateInline = false,
 }: {
   files: ConversationWorkspaceFileBuckets;
+  previewFiles?: WorkbenchFileItem[];
+  onPreviewFile?: (file: WorkbenchFileItem) => void;
   title?: string;
   eyebrow?: string;
   ariaLabel?: string;
   showIntermediateInline?: boolean;
 }) {
   if (files.total === 0) return null;
+  const visiblePreviewFiles = previewFiles.slice(0, showIntermediateInline ? 8 : 4);
+  const remainingPreviewFiles = Math.max(previewFiles.length - visiblePreviewFiles.length, 0);
   return (
     <section className="conversation-files-panel" aria-label={ariaLabel}>
       <div className="conversation-files-header">
@@ -2586,6 +2625,27 @@ function ConversationWorkspaceFiles({
           {files.intermediate.length > 0 ? ` · ${files.intermediate.length} 个中间产物` : ""}
         </small>
       </div>
+      {visiblePreviewFiles.length > 0 ? (
+        <div className="conversation-file-link-grid" aria-label="交互区文件链接">
+          {visiblePreviewFiles.map((file) => (
+            <button
+              key={file.id}
+              type="button"
+              className="conversation-file-link"
+              onClick={() => onPreviewFile?.(file)}
+              disabled={!onPreviewFile}
+              aria-label={`预览文件 ${file.path || file.filename}`}
+            >
+              <small>{file.operation}</small>
+              <strong>{file.path || file.filename}</strong>
+              <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
+            </button>
+          ))}
+          {remainingPreviewFiles > 0 ? (
+            <span className="conversation-file-more">另有 {remainingPreviewFiles} 个文件在工作席</span>
+          ) : null}
+        </div>
+      ) : null}
       {files.final.length > 0 ? (
         <div className="conversation-files-group" aria-label="最终产物">
           {files.final.map((artifact) => (
@@ -2612,6 +2672,83 @@ function ConversationWorkspaceFiles({
       ) : null}
     </section>
   );
+}
+
+function RunInteractionArtifactSummary({
+  detail,
+  files,
+  onPreviewFile,
+}: {
+  detail: RunDetail;
+  files: WorkbenchFileItem[];
+  onPreviewFile: (file: WorkbenchFileItem) => void;
+}) {
+  const visibleFiles = files.slice(0, 6);
+  const planFiles = visibleFiles.filter((file) =>
+    /(^|\/)(plan|implementation|requirements|readme|verification|skill)\.(md|json)$/i.test(file.path || file.filename),
+  );
+  const sourceFiles = visibleFiles.filter((file) =>
+    /\.(?:js|jsx|ts|tsx|py|css|html|json|md|sql|sh)$/i.test(file.path || file.filename),
+  );
+  const primaryText = preferredReplyArtifact(dedupeTextArtifacts(detail.artifacts))?.text?.trim() ?? "";
+  const outcome = conciseProcessText(
+    primaryText || failureSummaryForChat(detail) || detail.request,
+    detail.status === "completed" ? "主 Agent 已完成本轮交付。" : "主 Agent 正在整理本轮交付。",
+  );
+  if (files.length === 0 && !primaryText && detail.status !== "completed") return null;
+  return (
+    <section className="conversation-artifact-summary" aria-label="本轮产物摘要">
+      <div className="conversation-artifact-summary-header">
+        <div>
+          <span className="eyebrow">Delivery</span>
+          <strong>本轮产物</strong>
+        </div>
+        <small>{displayChatRunStatus(detail.status)} · {files.length} 个文件/产物</small>
+      </div>
+      <p>{outcome}</p>
+      <div className="conversation-artifact-metrics" aria-label="产物分类">
+        <span>计划 {planFiles.length}</span>
+        <span>源码 {sourceFiles.length}</span>
+        <span>附件 {detail.artifacts.filter(hasArtifactDownload).length}</span>
+      </div>
+      {visibleFiles.length > 0 ? (
+        <div className="conversation-file-link-grid" aria-label="本轮文件链接">
+          {visibleFiles.map((file) => (
+            <button
+              key={file.id}
+              type="button"
+              className="conversation-file-link"
+              onClick={() => onPreviewFile(file)}
+              aria-label={`预览文件 ${file.path || file.filename}`}
+            >
+              <small>{file.operation}</small>
+              <strong>{file.path || file.filename}</strong>
+              <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
+            </button>
+          ))}
+          {files.length > visibleFiles.length ? (
+            <span className="conversation-file-more">另有 {files.length - visibleFiles.length} 个文件在工作席</span>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function RunInteractionSummaryInline({
+  agentNames,
+  mainAgentModelName,
+  onPreviewFile,
+  run,
+}: {
+  agentNames: Map<string, string>;
+  mainAgentModelName?: string;
+  onPreviewFile: (file: WorkbenchFileItem) => void;
+  run: RunDetail;
+}) {
+  const processItems = runProcessItems(run, agentNames, mainAgentModelName);
+  const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, processItems);
+  return <RunInteractionArtifactSummary detail={run} files={files} onPreviewFile={onPreviewFile} />;
 }
 
 function inlineFileMessageId(messages: ChatMessage[]) {
@@ -2851,6 +2988,47 @@ function WorkbenchFilePreview({
       )}
       {error ? <p role="alert" className="form-error">{error}</p> : null}
     </article>
+  );
+}
+
+function ConversationFilePreviewDrawer({
+  file,
+  onClose,
+  onOpenSource,
+}: {
+  file: WorkbenchFileItem;
+  onClose: () => void;
+  onOpenSource: (target: ProcessDetailTarget) => void;
+}) {
+  return createPortal(
+    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="process-drawer conversation-file-preview-drawer"
+        role="dialog"
+        aria-label="文件内容预览"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-handle" aria-hidden="true" />
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">File preview</span>
+            <h3>{file.path || file.filename}</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <WorkbenchFilePreview
+          file={file}
+          onOpenSource={(target) => {
+            onClose();
+            onOpenSource(target);
+          }}
+        />
+      </section>
+    </div>,
+    document.body,
   );
 }
 
@@ -4589,6 +4767,26 @@ function markdownTableCells(line: string) {
   return normalized.split("|").map((cell) => cell.replace(/\\\|/g, "|").trim());
 }
 
+function CollapsibleMessageParagraph({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split("\n");
+  const shouldCollapse = text.length > 900 || lines.length > 12;
+  const preview = lines.slice(0, 10).join("\n");
+  const displayText = shouldCollapse && !expanded
+    ? `${preview.slice(0, 900)}${text.length > 900 || lines.length > 10 ? "\n..." : ""}`
+    : text;
+  return (
+    <div className={`message-paragraph${shouldCollapse ? " is-collapsible" : ""}`}>
+      <p>{displayText}</p>
+      {shouldCollapse ? (
+        <button type="button" className="message-expand-button" onClick={() => setExpanded((current) => !current)}>
+          {expanded ? "收起" : "展开全文"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function MessageBody({ text, title }: { text: string; title: string }) {
   const blocks = markdownMessageBlocks(text);
   if (blocks.length === 0) return null;
@@ -4597,7 +4795,7 @@ function MessageBody({ text, title }: { text: string; title: string }) {
     <div className="message-body">
       {blocks.map((block, index) => {
         if (block.kind === "paragraph") {
-          return <p key={`paragraph-${index}`}>{block.text}</p>;
+          return <CollapsibleMessageParagraph key={`paragraph-${index}`} text={block.text} />;
         }
         tableIndex += 1;
         return (
@@ -4665,6 +4863,7 @@ export function RunsPage() {
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
+  const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
@@ -4942,9 +5141,10 @@ export function RunsPage() {
 
   useEffect(() => {
     setProcessDetailTarget(null);
+    setConversationPreviewFile(null);
   }, [selectedRunId]);
 
-  const pageOverlayOpen = Boolean(processDetailTarget) || historyOpen;
+  const pageOverlayOpen = Boolean(processDetailTarget) || Boolean(conversationPreviewFile) || historyOpen;
   useEffect(() => {
     if (!pageOverlayOpen) return undefined;
     const previousBodyOverflow = document.body.style.overflow;
@@ -6280,6 +6480,14 @@ export function RunsPage() {
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{repairApproval.proposal.title}</h3>
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
+                <div className="composer-card-actions">
+                  <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                    {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
+                  </button>
+                  <button type="button" className="secondary-action" disabled={acceptSelfRepair.isPending} onClick={cancelSelfRepair}>
+                    取消修复
+                  </button>
+                </div>
               </article>
             ) : null}
             {messages.map((item, index) => (
@@ -6300,6 +6508,12 @@ export function RunsPage() {
                   {item.id === inlineWorkspaceFilesMessageId ? (
                     <ConversationWorkspaceFiles
                       files={workspaceFiles}
+                      previewFiles={workbenchFileItems(
+                        visibleRuns,
+                        workspaceFiles,
+                        visibleRuns.flatMap((run) => runProcessItems(run, agentNameMap, mainAgentModelName)),
+                      )}
+                      onPreviewFile={setConversationPreviewFile}
                       title="交付文件"
                       eyebrow="Files"
                       ariaLabel="交付文件"
@@ -6308,18 +6522,43 @@ export function RunsPage() {
                   ) : null}
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
-                  <RunProcessSummary
-                    detail={item.run}
-                    onOpen={setProcessDetailTarget}
-                    agentNames={agentNameMap}
-                    mainAgentModelName={mainAgentModelName}
-                    workspaceFiles={workspaceFiles}
-                  />
+                  <>
+                    <RunInteractionSummaryInline
+                      run={item.run}
+                      agentNames={agentNameMap}
+                      mainAgentModelName={mainAgentModelName}
+                      onPreviewFile={setConversationPreviewFile}
+                    />
+                    <RunProcessSummary
+                      detail={item.run}
+                      onOpen={setProcessDetailTarget}
+                      agentNames={agentNameMap}
+                      mainAgentModelName={mainAgentModelName}
+                      workspaceFiles={workspaceFiles}
+                    />
+                  </>
                 ) : null}
               </Fragment>
             ))}
-            {inlineWorkspaceFilesMessageId ? null : <ConversationWorkspaceFiles files={workspaceFiles} />}
+            {inlineWorkspaceFilesMessageId ? null : (
+              <ConversationWorkspaceFiles
+                files={workspaceFiles}
+                previewFiles={workbenchFileItems(
+                  visibleRuns,
+                  workspaceFiles,
+                  visibleRuns.flatMap((run) => runProcessItems(run, agentNameMap, mainAgentModelName)),
+                )}
+                onPreviewFile={setConversationPreviewFile}
+              />
+            )}
           </div>
+          {conversationPreviewFile ? (
+            <ConversationFilePreviewDrawer
+              file={conversationPreviewFile}
+              onClose={() => setConversationPreviewFile(null)}
+              onOpenSource={setProcessDetailTarget}
+            />
+          ) : null}
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
               target={refreshedProcessDetailTarget}

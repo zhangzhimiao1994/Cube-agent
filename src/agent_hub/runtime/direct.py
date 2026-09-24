@@ -147,6 +147,10 @@ def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
     return (
         context.mode is TaskMode.DIRECT
         and is_project_scale_artifact_request(context.request)
+    ) or (
+        context.mode is TaskMode.DIRECT
+        and _is_project_scale_capability_request(context.request)
+        and _is_ultra_project_scale_request(context.request)
     )
 
 
@@ -177,6 +181,17 @@ def _can_recover_project_scale_capability_request(request: object) -> bool:
         or "real ultra business project" in text
         or "ultra-large project" in text
         or "scale=ultra" in text
+    )
+
+
+def _is_ultra_project_scale_request(request: object) -> bool:
+    text = str(request).casefold()
+    return (
+        "scale=ultra" in text
+        or "real ultra business project" in text
+        or "real ultra-large business project" in text
+        or "ultra-large project" in text
+        or "ultra large project" in text
     )
 
 

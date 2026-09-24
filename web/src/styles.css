@@ -3455,6 +3455,68 @@ article:hover {
   margin-top: 0.75rem;
 }
 
+.conversation-artifact-summary {
+  align-self: flex-start;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 252, 0.96)),
+    #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.1);
+  color: #0f172a;
+  display: grid;
+  gap: 0.6rem;
+  margin: -0.25rem 0 0.1rem;
+  max-width: min(720px, 92%);
+  padding: 0.78rem;
+}
+
+.conversation-artifact-summary::before {
+  display: none;
+}
+
+.conversation-artifact-summary-header {
+  align-items: center;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.conversation-artifact-summary-header strong {
+  color: #111827;
+  display: block;
+  font-size: 1rem;
+}
+
+.conversation-artifact-summary-header small,
+.conversation-artifact-summary p,
+.conversation-artifact-metrics span,
+.conversation-file-more {
+  color: #64748b;
+}
+
+.conversation-artifact-summary p {
+  line-height: 1.55;
+  margin: 0;
+}
+
+.conversation-artifact-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.conversation-artifact-metrics span,
+.conversation-file-more {
+  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 850;
+  padding: 0.28rem 0.45rem;
+}
+
 .conversation-files-panel {
   background:
     linear-gradient(90deg, rgba(85, 215, 255, 0.09), rgba(125, 255, 189, 0.045)),
@@ -3465,6 +3527,67 @@ article:hover {
   gap: 0.55rem;
   margin: 0.65rem 0 0.25rem;
   padding: 0.7rem;
+}
+
+.conversation-file-link-grid {
+  display: grid;
+  gap: 0.4rem;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.conversation-file-link {
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 8px;
+  box-shadow: none;
+  color: #0f172a;
+  display: grid;
+  gap: 0.14rem;
+  justify-items: start;
+  min-height: 0;
+  padding: 0.48rem 0.58rem;
+  text-align: left;
+  transform: none;
+  width: 100%;
+}
+
+.conversation-file-link:hover,
+.conversation-file-link:focus-visible {
+  background: #f8fafc;
+  border-color: rgba(37, 99, 235, 0.38);
+  box-shadow: none;
+  color: #0f172a;
+  transform: none;
+}
+
+.conversation-file-link:disabled {
+  opacity: 1;
+}
+
+.conversation-file-link small {
+  color: #0f766e;
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.conversation-file-link strong,
+.conversation-file-link span {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.conversation-file-link strong {
+  color: #111827;
+  font-size: 0.9rem;
+  line-height: 1.28;
+}
+
+.conversation-file-link span {
+  color: #64748b;
+  font-size: 0.76rem;
+  font-weight: 800;
 }
 
 .conversation-files-header {
@@ -3500,6 +3623,39 @@ article:hover {
 
 .conversation-files-details > summary {
   cursor: pointer;
+}
+
+.conversation-file-preview-drawer {
+  max-width: min(920px, calc(100vw - 1.2rem));
+  width: min(920px, calc(100vw - 1.2rem));
+}
+
+.conversation-file-preview-drawer .agent-workbench-file-preview {
+  box-shadow: none;
+  margin: 0;
+}
+
+.message-paragraph {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.message-expand-button {
+  align-self: start;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(148, 163, 184, 0.28);
+  box-shadow: none;
+  color: var(--ink);
+  font-size: 0.78rem;
+  min-height: 1.85rem;
+  padding: 0.28rem 0.55rem;
+}
+
+.message-expand-button:hover,
+.message-expand-button:focus-visible {
+  background: rgba(85, 215, 255, 0.12);
+  box-shadow: none;
+  transform: none;
 }
 
 .artifact-file-link {
@@ -5613,7 +5769,7 @@ article:hover {
 
   .agent-workbench-action-row .process-intermediate-card {
     gap: 0.26rem;
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     padding: 0.38rem 0.42rem;
   }
 
@@ -5645,6 +5801,27 @@ article:hover {
   .agent-workbench-file-preview dd {
     overflow-wrap: anywhere;
     white-space: normal;
+  }
+
+  .conversation-artifact-summary {
+    max-width: 100%;
+    padding: 0.62rem;
+  }
+
+  .conversation-artifact-summary-header {
+    align-items: start;
+    flex-direction: column;
+    gap: 0.28rem;
+  }
+
+  .conversation-file-link-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .conversation-file-preview-drawer {
+    max-height: 96dvh;
+    max-width: 100vw;
+    width: 100vw;
   }
 
   .process-detail-modal-backdrop {
