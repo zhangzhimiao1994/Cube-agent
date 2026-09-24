@@ -1450,7 +1450,10 @@ article:hover {
   box-shadow: none;
   margin: 0;
   max-width: min(720px, 90%);
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: 0.35rem 0;
+  word-break: break-word;
 }
 
 .chat-message::before {
@@ -1467,7 +1470,9 @@ article:hover {
   background: rgba(125, 255, 189, 0.1);
   border: 1px solid rgba(125, 255, 189, 0.22);
   border-radius: 1.25rem;
-  max-width: min(560px, 82%);
+  max-width: min(560px, calc(100% - 1rem));
+  min-width: 0;
+  overflow: hidden;
   padding: 0.85rem 1rem;
 }
 
@@ -1483,7 +1488,11 @@ article:hover {
 .chat-message p {
   line-height: 1.7;
   margin: 0;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .temporary-agent-summary-card {
@@ -2159,37 +2168,40 @@ article:hover {
 }
 
 .agent-workbench-detail {
-  background: rgba(3, 10, 20, 0.34);
-  border: 1px solid rgba(123, 225, 255, 0.12);
+  background: transparent;
+  border: 0;
   border-radius: 8px;
   display: grid;
-  gap: 0.52rem;
+  gap: 0.6rem;
   max-height: calc(98dvh - 6.25rem);
   min-width: 0;
   overflow-y: auto;
-  padding: 0.52rem;
+  padding: 0;
 }
 
 .agent-workbench-tabs {
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(123, 225, 255, 0.12);
-  border-radius: 8px;
-  display: grid;
-  gap: 0.32rem;
-  grid-template-columns: repeat(auto-fit, minmax(6.8rem, 1fr));
-  padding: 0.28rem;
+  background: #eef2f7;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  display: flex;
+  gap: 0.22rem;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 0.22rem;
+  scrollbar-width: thin;
 }
 
 .agent-workbench-tabs button {
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--muted);
-  display: grid;
-  gap: 0.1rem;
+  flex: 0 0 auto;
+  font-weight: 900;
   min-width: 0;
-  padding: 0.42rem 0.48rem;
-  text-align: left;
+  padding: 0.45rem 0.62rem;
+  text-align: center;
+  white-space: nowrap;
 }
 
 .agent-workbench-tabs button.active,
@@ -2205,6 +2217,7 @@ article:hover {
   font-size: 0.68rem;
   font-weight: 850;
   opacity: 0.72;
+  padding-left: 0.2rem;
 }
 
 .agent-workbench-list {
@@ -2233,9 +2246,9 @@ article:hover {
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 8px;
   display: grid;
-  gap: 0.42rem;
+  gap: 0.34rem;
   min-width: 0;
-  padding: 0.56rem;
+  padding: 0.5rem;
 }
 
 .agent-workbench-files {
@@ -2257,6 +2270,37 @@ article:hover {
   max-height: min(54dvh, 32rem);
   min-width: 0;
   overflow-y: auto;
+}
+
+.agent-workbench-files-inline {
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+  display: grid;
+  gap: 0.42rem;
+  margin-top: 0.1rem;
+  min-width: 0;
+  padding-top: 0.55rem;
+}
+
+.agent-workbench-recovery-inline {
+  display: grid;
+  gap: 0.46rem;
+  min-width: 0;
+}
+
+.agent-workbench-recovery-inline .run-failure-diagnostic span,
+.agent-workbench-recovery-inline .run-failure-diagnostic em,
+.agent-workbench-recovery-inline .run-failure-diagnostic p,
+.agent-workbench-recovery-inline .run-execution-intent span,
+.agent-workbench-recovery-inline .run-execution-intent em {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.agent-workbench-file-list.compact {
+  max-height: 12rem;
 }
 
 .agent-workbench-file-list button {
@@ -2582,11 +2626,11 @@ article:hover {
 }
 
 .agent-workbench-brief {
-  border: 1px solid rgba(123, 225, 255, 0.12);
-  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
   display: grid;
   gap: 0.48rem;
-  padding: 0.5rem;
+  padding: 0.55rem;
 }
 
 .agent-workbench-brief-header {
@@ -2611,18 +2655,18 @@ article:hover {
 
 .agent-workbench-brief-grid {
   display: grid;
-  gap: 0.42rem;
-  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+  gap: 0.36rem;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
 }
 
 .agent-workbench-brief-section {
-  background: #ffffff;
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 8px;
   display: grid;
-  gap: 0.34rem;
+  gap: 0.28rem;
   min-width: 0;
-  padding: 0.46rem;
+  padding: 0.42rem;
 }
 
 .agent-workbench-brief-section > div:first-child {
@@ -2638,8 +2682,8 @@ article:hover {
 }
 
 .agent-workbench-brief-section button {
-  background: #f8fafc;
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 6px;
   color: var(--text);
   cursor: pointer;
@@ -2678,7 +2722,7 @@ article:hover {
 }
 
 .agent-workbench-action-row {
-  border-left: 1px solid rgba(123, 225, 255, 0.18);
+  border-left: 1px solid rgba(148, 163, 184, 0.26);
   display: grid;
   gap: 0.24rem;
   min-width: 0;
@@ -2688,7 +2732,7 @@ article:hover {
 
 .agent-workbench-action-row::before {
   background: var(--accent);
-  border: 2px solid rgba(3, 10, 20, 0.92);
+  border: 2px solid #ffffff;
   border-radius: 999px;
   content: "";
   height: 0.42rem;
@@ -2751,9 +2795,10 @@ article:hover {
   max-width: 100%;
   min-width: 0;
   overflow: hidden;
+  overflow-wrap: anywhere;
   padding: 0.14rem 0.38rem;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .agent-workbench-action-files {
@@ -3338,6 +3383,9 @@ article:hover {
 }
 
 .process-drawer.agent-workbench-drawer {
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.32);
+  color: #0f172a;
   max-height: min(98dvh, 1160px);
   max-width: min(100vw, 1360px);
   width: min(100vw, 1360px);
@@ -5363,20 +5411,26 @@ article:hover {
   }
 
   .mode-entry-panel {
-    min-height: 32dvh;
-    padding: 0.85rem 0.25rem;
+    gap: 0.45rem;
+    min-height: 20dvh;
+    padding: 0.55rem 0.2rem;
   }
 
   .mode-entry-tabs {
-    border-radius: 1rem;
+    border-radius: 999px;
+    gap: 0.18rem;
     flex-wrap: nowrap;
     justify-content: flex-start;
     max-width: 100%;
     overflow-x: auto;
+    padding: 0.2rem;
   }
 
   .mode-entry-tabs button {
     flex: 0 0 auto;
+    font-size: 0.9rem;
+    min-height: 2.15rem;
+    padding: 0.32rem 0.58rem;
     white-space: nowrap;
   }
 
@@ -5408,26 +5462,60 @@ article:hover {
   .agent-workbench-drawer {
     max-height: 99dvh;
     max-width: 100vw;
+    padding: 0.56rem 0.62rem calc(0.62rem + env(safe-area-inset-bottom));
     width: 100vw;
+  }
+
+  .agent-workbench-drawer .process-drawer-handle {
+    margin-bottom: 0.45rem;
+  }
+
+  .agent-workbench-drawer .process-drawer-header {
+    align-items: center;
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    margin-bottom: 0.46rem;
+  }
+
+  .agent-workbench-drawer .process-drawer-header > div {
+    min-width: 0;
+  }
+
+  .agent-workbench-drawer .process-drawer-header .eyebrow {
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+  }
+
+  .agent-workbench-drawer .process-drawer-header h3 {
+    font-size: 1rem;
+    line-height: 1.2;
+    margin-top: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .agent-workbench-drawer .process-drawer-header .secondary-action {
+    min-height: 2rem;
+    padding: 0.3rem 0.62rem;
   }
 
   .agent-workbench-detail {
     max-height: calc(99dvh - 5.4rem);
-    padding: 0.42rem;
+    overflow-y: auto;
+    padding: 0;
   }
 
   .agent-workbench-tabs {
-    display: flex;
-    gap: 0.35rem;
-    overflow-x: auto;
-    padding-bottom: 0.35rem;
-    scroll-snap-type: x proximity;
+    gap: 0.18rem;
+    padding: 0.18rem;
   }
 
   .agent-workbench-tabs button {
-    flex: 0 0 auto;
-    min-height: 2.45rem;
-    scroll-snap-align: start;
+    flex: 1 1 0;
+    min-height: 2rem;
+    padding: 0.34rem 0.42rem;
   }
 
   .agent-workbench-tabs button small {
@@ -5463,10 +5551,70 @@ article:hover {
     padding-left: 0.55rem;
   }
 
+  .agent-workbench-list {
+    gap: 0.4rem;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-workbench-agent-card {
+    gap: 0.28rem;
+    padding: 0.44rem;
+  }
+
+  .agent-workbench-agent-card p {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    overflow: hidden;
+  }
+
+  .agent-workbench-inputs {
+    display: none;
+  }
+
+  .agent-workbench-brief {
+    gap: 0.28rem;
+    padding: 0.38rem;
+  }
+
+  .agent-workbench-brief-grid {
+    gap: 0.26rem;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-workbench-brief-header strong,
+  .agent-workbench-brief-section strong {
+    font-size: 0.9rem;
+  }
+
+  .agent-workbench-brief-header small,
+  .agent-workbench-brief-section small {
+    font-size: 0.74rem;
+  }
+
+  .agent-workbench-brief-section {
+    gap: 0.2rem;
+    padding: 0.34rem;
+  }
+
+  .agent-workbench-brief-section button {
+    gap: 0.04rem;
+    padding: 0.28rem 0.34rem;
+  }
+
+  .agent-workbench-brief-section span {
+    font-size: 0.82rem;
+    -webkit-line-clamp: 1;
+  }
+
+  .agent-workbench-files-inline {
+    padding-top: 0.45rem;
+  }
+
   .agent-workbench-action-row .process-intermediate-card {
     gap: 0.26rem;
     grid-template-columns: auto minmax(0, 1fr);
-    padding: 0.44rem 0.46rem;
+    padding: 0.38rem 0.42rem;
   }
 
   .agent-workbench-action-row .process-intermediate-card > span:first-child {
@@ -5481,11 +5629,13 @@ article:hover {
   }
 
   .agent-workbench-action-row .process-intermediate-card > strong {
+    font-size: 0.86rem;
     overflow-wrap: anywhere;
     white-space: normal;
   }
 
   .agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge) {
+    font-size: 0.78rem;
     white-space: normal;
   }
 
@@ -6182,11 +6332,18 @@ article:hover {
 .message-body {
   display: grid;
   gap: 0.75rem;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .message-body p {
+  max-width: 100%;
+  min-width: 0;
   margin: 0;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .message-table-wrap {

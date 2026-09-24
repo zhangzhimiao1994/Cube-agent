@@ -3910,18 +3910,12 @@ function AgentWorkbenchDrawer({
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<"overview" | "coordination" | "actions" | "files" | "terminal" | "results" | "recovery">("overview");
+  const [activeView, setActiveView] = useState<"overview" | "actions">("overview");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const previewPaneRef = useRef<HTMLElement | null>(null);
   const selectedAgent = dispatchCards.find((card) => card.id === selectedAgentId) ?? null;
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
   const actionItems = items.filter((item) => !isWorkbenchCoordinationItem(item));
-  const terminalItems = actionItems.filter((item) => item.badge === "运行终端" || /运行终端/.test(`${item.title} ${item.message}`));
-  const resultItems = actionItems.filter((item) => {
-    if (item.rows.some((row) => row.label === "关联文件")) return false;
-    if (/创建文件|编辑文件|读取文件/.test(`${item.badge} ${item.title} ${item.message}`)) return false;
-    return item.artifact || /输出|产物|结果/.test(`${item.badge} ${item.title} ${item.message}`);
-  });
   const coordinationSections = coordinationEvidenceSections(coordinationItems);
   const selectedAgentItems = selectedAgent ? agentActivityItems(selectedAgent, items) : [];
   const actionPreview = recentPreview(selectedAgentItems, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
@@ -3938,7 +3932,7 @@ function AgentWorkbenchDrawer({
     setSelectedFileId(file.id);
     if (selectedAgentId) {
       setSelectedAgentId(null);
-      setActiveView("files");
+      setActiveView("actions");
     }
   };
   useEffect(() => {
@@ -3947,40 +3941,10 @@ function AgentWorkbenchDrawer({
     if (!window.matchMedia("(max-width: 980px)").matches) return;
     previewPaneRef.current.scrollIntoView({ block: "start", inline: "nearest" });
   }, [selectedFileId, activeView]);
-  const actionWorkspaceItems =
-    activeView === "coordination"
-      ? coordinationItems
-      : activeView === "terminal"
-        ? terminalItems
-        : activeView === "results"
-          ? resultItems
-          : activeView === "actions"
-            ? actionItems
-            : [];
-  const actionWorkspaceLabel =
-    activeView === "coordination"
-      ? "调度与讨论"
-      : activeView === "terminal"
-        ? "终端窗口"
-        : activeView === "results"
-          ? "结果窗口"
-          : "过程轨迹";
-  const actionWorkspaceAria =
-    activeView === "coordination"
-      ? "调度与讨论"
-      : activeView === "terminal"
-        ? "终端窗口"
-        : activeView === "results"
-          ? "结果窗口"
-          : "过程轨迹";
-  const actionWorkspaceEmpty =
-    activeView === "coordination"
-      ? "调度与讨论暂无记录"
-      : activeView === "terminal"
-        ? "暂无终端记录"
-        : activeView === "results"
-          ? "暂无结果记录"
-          : "过程轨迹暂无记录";
+  const actionWorkspaceItems = activeView === "actions" ? actionItems : [];
+  const actionWorkspaceLabel = "动作与文件";
+  const actionWorkspaceAria = "动作与文件";
+  const actionWorkspaceEmpty = "暂无动作或文件记录";
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -4047,74 +4011,23 @@ function AgentWorkbenchDrawer({
                   className={activeView === "overview" ? "active" : ""}
                   onClick={() => setActiveView("overview")}
                 >
-                  助手总览
+                  总览
                   <small>{dispatchCards.length} 个 Agent</small>
                 </button>
                 <button
                   type="button"
-                  aria-label="调度讨论"
-                  aria-pressed={activeView === "coordination"}
-                  className={activeView === "coordination" ? "active" : ""}
-                  onClick={() => setActiveView("coordination")}
-                >
-                  调度讨论
-                  <small>{coordinationItems.length} 条</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="实际动作"
+                  aria-label="动作与文件"
                   aria-pressed={activeView === "actions"}
                   className={activeView === "actions" ? "active" : ""}
                   onClick={() => setActiveView("actions")}
                 >
-                  实际动作
-                  <small>{actionItems.length} 条</small>
+                  动作与文件
+                  <small>{actionItems.length + files.length + recoveryCount} 条</small>
                 </button>
-                <button
-                  type="button"
-                  aria-label="文件"
-                  aria-pressed={activeView === "files"}
-                  className={activeView === "files" ? "active" : ""}
-                  onClick={() => setActiveView("files")}
-                >
-                  文件
-                  <small>{files.length} 个</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="终端"
-                  aria-pressed={activeView === "terminal"}
-                  className={activeView === "terminal" ? "active" : ""}
-                  onClick={() => setActiveView("terminal")}
-                >
-                  终端
-                  <small>{terminalItems.length} 条</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="结果"
-                  aria-pressed={activeView === "results"}
-                  className={activeView === "results" ? "active" : ""}
-                  onClick={() => setActiveView("results")}
-                >
-                  结果
-                  <small>{resultItems.length} 条</small>
-                </button>
-                {recoveryCount > 0 ? (
-                  <button
-                    type="button"
-                    aria-label="修复异常"
-                    aria-pressed={activeView === "recovery"}
-                    className={activeView === "recovery" ? "active" : ""}
-                    onClick={() => setActiveView("recovery")}
-                  >
-                    修复异常
-                    <small>{recoveryCount} 条</small>
-                  </button>
-                ) : null}
               </div>
               {activeView === "overview" ? (
                 <>
+                  {coordinationItems.length > 0 ? <AgentCoordinationEvidence sections={coordinationSections} onOpen={onOpen} /> : null}
                   <div className="agent-workbench-list">
                     {dispatchCards.map((card) => {
                       const activityItems = agentActivityItems(card, items);
@@ -4189,19 +4102,16 @@ function AgentWorkbenchDrawer({
                   ) : null}
                 </>
               ) : null}
-              {["coordination", "actions", "terminal", "results"].includes(activeView) ? (
+              {activeView === "actions" ? (
                 <section
                   className="agent-workbench-action-workspace"
-                  aria-label={`${activeView === "actions" ? "实际动作" : actionWorkspaceLabel}工作区`}
+                  aria-label={`${actionWorkspaceLabel}工作区`}
                 >
                   <section className="agent-workbench-action-list-pane" aria-label="动作列表">
                     <div className="agent-workbench-actions-header">
                       <strong>{actionWorkspaceLabel}</strong>
                       <small>{actionWorkspaceItems.length} 条</small>
                     </div>
-                    {activeView === "coordination" && coordinationItems.length > 0 ? (
-                      <AgentCoordinationEvidence sections={coordinationSections} onOpen={onOpen} />
-                    ) : null}
                     <div className="agent-cluster-actions" role="region" aria-label={actionWorkspaceAria}>
                       {actionWorkspaceItems.map((item) => (
                         <WorkbenchActionRow
@@ -4214,6 +4124,35 @@ function AgentWorkbenchDrawer({
                       ))}
                     </div>
                     {actionWorkspaceItems.length === 0 ? <p className="agent-workbench-compressed-note">{actionWorkspaceEmpty}</p> : null}
+                    {files.length > 0 ? (
+                      <section className="agent-workbench-files-inline" aria-label="本轮文件">
+                        <div className="agent-workbench-actions-header">
+                          <strong>文件</strong>
+                          <small>{files.length} 个文件/产物</small>
+                        </div>
+                        <div className="agent-workbench-file-list compact" aria-label="文件操作列表">
+                          {files.map((file) => (
+                            <button
+                              key={file.id}
+                              type="button"
+                              className={selectedFile?.id === file.id ? "active" : ""}
+                              aria-pressed={selectedFile?.id === file.id}
+                              onClick={() => setSelectedFileId(file.id)}
+                            >
+                              <small>{file.operation}</small>
+                              <strong>{file.path || file.filename}</strong>
+                              <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </section>
+                    ) : null}
+                    {recoveryCount > 0 ? (
+                      <div className="agent-workbench-recovery-inline">
+                        <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
+                        <RunExecutionIntentsPanel intents={executionIntents} />
+                      </div>
+                    ) : null}
                   </section>
                   <section
                     className={`agent-workbench-preview-pane${selectedFile ? " is-selected" : ""}`}
@@ -4237,49 +4176,6 @@ function AgentWorkbenchDrawer({
                     )}
                   </section>
                 </section>
-              ) : null}
-              {activeView === "files" ? (
-                <section className="agent-workbench-files" aria-label="文件窗口">
-                  <div className="agent-workbench-actions-header">
-                    <strong>文件窗口</strong>
-                    <small>{files.length} 个文件/产物</small>
-                  </div>
-                  {files.length > 0 ? (
-                    <div className="agent-workbench-file-layout">
-                      <div className="agent-workbench-file-list" aria-label="文件操作列表">
-                        {files.map((file) => (
-                          <button
-                            key={file.id}
-                            type="button"
-                            className={selectedFile?.id === file.id ? "active" : ""}
-                            aria-pressed={selectedFile?.id === file.id}
-                            onClick={() => setSelectedFileId(file.id)}
-                          >
-                            <small>{file.operation}</small>
-                            <strong>{file.path || file.filename}</strong>
-                            <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
-                          </button>
-                        ))}
-                      </div>
-                      {selectedFile ? (
-                        <WorkbenchFilePreview
-                          file={selectedFile}
-                          onOpenSource={(target) => {
-                            onOpen(target);
-                          }}
-                        />
-                      ) : null}
-                    </div>
-                  ) : (
-                    <p className="agent-workbench-compressed-note">暂无可预览文件；后续运行产生文件后会显示在这里。</p>
-                  )}
-                </section>
-              ) : null}
-              {activeView === "recovery" ? (
-                <>
-                  <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
-                  <RunExecutionIntentsPanel intents={executionIntents} />
-                </>
               ) : null}
             </>
           )}
