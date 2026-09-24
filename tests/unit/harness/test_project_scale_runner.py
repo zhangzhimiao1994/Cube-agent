@@ -1602,6 +1602,76 @@ def test_execute_project_scale_plan_repairs_failed_deliverable_quality() -> None
     ) in client.calls
 
 
+def test_execute_project_scale_plan_reports_repair_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("medium",),
+        flows=("artifact_production",),
+        execute=True,
+    )
+    progress: list[str] = []
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: command failed exit=1",),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-artifact",
+        session_id="project-scale-medium-artifact_production",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+                "src/main.js": _functional_js_source(),
+                "tests/main.test.js": _functional_js_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+        progress=progress.append,
+    )
+
+    assert report.ok is True
+    assert progress == [
+        "case 1/1 medium:artifact_production: submitting run",
+        "case 1/1 medium:artifact_production: observing run run-medium-artifact",
+        "case 1/1 medium:artifact_production: validating deliverable",
+        "case 1/1 medium:artifact_production: submitting deliverable repair 1",
+        "case 1/1 medium:artifact_production: observing repair run run-medium-artifact-repair",
+        "case 1/1 medium:artifact_production: validating repaired deliverable 1",
+        "case 1/1 medium:artifact_production: completed status=completed ok=true",
+    ]
+
+
 def test_execute_project_scale_plan_repairs_missing_agent_standard_verification() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
     client = FakeAcceptanceClient(

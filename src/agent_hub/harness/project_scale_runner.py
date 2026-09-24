@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -445,6 +445,11 @@ class _EvidenceCheck:
     reasons: tuple[str, ...]
 
 
+def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
 def execute_project_scale_plan(
     plan: ProjectScaleRunPlan,
     client: AcceptanceClient,
@@ -455,10 +460,12 @@ def execute_project_scale_plan(
     validate_generated_project: bool = False,
     generated_project_commands: Sequence[Sequence[str]] | None = None,
     generated_project_timeout_seconds: float = 120,
+    progress: Callable[[str], None] | None = None,
 ) -> ProjectScaleExecutionReport:
     validate_generated_project = validate_generated_project or plan.benchmark_kind == "capability"
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
+        case_label = f"case {index + 1}/{plan.case_count} {run_request.case_id}"
         request_body = _scoped_execution_body(run_request.body, execution_id=execution_id)
         evidence = {
             "run_details": False,
@@ -484,6 +491,7 @@ def execute_project_scale_plan(
         status: str | None = None
         case_deadline = time.monotonic() + max(wait_seconds, 0)
         try:
+            _report_progress(progress, f"{case_label}: submitting run")
             response = client.request_json(
                 "POST",
                 "/api/v1/runs",
@@ -522,6 +530,7 @@ def execute_project_scale_plan(
                 evidence["project_preflight_approval"] = True
                 status = _string_value(approval.get("status")) or status
 
+            _report_progress(progress, f"{case_label}: observing run {run_id}")
             observation = _collect_run_observation(
                 client,
                 run_id=run_id,
@@ -631,6 +640,7 @@ def execute_project_scale_plan(
             evidence["plugin_contract"] = plugin_contract.passed
             generated_project_validation = _EvidenceCheck(passed=True, reasons=())
             if validate_generated_project:
+                _report_progress(progress, f"{case_label}: validating deliverable")
                 generated_project_validation = _validate_generated_project_bundle(
                     observation.workspace_bundle,
                     commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
@@ -683,6 +693,10 @@ def execute_project_scale_plan(
                     except Exception as error:  # noqa: BLE001 - repair can still supersede it.
                         errors.append(f"cleanup_cancel: {error}")
                 deliverable_repair_attempts += 1
+                _report_progress(
+                    progress,
+                    f"{case_label}: submitting deliverable repair {deliverable_repair_attempts}",
+                )
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
@@ -722,6 +736,10 @@ def execute_project_scale_plan(
                 evidence["deliverable_repair_trace"] = True
                 run_id = repair_run_id
                 status = _string_value(repair_response.get("status")) or status
+                _report_progress(
+                    progress,
+                    f"{case_label}: observing repair run {run_id}",
+                )
                 repair_observation = _collect_run_observation(
                     client,
                     run_id=run_id,
@@ -773,6 +791,13 @@ def execute_project_scale_plan(
                 )
                 evidence["plugin_contract"] = plugin_contract.passed
                 if validate_generated_project:
+                    _report_progress(
+                        progress,
+                        (
+                            f"{case_label}: validating repaired deliverable "
+                            f"{deliverable_repair_attempts}"
+                        ),
+                    )
                     generated_project_validation = _validate_generated_project_bundle(
                         repair_observation.workspace_bundle,
                         commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
@@ -856,16 +881,19 @@ def execute_project_scale_plan(
                         errors.append(f"cleanup_cancel: {error}")
         if evidence["terminal_status"] and status != "completed":
             errors.append(f"terminal_status: {status or 'unknown'}")
-        results.append(
-            ProjectScaleCaseResult(
-                case_id=run_request.case_id,
-                run_id=run_id,
-                status=status,
-                evidence=evidence,
-                validation_focus=run_request.validation_focus,
-                errors=tuple(errors),
-            )
+        result = ProjectScaleCaseResult(
+            case_id=run_request.case_id,
+            run_id=run_id,
+            status=status,
+            evidence=evidence,
+            validation_focus=run_request.validation_focus,
+            errors=tuple(errors),
         )
+        _report_progress(
+            progress,
+            f"{case_label}: completed status={status or 'unknown'} ok={str(result.ok).lower()}",
+        )
+        results.append(result)
     return ProjectScaleExecutionReport(results=tuple(results), benchmark_kind=plan.benchmark_kind)
 
 
@@ -1022,6 +1050,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             execution_id=args.execution_id or _default_execution_id(),
             validate_generated_project=args.validate_generated_project,
             generated_project_timeout_seconds=args.artifact_build_timeout,
+            progress=lambda message: print(
+                f"project-scale progress: {message}",
+                file=sys.stderr,
+                flush=True,
+            ),
         )
         payload = report.to_payload()
     else:
