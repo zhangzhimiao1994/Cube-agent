@@ -437,6 +437,16 @@ function downloadArtifactMessage(artifact: DownloadableArtifact): ChatMessage {
   };
 }
 
+function shouldShowStandaloneDownloadMessage(artifact: DownloadableArtifact) {
+  const filename = artifactFileName(artifact);
+  const normalizedTitle = artifact.title.trim().toLowerCase();
+  const normalizedKind = artifact.kind.trim().toLowerCase();
+  if (artifact.presentation !== "final_attachment") return true;
+  if (artifact.text?.trim()) return false;
+  if (normalizedTitle === "main" || normalizedTitle === "final_synthesizer") return false;
+  return !(normalizedKind === "workspace_bundle" || filename === "workspace.zip");
+}
+
 function artifactMessage(artifact: RunArtifact): ChatMessage {
   if (isFinalDownloadableArtifact(artifact)) {
     return downloadArtifactMessage(artifact);
@@ -2277,10 +2287,12 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
         },
         ...downloadableArtifacts
           .filter((artifact) => artifact.id !== replyArtifact.id)
+          .filter(shouldShowStandaloneDownloadMessage)
           .map(downloadArtifactMessage),
       ]
     : detail.artifacts
         .filter((artifact) => !artifact.text?.trim())
+        .filter((artifact) => !isFinalDownloadableArtifact(artifact) || shouldShowStandaloneDownloadMessage(artifact))
         .map(artifactMessage);
   const failureMessages: ChatMessage[] =
     detail.status === "failed"
@@ -2706,6 +2718,7 @@ function RunInteractionArtifactSummary({
         ? "主 Agent 已整理本轮交付，文件可直接预览。"
         : "主 Agent 正在整理本轮交付，已生成的文件会在这里汇总。";
   if (files.length === 0) return null;
+  const resultBullets = deliveryResultBullets(detail, files, planFiles, sourceFiles);
   return (
     <section className="conversation-artifact-summary" aria-label="本轮产物摘要">
       <div className="conversation-artifact-summary-header">
@@ -2715,7 +2728,20 @@ function RunInteractionArtifactSummary({
         </div>
         <small>{displayChatRunStatus(detail.status)} · {files.length} 个文件/产物</small>
       </div>
-      <p>{outcome}</p>
+      <div className="conversation-delivery-result">
+        <strong>{detail.status === "completed" ? "任务已完成" : displayChatRunStatus(detail.status)}</strong>
+        <p>{outcome}</p>
+        {resultBullets.length > 0 ? (
+          <ul>
+            {resultBullets.map((bullet) => (
+              <li key={bullet.label}>
+                <span>{bullet.label}</span>
+                <p>{bullet.value}</p>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
       <div className="conversation-artifact-metrics" aria-label="产物分类">
         <span>计划 {planFiles.length}</span>
         <span>源码 {sourceFiles.length}</span>
@@ -2743,6 +2769,65 @@ function RunInteractionArtifactSummary({
       ) : null}
     </section>
   );
+}
+
+function deliveryResultBullets(
+  detail: RunDetail,
+  files: WorkbenchFileItem[],
+  planFiles: WorkbenchFileItem[],
+  sourceFiles: WorkbenchFileItem[],
+) {
+  const finalFiles = files.filter((file) => file.download?.presentation === "final_attachment");
+  const finalNames = finalFiles.length > 0 ? finalFiles : files;
+  const fileNameList = finalNames
+    .slice(0, 3)
+    .map((file) => file.path || file.filename)
+    .filter(Boolean)
+    .join("、");
+  const verification = deliveryVerificationSignal(detail);
+  const bullets = [
+    fileNameList ? { label: "核心产物", value: `${fileNameList}${finalNames.length > 3 ? ` 等 ${finalNames.length} 个文件` : ""}` } : null,
+    planFiles.length > 0
+      ? {
+          label: "计划与说明",
+          value: planFiles
+            .slice(0, 3)
+            .map((file) => file.path || file.filename)
+            .join("、"),
+        }
+      : null,
+    sourceFiles.length > 0
+      ? {
+          label: "代码文件",
+          value: `${sourceFiles.length} 个源码/配置文件已关联，可点下方文件链接预览内容。`,
+        }
+      : null,
+    verification ? { label: "验证", value: verification } : null,
+  ].filter((item): item is { label: string; value: string } => Boolean(item && item.value.trim()));
+  return bullets.slice(0, 4);
+}
+
+function deliveryVerificationSignal(detail: RunDetail) {
+  const event = [...orderedRunEvents(detail.events)]
+    .reverse()
+    .find((candidate) => {
+      const text = [
+        candidate.summary,
+        candidate.message,
+        candidate.step_id,
+        candidate.tool_name,
+        formatEventPayloadValue(candidate.payload.summary),
+        formatEventPayloadValue(candidate.payload.result),
+        formatEventPayloadValue(candidate.payload.output),
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return /验证|测试|通过|构建|build|test|verify|passed|success/i.test(text);
+    });
+  if (event) return conciseProcessText(eventSummaryText(event, new Map()), "验证记录已生成");
+  if (detail.status === "completed") return "本轮运行已完成，详细验证记录可在 Agent 工作席查看。";
+  if (detail.status === "failed") return "运行中断，失败原因和保留产物可在工作席查看。";
+  return "";
 }
 
 function RunInteractionSummaryInline({
@@ -4106,6 +4191,7 @@ function AgentWorkbenchDrawer({
   executionIntents,
   failureDiagnostics,
   files,
+  initialAgentId,
   items,
   taskChain,
   onClose,
@@ -4115,13 +4201,14 @@ function AgentWorkbenchDrawer({
   executionIntents: RunExecutionIntent[];
   failureDiagnostics: RunFailureDiagnostic[];
   files: WorkbenchFileItem[];
+  initialAgentId?: string | null;
   items: ProcessDetailTarget[];
   taskChain: TaskChainStep[];
   onClose: () => void;
   onOpen: (target: ProcessDetailTarget) => void;
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(initialAgentId ?? null);
   const [activeView, setActiveView] = useState<"overview" | "actions">("overview");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const previewPaneRef = useRef<HTMLElement | null>(null);
@@ -4147,6 +4234,11 @@ function AgentWorkbenchDrawer({
       setActiveView("actions");
     }
   };
+  useEffect(() => {
+    setSelectedAgentId(initialAgentId ?? null);
+    setActiveView("overview");
+    setShowAllActions(false);
+  }, [initialAgentId]);
   useEffect(() => {
     if (!selectedFileId || !previewPaneRef.current) return;
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
@@ -4398,6 +4490,44 @@ function AgentWorkbenchDrawer({
   );
 }
 
+function RunAgentActivityStrip({
+  cards,
+  items,
+  onOpenAgent,
+}: {
+  cards: AgentDispatchCard[];
+  items: ProcessDetailTarget[];
+  onOpenAgent: (agentId: string) => void;
+}) {
+  if (cards.length === 0) return null;
+  const visibleCards = cards.slice(0, 4);
+  const hiddenCount = cards.length - visibleCards.length;
+  return (
+    <div className="run-agent-activity-strip" aria-label="本轮参与 Agent">
+      {visibleCards.map((card) => {
+        const activityCount = agentActivityItems(card, items).length;
+        return (
+          <button
+            key={card.id}
+            type="button"
+            className={`run-agent-chip status-${card.status}`}
+            onClick={() => onOpenAgent(card.id)}
+            aria-label={`打开 ${card.name} 调度详情`}
+          >
+            <span aria-hidden="true">{card.name.slice(0, 1)}</span>
+            <strong>{card.name}</strong>
+            <small>
+              {card.status}
+              {activityCount > 0 ? ` · ${activityCount} 步` : ""}
+            </small>
+          </button>
+        );
+      })}
+      {hiddenCount > 0 ? <span className="run-agent-chip-more">另 {hiddenCount} 个</span> : null}
+    </div>
+  );
+}
+
 function RunProcessSummary({
   detail,
   onOpen,
@@ -4412,6 +4542,7 @@ function RunProcessSummary({
   workspaceFiles: ConversationWorkspaceFileBuckets;
 }) {
   const [isWorkbenchOpen, setIsWorkbenchOpen] = useState(false);
+  const [initialWorkbenchAgentId, setInitialWorkbenchAgentId] = useState<string | null>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
@@ -4469,11 +4600,22 @@ function RunProcessSummary({
       ) : null}
       {hasWorkbench ? (
         <section className="agent-workbench" aria-label="Agent 工作席">
+          <RunAgentActivityStrip
+            cards={dispatchCards}
+            items={items}
+            onOpenAgent={(agentId) => {
+              setInitialWorkbenchAgentId(agentId);
+              setIsWorkbenchOpen(true);
+            }}
+          />
           <button
             type="button"
             className="agent-workbench-trigger"
             aria-expanded={isWorkbenchOpen}
-            onClick={() => setIsWorkbenchOpen((current) => !current)}
+            onClick={() => {
+              setInitialWorkbenchAgentId(null);
+              setIsWorkbenchOpen((current) => !current);
+            }}
           >
             <span aria-hidden="true">⌘</span>
             <strong>Agent 工作席</strong>
@@ -4485,6 +4627,7 @@ function RunProcessSummary({
               executionIntents={executionIntents}
               failureDiagnostics={failureDiagnostics}
               files={fileItems}
+              initialAgentId={initialWorkbenchAgentId}
               items={items}
               taskChain={taskChain}
               onClose={() => setIsWorkbenchOpen(false)}

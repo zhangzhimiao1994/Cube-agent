@@ -189,6 +189,57 @@ describe("conversation ordering", () => {
     ]);
   });
 
+  it("does not render download-only main artifacts as standalone attachment replies", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      status: "completed",
+      artifacts: [
+        {
+          id: "artifact-main",
+          kind: "tool_result",
+          title: "main",
+          filename: "project.zip",
+          mime_type: "application/zip",
+          size_bytes: 1024,
+          sha256: "abc",
+          download_url: "/api/v1/runs/run/artifacts/artifact-main/download",
+          presentation: "final_attachment",
+        },
+      ],
+    };
+
+    const messages = conversationMessages([run]);
+
+    expect(messages.map((message) => message.title)).toEqual(["你"]);
+  });
+
+  it("keeps final artifacts with text as normal assistant replies", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      status: "completed",
+      artifacts: [
+        {
+          id: "artifact-main",
+          kind: "tool_result",
+          title: "main",
+          text: "插件已完成构建。\n\n核心设计：后台解析文档，前台搜索。",
+          filename: "project.zip",
+          mime_type: "application/zip",
+          size_bytes: 1024,
+          sha256: "abc",
+          download_url: "/api/v1/runs/run/artifacts/artifact-main/download",
+          presentation: "final_attachment",
+        },
+      ],
+    };
+
+    const messages = conversationMessages([run]);
+
+    expect(messages.map((message) => message.title)).toEqual(["你", "回复"]);
+    expect(messages[1].body).toContain("插件已完成构建");
+    expect(messages[1].artifact?.filename).toBe("project.zip");
+  });
+
   it("orders process cards by event sequence when backend events arrive out of order", () => {
     const outOfOrderRun: RunDetail = {
       ...baseRun,

@@ -2118,6 +2118,96 @@ article:hover {
   max-width: min(100%, 42rem);
 }
 
+.run-agent-activity-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.38rem;
+  max-width: min(100%, 42rem);
+  min-width: 0;
+}
+
+.run-agent-chip,
+.run-agent-chip-more {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  color: #0f172a;
+  display: inline-grid;
+  gap: 0.12rem 0.38rem;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 2.25rem;
+  min-width: 0;
+  padding: 0.34rem 0.48rem;
+}
+
+.run-agent-chip {
+  cursor: pointer;
+  max-width: min(12rem, 100%);
+  text-align: left;
+}
+
+.run-agent-chip:hover,
+.run-agent-chip:focus-visible {
+  background: #f8fafc;
+  border-color: rgba(8, 145, 178, 0.38);
+  box-shadow: none;
+  outline: none;
+  transform: none;
+}
+
+.run-agent-chip > span:first-child {
+  align-items: center;
+  background: #ecfeff;
+  border: 1px solid rgba(8, 145, 178, 0.18);
+  border-radius: 999px;
+  color: #0f766e;
+  display: inline-flex;
+  font-size: 0.78rem;
+  font-weight: 950;
+  grid-row: 1 / span 2;
+  height: 1.55rem;
+  justify-content: center;
+  width: 1.55rem;
+}
+
+.run-agent-chip strong,
+.run-agent-chip small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-agent-chip strong {
+  font-size: 0.82rem;
+  font-weight: 950;
+}
+
+.run-agent-chip small,
+.run-agent-chip-more {
+  color: #64748b;
+  font-size: 0.72rem;
+  font-weight: 850;
+}
+
+.run-agent-chip.status-异常 {
+  border-color: rgba(220, 38, 38, 0.28);
+}
+
+.run-agent-chip.status-工作中 {
+  border-color: rgba(8, 145, 178, 0.32);
+}
+
+.run-agent-chip.status-已完成 {
+  border-color: rgba(5, 150, 105, 0.3);
+}
+
+.run-agent-chip-more {
+  align-content: center;
+  grid-template-columns: auto;
+}
+
 .agent-workbench-trigger {
   align-items: center;
   background: linear-gradient(135deg, rgba(8, 24, 43, 0.96), rgba(8, 42, 52, 0.86));
@@ -3499,6 +3589,47 @@ article:hover {
 .conversation-artifact-summary p {
   line-height: 1.55;
   margin: 0;
+}
+
+.conversation-delivery-result {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.conversation-delivery-result > strong {
+  color: #0f172a;
+  font-size: 1.04rem;
+  font-weight: 950;
+  line-height: 1.3;
+}
+
+.conversation-delivery-result ul {
+  display: grid;
+  gap: 0.42rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.conversation-delivery-result li {
+  border-left: 3px solid rgba(8, 145, 178, 0.32);
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+  padding-left: 0.55rem;
+}
+
+.conversation-delivery-result li span {
+  color: #0f766e;
+  font-size: 0.78rem;
+  font-weight: 950;
+}
+
+.conversation-delivery-result li p {
+  color: #334155;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .conversation-artifact-metrics {
