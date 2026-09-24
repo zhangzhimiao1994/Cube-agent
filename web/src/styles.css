@@ -2214,14 +2214,23 @@ article:hover {
 }
 
 .agent-workbench-drawer {
+  --accent: #0891b2;
+  --accent-2: #059669;
+  --danger: #dc2626;
+  --muted: #64748b;
+  --panel: #ffffff;
+  --text: #0f172a;
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.34);
+  color: var(--text);
   max-height: min(98dvh, 1160px);
   max-width: min(100vw, 1360px);
   width: min(100vw, 1360px);
 }
 
 .agent-workbench-agent-card {
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(123, 225, 255, 0.12);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 8px;
   display: grid;
   gap: 0.42rem;
@@ -2251,8 +2260,8 @@ article:hover {
 }
 
 .agent-workbench-file-list button {
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(123, 225, 255, 0.12);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 8px;
   color: var(--text);
   display: grid;
@@ -2288,8 +2297,8 @@ article:hover {
 }
 
 .agent-workbench-file-preview {
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(123, 225, 255, 0.14);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 8px;
   display: grid;
   gap: 0.55rem;
@@ -2329,8 +2338,8 @@ article:hover {
 }
 
 .agent-workbench-file-preview dl div {
-  background: rgba(3, 10, 20, 0.24);
-  border: 1px solid rgba(123, 225, 255, 0.1);
+  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 6px;
   display: grid;
   gap: 0.12rem;
@@ -2454,8 +2463,8 @@ article:hover {
 }
 
 .agent-workbench-inputs span {
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #f1f5f9;
+  border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 999px;
   color: var(--muted);
   font-size: 0.68rem;
@@ -2530,8 +2539,8 @@ article:hover {
 }
 
 .agent-workbench-preview-pane {
-  background: rgba(255, 255, 255, 0.025);
-  border: 1px solid rgba(123, 225, 255, 0.12);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 8px;
   padding: 0.52rem;
 }
@@ -2607,8 +2616,8 @@ article:hover {
 }
 
 .agent-workbench-brief-section {
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 8px;
   display: grid;
   gap: 0.34rem;
@@ -2629,8 +2638,8 @@ article:hover {
 }
 
 .agent-workbench-brief-section button {
-  background: rgba(3, 10, 20, 0.42);
-  border: 1px solid rgba(123, 225, 255, 0.12);
+  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 6px;
   color: var(--text);
   cursor: pointer;
@@ -2732,8 +2741,8 @@ article:hover {
 }
 
 .agent-workbench-action-meta span {
-  background: rgba(85, 215, 255, 0.08);
-  border: 1px solid rgba(123, 225, 255, 0.14);
+  background: #ecfeff;
+  border: 1px solid rgba(14, 116, 144, 0.16);
   border-radius: 999px;
   color: var(--muted);
   font-size: 0.68rem;
@@ -2756,8 +2765,8 @@ article:hover {
 
 .agent-workbench-action-files button {
   align-items: center;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(123, 225, 255, 0.14);
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 8px;
   color: var(--text);
   cursor: pointer;
@@ -2782,8 +2791,8 @@ article:hover {
 
 .agent-workbench-action-files button:hover,
 .agent-workbench-action-files button:focus-visible {
-  background: rgba(27, 178, 226, 0.2);
-  border-color: rgba(123, 225, 255, 0.38);
+  background: #ecfeff;
+  border-color: rgba(8, 145, 178, 0.34);
   outline: none;
 }
 
