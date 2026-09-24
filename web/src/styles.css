@@ -3297,10 +3297,12 @@ article:hover {
   border: 1px solid rgba(123, 225, 255, 0.24);
   border-radius: 10px;
   box-shadow: 0 24px 90px rgba(0, 0, 0, 0.48);
+  display: flex;
+  flex-direction: column;
   max-height: min(86dvh, 820px);
   max-width: min(94vw, 920px);
   min-width: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 0.85rem;
   width: min(94vw, 920px);
 }
@@ -3308,6 +3310,7 @@ article:hover {
 .process-detail-modal-header {
   align-items: center;
   display: flex;
+  flex: 0 0 auto;
   gap: 1rem;
   justify-content: space-between;
   margin-bottom: 0.7rem;
@@ -3319,10 +3322,14 @@ article:hover {
 
 .process-detail-modal dl {
   display: grid;
+  flex: 1 1 auto;
   gap: 0.42rem;
   grid-template-columns: minmax(7rem, 0.28fr) minmax(0, 1fr);
   margin: 0;
+  min-height: 0;
   min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 0.1rem 0 0;
   width: 100%;
 }
@@ -3350,6 +3357,8 @@ article:hover {
   background: rgba(2, 6, 23, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.18);
   border-radius: 8px;
+  display: flex;
+  flex-direction: column;
   max-width: 100%;
   min-width: 0;
   overflow: hidden;
@@ -3403,11 +3412,13 @@ article:hover {
 
 .bounded-text-block pre {
   color: var(--text);
+  flex: 1 1 auto;
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
   font-size: 0.82rem;
   line-height: 1.58;
   margin: 0;
   max-height: 18rem;
+  min-height: 0;
   overflow: auto;
   padding: 0.7rem;
   tab-size: 2;
@@ -5797,8 +5808,20 @@ article:hover {
 
   .process-drawer {
     max-height: 94dvh;
-    width: 100vw;
     padding: 0.75rem 0.62rem calc(0.75rem + env(safe-area-inset-bottom));
+    width: 100vw;
+  }
+
+  .process-drawer:not(.agent-workbench-drawer) {
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .process-drawer:not(.agent-workbench-drawer) .run-process-detail {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .run-process-detail dl {

@@ -53,14 +53,31 @@ it("gives the workbench drawer enough room for inspectable detail panes", () => 
   );
 });
 
+it("keeps mobile nested process drawers anchored while only details scroll", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-drawer:not\(\.agent-workbench-drawer\)\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*overflow:\s*hidden;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-drawer:not\(\.agent-workbench-drawer\) \.run-process-detail\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;/,
+  );
+});
+
 it("keeps nested process detail modals full-width and readable on mobile", () => {
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
   expect(stylesCss).toMatch(
-    /\.process-detail-modal\s*{[\s\S]*min-width:\s*0;[\s\S]*width:\s*min\(94vw,\s*920px\);/,
+    /\.process-detail-modal\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*min-width:\s*0;[\s\S]*overflow:\s*hidden;[\s\S]*width:\s*min\(94vw,\s*920px\);/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal dl\s*{[\s\S]*min-width:\s*0;[\s\S]*width:\s*100%;/,
+    /\.process-detail-modal-header\s*{[\s\S]*flex:\s*0 0 auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal dl\s*{[\s\S]*flex:\s*1 1 auto;[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;[\s\S]*width:\s*100%;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.bounded-text-block\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
@@ -246,7 +263,7 @@ describe("RunDetailPage", () => {
     expect(backdrop?.parentElement).toBe(document.body);
     expect(controlsId ? document.getElementById(controlsId) : null).toBe(drawer);
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
     await user.click(within(drawer).getByRole("button", { name: /SUMMARY_SHOULD_BE_COMPACTED_BEFORE_DRA/ }));
     expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
@@ -273,7 +290,7 @@ describe("RunDetailPage", () => {
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull());
     expect(document.body.style.overflow).toBe("");
-    expect(document.body.style.touchAction).toBe("");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("");
 
     await user.click(processCard);
@@ -281,7 +298,7 @@ describe("RunDetailPage", () => {
     await user.click(document.querySelector(".process-drawer-backdrop") as HTMLElement);
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull());
     expect(document.body.style.overflow).toBe("");
-    expect(document.body.style.touchAction).toBe("");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("");
   });
 

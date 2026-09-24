@@ -6234,7 +6234,7 @@ describe("operational management pages", () => {
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     const backdrop = drawerBackdrop(drawer);
@@ -6245,7 +6245,7 @@ describe("operational management pages", () => {
     const workbench = screen.getByRole("dialog", { name: "Agent 工作席详情" });
     expect(workbench).not.toBeNull();
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     await user.click(within(workbench).getByRole("button", { name: "关闭" }));
@@ -6274,7 +6274,7 @@ describe("operational management pages", () => {
     const workbench = screen.getByRole("dialog", { name: "Agent 工作席详情" });
     expect(workbench).not.toBeNull();
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     await user.click(within(workbench).getByRole("button", { name: "关闭" }));
@@ -6301,7 +6301,7 @@ describe("operational management pages", () => {
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).toBe("pan-y");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     await user.click(drawerBackdrop(drawer));
@@ -6310,7 +6310,7 @@ describe("operational management pages", () => {
     const workbench = screen.getByRole("dialog", { name: "Agent 工作席详情" });
     expect(workbench).not.toBeNull();
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).toBe("pan-y");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     await user.click(within(workbench).getByRole("button", { name: "关闭" }));
@@ -6355,7 +6355,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "打开历史对话" }));
 
     expect(document.body.style.overflow).toBe("hidden");
-    expect(document.body.style.touchAction).toBe("none");
+    expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("hidden");
 
     const backdrop = document.querySelector(".conversation-drawer-backdrop");

@@ -3092,10 +3092,8 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
     if (!drawerOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousBodyOverflow = document.body.style.overflow;
-    const previousBodyTouchAction = document.body.style.touchAction;
     const previousDocumentOverflow = document.documentElement.style.overflow;
     document.body.style.overflow = "hidden";
-    document.body.style.touchAction = "none";
     document.documentElement.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setDrawerOpen(false);
@@ -3104,7 +3102,6 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       document.body.style.overflow = previousBodyOverflow || "";
-      document.body.style.touchAction = previousBodyTouchAction || "";
       document.documentElement.style.overflow = previousDocumentOverflow || "";
       previouslyFocused.current?.focus();
     };

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -453,6 +455,12 @@ describe("MessageBody", () => {
 });
 
 describe("agentInlineSummary", () => {
+  it("does not disable touch scrolling while the workbench owns nested mobile drawers", () => {
+    const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
+
+    expect(source).not.toContain('document.body.style.touchAction = "none"');
+  });
+
   it("explains scheduled context-loading agents with a compact action summary", () => {
     expect(
       agentInlineSummary({
