@@ -702,6 +702,7 @@ def execute_project_scale_plan(
                         request_body,
                         run_request.case_id,
                         benchmark_kind=plan.benchmark_kind,
+                        source_workspace_bundle=observation.workspace_bundle,
                         failed_reasons=(
                             *deliverable_quality.reasons,
                             *agent_standard_verification.reasons,
@@ -772,16 +773,20 @@ def execute_project_scale_plan(
                     or _has_self_repair_trace(repair_observation.events)
                     or _has_deliverable_repair_trace(repair_observation.events)
                 )
+                repair_workspace_bundle = _merged_workspace_bundle(
+                    observation.workspace_bundle,
+                    repair_observation.workspace_bundle,
+                )
                 deliverable_quality = _evaluate_deliverable_quality(
                     repair_observation.details,
                     repair_observation.events,
-                    repair_observation.workspace_bundle,
+                    repair_workspace_bundle,
                 )
                 evidence["deliverable_quality"] = deliverable_quality.passed
                 agent_standard_verification = _evaluate_agent_standard_verification(
                     repair_observation.details,
                     repair_observation.events,
-                    repair_observation.workspace_bundle,
+                    repair_workspace_bundle,
                     benchmark_kind=plan.benchmark_kind,
                 )
                 evidence["agent_standard_verification"] = agent_standard_verification.passed
@@ -806,7 +811,7 @@ def execute_project_scale_plan(
                         ),
                     )
                     generated_project_validation = _validate_generated_project_bundle(
-                        repair_observation.workspace_bundle,
+                        repair_workspace_bundle,
                         commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
                         timeout_seconds=generated_project_timeout_seconds,
                         requirements_case_id=(
@@ -819,7 +824,7 @@ def execute_project_scale_plan(
                     if plan.benchmark_kind == "capability":
                         evidence["requirements_validation"] = generated_project_validation.passed
                         deliverable_quality = _executed_capability_quality(
-                            repair_observation.workspace_bundle, generated_project_validation
+                            repair_workspace_bundle, generated_project_validation
                         )
                         evidence["deliverable_quality"] = deliverable_quality.passed
                 if evidence["workspace_bundle"]:
@@ -1282,6 +1287,43 @@ def _workspace_bundle_from_downloaded_artifact(raw: bytes) -> bytes | None:
     return _embedded_workspace_bundle_from_text(text)
 
 
+def _merged_workspace_bundle(base: bytes | None, patch: bytes | None) -> bytes | None:
+    if base is None:
+        return patch
+    if patch is None:
+        return base
+    base_files = _workspace_bundle_file_bytes(base)
+    patch_files = _workspace_bundle_file_bytes(patch)
+    if base_files is None:
+        return patch
+    if patch_files is None:
+        return base
+    base_files.update(patch_files)
+    return _workspace_bundle_from_file_bytes(base_files)
+
+
+def _workspace_bundle_file_bytes(workspace_bundle: bytes) -> dict[str, bytes] | None:
+    try:
+        with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
+            files: dict[str, bytes] = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                path = str(_safe_zip_member_path(info.filename))
+                files[path] = archive.read(info.filename)
+            return files
+    except (OSError, RuntimeError, zipfile.BadZipFile):
+        return None
+
+
+def _workspace_bundle_from_file_bytes(files: Mapping[str, bytes]) -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(files):
+            archive.writestr(path, files[path])
+    return buffer.getvalue()
+
+
 def _validate_generated_project_bundle(
     workspace_bundle: bytes | None,
     *,
@@ -1493,7 +1535,9 @@ def _collect_run_observation(
             details = details_response
             _validate_run_details_scope(details, run_id)
             status = _string_value(details.get("status")) or status
-            evidence["final_artifacts"] = _has_final_artifacts(details)
+            evidence["final_artifacts"] = bool(
+                evidence.get("final_artifacts")
+            ) or _has_final_artifacts(details)
             approved_status = _approve_pending_capability(
                 client,
                 run_id=run_id,
@@ -2046,7 +2090,9 @@ def _deliverable_repair_body(
     *,
     failed_reasons: Sequence[str] = (),
     benchmark_kind: str = "fixture",
+    source_workspace_bundle: bytes | None = None,
 ) -> dict[str, object]:
+    del source_workspace_bundle
     repair_body = dict(body)
     original_message = body.get("message")
     if benchmark_kind == "capability":

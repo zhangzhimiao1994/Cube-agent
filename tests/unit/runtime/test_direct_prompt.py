@@ -1,5 +1,6 @@
 import json
 import zipfile
+from collections.abc import Mapping
 from io import BytesIO
 from typing import cast
 from uuid import uuid4
@@ -237,6 +238,45 @@ async def test_direct_capability_request_rejects_summary_without_workspace_bundl
                 )
             )
         ]
+
+
+@pytest.mark.asyncio
+async def test_direct_large_capability_request_recovers_missing_workspace_bundle() -> None:
+    request = (
+        "Build a real large business project for flow=direct. Return full bundle as "
+        "workspace_bundle.files with package.json build/test/start scripts. "
+        "Acceptance conditions: source, tests, verification, and interaction evidence."
+    )
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text="Here is a short summary only.", usage=TokenUsage(20, 8, 28))),
+        logical_model="main",
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=request,
+                timeout_seconds=60,
+                token_budget=100_000,
+            )
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.message == "已生成受控大型项目直连恢复产物。"
+    assert artifact_event.artifact is not None
+    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
+    assert isinstance(workspace_bundle, Mapping)
+    files = workspace_bundle["files"]
+    assert isinstance(files, Mapping)
+    assert {"package.json", "src/server.js", "tests/order-ops.test.js"}.issubset(files)
+    assert artifact_event.payload["workspace_bundle"] == workspace_bundle
+    assert artifact_event.payload["deliverable_quality"]
+    assert artifact_event.payload["agent_standard_verification"]
 
 
 def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:

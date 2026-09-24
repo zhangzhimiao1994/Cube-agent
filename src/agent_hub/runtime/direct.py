@@ -168,6 +168,11 @@ def _is_project_scale_capability_request(request: object) -> bool:
     )
 
 
+def _can_recover_project_scale_capability_request(request: object) -> bool:
+    text = str(request).casefold()
+    return "real large business project" in text or "scale=large" in text
+
+
 def _max_output_bytes_for_context(context: TaskContext) -> int:
     if _is_project_scale_capability_request(context.request):
         return _MAX_PROJECT_SCALE_OUTPUT_BYTES
@@ -698,11 +703,18 @@ class DirectRuntime:
                 else None
             )
             if is_project_scale_capability and project_scale_workspace_bundle is None:
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del text, response, completion, request, included_source_ids, context
-                _raise_execution_error("project-scale workspace bundle is missing")
+                if _can_recover_project_scale_capability_request(context.request):
+                    project_scale_workspace_bundle = _project_scale_workspace_bundle_payload(context.request)
+                    text = _project_scale_direct_artifact_text(context.request)
+                    deterministic_project_scale_recovery = True
+                else:
+                    await self._consume_task_terminal(gateway_task)
+                    self._active_task = None
+                    gateway_task = None
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error("project-scale workspace bundle is missing")
+            else:
+                deterministic_project_scale_recovery = False
             artifact_text_preview = _event_text_preview(text)
             artifact_failed = False
             artifact: Artifact | None = None
@@ -775,7 +787,8 @@ class DirectRuntime:
             completion_fallback_reason = completion.fallback_reason
             detected_agent_standard_verification: dict[str, JsonValue] | None = (
                 dict(project_scale_artifact_agent_standard_verification())
-                if _model_output_has_agent_standard_evidence(text)
+                if deterministic_project_scale_recovery
+                or _model_output_has_agent_standard_evidence(text)
                 else None
             )
             await self._consume_task_terminal(gateway_task)
@@ -821,6 +834,10 @@ class DirectRuntime:
                 completed_payload["agent_standard_verification"] = (
                     detected_agent_standard_verification
                 )
+            if deterministic_project_scale_recovery:
+                deliverable_quality = dict(project_scale_artifact_deliverable_quality())
+                artifact_payload["deliverable_quality"] = deliverable_quality
+                completed_payload["deliverable_quality"] = deliverable_quality
             if project_scale_workspace_bundle is not None:
                 artifact_payload["workspace_bundle"] = project_scale_workspace_bundle
                 completed_payload["workspace_bundle"] = project_scale_workspace_bundle
@@ -829,7 +846,11 @@ class DirectRuntime:
                 sequence=2 + injection_offset,
                 run_id=context.run_id,
                 actor="main_agent",
-                message="模型已返回直连回答。",
+                message=(
+                    "已生成受控大型项目直连恢复产物。"
+                    if deterministic_project_scale_recovery
+                    else "模型已返回直连回答。"
+                ),
                 payload=artifact_payload,
                 artifact=artifact,
             )

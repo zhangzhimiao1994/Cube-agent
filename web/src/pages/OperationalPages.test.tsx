@@ -3252,6 +3252,37 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已接受受控自修复，这次运行已重新排队。")).not.toBeNull();
   });
+  it("can dismiss a self-repair proposal without retrying the failed run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "取消修复" }));
+
+    expect(screen.queryByRole("status", { name: "自修复确认" })).toBeNull();
+    expect(screen.getByText("已取消本次受控自修复建议。")).not.toBeNull();
+    expect(requests.some((request) => request.path === `/api/v1/runs/${runId}/accept-repair`)).toBe(false);
+  });
+  it("does not carry a pending self-repair proposal into a new conversation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    await user.click(screen.getAllByRole("button", { name: "新建对话" })[0]);
+
+    expect(screen.queryByRole("status", { name: "自修复确认" })).toBeNull();
+    expect(screen.queryByText("受控自修复建议")).toBeNull();
+    expect(screen.getByText("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。")).not.toBeNull();
+  });
   it("allows a pending sandbox capability from the composer card", async () => {
     const user = userEvent.setup();
     visibleRunListItem = { ...runListItem, status: "waiting_approval", version: 5 };

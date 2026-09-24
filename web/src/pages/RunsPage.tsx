@@ -4662,6 +4662,7 @@ export function RunsPage() {
   } | null>(null);
   const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
   const [dismissedEvolutionApprovalRunIds, setDismissedEvolutionApprovalRunIds] = useState<string[]>([]);
+  const [dismissedRepairApprovalRunIds, setDismissedRepairApprovalRunIds] = useState<string[]>([]);
   const [evolutionApproval, setEvolutionApproval] = useState<{
     runId: string;
     proposal: EvolutionProposal;
@@ -4856,7 +4857,7 @@ export function RunsPage() {
       );
     }
     const proposedRepair = repairApprovalFromRunDetail(selectedRun.data);
-    if (proposedRepair) {
+    if (proposedRepair && !dismissedRepairApprovalRunIds.includes(proposedRepair.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
       setScheduleApproval(null);
@@ -4913,7 +4914,7 @@ export function RunsPage() {
     } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
+  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -5053,6 +5054,7 @@ export function RunsPage() {
         setEvolutionApproval(null);
         setOpenClawApproval(null);
         setProjectPreflightApproval(null);
+        setDismissedRepairApprovalRunIds((current) => current.filter((id) => id !== repair.runId));
         setRepairApproval(repair);
         setSubmitNotice("运行失败已生成受控自修复建议，需要确认后才会重新排队。");
       } else if (run.openclaw_proposal) {
@@ -5187,6 +5189,16 @@ export function RunsPage() {
       await refreshRunSurfaces(run);
     },
   });
+
+  const cancelSelfRepair = () => {
+    const approval = repairApproval;
+    if (!approval) return;
+    setDismissedRepairApprovalRunIds((current) =>
+      current.includes(approval.runId) ? current : [...current, approval.runId],
+    );
+    setRepairApproval(null);
+    setSubmitNotice("已取消本次受控自修复建议。");
+  };
 
   const approveProjectPreflight = useMutation({
     mutationFn: () => {
@@ -5517,12 +5529,17 @@ export function RunsPage() {
     if (repairApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "accept", label: "接受修复", aliases: ["接受", "修复", "重试", "approve", "yes", "fix"] },
+        { value: "cancel", label: "取消修复", aliases: ["取消", "忽略", "不修复", "拒绝", "cancel", "reject", "no"] },
       ]);
       if (!choice) {
-        setSubmitNotice("请回复 1/接受/修复，或点击自修复确认卡里的按钮。");
+        setSubmitNotice("请回复 1/接受/修复，或 2/取消/不修复。");
         return;
       }
       setMessage("");
+      if (choice.option.value === "cancel") {
+        cancelSelfRepair();
+        return;
+      }
       setSubmitNotice("已选择接受受控自修复，正在重新排队。");
       acceptSelfRepair.mutate();
       return;
@@ -5640,6 +5657,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setEvolutionApproval(null);
     setOpenClawApproval(null);
+    setProjectPreflightApproval(null);
+    setRepairApproval(null);
+    setCapabilityApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
@@ -5662,6 +5682,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setEvolutionApproval(null);
     setOpenClawApproval(null);
+    setProjectPreflightApproval(null);
+    setRepairApproval(null);
+    setCapabilityApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
     setSubmitNotice(`已按原思路新建分支：新对话会读取 ${trimmedSourceConversationId} 作为参考上下文。`);
@@ -6358,9 +6381,14 @@ export function RunsPage() {
                   <small>{repairApproval.proposal.summary}</small>
                 </div>
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
-                <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
-                  {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
-                </button>
+                <div className="composer-card-actions">
+                  <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                    {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
+                  </button>
+                  <button type="button" className="secondary-action" disabled={acceptSelfRepair.isPending} onClick={cancelSelfRepair}>
+                    取消修复
+                  </button>
+                </div>
               </aside>
             ) : null}
             {projectPreflightApproval ? (

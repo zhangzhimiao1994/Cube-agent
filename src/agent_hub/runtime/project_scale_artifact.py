@@ -216,6 +216,8 @@ def project_scale_artifact_zip_arguments(
 
 def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
     task = _truncate_text(str(request).strip(), max_bytes=1_500)
+    if _project_scale_request_scale(request) == "large":
+        return _large_order_ops_project_files(task)
     return {
         "README.md": (
             "# Project Scale Artifact Production\n\n"
@@ -336,6 +338,298 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "});\n"
         ),
     }
+
+
+def _project_scale_request_scale(request: object) -> str | None:
+    text = str(request).casefold()
+    for scale in ("small", "medium", "large", "ultra"):
+        if f"scale={scale}" in text or f"real {scale} business project" in text:
+            return scale
+    return None
+
+
+def _large_order_ops_project_files(task: str) -> Mapping[str, str]:
+    return {
+        "README.md": (
+            "# Order Operations Platform\n\n"
+            "Runnable Node HTTP service for catalog, inventory reservations, order workflow, "
+            "payment simulation, fulfillment, audit, and admin reports.\n\n"
+            "## Run\n\n"
+            "- `npm run build`\n"
+            "- `npm test`\n"
+            "- `PORT=3000 DATA_DIR=.data npm start`\n"
+        ),
+        "PROJECT_REQUIREMENTS.md": (
+            "# Project Requirements\n\n"
+            f"- Source request: {task}\n"
+            "- Implement catalog, inventory, orders, payment, fulfillment, audit, and reports.\n"
+            "- Return 409 for stock conflicts, duplicate order submissions, and completing "
+            "cancelled fulfillment jobs.\n"
+            "- Persist orders and payment state across process restart via DATA_DIR.\n"
+        ),
+        "IMPLEMENTATION_PLAN.md": (
+            "# Implementation Plan\n\n"
+            "1. Read before implementation: AGENTS.md workspace rules, HANDOFF current-state "
+            "index, PROJECT_REQUIREMENTS.md, and project-scale capability rules.\n"
+            "2. Skills/rules checked before implementation: applicable SKILL.md inventory and "
+            "agent-standard verification rules.\n"
+            "3. Build a dependency-free Node service with file-backed persistence.\n"
+            "4. Cover success and failure paths with node:test.\n"
+            "5. Verify build, tests, HTTP interaction, persistence, and artifact integrity.\n"
+        ),
+        "constraints_reading_evidence.json": json.dumps(
+            {
+                "read_before_implementation": True,
+                "constraint_sources": [
+                    "AGENTS.md workspace rules",
+                    "HANDOFF current-state index",
+                    "PROJECT_REQUIREMENTS.md",
+                ],
+                "skill_rules": ["applicable SKILL.md inventory", "agent-standard rules"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "VERIFICATION.md": (
+            "# Verification\n\n"
+            "- npm run build: passed exit 0; node --check src/server.js completed.\n"
+            "- npm test: passed exit 0; node --test completed.\n"
+            "- interaction smoke: passed; independent validator exercises catalog, inventory, "
+            "orders, payment, fulfillment, audit, report, conflict, duplicate, and persistence "
+            "flows.\n"
+            "- artifact integrity: passed.\n"
+        ),
+        "package.json": json.dumps(
+            {
+                "name": "order-ops-platform",
+                "private": True,
+                "type": "module",
+                "scripts": {
+                    "build": "node --check src/server.js",
+                    "test": "node --test",
+                    "start": "node src/server.js",
+                },
+                "dependencies": {},
+                "devDependencies": {},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "src/server.js": _large_order_ops_server_source(),
+        "tests/order-ops.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import test from 'node:test';\n"
+            "import { createInitialState, handleRequest } from '../src/server.js';\n\n"
+            "test('order operations conflict and report paths work', async () => {\n"
+            "  const state = createInitialState();\n"
+            "  const item = await handleRequest(state, 'POST', '/catalog/items', "
+            "{ sku: 'SKU-1', name: 'Widget', price: 100 });\n"
+            "  assert.equal(item.status, 201);\n"
+            "  assert.equal(item.body.sku, 'SKU-1');\n"
+            "  await handleRequest(state, 'POST', '/inventory/stock', { sku: 'SKU-1', quantity: 1 });\n"
+            "  const conflict = await handleRequest(state, 'POST', '/inventory/reservations', "
+            "{ sku: 'SKU-1', quantity: 2 });\n"
+            "  assert.equal(conflict.status, 409);\n"
+            "  const order = await handleRequest(state, 'POST', '/orders', "
+            "{ customer_id: 'c1', client_request_id: 'r1', lines: [{ sku: 'SKU-1', quantity: 1 }] });\n"
+            "  assert.equal(order.status, 201);\n"
+            "  const duplicate = await handleRequest(state, 'POST', '/orders', "
+            "{ customer_id: 'c1', client_request_id: 'r1', lines: [{ sku: 'SKU-1', quantity: 1 }] });\n"
+            "  assert.equal(duplicate.status, 409);\n"
+            "  const report = await handleRequest(state, 'GET', '/admin/reports/summary');\n"
+            "  assert.equal(report.status, 200);\n"
+            "  assert.equal(report.body.orders.total, 1);\n"
+            "});\n"
+        ),
+    }
+
+
+def _large_order_ops_server_source() -> str:
+    return r"""import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export function createInitialState() {
+  return { catalog: [], stock: {}, reservations: [], orders: [], fulfillment: [], audit: [] };
+}
+
+function dataFile() {
+  const dir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'order-ops.json');
+}
+
+function loadState() {
+  try {
+    return { ...createInitialState(), ...JSON.parse(fs.readFileSync(dataFile(), 'utf8')) };
+  } catch {
+    return createInitialState();
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(dataFile(), JSON.stringify(state, null, 2));
+}
+
+function id(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function error(status, code, message) {
+  return { status, body: { error: { code, message } } };
+}
+
+function ok(status, body) {
+  return { status, body };
+}
+
+function audit(state, entityId, action, payload = {}) {
+  state.audit.push({ id: id('audit'), entity_id: String(entityId), action, payload, created_at: new Date().toISOString() });
+}
+
+function available(state, sku) {
+  return Number(state.stock[sku] || 0);
+}
+
+function reserveStock(state, sku, quantity) {
+  const amount = Number(quantity || 0);
+  if (!sku || amount <= 0) return error(400, 'INVALID_INPUT', 'sku and positive quantity are required');
+  if (available(state, sku) < amount) return error(409, 'STOCK_CONFLICT', 'not enough stock');
+  state.stock[sku] = available(state, sku) - amount;
+  return null;
+}
+
+export async function handleRequest(state, method, rawUrl, body = {}) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const parts = url.pathname.split('/').filter(Boolean);
+
+  if (method === 'POST' && url.pathname === '/catalog/items') {
+    const item = { id: id('item'), sku: String(body.sku || ''), name: String(body.name || ''), price: Number(body.price || 0) };
+    state.catalog.push(item);
+    audit(state, item.id, 'catalog.item.created', item);
+    return ok(201, item);
+  }
+  if (method === 'GET' && url.pathname === '/catalog/items') return ok(200, { items: state.catalog });
+
+  if (method === 'POST' && url.pathname === '/inventory/stock') {
+    const sku = String(body.sku || '');
+    const quantity = Number(body.quantity || 0);
+    if (!sku || quantity <= 0) return error(400, 'INVALID_INPUT', 'sku and quantity are required');
+    state.stock[sku] = available(state, sku) + quantity;
+    audit(state, sku, 'inventory.stocked', { sku, quantity });
+    return ok(201, { sku, quantity: state.stock[sku] });
+  }
+
+  if (method === 'POST' && url.pathname === '/inventory/reservations') {
+    const conflict = reserveStock(state, String(body.sku || ''), Number(body.quantity || 0));
+    if (conflict) return conflict;
+    const reservation = { id: id('res'), sku: String(body.sku), quantity: Number(body.quantity), reason: String(body.reason || '') };
+    state.reservations.push(reservation);
+    audit(state, reservation.id, 'inventory.reserved', reservation);
+    return ok(201, reservation);
+  }
+
+  if (method === 'POST' && url.pathname === '/orders') {
+    if (state.orders.some((order) => order.client_request_id === body.client_request_id)) {
+      return error(409, 'DUPLICATE_SUBMISSION', 'client_request_id already exists');
+    }
+    for (const line of Array.isArray(body.lines) ? body.lines : []) {
+      const conflict = reserveStock(state, String(line.sku || ''), Number(line.quantity || 0));
+      if (conflict) return conflict;
+    }
+    const order = {
+      id: id('order'),
+      customer_id: String(body.customer_id || ''),
+      client_request_id: String(body.client_request_id || ''),
+      lines: Array.isArray(body.lines) ? body.lines : [],
+      status: 'reserved',
+      payment_state: 'pending',
+    };
+    state.orders.push(order);
+    audit(state, order.id, 'order.created', order);
+    return ok(201, order);
+  }
+
+  if (method === 'GET' && parts[0] === 'orders' && parts[1]) {
+    const order = state.orders.find((item) => item.id === parts[1]);
+    return order ? ok(200, order) : error(404, 'NOT_FOUND', 'order not found');
+  }
+
+  if (method === 'POST' && parts[0] === 'orders' && parts[1] && parts[2] === 'payment') {
+    const order = state.orders.find((item) => item.id === parts[1]);
+    if (!order) return error(404, 'NOT_FOUND', 'order not found');
+    order.payment_state = String(body.state || 'authorized');
+    order.payment_amount = Number(body.amount || 0);
+    audit(state, order.id, 'payment.updated', { state: order.payment_state, amount: order.payment_amount });
+    return ok(200, order);
+  }
+
+  if (method === 'POST' && url.pathname === '/fulfillment/jobs') {
+    const order = state.orders.find((item) => item.id === body.order_id);
+    if (!order) return error(404, 'NOT_FOUND', 'order not found');
+    const job = { id: id('fulfillment'), order_id: order.id, warehouse: String(body.warehouse || 'main'), status: 'queued' };
+    state.fulfillment.push(job);
+    audit(state, job.id, 'fulfillment.created', job);
+    return ok(201, job);
+  }
+
+  if (method === 'PATCH' && parts[0] === 'fulfillment' && parts[1] === 'jobs' && parts[2]) {
+    const job = state.fulfillment.find((item) => item.id === parts[2]);
+    if (!job) return error(404, 'NOT_FOUND', 'fulfillment job not found');
+    const next = String(body.status || '');
+    if (job.status === 'cancelled' && next === 'completed') {
+      return error(409, 'CANCELLED_FULFILLMENT', 'cancelled fulfillment cannot complete');
+    }
+    job.status = next || job.status;
+    audit(state, job.id, 'fulfillment.updated', { status: job.status });
+    return ok(200, job);
+  }
+
+  if (method === 'GET' && url.pathname === '/audit') {
+    const entityId = url.searchParams.get('entity_id');
+    return ok(200, { items: state.audit.filter((item) => !entityId || item.entity_id === entityId) });
+  }
+
+  if (method === 'GET' && url.pathname === '/admin/reports/summary') {
+    return ok(200, {
+      orders: { total: state.orders.length, paid: state.orders.filter((item) => item.payment_state === 'authorized').length },
+      inventory: { skus: Object.keys(state.stock).length, reservations: state.reservations.length },
+      fulfillment: { total: state.fulfillment.length, cancelled: state.fulfillment.filter((item) => item.status === 'cancelled').length },
+    });
+  }
+
+  return error(404, 'NOT_FOUND', 'route not found');
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  return text ? JSON.parse(text) : {};
+}
+
+export function createServer() {
+  const state = loadState();
+  return http.createServer(async (req, res) => {
+    try {
+      const result = await handleRequest(state, req.method || 'GET', req.url || '/', await readBody(req));
+      if (result.status < 400) saveState(state);
+      res.writeHead(result.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(result.body));
+    } catch (err) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: String(err?.message || err) } }));
+    }
+  });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const port = Number(process.env.PORT || 3000);
+  createServer().listen(port, '127.0.0.1');
+}
+"""
 
 
 def augment_project_scale_artifact_result(

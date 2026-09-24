@@ -2826,6 +2826,94 @@ def test_execute_project_scale_plan_repairs_generated_project_validation_failure
     assert "rerun build/test/interaction checks" in repair_message
 
 
+def test_execute_project_scale_plan_merges_partial_repair_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("large",),
+        flows=("direct",),
+        execute=True,
+    )
+    base_bundle = _project_bundle(
+        {
+            "README.md": "# Order Ops\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Large order operations contract\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": (
+                "- npm run build: passed exit 0; node --check completed\n"
+                "- npm test: passed exit 0; 1 test passed\n"
+                "- interaction smoke: passed\n"
+            ),
+            "package.json": json.dumps({"scripts": {"build": "node --check src/main.js"}}),
+            "src/main.js": _functional_js_source(),
+            "tests/audit.test.js": "throw new Error('syntax stays broken');\n",
+        }
+    )
+    patch_bundle = _project_bundle({"tests/audit.test.js": "import assert from 'node:assert/strict';\nassert.equal(42, 42);\n"})
+    seen: list[bytes | None] = []
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        seen.append(bundle)
+        assert bundle is not None
+        with zipfile.ZipFile(BytesIO(bundle)) as archive:
+            names = set(archive.namelist())
+            repaired_test = archive.read("tests/audit.test.js").decode("utf-8")
+        if len(seen) == 1:
+            return project_scale_runner_module._EvidenceCheck(
+                passed=False,
+                reasons=("generated_project_validation: command failed exit=2 output_tail=\"tests/audit.test.js(1,1): error\"",),
+            )
+        assert "src/main.js" in names
+        assert "assert.equal(42, 42)" in repaired_test
+        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-large-direct-merge",
+        session_id="project-scale-large-direct",
+        create_status="waiting_approval",
+        decision_token="approve-large",
+        decision_version=4,
+        statuses=("queued", "completed"),
+        repair_create_status="waiting_approval",
+        repair_decision_token="approve-large-repair",
+        repair_decision_version=7,
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=base_bundle,
+        repair_workspace_bundle=patch_bundle,
+    )
+
+    report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-large-direct-merge-repair"
+    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert len(seen) == 2
+
+
 def test_execute_project_scale_plan_repairs_running_run_with_invalid_generated_project(
     tmp_path: Path,
 ) -> None:
@@ -3873,6 +3961,8 @@ class FakeAcceptanceClient:
         self_repair_decision_version: int | None = None,
         public_self_repair_proposal: bool = True,
         workspace_bundle: bytes | None = None,
+        repair_workspace_bundle: bytes | None = None,
+        workspace_bundle_sequence: tuple[bytes | None, ...] | None = None,
         artifact_downloads: Mapping[str, bytes] | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
@@ -3916,8 +4006,11 @@ class FakeAcceptanceClient:
         self.self_repair_decision_version = self_repair_decision_version
         self.public_self_repair_proposal = public_self_repair_proposal
         self.workspace_bundle = workspace_bundle
+        self.repair_workspace_bundle = repair_workspace_bundle
+        self.workspace_bundle_sequence = list(workspace_bundle_sequence or ())
         self.artifact_downloads = dict(artifact_downloads or {})
         self.repair_run_id = f"{run_id}-repair"
+        self._collecting_repair_run = False
         self.calls: list[tuple[str, str, str | None]] = []
         self.submitted_bodies: list[dict[str, object]] = []
 
@@ -4004,6 +4097,7 @@ class FakeAcceptanceClient:
             f"/api/v1/runs/{self.run_id}/details",
             f"/api/v1/runs/{self.repair_run_id}/details",
         }:
+            self._collecting_repair_run = path == f"/api/v1/runs/{self.repair_run_id}/details"
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
             if path == f"/api/v1/runs/{self.repair_run_id}/details":
                 details_run_id = self.repair_run_id
@@ -4123,6 +4217,13 @@ class FakeAcceptanceClient:
         if self.fail_bundle_once:
             self.fail_bundle_once = False
             raise RuntimeError("workspace bundle unavailable")
+        if self._collecting_repair_run and self.repair_workspace_bundle is not None:
+            return self.repair_workspace_bundle
+        if self.workspace_bundle_sequence:
+            item = self.workspace_bundle_sequence.pop(0)
+            if item is None:
+                raise RuntimeError("workspace bundle unavailable")
+            return item
         if self.workspace_bundle is not None:
             return self.workspace_bundle
         self._next_execution_evidence()
