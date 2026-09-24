@@ -531,6 +531,32 @@ async function mockCodingRunApi(
       await route.fulfill({ json: { conversation_id: codingConversationId, runs: [runDetail] } });
       return;
     }
+    if (path === `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files`) {
+      await route.fulfill({
+        json: {
+          items: [
+            {
+              path: "plan.md",
+              filename: "plan.md",
+              mime_type: "text/markdown",
+              size_bytes: 512,
+              sha256: "c".repeat(64),
+              download_url: `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files/download?path=plan.md`,
+            },
+            {
+              path: "src/index.mjs",
+              filename: "index.mjs",
+              mime_type: "text/javascript",
+              size_bytes: 28,
+              sha256: "d".repeat(64),
+              download_url: `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files/download?path=src%2Findex.mjs`,
+            },
+          ],
+          bundle_download_url: `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/bundle/download`,
+        },
+      });
+      return;
+    }
     if (path === finalDownloadPath || path === intermediateDownloadPath) {
       const filename = path === finalDownloadPath ? "hello-world.zip" : "hello-world-source.zip";
       const body =
@@ -567,6 +593,14 @@ test("operator validates a simple coding run and downloads final and intermediat
   await page.getByRole("button", { name: "发送" }).click();
 
   await expect(page.getByText("已生成一个最小 hello world 项目，并附上可下载压缩包。")).toBeVisible();
+  const resultMessage = page
+    .locator("article.chat-message.assistant")
+    .filter({ hasText: "已生成一个最小 hello world 项目" });
+  const deliverableFiles = resultMessage.getByRole("region", { name: "交付文件" });
+  await expect(deliverableFiles).toBeVisible();
+  await expect(deliverableFiles.getByRole("button", { name: "下载 workspace.zip" })).toBeVisible();
+  await expect(deliverableFiles.getByRole("button", { name: "下载 plan.md" })).toBeVisible();
+  await expect(deliverableFiles.getByRole("button", { name: "下载 index.mjs" })).toBeVisible();
   await expect(page.getByRole("button", { name: /下载 hello-world\.zip/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ })).toBeVisible();
   await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();

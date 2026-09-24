@@ -2562,16 +2562,24 @@ function mergeWorkspaceFileList(
 
 function ConversationWorkspaceFiles({
   files,
+  title = "当前会话文件",
+  eyebrow = "Files",
+  ariaLabel = title,
+  showIntermediateInline = false,
 }: {
   files: ConversationWorkspaceFileBuckets;
+  title?: string;
+  eyebrow?: string;
+  ariaLabel?: string;
+  showIntermediateInline?: boolean;
 }) {
   if (files.total === 0) return null;
   return (
-    <section className="conversation-files-panel" aria-label="当前会话文件">
+    <section className="conversation-files-panel" aria-label={ariaLabel}>
       <div className="conversation-files-header">
         <div>
-          <span className="eyebrow">Files</span>
-          <h3>当前会话文件</h3>
+          <span className="eyebrow">{eyebrow}</span>
+          <h3>{title}</h3>
         </div>
         <small>
           {files.final.length} 个最终产物
@@ -2585,7 +2593,14 @@ function ConversationWorkspaceFiles({
           ))}
         </div>
       ) : null}
-      {files.intermediate.length > 0 ? (
+      {files.intermediate.length > 0 && showIntermediateInline ? (
+        <div className="conversation-files-group" aria-label="相关文件">
+          {files.intermediate.map((artifact) => (
+            <ArtifactFileCard key={artifact.download_url} artifact={artifact} compact />
+          ))}
+        </div>
+      ) : null}
+      {files.intermediate.length > 0 && !showIntermediateInline ? (
         <details className="conversation-files-details">
           <summary>中间产物</summary>
           <div className="conversation-files-group">
@@ -2596,6 +2611,15 @@ function ConversationWorkspaceFiles({
         </details>
       ) : null}
     </section>
+  );
+}
+
+function inlineFileMessageId(messages: ChatMessage[]) {
+  const assistantMessages = [...messages].reverse().filter((message) => message.role === "assistant");
+  return (
+    assistantMessages.find((message) => message.title === "回复")?.id ??
+    assistantMessages.find((message) => Boolean(message.artifact))?.id ??
+    null
   );
 }
 
@@ -5736,6 +5760,7 @@ export function RunsPage() {
     conversationWorkspaceFiles(visibleRuns),
     activeWorkspaceFiles.data,
   );
+  const inlineWorkspaceFilesMessageId = inlineFileMessageId(messages);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
@@ -6272,6 +6297,15 @@ export function RunsPage() {
                       <ArtifactFileCard artifact={item.artifact} />
                     </div>
                   ) : null}
+                  {item.id === inlineWorkspaceFilesMessageId ? (
+                    <ConversationWorkspaceFiles
+                      files={workspaceFiles}
+                      title="交付文件"
+                      eyebrow="Files"
+                      ariaLabel="交付文件"
+                      showIntermediateInline
+                    />
+                  ) : null}
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
@@ -6284,7 +6318,7 @@ export function RunsPage() {
                 ) : null}
               </Fragment>
             ))}
-            <ConversationWorkspaceFiles files={workspaceFiles} />
+            {inlineWorkspaceFilesMessageId ? null : <ConversationWorkspaceFiles files={workspaceFiles} />}
           </div>
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer

@@ -2489,7 +2489,7 @@ describe("operational management pages", () => {
     expect(within(stream).getAllByRole("button", { name: /下载 delivery-plan\.docx/ })).toHaveLength(1);
   });
 
-  it("shows current conversation workspace files without reopening the conversation", async () => {
+  it("shows deliverable workspace files in the conversation result without reopening the conversation", async () => {
     visibleWorkspaceFiles = {
       items: [
         {
@@ -2508,11 +2508,70 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    const files = await screen.findByRole("region", { name: "当前会话文件" });
+    const files = await screen.findByRole("region", { name: "交付文件" });
 
-    expect(within(files).getByRole("heading", { name: "当前会话文件" })).not.toBeNull();
+    expect(within(files).getByRole("heading", { name: "交付文件" })).not.toBeNull();
     expect(within(files).getByRole("button", { name: "下载 workspace.zip" })).not.toBeNull();
-    expect(within(files).getByText("中间产物")).not.toBeNull();
+    expect(within(files).getByRole("button", { name: "下载 app.py" })).not.toBeNull();
+  });
+
+  it("embeds deliverable file links in the main agent result message", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        ...runDetail.artifacts,
+        {
+          id: "artifact-final-zip",
+          kind: "zip",
+          title: "final_synthesizer",
+          text: null,
+          filename: "project.zip",
+          mime_type: "application/zip",
+          size_bytes: 4096,
+          sha256: "3".repeat(64),
+          download_url: "/api/v1/runs/22222222-2222-4222-8222-222222222222/artifacts/artifact-final-zip/download",
+          presentation: "final_attachment",
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+    visibleWorkspaceFiles = {
+      items: [
+        {
+          path: "plan.md",
+          filename: "plan.md",
+          mime_type: "text/markdown",
+          size_bytes: 2048,
+          sha256: "1".repeat(64),
+          download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=plan.md",
+        },
+        {
+          path: "src/app.py",
+          filename: "app.py",
+          mime_type: "text/x-python",
+          size_bytes: 21,
+          sha256: "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+          download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=src%2Fapp.py",
+        },
+      ],
+      bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const assistantReply = await within(stream).findByText(/这是最终回复正文/);
+    const replyCard = assistantReply.closest("article");
+
+    expect(replyCard).not.toBeNull();
+    const files = within(replyCard as HTMLElement).getByRole("region", { name: "交付文件" });
+    expect(within(files).getByRole("heading", { name: "交付文件" })).not.toBeNull();
+    expect(within(files).getByRole("button", { name: "下载 workspace.zip" })).not.toBeNull();
+    expect(within(files).getByRole("button", { name: "下载 plan.md" })).not.toBeNull();
+    expect(within(files).getByRole("button", { name: "下载 app.py" })).not.toBeNull();
+    expect(within(replyCard as HTMLElement).queryByRole("button", { name: "下载 project.zip" })).toBeNull();
   });
 
   it("shows workspace files inside the agent workbench file window with text preview", async () => {
@@ -2676,7 +2735,7 @@ describe("operational management pages", () => {
     expect(actionWindow.textContent).not.toContain("stdout");
   });
 
-  it("places current conversation workspace files after the conversation messages", async () => {
+  it("places current conversation workspace files inside the main agent result message", async () => {
     visibleWorkspaceFiles = {
       items: [
         {
@@ -2697,7 +2756,8 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const assistantReply = await within(stream).findByText(/这是最终回复正文/);
-    const files = await within(stream).findByRole("region", { name: "当前会话文件" });
+    const replyCard = assistantReply.closest("article");
+    const files = await within(replyCard as HTMLElement).findByRole("region", { name: "交付文件" });
 
     expect(Boolean(assistantReply.compareDocumentPosition(files) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
   });
