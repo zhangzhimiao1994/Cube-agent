@@ -3788,6 +3788,77 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     assert client.calls.count(("GET", "/api/v1/runs/run-small-self-repair/details", None)) == 2
 
 
+def test_execute_project_scale_plan_repairs_missing_self_repair_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda *args, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_evaluate_deliverable_quality",
+        lambda *args, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_evaluate_agent_standard_verification",
+        lambda *args, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_evaluate_discussion_trace",
+        lambda *args, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("self_repair",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-self-repair",
+        session_id="project-scale-small-self_repair",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "discussion.completed", "run_id": "run-small-self-repair"}],
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=5,
+        poll_interval_seconds=0,
+    )
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-small-self-repair-repair"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["self_repair_trace"] is True
+    assert result.missing_evidence == ()
+    assert (
+        "POST",
+        "/api/v1/runs",
+        "project-scale-small-self-repair-0-deliverable-repair",
+    ) in client.calls
+    repair_message = str(client.submitted_bodies[-1]["message"])
+    assert "self_repair_trace: expected explicit fault-injection or repair evidence" in repair_message
+
+
 def test_execute_project_scale_plan_does_not_cancel_or_fetch_bundle_for_running_timeout() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="capability", scales=("medium",), flows=("hybrid",), execute=True)
     client = FakeAcceptanceClient(

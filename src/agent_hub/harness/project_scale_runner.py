@@ -215,7 +215,7 @@ class ProjectScaleCaseResult:
             required = (*required, "discussion_trace")
         if _case_requires_plugin_contract(self.case_id):
             required = (*required, "plugin_contract")
-        if "self_repair" in self.case_id or "model_failure" in self.case_id:
+        if _case_requires_self_repair_trace(self.case_id):
             required = (*required, "self_repair_trace")
         if "generated_project_validation" in self.evidence:
             required = (*required, "generated_project_validation")
@@ -709,6 +709,10 @@ def execute_project_scale_plan(
                             *discussion_trace.reasons,
                             *plugin_contract.reasons,
                             *generated_project_validation.reasons,
+                            *_self_repair_trace_reasons(
+                                evidence,
+                                case_id=run_request.case_id,
+                            ),
                         ),
                     ),
                     idempotency_key=_deliverable_repair_idempotency_key(
@@ -772,6 +776,10 @@ def execute_project_scale_plan(
                     evidence["self_repair_trace"]
                     or _has_self_repair_trace(repair_observation.events)
                     or _has_deliverable_repair_trace(repair_observation.events)
+                    or (
+                        _case_requires_self_repair_trace(run_request.case_id)
+                        and evidence["deliverable_repair_trace"]
+                    )
                 )
                 repair_workspace_bundle = _merged_workspace_bundle(
                     observation.workspace_bundle,
@@ -3271,6 +3279,10 @@ def _should_attempt_deliverable_repair(
                 and evidence.get("plugin_contract") is not True
             )
             or evidence.get("generated_project_validation") is False
+            or (
+                _case_requires_self_repair_trace(case_id)
+                and evidence.get("self_repair_trace") is not True
+            )
         )
     )
 
@@ -3292,7 +3304,30 @@ def _has_followup_deliverable_repair_reason(
             and evidence.get("plugin_contract") is not True
         )
         or evidence.get("generated_project_validation") is False
+        or (
+            _case_requires_self_repair_trace(case_id)
+            and evidence.get("self_repair_trace") is not True
+        )
     )
+
+
+def _case_requires_self_repair_trace(case_id: str) -> bool:
+    return "self_repair" in case_id or "model_failure" in case_id
+
+
+def _self_repair_trace_reasons(
+    evidence: Mapping[str, bool],
+    *,
+    case_id: str,
+) -> tuple[str, ...]:
+    if (
+        _case_requires_self_repair_trace(case_id)
+        and evidence.get("self_repair_trace") is not True
+    ):
+        return (
+            "self_repair_trace: expected explicit fault-injection or repair evidence",
+        )
+    return ()
 
 
 def _has_deliverable_repair_trace(events: list[object] | None) -> bool:
