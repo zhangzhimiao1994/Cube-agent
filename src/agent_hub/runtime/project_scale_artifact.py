@@ -519,7 +519,7 @@ export async function handleRequest(state, method, rawUrl, body = {}) {
     if (!sku || quantity <= 0) return error(400, 'INVALID_INPUT', 'sku and quantity are required');
     state.stock[sku] = available(state, sku) + quantity;
     audit(state, sku, 'inventory.stocked', { sku, quantity });
-    return ok(201, { sku, quantity: state.stock[sku] });
+    return ok(201, { id: `stock-${sku}`, sku, quantity: state.stock[sku] });
   }
 
   if (method === 'POST' && url.pathname === '/inventory/reservations') {
