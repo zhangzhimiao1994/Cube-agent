@@ -2508,6 +2508,34 @@ article:hover {
   min-width: 0;
 }
 
+.agent-workbench-action-workspace {
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: minmax(18rem, 0.96fr) minmax(20rem, 1.04fr);
+  min-width: 0;
+}
+
+.agent-workbench-action-list-pane,
+.agent-workbench-preview-pane {
+  align-content: start;
+  display: grid;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.agent-workbench-action-list-pane {
+  max-height: min(62dvh, 46rem);
+  overflow-y: auto;
+  padding-right: 0.12rem;
+}
+
+.agent-workbench-preview-pane {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  padding: 0.52rem;
+}
+
 .agent-workbench-actions-header {
   align-items: center;
   display: grid;
@@ -4871,6 +4899,20 @@ article:hover {
     overflow-x: auto;
     overflow-wrap: anywhere;
     word-break: normal;
+  }
+
+  .agent-workbench-action-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-workbench-action-list-pane {
+    max-height: none;
+    overflow-y: visible;
+    padding-right: 0;
+  }
+
+  .agent-workbench-preview-pane.is-selected {
+    order: -1;
   }
 
   .process-detail-card,

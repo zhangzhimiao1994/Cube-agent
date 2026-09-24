@@ -2590,10 +2590,83 @@ describe("operational management pages", () => {
     expect(within(workbenchActions).getByRole("button", { name: /implementer 创建文件 src\/app\.py/ })).not.toBeNull();
     await user.click(within(workbenchActions).getByRole("button", { name: "预览文件 src/app.py" }));
 
-    const fileWindow = within(workbench).getByRole("region", { name: "文件窗口" });
-    expect(within(workbench).getByRole("button", { name: "文件" }).getAttribute("aria-pressed")).toBe("true");
-    expect(within(fileWindow).getByRole("button", { name: /src\/app\.py/ }).getAttribute("aria-pressed")).toBe("true");
-    expect(await within(fileWindow).findByText("print('hello from workspace')")).not.toBeNull();
+    const actionWorkspace = within(workbench).getByRole("region", { name: "实际动作工作区" });
+    const filePreview = within(actionWorkspace).getByRole("region", { name: "关联文件预览" });
+    expect(within(workbench).getByRole("button", { name: "实际动作" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(filePreview).getByLabelText("app.py预览")).not.toBeNull();
+    expect(await within(filePreview).findByText("print('hello from workspace')")).not.toBeNull();
+  });
+
+  it("shows safe command and workspace path summaries for action rows without downloadable files", async () => {
+    const user = userEvent.setup();
+    const actionOnlyRunDetail: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: null,
+          created_at: conversationCreatedAt,
+          actor: "implementer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call-test",
+          step_id: "verify",
+          action: null,
+          decision: null,
+          payload: {
+            operation_kind: "terminal",
+            status: "completed",
+            command: "npm test -- --run",
+            exit_code: 0,
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: null,
+          created_at: conversationCreatedAt,
+          actor: "implementer",
+          participants: [],
+          tool_name: "workspace.edit_file",
+          tool_call_id: "call-edit",
+          step_id: "edit-upload",
+          action: null,
+          decision: null,
+          payload: {
+            operation_kind: "file_edit",
+            status: "completed",
+            workspace_files: [
+              {
+                path: "src/routes/upload.ts",
+                filename: "upload.ts",
+                operation_kind: "file_edit",
+              },
+            ],
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = actionOnlyRunDetail;
+    visibleConversationRuns = [actionOnlyRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const workbench = await openAgentWorkbench(user, stream);
+    await openWorkbenchView(user, workbench, "实际动作");
+
+    const actionWindow = within(workbench).getByRole("region", { name: "过程轨迹" });
+    expect(within(actionWindow).getByRole("button", { name: /npm test -- --run/ })).not.toBeNull();
+    expect(within(actionWindow).getByRole("button", { name: /src\/routes\/upload\.ts/ })).not.toBeNull();
+    expect(actionWindow.textContent).toContain("运行终端");
+    expect(actionWindow.textContent).toContain("编辑文件");
+    expect(actionWindow.textContent).not.toContain("stdout");
   });
 
   it("places current conversation workspace files after the conversation messages", async () => {

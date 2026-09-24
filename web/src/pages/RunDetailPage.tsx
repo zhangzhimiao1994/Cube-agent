@@ -847,6 +847,42 @@ function hasSensitiveNestedValue(value: unknown): boolean {
   );
 }
 
+function isSensitiveActionTargetText(value: string) {
+  return /api[_-]?key|authorization|bearer|credential|password|private[-_ ]?token|secret|token/i.test(value);
+}
+
+function safeActionTargetText(value: unknown) {
+  const text = formatDetailValue(value);
+  if (!text || isSensitiveActionTargetText(text)) return "";
+  return text;
+}
+
+function workspaceFilesActionTarget(value: unknown) {
+  if (!Array.isArray(value)) return "";
+  const targets = value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const target = safeActionTargetText(record.path) || safeActionTargetText(record.filename);
+    return target ? [target] : [];
+  });
+  return targets.slice(0, 3).join("、");
+}
+
+function safeActionTargetRows(event: RunEvent): DetailProcessRow[] {
+  const rows: DetailProcessRow[] = [];
+  const command = safeActionTargetText(event.payload.command);
+  if (command) rows.push({ label: "命令", value: command });
+  const workspaceFiles = workspaceFilesActionTarget(event.payload.workspace_files);
+  if (workspaceFiles) rows.push({ label: "工作区文件", value: workspaceFiles });
+  const directTarget =
+    safeActionTargetText(event.payload.path) ||
+    safeActionTargetText(event.payload.file_path) ||
+    safeActionTargetText(event.payload.filename) ||
+    safeActionTargetText(event.payload.target);
+  if (directTarget && !rows.some((row) => row.value === directTarget)) rows.push({ label: "目标", value: directTarget });
+  return rows;
+}
+
 function artifactText(artifact: RunArtifact | null | undefined) {
   const text = artifact?.text?.trim() ?? "";
   return isGenericDetailText(text) ? "" : text;
@@ -972,8 +1008,10 @@ function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefin
   if (event.summary?.trim()) rows.push({ label: "安全摘要", value: event.summary.trim() });
   if (!isGenericDetailText(event.message)) rows.push({ label: "事件内容", value: event.message.trim() });
   discussionTraceRows(event.payload).forEach((row) => rows.push(row));
+  safeActionTargetRows(event).forEach((row) => rows.push(row));
   Object.entries(event.payload).forEach(([key, value]) => {
     if (key === "discussion_trace" || key === "dispatch_discussion_trace" || key === "coordination_trace") return;
+    if (key === "workspace_files") return;
     if (isSensitivePayloadKey(key) || hasSensitiveNestedValue(value)) return;
     const formatted = formatDetailPayloadDisplayValue(key, value);
     if (formatted) rows.push({ label: detailPayloadLabel(key), value: formatted });
@@ -1287,12 +1325,14 @@ function detailCardActionOperation(card: DetailProcessCard) {
 function detailCardActionTarget(card: DetailProcessCard) {
   const fileTarget = card.workspaceFiles?.[0]?.title || card.workspaceFiles?.[0]?.filename || "";
   if (fileTarget) return fileTarget;
-  const rowTarget =
-    detailCardRowValue(card, /^(关联文件|文件|路径|工作区文件|命令|目标|工具|步骤)$/) ||
-    detailCardRowValue(card, /command|path|file|target|step/i);
-  if (rowTarget) return conciseProcessText(rowTarget, "");
+  const primaryTarget =
+    detailCardRowValue(card, /^(关联文件|文件|路径|工作区文件|命令|目标)$/) ||
+    detailCardRowValue(card, /command|path|file|target/i);
+  if (primaryTarget) return conciseProcessText(primaryTarget, "");
   if (card.artifact) return artifactFileName(card.artifact);
   if (card.sourceStepId) return `步骤 ${card.sourceStepId}`;
+  const fallbackTarget = detailCardRowValue(card, /^工具$/) || detailCardRowValue(card, /^步骤$/);
+  if (fallbackTarget) return conciseProcessText(fallbackTarget, "");
   return "";
 }
 
@@ -2764,6 +2804,7 @@ function DetailProcessDrawer({
   const [showAllActions, setShowAllActions] = useState(false);
   const [activeView, setActiveView] = useState<DetailWorkbenchView>("overview");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const previewPaneRef = useRef<HTMLElement | null>(null);
   const overviewCards = detailWorkbenchOverviewCards(cards);
   const coordinationCards = cards.filter(isDetailCoordinationCard);
   const coordinationSections = detailCoordinationEvidenceSections(coordinationCards);
@@ -2782,9 +2823,14 @@ function DetailProcessDrawer({
   const filesForCard = (card: DetailProcessCard) => filesBySourceId.get(card.id) ?? [];
   const openFile = (file: DetailWorkbenchFileItem) => {
     setSelectedFileId(file.id);
-    setActiveView("files");
     setShowAllActions(false);
   };
+  useEffect(() => {
+    if (!selectedFileId || !previewPaneRef.current) return;
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    if (!window.matchMedia("(max-width: 980px)").matches) return;
+    previewPaneRef.current.scrollIntoView({ block: "start", inline: "nearest" });
+  }, [selectedFileId, activeView]);
   const visibleCards =
     activeView === "coordination"
       ? coordinationCards
@@ -2973,35 +3019,52 @@ function DetailProcessDrawer({
                   )}
                 </section>
               ) : (
-                <>
-                  <div className="agent-workbench-actions-header">
-                    <strong>{visibleLabel}</strong>
-                    <small>{visibleCards.length} 条</small>
-                    {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
-                      <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
-                        {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
-                      </button>
+                <section className="agent-workbench-action-workspace" aria-label={`${visibleLabel}工作区`}>
+                  <section className="agent-workbench-action-list-pane" aria-label="动作列表">
+                    <div className="agent-workbench-actions-header">
+                      <strong>{visibleLabel}</strong>
+                      <small>{visibleCards.length} 条</small>
+                      {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
+                        <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
+                          {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
+                        </button>
+                      ) : null}
+                    </div>
+                    {visiblePreview.hiddenCount > 0 ? (
+                      <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
                     ) : null}
-                  </div>
-                  {visiblePreview.hiddenCount > 0 ? (
-                    <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
-                  ) : null}
-                  {activeView === "coordination" && coordinationCards.length > 0 ? (
-                    <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} />
-                  ) : null}
-                  <div className="agent-cluster-actions" aria-label={visibleAria}>
-                    {visiblePreview.visible.map((card) => (
-                      <DetailWorkbenchActionRow
-                        key={card.id}
-                        card={card}
-                        files={filesForCard(card)}
-                        onOpen={onSelectCard}
-                        onOpenFile={openFile}
-                      />
-                    ))}
-                  </div>
-                  {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
-                </>
+                    {activeView === "coordination" && coordinationCards.length > 0 ? (
+                      <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} />
+                    ) : null}
+                    <div className="agent-cluster-actions" role="region" aria-label={visibleAria}>
+                      {visiblePreview.visible.map((card) => (
+                        <DetailWorkbenchActionRow
+                          key={card.id}
+                          card={card}
+                          files={filesForCard(card)}
+                          onOpen={onSelectCard}
+                          onOpenFile={openFile}
+                        />
+                      ))}
+                    </div>
+                    {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
+                  </section>
+                  <section
+                    className={`agent-workbench-preview-pane${selectedFile ? " is-selected" : ""}`}
+                    ref={previewPaneRef}
+                    aria-label="关联文件预览"
+                  >
+                    <div className="agent-workbench-actions-header">
+                      <strong>关联文件预览</strong>
+                      <small>{selectedFile ? selectedFile.path || selectedFile.filename : `${fileItems.length} 个文件/产物`}</small>
+                    </div>
+                    {selectedFile ? (
+                      <DetailWorkbenchFilePreview key={selectedFile.id} file={selectedFile} onOpenSource={onSelectCard} />
+                    ) : (
+                      <p className="agent-workbench-compressed-note">点击动作里的文件，可在这里直接预览内容。</p>
+                    )}
+                  </section>
+                </section>
               )}
             </div>
           )}

@@ -709,6 +709,148 @@ describe("RunDetailPage", () => {
     expect(writeAppFileButton.textContent).toContain("创建文件 src/app.ts");
   });
 
+  it("keeps file previews beside workbench action rows instead of switching away from the action window", async () => {
+    const user = userEvent.setup();
+    const finalArtifact = {
+      ...runDetail.artifacts[0],
+      filename: "final-script.md",
+      title: "final-script.md",
+      text: longArtifactText,
+      download_url: "/api/v1/artifacts/final-script/download",
+    };
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "artifact.created",
+          message: "created final script",
+          summary: "创建文件 final-script.md",
+          actor: "writer",
+          step_id: "write-final",
+          payload: { operation_kind: "file_create", artifact_id: finalArtifact.id },
+          artifact: finalArtifact,
+        },
+      ],
+      artifacts: [finalArtifact],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+
+    const actionWorkspace = within(drawer).getByRole("region", { name: "实际动作工作区" });
+    const actionList = within(actionWorkspace).getByRole("region", { name: "动作列表" });
+    const previewPane = within(actionWorkspace).getByRole("region", { name: "关联文件预览" });
+    await user.click(within(actionList).getByRole("button", { name: "预览文件 final-script.md" }));
+
+    expect(within(drawer).getByRole("button", { name: "实际动作" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(previewPane).getByLabelText("final-script.md预览")).not.toBeNull();
+    expect(within(previewPane).getByText(longArtifactText)).not.toBeNull();
+  });
+
+  it("shows safe command and workspace path summaries for detail action rows without downloadable files", async () => {
+    const user = userEvent.setup();
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: null,
+          actor: "runner",
+          tool_name: "run_safe_command",
+          tool_call_id: "call-test",
+          step_id: "verify",
+          payload: {
+            operation_kind: "terminal",
+            status: "completed",
+            command: "npm test -- --run",
+            exit_code: 0,
+          },
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 2,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: null,
+          actor: "writer",
+          tool_name: "workspace.edit_file",
+          tool_call_id: "call-edit",
+          step_id: "edit-upload",
+          payload: {
+            operation_kind: "file_edit",
+            status: "completed",
+            workspace_files: [
+              {
+                path: "src/routes/upload.ts",
+                filename: "upload.ts",
+                operation_kind: "file_edit",
+              },
+            ],
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+
+    const actionWorkspace = within(drawer).getByRole("region", { name: "实际动作工作区" });
+    const actionList = within(actionWorkspace).getByRole("region", { name: "Agent 工作席动作" });
+    expect(within(actionList).getByRole("button", { name: /npm test -- --run/ })).not.toBeNull();
+    expect(within(actionList).getByRole("button", { name: /src\/routes\/upload\.ts/ })).not.toBeNull();
+    expect(actionList.textContent).toContain("终端");
+    expect(actionList.textContent).toContain("文件编辑");
+    expect(actionList.textContent).not.toContain("stdout");
+  });
+
   it("shows checkpoint recovery as a clear workbench action without leaking checkpoint internals", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {
