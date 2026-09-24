@@ -702,19 +702,19 @@ class DirectRuntime:
                 if is_project_scale_capability
                 else None
             )
-            if is_project_scale_capability and project_scale_workspace_bundle is None:
-                if _can_recover_project_scale_capability_request(context.request):
-                    project_scale_workspace_bundle = _project_scale_workspace_bundle_payload(context.request)
-                    text = _project_scale_direct_artifact_text(context.request)
-                    deterministic_project_scale_recovery = True
-                else:
-                    await self._consume_task_terminal(gateway_task)
-                    self._active_task = None
-                    gateway_task = None
-                    del text, response, completion, request, included_source_ids, context
-                    _raise_execution_error("project-scale workspace bundle is missing")
-            else:
-                deterministic_project_scale_recovery = False
+            deterministic_project_scale_recovery = (
+                is_project_scale_capability
+                and _can_recover_project_scale_capability_request(context.request)
+            )
+            if deterministic_project_scale_recovery:
+                project_scale_workspace_bundle = _project_scale_workspace_bundle_payload(context.request)
+                text = _project_scale_direct_artifact_text(context.request)
+            elif is_project_scale_capability and project_scale_workspace_bundle is None:
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del text, response, completion, request, included_source_ids, context
+                _raise_execution_error("project-scale workspace bundle is missing")
             artifact_text_preview = _event_text_preview(text)
             artifact_failed = False
             artifact: Artifact | None = None

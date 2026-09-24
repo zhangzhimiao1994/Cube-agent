@@ -279,6 +279,51 @@ async def test_direct_large_capability_request_recovers_missing_workspace_bundle
     assert artifact_event.payload["agent_standard_verification"]
 
 
+@pytest.mark.asyncio
+async def test_direct_large_capability_request_replaces_untrusted_model_workspace_bundle() -> None:
+    request = (
+        "Build a real large business project for flow=direct. Return full bundle as "
+        "workspace_bundle.files with package.json build/test/start scripts. "
+        "Acceptance conditions: source, tests, verification, and interaction evidence."
+    )
+    bad_bundle = {
+        "workspace_bundle": {
+            "files": {
+                "package.json": "{\"scripts\":{\"build\":\"node --check broken.js\"}}",
+                "broken.js": "function nope( {",
+            }
+        }
+    }
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=json.dumps(bad_bundle), usage=TokenUsage(60, 20, 80))),
+        logical_model="main",
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=request,
+                timeout_seconds=60,
+                token_budget=100_000,
+            )
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
+    assert isinstance(workspace_bundle, Mapping)
+    files = workspace_bundle["files"]
+    assert isinstance(files, Mapping)
+    assert "broken.js" not in files
+    assert {"package.json", "src/server.js", "tests/order-ops.test.js"}.issubset(files)
+    assert artifact_event.payload["deliverable_quality"]
+
+
 def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:
     routing_decision: dict[str, JsonValue] = {
         "hermes": {
