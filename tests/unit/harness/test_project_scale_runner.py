@@ -2886,6 +2886,146 @@ def test_execute_project_scale_plan_repairs_running_run_with_invalid_generated_p
     assert "generated_project_validation: command failed exit=7" in repair_message
 
 
+def test_capability_repair_retries_when_repair_run_fails_without_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                'generated_project_validation: command failed exit=2 command=npm run build output_tail="type error"',
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: missing workspace bundle",),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+
+    class RepairFailureClient:
+        def __init__(self) -> None:
+            self.submitted_bodies: list[dict[str, object]] = []
+            self.calls: list[tuple[str, str, str | None]] = []
+            self.bundle_requests = 0
+            self.run_ids = (
+                "run-medium-direct",
+                "run-medium-direct-repair-1",
+                "run-medium-direct-repair-2",
+            )
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            self.calls.append((method, path, idempotency_key))
+            if method == "POST" and path == "/api/v1/runs":
+                assert body is not None
+                index = len(self.submitted_bodies)
+                self.submitted_bodies.append(dict(body))
+                return {
+                    "id": self.run_ids[index],
+                    "status": "completed" if index != 1 else "failed",
+                    "project_id": body["project_id"],
+                    "workspace_session_id": body["workspace_session_id"],
+                    "mode": body["mode"],
+                }
+            for index, run_id in enumerate(self.run_ids):
+                if path == f"/api/v1/runs/{run_id}/details":
+                    return {
+                        "id": run_id,
+                        "status": "failed" if index == 1 else "completed",
+                        "artifacts": [] if index == 1 else [{"id": f"artifact-{index}"}],
+                        "mode": self.submitted_bodies[-1]["mode"],
+                    }
+                if path == f"/api/v1/runs/{run_id}/events":
+                    return [
+                        {
+                            "kind": "artifact.created",
+                            "run_id": run_id,
+                            "tool_name": "project.generate_zip",
+                            "payload": {
+                                "agent_standard_verification": {
+                                    "constraints_read": True,
+                                    "plan_before_implementation": True,
+                                    "reproducible_verification": True,
+                                    "root_cause_repair": True,
+                                }
+                            },
+                        }
+                    ]
+                if path == f"/api/v1/admin/runs/{run_id}":
+                    return {
+                        "id": run_id,
+                        "status": "failed" if index == 1 else "completed",
+                        "artifacts": [] if index == 1 else [{"id": f"artifact-{index}"}],
+                    }
+            raise AssertionError(f"unexpected JSON request {method} {path}")
+
+        def request_bytes(self, method: str, path: str) -> bytes:
+            self.calls.append((method, path, None))
+            self.bundle_requests += 1
+            if self.bundle_requests == 2:
+                raise RuntimeError("workspace bundle unavailable")
+            return _project_bundle(
+                {
+                    "README.md": "# CRM Lite\n\nImplements the requested project scope.\n",
+                    "PROJECT_REQUIREMENTS.md": "- CRM requirement satisfied\n- Interaction verified\n",
+                    "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                    "VERIFICATION.md": (
+                        "- npm run build: passed exit 0\n"
+                        "- npm test: passed exit 0; 3 tests passed\n"
+                        "- interaction smoke: passed\n"
+                    ),
+                    "package.json": json.dumps(
+                        {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                        sort_keys=True,
+                    ),
+                    "src/main.js": _functional_js_source(),
+                    "tests/main.test.js": _functional_js_test(),
+                }
+            )
+
+    client = RepairFailureClient()
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+    )
+
+    result = report.results[0]
+    assert report.ok is True
+    assert result.run_id == "run-medium-direct-repair-2"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["generated_project_validation"] is True
+    assert len(client.submitted_bodies) == 3
+    assert "generated_project_validation: missing workspace bundle" in str(
+        client.submitted_bodies[2]["message"]
+    )
+
+
 def test_execute_project_scale_plan_does_not_start_unobservable_repair_after_wait_budget_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

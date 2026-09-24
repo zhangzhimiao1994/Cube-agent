@@ -3203,9 +3203,13 @@ def _should_attempt_deliverable_repair(
         evidence.get("final_artifacts") is True
         and evidence.get("workspace_bundle") is True
     )
+    has_capability_validation_failure = (
+        benchmark_kind == "capability"
+        and evidence.get("generated_project_validation") is False
+    )
     return (
         (status in {"completed", "failed"} or has_observable_deliverable)
-        and evidence.get("final_artifacts") is True
+        and (evidence.get("final_artifacts") is True or has_capability_validation_failure)
         and (
             evidence.get("workspace_bundle") is not True
             or evidence.get("deliverable_quality") is not True
