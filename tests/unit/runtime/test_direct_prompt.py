@@ -372,6 +372,12 @@ async def test_direct_ultra_capability_request_replaces_untrusted_model_workspac
     assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
+    assert artifact_event.artifact.content["workspace_bundle"] == artifact_event.payload["workspace_bundle"]
+    assert artifact_event.artifact.content["deliverable_quality"] == artifact_event.payload["deliverable_quality"]
+    assert (
+        artifact_event.artifact.content["agent_standard_verification"]
+        == artifact_event.payload["agent_standard_verification"]
+    )
     workspace_bundle = artifact_event.payload["workspace_bundle"]
     assert isinstance(workspace_bundle, Mapping)
     files = workspace_bundle["files"]

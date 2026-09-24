@@ -477,7 +477,12 @@ class DirectRuntime:
                     id=uuid4(),
                     type="text",
                     producer="main",
-                    content={"text": _project_scale_direct_artifact_text(context.request)},
+                    content={
+                        "text": _project_scale_direct_artifact_text(context.request),
+                        "workspace_bundle": workspace_bundle,
+                        "deliverable_quality": deliverable_quality,
+                        "agent_standard_verification": agent_standard_verification,
+                    },
                     version=1,
                 )
                 artifact_text_preview = _event_text_preview(direct_artifact.content.get("text"))
