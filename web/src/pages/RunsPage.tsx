@@ -958,6 +958,13 @@ type WorkbenchFileItem = {
   source: ProcessDetailTarget | null;
 };
 
+type WorkbenchActionDescriptor = {
+  operation: string;
+  target: string;
+  summary: string;
+  meta: string[];
+};
+
 type AgentDispatchCard = {
   id: string;
   name: string;
@@ -1251,6 +1258,33 @@ function processTargetActionMeta(item: ProcessDetailTarget) {
       return true;
     })
     .slice(0, 3);
+}
+
+export function workbenchActionDescriptor(
+  item: ProcessDetailTarget,
+  files: Pick<WorkbenchFileItem, "path" | "filename" | "operation">[] = [],
+): WorkbenchActionDescriptor {
+  const concreteFile = files.find((file) => file.operation !== "产物" && file.operation !== "文件夹");
+  const operation = concreteFile?.operation || processTargetActionOperation(item) || item.badge;
+  const fileTarget = files.map((file) => file.path || file.filename).find((value) => value.trim().length > 0);
+  const target = fileTarget || item.message || processTargetActionTarget(item) || item.sourceStepId || item.title;
+  const summary = item.message === target ? item.title : item.message;
+  const actor = processTargetRowValue(item, /^执行者$/) || item.sourceActor || "";
+  const meta = fileTarget ? [actor, operation, target, ...processTargetActionMeta(item)] : processTargetActionMeta(item);
+  const seen = new Set<string>();
+  return {
+    operation,
+    target,
+    summary,
+    meta: meta
+      .map((value) => conciseProcessText(value, "").trim())
+      .filter((value) => {
+        if (!value || seen.has(value)) return false;
+        seen.add(value);
+        return true;
+      })
+      .slice(0, 4),
+  };
 }
 
 function isWorkbenchExecutionItem(item: ProcessDetailTarget) {
@@ -3767,16 +3801,17 @@ function WorkbenchActionRow({
   onOpen: (target: ProcessDetailTarget) => void;
   onOpenFile: (file: WorkbenchFileItem) => void;
 }) {
-  const actionMeta = processTargetActionMeta(item);
+  const descriptor = workbenchActionDescriptor(item, files);
   return (
     <article className="agent-workbench-action-row">
       <button type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
         <span aria-hidden="true">›</span>
-        <small className="process-card-badge">{item.badge}</small>
-        <strong>{item.message}</strong>
-        {actionMeta.length > 0 ? (
+        <small className="process-card-badge">{descriptor.operation}</small>
+        <strong>{descriptor.target}</strong>
+        <small>{descriptor.summary}</small>
+        {descriptor.meta.length > 0 ? (
           <span className="agent-workbench-action-meta">
-            {actionMeta.map((meta) => (
+            {descriptor.meta.map((meta) => (
               <span key={meta}>{meta}</span>
             ))}
           </span>

@@ -2214,9 +2214,9 @@ article:hover {
 }
 
 .agent-workbench-drawer {
-  max-height: min(98dvh, 1120px);
-  max-width: min(99vw, 1280px);
-  width: min(99vw, 1280px);
+  max-height: min(98dvh, 1160px);
+  max-width: min(100vw, 1360px);
+  width: min(100vw, 1360px);
 }
 
 .agent-workbench-agent-card {
@@ -2238,7 +2238,7 @@ article:hover {
 .agent-workbench-file-layout {
   display: grid;
   gap: 0.65rem;
-  grid-template-columns: minmax(13rem, 0.75fr) minmax(0, 1.35fr);
+  grid-template-columns: minmax(15rem, 0.72fr) minmax(0, 1.38fr);
   min-width: 0;
 }
 
@@ -2301,7 +2301,7 @@ article:hover {
   align-items: start;
   display: grid;
   gap: 0.55rem;
-  grid-template-columns: minmax(0, 1fr) minmax(12rem, auto);
+  grid-template-columns: minmax(0, 1fr) minmax(14rem, auto);
   min-width: 0;
 }
 
@@ -2667,9 +2667,32 @@ article:hover {
   width: 100%;
 }
 
+.agent-workbench-action-row .process-intermediate-card {
+  align-items: start;
+  grid-template-columns: auto auto minmax(0, 1fr);
+}
+
+.agent-workbench-action-row .process-intermediate-card > span:first-child {
+  padding-top: 0.12rem;
+}
+
+.agent-workbench-action-row .process-intermediate-card > strong {
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
 .agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge),
 .agent-workbench-action-row .agent-workbench-action-meta {
   grid-column: 3;
+}
+
+.agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge) {
+  display: block;
+  line-height: 1.35;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-workbench-action-meta {
@@ -2719,6 +2742,14 @@ article:hover {
   min-width: 0;
   padding: 0.34rem 0.48rem;
   text-align: left;
+}
+
+.agent-workbench-action-files button::before {
+  color: var(--accent);
+  content: "□";
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.74rem;
+  grid-row: 1 / span 3;
 }
 
 .agent-workbench-action-files button:hover,
@@ -3267,6 +3298,12 @@ article:hover {
   overflow-y: auto;
   padding: 0.85rem;
   width: min(100%, 820px);
+}
+
+.process-drawer.agent-workbench-drawer {
+  max-height: min(98dvh, 1160px);
+  max-width: min(100vw, 1360px);
+  width: min(100vw, 1360px);
 }
 
 .process-drawer-handle {
@@ -5297,9 +5334,9 @@ article:hover {
   }
 
   .process-drawer {
-    max-height: 88dvh;
-    width: min(100vw, 100%);
-    padding: 0.9rem 0.85rem calc(0.9rem + env(safe-area-inset-bottom));
+    max-height: 94dvh;
+    width: 100vw;
+    padding: 0.75rem 0.62rem calc(0.75rem + env(safe-area-inset-bottom));
   }
 
   .run-process-detail dl {
@@ -5318,13 +5355,14 @@ article:hover {
   }
 
   .agent-workbench-drawer {
-    max-height: 98dvh;
+    max-height: 99dvh;
     max-width: 100vw;
     width: 100vw;
   }
 
   .agent-workbench-detail {
-    max-height: calc(98dvh - 6rem);
+    max-height: calc(99dvh - 5.4rem);
+    padding: 0.42rem;
   }
 
   .agent-workbench-tabs {
@@ -5351,7 +5389,7 @@ article:hover {
   }
 
   .agent-workbench-file-list {
-    max-height: 13rem;
+    max-height: 11rem;
   }
 
   .agent-workbench-file-code {
@@ -5370,9 +5408,42 @@ article:hover {
     max-width: 100%;
   }
 
+  .agent-workbench-action-row {
+    padding-left: 0.55rem;
+  }
+
+  .agent-workbench-action-row .process-intermediate-card {
+    gap: 0.26rem;
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: 0.44rem 0.46rem;
+  }
+
+  .agent-workbench-action-row .process-intermediate-card > span:first-child {
+    display: none;
+  }
+
+  .agent-workbench-action-row .process-intermediate-card > .process-card-badge,
+  .agent-workbench-action-row .process-intermediate-card > strong,
   .agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge),
   .agent-workbench-action-row .agent-workbench-action-meta {
     grid-column: 1 / -1;
+  }
+
+  .agent-workbench-action-row .process-intermediate-card > strong {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .agent-workbench-action-row .process-intermediate-card > small:not(.process-card-badge) {
+    white-space: normal;
+  }
+
+  .agent-workbench-action-meta span,
+  .agent-workbench-action-files strong,
+  .agent-workbench-action-files span,
+  .agent-workbench-file-preview dd {
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .process-detail-modal-backdrop {

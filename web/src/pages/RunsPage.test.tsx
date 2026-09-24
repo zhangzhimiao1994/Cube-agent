@@ -10,6 +10,7 @@ import {
   runDetailVersion,
   runProcessItems,
   workbenchFileItems,
+  workbenchActionDescriptor,
   workspacePreviewPath,
 } from "./RunsPage";
 
@@ -597,6 +598,105 @@ describe("workspace and sandbox submission helpers", () => {
     const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, []);
 
     expect(files.map((file) => `${file.filename}:${file.operation}`)).toEqual(["app.ts:编辑文件"]);
+  });
+
+  it("summarizes agent actions by concrete file operation and target path", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "implementer 写入源码文件",
+          created_at: "2026-09-02T00:01:30Z",
+          actor: "implementer",
+          participants: [],
+          tool_name: "workspace.write_file",
+          step_id: "write-storage",
+          payload: {
+            workspace_files: [
+              {
+                path: "src/storage/cloud-drive.ts",
+                filename: "cloud-drive.ts",
+                operation_kind: "file_create",
+                mime_type: "text/typescript",
+                size_bytes: 2048,
+                sha256: "d".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src/storage/cloud-drive.ts",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map());
+    const action = items.find((item) => item.sourceActor === "implementer" && item.sourceStepId === "write-storage");
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, items);
+    const descriptor = workbenchActionDescriptor(action!, files.filter((file) => file.source?.id === action?.id));
+
+    expect(descriptor.operation).toBe("创建文件");
+    expect(descriptor.target).toBe("src/storage/cloud-drive.ts");
+    expect(descriptor.summary).toContain("写入源码文件");
+    expect(descriptor.meta).toEqual(expect.arrayContaining(["implementer", "创建文件", "src/storage/cloud-drive.ts"]));
+  });
+
+  it("keeps multi-file action summaries tied to the clicked action instead of only global artifacts", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.completed",
+          message: "tool.completed",
+          summary: "tester 更新测试与配置",
+          created_at: "2026-09-02T00:01:30Z",
+          actor: "tester",
+          participants: [],
+          tool_name: "workspace.patch_file",
+          step_id: "patch-tests",
+          payload: {
+            workspace_files: [
+              {
+                path: "tests/storage.test.ts",
+                filename: "storage.test.ts",
+                operation_kind: "file_edit",
+                mime_type: "text/typescript",
+                size_bytes: 1024,
+                sha256: "e".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=tests/storage.test.ts",
+              },
+              {
+                path: "vitest.config.ts",
+                filename: "vitest.config.ts",
+                operation_kind: "file_read",
+                mime_type: "text/typescript",
+                size_bytes: 640,
+                sha256: "f".repeat(64),
+                download_url:
+                  "/api/v1/workspaces/projects/project/sessions/session/files/download?path=vitest.config.ts",
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map());
+    const action = items.find((item) => item.sourceActor === "tester" && item.sourceStepId === "patch-tests");
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, items);
+    const actionFiles = files.filter((file) => file.source?.id === action?.id);
+    const descriptor = workbenchActionDescriptor(action!, actionFiles);
+
+    expect(actionFiles.map((file) => `${file.operation}:${file.path}`)).toEqual([
+      "编辑文件:tests/storage.test.ts",
+      "读取文件:vitest.config.ts",
+    ]);
+    expect(descriptor.operation).toBe("编辑文件");
+    expect(descriptor.target).toBe("tests/storage.test.ts");
   });
 
   it("maps sandbox profiles to bounded requested permissions", () => {
