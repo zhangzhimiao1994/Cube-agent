@@ -192,7 +192,7 @@ type DownloadableArtifact = RunArtifact & {
 };
 
 const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
-type DetailWorkbenchView = "overview" | "coordination" | "actions" | "files" | "terminal" | "results" | "recovery";
+type DetailWorkbenchView = "overview" | "actions";
 
 type DetailWorkbenchFileItem = {
   id: string;
@@ -1448,6 +1448,10 @@ function isDetailRecoveryCard(card: DetailProcessCard) {
 
 function detailActionCards(cards: DetailProcessCard[]) {
   return cards.filter((card) => !isDetailCoordinationCard(card) && !isDetailRecoveryCard(card));
+}
+
+function detailActionWorkspaceCards(cards: DetailProcessCard[]) {
+  return cards.filter((card) => !isDetailCoordinationCard(card));
 }
 
 function detailWorkbenchOverviewCards(cards: DetailProcessCard[]) {
@@ -2810,9 +2814,17 @@ function DetailProcessDrawer({
   const coordinationSections = detailCoordinationEvidenceSections(coordinationCards);
   const recoveryCards = cards.filter(isDetailRecoveryCard);
   const actionCards = detailActionCards(cards);
+  const actionWorkspaceCards = detailActionWorkspaceCards(cards);
   const fileItems = detailWorkbenchFiles(cards);
   const terminalCards = actionCards.filter(isDetailTerminalCard);
   const resultCards = dedupeDetailResultCards(actionCards.filter(isDetailResultCard));
+  const actionBreakdown = [
+    `${actionCards.length} 动作`,
+    fileItems.length > 0 ? `${fileItems.length} 文件` : "",
+    terminalCards.length > 0 ? `${terminalCards.length} 终端` : "",
+    resultCards.length > 0 ? `${resultCards.length} 结果` : "",
+    recoveryCards.length > 0 ? `${recoveryCards.length} 修复` : "",
+  ].filter(Boolean);
   const defaultFile = fileItems.find(isDetailTextPreviewCandidate) ?? fileItems[0] ?? null;
   const selectedFile = fileItems.find((file) => file.id === selectedFileId) ?? defaultFile;
   const filesBySourceId = new Map<string, DetailWorkbenchFileItem[]>();
@@ -2823,6 +2835,7 @@ function DetailProcessDrawer({
   const filesForCard = (card: DetailProcessCard) => filesBySourceId.get(card.id) ?? [];
   const openFile = (file: DetailWorkbenchFileItem) => {
     setSelectedFileId(file.id);
+    setActiveView("actions");
     setShowAllActions(false);
   };
   useEffect(() => {
@@ -2831,33 +2844,10 @@ function DetailProcessDrawer({
     if (!window.matchMedia("(max-width: 980px)").matches) return;
     previewPaneRef.current.scrollIntoView({ block: "start", inline: "nearest" });
   }, [selectedFileId, activeView]);
-  const visibleCards =
-    activeView === "coordination"
-      ? coordinationCards
-      : activeView === "recovery"
-        ? recoveryCards
-        : activeView === "terminal"
-          ? terminalCards
-          : activeView === "results"
-            ? resultCards
-            : activeView === "actions"
-              ? actionCards
-              : overviewCards;
+  const visibleCards = activeView === "actions" ? actionWorkspaceCards : overviewCards;
   const visiblePreview = recentPreview(visibleCards, DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
-  const visibleLabel =
-    activeView === "coordination"
-      ? "调度讨论"
-      : activeView === "recovery"
-        ? "修复异常"
-        : activeView === "terminal"
-          ? "终端窗口"
-          : activeView === "results"
-            ? "结果窗口"
-            : activeView === "actions"
-              ? "实际动作"
-              : "助手总览";
-  const visibleAria =
-    activeView === "overview" ? "Agent 工作席概览" : activeView === "terminal" ? "终端窗口" : activeView === "results" ? "结果窗口" : "Agent 工作席动作";
+  const visibleLabel = activeView === "actions" ? "动作与文件" : "助手总览";
+  const visibleAria = activeView === "overview" ? "Agent 工作席概览" : "Agent 工作席动作";
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -2910,20 +2900,7 @@ function DetailProcessDrawer({
                 </button>
                 <button
                   type="button"
-                  aria-label="调度讨论"
-                  aria-pressed={activeView === "coordination"}
-                  className={activeView === "coordination" ? "active" : ""}
-                  onClick={() => {
-                    setActiveView("coordination");
-                    setShowAllActions(false);
-                  }}
-                >
-                  调度讨论
-                  <small>{coordinationCards.length} 条</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="实际动作"
+                  aria-label="动作与文件"
                   aria-pressed={activeView === "actions"}
                   className={activeView === "actions" ? "active" : ""}
                   onClick={() => {
@@ -2931,99 +2908,39 @@ function DetailProcessDrawer({
                     setShowAllActions(false);
                   }}
                 >
-                  实际动作
-                  <small>{actionCards.length} 条</small>
+                  动作与文件
+                  <small>{actionBreakdown.join(" · ") || "暂无动作"}</small>
                 </button>
-                <button
-                  type="button"
-                  aria-label="文件"
-                  aria-pressed={activeView === "files"}
-                  className={activeView === "files" ? "active" : ""}
-                  onClick={() => {
-                    setActiveView("files");
-                    setShowAllActions(false);
-                  }}
-                >
-                  文件
-                  <small>{fileItems.length} 个</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="终端"
-                  aria-pressed={activeView === "terminal"}
-                  className={activeView === "terminal" ? "active" : ""}
-                  onClick={() => {
-                    setActiveView("terminal");
-                    setShowAllActions(false);
-                  }}
-                >
-                  终端
-                  <small>{terminalCards.length} 条</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="结果"
-                  aria-pressed={activeView === "results"}
-                  className={activeView === "results" ? "active" : ""}
-                  onClick={() => {
-                    setActiveView("results");
-                    setShowAllActions(false);
-                  }}
-                >
-                  结果
-                  <small>{resultCards.length} 条</small>
-                </button>
-                {recoveryCards.length > 0 ? (
-                  <button
-                    type="button"
-                    aria-label="修复异常"
-                    aria-pressed={activeView === "recovery"}
-                    className={activeView === "recovery" ? "active" : ""}
-                    onClick={() => {
-                      setActiveView("recovery");
-                      setShowAllActions(false);
-                    }}
-                  >
-                    修复异常
-                    <small>{recoveryCards.length} 条</small>
-                  </button>
-                ) : null}
               </div>
-              {activeView === "files" ? (
-                <section className="agent-workbench-files" aria-label="文件窗口">
+              {activeView === "overview" ? (
+                <section className="agent-workbench-action-list-pane" aria-label="助手总览工作区">
                   <div className="agent-workbench-actions-header">
-                    <strong>文件窗口</strong>
-                    <small>{fileItems.length} 个文件/产物</small>
+                    <strong>助手总览</strong>
+                    <small>
+                      {overviewCards.length} 个 Agent
+                      {coordinationCards.length > 0 ? ` · ${coordinationCards.length} 条调度证据` : ""}
+                    </small>
                   </div>
-                  {fileItems.length > 0 ? (
-                    <div className="agent-workbench-file-layout">
-                      <div className="agent-workbench-file-list" aria-label="文件操作列表">
-                        {fileItems.map((file) => (
-                          <button
-                            key={file.id}
-                            type="button"
-                            className={selectedFile?.id === file.id ? "active" : ""}
-                            aria-pressed={selectedFile?.id === file.id}
-                            onClick={() => setSelectedFileId(file.id)}
-                          >
-                            <small>{file.operation}</small>
-                            <strong>{file.path || file.filename}</strong>
-                            <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
-                          </button>
-                        ))}
-                      </div>
-                      {selectedFile ? <DetailWorkbenchFilePreview key={selectedFile.id} file={selectedFile} onOpenSource={onSelectCard} /> : null}
-                    </div>
-                  ) : (
-                    <p className="agent-workbench-compressed-note">暂无可预览文件；后续运行产生文件后会显示在这里。</p>
-                  )}
+                  {coordinationCards.length > 0 ? <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} /> : null}
+                  <div className="agent-cluster-actions" role="region" aria-label={visibleAria}>
+                    {visiblePreview.visible.map((card) => (
+                      <DetailWorkbenchActionRow
+                        key={card.id}
+                        card={card}
+                        files={filesForCard(card)}
+                        onOpen={onSelectCard}
+                        onOpenFile={openFile}
+                      />
+                    ))}
+                  </div>
+                  {overviewCards.length === 0 ? <p className="agent-workbench-compressed-note">助手总览暂无记录</p> : null}
                 </section>
               ) : (
                 <section className="agent-workbench-action-workspace" aria-label={`${visibleLabel}工作区`}>
                   <section className="agent-workbench-action-list-pane" aria-label="动作列表">
                     <div className="agent-workbench-actions-header">
                       <strong>{visibleLabel}</strong>
-                      <small>{visibleCards.length} 条</small>
+                      <small>{actionBreakdown.join(" · ") || `${visibleCards.length} 条`}</small>
                       {visibleCards.length > DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT ? (
                         <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
                           {showAllActions ? `收起${visibleLabel}` : `显示全部${visibleLabel}`}
@@ -3032,9 +2949,6 @@ function DetailProcessDrawer({
                     </div>
                     {visiblePreview.hiddenCount > 0 ? (
                       <p className="agent-workbench-compressed-note">已折叠 {visiblePreview.hiddenCount} 个较早{visibleLabel}</p>
-                    ) : null}
-                    {activeView === "coordination" && coordinationCards.length > 0 ? (
-                      <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} />
                     ) : null}
                     <div className="agent-cluster-actions" role="region" aria-label={visibleAria}>
                       {visiblePreview.visible.map((card) => (
@@ -3047,6 +2961,29 @@ function DetailProcessDrawer({
                         />
                       ))}
                     </div>
+                    {fileItems.length > 0 ? (
+                      <section className="agent-workbench-files-inline" aria-label="文件窗口">
+                        <div className="agent-workbench-actions-header">
+                          <strong>文件窗口</strong>
+                          <small>{fileItems.length} 个文件/产物</small>
+                        </div>
+                        <div className="agent-workbench-file-list compact" aria-label="文件操作列表">
+                          {fileItems.map((file) => (
+                            <button
+                              key={file.id}
+                              type="button"
+                              className={selectedFile?.id === file.id ? "active" : ""}
+                              aria-pressed={selectedFile?.id === file.id}
+                              onClick={() => openFile(file)}
+                            >
+                              <small>{file.operation}</small>
+                              <strong>{file.path || file.filename}</strong>
+                              <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </section>
+                    ) : null}
                     {visibleCards.length === 0 ? <p className="agent-workbench-compressed-note">{visibleLabel}暂无记录</p> : null}
                   </section>
                   <section

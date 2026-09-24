@@ -405,21 +405,21 @@ describe("RunDetailPage", () => {
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     expect(within(drawer).getByRole("button", { name: "助手总览" }).getAttribute("aria-pressed")).toBe("true");
-    expect(within(drawer).getByRole("button", { name: "调度讨论" }).textContent).toContain("1 条");
-    expect(within(drawer).getByRole("button", { name: "实际动作" }).textContent).toContain("5 条");
-    expect(within(drawer).getByRole("button", { name: "修复异常" }).textContent).toContain("1 条");
+    expect(within(drawer).queryByRole("button", { name: "调度讨论" })).toBeNull();
+    expect(within(drawer).queryByRole("button", { name: "实际动作" })).toBeNull();
+    expect(within(drawer).queryByRole("button", { name: "修复异常" })).toBeNull();
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("5 动作");
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("1 修复");
     const workbenchOverview = within(drawer).getByLabelText("Agent 工作席概览");
     expect(within(drawer).getByText("主 Agent 初始判断")).not.toBeNull();
     expect(within(drawer).getByText("reviewer 子 Agent 调度")).not.toBeNull();
     expect(within(workbenchOverview).queryByText("critic 子 Agent 已下班")).toBeNull();
     expect(drawer.querySelector(".run-process-detail")).toBeNull();
-    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
-    expect(within(drawer).getByRole("button", { name: "调度讨论" }).getAttribute("aria-pressed")).toBe("true");
-    const coordinationActions = within(drawer).getByLabelText("Agent 工作席动作");
-    expect(within(coordinationActions).getByRole("button", { name: /planner 子 Agent 已安排/ })).not.toBeNull();
-    expect(within(coordinationActions).queryByRole("button", { name: /critic 子 Agent 已下班/ })).toBeNull();
+    const coordinationBrief = within(drawer).getByLabelText("调度简报");
+    expect(within(coordinationBrief).getByRole("button", { name: /planner 子 Agent 已安排/ })).not.toBeNull();
+    expect(within(coordinationBrief).queryByRole("button", { name: /critic 子 Agent 已下班/ })).toBeNull();
 
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
     expect(within(workbenchActions).getByRole("button", { name: /reviewer 子 Agent 调度/ })).not.toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /critic 子 Agent 已下班/ })).not.toBeNull();
@@ -479,11 +479,12 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
 
-    expect(within(drawer).getByRole("button", { name: "实际动作" }).textContent).toContain("1 条");
-    expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
-    await user.click(within(drawer).getByRole("button", { name: "终端" }));
-    const terminalWindow = within(drawer).getByLabelText("终端窗口");
-    const terminalAction = within(terminalWindow).getByRole("button", { name: /运行终端 已完成/ });
+    expect(within(drawer).queryByRole("button", { name: "终端" })).toBeNull();
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("1 动作");
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("1 终端");
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    const terminalAction = within(workbenchActions).getByRole("button", { name: /运行终端 已完成/ });
     expect(terminalAction.textContent).toContain("implementer");
     expect(terminalAction.textContent).toContain("install-deps");
 
@@ -557,7 +558,6 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
 
     const brief = within(drawer).getByLabelText("调度简报");
     expect(within(brief).getByText("成员发言")).not.toBeNull();
@@ -570,7 +570,7 @@ describe("RunDetailPage", () => {
     expect(within(brief).getByText(/先完成计划和验收清单/)).not.toBeNull();
   });
 
-  it("splits run detail workbench files terminals and results into separate inspectable windows", async () => {
+  it("merges run detail files terminals and results into one inspectable action workspace", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {
       ...runDetail,
@@ -669,41 +669,40 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
 
-    expect(within(drawer).getByRole("button", { name: "文件" }).textContent).toContain("3 个");
-    expect(within(drawer).getByRole("button", { name: "终端" }).textContent).toContain("1 条");
-    expect(within(drawer).getByRole("button", { name: "结果" }).textContent).toContain("1 条");
+    expect(within(drawer).queryByRole("button", { name: "文件" })).toBeNull();
+    expect(within(drawer).queryByRole("button", { name: "终端" })).toBeNull();
+    expect(within(drawer).queryByRole("button", { name: "结果" })).toBeNull();
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("3 文件");
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("1 终端");
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).textContent).toContain("1 结果");
 
-    await user.click(within(drawer).getByRole("button", { name: "文件" }));
-    const filesWindow = within(drawer).getByLabelText("文件窗口");
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
+    const actionWorkspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
+    const filesWindow = within(actionWorkspace).getByLabelText("文件窗口");
+    const previewPane = within(actionWorkspace).getByRole("region", { name: "关联文件预览" });
     const fileList = within(filesWindow).getByLabelText("文件操作列表");
     const finalScriptButton = within(fileList).getByRole("button", { name: /final-script\.md/ });
     const workspaceFileButtons = within(fileList).getAllByRole("button", { name: /src\/app\.ts/ });
     expect(finalScriptButton).not.toBeNull();
     expect(workspaceFileButtons).toHaveLength(2);
     await user.click(workspaceFileButtons[0]);
-    const createdPreview = within(filesWindow).getByLabelText("app.ts预览");
+    const createdPreview = within(previewPane).getByLabelText("app.ts预览");
     expect(within(createdPreview).getByText("创建文件")).not.toBeNull();
     await user.click(workspaceFileButtons[1]);
-    const workspacePreview = within(filesWindow).getByLabelText("app.ts预览");
+    const workspacePreview = within(previewPane).getByLabelText("app.ts预览");
     expect(within(workspacePreview).getByText("编辑文件")).not.toBeNull();
     await user.click(finalScriptButton);
-    expect(within(filesWindow).getByText(longArtifactText)).not.toBeNull();
+    expect(within(previewPane).getByText(longArtifactText)).not.toBeNull();
 
-    await user.click(within(drawer).getByRole("button", { name: "终端" }));
-    const terminalWindow = within(drawer).getByLabelText("终端窗口");
-    expect(within(terminalWindow).getByRole("button", { name: /运行终端 npm test/ })).not.toBeNull();
+    const actionWindow = within(drawer).getByLabelText("Agent 工作席动作");
+    expect(within(actionWindow).getByRole("button", { name: /运行终端 npm test/ })).not.toBeNull();
 
-    await user.click(within(drawer).getByRole("button", { name: "结果" }));
-    const resultWindow = within(drawer).getByLabelText("结果窗口");
-    expect(resultWindow.querySelectorAll(".agent-workbench-action-row")).toHaveLength(1);
-    const finalResultFileButton = within(resultWindow).getByRole("button", { name: "预览文件 final-script.md" });
+    const finalResultFileButton = within(actionWindow).getByRole("button", { name: "预览文件 final-script.md" });
     expect(finalResultFileButton).not.toBeNull();
     expect(finalResultFileButton.textContent).toContain("创建文件");
     expect(finalResultFileButton.textContent).toContain("final-script.md");
     expect(finalResultFileButton.textContent).toContain("工具动作");
 
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
-    const actionWindow = within(drawer).getByLabelText("Agent 工作席动作");
     const writeAppFileButton = within(actionWindow).getAllByRole("button", { name: "预览文件 src/app.ts" })[0];
     expect(writeAppFileButton.textContent).toContain("writer");
     expect(writeAppFileButton.textContent).toContain("创建文件 src/app.ts");
@@ -758,14 +757,14 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
 
-    const actionWorkspace = within(drawer).getByRole("region", { name: "实际动作工作区" });
+    const actionWorkspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
     const actionList = within(actionWorkspace).getByRole("region", { name: "动作列表" });
     const previewPane = within(actionWorkspace).getByRole("region", { name: "关联文件预览" });
     await user.click(within(actionList).getByRole("button", { name: "预览文件 final-script.md" }));
 
-    expect(within(drawer).getByRole("button", { name: "实际动作" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(drawer).getByRole("button", { name: "动作与文件" }).getAttribute("aria-pressed")).toBe("true");
     expect(within(previewPane).getByLabelText("final-script.md预览")).not.toBeNull();
     expect(within(previewPane).getByText(longArtifactText)).not.toBeNull();
   });
@@ -840,9 +839,9 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
 
-    const actionWorkspace = within(drawer).getByRole("region", { name: "实际动作工作区" });
+    const actionWorkspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
     const actionList = within(actionWorkspace).getByRole("region", { name: "Agent 工作席动作" });
     expect(within(actionList).getByRole("button", { name: /npm test -- --run/ })).not.toBeNull();
     expect(within(actionList).getByRole("button", { name: /src\/routes\/upload\.ts/ })).not.toBeNull();
@@ -909,7 +908,7 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "修复异常" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
     const recoveryAction = within(workbenchActions).getByRole("button", { name: /断点续跑/ });
 
@@ -975,8 +974,7 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "调度讨论" }));
-    const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
+    const workbenchActions = within(drawer).getByLabelText("Agent 工作席概览");
     await user.click(within(workbenchActions).getByRole("button", { name: /主 Agent 选择运行模式与角色/ }));
 
     const detailRegion = drawer.querySelector(".run-process-detail") as HTMLElement;
@@ -1031,18 +1029,18 @@ describe("RunDetailPage", () => {
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
-    expect(within(drawer).getByText("已折叠 4 个较早实际动作")).not.toBeNull();
+    expect(within(drawer).getByText("已折叠 4 个较早动作与文件")).not.toBeNull();
     expect(within(workbenchActions).queryByRole("button", { name: /worker 第 01 步处理/ })).toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 05 步处理/ })).not.toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 16 步处理/ })).not.toBeNull();
 
-    await user.click(within(drawer).getByRole("button", { name: "显示全部实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "显示全部动作与文件" }));
 
-    expect(within(drawer).queryByText("已折叠 4 个较早实际动作")).toBeNull();
+    expect(within(drawer).queryByText("已折叠 4 个较早动作与文件")).toBeNull();
     expect(within(workbenchActions).getByRole("button", { name: /worker 第 01 步处理/ })).not.toBeNull();
-    expect(within(drawer).getByRole("button", { name: "收起实际动作" })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: "收起动作与文件" })).not.toBeNull();
   });
 
   it("renders run detail events in sequence order when backend payload arrives out of order", async () => {
@@ -2599,7 +2597,7 @@ describe("RunDetailPage", () => {
     const processSummary = await screen.findByLabelText("Agent 集群动作");
     await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
-    await user.click(within(drawer).getByRole("button", { name: "实际动作" }));
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
     const workbenchActions = within(drawer).getByLabelText("Agent 工作席动作");
     expect(within(workbenchActions).getByRole("button", { name: /writer 初始动作/ })).not.toBeNull();
 
