@@ -3772,7 +3772,8 @@ describe("operational management pages", () => {
     expect(workbenchCard).not.toBeNull();
     expect(within(workbenchCard).getByText("2 个 Agent · 1 工作中 · 1 已完成")).not.toBeNull();
     expect(within(stream).queryByRole("region", { name: "Agent 工作席详情" })).toBeNull();
-    expect(within(stream).queryByText("负责输出可拍摄脚本文案。")).toBeNull();
+    const copywriterChip = within(stream).getByRole("button", { name: /打开 文案生成 调度详情/ });
+    expect(within(copywriterChip).getByText("负责输出可拍摄脚本文案。")).not.toBeNull();
 
     await user.click(workbenchCard);
 
@@ -3974,6 +3975,9 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const workbenchCard = within(stream).getByRole("button", { name: /Agent 工作席 3 个 Agent/ });
     expect(within(workbenchCard).getByText("3 个 Agent · 1 异常 · 1 工作中 · 1 已安排")).not.toBeNull();
+    const betaChip = within(stream).getByRole("button", { name: /打开 beta 调度详情/ });
+    expect(within(betaChip).getByText(/已安排/)).not.toBeNull();
+    expect(within(betaChip).getByText("讨论：Verifier")).not.toBeNull();
     expect(stream.querySelectorAll(".agent-workbench-agent-card")).toHaveLength(0);
     await user.click(workbenchCard);
 

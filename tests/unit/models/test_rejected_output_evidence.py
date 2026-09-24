@@ -56,6 +56,7 @@ def harness(
     wait: asyncio.Event | None = None,
     close_started: asyncio.Event | None = None,
     close_gate: asyncio.Event | None = None,
+    capacity_wait_timeout: float = 5,
 ) -> tuple[ModelGateway, CapacityStub, list[httpx.Request], list[httpx.AsyncClient], asyncio.Event]:
     calls: list[httpx.Request] = []
     clients: list[httpx.AsyncClient] = []
@@ -89,6 +90,7 @@ def harness(
         secret_resolver=SecretStub(capacity.events),
         transport=LiteLLMClient(client_factory=cast(OpenAIClientFactory, factory)),
         fallbacks={"primary": "backup"}, pricing=pricing,
+        capacity_wait_timeout=capacity_wait_timeout,
     )
     return gateway, capacity, calls, clients, entered
 
@@ -363,6 +365,36 @@ async def test_cancellation_during_rejected_outcome_recording_cannot_offer_corre
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert len(calls) == 1 and len(capacity.releases) == 1
+
+
+async def test_rejected_outcome_recording_timeout_preserves_rejected_receipt() -> None:
+    gateway, capacity, calls, _, _ = harness(wire(), capacity_wait_timeout=0.05)
+    entered = asyncio.Event()
+
+    async def record(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await asyncio.Future()
+
+    capacity.record_outcome = record  # type: ignore[method-assign]
+    with pytest.raises(GatewayRejectedOutput) as caught:
+        await asyncio.wait_for(gateway.complete_with_context(request()), timeout=1)
+
+    evidence = caught.value.evidence
+    assert evidence is not None and evidence.final_text == PRIVATE
+    assert len(calls) == 1 and len(capacity.releases) == 1
+    assert entered.is_set()
+
+
+async def test_rejected_outcome_release_timeout_preserves_rejected_receipt() -> None:
+    gateway, capacity, calls, _, _ = harness(wire(), capacity_wait_timeout=0.05)
+    capacity.release_block = asyncio.Event()
+
+    with pytest.raises(GatewayRejectedOutput) as caught:
+        await asyncio.wait_for(gateway.complete_with_context(request()), timeout=1)
+
+    evidence = caught.value.evidence
+    assert evidence is not None and evidence.final_text == PRIVATE
     assert len(calls) == 1 and len(capacity.releases) == 1
 
 

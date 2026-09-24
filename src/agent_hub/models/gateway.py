@@ -406,6 +406,25 @@ class ModelGateway:
     async def complete(self, request: ModelRequest) -> ModelResponse:
         return (await self.complete_with_context(request)).response
 
+    async def _record_capacity_outcome(
+        self,
+        capacity: CapacityController | CapacityPool,
+        lease: CapacityLease,
+        *,
+        status_code: int | None,
+        latency_seconds: float,
+        succeeded: bool,
+    ) -> None:
+        await asyncio.wait_for(
+            capacity.record_outcome(
+                lease.quota_scope_id,
+                status_code=status_code,
+                latency_seconds=latency_seconds,
+                succeeded=succeeded,
+            ),
+            timeout=self._capacity_wait_timeout,
+        )
+
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
@@ -841,8 +860,9 @@ class ModelGateway:
                     raise ModelGatewayError("model transport timing unavailable")
                 latency = max(0.0, self._monotonic() - transport_started)
                 try:
-                    await capacity.record_outcome(
-                        lease.quota_scope_id,
+                    await self._record_capacity_outcome(
+                        capacity,
+                        lease,
                         status_code=status_code,
                         latency_seconds=latency,
                         succeeded=succeeded,
@@ -1009,8 +1029,9 @@ class ModelGateway:
                     raise ModelGatewayError("model transport timing unavailable")
                 latency = max(0.0, self._monotonic() - transport_started)
                 try:
-                    await capacity.record_outcome(
-                        lease.quota_scope_id,
+                    await self._record_capacity_outcome(
+                        capacity,
+                        lease,
                         status_code=status_code,
                         latency_seconds=latency,
                         succeeded=response is not None,
@@ -1173,4 +1194,26 @@ class ModelGateway:
         self, capacity: CapacityController | CapacityPool, lease: CapacityLease
     ) -> BaseException | None:
         release_task = asyncio.create_task(capacity.release(lease))
-        return await _settle_cleanup(release_task)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(release_task),
+                timeout=self._capacity_wait_timeout,
+            )
+        except TimeoutError:
+            release_task.cancel()
+
+            def _consume_release_result(task: asyncio.Task[bool]) -> None:
+                if not task.cancelled():
+                    task.exception()
+
+            release_task.add_done_callback(_consume_release_result)
+            return CapacityBackendError("model capacity release failed")
+        except asyncio.CancelledError as error:
+            release_task.cancel()
+            cleanup_error = await _settle_cleanup(release_task)
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                return error
+            return cleanup_error or error
+        except BaseException as error:  # noqa: BLE001 - caller decides precedence
+            return error
+        return None

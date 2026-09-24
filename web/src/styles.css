@@ -2143,7 +2143,7 @@ article:hover {
 
 .run-agent-chip {
   cursor: pointer;
-  max-width: min(12rem, 100%);
+  max-width: min(16rem, 100%);
   text-align: left;
 }
 
@@ -2165,14 +2165,15 @@ article:hover {
   display: inline-flex;
   font-size: 0.78rem;
   font-weight: 950;
-  grid-row: 1 / span 2;
+  grid-row: 1 / span 3;
   height: 1.55rem;
   justify-content: center;
   width: 1.55rem;
 }
 
 .run-agent-chip strong,
-.run-agent-chip small {
+.run-agent-chip small,
+.run-agent-chip em {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2185,10 +2186,17 @@ article:hover {
 }
 
 .run-agent-chip small,
+.run-agent-chip em,
 .run-agent-chip-more {
   color: #64748b;
   font-size: 0.72rem;
   font-weight: 850;
+}
+
+.run-agent-chip em {
+  font-style: normal;
+  grid-column: 2;
+  opacity: 0.86;
 }
 
 .run-agent-chip.status-异常 {
@@ -3767,12 +3775,28 @@ article:hover {
 }
 
 .message-paragraph {
+  border-radius: 8px;
   display: grid;
   gap: 0.35rem;
+  min-width: 0;
+}
+
+.message-paragraph.is-collapsible {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  padding: 0.52rem;
+}
+
+.message-paragraph-tools {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.38rem;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .message-expand-button {
-  align-self: start;
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(148, 163, 184, 0.28);
   box-shadow: none;

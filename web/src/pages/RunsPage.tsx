@@ -1307,6 +1307,29 @@ function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[
   return items.filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)));
 }
 
+function agentRoleActionSummary(card: AgentDispatchCard) {
+  const key = `${card.name} ${card.role} ${card.id}`.toLowerCase();
+  if (key.includes("context")) return "加载上下文与约束";
+  if (key.includes("plan") || key.includes("architect")) return "拆解计划与方案";
+  if (key.includes("implement") || key.includes("coder") || key.includes("build")) return "实现代码与产物";
+  if (key.includes("review")) return "审查风险与质量";
+  if (key.includes("verify") || key.includes("test")) return "验证功能与结果";
+  if (key.includes("repair") || key.includes("fix")) return "定位问题并修复";
+  if (key.includes("summar") || key.includes("synth")) return "汇总结果与交付";
+  return "";
+}
+
+export function agentInlineSummary(card: AgentDispatchCard) {
+  const concreteTask = card.taskInputs.find((item) => !/^步骤\s+[-_\w]+$/i.test(item));
+  if (concreteTask) return concreteTask;
+  if (card.summary && card.summary !== "等待执行分配任务") return card.summary;
+  const roleAction = agentRoleActionSummary(card);
+  if (roleAction) return roleAction;
+  if (card.purpose && card.role && card.role !== "Agent") return `${card.purpose}：${card.role}`;
+  if (card.role && card.role !== "Agent") return `负责 ${card.role}`;
+  return "参与本轮调度";
+}
+
 function processTargetRowValue(item: ProcessDetailTarget, labelPattern: RegExp) {
   return item.rows.find((row) => labelPattern.test(row.label))?.value.trim() ?? "";
 }
@@ -4506,6 +4529,7 @@ function RunAgentActivityStrip({
     <div className="run-agent-activity-strip" aria-label="本轮参与 Agent">
       {visibleCards.map((card) => {
         const activityCount = agentActivityItems(card, items).length;
+        const summary = agentInlineSummary(card);
         return (
           <button
             key={card.id}
@@ -4520,6 +4544,7 @@ function RunAgentActivityStrip({
               {card.status}
               {activityCount > 0 ? ` · ${activityCount} 步` : ""}
             </small>
+            <em>{summary}</em>
           </button>
         );
       })}
@@ -4920,27 +4945,52 @@ function markdownTableCells(line: string) {
   return normalized.split("|").map((cell) => cell.replace(/\\\|/g, "|").trim());
 }
 
+function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return Promise.reject(new Error("clipboard unavailable"));
+}
+
 function CollapsibleMessageParagraph({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
   const lines = text.split("\n");
   const shouldCollapse = text.length > 900 || lines.length > 12;
   const preview = lines.slice(0, 10).join("\n");
   const displayText = shouldCollapse && !expanded
     ? `${preview.slice(0, 900)}${text.length > 900 || lines.length > 10 ? "\n..." : ""}`
     : text;
+  const copyable = shouldCollapse || text.length > 240 || lines.length > 4;
   return (
     <div className={`message-paragraph${shouldCollapse ? " is-collapsible" : ""}`}>
-      <p>{displayText}</p>
-      {shouldCollapse ? (
-        <button type="button" className="message-expand-button" onClick={() => setExpanded((current) => !current)}>
-          {expanded ? "收起" : "展开全文"}
-        </button>
+      {copyable ? (
+        <div className="message-paragraph-tools" aria-label="消息文本工具">
+          {shouldCollapse ? (
+            <button type="button" className="message-expand-button" onClick={() => setExpanded((current) => !current)}>
+              {expanded ? "收起" : "展开全文"}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="message-expand-button"
+            onClick={() => {
+              void copyTextToClipboard(text).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1600);
+              }).catch(() => undefined);
+            }}
+          >
+            {copied ? "已复制" : "复制全文"}
+          </button>
+        </div>
       ) : null}
+      <p>{displayText}</p>
     </div>
   );
 }
 
-function MessageBody({ text, title }: { text: string; title: string }) {
+export function MessageBody({ text, title }: { text: string; title: string }) {
   const blocks = markdownMessageBlocks(text);
   if (blocks.length === 0) return null;
   let tableIndex = 0;

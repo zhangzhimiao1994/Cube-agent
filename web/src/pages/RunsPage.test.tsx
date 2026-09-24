@@ -1,9 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 
 import type { RunDetail } from "../api/client";
 import {
+  agentInlineSummary,
   conversationWorkspaceFiles,
   conversationMessages,
+  MessageBody,
   mergeConversationRuns,
   requestedPermissionsForSandbox,
   runConversationId,
@@ -402,6 +406,49 @@ describe("conversation ordering", () => {
     expect(rows).toContain("分歧与风险:是否立即实现存在分歧");
     expect(rows).toContain("求证与验证:核对技能规则、读取约束");
     expect(rows).toContain("最终决策:先完成计划和验收清单");
+  });
+});
+
+describe("MessageBody", () => {
+  it("keeps long content compact while allowing expand and full copy", async () => {
+    const longText = Array.from({ length: 22 }, (_item, index) => `line-${index + 1}: long architecture detail`)
+      .join("\n");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(<MessageBody text={longText} title="回复" />);
+
+    expect(screen.queryByText(/line-22/)).toBeNull();
+    expect(screen.getByRole("button", { name: "展开全文" })).not.toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "复制全文" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(longText));
+    expect(screen.getByRole("button", { name: "已复制" })).not.toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "展开全文" }));
+    expect(screen.getByText(/line-22: long architecture detail/)).not.toBeNull();
+  });
+});
+
+describe("agentInlineSummary", () => {
+  it("explains scheduled context-loading agents with a compact action summary", () => {
+    expect(
+      agentInlineSummary({
+        id: "context_loader",
+        name: "Context Loader",
+        role: "Context Loader",
+        model: "默认模型",
+        summary: "等待执行分配任务",
+        purpose: "",
+        taskInputs: [],
+        dependencyInputs: [],
+        toolInputs: [],
+        status: "已安排",
+      }),
+    ).toBe("加载上下文与约束");
   });
 });
 
