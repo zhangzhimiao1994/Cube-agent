@@ -262,7 +262,7 @@ export function SkillsPage() {
           >
             {createSkillTask.isPending ? "创建中..." : "创建并进入进化"}
           </button>
-          {createSkillTask.isSuccess ? <span role="status">已创建进化任务：{createSkillTask.data.title}。到“对话与进化 / 进化”继续审批和执行。</span> : null}
+          {createSkillTask.isSuccess ? <span role="status">已创建进化任务：{createSkillTask.data.title}。到“Skill 进化”继续审批和执行。</span> : null}
         </div>
         {createSkillTask.isError ? <p role="alert">{formatApiError(createSkillTask.error, "Skill 创建任务创建失败")}</p> : null}
       </section>

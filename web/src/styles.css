@@ -938,10 +938,6 @@ article:hover {
   margin-bottom: 0.8rem;
 }
 
-.mobile-chat-hierarchy {
-  display: none;
-}
-
 .run-compose {
   margin: 1rem 0;
 }
@@ -5604,28 +5600,6 @@ article:hover {
 
   .compact-page-intro {
     font-size: 0.9rem;
-  }
-
-  .mobile-chat-hierarchy {
-    background: rgba(3, 10, 20, 0.46);
-    border: 1px solid rgba(85, 215, 255, 0.14);
-    border-radius: 999px;
-    display: grid;
-    gap: 0.35rem;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    margin: 0.7rem 0;
-    padding: 0.35rem;
-  }
-
-  .mobile-chat-hierarchy span {
-    background: rgba(85, 215, 255, 0.08);
-    border-radius: 999px;
-    color: var(--muted);
-    font-size: 0.72rem;
-    font-weight: 900;
-    letter-spacing: 0.02em;
-    padding: 0.45rem 0.35rem;
-    text-align: center;
   }
 
   .chat-console {

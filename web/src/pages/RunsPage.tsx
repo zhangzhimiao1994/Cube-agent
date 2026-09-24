@@ -1085,6 +1085,32 @@ type TaskChainStep = {
 const WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
 const WORKBENCH_AGENT_ACTIVITY_PREVIEW_LIMIT = 5;
 const WORKBENCH_COORDINATION_SECTION_LIMIT = 4;
+const AGENT_NICKNAMES = [
+  "费曼",
+  "陆思聆",
+  "沈括",
+  "顾准",
+  "林衡",
+  "苏澈",
+  "程予",
+  "许砚",
+  "白芷",
+  "周晏",
+  "叶岚",
+  "秦越",
+  "陶然",
+  "闻舟",
+  "韩序",
+  "江宁",
+  "夏衡",
+  "洛川",
+  "宁远",
+  "方知",
+  "黎初",
+  "孟珩",
+  "楚越",
+  "谢安",
+];
 
 function recentPreview<T>(items: T[], limit: number, expanded = false) {
   if (expanded || items.length <= limit) {
@@ -1166,8 +1192,8 @@ function fallbackAgentCards(detail: RunDetail, agentNames: Map<string, string>):
   });
   return [...ids].map((id) => ({
     id,
-    name: agentNames.get(id) ?? humanizeEventIdentifier(id),
-    role: "Agent",
+    name: stableAgentNickname(id),
+    role: agentFunctionLabel({ id, name: agentNames.get(id), role: "Agent" }),
     model:
       detail.events
         .map((event) => (event.actor === id ? eventModelName(event) : ""))
@@ -1213,6 +1239,49 @@ function purposeLabel(value: string | null) {
   return labels[value] ?? value;
 }
 
+function stableAgentNickname(agentId: string) {
+  let hash = 0;
+  for (const character of agentId) {
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  }
+  return AGENT_NICKNAMES[hash % AGENT_NICKNAMES.length];
+}
+
+function agentFunctionLabel({
+  id,
+  name,
+  purpose,
+  role,
+}: {
+  id: string;
+  name?: string | null;
+  purpose?: string | null;
+  role?: string | null;
+}) {
+  const combined = [id, name, role, purpose].filter(Boolean).join(" ").toLowerCase();
+  if (/context|loader|上下文/.test(combined)) return "上下文";
+  if (/implement|coder|engineer|build|代码|实现|工程/.test(combined)) return "实现";
+  if (/review|critic|security|审查|审核|安全/.test(combined)) return "审查";
+  if (/verify|verifier|test|qa|acceptance|验证|测试/.test(combined)) return "验证";
+  if (/plan|architect|planner|架构|规划|计划/.test(combined)) return "规划";
+  if (/repair|fix|self.?repair|修复/.test(combined)) return "修复";
+  if (/summar|synth|final|汇总|总结/.test(combined)) return "汇总";
+  if (/copy|writer|文案|写作/.test(combined)) return "文案";
+  if (/director|导演/.test(combined)) return "导演";
+  if (/editor|剪辑/.test(combined)) return "剪辑";
+  const purposeText = purposeLabel(purpose ?? null);
+  if (purposeText) return purposeText;
+  const savedName = name?.trim();
+  if (savedName && savedName !== id) return savedName;
+  const roleText = role?.trim();
+  if (roleText && roleText !== "Agent") return roleText;
+  return "协作";
+}
+
+function agentDisplayTitle(card: Pick<AgentDispatchCard, "name" | "role">) {
+  return card.role && card.role !== "Agent" ? `${card.name} · ${card.role}` : card.name;
+}
+
 function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>): AgentDispatchCard[] {
   const plan = mainAgentPlanEvent(detail);
   if (!plan) return fallbackAgentCards(detail, agentNames);
@@ -1240,6 +1309,7 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
         }),
       );
       const roleLabel = stringValue(role.role) ?? id;
+      const savedName = agentNames.get(id);
       const model = stringValue(role.logical_model) ?? "默认模型";
       const roleSummary =
         stringValue(role.summary) ??
@@ -1253,8 +1323,8 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
       const toolInputs = uniqLimited([...stringArrayValue(role.tools), ...ownedSteps.flatMap((step) => stringArrayValue(step.tools))]);
       return {
         id,
-        name: agentNames.get(id) ?? id,
-        role: roleLabel,
+        name: stableAgentNickname(id),
+        role: agentFunctionLabel({ id, name: savedName, purpose, role: roleLabel }),
         model,
         summary: conciseProcessText(roleSummary, "等待执行分配任务"),
         purpose: purposeLabel(purpose),
@@ -1309,13 +1379,16 @@ function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[
 
 function agentRoleActionSummary(card: AgentDispatchCard) {
   const key = `${card.name} ${card.role} ${card.id}`.toLowerCase();
-  if (key.includes("context")) return "加载上下文与约束";
-  if (key.includes("plan") || key.includes("architect")) return "拆解计划与方案";
-  if (key.includes("implement") || key.includes("coder") || key.includes("build")) return "实现代码与产物";
-  if (key.includes("review")) return "审查风险与质量";
-  if (key.includes("verify") || key.includes("test")) return "验证功能与结果";
-  if (key.includes("repair") || key.includes("fix")) return "定位问题并修复";
-  if (key.includes("summar") || key.includes("synth")) return "汇总结果与交付";
+  if (/context|上下文/.test(key)) return "加载上下文与约束";
+  if (/plan|architect|规划|计划|架构/.test(key)) return "拆解计划与方案";
+  if (/implement|coder|build|实现|工程|代码/.test(key)) return "实现代码与产物";
+  if (/review|critic|审查|审核|安全/.test(key)) return "审查风险与质量";
+  if (/verify|test|qa|验证|测试/.test(key)) return "验证功能与结果";
+  if (/repair|fix|修复/.test(key)) return "定位问题并修复";
+  if (/summar|synth|汇总|总结/.test(key)) return "汇总结果与交付";
+  if (/copy|writer|文案|写手/.test(key)) return "撰写内容与交付文案";
+  if (/director|导演/.test(key)) return "把控流程与现场节奏";
+  if (/editor|剪辑/.test(key)) return "整理素材与剪辑结构";
   return "";
 }
 
@@ -1554,7 +1627,14 @@ function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): T
       {
         id: stepId,
         agentId,
-        agentName: roleNames.get(agentId) ?? agentNames.get(agentId) ?? humanizeEventIdentifier(agentId),
+        agentName: agentDisplayTitle({
+          name: stableAgentNickname(agentId),
+          role: agentFunctionLabel({
+            id: agentId,
+            name: agentNames.get(agentId),
+            role: roleNames.get(agentId),
+          }),
+        }),
         status,
         summary,
         dependsOn,
@@ -4293,9 +4373,9 @@ function AgentWorkbenchDrawer({
         </div>
         <div className="agent-workbench-detail">
           {selectedAgent ? (
-            <section className="agent-workbench-actions" aria-label={`${selectedAgent.name}工作调度`}>
+            <section className="agent-workbench-actions" aria-label={`${agentDisplayTitle(selectedAgent)}工作调度`}>
               <div className="agent-workbench-actions-header">
-                <strong>{selectedAgent.name}工作调度</strong>
+                <strong>{agentDisplayTitle(selectedAgent)}工作调度</strong>
                 <small>{selectedAgentItems.length} 个动作</small>
                 <button
                   type="button"
@@ -4363,7 +4443,7 @@ function AgentWorkbenchDrawer({
                           key={card.id}
                           type="button"
                           className={`agent-workbench-agent-card status-${card.status}`}
-                          aria-label={`打开${card.name}工作调度`}
+                          aria-label={`打开${agentDisplayTitle(card)}工作调度`}
                           onClick={() => {
                             setSelectedAgentId(card.id);
                             setShowAllActions(false);
@@ -4374,16 +4454,14 @@ function AgentWorkbenchDrawer({
                       {card.name.slice(0, 1)}
                     </div>
                     <div>
-                      <strong>{card.name}</strong>
-                      <small>
-                        {card.role} · {card.model}
-                      </small>
+                      <strong>{agentDisplayTitle(card)}</strong>
+                      <small>{card.model}</small>
                     </div>
                     <span>{card.status}</span>
                   </div>
                   <p>{card.summary}</p>
                   {card.purpose || card.taskInputs.length > 0 || card.dependencyInputs.length > 0 || card.toolInputs.length > 0 ? (
-                    <div className="agent-workbench-inputs" aria-label={`${card.name}调度输入`}>
+                    <div className="agent-workbench-inputs" aria-label={`${agentDisplayTitle(card)}调度输入`}>
                       {card.purpose ? <span>职责 {card.purpose}</span> : null}
                       {card.taskInputs.map((item) => (
                         <span key={`task-${item}`}>任务 {item}</span>
@@ -4536,10 +4614,10 @@ function RunAgentActivityStrip({
             type="button"
             className={`run-agent-chip status-${card.status}`}
             onClick={() => onOpenAgent(card.id)}
-            aria-label={`打开 ${card.name} 调度详情`}
+            aria-label={`打开 ${agentDisplayTitle(card)} 调度详情`}
           >
             <span aria-hidden="true">{card.name.slice(0, 1)}</span>
-            <strong>{card.name}</strong>
+            <strong>{agentDisplayTitle(card)}</strong>
             <small>
               {card.status}
               {activityCount > 0 ? ` · ${activityCount} 步` : ""}
@@ -4602,7 +4680,10 @@ function RunProcessSummary({
     document.body.style.touchAction = "none";
     document.documentElement.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIsWorkbenchOpen(false);
+      if (event.key !== "Escape") return;
+      const processDetailOpen = document.querySelector('[role="dialog"][aria-label="运行过程详情"]');
+      if (processDetailOpen) return;
+      setIsWorkbenchOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -4658,7 +4739,6 @@ function RunProcessSummary({
               onClose={() => setIsWorkbenchOpen(false)}
               onOpen={(item) => {
                 onOpen(item);
-                setIsWorkbenchOpen(false);
               }}
             />
           ) : null}
@@ -6255,16 +6335,10 @@ export function RunsPage() {
   return (
     <section>
       <p className="eyebrow">Conversation</p>
-      <h2>对话与进化</h2>
+      <h2>对话</h2>
       <p className="compact-page-intro">
-        这里是连续对话窗口，也会承接长期多轮任务、上下文压缩和后续 Skill 进化。历史会话从右侧抽屉打开。
+        连续对话窗口，可承接多轮任务、上下文压缩和历史会话。
       </p>
-
-      <div className="mobile-chat-hierarchy" aria-label="移动端对话层级">
-        <span>1 · 会话</span>
-        <span>2 · 对话</span>
-        <span>3 · 设置 / 详情</span>
-      </div>
 
       <button
         type="button"

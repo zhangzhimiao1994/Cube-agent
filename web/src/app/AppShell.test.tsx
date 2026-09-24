@@ -73,6 +73,8 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findAllByText("魔方 agent")).not.toHaveLength(0);
     expect(screen.getAllByAltText("魔方 agent")).not.toHaveLength(0);
+    expect(screen.queryByText("魔方工作台")).toBeNull();
+    expect(screen.getAllByText("super_admin:11111111").length).toBeGreaterThan(0);
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(screen.getAllByText("工作台").length).toBeGreaterThan(0);

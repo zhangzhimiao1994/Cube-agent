@@ -83,7 +83,7 @@ export function AppShell() {
           </button>
           <div className="mobile-nav-title">
             <span>{APP_BRAND_NAME}</span>
-            <strong>魔方工作台</strong>
+            <strong>{auth.user?.username ?? "当前用户"}</strong>
           </div>
         </div>
         <button
