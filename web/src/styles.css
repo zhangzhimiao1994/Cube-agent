@@ -1003,6 +1003,7 @@ article:hover {
 .history-drawer-open .conversation-list {
   pointer-events: auto;
   transform: translateX(0);
+  visibility: visible;
 }
 
 .chat-session-toolbar > div {
@@ -1139,6 +1140,7 @@ article:hover {
   top: 5.6rem;
   transform: translateX(calc(100% + 1.2rem));
   transition: transform 160ms ease;
+  visibility: hidden;
   width: min(340px, calc(100vw - 2rem));
   z-index: 18;
 }

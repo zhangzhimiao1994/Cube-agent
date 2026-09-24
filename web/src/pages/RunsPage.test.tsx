@@ -461,6 +461,17 @@ describe("agentInlineSummary", () => {
     expect(source).not.toContain('document.body.style.touchAction = "none"');
   });
 
+  it("keeps the closed conversation history drawer out of the visible interaction tree", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /\.conversation-list\s*{[\s\S]*pointer-events:\s*none;[\s\S]*transform:\s*translateX\(calc\(100% \+ 1\.2rem\)\);[\s\S]*visibility:\s*hidden;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.history-drawer-open \.conversation-list\s*{[\s\S]*pointer-events:\s*auto;[\s\S]*transform:\s*translateX\(0\);[\s\S]*visibility:\s*visible;/,
+    );
+  });
+
   it("explains scheduled context-loading agents with a compact action summary", () => {
     expect(
       agentInlineSummary({
