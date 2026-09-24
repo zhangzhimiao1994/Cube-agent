@@ -518,17 +518,15 @@ def execute_project_scale_plan(
                     validation_focus=run_request.validation_focus,
                 ),
             )
-            if _case_requires_project_preflight(run_request.case_id):
-                approval_body = _project_preflight_approval_body(response)
-                approval = client.request_json(
-                    "POST",
-                    f"/api/v1/runs/{quote(run_id)}/approve-project-preflight",
-                    body=approval_body,
-                )
-                if not isinstance(approval, dict):
-                    raise TypeError("project preflight approval returned non-object JSON")
-                evidence["project_preflight_approval"] = True
-                status = _string_value(approval.get("status")) or status
+            approval_status = _approve_project_preflight_run(
+                client,
+                run_id=run_id,
+                response=response,
+                case_id=run_request.case_id,
+                evidence=evidence,
+                required=True,
+            )
+            status = approval_status or status
 
             _report_progress(progress, f"{case_label}: observing run {run_id}")
             observation = _collect_run_observation(
@@ -736,6 +734,15 @@ def execute_project_scale_plan(
                 evidence["deliverable_repair_trace"] = True
                 run_id = repair_run_id
                 status = _string_value(repair_response.get("status")) or status
+                approval_status = _approve_project_preflight_run(
+                    client,
+                    run_id=run_id,
+                    response=repair_response,
+                    case_id=run_request.case_id,
+                    evidence=evidence,
+                    required=False,
+                )
+                status = approval_status or status
                 _report_progress(
                     progress,
                     f"{case_label}: observing repair run {run_id}",
@@ -2178,6 +2185,33 @@ def _case_requires_discussion_trace(case_id: str) -> bool:
 def _case_requires_plugin_contract(case_id: str) -> bool:
     _scale, _, flow = case_id.partition(":")
     return flow == "plugin"
+
+
+def _approve_project_preflight_run(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    response: dict[str, object],
+    case_id: str,
+    evidence: dict[str, bool],
+    required: bool,
+) -> str | None:
+    if not _case_requires_project_preflight(case_id):
+        return None
+    if response.get("status") != "waiting_approval":
+        if required:
+            _project_preflight_approval_body(response)
+        return None
+    approval_body = _project_preflight_approval_body(response)
+    approval = client.request_json(
+        "POST",
+        f"/api/v1/runs/{quote(run_id)}/approve-project-preflight",
+        body=approval_body,
+    )
+    if not isinstance(approval, dict):
+        raise TypeError("project preflight approval returned non-object JSON")
+    evidence["project_preflight_approval"] = True
+    return _string_value(approval.get("status"))
 
 
 def _project_preflight_approval_body(response: dict[str, object]) -> dict[str, object]:
