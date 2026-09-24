@@ -365,7 +365,7 @@ class _PlannedRuntime:
                     "main_agent_model": self._main_agent_model,
                     "logical_model": self._main_agent_model,
                     "task": "选择运行模式、角色和模型。",
-                    "summary": "Main Agent selected the runtime mode, roles, and models.",
+                    "summary": "主 Agent 已选择运行模式、角色和模型。",
                     "roles": self._roles,
                     "steps": self._steps,
                     "model_execution_plan": _model_execution_plan_payload(

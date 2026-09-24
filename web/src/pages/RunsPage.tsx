@@ -349,6 +349,39 @@ function displayEventActor(actor: string | null | undefined, agentNames: Map<str
   return agentNames.get(actor) ?? actor;
 }
 
+function localizedRecordedEventLabel(kind: string) {
+  const labels: Record<string, string> = {
+    "step.started": "开始执行步骤",
+    "step.completed": "完成阶段输出",
+    "model.started": "开始调用模型",
+    "tool.started": "开始使用工具",
+    "tool.completed": "完成工具操作",
+    "tool.failed": "工具操作失败",
+    "decision.started": "开始决策",
+    "decision.completed": "完成决策",
+    "dispatch.started": "开始派单",
+    "dispatch.completed": "完成派单",
+  };
+  return labels[kind] ?? `记录 ${kind}`;
+}
+
+function localizedEventSummaryText(
+  summary: string,
+  event: RunDetail["events"][number],
+  agentNames: Map<string, string>,
+) {
+  const trimmed = summary.trim();
+  if (/^main agent selected the runtime mode, roles, and models\.?$/i.test(trimmed)) {
+    return "主 Agent 已选择运行模式、角色和模型";
+  }
+  const recordedMatch = trimmed.match(/^(.+?)\s+recorded\s+([a-z][a-z0-9_.-]*)\.?$/i);
+  if (recordedMatch) {
+    const actor = displayEventActor(event.actor || recordedMatch[1], agentNames) ?? recordedMatch[1];
+    return `${actor} ${localizedRecordedEventLabel(recordedMatch[2])}`;
+  }
+  return trimmed;
+}
+
 function displayEventParticipants(participants: string[], agentNames: Map<string, string>) {
   const names = participants.map((id) => agentNames.get(id) ?? id).filter(Boolean);
   return names.length > 0 ? names.join("、") : null;
@@ -1031,6 +1064,69 @@ type ProcessDetailTarget = {
   sourceStepId?: string | null;
   sourceActor?: string | null;
 };
+
+type ProcessDetailValuePresentation = {
+  kind: "plain" | "json" | "code";
+  label: string;
+  copyLabel: string;
+  text: string;
+  shouldCollapse: boolean;
+};
+
+function prettyJsonValue(value: string) {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeCommandLabel(label: string) {
+  return /命令|终端|shell|bash|command/i.test(label);
+}
+
+function looksLikeCodeValue(value: string) {
+  if (!value.includes("\n")) return false;
+  return /\b(import|export|const|let|function|class|return|def|from|SELECT|POST|GET|npm|pnpm|ssh|curl)\b/.test(value);
+}
+
+function detailBlockLanguage(label: string, value: string) {
+  if (looksLikeCommandLabel(label)) return "bash";
+  if (/tsx?|jsx?|typescript|javascript/i.test(`${label} ${value.slice(0, 80)}`)) return "ts";
+  if (/python|\.py\b|def\s+\w+/i.test(`${label} ${value.slice(0, 120)}`)) return "python";
+  return "text";
+}
+
+export function processDetailValuePresentation(row: { label: string; value: string }): ProcessDetailValuePresentation {
+  const trimmed = row.value.trim();
+  const jsonText = prettyJsonValue(trimmed);
+  if (jsonText) {
+    return {
+      kind: "json",
+      label: "json",
+      copyLabel: "复制 json 内容",
+      text: jsonText,
+      shouldCollapse: jsonText.length > 1200 || jsonText.split("\n").length > 18,
+    };
+  }
+  if (looksLikeCommandLabel(row.label) || looksLikeCodeValue(trimmed)) {
+    const label = detailBlockLanguage(row.label, trimmed);
+    return {
+      kind: "code",
+      label,
+      copyLabel: `复制 ${label} 内容`,
+      text: trimmed,
+      shouldCollapse: trimmed.length > 1200 || trimmed.split("\n").length > 18,
+    };
+  }
+  return {
+    kind: "plain",
+    label: "text",
+    copyLabel: "复制文本",
+    text: row.value,
+    shouldCollapse: row.value.length > 900 || row.value.split("\n").length > 12,
+  };
+}
 
 type WorkbenchFileItem = {
   id: string;
@@ -3612,7 +3708,7 @@ function eventSummaryText(
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
 ) {
   const safeSummary = eventSafeSummary(event);
-  if (safeSummary) return conciseProcessText(safeSummary, "记录了一步过程");
+  if (safeSummary) return conciseProcessText(localizedEventSummaryText(safeSummary, event, agentNames), "记录了一步过程");
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
   const readableMessage =
@@ -4830,7 +4926,84 @@ function processDetailGroups(rows: Array<{ label: string; value: string }>): Pro
 
 function processDetailGroupSummary(group: ProcessDetailGroup) {
   const first = group.rows.find((row) => row.value.trim().length > 0);
-  return conciseProcessText(first?.value ?? "", `${group.rows.length} 项摘要`);
+  if (!first) return `${group.rows.length} 项摘要`;
+  const presentation = processDetailValuePresentation(first);
+  if (presentation.kind === "json") return "查看结构化 JSON";
+  if (presentation.kind === "code") return `查看 ${presentation.label} 内容`;
+  return conciseProcessText(presentation.text, `${group.rows.length} 项摘要`);
+}
+
+function BoundedTextBlock({
+  copyAriaLabel,
+  label,
+  text,
+  collapseLabel = "展开",
+  expandLabel = "收起",
+}: {
+  copyAriaLabel: string;
+  label: string;
+  text: string;
+  collapseLabel?: string;
+  expandLabel?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const shouldCollapse = text.length > 1200 || text.split("\n").length > 18;
+  return (
+    <div className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}`}>
+      <div className="bounded-text-block-header">
+        <span>{label}</span>
+        <div>
+          {shouldCollapse ? (
+            <button type="button" className="text-button" onClick={() => setExpanded((current) => !current)}>
+              {expanded ? expandLabel : collapseLabel}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="text-button"
+            aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
+            onClick={() => {
+              void copyTextToClipboard(text)
+                .then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1600);
+                })
+                .catch(() => undefined);
+            }}
+          >
+            {copied ? "已复制" : "复制"}
+          </button>
+        </div>
+      </div>
+      <pre>{text}</pre>
+    </div>
+  );
+}
+
+function ProcessDetailValueBlock({ row }: { row: { label: string; value: string } }) {
+  const presentation = processDetailValuePresentation(row);
+  if (presentation.kind === "plain" && !presentation.shouldCollapse) {
+    return <span>{presentation.text}</span>;
+  }
+  if (presentation.kind === "plain") {
+    return (
+      <BoundedTextBlock
+        copyAriaLabel={presentation.copyLabel}
+        label={row.label}
+        text={presentation.text}
+        collapseLabel="展开全文"
+        expandLabel="收起"
+      />
+    );
+  }
+  return (
+    <BoundedTextBlock
+      copyAriaLabel={presentation.copyLabel}
+      label={presentation.label}
+      text={presentation.text}
+    />
+  );
 }
 
 function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
@@ -4877,7 +5050,9 @@ function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
               {openGroup.rows.map((row, index) => (
                 <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
                   <dt>{row.label}</dt>
-                  <dd>{row.value}</dd>
+                  <dd>
+                    <ProcessDetailValueBlock row={row} />
+                  </dd>
                 </Fragment>
               ))}
             </dl>
@@ -4973,6 +5148,7 @@ function ModeEntryPanel({
 
 type MessageBodyBlock =
   | { kind: "paragraph"; text: string }
+  | { kind: "code"; language: string; text: string }
   | { kind: "table"; headers: string[]; rows: string[][] };
 
 function markdownMessageBlocks(text: string): MessageBodyBlock[] {
@@ -4988,6 +5164,20 @@ function markdownMessageBlocks(text: string): MessageBodyBlock[] {
   }
 
   while (index < lines.length) {
+    const fenceMatch = lines[index].match(/^```\s*([A-Za-z0-9_-]+)?\s*$/);
+    if (fenceMatch) {
+      flushParagraph();
+      const language = fenceMatch[1]?.trim() || "text";
+      index += 1;
+      const codeLines: string[] = [];
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push({ kind: "code", language, text: codeLines.join("\n") });
+      continue;
+    }
     if (isMarkdownTableStart(lines, index)) {
       flushParagraph();
       const headers = markdownTableCells(lines[index]);
@@ -5079,6 +5269,16 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
       {blocks.map((block, index) => {
         if (block.kind === "paragraph") {
           return <CollapsibleMessageParagraph key={`paragraph-${index}`} text={block.text} />;
+        }
+        if (block.kind === "code") {
+          return (
+            <BoundedTextBlock
+              key={`code-${index}`}
+              copyAriaLabel={`复制 ${block.language} 代码`}
+              label={block.language}
+              text={block.text}
+            />
+          );
         }
         tableIndex += 1;
         return (

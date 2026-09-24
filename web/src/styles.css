@@ -3346,6 +3346,78 @@ article:hover {
   word-break: normal;
 }
 
+.bounded-text-block {
+  background: rgba(2, 6, 23, 0.42);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 8px;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.bounded-text-block-header {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(123, 225, 255, 0.12);
+  display: flex;
+  gap: 0.65rem;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 0.45rem 0.58rem;
+}
+
+.bounded-text-block-header span {
+  color: rgba(178, 194, 216, 0.88);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 850;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bounded-text-block-header div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+}
+
+.text-button {
+  background: rgba(123, 225, 255, 0.1);
+  border: 1px solid rgba(123, 225, 255, 0.2);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 850;
+  line-height: 1;
+  padding: 0.28rem 0.48rem;
+}
+
+.text-button:hover,
+.text-button:focus-visible {
+  background: rgba(123, 225, 255, 0.18);
+  border-color: rgba(123, 225, 255, 0.34);
+}
+
+.bounded-text-block pre {
+  color: var(--text);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.58;
+  margin: 0;
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.7rem;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.bounded-text-block.is-collapsed pre {
+  max-height: 12rem;
+}
+
 .artifact-file-card {
   align-items: center;
   background: rgba(3, 10, 20, 0.38);
@@ -6535,14 +6607,37 @@ article:hover {
 }
 
 .run-process-detail article,
-.process-detail-modal {
+.process-detail-modal,
+.bounded-text-block {
   background: #ffffff;
   border-color: rgba(148, 163, 184, 0.28);
 }
 
+.bounded-text-block-header {
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.24);
+}
+
+.bounded-text-block-header span {
+  color: #475569;
+}
+
+.text-button {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.text-button:hover,
+.text-button:focus-visible {
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
 .run-process-detail p,
 .run-process-detail dd,
-.process-detail-modal dd {
+.process-detail-modal dd,
+.bounded-text-block pre {
   color: #1f2937;
 }
 

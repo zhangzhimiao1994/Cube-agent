@@ -11179,6 +11179,18 @@ def _event_summary(
     payload: Mapping[str, JsonValue],
 ) -> str:
     actor_label = actor or "agent"
+    recorded_labels = {
+        "step.started": "开始执行步骤",
+        "step.completed": "完成阶段输出",
+        "model.started": "开始调用模型",
+        "tool.started": "开始使用工具",
+        "tool.completed": "完成工具操作",
+        "tool.failed": "工具操作失败",
+        "decision.started": "开始决策",
+        "decision.completed": "完成决策",
+        "dispatch.started": "开始派单",
+        "dispatch.completed": "完成派单",
+    }
     if kind == "review.completed":
         return _safe_model_check_detail(f"{actor_label} completed review")
     if kind == "approval.requested":
@@ -11202,6 +11214,8 @@ def _event_summary(
         summary = _safe_model_check_detail(candidate)
         if summary != "redacted":
             return summary
+    if kind in recorded_labels:
+        return _safe_model_check_detail(f"{actor_label} {recorded_labels[kind]}")
     return _safe_model_check_detail(f"{actor_label} recorded {kind}")
 
 

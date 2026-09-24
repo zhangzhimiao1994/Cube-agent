@@ -13,6 +13,7 @@ import {
   runConversationId,
   runDetailVersion,
   runProcessItems,
+  processDetailValuePresentation,
   workbenchFileItems,
   workbenchActionDescriptor,
   workspacePreviewPath,
@@ -431,6 +432,24 @@ describe("MessageBody", () => {
     await userEvent.click(screen.getByRole("button", { name: "展开全文" }));
     expect(screen.getByText(/line-22: long architecture detail/)).not.toBeNull();
   });
+
+  it("renders fenced code blocks as categorized copyable blocks", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(<MessageBody title="回复" text={"快速定位\n```bash\nssh -vvv user@host\nnc -v host 22\n```\n完成"} />);
+
+    expect(screen.getByText("bash")).not.toBeNull();
+    expect(screen.getByText(/ssh -vvv user@host/)).not.toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "复制 bash 代码" }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("ssh -vvv user@host\nnc -v host 22"));
+    expect(screen.getByRole("button", { name: "已复制 bash 代码" })).not.toBeNull();
+  });
 });
 
 describe("agentInlineSummary", () => {
@@ -739,6 +758,63 @@ describe("workspace and sandbox submission helpers", () => {
     expect(descriptor.target).toBe("src/storage/cloud-drive.ts");
     expect(descriptor.summary).toContain("写入源码文件");
     expect(descriptor.meta).toEqual(expect.arrayContaining(["implementer", "创建文件", "src/storage/cloud-drive.ts"]));
+  });
+
+  it("localizes backend English fallback summaries for workbench action rows", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "architect recorded step.started",
+          summary: "architect recorded step.started",
+          created_at: "2026-09-02T00:01:30Z",
+          actor: "architect",
+          participants: [],
+          step_id: "architect-step",
+          payload: {},
+        },
+        {
+          sequence: 2,
+          kind: "harness.started",
+          message: "Main Agent selected the runtime mode, roles, and models.",
+          summary: "Main Agent selected the runtime mode, roles, and models.",
+          created_at: "2026-09-02T00:02:30Z",
+          actor: "main_agent",
+          participants: [],
+          payload: {},
+        },
+      ],
+    };
+
+    const items = runProcessItems(run, new Map([["architect", "林衡 · 审查"]]));
+    const architect = items.find((item) => item.sourceActor === "architect");
+    const mainAgent = items.find((item) => item.sourceActor === "main_agent");
+
+    expect(workbenchActionDescriptor(architect!).target).toBe("林衡 · 审查 开始执行步骤");
+    expect(workbenchActionDescriptor(mainAgent!).target).toBe("主 Agent 已选择运行模式、角色和模型");
+  });
+
+  it("classifies long detail values into bounded JSON and code blocks", () => {
+    expect(processDetailValuePresentation({ label: "事件内容", value: '{"items":[{"id":"calculator.evaluate"}]}' })).toEqual({
+      kind: "json",
+      label: "json",
+      copyLabel: "复制 json 内容",
+      text: '{\n  "items": [\n    {\n      "id": "calculator.evaluate"\n    }\n  ]\n}',
+      shouldCollapse: false,
+    });
+    expect(
+      processDetailValuePresentation({
+        label: "命令",
+        value: "npm run build\nnpm test",
+      }),
+    ).toMatchObject({
+      kind: "code",
+      label: "bash",
+      copyLabel: "复制 bash 内容",
+      shouldCollapse: false,
+    });
   });
 
   it("keeps multi-file action summaries tied to the clicked action instead of only global artifacts", () => {

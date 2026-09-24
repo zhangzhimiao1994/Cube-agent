@@ -54,6 +54,7 @@ from agent_hub.api.routers.admin import (
     SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
+    _event_summary,
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
@@ -1219,6 +1220,19 @@ def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses()
     assert completed is not None
     assert completed.status == "completed"
     assert completed.blocked_contract_count == 0
+
+
+def test_admin_event_summary_localizes_recorded_fallbacks() -> None:
+    assert (
+        _event_summary(
+            "step.started",
+            actor="architect",
+            action=None,
+            decision=None,
+            payload={},
+        )
+        == "architect 开始执行步骤"
+    )
 
 
 def test_orchestration_protocol_summary_uses_step_contract_event_ids() -> None:
