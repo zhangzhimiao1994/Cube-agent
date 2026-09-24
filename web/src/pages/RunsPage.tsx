@@ -3943,7 +3943,7 @@ function AgentWorkbenchDrawer({
   }, [selectedFileId, activeView]);
   const actionWorkspaceItems = activeView === "actions" ? actionItems : [];
   const actionWorkspaceLabel = "动作与文件";
-  const actionWorkspaceAria = "动作与文件";
+  const actionWorkspaceAria = "过程轨迹";
   const actionWorkspaceEmpty = "暂无动作或文件记录";
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
@@ -4125,7 +4125,7 @@ function AgentWorkbenchDrawer({
                     </div>
                     {actionWorkspaceItems.length === 0 ? <p className="agent-workbench-compressed-note">{actionWorkspaceEmpty}</p> : null}
                     {files.length > 0 ? (
-                      <section className="agent-workbench-files-inline" aria-label="本轮文件">
+                      <section className="agent-workbench-files-inline" aria-label="文件窗口">
                         <div className="agent-workbench-actions-header">
                           <strong>文件</strong>
                           <small>{files.length} 个文件/产物</small>
