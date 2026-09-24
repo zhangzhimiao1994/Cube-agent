@@ -192,6 +192,32 @@ type DownloadableArtifact = RunArtifact & {
 };
 
 const DETAIL_WORKBENCH_ACTION_PREVIEW_LIMIT = 12;
+const DETAIL_AGENT_NICKNAMES = [
+  "费曼",
+  "陆思聆",
+  "沈括",
+  "顾准",
+  "林衡",
+  "苏澈",
+  "程予",
+  "许砚",
+  "白芷",
+  "周晏",
+  "叶岚",
+  "秦越",
+  "陶然",
+  "闻舟",
+  "韩序",
+  "江宁",
+  "夏衡",
+  "洛川",
+  "宁远",
+  "方知",
+  "黎初",
+  "孟珩",
+  "楚越",
+  "谢安",
+];
 type DetailWorkbenchView = "overview" | "actions";
 
 type DetailWorkbenchFileItem = {
@@ -567,10 +593,35 @@ function displayDetailToolName(toolName: string | null | undefined, operationKin
   return text;
 }
 
-function displayDetailActor(actor: string | null | undefined) {
+function stableDetailAgentNickname(agentId: string) {
+  let hash = 0;
+  for (const character of agentId) {
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  }
+  return DETAIL_AGENT_NICKNAMES[hash % DETAIL_AGENT_NICKNAMES.length];
+}
+
+function detailAgentFunctionLabel(actor: string) {
+  const text = actor.toLowerCase();
+  if (/context|loader|上下文/.test(text)) return "上下文";
+  if (/implement|coder|engineer|build|代码|实现|工程/.test(text)) return "实现";
+  if (/review|critic|security|审查|审核|安全/.test(text)) return "审查";
+  if (/verify|verifier|test|qa|acceptance|验证|测试/.test(text)) return "验证";
+  if (/plan|architect|planner|架构|规划|计划/.test(text)) return "规划";
+  if (/repair|fix|self.?repair|修复/.test(text)) return "修复";
+  if (/summar|synth|final|汇总|总结/.test(text)) return "汇总";
+  if (/copy|writer|文案|写作/.test(text)) return "文案";
+  return "协作";
+}
+
+function displayDetailAgent(actor: string | null | undefined) {
   if (!actor) return "";
   if (actor === "main_agent" || actor === "main") return "主 Agent";
-  return actor;
+  return `${stableDetailAgentNickname(actor)} · ${detailAgentFunctionLabel(actor)}`;
+}
+
+function displayDetailActor(actor: string | null | undefined) {
+  return displayDetailAgent(actor);
 }
 
 function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
@@ -1334,6 +1385,25 @@ function detailCardActionTarget(card: DetailProcessCard) {
   const fallbackTarget = detailCardRowValue(card, /^工具$/) || detailCardRowValue(card, /^步骤$/);
   if (fallbackTarget) return conciseProcessText(fallbackTarget, "");
   return "";
+}
+
+function detailTextWithAgentDisplay(text: string, actor: string | null | undefined) {
+  const actorTitle = displayDetailAgent(actor);
+  const rawActor = actor?.trim();
+  if (!actorTitle || !rawActor) return text;
+  const escapedActor = rawActor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return text
+    .replace(new RegExp(`${escapedActor}\\s*子\\s*Agent`, "gi"), actorTitle)
+    .replace(new RegExp(`\\b${escapedActor}\\b`, "gi"), actorTitle);
+}
+
+function detailProcessCardDisplayTitle(card: DetailProcessCard) {
+  const actorTitle = displayDetailAgent(card.sourceActor);
+  const cleaned = conciseProcessText(
+    detailTextWithAgentDisplay(card.title, card.sourceActor),
+    card.title,
+  );
+  return cleaned || actorTitle;
 }
 
 function detailCardActionMeta(card: DetailProcessCard) {
@@ -2654,7 +2724,7 @@ function DetailCoordinationEvidence({
                 {section.snippets.map((snippet) => (
                   <button key={snippet.id} type="button" onClick={() => onOpen(snippet.target)}>
                     <small>{snippet.label}</small>
-                    <span>{snippet.text}</span>
+                    <span>{detailTextWithAgentDisplay(snippet.text, snippet.target.sourceActor)}</span>
                   </button>
                 ))}
               </div>
@@ -2678,6 +2748,7 @@ function DetailWorkbenchActionRow({
   onOpenFile: (file: DetailWorkbenchFileItem) => void;
 }) {
   const actionMeta = detailCardActionMeta(card);
+  const displayTitle = detailProcessCardDisplayTitle(card);
   return (
     <article className="agent-workbench-action-row">
       <button
@@ -2687,7 +2758,7 @@ function DetailWorkbenchActionRow({
       >
         <span aria-hidden="true">›</span>
         <small className="process-card-badge">{card.label}</small>
-        <strong>{card.title}</strong>
+        <strong>{displayTitle}</strong>
         {actionMeta.length > 0 ? (
           <span className="agent-workbench-action-meta">
             {actionMeta.map((meta) => (
@@ -2698,13 +2769,13 @@ function DetailWorkbenchActionRow({
         {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
       </button>
       {files.length > 0 ? (
-        <div className="agent-workbench-action-files" aria-label={`${card.title}关联文件`}>
+        <div className="agent-workbench-action-files" aria-label={`${displayTitle}关联文件`}>
           {files.map((file) => (
             <button key={file.id} type="button" onClick={() => onOpenFile(file)} aria-label={`预览文件 ${file.path || file.filename}`}>
               <small>{file.operation}</small>
               <strong>{file.path || file.filename}</strong>
               {file.source ? (
-                <span>{[file.source.sourceActor, file.source.label, file.source.title].filter(Boolean).join(" · ")}</span>
+                <span>{[displayDetailAgent(file.source.sourceActor), file.source.label, detailProcessCardDisplayTitle(file.source)].filter(Boolean).join(" · ")}</span>
               ) : null}
             </button>
           ))}

@@ -81,6 +81,28 @@ _PLUGIN_CONTRACT_DETAIL_KEYS = (
     ("sandbox_ref", "sandbox_profile", "sandbox_policy", "sandbox"),
     ("recovery_ref", "failure_modes", "recovery_plan", "failure_recovery"),
 )
+_REPAIR_CONTEXT_MAX_FILES = 24
+_REPAIR_CONTEXT_MAX_SNIPPET_CHARS = 700
+_REPAIR_CONTEXT_EXTENSIONS = frozenset(
+    {
+        ".cjs",
+        ".css",
+        ".html",
+        ".js",
+        ".json",
+        ".jsx",
+        ".md",
+        ".mjs",
+        ".mts",
+        ".ts",
+        ".tsx",
+        ".yaml",
+        ".yml",
+    }
+)
+_REPAIR_CONTEXT_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.@+/-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|mts|ts|tsx|yaml|yml))(?![A-Za-z0-9_./-])"
+)
 _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
     "plugin_contract",
     "plugin_capability_contract",
@@ -655,6 +677,7 @@ def execute_project_scale_plan(
                     )
                     evidence["deliverable_quality"] = deliverable_quality.passed
             deliverable_repair_attempts = 0
+            current_workspace_bundle = observation.workspace_bundle
             max_deliverable_repair_attempts = (
                 _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS
                 if plan.benchmark_kind == "capability"
@@ -702,7 +725,7 @@ def execute_project_scale_plan(
                         request_body,
                         run_request.case_id,
                         benchmark_kind=plan.benchmark_kind,
-                        source_workspace_bundle=observation.workspace_bundle,
+                        source_workspace_bundle=current_workspace_bundle,
                         failed_reasons=(
                             *deliverable_quality.reasons,
                             *agent_standard_verification.reasons,
@@ -782,9 +805,10 @@ def execute_project_scale_plan(
                     )
                 )
                 repair_workspace_bundle = _merged_workspace_bundle(
-                    observation.workspace_bundle,
+                    current_workspace_bundle,
                     repair_observation.workspace_bundle,
                 )
+                current_workspace_bundle = repair_workspace_bundle
                 deliverable_quality = _evaluate_deliverable_quality(
                     repair_observation.details,
                     repair_observation.events,
@@ -2100,7 +2124,6 @@ def _deliverable_repair_body(
     benchmark_kind: str = "fixture",
     source_workspace_bundle: bytes | None = None,
 ) -> dict[str, object]:
-    del source_workspace_bundle
     repair_body = dict(body)
     original_message = body.get("message")
     if benchmark_kind == "capability":
@@ -2136,15 +2159,24 @@ def _deliverable_repair_body(
         )
         if case_id.startswith("medium:"):
             guidance += medium_guidance
+        context = _workspace_repair_context(
+            source_workspace_bundle,
+            failed_reasons=failed_reasons,
+        )
         guidance += (
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
             "Report executed checks only.\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
         prefix = guidance + reasons + "\nOriginal request:\n"
-        available = 2_000 - len(" ".join(prefix.split())) - 1
+        suffix = f"\n{context}" if context else ""
+        max_chars = 2_600 if context else 2_000
+        available = max_chars - len(" ".join((prefix + suffix).split())) - 1
         bounded_original = original[: max(available, 0)]
-        repair_body["message"] = _bounded_role_planning_task_text(prefix + bounded_original)
+        repair_body["message"] = _bounded_role_planning_task_text(
+            prefix + bounded_original + suffix,
+            max_chars=max_chars,
+        )
         repair_body["skip_evolution_proposal"] = True
         return repair_body
     reason_text = _format_failed_reasons(failed_reasons)
@@ -2181,9 +2213,109 @@ def _deliverable_repair_body(
         "Original request:\n"
         f"{original_message if isinstance(original_message, str) else ''}"
     )
-    repair_body["message"] = _bounded_role_planning_task_text(repair_message)
+    context = _workspace_repair_context(source_workspace_bundle, failed_reasons=failed_reasons)
+    repair_body["message"] = _bounded_role_planning_task_text(
+        f"{repair_message}\n{context}" if context else repair_message,
+        max_chars=2_600 if context else 2_000,
+    )
     repair_body["skip_evolution_proposal"] = True
     return repair_body
+
+
+def _workspace_repair_context(
+    workspace_bundle: bytes | None,
+    *,
+    failed_reasons: Sequence[str],
+) -> str:
+    if workspace_bundle is None:
+        return ""
+    files = _workspace_bundle_file_bytes(workspace_bundle)
+    if not files:
+        return ""
+    paths = sorted(files)
+    relevant_paths = _repair_context_relevant_paths(paths, failed_reasons)
+    snippets = []
+    for path in relevant_paths:
+        raw = files.get(path)
+        if raw is None:
+            continue
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except AttributeError:
+            continue
+        snippets.append(f"- {path}: {_compact_repair_snippet(text)}")
+    inventory = ", ".join(paths[:_REPAIR_CONTEXT_MAX_FILES])
+    if len(paths) > _REPAIR_CONTEXT_MAX_FILES:
+        inventory += f", ... (+{len(paths) - _REPAIR_CONTEXT_MAX_FILES} more)"
+    hints = _repair_context_failure_hints(failed_reasons)
+    parts = [
+        "Current workspace context for precise repair:",
+        f"Files: {inventory}",
+    ]
+    if snippets:
+        parts.append("Relevant file snippets:")
+        parts.extend(snippets)
+    if hints:
+        parts.append(hints)
+    return "\n".join(parts)
+
+
+def _repair_context_relevant_paths(
+    paths: Sequence[str],
+    failed_reasons: Sequence[str],
+) -> list[str]:
+    path_set = set(paths)
+    selected: list[str] = []
+
+    def add(path: str) -> None:
+        if path in path_set and path not in selected:
+            selected.append(path)
+
+    failed_text = "\n".join(failed_reasons)
+    for match in _REPAIR_CONTEXT_PATH_RE.finditer(failed_text):
+        add(match.group(1))
+    for path in paths:
+        basename = PurePosixPath(path).name.lower()
+        if basename in {"package.json", "tsconfig.json"}:
+            add(path)
+    if "has no exported member" in failed_text or "TS2305" in failed_text:
+        for path in paths:
+            lowered = path.lower()
+            if lowered.endswith(("/types.ts", "/types.tsx")) or lowered in {
+                "src/types.ts",
+                "src/types.tsx",
+                "types.ts",
+                "types.tsx",
+            }:
+                add(path)
+    if not selected:
+        for path in paths:
+            suffix = PurePosixPath(path).suffix.lower()
+            if suffix in _REPAIR_CONTEXT_EXTENSIONS:
+                add(path)
+            if len(selected) >= 4:
+                break
+    return selected[:8]
+
+
+def _compact_repair_snippet(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= _REPAIR_CONTEXT_MAX_SNIPPET_CHARS:
+        return compact
+    return compact[: _REPAIR_CONTEXT_MAX_SNIPPET_CHARS - 4].rstrip() + " ..."
+
+
+def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
+    text = "\n".join(failed_reasons)
+    if "TS2305" not in text and "has no exported member" not in text:
+        return ""
+    symbols = re.findall(r"has no exported member '([^']+)'", text)
+    symbol_note = f" Missing export(s): {', '.join(dict.fromkeys(symbols))}." if symbols else ""
+    return (
+        "TypeScript import/export repair hint: TS2305 means the imported symbol must be "
+        "exported by that module, or the import must be corrected/removed."
+        f"{symbol_note}"
+    )
 
 
 def _bounded_role_planning_task_text(value: str, *, max_chars: int = 2_000) -> str:

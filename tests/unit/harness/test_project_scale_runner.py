@@ -1966,6 +1966,44 @@ def test_direct_deliverable_repair_prompt_requires_embedded_bundle() -> None:
     assert "sk-" in repair_message
 
 
+def test_deliverable_repair_prompt_includes_relevant_workspace_context() -> None:
+    bundle = _project_bundle(
+        {
+            "package.json": json.dumps({"scripts": {"build": "tsc -p tsconfig.json"}}),
+            "tsconfig.json": json.dumps({"compilerOptions": {"strict": True}}),
+            "src/server.ts": "import type { CreateServerOptions } from './types';\nexport function start(options: CreateServerOptions) { return options.port; }\n",
+            "src/types.ts": "export type Task = { id: string; title: string };\n",
+            "README.md": "# Small task API\n",
+        }
+    )
+
+    repair_body = _deliverable_repair_body(
+        {
+            "message": "Build a small task API.",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "small:self_repair",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle,
+        failed_reasons=(
+            (
+                "generated_project_validation: command failed exit=2 command=npm run build "
+                "output_tail=\"src/server.ts(8,15): error TS2305: Module './types' "
+                "has no exported member 'CreateServerOptions'.\""
+            ),
+        ),
+    )
+
+    repair_message = str(repair_body["message"])
+    assert "Current workspace context for precise repair" in repair_message
+    assert "src/server.ts" in repair_message
+    assert "src/types.ts" in repair_message
+    assert "CreateServerOptions" in repair_message
+    assert "TS2305 means the imported symbol must be exported" in repair_message
+
+
 def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     embedded_bundle = {
@@ -3323,6 +3361,8 @@ def test_capability_generated_project_repair_can_use_second_round(
     assert len(client.submitted_bodies) == 4
     repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
     assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
+    assert "Current workspace context for precise repair" in repair_messages[0]
+    assert "src/app.ts" in repair_messages[0]
     assert "Expected 2 arguments, but got 1" in repair_messages[1]
     assert "validator helpers that require a field argument" in repair_messages[1]
     assert "Property 'tenant_id' does not exist" in repair_messages[2]
