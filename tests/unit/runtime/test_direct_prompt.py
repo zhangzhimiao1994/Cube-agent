@@ -40,6 +40,21 @@ def test_project_scale_fixture_files_include_agent_standard_reading_evidence() -
     assert _workspace_bundle_agent_standard_reasons(buffer.getvalue()) == ()
 
 
+def test_project_scale_small_fixture_files_include_start_script() -> None:
+    files = project_scale_artifact_zip_files(
+        "Project-scale acceptance fixture: build a small project for scale=small "
+        "and flow=artifact_production."
+    )
+
+    package_json = json.loads(files["package.json"])
+
+    assert package_json["scripts"]["build"] == "tsc -p tsconfig.json --noEmit"
+    assert package_json["scripts"]["test"] == "vitest run"
+    assert package_json["scripts"]["start"] == "node src/server.js"
+    assert "src/server.js" in files
+    assert "server listens on PORT" in files["VERIFICATION.md"]
+
+
 def test_project_scale_fixture_files_include_buildable_node_type_config() -> None:
     files = project_scale_artifact_zip_files(
         "Project-scale acceptance fixture: build an ultra project for scale=ultra "

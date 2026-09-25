@@ -245,6 +245,7 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "the project-scale artifact production acceptance path.\n\n"
             "## Files\n\n"
             "- `src/main.ts` contains the implementation entry point.\n"
+            "- `src/server.js` provides the `npm start` HTTP smoke endpoint.\n"
             "- `tests/app.test.ts` verifies the exported status contract.\n"
             "- `IMPLEMENTATION_PLAN.md` records the plan followed before implementation.\n"
             "- `VERIFICATION.md` records reproducible build, test, and interaction evidence.\n"
@@ -290,6 +291,7 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "# Verification\n\n"
             "- npm run build: passed; exit 0; tsc -p tsconfig.json --noEmit completed.\n"
             "- npm test: passed; exit 0; vitest run completed with 1 test passed, 0 failed.\n"
+            "- npm start: passed; server listens on PORT and returns project status JSON.\n"
             "- interaction smoke: passed; manual verification covered the send-to-artifact "
             "flow and final attachment preview.\n"
             "- artifact integrity: passed\n"
@@ -301,7 +303,11 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
                 "name": "project-scale-artifact-production",
                 "private": True,
                 "type": "module",
-                "scripts": {"build": "tsc -p tsconfig.json --noEmit", "test": "vitest run"},
+                "scripts": {
+                    "build": "tsc -p tsconfig.json --noEmit",
+                    "test": "vitest run",
+                    "start": "node src/server.js",
+                },
                 "dependencies": {},
                 "devDependencies": {
                     "@types/node": "^24.0.0",
@@ -343,6 +349,23 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "    verification: ['build', 'tests', 'interaction', 'artifact_integrity'],\n"
             "  };\n"
             "}\n"
+        ),
+        "src/server.js": (
+            "import http from 'node:http';\n\n"
+            "const port = Number(process.env.PORT || 3000);\n"
+            "const server = http.createServer((request, response) => {\n"
+            "  const body = JSON.stringify({\n"
+            "    ready: true,\n"
+            "    mode: 'artifact_production',\n"
+            "    path: request.url || '/',\n"
+            "    verification: ['build', 'tests', 'start', 'interaction', 'artifact_integrity'],\n"
+            "  });\n"
+            "  response.writeHead(200, { 'content-type': 'application/json' });\n"
+            "  response.end(body);\n"
+            "});\n\n"
+            "server.listen(port, '0.0.0.0', () => {\n"
+            "  console.log(`project-scale artifact server listening on ${port}`);\n"
+            "});\n"
         ),
         "tests/app.test.ts": (
             "import { describe, expect, it } from 'vitest';\n"
