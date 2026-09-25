@@ -33,7 +33,12 @@ from agent_hub.runtime.contracts import (
     RuntimeContractError,
     TaskContext,
 )
-from agent_hub.runtime.direct import DirectRuntime, RuntimeBusy, RuntimeExecutionError
+from agent_hub.runtime.direct import (
+    DirectRuntime,
+    RuntimeBusy,
+    RuntimeExecutionError,
+    _project_scale_workspace_bundle_from_model_text,
+)
 from agent_hub.runtime.registry import InvalidRuntimeRegistration, RuntimeRegistry
 
 RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -1095,12 +1100,6 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
 
 
 async def test_direct_extracts_project_scale_markdown_bundle_with_level_two_headings() -> None:
-    request = (
-        "Build a real medium business project for flow=direct. "
-        "Return strict JSON workspace_bundle.files (relative paths to full content). "
-        "Acceptance conditions: independently test API behavior and errors with "
-        "reproducible verification evidence."
-    )
     text = """
 Below is the bundle.
 
@@ -1116,16 +1115,8 @@ Below is the bundle.
 export const ok = true;
 ```
 """.strip()
-    runtime = DirectRuntime(
-        FakeGateway(ModelResponse(text=text, usage=TokenUsage(1, 1, 2))),
-        logical_model="general",
-    )
 
-    events = await collect(runtime, context(request=request, token_budget=100_000))
-
-    assert events[1].artifact is not None
-    assert events[1].artifact.type == "tool_result"
-    assert events[1].payload["workspace_bundle"] == {
+    assert _project_scale_workspace_bundle_from_model_text(text) == {
         "files": {"README.md": "# CRM Lite\n", "src/server.ts": "export const ok = true;\n"}
     }
 

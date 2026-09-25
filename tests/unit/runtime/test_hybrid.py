@@ -439,8 +439,8 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
         "constraints_reading_evidence.json",
         "VERIFICATION.md",
         "package.json",
-        "src/main.ts",
-        "tests/app.test.ts",
+        "src/main.js",
+        "tests/app.test.js",
     }
     completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
     assert completed.artifact is not None

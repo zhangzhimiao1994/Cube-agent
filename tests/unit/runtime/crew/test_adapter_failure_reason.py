@@ -2503,8 +2503,8 @@ async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() 
         "IMPLEMENTATION_PLAN.md",
         "VERIFICATION.md",
         "package.json",
-        "src/main.ts",
-        "tests/app.test.ts",
+        "src/main.js",
+        "tests/app.test.js",
     }
     assert len(gateway.requests) == 2
     assert any(
