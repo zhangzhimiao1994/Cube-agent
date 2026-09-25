@@ -676,6 +676,8 @@ def execute_project_scale_plan(
                         observation.workspace_bundle, generated_project_validation
                     )
                     evidence["deliverable_quality"] = deliverable_quality.passed
+            if evidence["workspace_bundle"]:
+                _drop_recovered_workspace_bundle_errors(errors)
             deliverable_repair_attempts = 0
             current_workspace_bundle = observation.workspace_bundle
             max_deliverable_repair_attempts = (
