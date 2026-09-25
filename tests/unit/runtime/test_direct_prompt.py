@@ -48,11 +48,12 @@ def test_project_scale_small_fixture_files_include_start_script() -> None:
 
     package_json = json.loads(files["package.json"])
 
-    assert package_json["scripts"]["build"] == "tsc -p tsconfig.json --noEmit"
+    assert package_json["scripts"]["build"] == "tsc -p tsconfig.json --noEmit && node --check src/server.js"
     assert package_json["scripts"]["test"] == "vitest run"
     assert package_json["scripts"]["start"] == "node src/server.js"
     assert "src/server.js" in files
-    assert "server listens on PORT" in files["VERIFICATION.md"]
+    assert "GET' && url.pathname === '/tasks'" in files["src/server.js"]
+    assert "supports create/list/update/delete/restore" in files["VERIFICATION.md"]
 
 
 def test_project_scale_fixture_files_include_buildable_node_type_config() -> None:
