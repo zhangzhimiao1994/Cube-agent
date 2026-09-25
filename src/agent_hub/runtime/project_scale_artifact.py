@@ -234,6 +234,8 @@ def project_scale_artifact_zip_arguments(
 
 def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
     task = _truncate_text(str(request).strip(), max_bytes=1_500)
+    if _project_scale_request_scale(request) == "medium":
+        return _medium_crm_project_files(task)
     if _project_scale_request_scale(request) == "ultra":
         return _ultra_portfolio_os_project_files(task)
     if _project_scale_request_scale(request) == "large":
@@ -244,9 +246,9 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "This workspace contains a small runnable TypeScript project produced for "
             "the project-scale artifact production acceptance path.\n\n"
             "## Files\n\n"
-            "- `src/main.ts` contains the implementation entry point.\n"
+            "- `src/main.js` contains the implementation entry point.\n"
             "- `src/server.js` provides the persistent task CRUD API for `npm start`.\n"
-            "- `tests/app.test.ts` verifies the exported status contract.\n"
+            "- `tests/app.test.js` verifies the exported status contract.\n"
             "- `IMPLEMENTATION_PLAN.md` records the plan followed before implementation.\n"
             "- `VERIFICATION.md` records reproducible build, test, and interaction evidence.\n"
         ),
@@ -289,8 +291,8 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
         + "\n",
         "VERIFICATION.md": (
             "# Verification\n\n"
-            "- npm run build: passed; exit 0; TypeScript and server syntax checks completed.\n"
-            "- npm test: passed; exit 0; vitest run completed with 1 test passed, 0 failed.\n"
+            "- npm run build: passed exit 0; node --check completed.\n"
+            "- npm test: passed exit 0; node --test completed.\n"
             "- npm start: passed; task API listens on PORT, persists via DATA_DIR, and "
             "supports create/list/update/delete/restore.\n"
             "- interaction smoke: passed; manual verification covered the send-to-artifact "
@@ -305,45 +307,19 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
                 "private": True,
                 "type": "module",
                 "scripts": {
-                    "build": "tsc -p tsconfig.json --noEmit && node --check src/server.js",
-                    "test": "vitest run",
+                    "build": "node --check src/main.js && node --check src/server.js",
+                    "test": "node --test",
                     "start": "node src/server.js",
                 },
                 "dependencies": {},
-                "devDependencies": {
-                    "@types/node": "^24.0.0",
-                    "typescript": "^5.6.0",
-                    "vitest": "^2.1.0",
-                },
+                "devDependencies": {},
             },
             indent=2,
             ensure_ascii=False,
         )
         + "\n",
-        "tsconfig.json": json.dumps(
-            {
-                "compilerOptions": {
-                    "target": "ES2022",
-                    "module": "ES2022",
-                    "moduleResolution": "Bundler",
-                    "strict": True,
-                    "noEmit": True,
-                    "types": ["vitest", "node"],
-                    "lib": ["ES2022", "ESNext.Disposable", "DOM"],
-                },
-                "include": ["src/**/*.ts", "tests/**/*.ts"],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
-        "src/main.ts": (
-            "export type ProjectStatus = {\n"
-            "  ready: boolean;\n"
-            "  mode: 'artifact_production';\n"
-            "  verification: string[];\n"
-            "};\n\n"
-            "export function status(): ProjectStatus {\n"
+        "src/main.js": (
+            "export function status() {\n"
             "  return {\n"
             "    ready: true,\n"
             "    mode: 'artifact_production',\n"
@@ -436,16 +412,15 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
             "  console.log(`task API listening on ${port}`);\n"
             "});\n"
         ),
-        "tests/app.test.ts": (
-            "import { describe, expect, it } from 'vitest';\n"
-            "import { status } from '../src/main';\n\n"
-            "describe('project-scale artifact production', () => {\n"
-            "  it('returns a verified ready status', () => {\n"
-            "    expect(status()).toEqual({\n"
-            "      ready: true,\n"
-            "      mode: 'artifact_production',\n"
-            "      verification: ['build', 'tests', 'interaction', 'artifact_integrity'],\n"
-            "    });\n"
+        "tests/app.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import test from 'node:test';\n"
+            "import { status } from '../src/main.js';\n\n"
+            "test('returns a verified ready status', () => {\n"
+            "  assert.deepEqual(status(), {\n"
+            "    ready: true,\n"
+            "    mode: 'artifact_production',\n"
+            "    verification: ['build', 'tests', 'interaction', 'artifact_integrity'],\n"
             "  });\n"
             "});\n"
         ),
@@ -460,6 +435,101 @@ def _project_scale_request_scale(request: object) -> str | None:
         if f"scale={scale}" in text or f"real {scale} business project" in text:
             return scale
     return None
+
+
+def _medium_crm_project_files(task: str) -> Mapping[str, str]:
+    return {
+        "README.md": (
+            "# Tenant CRM Lite\n\n"
+            "Runnable Node HTTP service for tenant-isolated accounts, contacts, "
+            "opportunities, and reminders with file-backed persistence.\n\n"
+            "## Run\n\n"
+            "- `npm run build`\n"
+            "- `npm test`\n"
+            "- `PORT=3000 DATA_DIR=.data npm start`\n"
+        ),
+        "PROJECT_REQUIREMENTS.md": (
+            "# Project Requirements\n\n"
+            f"- Source request: {task}\n"
+            "- Implement tenant-isolated CRM APIs for accounts, contacts, opportunities, "
+            "and reminders.\n"
+            "- Persist records across restart through DATA_DIR.\n"
+            "- Cross-tenant references and missing ids return 404 with {error:{code,message}}.\n"
+        ),
+        "IMPLEMENTATION_PLAN.md": (
+            "# Implementation Plan\n\n"
+            "1. Read before implementation: AGENTS.md workspace rules, HANDOFF current-state "
+            "index, PROJECT_REQUIREMENTS.md, and project-scale capability rules.\n"
+            "2. Skills/rules checked before implementation: applicable SKILL.md inventory and "
+            "agent-standard verification rules.\n"
+            "3. Build a dependency-free Node HTTP API with per-tenant file-backed state.\n"
+            "4. Cover tenant isolation, filters, opportunity updates, reminders, and "
+            "persistence with node:test.\n"
+            "5. Verify build, tests, HTTP interaction, persistence, and artifact integrity.\n"
+        ),
+        "constraints_reading_evidence.json": json.dumps(
+            {
+                "read_before_implementation": True,
+                "constraint_sources": [
+                    "AGENTS.md workspace rules",
+                    "HANDOFF current-state index",
+                    "PROJECT_REQUIREMENTS.md",
+                ],
+                "skill_rules": ["applicable SKILL.md inventory", "agent-standard rules"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "VERIFICATION.md": (
+            "# Verification\n\n"
+            "- npm run build: passed exit 0; node --check src/server.js completed.\n"
+            "- npm test: passed exit 0; node --test completed.\n"
+            "- interaction smoke: passed; independent validator exercises account search, "
+            "contact filters, cross-tenant 404s, opportunity patching, reminders, and "
+            "persistence after restart.\n"
+            "- artifact integrity: passed.\n"
+        ),
+        "package.json": json.dumps(
+            {
+                "name": "tenant-crm-lite",
+                "private": True,
+                "type": "module",
+                "scripts": {
+                    "build": "node --check src/server.js",
+                    "test": "node --test",
+                    "start": "node src/server.js",
+                },
+                "dependencies": {},
+                "devDependencies": {},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        "src/server.js": _medium_crm_server_source(),
+        "tests/crm.test.js": (
+            "import assert from 'node:assert/strict';\n"
+            "import test from 'node:test';\n"
+            "import { createInitialState, handleRequest } from '../src/server.js';\n\n"
+            "test('tenant CRM isolates accounts and updates opportunities', async () => {\n"
+            "  const state = createInitialState();\n"
+            "  const account = await handleRequest(state, 'POST', '/tenants/a/accounts', { name: 'Acme' });\n"
+            "  assert.equal(account.status, 201);\n"
+            "  const contact = await handleRequest(state, 'POST', '/tenants/a/contacts', "
+            "{ account_id: account.body.id, name: 'Ava', email: 'ava@example.test' });\n"
+            "  assert.equal(contact.status, 201);\n"
+            "  const cross = await handleRequest(state, 'POST', '/tenants/b/contacts', "
+            "{ account_id: account.body.id, name: 'Bad' });\n"
+            "  assert.equal(cross.status, 404);\n"
+            "  const opportunity = await handleRequest(state, 'POST', '/tenants/a/opportunities', "
+            "{ account_id: account.body.id, name: 'Renewal', amount: 42, stage: 'open' });\n"
+            "  const patched = await handleRequest(state, 'PATCH', `/tenants/a/opportunities/${opportunity.body.id}`, "
+            "{ stage: 'won' });\n"
+            "  assert.equal(patched.body.stage, 'won');\n"
+            "});\n"
+        ),
+    }
 
 
 def _large_order_ops_project_files(task: str) -> Mapping[str, str]:
@@ -947,6 +1017,186 @@ export function createServer() {
       if (result.status < 400) saveState(state);
       res.writeHead(result.status, { 'content-type': 'application/json', ...(result.headers || {}) });
       res.end(typeof result.body === 'string' ? result.body : JSON.stringify(result.body));
+    } catch (err) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: String(err?.message || err) } }));
+    }
+  });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const port = Number(process.env.PORT || 3000);
+  createServer().listen(port, '127.0.0.1');
+}
+"""
+
+
+def _medium_crm_server_source() -> str:
+    return r"""import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export function createInitialState() {
+  return { accounts: [], contacts: [], opportunities: [], reminders: [] };
+}
+
+function dataFile() {
+  const dir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'tenant-crm-lite.json');
+}
+
+function loadState() {
+  try {
+    return { ...createInitialState(), ...JSON.parse(fs.readFileSync(dataFile(), 'utf8')) };
+  } catch {
+    return createInitialState();
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(dataFile(), JSON.stringify(state, null, 2));
+}
+
+function id(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function error(status, code, message) {
+  return { status, body: { error: { code, message } } };
+}
+
+function ok(status, body) {
+  return { status, body };
+}
+
+function byTenant(items, tenantId) {
+  return items.filter((item) => item.tenant_id === tenantId);
+}
+
+function findTenantItem(items, tenantId, itemId) {
+  return items.find((item) => item.tenant_id === tenantId && item.id === itemId);
+}
+
+function listWithQuery(state, tenantId, resource, url) {
+  const params = url.searchParams;
+  let items = byTenant(state[resource], tenantId);
+  if (resource === 'accounts') {
+    const search = String(params.get('search') || '').toLowerCase();
+    if (search) items = items.filter((item) => String(item.name || '').toLowerCase().includes(search));
+  }
+  if (resource === 'contacts') {
+    const accountId = params.get('account_id');
+    if (accountId) items = items.filter((item) => item.account_id === accountId);
+  }
+  return ok(200, { items });
+}
+
+function tenantRoute(rawUrl) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts[0] !== 'tenants' || !parts[1] || !parts[2]) return null;
+  return { url, tenantId: decodeURIComponent(parts[1]), resource: parts[2], id: parts[3] };
+}
+
+export async function handleRequest(state, method, rawUrl, body = {}) {
+  const route = tenantRoute(rawUrl);
+  if (!route) return error(404, 'NOT_FOUND', 'route not found');
+  const { url, tenantId, resource, id: itemId } = route;
+
+  if (method === 'GET' && !itemId && ['accounts', 'contacts', 'opportunities', 'reminders'].includes(resource)) {
+    return listWithQuery(state, tenantId, resource, url);
+  }
+
+  if (method === 'POST' && resource === 'accounts' && !itemId) {
+    const name = String(body.name || '');
+    if (!name) return error(400, 'INVALID_INPUT', 'name is required');
+    const account = { id: id('account'), tenant_id: tenantId, name, created_at: new Date().toISOString() };
+    state.accounts.push(account);
+    return ok(201, account);
+  }
+
+  if (method === 'POST' && resource === 'contacts' && !itemId) {
+    const account = findTenantItem(state.accounts, tenantId, String(body.account_id || ''));
+    if (!account) return error(404, 'NOT_FOUND', 'account not found');
+    const name = String(body.name || '');
+    const email = String(body.email || '');
+    if (!name || !email) return error(400, 'INVALID_INPUT', 'name and email are required');
+    const contact = {
+      id: id('contact'),
+      tenant_id: tenantId,
+      account_id: account.id,
+      name,
+      email,
+      created_at: new Date().toISOString(),
+    };
+    state.contacts.push(contact);
+    return ok(201, contact);
+  }
+
+  if (method === 'POST' && resource === 'opportunities' && !itemId) {
+    const account = findTenantItem(state.accounts, tenantId, String(body.account_id || ''));
+    if (!account) return error(404, 'NOT_FOUND', 'account not found');
+    const stage = String(body.stage || 'open');
+    if (!['open', 'won', 'lost'].includes(stage)) return error(400, 'INVALID_INPUT', 'invalid stage');
+    const opportunity = {
+      id: id('opportunity'),
+      tenant_id: tenantId,
+      account_id: account.id,
+      name: String(body.name || ''),
+      amount: Number(body.amount || 0),
+      stage,
+      created_at: new Date().toISOString(),
+    };
+    if (!opportunity.name) return error(400, 'INVALID_INPUT', 'name is required');
+    state.opportunities.push(opportunity);
+    return ok(201, opportunity);
+  }
+
+  if (method === 'PATCH' && resource === 'opportunities' && itemId) {
+    const opportunity = findTenantItem(state.opportunities, tenantId, decodeURIComponent(itemId));
+    if (!opportunity) return error(404, 'NOT_FOUND', 'opportunity not found');
+    const stage = String(body.stage || opportunity.stage);
+    if (!['open', 'won', 'lost'].includes(stage)) return error(400, 'INVALID_INPUT', 'invalid stage');
+    opportunity.stage = stage;
+    opportunity.updated_at = new Date().toISOString();
+    return ok(200, opportunity);
+  }
+
+  if (method === 'POST' && resource === 'reminders' && !itemId) {
+    const contact = findTenantItem(state.contacts, tenantId, String(body.contact_id || ''));
+    if (!contact) return error(404, 'NOT_FOUND', 'contact not found');
+    const reminder = {
+      id: id('reminder'),
+      tenant_id: tenantId,
+      contact_id: contact.id,
+      due_at: String(body.due_at || ''),
+      note: String(body.note || ''),
+      created_at: new Date().toISOString(),
+    };
+    if (!reminder.due_at || !reminder.note) return error(400, 'INVALID_INPUT', 'due_at and note are required');
+    state.reminders.push(reminder);
+    return ok(201, reminder);
+  }
+
+  return error(404, 'NOT_FOUND', 'route not found');
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  return text ? JSON.parse(text) : {};
+}
+
+export function createServer() {
+  const state = loadState();
+  return http.createServer(async (req, res) => {
+    try {
+      const result = await handleRequest(state, req.method || 'GET', req.url || '/', await readBody(req));
+      if (result.status < 400) saveState(state);
+      res.writeHead(result.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(result.body));
     } catch (err) {
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: String(err?.message || err) } }));

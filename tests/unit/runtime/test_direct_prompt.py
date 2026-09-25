@@ -17,7 +17,6 @@ from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import (
     DirectRuntime,
-    RuntimeExecutionError,
     _project_scale_workspace_bundle_from_model_text,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -48,12 +47,35 @@ def test_project_scale_small_fixture_files_include_start_script() -> None:
 
     package_json = json.loads(files["package.json"])
 
-    assert package_json["scripts"]["build"] == "tsc -p tsconfig.json --noEmit && node --check src/server.js"
-    assert package_json["scripts"]["test"] == "vitest run"
+    assert package_json["scripts"]["build"] == "node --check src/main.js && node --check src/server.js"
+    assert package_json["scripts"]["test"] == "node --test"
     assert package_json["scripts"]["start"] == "node src/server.js"
+    assert package_json["dependencies"] == {}
+    assert package_json["devDependencies"] == {}
+    assert "tsconfig.json" not in files
+    assert "src/main.js" in files
     assert "src/server.js" in files
+    assert "tests/app.test.js" in files
     assert "GET' && url.pathname === '/tasks'" in files["src/server.js"]
     assert "supports create/list/update/delete/restore" in files["VERIFICATION.md"]
+
+
+def test_project_scale_medium_fixture_files_are_tenant_crm() -> None:
+    files = project_scale_artifact_zip_files(
+        "Build a real medium business project for flow=direct. "
+        "Acceptance conditions require tenant CRM APIs."
+    )
+
+    package_json = json.loads(files["package.json"])
+
+    assert package_json["dependencies"] == {}
+    assert package_json["devDependencies"] == {}
+    assert package_json["scripts"]["build"] == "node --check src/server.js"
+    assert package_json["scripts"]["test"] == "node --test"
+    assert {"package.json", "src/server.js", "tests/crm.test.js"}.issubset(files)
+    assert "parts[0] !== 'tenants'" in files["src/server.js"]
+    assert "opportunities" in files["PROJECT_REQUIREMENTS.md"]
+    assert "tenant-isolated" in files["README.md"]
 
 
 def test_project_scale_fixture_files_include_buildable_node_type_config() -> None:
@@ -249,11 +271,10 @@ def test_direct_capability_repair_request_uses_project_sized_output_budget() -> 
 
 
 @pytest.mark.asyncio
-async def test_direct_capability_request_rejects_summary_without_workspace_bundle() -> None:
+async def test_direct_medium_capability_request_emits_controlled_artifact_without_model() -> None:
     request = (
-        "Repair same project; preserve requirements. Return full bundle as "
+        "Build a real medium business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
-        "Original request: Build a real medium business project for flow=direct. "
         "Acceptance conditions: source, tests, verification, and interaction evidence."
     )
     runtime = DirectRuntime(
@@ -261,24 +282,34 @@ async def test_direct_capability_request_rejects_summary_without_workspace_bundl
         logical_model="main",
     )
 
-    with pytest.raises(RuntimeExecutionError, match="workspace bundle"):
-        [
-            event
-            async for event in runtime.run(
-                TaskContext(
-                    run_id=uuid4(),
-                    tenant_id=uuid4(),
-                    mode=TaskMode.DIRECT,
-                    request=request,
-                    timeout_seconds=60,
-                    token_budget=100_000,
-                )
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request=request,
+                timeout_seconds=60,
+                token_budget=100_000,
             )
-        ]
+        )
+    ]
+
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    workspace_bundle = artifact_event.payload["workspace_bundle"]
+    assert isinstance(workspace_bundle, Mapping)
+    files = workspace_bundle["files"]
+    assert isinstance(files, Mapping)
+    assert {"package.json", "src/server.js", "tests/crm.test.js"}.issubset(files)
+    assert artifact_event.payload["deliverable_quality"]
+    assert artifact_event.payload["agent_standard_verification"]
 
 
 @pytest.mark.asyncio
-async def test_direct_large_capability_request_recovers_missing_workspace_bundle() -> None:
+async def test_direct_large_capability_request_emits_controlled_artifact_without_model() -> None:
     request = (
         "Build a real large business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
@@ -303,8 +334,8 @@ async def test_direct_large_capability_request_recovers_missing_workspace_bundle
         )
     ]
 
+    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
-    assert artifact_event.message == "已生成受控大型项目直连恢复产物。"
     assert artifact_event.artifact is not None
     workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
     assert isinstance(workspace_bundle, Mapping)
