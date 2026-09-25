@@ -545,6 +545,7 @@ class RunDetailResponse(RunListItem):
     openclaw_proposal: dict[str, JsonValue] | None = None
     project_preflight_proposal: dict[str, JsonValue] | None = None
     repair_proposal: dict[str, JsonValue] | None = None
+    capability_install_proposal: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def populate_failure_diagnostics(self) -> RunDetailResponse:
@@ -1089,6 +1090,21 @@ class PluginArchiveInstallResponse(BaseModel):
     filename: str
     content_sha256: str
     plugin: PluginResourceResponse
+
+
+class CapabilityInstallerResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=1000)
+
+
+class CapabilityInstallerPlanRequest(CapabilityInstallerResolveRequest):
+    entry_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+
+
+class CapabilityInstallerInstallRequest(CapabilityInstallerPlanRequest):
+    plan_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    confirm: bool = False
 
 
 class PluginPackageApprovalRequest(BaseModel):
@@ -2825,6 +2841,30 @@ class AdminResourceService(Protocol):
         content_sha256: str | None = None,
         package_metadata: PluginPackageMetadata | None = None,
     ) -> PluginResourceResponse: ...
+
+    async def get_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, str] | None: ...
+
+    async def upsert_capability_install_state(
+        self,
+        entry_id: str,
+        state: dict[str, str],
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> dict[str, str]: ...
+
+    async def delete_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None: ...
 
     async def start_plugin(
         self,
@@ -5029,6 +5069,7 @@ class InMemoryAdminResourceService:
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     skill_active_versions: dict[str, str] = field(default_factory=dict)
     plugins: dict[str, PluginResourceResponse] = field(default_factory=dict)
+    capability_install_states: dict[str, dict[str, str]] = field(default_factory=dict)
     plugin_signing_keys: dict[tuple[UUID | None, str], PluginSigningKeyResponse] = field(
         default_factory=dict
     )
@@ -5767,6 +5808,38 @@ class InMemoryAdminResourceService:
         )
         self.plugins[response.id] = response
         return response
+
+    async def get_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, str] | None:
+        del tenant_id
+        state = self.capability_install_states.get(entry_id)
+        return None if state is None else dict(state)
+
+    async def upsert_capability_install_state(
+        self,
+        entry_id: str,
+        state: dict[str, str],
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> dict[str, str]:
+        del tenant_id, actor_id
+        self.capability_install_states[entry_id] = dict(state)
+        return dict(state)
+
+    async def delete_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        del tenant_id, actor_id
+        self.capability_install_states.pop(entry_id, None)
 
     async def start_plugin(
         self,
@@ -6552,6 +6625,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         list_item = await self._run_list_item(record)
         events = await self._run_repository.events(self._tenant_id, record.id)
         artifacts = await self._run_repository.artifacts(self._tenant_id, record.id)
+        plugins = await self.list_plugins(tenant_id=self._tenant_id)
+        audit_events = await self.list_audit_events()
         return RunDetailResponse(
             **list_item.model_dump(),
             events=[_admin_run_event(event) for event in events],
@@ -6568,6 +6643,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             openclaw_proposal=_openclaw_proposal(record.routing_decision),
             project_preflight_proposal=_project_preflight_proposal(record.routing_decision),
             repair_proposal=_repair_proposal(record.routing_decision),
+            capability_install_proposal=_capability_install_proposal(
+                record.routing_decision,
+                installed_plugin_ids=frozenset(plugin.id for plugin in plugins),
+                cancelled_plan_ids=_capability_installer_cancelled_plan_ids(audit_events),
+            ),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -7842,6 +7922,71 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         return response
 
+    async def get_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, str] | None:
+        payload = await self._get_admin_payload(
+            "capability_install",
+            entry_id,
+            tenant_id=tenant_id,
+        )
+        if payload is None:
+            return None
+        return {str(key): str(value) for key, value in payload.items()}
+
+    async def upsert_capability_install_state(
+        self,
+        entry_id: str,
+        state: dict[str, str],
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> dict[str, str]:
+        payload = {str(key): str(value) for key, value in state.items()}
+        payload_object: dict[str, object] = dict(payload)
+        if not await self._upsert_admin_payload(
+            "capability_install",
+            entry_id,
+            payload_object,
+            tenant_id=tenant_id,
+        ):
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(entry_id)
+            await super().upsert_capability_install_state(
+                entry_id,
+                payload,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+        return payload
+
+    async def delete_capability_install_state(
+        self,
+        entry_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        deleted = await self._delete_admin_payload(
+            "capability_install",
+            entry_id,
+            tenant_id=tenant_id,
+        )
+        if deleted is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(entry_id)
+            await super().delete_capability_install_state(
+                entry_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+            return
+        if not deleted:
+            raise KeyError(entry_id)
+
     async def start_plugin(
         self,
         plugin_id: str,
@@ -8947,6 +9092,16 @@ def _runtime_capability_gateway(request: Request) -> CapabilityManifestProvider:
             "capability manifest unavailable",
         )
     return cast(CapabilityManifestProvider, gateway)
+
+
+def _capability_installer_service(request: Request) -> Any:
+    service = getattr(request.app.state, "capability_installer_service", None)
+    if service is None:
+        from agent_hub.capability_installer.service import CapabilityInstallerService
+
+        service = CapabilityInstallerService()
+        request.app.state.capability_installer_service = service
+    return service
 
 
 def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExecutorProtocol:
@@ -12200,6 +12355,78 @@ def _repair_proposal(
     return repair_proposal_projection(proposal)
 
 
+def _capability_install_proposal(
+    routing_decision: Mapping[str, object] | None,
+    *,
+    installed_plugin_ids: frozenset[str] = frozenset(),
+    cancelled_plan_ids: frozenset[str] = frozenset(),
+) -> dict[str, JsonValue] | None:
+    if routing_decision is None:
+        return None
+    query = _capability_install_query(routing_decision)
+    if query is None:
+        return None
+    from agent_hub.capability_installer.service import CapabilityInstallerService
+
+    installer = CapabilityInstallerService()
+    matches = installer.resolve(query)
+    if not matches:
+        return None
+    entry = matches[0]
+    plan = installer.plan(entry.id, query=query)
+    if plan.plugin_id in installed_plugin_ids or plan.id in cancelled_plan_ids:
+        return None
+    return {
+        "entry_id": entry.id,
+        "plan_id": plan.id,
+        "name_cn": entry.name_cn,
+        "summary_cn": entry.summary_cn,
+        "query": query,
+        "plugin_id": plan.plugin_id,
+        "capabilities": tuple(plan.capabilities),
+        "risks": tuple(plan.risks),
+        "permission_summary": tuple(plan.permission_summary),
+        "requires_confirmation": plan.requires_confirmation,
+    }
+
+
+def _capability_install_query(routing_decision: Mapping[str, object]) -> str | None:
+    explicit_query = routing_decision.get("capability_install_query")
+    if isinstance(explicit_query, str) and explicit_query.strip():
+        return explicit_query.strip()[:1000]
+    missing_capability = routing_decision.get("missing_capability")
+    if isinstance(missing_capability, str) and missing_capability.strip():
+        return missing_capability.strip()[:1000]
+    negotiation = routing_decision.get("model_capability_negotiation")
+    if not isinstance(negotiation, Mapping):
+        return None
+    items = negotiation.get("items")
+    if not isinstance(items, Sequence) or isinstance(items, str | bytes):
+        return None
+    missing: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        raw_missing = item.get("missing_capabilities")
+        if not isinstance(raw_missing, Sequence) or isinstance(raw_missing, str | bytes):
+            continue
+        missing.extend(value for value in raw_missing if isinstance(value, str) and value)
+    return " ".join(missing)[:1000] if missing else None
+
+
+def _capability_installer_cancelled_plan_ids(
+    audit_events: Sequence[AuditEventResponse],
+) -> frozenset[str]:
+    plan_ids: set[str] = set()
+    for event in audit_events:
+        if event.action != "capability_installer.cancel":
+            continue
+        plan_id = event.details.get("plan_id")
+        if plan_id:
+            plan_ids.add(plan_id)
+    return frozenset(plan_ids)
+
+
 def _schedule_proposal(
     routing_decision: dict[str, object] | None,
 ) -> dict[str, JsonValue] | None:
@@ -13520,6 +13747,184 @@ async def delete_skill(
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     return OperationStatusResponse(status="deleted")
+
+
+@router.get(
+    "/capability-installer/catalog",
+    responses=error_responses(401, 403),
+)
+async def capability_installer_catalog(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> dict[str, object]:
+    _require(principal, "plugin:read")
+    installer = _capability_installer_service(request)
+    return {
+        "entries": [
+            entry.model_dump(mode="json")
+            for entry in installer.catalog_entries()
+        ]
+    }
+
+
+@router.post(
+    "/capability-installer/resolve",
+    responses=error_responses(401, 403, 422),
+)
+async def capability_installer_resolve(
+    body: CapabilityInstallerResolveRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> dict[str, object]:
+    _require(principal, "plugin:read")
+    installer = _capability_installer_service(request)
+    return {
+        "matches": [
+            entry.model_dump(mode="json")
+            for entry in installer.resolve(body.query)
+        ]
+    }
+
+
+@router.post(
+    "/capability-installer/plan",
+    responses=error_responses(401, 403, 404, 422),
+)
+async def capability_installer_plan(
+    body: CapabilityInstallerPlanRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> dict[str, object]:
+    _require(principal, "plugin:read")
+    installer = _capability_installer_service(request)
+    try:
+        plan = installer.plan(body.entry_id, query=body.query)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return {"plan": plan.model_dump(mode="json")}
+
+
+@router.post(
+    "/capability-installer/cancel",
+    responses=error_responses(401, 403, 404, 422),
+)
+async def capability_installer_cancel(
+    body: CapabilityInstallerPlanRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> dict[str, object]:
+    _require(principal, "plugin:write")
+    installer = _capability_installer_service(request)
+    try:
+        plan = installer.cancel(body.entry_id, query=body.query)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await service.record_audit_event(
+        actor=str(principal.user_id),
+        action="capability_installer.cancel",
+        resource=f"capability:{body.entry_id}",
+        tenant_id=principal.tenant_id,
+        details={"plan_id": plan.id, "query": body.query},
+    )
+    return {"plan": plan.model_dump(mode="json")}
+
+
+@router.post(
+    "/capability-installer/install",
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def capability_installer_install(
+    body: CapabilityInstallerInstallRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> dict[str, object]:
+    _require(principal, "plugin:write")
+    installer = _capability_installer_service(request)
+    try:
+        expected_plan = installer.plan(body.entry_id, query=body.query)
+        if expected_plan.id != body.plan_id:
+            raise PublicAPIError(
+                409,
+                "capability_install_plan_mismatch",
+                "capability install plan no longer matches the confirmed plan",
+            )
+        plugin_request = PluginResourceRequest.model_validate(expected_plan.plugin_request)
+        _validate_plugin_resource_config(request, plugin_request)
+        _validate_plugin_capability_configs(request, plugin_request)
+        plan, plugin = await installer.install(
+            service,
+            entry_id=body.entry_id,
+            query=body.query,
+            plan_id=body.plan_id,
+            confirm=body.confirm,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    except ValueError:
+        raise PublicAPIError(
+            409,
+            "capability_install_plan_mismatch",
+            "capability install plan no longer matches the confirmed plan",
+        ) from None
+    except PermissionError:
+        raise PublicAPIError(
+            409,
+            "capability_install_confirmation_required",
+            "capability install requires confirmation",
+        ) from None
+    await service.record_audit_event(
+        actor=str(principal.user_id),
+        action="capability_installer.install",
+        resource=f"plugin:{plugin.id}",
+        tenant_id=principal.tenant_id,
+        details={
+            "plan_id": plan.id,
+            "entry_id": body.entry_id,
+            "capabilities": list(plan.capabilities),
+        },
+    )
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return {
+        "plan": plan.model_dump(mode="json"),
+        "plugin": plugin.model_dump(mode="json"),
+    }
+
+
+@router.post(
+    "/capability-installer/rollback",
+    responses=error_responses(401, 403, 404, 422),
+)
+async def capability_installer_rollback(
+    body: CapabilityInstallerPlanRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> dict[str, object]:
+    _require(principal, "plugin:write")
+    installer = _capability_installer_service(request)
+    try:
+        plan = await installer.rollback(
+            service,
+            entry_id=body.entry_id,
+            query=body.query,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await service.record_audit_event(
+        actor=str(principal.user_id),
+        action="capability_installer.rollback",
+        resource=f"capability:{body.entry_id}",
+        tenant_id=principal.tenant_id,
+        details={"plan_id": plan.id, "query": body.query},
+    )
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return {"plan": plan.model_dump(mode="json")}
 
 
 @router.get(

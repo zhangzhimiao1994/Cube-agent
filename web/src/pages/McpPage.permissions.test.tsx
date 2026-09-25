@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -72,6 +72,113 @@ vi.mock("../api/client", () => ({
       },
     ]),
     pluginAdapters: vi.fn(async () => []),
+    capabilityInstallerCatalog: vi.fn(async () => ({ entries: [] })),
+    resolveCapabilityInstall: vi.fn(async () => ({
+      matches: [
+        {
+          id: "office_doc_search",
+          name_cn: "Office 文档搜索",
+          summary_cn: "读取授权范围内的 Office 文档索引。",
+          aliases: ["office"],
+          risks: ["read_only"],
+          permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+          plugin: {
+            id: "office-doc-search",
+            name: "Office 文档搜索",
+            enabled: true,
+            capabilities: [],
+          },
+        },
+      ],
+    })),
+    planCapabilityInstall: vi.fn(async () => ({
+      plan: {
+        id: "cap-install-1234",
+        status: "planned",
+        entry_id: "office_doc_search",
+        name_cn: "Office 文档搜索",
+        summary_cn: "读取授权范围内的 Office 文档索引。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+        rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+        requires_confirmation: true,
+        plugin_request: {
+          id: "office-doc-search",
+          name: "Office 文档搜索",
+          enabled: true,
+          capabilities: [],
+        },
+      },
+    })),
+    cancelCapabilityInstall: vi.fn(async () => ({
+      plan: {
+        id: "cap-install-1234",
+        status: "cancelled",
+        entry_id: "office_doc_search",
+        name_cn: "Office 文档搜索",
+        summary_cn: "读取授权范围内的 Office 文档索引。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+        rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+        requires_confirmation: true,
+        plugin_request: {
+          id: "office-doc-search",
+          name: "Office 文档搜索",
+          enabled: true,
+          capabilities: [],
+        },
+      },
+    })),
+    installCapability: vi.fn(async () => ({
+      plan: {
+        id: "cap-install-1234",
+        status: "installed",
+        entry_id: "office_doc_search",
+        name_cn: "Office 文档搜索",
+        summary_cn: "读取授权范围内的 Office 文档索引。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+        rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+        requires_confirmation: true,
+        plugin_request: {
+          id: "office-doc-search",
+          name: "Office 文档搜索",
+          enabled: true,
+          capabilities: [],
+        },
+      },
+      plugin: {
+        id: "office-doc-search",
+        name: "Office 文档搜索",
+        enabled: true,
+        description: null,
+        version: "1.0.0",
+        endpoint_url: null,
+        domain_allowlist: [],
+        resource_config: {},
+        timeout_seconds: 10,
+        credential_ref: null,
+        credential_header: "X-Plugin-Credential",
+        credential_scheme: "Bearer",
+        capabilities: [],
+        source_filename: null,
+        content_sha256: null,
+        package_metadata: null,
+        status: "running",
+        health: "healthy",
+        last_error_type: null,
+      },
+    })),
+    rollbackCapabilityInstall: vi.fn(async () => ({})),
     capabilityManifest: vi.fn(async () => ({ schema_version: 1, capabilities: [] })),
     pluginSigningKeys: vi.fn(async () => [
       {
@@ -165,5 +272,33 @@ describe("McpPage plugin approval permissions", () => {
 
     expect(api.approvePluginPackage).toHaveBeenCalledWith("calendar", { reason: "reviewed by security" });
     expect(api.rejectPluginPackage).toHaveBeenCalledWith("calendar", { reason: "requires isolation review" });
+  });
+
+  it("searches, plans, and confirms trusted capability installs from the MCP page", async () => {
+    const user = userEvent.setup();
+    renderMcpPage();
+
+    const installerRegion = await screen.findByRole("region", { name: "能力安装器" });
+    await user.type(within(installerRegion).getByLabelText("能力需求"), "读取 Office 文档并搜索");
+    await user.click(within(installerRegion).getByRole("button", { name: "搜索能力" }));
+
+    expect(await within(installerRegion).findByText("Office 文档搜索")).not.toBeNull();
+    await user.click(
+      within(installerRegion).getByRole("button", { name: "生成安装计划 Office 文档搜索" }),
+    );
+    expect(await within(installerRegion).findByText("office.search_documents")).not.toBeNull();
+    await user.click(
+      within(installerRegion).getByRole("button", { name: "确认安装 Office 文档搜索" }),
+    );
+
+    await waitFor(() =>
+      expect(api.installCapability).toHaveBeenCalledWith({
+        entry_id: "office_doc_search",
+        query: "读取 Office 文档并搜索",
+        plan_id: "cap-install-1234",
+        confirm: true,
+      }),
+    );
+    expect(await within(installerRegion).findByText("能力已安装：Office 文档搜索")).not.toBeNull();
   });
 });

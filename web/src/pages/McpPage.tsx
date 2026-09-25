@@ -4,7 +4,9 @@ import { FormEvent, useState } from "react";
 import {
   api,
   formatApiError,
+  type CapabilityCatalogEntry,
   type CapabilityManifestItem,
+  type CapabilityInstallPlan,
   type McpServer,
   type PluginAdapterDescriptor,
   type PluginCapability,
@@ -551,6 +553,10 @@ export function McpPage() {
   const [pluginArchiveFile, setPluginArchiveFile] = useState<File | null>(null);
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
   const [pluginPackageApprovalReasons, setPluginPackageApprovalReasons] = useState<Record<string, string>>({});
+  const [capabilityInstallQuery, setCapabilityInstallQuery] = useState("");
+  const [capabilityInstallMatches, setCapabilityInstallMatches] = useState<CapabilityCatalogEntry[]>([]);
+  const [capabilityInstallPlan, setCapabilityInstallPlan] = useState<CapabilityInstallPlan | null>(null);
+  const [capabilityInstallMessage, setCapabilityInstallMessage] = useState<string | null>(null);
   const [signingKeyId, setSigningKeyId] = useState("calendar-prod");
   const [signingKeyPublicKey, setSigningKeyPublicKey] = useState("");
   const [signingKeyNotBefore, setSigningKeyNotBefore] = useState("");
@@ -656,6 +662,52 @@ export function McpPage() {
       await refreshPluginSurfaces();
     },
   });
+  const resolveCapabilityInstall = useMutation({
+    mutationFn: () => api.resolveCapabilityInstall(capabilityInstallQuery.trim()),
+    onSuccess: (result) => {
+      setCapabilityInstallMatches(result.matches);
+      setCapabilityInstallPlan(null);
+      setCapabilityInstallMessage(
+        result.matches.length > 0 ? `找到 ${result.matches.length} 个可安装能力。` : "没有匹配的可信能力。",
+      );
+    },
+  });
+  const planCapabilityInstall = useMutation({
+    mutationFn: (entry: CapabilityCatalogEntry) =>
+      api.planCapabilityInstall({
+        entry_id: entry.id,
+        query: capabilityInstallQuery.trim(),
+      }),
+    onSuccess: (result) => {
+      setCapabilityInstallPlan(result.plan);
+      setCapabilityInstallMessage(`安装计划已生成：${result.plan.name_cn}`);
+    },
+  });
+  const cancelCapabilityInstall = useMutation({
+    mutationFn: (plan: CapabilityInstallPlan) =>
+      api.cancelCapabilityInstall({
+        entry_id: plan.entry_id,
+        query: plan.query,
+      }),
+    onSuccess: (result) => {
+      setCapabilityInstallPlan(result.plan);
+      setCapabilityInstallMessage(`已取消安装计划：${result.plan.name_cn}`);
+    },
+  });
+  const installCapability = useMutation({
+    mutationFn: (plan: CapabilityInstallPlan) =>
+      api.installCapability({
+        entry_id: plan.entry_id,
+        query: plan.query,
+        plan_id: plan.id,
+        confirm: true,
+      }),
+    onSuccess: async (result) => {
+      setCapabilityInstallPlan(result.plan);
+      setCapabilityInstallMessage(`能力已安装：${result.plan.name_cn}`);
+      await refreshPluginSurfaces();
+    },
+  });
   const pluginLifecycle = useMutation({
     mutationFn: ({
       id,
@@ -741,6 +793,12 @@ export function McpPage() {
     event.preventDefault();
     setPluginMessage(null);
     savePlugin.mutate();
+  }
+
+  function submitCapabilityInstallSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setCapabilityInstallMessage(null);
+    resolveCapabilityInstall.mutate();
   }
 
   function submitSigningKey(event: FormEvent<HTMLFormElement>) {
@@ -949,6 +1007,99 @@ export function McpPage() {
               </tbody>
             </table>
           </div>
+        ) : null}
+      </section>
+
+      <section aria-label="能力安装器">
+        <h3>能力安装器</h3>
+        <form onSubmit={submitCapabilityInstallSearch} aria-label="搜索可安装能力">
+          <label htmlFor="capability-install-query">能力需求</label>
+          <input
+            id="capability-install-query"
+            value={capabilityInstallQuery}
+            onChange={(event) => setCapabilityInstallQuery(event.target.value)}
+            placeholder="例如：读取 Office 文档并搜索"
+            required
+          />
+          <button
+            type="submit"
+            disabled={resolveCapabilityInstall.isPending || !canWritePlugins}
+          >
+            {resolveCapabilityInstall.isPending ? "正在搜索..." : "搜索能力"}
+          </button>
+          {!canWritePlugins ? <p className="field-help">当前账号无权安装插件能力。</p> : null}
+        </form>
+        {capabilityInstallMessage ? <p role="status">{capabilityInstallMessage}</p> : null}
+        {resolveCapabilityInstall.isError ? (
+          <p role="alert">{formatApiError(resolveCapabilityInstall.error, "能力搜索失败")}</p>
+        ) : null}
+        {planCapabilityInstall.isError ? (
+          <p role="alert">{formatApiError(planCapabilityInstall.error, "安装计划生成失败")}</p>
+        ) : null}
+        {installCapability.isError ? (
+          <p role="alert">{formatApiError(installCapability.error, "能力安装失败")}</p>
+        ) : null}
+        {cancelCapabilityInstall.isError ? (
+          <p role="alert">{formatApiError(cancelCapabilityInstall.error, "安装取消失败")}</p>
+        ) : null}
+        {capabilityInstallMatches.length > 0 ? (
+          <div className="card-grid">
+            {capabilityInstallMatches.map((entry) => (
+              <article key={entry.id}>
+                <h4>{entry.name_cn}</h4>
+                <p>{entry.summary_cn}</p>
+                <p className="field-help">插件：{entry.plugin.id}</p>
+                <p className="field-help">风险：{entry.risks.join("、") || "未声明"}</p>
+                <p className="field-help">权限：{entry.permission_summary.join("；")}</p>
+                <button
+                  type="button"
+                  disabled={planCapabilityInstall.isPending || !canWritePlugins}
+                  onClick={() => planCapabilityInstall.mutate(entry)}
+                >
+                  生成安装计划 {entry.name_cn}
+                </button>
+              </article>
+            ))}
+          </div>
+        ) : null}
+        {capabilityInstallPlan ? (
+          <article>
+            <h4>{capabilityInstallPlan.name_cn}</h4>
+            <p>{capabilityInstallPlan.summary_cn}</p>
+            <p className="field-help">插件：{capabilityInstallPlan.plugin_id}</p>
+            <p className="field-help">新增能力：</p>
+            <ul>
+              {capabilityInstallPlan.capabilities.map((capability) => (
+                <li key={capability}>{capability}</li>
+              ))}
+            </ul>
+            <p className="field-help">风险：{capabilityInstallPlan.risks.join("、") || "未声明"}</p>
+            <p className="field-help">
+              回滚：{capabilityInstallPlan.rollback_strategy === "restore_previous_plugin_or_delete_installed_plugin"
+                ? "恢复已有插件或删除本次安装插件"
+                : capabilityInstallPlan.rollback_strategy}
+            </p>
+            <div className="inline-actions">
+              <button
+                type="button"
+                disabled={
+                  installCapability.isPending ||
+                  !canWritePlugins ||
+                  capabilityInstallPlan.status === "installed"
+                }
+                onClick={() => installCapability.mutate(capabilityInstallPlan)}
+              >
+                确认安装 {capabilityInstallPlan.name_cn}
+              </button>
+              <button
+                type="button"
+                disabled={cancelCapabilityInstall.isPending || !canWritePlugins}
+                onClick={() => cancelCapabilityInstall.mutate(capabilityInstallPlan)}
+              >
+                取消安装计划
+              </button>
+            </div>
+          </article>
         ) : null}
       </section>
 

@@ -4991,7 +4991,9 @@ function BoundedTextBlock({
   const [copied, setCopied] = useState(false);
   const shouldCollapse = text.length > 1200 || text.split("\n").length > 18;
   return (
-    <div className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}`}>
+    <div
+      className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
+    >
       <div className="bounded-text-block-header">
         <span>{label}</span>
         <div>
@@ -5069,37 +5071,40 @@ function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
           </button>
         ))}
       </div>
-      {openGroup ? (
-        <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
-          <section
-            className="process-detail-modal"
-            role="dialog"
-            aria-label={`${openGroup.label}详情`}
-            aria-modal="true"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="process-detail-modal-header">
-              <div>
-                <span className="eyebrow">{target.badge}</span>
-                <h4>{openGroup.label}</h4>
-              </div>
-              <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
-                关闭
-              </button>
-            </div>
-            <dl>
-              {openGroup.rows.map((row, index) => (
-                <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
-                  <dt>{row.label}</dt>
-                  <dd>
-                    <ProcessDetailValueBlock row={row} />
-                  </dd>
-                </Fragment>
-              ))}
-            </dl>
-          </section>
-        </div>
-      ) : null}
+      {openGroup
+        ? createPortal(
+            <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
+              <section
+                className="process-detail-modal"
+                role="dialog"
+                aria-label={`${openGroup.label}详情`}
+                aria-modal="true"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="process-detail-modal-header">
+                  <div>
+                    <span className="eyebrow">{target.badge}</span>
+                    <h4>{openGroup.label}</h4>
+                  </div>
+                  <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
+                    关闭
+                  </button>
+                </div>
+                <dl>
+                  {openGroup.rows.map((row, index) => (
+                    <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
+                      <dt>{row.label}</dt>
+                      <dd>
+                        <ProcessDetailValueBlock row={row} />
+                      </dd>
+                    </Fragment>
+                  ))}
+                </dl>
+              </section>
+            </div>,
+            document.body,
+          )
+        : null}
     </>
   );
 }

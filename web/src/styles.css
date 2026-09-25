@@ -2341,7 +2341,7 @@ article:hover {
   border-radius: 8px;
   display: grid;
   gap: 0.6rem;
-  max-height: calc(98dvh - 6.25rem);
+  max-height: calc(98dvh - 5.25rem);
   min-width: 0;
   overflow-y: auto;
   padding: 0;
@@ -2404,6 +2404,7 @@ article:hover {
   background: #f8fafc;
   border-color: rgba(148, 163, 184, 0.34);
   color: var(--text);
+  height: min(98dvh, 1160px);
   max-height: min(98dvh, 1160px);
   max-width: min(100vw, 1360px);
   width: min(100vw, 1360px);
@@ -2435,7 +2436,7 @@ article:hover {
 .agent-workbench-file-list {
   display: grid;
   gap: 0.42rem;
-  max-height: min(54dvh, 32rem);
+  max-height: min(64dvh, 42rem);
   min-width: 0;
   overflow-y: auto;
 }
@@ -2468,7 +2469,7 @@ article:hover {
 }
 
 .agent-workbench-file-list.compact {
-  max-height: 12rem;
+  max-height: min(30dvh, 18rem);
 }
 
 .agent-workbench-file-list button {
@@ -2745,7 +2746,7 @@ article:hover {
 }
 
 .agent-workbench-action-list-pane {
-  max-height: min(62dvh, 46rem);
+  max-height: min(82dvh, 66rem);
   overflow-y: auto;
   padding-right: 0.12rem;
 }
@@ -2754,6 +2755,8 @@ article:hover {
   background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 8px;
+  max-height: min(82dvh, 66rem);
+  overflow-y: auto;
   padding: 0.52rem;
 }
 
@@ -3373,12 +3376,20 @@ article:hover {
   box-shadow: 0 24px 90px rgba(0, 0, 0, 0.48);
   display: flex;
   flex-direction: column;
-  max-height: min(86dvh, 820px);
-  max-width: min(94vw, 920px);
+  height: min(96dvh, 1040px);
+  max-height: min(96dvh, 1040px);
+  max-width: min(98vw, 1280px);
   min-width: 0;
   overflow: hidden;
   padding: 0.85rem;
-  width: min(94vw, 920px);
+  width: min(98vw, 1280px);
+}
+
+.process-detail-modal:has(.bounded-text-block.is-expanded) {
+  height: min(98dvh, 1120px);
+  max-height: min(98dvh, 1120px);
+  max-width: min(99vw, 1360px);
+  width: min(99vw, 1360px);
 }
 
 .process-detail-modal-header {
@@ -3388,13 +3399,31 @@ article:hover {
   gap: 1rem;
   justify-content: space-between;
   margin-bottom: 0.7rem;
+  min-width: 0;
+}
+
+.process-detail-modal-header > div {
+  min-width: 0;
 }
 
 .process-detail-modal-header h4 {
   margin: 0.1rem 0 0;
 }
 
+.process-detail-modal-header .eyebrow,
+.process-detail-modal-header h4 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.process-detail-modal-header .secondary-action {
+  flex: 0 0 auto;
+  min-width: 7rem;
+}
+
 .process-detail-modal dl {
+  align-content: start;
   display: grid;
   flex: 1 1 auto;
   gap: 0.42rem;
@@ -3405,6 +3434,7 @@ article:hover {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0.1rem 0 0;
+  scroll-padding-top: 0.5rem;
   width: 100%;
 }
 
@@ -3501,6 +3531,18 @@ article:hover {
 
 .bounded-text-block.is-collapsed pre {
   max-height: 12rem;
+}
+
+.bounded-text-block.is-expanded pre {
+  max-height: none;
+}
+
+.process-detail-modal .bounded-text-block.is-expanded {
+  min-height: min(72dvh, 48rem);
+}
+
+.process-detail-modal .bounded-text-block.is-expanded pre {
+  min-height: min(58dvh, 38rem);
 }
 
 .artifact-file-card {
@@ -3647,6 +3689,7 @@ article:hover {
   background: #f8fafc;
   border-color: rgba(148, 163, 184, 0.32);
   color: #0f172a;
+  height: min(98dvh, 1160px);
   max-height: min(98dvh, 1160px);
   max-width: min(100vw, 1360px);
   width: min(100vw, 1360px);
@@ -3930,9 +3973,10 @@ article:hover {
 .conversation-file-preview-drawer {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  max-width: min(920px, calc(100vw - 1.2rem));
+  height: min(98dvh, 1040px);
+  max-width: min(1120px, calc(100vw - 1.2rem));
   overflow: hidden;
-  width: min(920px, calc(100vw - 1.2rem));
+  width: min(1120px, calc(100vw - 1.2rem));
 }
 
 .conversation-file-preview-drawer .agent-workbench-file-preview {
@@ -3942,6 +3986,11 @@ article:hover {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding-bottom: calc(0.62rem + env(safe-area-inset-bottom));
+}
+
+.conversation-file-preview-drawer .agent-workbench-file-code {
+  max-height: none;
+  min-height: 0;
 }
 
 .message-paragraph {
@@ -5918,6 +5967,7 @@ article:hover {
   }
 
   .process-drawer {
+    height: 94dvh;
     max-height: 94dvh;
     padding: 0.75rem 0.62rem calc(0.75rem + env(safe-area-inset-bottom));
     width: 100vw;
@@ -5951,6 +6001,7 @@ article:hover {
   }
 
   .agent-workbench-drawer {
+    height: 99dvh;
     max-height: 99dvh;
     max-width: 100vw;
     padding: 0.56rem 0.62rem calc(0.62rem + env(safe-area-inset-bottom));
@@ -6019,11 +6070,11 @@ article:hover {
   }
 
   .agent-workbench-file-list {
-    max-height: 11rem;
+    max-height: min(34dvh, 18rem);
   }
 
   .agent-workbench-file-code {
-    max-height: 46dvh;
+    max-height: none;
     min-height: 14rem;
     overflow-x: auto;
     white-space: pre;
@@ -6160,15 +6211,23 @@ article:hover {
   }
 
   .process-detail-modal-backdrop {
-    align-items: flex-end;
-    padding: 0;
+    align-items: stretch;
+    padding: env(safe-area-inset-top) 0 0;
   }
 
   .process-detail-modal {
-    border-radius: 1.15rem 1.15rem 0 0;
-    max-height: 92dvh;
+    border-radius: 0;
+    height: calc(100dvh - env(safe-area-inset-top));
+    max-height: calc(100dvh - env(safe-area-inset-top));
     max-width: 100vw;
     padding: 0.95rem 0.9rem calc(0.95rem + env(safe-area-inset-bottom));
+    width: 100vw;
+  }
+
+  .process-detail-modal:has(.bounded-text-block.is-expanded) {
+    height: calc(100dvh - env(safe-area-inset-top));
+    max-height: calc(100dvh - env(safe-area-inset-top));
+    max-width: 100vw;
     width: 100vw;
   }
 
@@ -6183,6 +6242,14 @@ article:hover {
     margin: 0;
     overflow-x: auto;
     overflow-wrap: normal;
+  }
+
+  .process-detail-modal .bounded-text-block.is-expanded {
+    min-height: calc(100dvh - 11rem - env(safe-area-inset-top));
+  }
+
+  .process-detail-modal .bounded-text-block.is-expanded pre {
+    min-height: calc(100dvh - 15rem - env(safe-area-inset-top));
   }
 
   .chat-session-toolbar {
@@ -6236,6 +6303,12 @@ article:hover {
   .secondary-action {
     text-align: center;
     width: 100%;
+  }
+
+  .process-detail-modal-header .secondary-action {
+    max-width: 9rem;
+    min-width: 6.5rem;
+    width: auto;
   }
 
   .composer-status-line span {

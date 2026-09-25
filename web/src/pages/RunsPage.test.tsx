@@ -507,10 +507,35 @@ describe("agentInlineSummary", () => {
     const stylesCss = readFileSync("src/styles.css", "utf8");
 
     expect(stylesCss).toMatch(
-      /\.conversation-file-preview-drawer\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*overflow:\s*hidden;/,
+      /\.conversation-file-preview-drawer\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*height:\s*min\(98dvh,\s*1040px\);[\s\S]*overflow:\s*hidden;/,
     );
     expect(stylesCss).toMatch(
       /\.conversation-file-preview-drawer \.agent-workbench-file-preview\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.conversation-file-preview-drawer \.agent-workbench-file-code\s*{[\s\S]*max-height:\s*none;[\s\S]*min-height:\s*0;/,
+    );
+  });
+
+  it("opens process detail expansions as full reading sheets instead of cramped cards", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+    const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
+
+    expect(source).toContain('shouldCollapse && expanded ? " is-expanded"');
+    expect(stylesCss).toMatch(
+      /\.process-detail-modal\s*{[\s\S]*height:\s*min\(96dvh,\s*1040px\);[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
+    );
+    expect(stylesCss).toMatch(
+      /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\)\s*{[\s\S]*height:\s*min\(98dvh,\s*1120px\);[\s\S]*width:\s*min\(99vw,\s*1360px\);/,
+    );
+    expect(stylesCss).toMatch(
+      /\.bounded-text-block\.is-expanded pre\s*{[\s\S]*max-height:\s*none;/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-backdrop\s*{[\s\S]*align-items:\s*stretch;[\s\S]*padding:\s*env\(safe-area-inset-top\) 0 0;/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*height:\s*calc\(100dvh - env\(safe-area-inset-top\)\);[\s\S]*width:\s*100vw;/,
     );
   });
 

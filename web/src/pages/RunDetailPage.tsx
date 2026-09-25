@@ -35,6 +35,7 @@ type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
 type RepairProposal = NonNullable<RunDetail["repair_proposal"]>;
+type CapabilityInstallProposal = NonNullable<RunDetail["capability_install_proposal"]>;
 type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
 type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
 type ApiCapabilityExecutionSummary = RunDetail["capability_execution_summary"];
@@ -2617,7 +2618,156 @@ function detailProcessGroups(rows: DetailProcessRow[]): DetailProcessGroup[] {
 
 function detailProcessGroupSummary(group: DetailProcessGroup) {
   const first = group.rows.find((row) => row.value.trim().length > 0);
-  return conciseProcessText(first?.value ?? "", `${group.rows.length} 项摘要`);
+  if (!first) return `${group.rows.length} 项摘要`;
+  const presentation = detailProcessValuePresentation(first);
+  if (presentation.kind === "json") return "查看结构化 JSON";
+  if (presentation.kind === "code") return `查看 ${presentation.label} 内容`;
+  return conciseProcessText(presentation.text, `${group.rows.length} 项摘要`);
+}
+
+type DetailProcessValuePresentation = {
+  kind: "plain" | "json" | "code";
+  label: string;
+  copyLabel: string;
+  text: string;
+  shouldCollapse: boolean;
+};
+
+function prettyDetailJsonValue(value: string) {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function detailLooksLikeCommandLabel(label: string) {
+  return /命令|终端|shell|bash|command/i.test(label);
+}
+
+function detailLooksLikeCodeValue(value: string) {
+  if (!value.includes("\n")) return false;
+  return /\b(import|export|const|let|function|class|return|def|from|SELECT|POST|GET|npm|pnpm|ssh|curl)\b/.test(value);
+}
+
+function detailBlockLanguage(label: string, value: string) {
+  if (detailLooksLikeCommandLabel(label)) return "bash";
+  if (/tsx?|jsx?|typescript|javascript/i.test(`${label} ${value.slice(0, 80)}`)) return "ts";
+  if (/python|\.py\b|def\s+\w+/i.test(`${label} ${value.slice(0, 120)}`)) return "python";
+  return "text";
+}
+
+function detailProcessValuePresentation(row: DetailProcessRow): DetailProcessValuePresentation {
+  const trimmed = row.value.trim();
+  const jsonText = prettyDetailJsonValue(trimmed);
+  if (jsonText) {
+    return {
+      kind: "json",
+      label: "json",
+      copyLabel: "复制 json 内容",
+      text: jsonText,
+      shouldCollapse: jsonText.length > 1200 || jsonText.split("\n").length > 18,
+    };
+  }
+  if (detailLooksLikeCommandLabel(row.label) || detailLooksLikeCodeValue(trimmed)) {
+    const label = detailBlockLanguage(row.label, trimmed);
+    return {
+      kind: "code",
+      label,
+      copyLabel: `复制 ${label} 内容`,
+      text: trimmed,
+      shouldCollapse: trimmed.length > 1200 || trimmed.split("\n").length > 18,
+    };
+  }
+  return {
+    kind: "plain",
+    label: "text",
+    copyLabel: "复制文本",
+    text: row.value,
+    shouldCollapse: row.value.length > 900 || row.value.split("\n").length > 12,
+  };
+}
+
+function copyDetailTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return Promise.reject(new Error("clipboard unavailable"));
+}
+
+function DetailBoundedTextBlock({
+  copyAriaLabel,
+  label,
+  text,
+  collapseLabel = "展开",
+  expandLabel = "收起",
+}: {
+  copyAriaLabel: string;
+  label: string;
+  text: string;
+  collapseLabel?: string;
+  expandLabel?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const shouldCollapse = text.length > 1200 || text.split("\n").length > 18;
+  return (
+    <div
+      className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
+    >
+      <div className="bounded-text-block-header">
+        <span>{label}</span>
+        <div>
+          {shouldCollapse ? (
+            <button type="button" className="text-button" onClick={() => setExpanded((current) => !current)}>
+              {expanded ? expandLabel : collapseLabel}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="text-button"
+            aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
+            onClick={() => {
+              void copyDetailTextToClipboard(text)
+                .then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1600);
+                })
+                .catch(() => undefined);
+            }}
+          >
+            {copied ? "已复制" : "复制"}
+          </button>
+        </div>
+      </div>
+      <pre>{text}</pre>
+    </div>
+  );
+}
+
+function DetailProcessValueBlock({ row }: { row: DetailProcessRow }) {
+  const presentation = detailProcessValuePresentation(row);
+  if (presentation.kind === "plain" && !presentation.shouldCollapse) {
+    return <span>{presentation.text}</span>;
+  }
+  if (presentation.kind === "plain") {
+    return (
+      <DetailBoundedTextBlock
+        copyAriaLabel={presentation.copyLabel}
+        label={row.label}
+        text={presentation.text}
+        collapseLabel="展开全文"
+        expandLabel="收起"
+      />
+    );
+  }
+  return (
+    <DetailBoundedTextBlock
+      copyAriaLabel={presentation.copyLabel}
+      label={presentation.label}
+      text={presentation.text}
+    />
+  );
 }
 
 function DetailProcessCards({ card }: { card: DetailProcessCard }) {
@@ -2650,35 +2800,40 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
           </button>
         ))}
       </div>
-      {openGroup ? (
-        <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
-          <section
-            className="process-detail-modal"
-            role="dialog"
-            aria-label={`${openGroup.label}详情`}
-            aria-modal="true"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="process-detail-modal-header">
-              <div>
-                <span className="eyebrow">{card.label}</span>
-                <h4>{openGroup.label}</h4>
-              </div>
-              <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
-                关闭
-              </button>
-            </div>
-            <dl>
-              {openGroup.rows.map((row, index) => (
-                <Fragment key={`${card.id}-${openGroup.key}-${row.label}-${index}`}>
-                  <dt>{row.label}</dt>
-                  <dd>{row.value}</dd>
-                </Fragment>
-              ))}
-            </dl>
-          </section>
-        </div>
-      ) : null}
+      {openGroup
+        ? createPortal(
+            <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
+              <section
+                className="process-detail-modal"
+                role="dialog"
+                aria-label={`${openGroup.label}详情`}
+                aria-modal="true"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="process-detail-modal-header">
+                  <div>
+                    <span className="eyebrow">{card.label}</span>
+                    <h4>{openGroup.label}</h4>
+                  </div>
+                  <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
+                    关闭
+                  </button>
+                </div>
+                <dl>
+                  {openGroup.rows.map((row, index) => (
+                    <Fragment key={`${card.id}-${openGroup.key}-${row.label}-${index}`}>
+                      <dt>{row.label}</dt>
+                      <dd>
+                        <DetailProcessValueBlock row={row} />
+                      </dd>
+                    </Fragment>
+                  ))}
+                </dl>
+              </section>
+            </div>,
+            document.body,
+          )
+        : null}
     </>
   );
 }
@@ -3219,6 +3374,34 @@ export function RunDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const [capabilityInstallMessage, setCapabilityInstallMessage] = useState("");
+  const installMissingCapability = useMutation({
+    mutationFn: (proposal: CapabilityInstallProposal) =>
+      api.installCapability({
+        entry_id: proposal.entry_id,
+        query: proposal.query,
+        plan_id: proposal.plan_id,
+        confirm: true,
+      }),
+    onSuccess: async (result) => {
+      setCapabilityInstallMessage(`能力已安装：${result.plan.name_cn}`);
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      await queryClient.invalidateQueries({ queryKey: ["capability-manifest"] });
+    },
+  });
+  const cancelCapabilityInstall = useMutation({
+    mutationFn: (proposal: CapabilityInstallProposal) =>
+      api.cancelCapabilityInstall({
+        entry_id: proposal.entry_id,
+        query: proposal.query,
+      }),
+    onSuccess: async (result) => {
+      setCapabilityInstallMessage(`已取消安装建议：${result.plan.name_cn}`);
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+    },
+  });
   const acceptSelfRepair = useMutation({
     mutationFn: () => {
       const approval = repairApprovalFromRunDetail(run.data);
@@ -3247,6 +3430,7 @@ export function RunDetailPage() {
   const isWaitingForMode = orderedRunData.status === "waiting_user_mode" && Boolean(orderedRunData.decision_token);
   const capabilityApproval = capabilityApprovalFromRunDetail(orderedRunData);
   const repairApproval = repairApprovalFromRunDetail(orderedRunData);
+  const capabilityInstallProposal = orderedRunData.capability_install_proposal;
   const observerNotices = collectObserverNotices(orderedRunData.events);
   const timelineItems = detailTimelineItems(orderedRunData.events);
   const toolLifecycles = toolLifecycleFromApi(orderedRunData);
@@ -3512,6 +3696,44 @@ export function RunDetailPage() {
                 </button>
               </aside>
             ) : null}
+            {capabilityInstallProposal ? (
+              <aside className="composer-attachment-card" role="status" aria-label="能力安装建议">
+                <div>
+                  <span className="eyebrow">可安装能力</span>
+                  <strong>{capabilityInstallProposal.name_cn}</strong>
+                  <small>{capabilityInstallProposal.plugin_id}</small>
+                </div>
+                <p>{capabilityInstallProposal.summary_cn}</p>
+                <ul className="compact-list" aria-label="能力安装摘要">
+                  <li>
+                    <strong>能力</strong>
+                    <span>{capabilityInstallProposal.capabilities.join("、") || "未声明"}</span>
+                  </li>
+                  <li>
+                    <strong>权限</strong>
+                    <span>{capabilityInstallProposal.permission_summary.join("；") || "按插件策略审批"}</span>
+                  </li>
+                </ul>
+                {capabilityInstallMessage ? <p className="field-help">{capabilityInstallMessage}</p> : null}
+                <div className="composer-card-actions">
+                  <button
+                    type="button"
+                    disabled={installMissingCapability.isPending || cancelCapabilityInstall.isPending}
+                    onClick={() => installMissingCapability.mutate(capabilityInstallProposal)}
+                  >
+                    {installMissingCapability.isPending ? "安装中..." : `安装能力 ${capabilityInstallProposal.name_cn}`}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={installMissingCapability.isPending || cancelCapabilityInstall.isPending}
+                    onClick={() => cancelCapabilityInstall.mutate(capabilityInstallProposal)}
+                  >
+                    {cancelCapabilityInstall.isPending ? "取消中..." : "取消安装建议"}
+                  </button>
+                </div>
+              </aside>
+            ) : null}
             <div className="toolbar">
               <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
                 暂停
@@ -3533,6 +3755,8 @@ export function RunDetailPage() {
         {approveCapability.isError ? <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p> : null}
         {rejectCapability.isError ? <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p> : null}
         {acceptSelfRepair.isError ? <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p> : null}
+        {installMissingCapability.isError ? <p role="alert">{formatApiError(installMissingCapability.error, "能力安装失败")}</p> : null}
+        {cancelCapabilityInstall.isError ? <p role="alert">{formatApiError(cancelCapabilityInstall.error, "能力安装取消失败")}</p> : null}
       </article>
 
       {observerNotices.length > 0 ? (

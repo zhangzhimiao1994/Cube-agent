@@ -1195,6 +1195,149 @@ describe("api client transport", () => {
     );
   });
 
+  it("installs trusted capabilities through the capability installer endpoint", async () => {
+    const installResponse = {
+      plan: {
+        id: "cap-install-1234",
+        status: "installed",
+        entry_id: "office_doc_search",
+        name_cn: "Office 文档搜索",
+        summary_cn: "读取授权范围内的 Office 文档索引。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+        rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+        requires_confirmation: true,
+        plugin_request: {
+          id: "office-doc-search",
+          name: "Office 文档搜索",
+          enabled: true,
+          capabilities: [
+            {
+              id: "office.search_documents",
+              adapter: "http_json",
+              permission_class: "file.read",
+              sandbox_profile: "remote_connector",
+              policy_effect: "require_approval",
+              replay_safe: true,
+              aliases: ["office_doc_search"],
+              capability_config: {},
+              input_schema: null,
+              output_schema: null,
+            },
+          ],
+        },
+      },
+      plugin: {
+        id: "office-doc-search",
+        name: "Office 文档搜索",
+        enabled: true,
+        description: null,
+        version: "1.0.0",
+        endpoint_url: "https://plugins.example/office-doc-search/invoke",
+        domain_allowlist: ["plugins.example"],
+        resource_config: {},
+        timeout_seconds: 10,
+        credential_ref: null,
+        credential_header: "X-Plugin-Credential",
+        credential_scheme: "Bearer",
+        capabilities: [
+          {
+            id: "office.search_documents",
+            adapter: "http_json",
+            permission_class: "file.read",
+            sandbox_profile: "remote_connector",
+            policy_effect: "require_approval",
+            replay_safe: true,
+            aliases: ["office_doc_search"],
+            capability_config: {},
+            input_schema: null,
+            output_schema: null,
+          },
+        ],
+        source_filename: null,
+        content_sha256: null,
+        package_metadata: null,
+        status: "running",
+        health: "healthy",
+        last_error_type: null,
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(installResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.installCapability({
+      entry_id: "office_doc_search",
+      query: "读取 Office 文档并搜索",
+      plan_id: "cap-install-1234",
+      confirm: true,
+    });
+
+    expect(result.plan.name_cn).toBe("Office 文档搜索");
+    expect(result.plugin.status).toBe("running");
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/capability-installer/install");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      entry_id: "office_doc_search",
+      query: "读取 Office 文档并搜索",
+      plan_id: "cap-install-1234",
+      confirm: true,
+    });
+  });
+
+  it("preserves capability install proposals on run detail responses", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "55555555-5555-4555-8555-555555555555",
+          tenant_id: "33333333-3333-4333-8333-333333333333",
+          status: "failed",
+          mode: "dispatch",
+          decision_token: null,
+          version: 1,
+          clarification_reason: null,
+          conversation_id: "conv-capability-install",
+          request: "读取 Office 文档并搜索",
+          created_at: "2026-09-25T00:00:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0.0000",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          capability_install_proposal: {
+            entry_id: "office_doc_search",
+            plan_id: "capability-plan-office_doc_search-1234",
+            name_cn: "Office 文档搜索",
+            summary_cn: "安装只读 Office 文档索引与搜索能力。",
+            query: "读取 Office 文档并搜索",
+            plugin_id: "office-doc-search",
+            capabilities: ["office.search_documents"],
+            risks: ["read_only"],
+            permission_summary: ["读取用户选择的文档目录"],
+            requires_confirmation: true,
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.run("55555555-5555-4555-8555-555555555555");
+
+    expect(result.capability_install_proposal?.name_cn).toBe("Office 文档搜索");
+    expect(result.capability_install_proposal?.capabilities).toEqual(["office.search_documents"]);
+  });
+
   it("updates plugin package approval state", async () => {
     const plugin: PluginResource = {
       id: "calendar",

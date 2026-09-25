@@ -54,6 +54,7 @@ from agent_hub.api.routers.admin import (
     SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
+    _capability_install_proposal,
     _event_summary,
     _mode_error_log_from_run,
     _model_check_failure_details,
@@ -2866,6 +2867,56 @@ def test_schedule_proposal_projects_allowlisted_fields_only() -> None:
     }
 
 
+def test_capability_install_proposal_projects_catalog_backed_chat_card() -> None:
+    proposal = cast(dict[str, object] | None, _capability_install_proposal(
+        {
+            "capability_install_query": "读取 Office 文档并搜索",
+            "missing_capability": "office.search_documents",
+            "credential_ref": "secret://private",
+            "api_base": "https://internal.example.invalid",
+        }
+    ))
+
+    assert proposal is not None
+    assert proposal["entry_id"] == "office_doc_search"
+    assert proposal["name_cn"] == "Office 文档搜索"
+    assert proposal["query"] == "读取 Office 文档并搜索"
+    assert proposal["plugin_id"] == "office-doc-search"
+    assert proposal["capabilities"] == ("office.search_documents",)
+    assert proposal["risks"] == ("read_only",)
+    assert proposal["permission_summary"] == (
+        "读取 Office 文档索引",
+        "执行前仍按能力策略审批",
+    )
+    assert proposal["requires_confirmation"] is True
+    assert isinstance(proposal["plan_id"], str)
+    serialized = json.dumps(proposal, ensure_ascii=False)
+    assert "secret" not in serialized
+    assert "internal.example.invalid" not in serialized
+
+
+def test_capability_install_proposal_hides_installed_or_cancelled_plan() -> None:
+    routing_decision = {
+        "capability_install_query": "读取 Office 文档并搜索",
+        "missing_capability": "office.search_documents",
+    }
+    proposal = _capability_install_proposal(routing_decision)
+    assert proposal is not None
+    plan_id = cast(str, proposal["plan_id"])
+
+    installed = _capability_install_proposal(
+        routing_decision,
+        installed_plugin_ids=frozenset({"office-doc-search"}),
+    )
+    cancelled = _capability_install_proposal(
+        routing_decision,
+        cancelled_plan_ids=frozenset({plan_id}),
+    )
+
+    assert installed is None
+    assert cancelled is None
+
+
 def test_run_detail_response_exposes_tool_lifecycle_without_raw_payloads() -> None:
     response = RunDetailResponse(
         id=uuid4(),
@@ -4422,6 +4473,255 @@ def test_capability_manifest_endpoint_includes_saved_mcp_config_tools() -> None:
         "output_schema": None,
     }
     assert capabilities["filesystem.read_file"]["sandbox_profile"] == "mcp_stdio"
+
+
+def test_capability_installer_resolves_and_plans_trusted_capability() -> None:
+    api = client()
+
+    catalog_response = api.get("/api/v1/admin/capability-installer/catalog", headers=headers())
+    resolve_response = api.post(
+        "/api/v1/admin/capability-installer/resolve",
+        headers=headers(),
+        json={"query": "读取 Office 文档并搜索"},
+    )
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+    cancel_response = api.post(
+        "/api/v1/admin/capability-installer/cancel",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+
+    assert catalog_response.status_code == 200
+    assert catalog_response.json()["entries"][0]["id"] == "office_doc_search"
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["matches"][0]["name_cn"] == "Office 文档搜索"
+    assert plan_response.status_code == 200
+    plan = plan_response.json()["plan"]
+    assert plan["status"] == "planned"
+    assert plan["plugin_id"] == "office-doc-search"
+    assert plan["capabilities"] == ["office.search_documents"]
+    assert plan["permission_summary"] == [
+        "读取 Office 文档索引",
+        "执行前仍按能力策略审批",
+    ]
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["plan"]["status"] == "cancelled"
+
+
+def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+    install_response = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "plan_id": plan_response.json()["plan"]["id"],
+            "confirm": True,
+        },
+    )
+    manifest_response = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert plan_response.status_code == 200
+    assert install_response.status_code == 200
+    install_body = install_response.json()
+    assert install_body["plan"]["status"] == "installed"
+    assert install_body["plugin"]["id"] == "office-doc-search"
+    assert install_body["plugin"]["status"] == "running"
+    assert install_body["plugin"]["resource_config"] == {}
+    assert reloaded == [TENANT_ID]
+    roundtrip_payload = {
+        key: install_body["plugin"][key]
+        for key in (
+            "id",
+            "name",
+            "description",
+            "version",
+            "resource_config",
+            "endpoint_url",
+            "domain_allowlist",
+            "timeout_seconds",
+            "credential_ref",
+            "credential_header",
+            "credential_scheme",
+            "enabled",
+            "capabilities",
+        )
+    }
+    roundtrip_response = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json=roundtrip_payload,
+    )
+    assert roundtrip_response.status_code == 200
+    assert roundtrip_response.json()["resource_config"] == {}
+    assert reloaded == [TENANT_ID, TENANT_ID]
+    capabilities = {
+        item["id"]: item
+        for item in manifest_response.json()["capabilities"]
+    }
+    assert capabilities["office.search_documents"]["kind"] == "plugin"
+    assert capabilities["office.search_documents"]["available"] is True
+
+    rollback_response = api.post(
+        "/api/v1/admin/capability-installer/rollback",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+    plugins_after_rollback = api.get("/api/v1/admin/plugins", headers=headers())
+
+    assert rollback_response.status_code == 200
+    assert rollback_response.json()["plan"]["status"] == "rolled_back"
+    assert plugins_after_rollback.status_code == 200
+    assert all(plugin["id"] != "office-doc-search" for plugin in plugins_after_rollback.json())
+    assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID]
+
+
+def test_capability_installer_rollback_restores_existing_plugin() -> None:
+    api = client()
+
+    existing = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "office-doc-search",
+            "name": "Existing Office Connector",
+            "description": "Existing user-managed connector must survive installer rollback.",
+            "endpoint_url": "https://existing.example/invoke",
+            "domain_allowlist": ["existing.example"],
+            "capabilities": [
+                {
+                    "id": "office.search_documents",
+                    "adapter": "http_json",
+                    "permission_class": "file.read",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "require_approval",
+                    "replay_safe": True,
+                }
+            ],
+        },
+    )
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+    install_response = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "plan_id": plan_response.json()["plan"]["id"],
+            "confirm": True,
+        },
+    )
+    rollback_response = api.post(
+        "/api/v1/admin/capability-installer/rollback",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+    plugins = api.get("/api/v1/admin/plugins", headers=headers()).json()
+    restored = next(plugin for plugin in plugins if plugin["id"] == "office-doc-search")
+
+    assert existing.status_code == 200
+    assert plan_response.status_code == 200
+    assert install_response.status_code == 200
+    assert install_response.json()["plugin"]["resource_config"] == {}
+    assert rollback_response.status_code == 200
+    assert restored["name"] == "Existing Office Connector"
+    assert restored["endpoint_url"] == "https://existing.example/invoke"
+    assert restored["domain_allowlist"] == ["existing.example"]
+    assert restored["resource_config"] == {}
+
+
+def test_capability_installer_requires_confirmation_before_installing_plugin() -> None:
+    api = client()
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+
+    response = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "plan_id": plan_response.json()["plan"]["id"],
+            "confirm": False,
+        },
+    )
+    plugins = api.get("/api/v1/admin/plugins", headers=headers())
+
+    assert plan_response.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "capability_install_confirmation_required"
+    assert plugins.status_code == 200
+    assert plugins.json() == []
+
+
+def test_capability_installer_requires_confirmed_plan_id() -> None:
+    api = client()
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+    )
+
+    missing_plan = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "confirm": True,
+        },
+    )
+    stale_plan = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "plan_id": "cap-install-stale",
+            "confirm": True,
+        },
+    )
+    confirmed_plan = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "office_doc_search",
+            "query": "读取 Office 文档并搜索",
+            "plan_id": plan_response.json()["plan"]["id"],
+            "confirm": True,
+        },
+    )
+
+    assert plan_response.status_code == 200
+    assert missing_plan.status_code == 422
+    assert stale_plan.status_code == 409
+    assert stale_plan.json()["error"]["code"] == "capability_install_plan_mismatch"
+    assert confirmed_plan.status_code == 200
 
 
 def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() -> None:

@@ -224,6 +224,8 @@ A package may contain a single Skill or multiple Skill directories. Multi-skill 
 
 MCP servers are configured separately with transport, command or URL, allowed tools, executable allowlists, domain allowlists, and timeouts.
 
+The trusted capability installer can propose cataloged plugin capabilities from a run detail card when the main Agent detects a missing ability. Operators can also search, plan, install, cancel, and roll back catalog entries from the MCP page. Installs are bound to the reviewed plan, and installer rollback state is kept outside plugin `resource_config`. It is fail-closed, approval-gated, and does not install arbitrary internet plugins.
+
 ## Channels
 
 The channel layer connects external chat platforms to the main agent. The console includes configuration surfaces for Feishu, DingTalk, WeCom, WeChat, Telegram, Slack, QQ, and custom webhook entries. Feishu has first-class setup documentation and runtime integration.

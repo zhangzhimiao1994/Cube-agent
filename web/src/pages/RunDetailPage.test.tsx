@@ -37,25 +37,34 @@ it("gives the workbench drawer enough room for inspectable detail panes", () => 
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
   expect(stylesCss).toMatch(
-    /\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-width:\s*min\(100vw,\s*1360px\);[\s\S]*width:\s*min\(100vw,\s*1360px\);/,
+    /\.agent-workbench-drawer\s*{[\s\S]*height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-width:\s*min\(100vw,\s*1360px\);[\s\S]*width:\s*min\(100vw,\s*1360px\);/,
   );
   expect(stylesCss).toMatch(
-    /\.process-drawer\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-width:\s*min\(100vw,\s*1360px\);[\s\S]*width:\s*min\(100vw,\s*1360px\);/,
+    /\.process-drawer\.agent-workbench-drawer\s*{[\s\S]*height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-height:\s*min\(98dvh,\s*1160px\);[\s\S]*max-width:\s*min\(100vw,\s*1360px\);[\s\S]*width:\s*min\(100vw,\s*1360px\);/,
   );
   expect(stylesCss).toMatch(
-    /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(98dvh - 6\.25rem\);[\s\S]*overflow-y:\s*auto;/,
+    /\.agent-workbench-detail\s*{[\s\S]*max-height:\s*calc\(98dvh - 5\.25rem\);[\s\S]*overflow-y:\s*auto;/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal\s*{[\s\S]*max-height:\s*min\(86dvh,\s*820px\);[\s\S]*max-width:\s*min\(94vw,\s*920px\);[\s\S]*width:\s*min\(94vw,\s*920px\);/,
+    /\.agent-workbench-action-list-pane\s*{[\s\S]*max-height:\s*min\(82dvh,\s*66rem\);[\s\S]*overflow-y:\s*auto;/,
   );
   expect(stylesCss).toMatch(
-    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-drawer\s*{[\s\S]*max-height:\s*99dvh;[\s\S]*width:\s*100vw;/,
+    /\.agent-workbench-preview-pane\s*{[\s\S]*max-height:\s*min\(82dvh,\s*66rem\);[\s\S]*overflow-y:\s*auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal\s*{[\s\S]*height:\s*min\(96dvh,\s*1040px\);[\s\S]*max-height:\s*min\(96dvh,\s*1040px\);[\s\S]*max-width:\s*min\(98vw,\s*1280px\);[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-drawer\s*{[\s\S]*height:\s*99dvh;[\s\S]*max-height:\s*99dvh;[\s\S]*width:\s*100vw;/,
   );
 });
 
 it("keeps mobile nested process drawers anchored while only details scroll", () => {
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-drawer\s*{[\s\S]*height:\s*94dvh;[\s\S]*max-height:\s*94dvh;[\s\S]*width:\s*100vw;/,
+  );
   expect(stylesCss).toMatch(
     /@media \(max-width: 640px\)[\s\S]*\.process-drawer:not\(\.agent-workbench-drawer\)\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*overflow:\s*hidden;/,
   );
@@ -68,10 +77,19 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
   const stylesCss = readFileSync("src/styles.css", "utf8");
 
   expect(stylesCss).toMatch(
-    /\.process-detail-modal\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*min-width:\s*0;[\s\S]*overflow:\s*hidden;[\s\S]*width:\s*min\(94vw,\s*920px\);/,
+    /\.process-detail-modal\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*min-width:\s*0;[\s\S]*overflow:\s*hidden;[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal-header\s*{[\s\S]*flex:\s*0 0 auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal-header > div\s*{[\s\S]*min-width:\s*0;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal-header \.secondary-action\s*{[\s\S]*flex:\s*0 0 auto;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-header \.secondary-action\s*{[\s\S]*width:\s*auto;/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal dl\s*{[\s\S]*flex:\s*1 1 auto;[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;[\s\S]*width:\s*100%;/,
@@ -80,10 +98,19 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.bounded-text-block\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/,
   );
   expect(stylesCss).toMatch(
+    /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\)\s*{[\s\S]*height:\s*min\(98dvh,\s*1120px\);[\s\S]*width:\s*min\(99vw,\s*1360px\);/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[\s\S]*min-height:\s*min\(58dvh,\s*38rem\);/,
+  );
+  expect(stylesCss).toMatch(
     /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
   );
   expect(stylesCss).toMatch(
-    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*max-height:\s*92dvh;[\s\S]*width:\s*100vw;/,
+    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-backdrop\s*{[\s\S]*align-items:\s*stretch;[\s\S]*padding:\s*env\(safe-area-inset-top\) 0 0;/,
+  );
+  expect(stylesCss).toMatch(
+    /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*height:\s*calc\(100dvh - env\(safe-area-inset-top\)\);[\s\S]*max-height:\s*calc\(100dvh - env\(safe-area-inset-top\)\);[\s\S]*width:\s*100vw;/,
   );
 });
 
@@ -276,6 +303,7 @@ describe("RunDetailPage", () => {
 
     await user.click(within(drawer).getByRole("button", { name: /产物/ }));
     const productDetail = await screen.findByRole("dialog", { name: "产物详情" });
+    expect(document.querySelector(".process-detail-modal-backdrop")?.parentElement).toBe(document.body);
     expect(within(productDetail).getByText(longArtifactText)).not.toBeNull();
     expect(within(productDetail).getByText("final-script.md")).not.toBeNull();
     await user.click(within(productDetail).getByRole("button", { name: "关闭" }));
@@ -2469,6 +2497,143 @@ describe("RunDetailPage", () => {
     await user.click(within(card).getByRole("button", { name: "拒绝" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/reject-capability"), expect.any(Object)));
+  });
+
+  it("installs and cancels missing capability proposals from the run detail page", async () => {
+    const user = userEvent.setup();
+    const proposalRun: RunDetail = {
+      ...runDetail,
+      status: "failed",
+      capability_install_proposal: {
+        entry_id: "office_doc_search",
+        plan_id: "capability-plan-office_doc_search-1234",
+        name_cn: "Office 文档搜索",
+        summary_cn: "安装只读 Office 文档索引与搜索能力。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取用户选择的文档目录"],
+        requires_confirmation: true,
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "https://agent-hub.test").pathname;
+      if (path === "/api/v1/auth/me") {
+        return jsonResponse({
+          user_id: "11111111-1111-4111-8111-111111111111",
+          tenant_id: "33333333-3333-4333-8333-333333333333",
+          username: "admin",
+          role: "super_admin",
+          permissions: ["*"],
+        });
+      }
+      if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(proposalRun);
+      if (path === "/api/v1/admin/capability-installer/install") {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          entry_id: "office_doc_search",
+          query: "读取 Office 文档并搜索",
+          plan_id: "capability-plan-office_doc_search-1234",
+          confirm: true,
+        });
+        return jsonResponse({
+          plan: {
+            id: "capability-plan-office_doc_search-1234",
+            status: "installed",
+            entry_id: "office_doc_search",
+            name_cn: "Office 文档搜索",
+            summary_cn: "安装只读 Office 文档索引与搜索能力。",
+            query: "读取 Office 文档并搜索",
+            plugin_id: "office-doc-search",
+            capabilities: ["office.search_documents"],
+            risks: ["read_only"],
+            permission_summary: ["读取用户选择的文档目录"],
+            rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+            requires_confirmation: true,
+            plugin_request: {
+              id: "office-doc-search",
+              name: "Office 文档搜索",
+              enabled: true,
+              capabilities: [],
+            },
+          },
+          plugin: {
+            id: "office-doc-search",
+            name: "Office 文档搜索",
+            enabled: true,
+            description: null,
+            version: "1.0.0",
+            endpoint_url: null,
+            domain_allowlist: [],
+            resource_config: {},
+            timeout_seconds: 10,
+            credential_ref: null,
+            credential_header: "X-Plugin-Credential",
+            credential_scheme: "Bearer",
+            capabilities: [],
+            source_filename: null,
+            content_sha256: null,
+            package_metadata: null,
+            status: "running",
+            health: "healthy",
+            last_error_type: null,
+          },
+        });
+      }
+      if (path === "/api/v1/admin/capability-installer/cancel") {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          entry_id: "office_doc_search",
+          query: "读取 Office 文档并搜索",
+        });
+        return jsonResponse({
+          plan: {
+            id: "capability-plan-office_doc_search-1234",
+            status: "cancelled",
+            entry_id: "office_doc_search",
+            name_cn: "Office 文档搜索",
+            summary_cn: "安装只读 Office 文档索引与搜索能力。",
+            query: "读取 Office 文档并搜索",
+            plugin_id: "office-doc-search",
+            capabilities: ["office.search_documents"],
+            risks: ["read_only"],
+            permission_summary: ["读取用户选择的文档目录"],
+            rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+            requires_confirmation: true,
+            plugin_request: {
+              id: "office-doc-search",
+              name: "Office 文档搜索",
+              enabled: true,
+              capabilities: [],
+            },
+          },
+        });
+      }
+      return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const card = await screen.findByRole("status", { name: "能力安装建议" });
+    expect(within(card).getByText("Office 文档搜索")).not.toBeNull();
+    expect(within(card).getByText("安装只读 Office 文档索引与搜索能力。")).not.toBeNull();
+    await user.click(within(card).getByRole("button", { name: "安装能力 Office 文档搜索" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/capability-installer/install",
+        expect.any(Object),
+      ),
+    );
+    expect(await within(card).findByText("能力已安装：Office 文档搜索")).not.toBeNull();
+
+    await user.click(within(card).getByRole("button", { name: "取消安装建议" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/capability-installer/cancel",
+        expect.any(Object),
+      ),
+    );
+    expect(await within(card).findByText("已取消安装建议：Office 文档搜索")).not.toBeNull();
   });
 
   it("does not show sandbox controls for non-capability waiting approvals", async () => {

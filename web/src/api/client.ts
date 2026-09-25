@@ -628,6 +628,20 @@ const RepairProposalSchema = z.object({
   recovery_strategy: z.string().optional(),
   orchestration_recovery_hint: z.string().optional(),
 });
+
+const CapabilityInstallProposalSchema = z.object({
+  entry_id: z.string(),
+  plan_id: z.string(),
+  name_cn: z.string(),
+  summary_cn: z.string(),
+  query: z.string(),
+  plugin_id: z.string(),
+  capabilities: z.array(z.string()).default([]),
+  risks: z.array(z.string()).default([]),
+  permission_summary: z.array(z.string()).default([]),
+  requires_confirmation: z.boolean(),
+});
+
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -651,6 +665,7 @@ const SubmittedRunSchema = z.object({
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
   project_preflight_proposal: ProjectPreflightProposalSchema.nullable().optional(),
   repair_proposal: RepairProposalSchema.nullable().optional(),
+  capability_install_proposal: CapabilityInstallProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -845,6 +860,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
   project_preflight_proposal: ProjectPreflightProposalSchema.nullable().optional(),
   repair_proposal: RepairProposalSchema.nullable().optional(),
+  capability_install_proposal: CapabilityInstallProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({
@@ -1191,6 +1207,79 @@ const PluginArchiveInstallSchema = z.object({
 });
 
 export type PluginArchiveInstall = z.infer<typeof PluginArchiveInstallSchema>;
+
+const CapabilityInstallerPluginRequestSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    enabled: z.boolean().default(true),
+    capabilities: z.array(PluginCapabilitySchema).default([]),
+  })
+  .passthrough();
+
+const CapabilityCatalogEntrySchema = z.object({
+  id: z.string(),
+  name_cn: z.string(),
+  summary_cn: z.string(),
+  aliases: z.array(z.string()).default([]),
+  risks: z.array(z.string()).default([]),
+  permission_summary: z.array(z.string()).default([]),
+  plugin: CapabilityInstallerPluginRequestSchema,
+});
+
+const CapabilityInstallPlanSchema = z.object({
+  id: z.string(),
+  status: z.enum(["planned", "cancelled", "installed", "failed", "rolled_back"]),
+  entry_id: z.string(),
+  name_cn: z.string(),
+  summary_cn: z.string(),
+  query: z.string(),
+  plugin_id: z.string(),
+  capabilities: z.array(z.string()).default([]),
+  risks: z.array(z.string()).default([]),
+  permission_summary: z.array(z.string()).default([]),
+  rollback_strategy: z.literal("restore_previous_plugin_or_delete_installed_plugin"),
+  requires_confirmation: z.boolean(),
+  plugin_request: CapabilityInstallerPluginRequestSchema,
+});
+
+const CapabilityInstallerCatalogSchema = z.object({
+  entries: z.array(CapabilityCatalogEntrySchema).default([]),
+});
+
+const CapabilityInstallerResolveSchema = z.object({
+  matches: z.array(CapabilityCatalogEntrySchema).default([]),
+});
+
+const CapabilityInstallerPlanResponseSchema = z.object({
+  plan: CapabilityInstallPlanSchema,
+});
+
+const CapabilityInstallerInstallResponseSchema = z.object({
+  plan: CapabilityInstallPlanSchema,
+  plugin: PluginResourceSchema,
+});
+
+export type CapabilityCatalogEntry = z.infer<typeof CapabilityCatalogEntrySchema>;
+export type CapabilityInstallPlan = z.infer<typeof CapabilityInstallPlanSchema>;
+export type CapabilityInstallerCatalog = z.infer<typeof CapabilityInstallerCatalogSchema>;
+export type CapabilityInstallerResolve = z.infer<typeof CapabilityInstallerResolveSchema>;
+export type CapabilityInstallerPlanResponse = z.infer<
+  typeof CapabilityInstallerPlanResponseSchema
+>;
+export type CapabilityInstallerInstallResponse = z.infer<
+  typeof CapabilityInstallerInstallResponseSchema
+>;
+
+export type CapabilityInstallerPlanPayload = {
+  entry_id: string;
+  query: string;
+};
+
+export type CapabilityInstallerInstallPayload = CapabilityInstallerPlanPayload & {
+  plan_id: string;
+  confirm: boolean;
+};
 
 const PluginSigningKeySchema = z.object({
   key_id: z.string(),
@@ -2362,6 +2451,56 @@ export const api = {
         },
       },
       PluginArchiveInstallSchema,
+    );
+  },
+  capabilityInstallerCatalog(): Promise<CapabilityInstallerCatalog> {
+    return request(
+      "/api/v1/admin/capability-installer/catalog",
+      { method: "GET" },
+      CapabilityInstallerCatalogSchema,
+    );
+  },
+  resolveCapabilityInstall(query: string): Promise<CapabilityInstallerResolve> {
+    return request(
+      "/api/v1/admin/capability-installer/resolve",
+      { method: "POST", body: JSON.stringify({ query }) },
+      CapabilityInstallerResolveSchema,
+    );
+  },
+  planCapabilityInstall(
+    payload: CapabilityInstallerPlanPayload,
+  ): Promise<CapabilityInstallerPlanResponse> {
+    return request(
+      "/api/v1/admin/capability-installer/plan",
+      { method: "POST", body: JSON.stringify(payload) },
+      CapabilityInstallerPlanResponseSchema,
+    );
+  },
+  cancelCapabilityInstall(
+    payload: CapabilityInstallerPlanPayload,
+  ): Promise<CapabilityInstallerPlanResponse> {
+    return request(
+      "/api/v1/admin/capability-installer/cancel",
+      { method: "POST", body: JSON.stringify(payload) },
+      CapabilityInstallerPlanResponseSchema,
+    );
+  },
+  installCapability(
+    payload: CapabilityInstallerInstallPayload,
+  ): Promise<CapabilityInstallerInstallResponse> {
+    return request(
+      "/api/v1/admin/capability-installer/install",
+      { method: "POST", body: JSON.stringify(payload) },
+      CapabilityInstallerInstallResponseSchema,
+    );
+  },
+  rollbackCapabilityInstall(
+    payload: CapabilityInstallerPlanPayload,
+  ): Promise<CapabilityInstallerPlanResponse> {
+    return request(
+      "/api/v1/admin/capability-installer/rollback",
+      { method: "POST", body: JSON.stringify(payload) },
+      CapabilityInstallerPlanResponseSchema,
     );
   },
   approvePluginPackage(id: string, payload: PluginPackageApprovalPayload): Promise<PluginResource> {
