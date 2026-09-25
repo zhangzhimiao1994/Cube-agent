@@ -1493,6 +1493,78 @@ article:hover {
   word-break: break-word;
 }
 
+.conversation-checkpoints {
+  align-items: center;
+  background: rgba(3, 10, 20, 0.34);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: auto minmax(0, 1fr);
+  max-width: 100%;
+  padding: 0.46rem 0.52rem;
+}
+
+.conversation-checkpoints > span {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 950;
+  letter-spacing: 0;
+}
+
+.conversation-checkpoints > div {
+  display: flex;
+  gap: 0.35rem;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding-bottom: 0.04rem;
+}
+
+.conversation-checkpoints button {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+  max-width: min(18rem, 72vw);
+  min-height: 2rem;
+  padding: 0.3rem 0.58rem;
+}
+
+.conversation-checkpoints button:hover,
+.conversation-checkpoints button:focus-visible {
+  background: rgba(123, 225, 255, 0.14);
+  border-color: rgba(123, 225, 255, 0.34);
+}
+
+.conversation-checkpoints small {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.15);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-weight: 950;
+  height: 1.18rem;
+  justify-content: center;
+  width: 1.18rem;
+}
+
+.conversation-checkpoints strong {
+  font-size: 0.78rem;
+  font-weight: 850;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .temporary-agent-summary-card {
   display: grid;
   gap: 0.65rem;
@@ -5798,6 +5870,23 @@ article:hover {
 
   .chat-message.user {
     max-width: 84%;
+  }
+
+  .conversation-checkpoints {
+    align-items: start;
+    gap: 0.35rem;
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0.42rem;
+  }
+
+  .conversation-checkpoints > div {
+    width: 100%;
+  }
+
+  .conversation-checkpoints button {
+    max-width: min(16rem, 78vw);
+    min-height: 1.9rem;
+    padding: 0.26rem 0.5rem;
   }
 
   .mode-entry-panel {

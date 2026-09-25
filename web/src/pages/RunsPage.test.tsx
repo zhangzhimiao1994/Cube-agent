@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RunDetail } from "../api/client";
 import {
   agentInlineSummary,
+  conversationCheckpoints,
   conversationWorkspaceFiles,
   conversationMessages,
   MessageBody,
@@ -245,6 +246,36 @@ describe("conversation ordering", () => {
     expect(messages.map((message) => message.title)).toEqual(["你", "回复"]);
     expect(messages[1].body).toContain("插件已完成构建");
     expect(messages[1].artifact?.filename).toBe("project.zip");
+  });
+
+  it("builds compact jump checkpoints from user questions", () => {
+    const runs: RunDetail[] = [
+      {
+        ...baseRun,
+        id: "11111111-1111-4111-8111-111111111111",
+        request: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并可以进行搜索查询",
+        created_at: "2026-09-02T00:01:00Z",
+      },
+      {
+        ...baseRun,
+        id: "33333333-3333-4333-8333-333333333333",
+        request: "继续优化 UI 交互，重点检查文件预览和配置页面",
+        created_at: "2026-09-02T00:02:00Z",
+      },
+    ];
+
+    expect(conversationCheckpoints(conversationMessages(runs))).toEqual([
+      {
+        id: "11111111-1111-4111-8111-111111111111-request",
+        label: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并...",
+        index: 1,
+      },
+      {
+        id: "33333333-3333-4333-8333-333333333333-request",
+        label: "继续优化 UI 交互，重点检查文件预览和配置页面",
+        index: 2,
+      },
+    ]);
   });
 
   it("orders process cards by event sequence when backend events arrive out of order", () => {

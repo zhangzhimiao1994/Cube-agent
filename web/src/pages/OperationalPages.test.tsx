@@ -3001,7 +3001,7 @@ describe("operational management pages", () => {
     await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).queryByText("正在读取当前会话...")).toBeNull();
   });
   it("keeps older conversation messages when a later run is appended", async () => {
@@ -3028,9 +3028,9 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(within(stream).getByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
-    expect(await within(stream).findByText("再给我一个更强的开头。")).not.toBeNull();
+    expect(await within(stream).findByText("再给我一个更强的开头。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
   });
 
@@ -3071,9 +3071,10 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await within(stream).findByText("第一轮：先生成代码。");
+    await within(stream).findByText("第一轮：先生成代码。", { selector: ".chat-message.user p" });
+    const userMessages = Array.from(stream.querySelectorAll(".chat-message.user p")).map((element) => element.textContent ?? "");
+    expect(userMessages).toEqual(["第一轮：先生成代码。", "第二轮：生成压缩包。"]);
     const text = stream.textContent ?? "";
-    expect(text.indexOf("第一轮：先生成代码。")).toBeLessThan(text.indexOf("第二轮：生成压缩包。"));
     expect(text.indexOf("第一轮回复：代码已经生成。")).toBeLessThan(text.indexOf("第二轮回复：压缩包已经生成。"));
   });
 
@@ -3084,15 +3085,15 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
 
     await user.click(screen.getAllByRole("button", { name: "新建对话" }).at(-1) as HTMLElement);
-    expect(within(stream).queryByText("给我做一个短视频脚本方案。")).toBeNull();
+    expect(within(stream).queryByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).toBeNull();
     expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
 
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(screen.getByText(/会话：conv-previous/)).not.toBeNull();
   });
@@ -3526,14 +3527,14 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
 
     visibleConversationRuns = [secondRunDetail];
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
   });
 
@@ -5703,7 +5704,7 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
     expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
-    expect(within(stream).getByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(within(stream).getByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
   });
 
   it("keeps later independent runtime failures separate from tool failure wrappers", async () => {

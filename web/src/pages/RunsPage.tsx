@@ -438,6 +438,11 @@ type ChatMessage = {
   temporaryAgent?: TemporaryAgentProposal;
   run?: RunDetail;
 };
+type ConversationCheckpoint = {
+  id: string;
+  label: string;
+  index: number;
+};
 type EventGroupItem = {
   event: RunEvent;
   index: number;
@@ -2742,6 +2747,45 @@ export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
         id: `${run.id}-${message.id}`,
         run,
       })),
+  );
+}
+
+export function conversationCheckpoints(messages: ChatMessage[]): ConversationCheckpoint[] {
+  return messages
+    .filter((message) => message.role === "user" && message.id.endsWith("-request"))
+    .map((message, index) => ({
+      id: message.id,
+      label: normalizeConversationQuestion(message.body, `第 ${index + 1} 轮`),
+      index: index + 1,
+    }));
+}
+
+function chatMessageAnchorId(messageId: string) {
+  return `chat-message-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+}
+
+function ConversationCheckpointNav({ checkpoints }: { checkpoints: ConversationCheckpoint[] }) {
+  if (checkpoints.length < 2) return null;
+  return (
+    <nav className="conversation-checkpoints" aria-label="对话检查点" aria-live="off">
+      <span>检查点</span>
+      <div>
+        {checkpoints.map((checkpoint) => (
+          <button
+            type="button"
+            key={checkpoint.id}
+            onClick={() => {
+              document
+                .getElementById(chatMessageAnchorId(checkpoint.id))
+                ?.scrollIntoView({ block: "start", behavior: "smooth" });
+            }}
+          >
+            <small>{checkpoint.index}</small>
+            <strong>{checkpoint.label}</strong>
+          </button>
+        ))}
+      </div>
+    </nav>
   );
 }
 
@@ -6456,6 +6500,7 @@ export function RunsPage() {
       ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
       : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
+  const checkpoints = conversationCheckpoints(messages);
   const workspaceFiles = mergeWorkspaceFileList(
     conversationWorkspaceFiles(visibleRuns),
     activeWorkspaceFiles.data,
@@ -6893,6 +6938,7 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
+            <ConversationCheckpointNav checkpoints={checkpoints} />
             {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
@@ -6978,7 +7024,10 @@ export function RunsPage() {
             ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
-                <article className={`chat-message ${item.role}`}>
+                <article
+                  className={`chat-message ${item.role}`}
+                  id={item.role === "user" ? chatMessageAnchorId(item.id) : undefined}
+                >
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
                   {item.temporaryAgent ? (

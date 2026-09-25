@@ -249,6 +249,7 @@ async function mockCodingRunApi(
     fullOutputSentinel?: string;
     largeWorkbench?: boolean;
     longWorkspacePreview?: boolean;
+    multiTurnHistory?: boolean;
   } = {},
 ) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
@@ -436,6 +437,37 @@ async function mockCodingRunApi(
       },
     ],
   };
+  const followUpRunDetail = {
+    ...runDetail,
+    id: "77777777-7777-4777-8777-777777777777",
+    request: "继续优化 UI 交互，重点检查文件预览和配置页面。",
+    created_at: "2026-08-31T00:03:00Z",
+    events: [
+      {
+        sequence: 1,
+        kind: "runtime.completed",
+        message: "runtime.completed",
+        summary: "已完成 UI 复核。",
+        created_at: "2026-08-31T00:03:02Z",
+        actor: "main",
+        payload: {},
+      },
+    ],
+    artifacts: [
+      {
+        id: "reply-follow-up",
+        kind: "markdown",
+        title: "main",
+        text: "已复核文件预览和配置页面交互。",
+        filename: null,
+        mime_type: null,
+        size_bytes: null,
+        sha256: null,
+        download_url: null,
+        presentation: null,
+      },
+    ],
+  };
 
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -540,7 +572,12 @@ async function mockCodingRunApi(
       return;
     }
     if (path === `/api/v1/admin/conversations/${codingConversationId}`) {
-      await route.fulfill({ json: { conversation_id: codingConversationId, runs: [runDetail] } });
+      await route.fulfill({
+        json: {
+          conversation_id: codingConversationId,
+          runs: options.multiTurnHistory ? [runDetail, followUpRunDetail] : [runDetail],
+        },
+      });
       return;
     }
     if (path === `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files`) {
@@ -712,6 +749,37 @@ test("operator validates a simple coding run and downloads final and intermediat
   await drawer.getByRole("button", { name: "关闭" }).click();
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);
   await expect(page.getByRole("dialog", { name: "Agent 工作席详情" })).toBeVisible();
+});
+
+test("conversation checkpoints jump between user questions", async ({ page }) => {
+  await mockCodingRunApi(page, { multiTurnHistory: true });
+
+  await page.goto("/");
+  await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  const checkpoints = page.getByRole("navigation", { name: "对话检查点" });
+  await expect(checkpoints).toBeVisible();
+  await expect(checkpoints.getByRole("button", { name: /生成一个最简单的 hello world 项目/ })).toBeVisible();
+  await expect(checkpoints.getByRole("button", { name: /继续优化 UI 交互/ })).toBeVisible();
+
+  await page.evaluate(() => {
+    const testWindow = window as unknown as { __lastConversationCheckpointTarget: string };
+    testWindow.__lastConversationCheckpointTarget = "";
+    HTMLElement.prototype.scrollIntoView = function () {
+      testWindow.__lastConversationCheckpointTarget = this.id;
+    };
+  });
+
+  await checkpoints.getByRole("button", { name: /继续优化 UI 交互/ }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const testWindow = window as unknown as { __lastConversationCheckpointTarget: string };
+        return testWindow.__lastConversationCheckpointTarget;
+      }),
+    )
+    .toBe("chat-message-77777777-7777-4777-8777-777777777777-request");
 });
 
 test("agent workbench keeps subagent scheduling compact on mobile", async ({ page }) => {
