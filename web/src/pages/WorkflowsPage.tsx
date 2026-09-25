@@ -478,18 +478,19 @@ export function WorkflowsPage() {
                 <p>调整列筛选或清空筛选查看全部工作流。</p>
               </article>
             ) : (
-              <table aria-label="已保存工作流列表" className="dense-table">
-                <thead>
-                  <tr>
-                    <th><SortHeader column="status" label="状态" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
-                    <th><SortHeader column="name" label="工作流" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>工作流</SortHeader></th>
-                    <th><SortHeader column="taskType" label="任务类型" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>任务类型</SortHeader></th>
-                    <th><SortHeader column="mode" label="默认模式" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认模式</SortHeader></th>
-                    <th><SortHeader column="roles" label="默认角色" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认角色</SortHeader></th>
-                    <th><SortHeader column="objective" label="目标" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>目标</SortHeader></th>
-                    <th>操作</th>
-                  </tr>
-                  <tr className="table-filter-row">
+              <div className="table-shell">
+                <table aria-label="已保存工作流列表" className="dense-table">
+                  <thead>
+                    <tr>
+                      <th><SortHeader column="status" label="状态" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                      <th><SortHeader column="name" label="工作流" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>工作流</SortHeader></th>
+                      <th><SortHeader column="taskType" label="任务类型" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>任务类型</SortHeader></th>
+                      <th><SortHeader column="mode" label="默认模式" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认模式</SortHeader></th>
+                      <th><SortHeader column="roles" label="默认角色" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认角色</SortHeader></th>
+                      <th><SortHeader column="objective" label="目标" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>目标</SortHeader></th>
+                      <th>操作</th>
+                    </tr>
+                    <tr className="table-filter-row">
                     <th>
                       <select
                         aria-label="按工作流状态筛选"
@@ -566,34 +567,35 @@ export function WorkflowsPage() {
                       />
                     </th>
                     <th aria-label="工作流操作筛选占位" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleWorkflows.map((workflow) => (
-                    <tr key={workflow.id}>
-                      <td>{workflowStatus(workflow)}</td>
-                      <td><strong>{workflow.name}</strong><br /><small>{workflow.id}</small></td>
-                      <td>{workflow.task_type || "未设置"}</td>
-                      <td>{workflowMode(workflow)}</td>
-                      <td>{workflowRoles(workflow)}</td>
-                      <td>{workflow.objective || "未设置"}</td>
-                      <td className="table-actions">
-                        <button type="button" onClick={() => editWorkflow(workflow)}>
-                          编辑工作流
-                        </button>
-                        <button
-                          type="button"
-                          className="danger-action"
-                          onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
-                          disabled={deleteWorkflow.isPending}
-                        >
-                          删除工作流
-                        </button>
-                      </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {visibleWorkflows.map((workflow) => (
+                      <tr key={workflow.id}>
+                        <td>{workflowStatus(workflow)}</td>
+                        <td><strong>{workflow.name}</strong><br /><small>{workflow.id}</small></td>
+                        <td>{workflow.task_type || "未设置"}</td>
+                        <td>{workflowMode(workflow)}</td>
+                        <td>{workflowRoles(workflow)}</td>
+                        <td>{workflow.objective || "未设置"}</td>
+                        <td className="table-actions">
+                          <button type="button" onClick={() => editWorkflow(workflow)}>
+                            编辑工作流
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-action"
+                            onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
+                            disabled={deleteWorkflow.isPending}
+                          >
+                            删除工作流
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </>
         )}

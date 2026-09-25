@@ -472,6 +472,17 @@ describe("agentInlineSummary", () => {
     );
   });
 
+  it("keeps conversation file previews scrollable when mobile drawers lock page scrolling", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /\.conversation-file-preview-drawer\s*{[\s\S]*display:\s*grid;[\s\S]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);[\s\S]*overflow:\s*hidden;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.conversation-file-preview-drawer \.agent-workbench-file-preview\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;/,
+    );
+  });
+
   it("closes the history drawer when starting a new blank conversation", () => {
     const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
     const startNewConversationMatch = source.match(/function startNewConversation\(\) \{[\s\S]*?\n  \}/);

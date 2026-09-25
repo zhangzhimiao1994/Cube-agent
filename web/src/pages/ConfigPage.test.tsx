@@ -360,6 +360,7 @@ describe("ConfigPage", () => {
 
   it("keeps advanced JSON publishing available with detailed parse errors", async () => {
     const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<TestApp initialPath="/config" />);
 
     await user.click(await screen.findByText("高级：直接编辑生产配置 JSON"));

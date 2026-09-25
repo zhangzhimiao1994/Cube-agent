@@ -244,12 +244,24 @@ test("operator inspects run detail and cancels safely", async ({ page }) => {
 
 async function mockCodingRunApi(
   page: Page,
-  options: { liveRefresh?: boolean; fullOutputSentinel?: string; largeWorkbench?: boolean } = {},
+  options: {
+    liveRefresh?: boolean;
+    fullOutputSentinel?: string;
+    largeWorkbench?: boolean;
+    longWorkspacePreview?: boolean;
+  } = {},
 ) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
   const intermediateArtifactId = "66666666-6666-4666-8666-666666666666";
   const finalDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${finalArtifactId}/download`;
   const intermediateDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${intermediateArtifactId}/download`;
+  const longPreviewSentinel = "README_SCROLL_SENTINEL_末尾内容必须可以通过拖动看到";
+  const longPreviewText = [
+    "# Enterprise Portfolio OS",
+    "",
+    ...Array.from({ length: 90 }, (_item, index) => `第 ${index + 1} 行：移动端文件预览需要保持可拖动，不能被抽屉或浏览器底栏截断。`),
+    longPreviewSentinel,
+  ].join("\n");
   let detailRequests = 0;
   const plannedRoles = options.largeWorkbench
     ? [
@@ -535,6 +547,18 @@ async function mockCodingRunApi(
       await route.fulfill({
         json: {
           items: [
+            ...(options.longWorkspacePreview
+              ? [
+                  {
+                    path: "README.md",
+                    filename: "README.md",
+                    mime_type: "text/markdown",
+                    size_bytes: longPreviewText.length,
+                    sha256: "e".repeat(64),
+                    download_url: `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files/download?path=README.md`,
+                  },
+                ]
+              : []),
             {
               path: "plan.md",
               filename: "plan.md",
@@ -556,6 +580,33 @@ async function mockCodingRunApi(
         },
       });
       return;
+    }
+    if (path === `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files/download`) {
+      const requestedPath = new URL(request.url()).searchParams.get("path");
+      if (requestedPath === "README.md") {
+        await route.fulfill({
+          status: 200,
+          headers: { "Content-Type": "text/markdown" },
+          body: longPreviewText,
+        });
+        return;
+      }
+      if (requestedPath === "plan.md") {
+        await route.fulfill({
+          status: 200,
+          headers: { "Content-Type": "text/markdown" },
+          body: "# Plan\n\nCreate a hello world project.\n",
+        });
+        return;
+      }
+      if (requestedPath === "src/index.mjs") {
+        await route.fulfill({
+          status: 200,
+          headers: { "Content-Type": "text/javascript" },
+          body: "console.log('hello world')\n",
+        });
+        return;
+      }
     }
     const workspaceBundlePath = `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/bundle/download`;
     if (path === finalDownloadPath || path === workspaceBundlePath || path === intermediateDownloadPath) {
@@ -688,6 +739,65 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
   await expect(detail).not.toContainText("工程师开始创建最小项目。");
   await detail.getByRole("button", { name: /打开.*实现.*工作调度/ }).click();
   await expect(detail).toContainText("工程师开始创建最小项目。");
+  const layout = await page.evaluate(() => ({
+    bodyScrollWidth: document.body.scrollWidth,
+    docScrollWidth: document.documentElement.scrollWidth,
+    innerWidth,
+  }));
+  expect(layout.bodyScrollWidth).toBeLessThanOrEqual(layout.innerWidth + 1);
+  expect(layout.docScrollWidth).toBeLessThanOrEqual(layout.innerWidth + 1);
+});
+
+test("mobile conversation file preview scrolls long files to the end", async ({ page }) => {
+  await mockCodingRunApi(page, { longWorkspacePreview: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  await page.goto("/");
+  await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await page.getByRole("button", { name: "预览文件 README.md" }).click();
+  const drawer = page.getByRole("dialog", { name: "文件内容预览" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer).toContainText("README.md");
+
+  const previewBody = drawer.locator(".agent-workbench-file-preview");
+  const codeBlock = drawer.locator(".agent-workbench-file-code");
+  await expect(codeBlock).toContainText("# Enterprise Portfolio OS");
+  await expect
+    .poll(() =>
+      previewBody.evaluate((element) => {
+        const style = window.getComputedStyle(element);
+        return style.overflowY;
+      }),
+    )
+    .toBe("auto");
+  await expect
+    .poll(() =>
+      codeBlock.evaluate((element) => ({
+        canScroll: element.scrollHeight > element.clientHeight,
+        overflowY: window.getComputedStyle(element).overflowY,
+      })),
+    )
+    .toEqual({ canScroll: true, overflowY: "auto" });
+
+  await previewBody.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await codeBlock.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect
+    .poll(() =>
+      codeBlock.evaluate((element) => ({
+        atEnd: element.scrollTop + element.clientHeight >= element.scrollHeight - 1,
+        text: element.textContent,
+      })),
+    )
+    .toMatchObject({
+      atEnd: true,
+      text: expect.stringContaining("README_SCROLL_SENTINEL_末尾内容必须可以通过拖动看到"),
+    });
   const layout = await page.evaluate(() => ({
     bodyScrollWidth: document.body.scrollWidth,
     docScrollWidth: document.documentElement.scrollWidth,

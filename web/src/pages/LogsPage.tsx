@@ -300,62 +300,64 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
             </button>
             <small>当前结果已选 {selectedEntries.length}</small>
           </div>
-          <table aria-label={`${module.title}列表`} className="dense-table">
-            <thead>
-              <tr>
-                <th>选择</th>
-                <th><SortHeader column="level" label="级别" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>级别</SortHeader></th>
-                <th><SortHeader column="title" label="标题与消息" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>标题与消息</SortHeader></th>
-                <th><SortHeader column="source" label="来源" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>来源</SortHeader></th>
-                <th><SortHeader column="time" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
-                <th><SortHeader column="details" label="详情" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>详情</SortHeader></th>
-              </tr>
-              <tr className="table-filter-row">
-                <th aria-label="日志选择筛选占位" />
-                <th>
-                  <select aria-label="按日志级别筛选" value={columnFilters.level} onChange={(event) => updateColumnFilter("level", event.currentTarget.value as LogColumnFilters["level"])}>
-                    <option value="all">全部</option>
-                    <option value="info">info</option>
-                    <option value="warning">warning</option>
-                    <option value="error">error</option>
-                  </select>
-                </th>
-                <th><input aria-label="按日志标题筛选" value={columnFilters.title} onChange={(event) => updateColumnFilter("title", event.currentTarget.value)} placeholder={module.category === "audit" ? "操作或对话" : "标题或消息"} /></th>
-                <th><input aria-label="按日志来源筛选" value={columnFilters.source} onChange={(event) => updateColumnFilter("source", event.currentTarget.value)} placeholder="来源" /></th>
-                <th><input aria-label="按日志时间筛选" value={columnFilters.time} onChange={(event) => updateColumnFilter("time", event.currentTarget.value)} placeholder="时间" /></th>
-                <th><input aria-label="按日志详情筛选" value={columnFilters.details} onChange={(event) => updateColumnFilter("details", event.currentTarget.value)} placeholder={module.category === "audit" ? "用户、对话或运行" : "详情键或值"} /></th>
-              </tr>
-            </thead>
-            <tbody>
-              {visibleEntries.map((entry) => (
-                <tr key={entry.id}>
-                  <td>
-                    <input
-                      type="checkbox"
-                      aria-label={`Select log ${entry.id}`}
-                      checked={selectedIds.includes(entry.id)}
-                      onChange={() => toggleLog(entry.id)}
-                    />
-                  </td>
-                  <td><span className={`level-pill level-${entry.level}`}>{entry.level}</span></td>
-                  <td>
-                    <strong>{entry.title}</strong>
-                    <br />
-                    <span>{auditDisplayMessage(entry)}</span>
-                    {auditConversationSummary(entry) ? (
-                      <>
-                        <br />
-                        <small>{auditConversationSummary(entry)}</small>
-                      </>
-                    ) : null}
-                  </td>
-                  <td>{entry.source}</td>
-                  <td><time dateTime={entry.created_at}>{entry.created_at}</time></td>
-                  <td>{logDetailsText(entry)}</td>
+          <div className="table-shell">
+            <table aria-label={`${module.title}列表`} className="dense-table">
+              <thead>
+                <tr>
+                  <th>选择</th>
+                  <th><SortHeader column="level" label="级别" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>级别</SortHeader></th>
+                  <th><SortHeader column="title" label="标题与消息" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>标题与消息</SortHeader></th>
+                  <th><SortHeader column="source" label="来源" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>来源</SortHeader></th>
+                  <th><SortHeader column="time" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
+                  <th><SortHeader column="details" label="详情" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>详情</SortHeader></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+                <tr className="table-filter-row">
+                  <th aria-label="日志选择筛选占位" />
+                  <th>
+                    <select aria-label="按日志级别筛选" value={columnFilters.level} onChange={(event) => updateColumnFilter("level", event.currentTarget.value as LogColumnFilters["level"])}>
+                      <option value="all">全部</option>
+                      <option value="info">info</option>
+                      <option value="warning">warning</option>
+                      <option value="error">error</option>
+                    </select>
+                  </th>
+                  <th><input aria-label="按日志标题筛选" value={columnFilters.title} onChange={(event) => updateColumnFilter("title", event.currentTarget.value)} placeholder={module.category === "audit" ? "操作或对话" : "标题或消息"} /></th>
+                  <th><input aria-label="按日志来源筛选" value={columnFilters.source} onChange={(event) => updateColumnFilter("source", event.currentTarget.value)} placeholder="来源" /></th>
+                  <th><input aria-label="按日志时间筛选" value={columnFilters.time} onChange={(event) => updateColumnFilter("time", event.currentTarget.value)} placeholder="时间" /></th>
+                  <th><input aria-label="按日志详情筛选" value={columnFilters.details} onChange={(event) => updateColumnFilter("details", event.currentTarget.value)} placeholder={module.category === "audit" ? "用户、对话或运行" : "详情键或值"} /></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleEntries.map((entry) => (
+                  <tr key={entry.id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select log ${entry.id}`}
+                        checked={selectedIds.includes(entry.id)}
+                        onChange={() => toggleLog(entry.id)}
+                      />
+                    </td>
+                    <td><span className={`level-pill level-${entry.level}`}>{entry.level}</span></td>
+                    <td>
+                      <strong>{entry.title}</strong>
+                      <br />
+                      <span>{auditDisplayMessage(entry)}</span>
+                      {auditConversationSummary(entry) ? (
+                        <>
+                          <br />
+                          <small>{auditConversationSummary(entry)}</small>
+                        </>
+                      ) : null}
+                    </td>
+                    <td>{entry.source}</td>
+                    <td><time dateTime={entry.created_at}>{entry.created_at}</time></td>
+                    <td>{logDetailsText(entry)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </>
       )}
     </section>

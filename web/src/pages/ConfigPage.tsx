@@ -462,7 +462,9 @@ export function ConfigPage() {
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            publish.mutate();
+            if (window.confirm("确认创建草稿并发布生产配置 JSON？发布后会影响后续任务和运行时配置。")) {
+              publish.mutate();
+            }
           }}
           aria-label="发布生产配置"
         >

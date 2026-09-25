@@ -60,6 +60,18 @@ export function AppShell() {
     setExpandedMobileGroupId(activeGroup?.id ?? null);
   }, [activeGroup?.id, location.pathname]);
 
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+    };
+  }, [mobileNavOpen]);
+
   return (
     <div className={`app-shell nav-floating${mobileNavOpen ? " mobile-nav-open" : ""}`}>
       <aside className="sidebar floating-sidebar">

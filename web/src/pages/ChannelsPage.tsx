@@ -638,7 +638,11 @@ export function ChannelsPage() {
                   type="button"
                   className="danger-action"
                   disabled={clearConfig.isPending || selected.status !== "configured"}
-                  onClick={() => clearConfig.mutate()}
+                  onClick={() => {
+                    if (window.confirm(`确认清空 ${selected.name} 的当前通道配置？保存的密钥引用和入口参数会被移除。`)) {
+                      clearConfig.mutate();
+                    }
+                  }}
                 >
                   {clearConfig.isPending ? "清空中..." : "清空当前通道配置"}
                 </button>
@@ -704,42 +708,44 @@ export function ChannelsPage() {
             <p>调整列筛选或清空筛选查看全部通道。</p>
           </article>
         ) : (
-          <table aria-label="通道支持矩阵列表">
-            <thead>
-              <tr>
-                <th><SortHeader column="name" label="通道" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>通道</SortHeader></th>
-                <th><SortHeader column="status" label="状态" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
-                <th><SortHeader column="entry" label="入口" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>入口</SortHeader></th>
-                <th><SortHeader column="missing" label="缺失配置" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>缺失配置</SortHeader></th>
-              </tr>
-              <tr className="table-filter-row">
-                <th><input aria-label="按通道筛选" value={channelColumnFilters.name} onChange={(event) => updateChannelColumnFilter("name", event.currentTarget.value)} placeholder="名称或 ID" /></th>
-                <th>
-                  <select aria-label="按通道状态筛选" value={channelColumnFilters.status} onChange={(event) => updateChannelColumnFilter("status", event.currentTarget.value)}>
-                    <option value="all">全部</option>
-                    <option value="configured">已接通</option>
-                    <option value="missing_config">待配置</option>
-                  </select>
-                </th>
-                <th><input aria-label="按通道入口筛选" value={channelColumnFilters.entry} onChange={(event) => updateChannelColumnFilter("entry", event.currentTarget.value)} placeholder="Webhook 或路径" /></th>
-                <th><input aria-label="按缺失配置筛选" value={channelColumnFilters.missing} onChange={(event) => updateChannelColumnFilter("missing", event.currentTarget.value)} placeholder="环境变量或无" /></th>
-              </tr>
-            </thead>
-            <tbody>
-              {visibleChannels.map((channel) => (
-                <tr key={channel.id}>
-                  <td>
-                    <strong>{channel.name}</strong>
-                    <br />
-                    <span>{channel.id}</span>
-                  </td>
-                  <td>{statusLabel(channel.status)}</td>
-                  <td>{channelEntry(channel)}</td>
-                  <td>{channelMissing(channel)}</td>
+          <div className="table-shell">
+            <table aria-label="通道支持矩阵列表">
+              <thead>
+                <tr>
+                  <th><SortHeader column="name" label="通道" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>通道</SortHeader></th>
+                  <th><SortHeader column="status" label="状态" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                  <th><SortHeader column="entry" label="入口" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>入口</SortHeader></th>
+                  <th><SortHeader column="missing" label="缺失配置" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>缺失配置</SortHeader></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+                <tr className="table-filter-row">
+                  <th><input aria-label="按通道筛选" value={channelColumnFilters.name} onChange={(event) => updateChannelColumnFilter("name", event.currentTarget.value)} placeholder="名称或 ID" /></th>
+                  <th>
+                    <select aria-label="按通道状态筛选" value={channelColumnFilters.status} onChange={(event) => updateChannelColumnFilter("status", event.currentTarget.value)}>
+                      <option value="all">全部</option>
+                      <option value="configured">已接通</option>
+                      <option value="missing_config">待配置</option>
+                    </select>
+                  </th>
+                  <th><input aria-label="按通道入口筛选" value={channelColumnFilters.entry} onChange={(event) => updateChannelColumnFilter("entry", event.currentTarget.value)} placeholder="Webhook 或路径" /></th>
+                  <th><input aria-label="按缺失配置筛选" value={channelColumnFilters.missing} onChange={(event) => updateChannelColumnFilter("missing", event.currentTarget.value)} placeholder="环境变量或无" /></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleChannels.map((channel) => (
+                  <tr key={channel.id}>
+                    <td>
+                      <strong>{channel.name}</strong>
+                      <br />
+                      <span>{channel.id}</span>
+                    </td>
+                    <td>{statusLabel(channel.status)}</td>
+                    <td>{channelEntry(channel)}</td>
+                    <td>{channelMissing(channel)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </section>
     </section>

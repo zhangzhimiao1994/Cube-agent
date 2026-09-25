@@ -145,6 +145,7 @@ describe("ModelsPage", () => {
 
   it("deletes an existing model deployment from the saved models table", async () => {
     const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<TestApp initialPath="/models" />);
 
     expect(await screen.findByText("planner")).not.toBeNull();

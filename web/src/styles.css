@@ -3856,13 +3856,20 @@ article:hover {
 }
 
 .conversation-file-preview-drawer {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   max-width: min(920px, calc(100vw - 1.2rem));
+  overflow: hidden;
   width: min(920px, calc(100vw - 1.2rem));
 }
 
 .conversation-file-preview-drawer .agent-workbench-file-preview {
   box-shadow: none;
   margin: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: calc(0.62rem + env(safe-area-inset-bottom));
 }
 
 .message-paragraph {
@@ -4731,8 +4738,11 @@ article:hover {
   border: 1px solid var(--line-strong);
   border-radius: 1.35rem;
   box-shadow: var(--shadow), var(--glow);
+  max-height: calc(100dvh - 2rem);
   max-width: min(560px, 100%);
+  overflow-y: auto;
   padding: clamp(1rem, 3vw, 1.4rem);
+  overscroll-behavior: contain;
 }
 
 .link-actions {

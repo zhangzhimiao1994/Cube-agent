@@ -292,6 +292,7 @@ describe("ChannelsPage", () => {
 
   it("clears saved Feishu settings from the visible form state", async () => {
     const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<TestApp initialPath="/channels" />);
 
     await screen.findByRole("heading", { name: "通道连接" });

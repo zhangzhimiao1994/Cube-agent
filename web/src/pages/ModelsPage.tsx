@@ -1143,74 +1143,80 @@ export function ModelsPage() {
                 <p>调整列筛选或清空筛选查看全部模型。</p>
               </article>
             ) : (
-              <table aria-label="已保存模型列表">
-                <thead>
-                  <tr>
-                    <th><SortHeader column="category" label="类别" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>类别</SortHeader></th>
-                    <th><SortHeader column="logical" label="逻辑模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>逻辑模型</SortHeader></th>
-                    <th><SortHeader column="provider" label="服务商" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>服务商</SortHeader></th>
-                    <th><SortHeader column="upstream" label="上游模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>上游模型</SortHeader></th>
-                    <th><SortHeader column="apiBase" label="API Base" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>API Base</SortHeader></th>
-                    <th><SortHeader column="capabilities" label="能力" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>能力</SortHeader></th>
-                    <th><SortHeader column="slots" label="有效/最大并发" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>有效/最大并发</SortHeader></th>
-                    <th>限流</th>
-                    <th><SortHeader column="quota" label="Quota Scope" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>Quota Scope</SortHeader></th>
-                    <th>操作</th>
-                    <th><SortHeader column="policy" label="策略" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>策略</SortHeader></th>
-                  </tr>
-                  <tr className="table-filter-row">
-                    <th>
-                      <select aria-label="按模型类别筛选" value={modelColumnFilters.category} onChange={(event) => updateModelColumnFilter("category", event.currentTarget.value as ModelColumnFilters["category"])}>
-                        <option value="all">全部</option>
-                        <option value="normal">普通模型</option>
-                        <option value="multimedia">多媒体 AI</option>
-                      </select>
-                    </th>
-                    <th><input aria-label="按逻辑模型筛选" value={modelColumnFilters.logical} onChange={(event) => updateModelColumnFilter("logical", event.currentTarget.value)} placeholder="逻辑模型" /></th>
-                    <th><input aria-label="按服务商筛选" value={modelColumnFilters.provider} onChange={(event) => updateModelColumnFilter("provider", event.currentTarget.value)} placeholder="服务商" /></th>
-                    <th><input aria-label="按上游模型筛选" value={modelColumnFilters.upstream} onChange={(event) => updateModelColumnFilter("upstream", event.currentTarget.value)} placeholder="上游模型" /></th>
-                    <th><input aria-label="按 API Base 筛选" value={modelColumnFilters.apiBase} onChange={(event) => updateModelColumnFilter("apiBase", event.currentTarget.value)} placeholder="API Base" /></th>
-                    <th><input aria-label="按模型能力筛选" value={modelColumnFilters.capabilities} onChange={(event) => updateModelColumnFilter("capabilities", event.currentTarget.value)} placeholder="能力" /></th>
-                    <th aria-label="有效并发筛选占位" />
-                    <th aria-label="限流筛选占位" />
-                    <th><input aria-label="按 Quota Scope 筛选" value={modelColumnFilters.quota} onChange={(event) => updateModelColumnFilter("quota", event.currentTarget.value)} placeholder="Quota Scope" /></th>
-                    <th aria-label="模型操作筛选占位" />
-                    <th aria-label="策略筛选占位" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleSavedModels.map((model) => (
-                    <tr key={model.id}>
-                      <td>{savedModelCategoryLabel(model)}</td>
-                      <td>{model.logical_model}</td>
-                      <td>{model.provider}</td>
-                      <td>{model.upstream_model}</td>
-                      <td>{model.api_base}</td>
-                      <td>{modelCapabilitiesText(model)}</td>
-                      <td>{model.effective_slots} / {model.max_concurrency}</td>
-                      <td>
-                        RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
-                      </td>
-                      <td>{model.quota_scope}</td>
-                      <td className="table-actions">
-                        <button type="button" data-testid={`edit-model-${model.id}`} onClick={() => editSavedModel(model)}>
-                          编辑模型
-                        </button>
-                        <button
-                          type="button"
-                          className="danger-button"
-                          data-testid={`delete-model-${model.id}`}
-                          onClick={() => deleteModel.mutate(model.id)}
-                          disabled={deleteModel.isPending}
-                        >
-                          删除模型
-                        </button>
-                      </td>
-                      <td>{displaySaturationPolicy(model.saturation_policy)}</td>
+              <div className="table-shell">
+                <table aria-label="已保存模型列表">
+                  <thead>
+                    <tr>
+                      <th><SortHeader column="category" label="类别" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>类别</SortHeader></th>
+                      <th><SortHeader column="logical" label="逻辑模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>逻辑模型</SortHeader></th>
+                      <th><SortHeader column="provider" label="服务商" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>服务商</SortHeader></th>
+                      <th><SortHeader column="upstream" label="上游模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>上游模型</SortHeader></th>
+                      <th><SortHeader column="apiBase" label="API Base" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>API Base</SortHeader></th>
+                      <th><SortHeader column="capabilities" label="能力" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>能力</SortHeader></th>
+                      <th><SortHeader column="slots" label="有效/最大并发" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>有效/最大并发</SortHeader></th>
+                      <th>限流</th>
+                      <th><SortHeader column="quota" label="Quota Scope" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>Quota Scope</SortHeader></th>
+                      <th>操作</th>
+                      <th><SortHeader column="policy" label="策略" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>策略</SortHeader></th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                    <tr className="table-filter-row">
+                      <th>
+                        <select aria-label="按模型类别筛选" value={modelColumnFilters.category} onChange={(event) => updateModelColumnFilter("category", event.currentTarget.value as ModelColumnFilters["category"])}>
+                          <option value="all">全部</option>
+                          <option value="normal">普通模型</option>
+                          <option value="multimedia">多媒体 AI</option>
+                        </select>
+                      </th>
+                      <th><input aria-label="按逻辑模型筛选" value={modelColumnFilters.logical} onChange={(event) => updateModelColumnFilter("logical", event.currentTarget.value)} placeholder="逻辑模型" /></th>
+                      <th><input aria-label="按服务商筛选" value={modelColumnFilters.provider} onChange={(event) => updateModelColumnFilter("provider", event.currentTarget.value)} placeholder="服务商" /></th>
+                      <th><input aria-label="按上游模型筛选" value={modelColumnFilters.upstream} onChange={(event) => updateModelColumnFilter("upstream", event.currentTarget.value)} placeholder="上游模型" /></th>
+                      <th><input aria-label="按 API Base 筛选" value={modelColumnFilters.apiBase} onChange={(event) => updateModelColumnFilter("apiBase", event.currentTarget.value)} placeholder="API Base" /></th>
+                      <th><input aria-label="按模型能力筛选" value={modelColumnFilters.capabilities} onChange={(event) => updateModelColumnFilter("capabilities", event.currentTarget.value)} placeholder="能力" /></th>
+                      <th aria-label="有效并发筛选占位" />
+                      <th aria-label="限流筛选占位" />
+                      <th><input aria-label="按 Quota Scope 筛选" value={modelColumnFilters.quota} onChange={(event) => updateModelColumnFilter("quota", event.currentTarget.value)} placeholder="Quota Scope" /></th>
+                      <th aria-label="模型操作筛选占位" />
+                      <th aria-label="策略筛选占位" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleSavedModels.map((model) => (
+                      <tr key={model.id}>
+                        <td>{savedModelCategoryLabel(model)}</td>
+                        <td>{model.logical_model}</td>
+                        <td>{model.provider}</td>
+                        <td>{model.upstream_model}</td>
+                        <td>{model.api_base}</td>
+                        <td>{modelCapabilitiesText(model)}</td>
+                        <td>{model.effective_slots} / {model.max_concurrency}</td>
+                        <td>
+                          RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
+                        </td>
+                        <td>{model.quota_scope}</td>
+                        <td className="table-actions">
+                          <button type="button" data-testid={`edit-model-${model.id}`} onClick={() => editSavedModel(model)}>
+                            编辑模型
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-button"
+                            data-testid={`delete-model-${model.id}`}
+                            onClick={() => {
+                              if (window.confirm(`确认删除模型 ${model.logical_model}？依赖该模型的 Agent 或工作流可能无法继续使用。`)) {
+                                deleteModel.mutate(model.id);
+                              }
+                            }}
+                            disabled={deleteModel.isPending}
+                          >
+                            删除模型
+                          </button>
+                        </td>
+                        <td>{displaySaturationPolicy(model.saturation_policy)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </>
         )}
