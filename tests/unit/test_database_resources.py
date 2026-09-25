@@ -112,27 +112,28 @@ def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() 
         "evolution",
         "plugin",
         "plugin_signing_key",
+        "capability_install",
     ):
         assert kind in sqltext
 
 
-def test_latest_migration_allows_plugin_signing_key_admin_resources() -> None:
+def test_latest_migration_allows_capability_install_admin_resources() -> None:
     migration_path = (
         Path(__file__).resolve().parents[2]
         / "alembic"
         / "versions"
-        / "0021_plugin_signing_key_admin_resources.py"
+        / "0024_capability_install_admin_resources.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "migration_0021_plugin_signing_key_admin_resources", migration_path
+        "migration_0024_capability_install_admin_resources", migration_path
     )
     assert spec is not None
     assert spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
 
-    assert migration.revision == "0021_plugin_key_resources"
+    assert migration.revision == "0024_capability_install"
     assert len(migration.revision) <= 32
-    assert migration.down_revision == "0020_plugin_admin_resources"
-    assert "plugin_signing_key" in migration._NEXT_KINDS
-    assert "plugin_signing_key" not in migration._CURRENT_KINDS
+    assert migration.down_revision == "0023_runtime_artifacts"
+    assert "capability_install" in migration._NEXT_KINDS
+    assert "capability_install" not in migration._CURRENT_KINDS

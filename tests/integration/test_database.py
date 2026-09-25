@@ -88,6 +88,29 @@ async def test_migrated_admin_resource_constraint_allows_plugin_signing_keys(
 
 
 @pytest.mark.integration
+async def test_migrated_admin_resource_constraint_allows_capability_installs(
+    db_session: AsyncSession,
+) -> None:
+    tenant = TenantRow(slug=f"capability-install-{uuid4()}", name="Capability install")
+    db_session.add(tenant)
+    await db_session.flush()
+    db_session.add(
+        AdminResourceRow(
+            tenant_id=tenant.id,
+            kind="capability_install",
+            resource_id="security_testing",
+            payload={
+                "entry_id": "security_testing",
+                "plugin_id": "security-testing",
+                "plan_id": "capability-plan-security_testing-test",
+            },
+        )
+    )
+
+    await db_session.commit()
+
+
+@pytest.mark.integration
 def test_encrypted_secrets_migration_downgrades_and_reupgrades(
     alembic_config: Config, database_url: str
 ) -> None:
