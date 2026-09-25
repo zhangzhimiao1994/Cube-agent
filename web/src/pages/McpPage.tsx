@@ -708,6 +708,18 @@ export function McpPage() {
       await refreshPluginSurfaces();
     },
   });
+  const rollbackCapabilityInstall = useMutation({
+    mutationFn: (plan: CapabilityInstallPlan) =>
+      api.rollbackCapabilityInstall({
+        entry_id: plan.entry_id,
+        query: plan.query,
+      }),
+    onSuccess: async (result) => {
+      setCapabilityInstallPlan(result.plan);
+      setCapabilityInstallMessage(`已回滚能力安装：${result.plan.name_cn}`);
+      await refreshPluginSurfaces();
+    },
+  });
   const pluginLifecycle = useMutation({
     mutationFn: ({
       id,
@@ -1042,6 +1054,9 @@ export function McpPage() {
         {cancelCapabilityInstall.isError ? (
           <p role="alert">{formatApiError(cancelCapabilityInstall.error, "安装取消失败")}</p>
         ) : null}
+        {rollbackCapabilityInstall.isError ? (
+          <p role="alert">{formatApiError(rollbackCapabilityInstall.error, "能力回滚失败")}</p>
+        ) : null}
         {capabilityInstallMatches.length > 0 ? (
           <div className="card-grid">
             {capabilityInstallMatches.map((entry) => (
@@ -1090,6 +1105,28 @@ export function McpPage() {
                 onClick={() => installCapability.mutate(capabilityInstallPlan)}
               >
                 确认安装 {capabilityInstallPlan.name_cn}
+              </button>
+              <button
+                type="button"
+                disabled={!canReadCapabilityManifest || capabilityManifest.isFetching || plugins.isFetching}
+                onClick={() => {
+                  void refreshPluginSurfaces().then(() => {
+                    setCapabilityInstallMessage(`已重新检测能力：${capabilityInstallPlan.name_cn}`);
+                  });
+                }}
+              >
+                重新检测能力
+              </button>
+              <button
+                type="button"
+                disabled={
+                  rollbackCapabilityInstall.isPending ||
+                  !canWritePlugins ||
+                  capabilityInstallPlan.status !== "installed"
+                }
+                onClick={() => rollbackCapabilityInstall.mutate(capabilityInstallPlan)}
+              >
+                回滚本次安装
               </button>
               <button
                 type="button"

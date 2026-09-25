@@ -178,7 +178,28 @@ vi.mock("../api/client", () => ({
         last_error_type: null,
       },
     })),
-    rollbackCapabilityInstall: vi.fn(async () => ({})),
+    rollbackCapabilityInstall: vi.fn(async () => ({
+      plan: {
+        id: "cap-install-1234",
+        status: "rolled_back",
+        entry_id: "office_doc_search",
+        name_cn: "Office 文档搜索",
+        summary_cn: "读取授权范围内的 Office 文档索引。",
+        query: "读取 Office 文档并搜索",
+        plugin_id: "office-doc-search",
+        capabilities: ["office.search_documents"],
+        risks: ["read_only"],
+        permission_summary: ["读取 Office 文档索引", "执行前仍按能力策略审批"],
+        rollback_strategy: "restore_previous_plugin_or_delete_installed_plugin",
+        requires_confirmation: true,
+        plugin_request: {
+          id: "office-doc-search",
+          name: "Office 文档搜索",
+          enabled: true,
+          capabilities: [],
+        },
+      },
+    })),
     capabilityManifest: vi.fn(async () => ({ schema_version: 1, capabilities: [] })),
     pluginSigningKeys: vi.fn(async () => [
       {
@@ -300,5 +321,17 @@ describe("McpPage plugin approval permissions", () => {
       }),
     );
     expect(await within(installerRegion).findByText("能力已安装：Office 文档搜索")).not.toBeNull();
+
+    await user.click(within(installerRegion).getByRole("button", { name: "重新检测能力" }));
+    expect(await within(installerRegion).findByText("已重新检测能力：Office 文档搜索")).not.toBeNull();
+
+    await user.click(within(installerRegion).getByRole("button", { name: "回滚本次安装" }));
+    await waitFor(() =>
+      expect(api.rollbackCapabilityInstall).toHaveBeenCalledWith({
+        entry_id: "office_doc_search",
+        query: "读取 Office 文档并搜索",
+      }),
+    );
+    expect(await within(installerRegion).findByText("已回滚能力安装：Office 文档搜索")).not.toBeNull();
   });
 });
