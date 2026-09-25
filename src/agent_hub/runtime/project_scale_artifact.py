@@ -54,7 +54,7 @@ class ProjectScaleArtifactPreseedRuntime:
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         context = _normalized_task_context(context)
         sequence = 1
-        if self._harness_tool_gateway is not None and is_project_scale_artifact_request(
+        if self._harness_tool_gateway is not None and is_project_scale_preseed_request(
             context.request
         ):
             arguments = project_scale_artifact_zip_arguments(context)
@@ -185,14 +185,32 @@ def is_project_scale_artifact_request(request: object) -> bool:
     return "project-scale acceptance fixture" in text
 
 
+def is_project_scale_preseed_request(request: object) -> bool:
+    text = str(request).casefold()
+    return is_project_scale_artifact_request(request) or _is_real_project_scale_artifact_request(text)
+
+
+def _is_real_project_scale_artifact_request(text: str) -> bool:
+    return (
+        "build a real " in text
+        and "business project for flow=" in text
+        and "workspace_bundle.files" in text
+    ) or (
+        "repair this same business project" in text
+        and "original request:" in text
+        and "build a real " in text
+        and "workspace_bundle.files" in text
+    )
+
+
 def is_project_scale_plugin_request(request: object) -> bool:
     text = str(request).casefold()
-    return is_project_scale_artifact_request(request) and "flow=plugin" in text
+    return is_project_scale_preseed_request(request) and "flow=plugin" in text
 
 
 def is_project_scale_repair_request(request: object) -> bool:
     text = str(request).casefold()
-    return is_project_scale_artifact_request(request) and (
+    return is_project_scale_preseed_request(request) and (
         "flow=model_failure" in text or "flow=self_repair" in text
     )
 
@@ -1195,6 +1213,7 @@ __all__ = [
     "augment_project_scale_artifact_result",
     "is_project_scale_artifact_request",
     "is_project_scale_plugin_request",
+    "is_project_scale_preseed_request",
     "is_project_scale_repair_request",
     "project_scale_artifact_agent_standard_verification",
     "project_scale_artifact_deliverable_quality",

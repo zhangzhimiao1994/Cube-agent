@@ -72,6 +72,7 @@ from agent_hub.runtime.project_preflight_context import project_preflight_contex
 from agent_hub.runtime.project_scale_artifact import (
     PROJECT_SCALE_ARTIFACT_TOOL_NAME,
     ProjectScaleArtifactPreseedRuntime,
+    is_project_scale_preseed_request,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
@@ -1786,8 +1787,7 @@ def _is_project_scale_generated_project_request(context: TaskContext) -> bool:
 
 
 def _is_project_scale_artifact_request(context: TaskContext) -> bool:
-    text = str(context.request).casefold()
-    return "project-scale acceptance fixture" in text
+    return is_project_scale_preseed_request(context.request)
 
 
 def _available_inventory_tools_for_role(

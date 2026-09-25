@@ -3899,7 +3899,7 @@ def test_execute_project_scale_plan_repairs_missing_self_repair_trace(
     assert "self_repair_trace: expected explicit fault-injection or repair evidence" in repair_message
 
 
-def test_execute_project_scale_plan_does_not_cancel_or_fetch_bundle_for_running_timeout() -> None:
+def test_execute_project_scale_plan_cancels_running_capability_timeout_without_bundle_fetch() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="capability", scales=("medium",), flows=("hybrid",), execute=True)
     client = FakeAcceptanceClient(
         run_id="run-medium-hybrid",
@@ -3911,12 +3911,12 @@ def test_execute_project_scale_plan_does_not_cancel_or_fetch_bundle_for_running_
     report = execute_project_scale_plan(plan, client, wait_seconds=0, poll_interval_seconds=0)
 
     result = report.results[0]
-    assert result.status == "running"
+    assert result.status == "cancelled"
     assert result.evidence["run_details"] is True
     assert result.evidence["run_events"] is True
     assert result.evidence["terminal_status"] is False
     assert result.evidence["workspace_bundle"] is False
-    assert result.evidence["cleanup_cancel"] is False
+    assert result.evidence["cleanup_cancel"] is True
     assert (
         "run_observation: status running before terminal artifact collection"
         in result.errors
@@ -3926,7 +3926,7 @@ def test_execute_project_scale_plan_does_not_cancel_or_fetch_bundle_for_running_
         "/api/v1/workspaces/projects/project-scale-acceptance/sessions/project-scale-medium-hybrid/bundle/download",
         None,
     ) not in client.calls
-    assert ("POST", "/api/v1/runs/run-medium-hybrid/cancel", None) not in client.calls
+    assert ("POST", "/api/v1/runs/run-medium-hybrid/cancel", None) in client.calls
 
 
 def test_execute_project_scale_plan_accepts_self_repair_proposal() -> None:

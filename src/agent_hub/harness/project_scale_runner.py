@@ -913,8 +913,6 @@ def execute_project_scale_plan(
             if run_id is not None:
                 if _is_terminal_status(status):
                     evidence["cleanup_cancel"] = True
-                elif plan.benchmark_kind == "capability" and not evidence["final_artifacts"]:
-                    pass
                 else:
                     try:
                         cleanup = client.request_json("POST", f"/api/v1/runs/{quote(run_id)}/cancel")

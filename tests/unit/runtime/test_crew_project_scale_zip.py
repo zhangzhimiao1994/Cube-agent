@@ -174,7 +174,7 @@ def test_project_zip_tool_uses_default_limit_without_planner_budget() -> None:
     assert _tool_argument_byte_limit(step, "project.generate_zip") == _MAX_TOOL_ARGUMENT_BYTES
 
 
-def test_real_project_scale_does_not_use_fixture_zip_without_model_files() -> None:
+def test_real_project_scale_short_unparseable_output_uses_zip_fallback() -> None:
     task = (
         "Role mission: implement.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -189,7 +189,16 @@ def test_real_project_scale_does_not_use_fixture_zip_without_model_files() -> No
         completion.response,
     )
 
-    assert updated is completion
+    assert updated is not completion
+    assert len(updated.response.tool_calls) == 1
+    call = updated.response.tool_calls[0]
+    assert call.name == "project.generate_zip"
+    assert call.arguments["project_id"] == "project-scale-acceptance"
+    assert call.arguments["workspace_session_id"] == "project-scale-small-dispatch"
+    files = call.arguments["files"]
+    assert isinstance(files, Mapping)
+    assert "package.json" in files
+    assert "README.md" in files
 
 
 def test_real_project_scale_oversized_unparseable_output_uses_zip_fallback() -> None:
