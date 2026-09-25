@@ -557,19 +557,20 @@ async function mockCodingRunApi(
       });
       return;
     }
-    if (path === finalDownloadPath || path === intermediateDownloadPath) {
-      const filename = path === finalDownloadPath ? "hello-world.zip" : "hello-world-source.zip";
+    const workspaceBundlePath = `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/bundle/download`;
+    if (path === finalDownloadPath || path === workspaceBundlePath || path === intermediateDownloadPath) {
+      const filename = path === intermediateDownloadPath ? "hello-world-source.zip" : "workspace.zip";
       const body =
-        path === finalDownloadPath
+        path === intermediateDownloadPath
           ? buildStoredZip({
-              "hello-world/index.mjs": "console.log('hello world')\n",
-              "hello-world/package.json": "{\"type\":\"module\",\"scripts\":{\"start\":\"node index.mjs\"}}\n",
-              "hello-world/README.md": "# Hello World\n\nRun with `node index.mjs`.\n",
-            })
-          : buildStoredZip({
               "source/index.mjs": "console.log('hello world')\n",
               "source/package.json": "{\"type\":\"module\",\"scripts\":{\"start\":\"node index.mjs\"}}\n",
               "source/README.md": "# Source Package\n\nRun with `node index.mjs`.\n",
+            })
+          : buildStoredZip({
+              "hello-world/index.mjs": "console.log('hello world')\n",
+              "hello-world/package.json": "{\"type\":\"module\",\"scripts\":{\"start\":\"node index.mjs\"}}\n",
+              "hello-world/README.md": "# Hello World\n\nRun with `node index.mjs`.\n",
             });
       await route.fulfill({
         status: 200,
@@ -601,21 +602,19 @@ test("operator validates a simple coding run and downloads final and intermediat
   await expect(deliverableFiles.getByRole("button", { name: "下载 workspace.zip" })).toBeVisible();
   await expect(deliverableFiles.getByRole("button", { name: "下载 plan.md" })).toBeVisible();
   await expect(deliverableFiles.getByRole("button", { name: "下载 index.mjs" })).toBeVisible();
-  await expect(page.getByRole("button", { name: /下载 hello-world\.zip/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ })).toBeVisible();
   await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();
-  await expect(page.getByText("hello-world-source.zip")).toHaveCount(1);
   const workbenchDrawer = page.getByRole("dialog", { name: "Agent 工作席详情" });
-  await expect(workbenchDrawer).toContainText("陆微");
-  await expect(workbenchDrawer).toContainText("生成中间项目文件。");
+  await expect(workbenchDrawer).toContainText("实现");
+  await expect(workbenchDrawer).toContainText("vibe-engineer");
   await expect(workbenchDrawer).not.toContainText("create_project");
   await workbenchDrawer.getByRole("button", { name: "关闭" }).click();
   await expect(workbenchDrawer).toHaveCount(0);
 
   const finalDownload = page.waitForEvent("download");
-  await page.getByRole("button", { name: /下载 hello-world\.zip/ }).click();
+  await deliverableFiles.getByRole("button", { name: "下载 workspace.zip" }).click();
   const finalArchive = await finalDownload;
-  expect(finalArchive.suggestedFilename()).toBe("hello-world.zip");
+  expect(finalArchive.suggestedFilename()).toBe("workspace.zip");
   const finalArchivePath = testInfo.outputPath("hello-world.zip");
   await finalArchive.saveAs(finalArchivePath);
   const finalArchiveBytes = await readFile(finalArchivePath);
@@ -640,8 +639,10 @@ test("operator validates a simple coding run and downloads final and intermediat
   expect(runResult.stdout.trim()).toBe("hello world");
 
   await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();
+  await page.getByRole("button", { name: /打开.*实现.*工作调度/ }).click();
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
-  await expect(page.getByRole("dialog", { name: "运行过程详情" })).toBeVisible();
+  const drawer = page.getByRole("dialog", { name: "运行过程详情" });
+  await expect(drawer).toBeVisible();
   const intermediateDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: /下载 hello-world-source\.zip/ }).click();
   const intermediateArchive = await intermediateDownload;
@@ -657,8 +658,9 @@ test("operator validates a simple coding run and downloads final and intermediat
     "source/package.json",
   ]);
   expect(intermediateEntries.get("source/README.md")).toContain("node index.mjs");
-  await page.locator(".process-drawer-backdrop").click({ position: { x: 5, y: 5 } });
+  await drawer.getByRole("button", { name: "关闭" }).click();
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Agent 工作席详情" })).toBeVisible();
 });
 
 test("agent workbench keeps subagent scheduling compact on mobile", async ({ page }) => {
@@ -681,10 +683,10 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
 
   await workbench.click();
   const detail = page.getByRole("dialog", { name: "Agent 工作席详情" });
-  await expect(detail).toContainText("陆微");
-  await expect(detail).toContainText("工程师 · vibe-engineer");
+  await expect(detail).toContainText("实现");
+  await expect(detail).toContainText("vibe-engineer");
   await expect(detail).not.toContainText("工程师开始创建最小项目。");
-  await detail.getByRole("button", { name: /打开陆微工作调度/ }).click();
+  await detail.getByRole("button", { name: /打开.*实现.*工作调度/ }).click();
   await expect(detail).toContainText("工程师开始创建最小项目。");
   const layout = await page.evaluate(() => ({
     bodyScrollWidth: document.body.scrollWidth,
@@ -703,6 +705,7 @@ test("opened agent process drawer refreshes when new step events arrive", async 
   await page.getByRole("button", { name: "发送" }).click();
 
   await page.getByRole("button", { name: /Agent 工作席/ }).click();
+  await page.getByRole("button", { name: /打开.*实现.*工作调度/ }).click();
   await page.getByRole("button", { name: /工程师开始创建最小项目。/ }).click();
   const drawer = page.getByRole("dialog", { name: "运行过程详情" });
   await expect(drawer).toBeVisible();
@@ -720,6 +723,7 @@ test("process drawer keeps long fields behind summary detail cards", async ({ pa
   await page.getByRole("button", { name: "发送" }).click();
 
   await page.getByRole("button", { name: /Agent 工作席/ }).click();
+  await page.getByRole("button", { name: /打开.*实现.*工作调度/ }).click();
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
   const drawer = page.getByRole("dialog", { name: "运行过程详情" });
   await expect(drawer).toBeVisible();

@@ -3438,7 +3438,7 @@ article:hover {
   border-radius: 8px;
   display: grid;
   gap: 0.55rem;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) minmax(max-content, auto);
   margin-top: 0.65rem;
   max-width: min(34rem, 100%);
   padding: 0.55rem 0.65rem;
@@ -3503,6 +3503,16 @@ article:hover {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.artifact-file-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .artifact-file-meta span:not(:last-child)::after {
@@ -6720,6 +6730,21 @@ article:hover {
 }
 
 @media (max-width: 640px) {
+  .artifact-file-card {
+    align-items: start;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .artifact-file-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .artifact-file-actions button {
+    flex: 1 1 5.5rem;
+  }
+
   .conversation-list {
     border-radius: 8px 0 0 8px;
     bottom: 0;

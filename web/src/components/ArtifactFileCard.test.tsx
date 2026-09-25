@@ -178,6 +178,16 @@ describe("ArtifactFileCard", () => {
     });
   });
 
+  it("keeps architecture graph download and open actions grouped for narrow layouts", () => {
+    render(<ArtifactFileCard artifact={architectureMapDownloadable} />);
+
+    const download = screen.getByRole("button", { name: "下载 architecture-map.html" });
+    const open = screen.getByRole("button", { name: "打开 architecture-map.html" });
+
+    expect(download.parentElement).toBe(open.parentElement);
+    expect(download.parentElement?.classList.contains("artifact-file-actions")).toBe(true);
+  });
+
   it("downloads workspace files from backend-issued workspace paths", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(new Blob(["source"], { type: "text/plain" }), {

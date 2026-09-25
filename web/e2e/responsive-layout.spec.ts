@@ -230,6 +230,22 @@ async function mockLayoutApi(page: Page) {
       });
       return;
     }
+    if (path === "/api/v1/admin/capabilities/manifest") {
+      await route.fulfill({ json: { schema_version: 1, capabilities: [] } });
+      return;
+    }
+    if (path === "/api/v1/admin/plugins/adapters") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+    if (path === "/api/v1/admin/plugins/signing-keys") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+    if (path === "/api/v1/admin/plugins") {
+      await route.fulfill({ json: [] });
+      return;
+    }
     if (path === "/api/v1/channels" || path === "/api/v1/admin/channels") {
       await route.fulfill({
         json: [

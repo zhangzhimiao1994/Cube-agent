@@ -472,6 +472,22 @@ describe("agentInlineSummary", () => {
     );
   });
 
+  it("closes the history drawer when starting a new blank conversation", () => {
+    const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
+    const startNewConversationMatch = source.match(/function startNewConversation\(\) \{[\s\S]*?\n  \}/);
+
+    expect(startNewConversationMatch?.[0]).toContain("setHistoryOpen(false)");
+  });
+
+  it("keeps approval cards cancellable when an action would otherwise proceed", () => {
+    const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
+
+    expect(source).toContain("cancelProjectPreflightApproval");
+    expect(source).toContain("取消预检");
+    expect(source).toContain("cancelOpenClawApproval");
+    expect(source).toContain("取消操作建议");
+  });
+
   it("explains scheduled context-loading agents with a compact action summary", () => {
     expect(
       agentInlineSummary({

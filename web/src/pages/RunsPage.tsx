@@ -5365,6 +5365,8 @@ export function RunsPage() {
   } | null>(null);
   const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
   const [dismissedEvolutionApprovalRunIds, setDismissedEvolutionApprovalRunIds] = useState<string[]>([]);
+  const [dismissedOpenClawApprovalRunIds, setDismissedOpenClawApprovalRunIds] = useState<string[]>([]);
+  const [dismissedProjectPreflightApprovalRunIds, setDismissedProjectPreflightApprovalRunIds] = useState<string[]>([]);
   const [dismissedRepairApprovalRunIds, setDismissedRepairApprovalRunIds] = useState<string[]>([]);
   const [evolutionApproval, setEvolutionApproval] = useState<{
     runId: string;
@@ -5547,7 +5549,7 @@ export function RunsPage() {
       );
     }
     const proposedOpenClaw = openClawApprovalFromRunDetail(selectedRun.data);
-    if (proposedOpenClaw) {
+    if (proposedOpenClaw && !dismissedOpenClawApprovalRunIds.includes(proposedOpenClaw.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
       setScheduleApproval(null);
@@ -5578,7 +5580,7 @@ export function RunsPage() {
       );
     }
     const proposedProjectPreflight = projectPreflightApprovalFromRunDetail(selectedRun.data);
-    if (proposedProjectPreflight) {
+    if (proposedProjectPreflight && !dismissedProjectPreflightApprovalRunIds.includes(proposedProjectPreflight.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
       setScheduleApproval(null);
@@ -5617,7 +5619,7 @@ export function RunsPage() {
     } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
+  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -5916,6 +5918,16 @@ export function RunsPage() {
     },
   });
 
+  const cancelProjectPreflightApproval = () => {
+    const approval = projectPreflightApproval;
+    if (!approval) return;
+    setDismissedProjectPreflightApprovalRunIds((current) =>
+      current.includes(approval.runId) ? current : [...current, approval.runId],
+    );
+    setProjectPreflightApproval(null);
+    setSubmitNotice("已取消项目架构预检，本轮不会自动进入执行。你可以继续补充要求或重新发送。");
+  };
+
   const approveCapability = useMutation({
     mutationFn: () => {
       if (!capabilityApproval) throw new Error("capability approval is unavailable");
@@ -6009,6 +6021,16 @@ export function RunsPage() {
       setSubmitNotice(`已创建 OpenClaw 待审批操作：${operation.id}。请到 OpenClaw 控制页审批和执行。`);
     },
   });
+
+  const cancelOpenClawApproval = () => {
+    const approval = openClawApproval;
+    if (!approval) return;
+    setDismissedOpenClawApprovalRunIds((current) =>
+      current.includes(approval.runId) ? current : [...current, approval.runId],
+    );
+    setOpenClawApproval(null);
+    setSubmitNotice("已取消 OpenClaw 操作建议，不会创建待审批动作。");
+  };
 
   const stopCurrentRun = useMutation({
     mutationFn: (runId: string) => api.cancelRun(runId),
@@ -6363,6 +6385,7 @@ export function RunsPage() {
     setCapabilityApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
+    setHistoryOpen(false);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
 
@@ -7085,9 +7108,14 @@ export function RunsPage() {
                 {openClawApproval.createdOperationId ? (
                   <small>待审批操作：{openClawApproval.createdOperationId}</small>
                 ) : (
-                  <button type="button" onClick={() => createOpenClawFromProposal.mutate()} disabled={createOpenClawFromProposal.isPending}>
-                    {createOpenClawFromProposal.isPending ? "创建中..." : "创建待审批操作"}
-                  </button>
+                  <div className="composer-card-actions">
+                    <button type="button" onClick={() => createOpenClawFromProposal.mutate()} disabled={createOpenClawFromProposal.isPending}>
+                      {createOpenClawFromProposal.isPending ? "创建中..." : "创建待审批操作"}
+                    </button>
+                    <button type="button" className="secondary-action" disabled={createOpenClawFromProposal.isPending} onClick={cancelOpenClawApproval}>
+                      取消操作建议
+                    </button>
+                  </div>
                 )}
                 <Link to="/openclaw" className="secondary-action">
                   打开 OpenClaw
@@ -7135,9 +7163,14 @@ export function RunsPage() {
                   <small>{projectPreflightApproval.proposal.summary}</small>
                 </div>
                 <p>{projectPreflightProposalBody(projectPreflightApproval.proposal)}</p>
-                <button type="button" disabled={approveProjectPreflight.isPending} onClick={() => approveProjectPreflight.mutate()}>
-                  {approveProjectPreflight.isPending ? "排队中..." : "批准并开始执行"}
-                </button>
+                <div className="composer-card-actions">
+                  <button type="button" disabled={approveProjectPreflight.isPending} onClick={() => approveProjectPreflight.mutate()}>
+                    {approveProjectPreflight.isPending ? "排队中..." : "批准并开始执行"}
+                  </button>
+                  <button type="button" className="secondary-action" disabled={approveProjectPreflight.isPending} onClick={cancelProjectPreflightApproval}>
+                    取消预检
+                  </button>
+                </div>
               </aside>
             ) : null}
             {capabilityApproval ? (

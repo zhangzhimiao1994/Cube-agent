@@ -134,24 +134,26 @@ export function ArtifactFileCard({
         ) : null}
         {checksum ? <small title={checksum}>SHA-256 {checksum.slice(0, 12)}</small> : null}
       </div>
-      <button
-        type="button"
-        disabled={downloading}
-        onClick={() => void handleDownload()}
-        aria-label={`下载 ${filename}`}
-      >
-        {downloading ? "下载中" : "下载"}
-      </button>
-      {architectureGraph ? (
+      <div className="artifact-file-actions">
         <button
           type="button"
-          disabled={opening}
-          onClick={() => void handleOpen()}
-          aria-label={`打开 ${filename}`}
+          disabled={downloading}
+          onClick={() => void handleDownload()}
+          aria-label={`下载 ${filename}`}
         >
-          {opening ? "打开中" : "打开"}
+          {downloading ? "下载中" : "下载"}
         </button>
-      ) : null}
+        {architectureGraph ? (
+          <button
+            type="button"
+            disabled={opening}
+            onClick={() => void handleOpen()}
+            aria-label={`打开 ${filename}`}
+          >
+            {opening ? "打开中" : "打开"}
+          </button>
+        ) : null}
+      </div>
       {error ? <small role="alert">{error}</small> : null}
     </div>
   );
