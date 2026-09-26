@@ -101,6 +101,50 @@ function sortedHermesInsights(items: HermesInsight[], sort: SortState<HermesSort
   return [...items].sort((left, right) => compareText(hermesColumnValue(left, sort.key), hermesColumnValue(right, sort.key), sort.direction));
 }
 
+function HermesJourney({ insights }: { insights: HermesInsight[] }) {
+  if (insights.length === 0) return null;
+  const pendingCount = insights.filter((insight) => insight.confirmed_at === null).length;
+  const confirmedCount = insights.length - pendingCount;
+  const journeyItems = [...insights]
+    .sort((left, right) => compareText(left.created_at, right.created_at, "desc"))
+    .slice(0, 6);
+  return (
+    <section className="hermes-journey" aria-label="Hermes 学习旅程">
+      <div className="hermes-journey-header">
+        <div>
+          <span className="eyebrow">Learning journey</span>
+          <h3>学习旅程</h3>
+        </div>
+        <div aria-label="Hermes 学习状态统计">
+          <strong>待确认 {pendingCount}</strong>
+          <strong>已确认 {confirmedCount}</strong>
+        </div>
+      </div>
+      <ol>
+        {journeyItems.map((insight) => (
+          <li key={insight.id}>
+            <time dateTime={insight.created_at}>{insight.created_at}</time>
+            <div>
+              <span>{categoryLabel(insight.category)} · {statusLabel(insight.confirmed_at)}</span>
+              <strong>{hermesLearningSummary(insight)}</strong>
+              <small>
+                {insight.conversation_id ?? "未关联对话"} · {insight.outcome} · 权重 {insight.weight}
+                {insight.tags.length > 0 ? ` · ${insight.tags.join(" / ")}` : ""}
+              </small>
+            </div>
+            <Link
+              to={`/hermes/${encodeURIComponent(insight.id)}`}
+              aria-label={`查看 ${insight.conversation_id ?? insight.id} 的学习详情`}
+            >
+              详情
+            </Link>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 export function HermesPage() {
   const { insightId } = useParams();
   if (insightId) return <HermesInsightDetail insightId={insightId} />;
@@ -245,6 +289,8 @@ function HermesLearningTable() {
         Hermes 是独立学习模块。它按时间和对话 ID 记录运行经验，外层以表格展示，
         点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
       </p>
+
+      <HermesJourney insights={items} />
 
       <section aria-label="Hermes 学习台账" {...navTargetProps(ledgerNavSection)}>
         <h3>学习台账</h3>

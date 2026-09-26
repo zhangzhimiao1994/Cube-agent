@@ -138,6 +138,57 @@ function formatPluginPackageProvenance(plugin: PluginResource) {
   return provenance.source_id ? `${provenance.source} / ${provenance.source_id}` : provenance.source;
 }
 
+function pluginOperationalHints(plugin: PluginResource) {
+  const hints: string[] = [];
+  const adapters = new Set(plugin.capabilities.map((capability) => capability.adapter));
+  const requiredCommands = Array.isArray(plugin.resource_config.required_commands)
+    ? plugin.resource_config.required_commands.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+  const requiredEnvAny = Array.isArray(plugin.resource_config.required_env_any)
+    ? plugin.resource_config.required_env_any.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+  const runtimeRequirements = Array.isArray(plugin.resource_config.runtime_requirements)
+    ? plugin.resource_config.runtime_requirements.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+  if (!plugin.enabled) {
+    hints.push("当前停用：启用配置后才允许进入调度。");
+  }
+  if (plugin.status !== "running") {
+    hints.push("当前未启动：启用配置不等于启动运行，需要启动后才可被 Agent 调用。");
+  }
+  if (plugin.health !== "healthy") {
+    hints.push(`健康状态为 ${plugin.health}：能力清单会保持不可用或谨慎使用。`);
+  }
+  if (adapters.has("http_json")) {
+    if (!plugin.endpoint_url || plugin.endpoint_url.includes("plugins.example")) {
+      hints.push("HTTP 插件缺少真实 Endpoint，不能用示例地址代替真实后端。");
+    } else if (plugin.domain_allowlist.length === 0) {
+      hints.push("HTTP 插件缺少允许域名，运行时会拒绝调用。");
+    }
+  }
+  if (adapters.has("local_command")) {
+    const command = plugin.resource_config.command;
+    hints.push(
+      typeof command === "string" && command
+        ? `本地命令后端：运行时将调用 ${command}，机器上必须已安装并在 PATH 或指定路径中。`
+        : "本地命令插件缺少 command 配置，无法执行。",
+    );
+    if (requiredCommands.length > 0) {
+      hints.push(`还需要本机命令：${requiredCommands.join("、")}。`);
+    }
+    if (requiredEnvAny.length > 0) {
+      hints.push(`运行前至少配置一个环境变量：${requiredEnvAny.join(" / ")}。`);
+    }
+    if (runtimeRequirements.length > 0) {
+      hints.push(`运行前提：${runtimeRequirements.join("；")}。`);
+    }
+  }
+  if (plugin.capabilities.some((capability) => capability.policy_effect === "require_approval")) {
+    hints.push("能力调用需要动作审批，这是安全策略，不代表插件启用失败。");
+  }
+  return hints;
+}
+
 function parseSchemaText(value: string, label: string): PluginCapability["input_schema"] {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -1290,7 +1341,7 @@ export function McpPage() {
             id="plugin-endpoint"
             value={pluginEndpointUrl}
             onChange={(event) => setPluginEndpointUrl(event.target.value)}
-            placeholder="https://plugins.example/invoke"
+            placeholder="填写你已部署的真实 HTTPS 调用地址"
           />
 
           <label htmlFor="plugin-domain-allowlist">允许域名，英文逗号分隔</label>
@@ -1298,7 +1349,7 @@ export function McpPage() {
             id="plugin-domain-allowlist"
             value={pluginDomainAllowlist}
             onChange={(event) => setPluginDomainAllowlist(event.target.value)}
-            placeholder="plugins.example"
+            placeholder="填写真实服务域名，例如 api.your-company.internal"
           />
 
           <label htmlFor="plugin-timeout">插件调用超时（秒）</label>
@@ -1639,12 +1690,21 @@ export function McpPage() {
             ) : null}
             {pluginItems.length > 0 ? (
               <div className="card-grid">
-                {pluginItems.map((plugin) => (
+                {pluginItems.map((plugin) => {
+                  const readinessHints = pluginOperationalHints(plugin);
+                  return (
                   <article key={plugin.id}>
                     <span className="eyebrow">插件 {plugin.health}</span>
                     <h3>{plugin.name}</h3>
                     <p>ID：<span>{plugin.id}</span></p>
                     <p>状态：<span>{plugin.status}</span></p>
+                    {readinessHints.length > 0 ? (
+                      <div className="plugin-readiness" aria-label={`${plugin.name} 运行条件`}>
+                        {readinessHints.map((hint) => (
+                          <p key={hint}>{hint}</p>
+                        ))}
+                      </div>
+                    ) : null}
                     <p>Endpoint：<span>{plugin.endpoint_url ?? "未填写"}</span></p>
                     <p>允许域名：<span>{plugin.domain_allowlist.join(", ") || "未配置"}</span></p>
                     <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
@@ -1764,7 +1824,7 @@ export function McpPage() {
                       onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "start" })}
                       aria-label={`启动插件 ${plugin.name}`}
                     >
-                      启动
+                      启动运行
                     </button>
                     <button
                       type="button"
@@ -1772,7 +1832,7 @@ export function McpPage() {
                       onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "enable" })}
                       aria-label={`启用插件 ${plugin.name}`}
                     >
-                      启用
+                      启用配置
                     </button>
                     <button
                       type="button"
@@ -1780,7 +1840,7 @@ export function McpPage() {
                       onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "disable" })}
                       aria-label={`停用插件 ${plugin.name}`}
                     >
-                      停用
+                      停用配置
                     </button>
                     <button
                       type="button"
@@ -1808,7 +1868,8 @@ export function McpPage() {
                       删除
                     </button>
                   </article>
-                ))}
+                );
+                })}
               </div>
             ) : null}
           </section>

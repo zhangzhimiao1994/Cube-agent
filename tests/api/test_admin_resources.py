@@ -60,6 +60,7 @@ from agent_hub.api.routers.admin import (
     _model_check_failure_details,
     _openclaw_proposal,
     _orchestration_protocol_summary_from_run_events,
+    _plugin_resource_value_matches_schema,
     _plugin_signature_payload,
     _repair_proposal,
     _routing_details,
@@ -70,6 +71,7 @@ from agent_hub.app import _submit_scheduled_task, create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PLUGIN_RUNTIME_FAILURE_CODES
+from agent_hub.capability_installer.service import CapabilityInstallerService
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
@@ -4521,18 +4523,23 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
 
     cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api.app).state.capability_installer_service = CapabilityInstallerService(
+        command_resolver=lambda command: (
+            f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
+        ),
+    )
 
     plan_response = api.post(
         "/api/v1/admin/capability-installer/plan",
         headers=headers(),
-        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
     )
     install_response = api.post(
         "/api/v1/admin/capability-installer/install",
         headers=headers(),
         json={
-            "entry_id": "office_doc_search",
-            "query": "读取 Office 文档并搜索",
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
             "plan_id": plan_response.json()["plan"]["id"],
             "confirm": True,
         },
@@ -4543,9 +4550,11 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
     assert install_response.status_code == 200
     install_body = install_response.json()
     assert install_body["plan"]["status"] == "installed"
-    assert install_body["plugin"]["id"] == "office-doc-search"
+    assert install_body["plugin"]["id"] == "security-testing"
     assert install_body["plugin"]["status"] == "running"
-    assert install_body["plugin"]["resource_config"] == {}
+    assert install_body["plugin"]["resource_config"]["command"] == "strix"
+    assert install_body["plugin"]["resource_config"]["required_commands"] == ["docker"]
+    assert "OPENAI_API_KEY" in install_body["plugin"]["resource_config"]["required_env_any"]
     assert reloaded == [TENANT_ID]
     roundtrip_payload = {
         key: install_body["plugin"][key]
@@ -4571,49 +4580,54 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
         json=roundtrip_payload,
     )
     assert roundtrip_response.status_code == 200
-    assert roundtrip_response.json()["resource_config"] == {}
+    assert roundtrip_response.json()["resource_config"]["command"] == "strix"
     assert reloaded == [TENANT_ID, TENANT_ID]
     capabilities = {
         item["id"]: item
         for item in manifest_response.json()["capabilities"]
     }
-    assert capabilities["office.search_documents"]["kind"] == "plugin"
-    assert capabilities["office.search_documents"]["available"] is True
+    assert capabilities["security.run_assessment"]["kind"] == "plugin"
+    assert capabilities["security.run_assessment"]["available"] is True
 
     rollback_response = api.post(
         "/api/v1/admin/capability-installer/rollback",
         headers=headers(),
-        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
     )
     plugins_after_rollback = api.get("/api/v1/admin/plugins", headers=headers())
 
     assert rollback_response.status_code == 200
     assert rollback_response.json()["plan"]["status"] == "rolled_back"
     assert plugins_after_rollback.status_code == 200
-    assert all(plugin["id"] != "office-doc-search" for plugin in plugins_after_rollback.json())
+    assert all(plugin["id"] != "security-testing" for plugin in plugins_after_rollback.json())
     assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID]
 
 
 def test_capability_installer_rollback_restores_existing_plugin() -> None:
     api = client()
+    cast(Any, api.app).state.capability_installer_service = CapabilityInstallerService(
+        command_resolver=lambda command: (
+            f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
+        ),
+    )
 
     existing = api.post(
         "/api/v1/admin/plugins",
         headers=headers(),
         json={
-            "id": "office-doc-search",
-            "name": "Existing Office Connector",
+            "id": "security-testing",
+            "name": "Existing Security Connector",
             "description": "Existing user-managed connector must survive installer rollback.",
-            "endpoint_url": "https://existing.example/invoke",
-            "domain_allowlist": ["existing.example"],
+            "resource_config": {"command": "custom-strix", "base_args": ["--old"]},
             "capabilities": [
                 {
-                    "id": "office.search_documents",
-                    "adapter": "http_json",
-                    "permission_class": "file.read",
-                    "sandbox_profile": "remote_connector",
+                    "id": "security.run_assessment",
+                    "adapter": "local_command",
+                    "permission_class": "security.testing",
+                    "sandbox_profile": "local_process",
                     "policy_effect": "require_approval",
-                    "replay_safe": True,
+                    "replay_safe": False,
+                    "capability_config": {"argument_style": "strix_assessment"},
                 }
             ],
         },
@@ -4621,14 +4635,14 @@ def test_capability_installer_rollback_restores_existing_plugin() -> None:
     plan_response = api.post(
         "/api/v1/admin/capability-installer/plan",
         headers=headers(),
-        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
     )
     install_response = api.post(
         "/api/v1/admin/capability-installer/install",
         headers=headers(),
         json={
-            "entry_id": "office_doc_search",
-            "query": "读取 Office 文档并搜索",
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
             "plan_id": plan_response.json()["plan"]["id"],
             "confirm": True,
         },
@@ -4636,20 +4650,18 @@ def test_capability_installer_rollback_restores_existing_plugin() -> None:
     rollback_response = api.post(
         "/api/v1/admin/capability-installer/rollback",
         headers=headers(),
-        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
     )
     plugins = api.get("/api/v1/admin/plugins", headers=headers()).json()
-    restored = next(plugin for plugin in plugins if plugin["id"] == "office-doc-search")
+    restored = next(plugin for plugin in plugins if plugin["id"] == "security-testing")
 
     assert existing.status_code == 200
     assert plan_response.status_code == 200
     assert install_response.status_code == 200
-    assert install_response.json()["plugin"]["resource_config"] == {}
+    assert install_response.json()["plugin"]["resource_config"]["command"] == "strix"
     assert rollback_response.status_code == 200
-    assert restored["name"] == "Existing Office Connector"
-    assert restored["endpoint_url"] == "https://existing.example/invoke"
-    assert restored["domain_allowlist"] == ["existing.example"]
-    assert restored["resource_config"] == {}
+    assert restored["name"] == "Existing Security Connector"
+    assert restored["resource_config"] == {"command": "custom-strix", "base_args": ["--old"]}
 
 
 def test_capability_installer_requires_confirmation_before_installing_plugin() -> None:
@@ -4681,18 +4693,23 @@ def test_capability_installer_requires_confirmation_before_installing_plugin() -
 
 def test_capability_installer_requires_confirmed_plan_id() -> None:
     api = client()
+    cast(Any, api.app).state.capability_installer_service = CapabilityInstallerService(
+        command_resolver=lambda command: (
+            f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
+        ),
+    )
     plan_response = api.post(
         "/api/v1/admin/capability-installer/plan",
         headers=headers(),
-        json={"entry_id": "office_doc_search", "query": "读取 Office 文档并搜索"},
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
     )
 
     missing_plan = api.post(
         "/api/v1/admin/capability-installer/install",
         headers=headers(),
         json={
-            "entry_id": "office_doc_search",
-            "query": "读取 Office 文档并搜索",
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
             "confirm": True,
         },
     )
@@ -4700,8 +4717,8 @@ def test_capability_installer_requires_confirmed_plan_id() -> None:
         "/api/v1/admin/capability-installer/install",
         headers=headers(),
         json={
-            "entry_id": "office_doc_search",
-            "query": "读取 Office 文档并搜索",
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
             "plan_id": "cap-install-stale",
             "confirm": True,
         },
@@ -4710,8 +4727,8 @@ def test_capability_installer_requires_confirmed_plan_id() -> None:
         "/api/v1/admin/capability-installer/install",
         headers=headers(),
         json={
-            "entry_id": "office_doc_search",
-            "query": "读取 Office 文档并搜索",
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
             "plan_id": plan_response.json()["plan"]["id"],
             "confirm": True,
         },
@@ -10140,6 +10157,17 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "input_schema": None,
         "output_schema": None,
     }
+
+
+def test_plugin_resource_array_schema_accepts_internal_tuple_values() -> None:
+    assert _plugin_resource_value_matches_schema(
+        ("--non-interactive", "--target"),
+        {"type": "array", "items": {"type": "string"}},
+    )
+    assert _plugin_resource_value_matches_schema(
+        (0, 1),
+        {"type": "array", "items": {"type": "number"}},
+    )
 
 
 def test_plugin_admin_api_exposes_safe_plugin_policy_summary() -> None:

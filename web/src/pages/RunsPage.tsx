@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -439,14 +439,69 @@ type ChatMessage = {
   run?: RunDetail;
 };
 type ConversationCheckpoint = {
+  anchorId: string;
+  artifactCount: number;
+  href: string;
   id: string;
   label: string;
   index: number;
+};
+export type SlashCommand = {
+  aliases: string[];
+  description: string;
+  id: "new" | "mode" | "memory" | "skills" | "usage";
+  label: string;
 };
 type EventGroupItem = {
   event: RunEvent;
   index: number;
 };
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  {
+    id: "new",
+    label: "/new 新建对话",
+    description: "清空当前输入并开启一个新的连续对话。",
+    aliases: ["new", "新建", "新对话"],
+  },
+  {
+    id: "memory",
+    label: "/memory 记忆",
+    description: "打开记忆管理，查看长期偏好、项目事实和摘要。",
+    aliases: ["memory", "mem", "记忆", "回忆"],
+  },
+  {
+    id: "mode",
+    label: "/mode 模式",
+    description: "展开本轮运行设置，切换直连、派单、讨论或混合模式。",
+    aliases: ["mode", "模式", "运行"],
+  },
+  {
+    id: "skills",
+    label: "/skills 技能",
+    description: "进入 Skill 页面查看已安装技能和待审批权限。",
+    aliases: ["skills", "skill", "技能", "工具"],
+  },
+  {
+    id: "usage",
+    label: "/usage 日志",
+    description: "打开日志中心，排查模型调用、失败和运行记录。",
+    aliases: ["usage", "logs", "log", "用量", "日志"],
+  },
+];
+
+export function slashCommandsForQuery(value: string): SlashCommand[] {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("/")) return [];
+  const query = trimmed.slice(1).trim().toLowerCase();
+  if (!query) return SLASH_COMMANDS;
+  return SLASH_COMMANDS.filter((command) =>
+    [command.id, command.label, command.description, ...command.aliases]
+      .join(" ")
+      .toLowerCase()
+      .includes(query),
+  );
+}
 
 function isFinalDownloadableArtifact(
   artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
@@ -2754,6 +2809,9 @@ export function conversationCheckpoints(messages: ChatMessage[]): ConversationCh
   return messages
     .filter((message) => message.role === "user" && message.id.endsWith("-request"))
     .map((message, index) => ({
+      anchorId: chatMessageAnchorId(message.id),
+      artifactCount: messages.filter((candidate) => candidate.run?.id === message.run?.id && candidate.artifact).length,
+      href: `#${chatMessageAnchorId(message.id)}`,
       id: message.id,
       label: normalizeConversationQuestion(message.body, `第 ${index + 1} 轮`),
       index: index + 1,
@@ -2764,26 +2822,65 @@ function chatMessageAnchorId(messageId: string) {
   return `chat-message-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 }
 
-function ConversationCheckpointNav({ checkpoints }: { checkpoints: ConversationCheckpoint[] }) {
+export function ConversationCheckpointNav({ checkpoints }: { checkpoints: ConversationCheckpoint[] }) {
+  const [query, setQuery] = useState("");
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   if (checkpoints.length < 2) return null;
+  const visibleCheckpoints = checkpoints.filter((checkpoint) =>
+    `${checkpoint.index} ${checkpoint.label}`.toLowerCase().includes(query.trim().toLowerCase()),
+  );
   return (
     <nav className="conversation-checkpoints" aria-label="对话检查点" aria-live="off">
-      <span>检查点</span>
+      <div className="conversation-checkpoints-header">
+        <span>检查点</span>
+        <label>
+          <span>搜索对话检查点</span>
+          <input
+            type="search"
+            aria-label="搜索对话检查点"
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="搜问题"
+          />
+        </label>
+      </div>
       <div>
-        {checkpoints.map((checkpoint) => (
-          <button
-            type="button"
-            key={checkpoint.id}
-            onClick={() => {
-              document
-                .getElementById(chatMessageAnchorId(checkpoint.id))
-                ?.scrollIntoView({ block: "start", behavior: "smooth" });
-            }}
-          >
-            <small>{checkpoint.index}</small>
-            <strong>{checkpoint.label}</strong>
-          </button>
-        ))}
+        {visibleCheckpoints.length === 0 ? (
+          <small className="conversation-checkpoints-empty">没有匹配的检查点</small>
+        ) : (
+          visibleCheckpoints.map((checkpoint) => (
+            <article key={checkpoint.id} className="conversation-checkpoint-item">
+              <button
+                type="button"
+                onClick={() => {
+                  document
+                    .getElementById(checkpoint.anchorId)
+                    ?.scrollIntoView({ block: "start", behavior: "smooth" });
+                }}
+              >
+                <small>{checkpoint.index}</small>
+                <strong>{checkpoint.label}</strong>
+                {checkpoint.artifactCount > 0 ? <em>产物 {checkpoint.artifactCount}</em> : null}
+              </button>
+              <button
+                type="button"
+                className="conversation-checkpoint-copy"
+                aria-label={`复制检查点链接：${checkpoint.label}`}
+                onClick={() => {
+                  const link = `${window.location.origin}${window.location.pathname}${window.location.search}${checkpoint.href}`;
+                  void copyTextToClipboard(link)
+                    .then(() => {
+                      setCopiedId(checkpoint.id);
+                      window.setTimeout(() => setCopiedId(null), 1600);
+                    })
+                    .catch(() => undefined);
+                }}
+              >
+                {copiedId === checkpoint.id ? "已复制" : "复制"}
+              </button>
+            </article>
+          ))
+        )}
       </div>
     </nav>
   );
@@ -5357,6 +5454,7 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
 }
 export function RunsPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const runs = useQuery({
     queryKey: ["runs"],
     queryFn: () => api.runs(),
@@ -6255,6 +6353,11 @@ export function RunsPage() {
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    const slashCommand = slashCommandsForQuery(trimmed)[0];
+    if (slashCommand && trimmed.toLowerCase() === `/${slashCommand.id}`) {
+      executeSlashCommand(slashCommand.id);
+      return;
+    }
     if (temporaryApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "同意临时加入", aliases: ["同意", "接受", "加入", "approve", "yes"] },
@@ -6468,6 +6571,31 @@ export function RunsPage() {
     setSubmitNotice("已取消引用会话。");
   }
 
+  function executeSlashCommand(commandId: SlashCommand["id"]) {
+    if (commandId === "new") {
+      startNewConversation();
+      return;
+    }
+    if (commandId === "mode") {
+      setConfigOpen(true);
+      setMessage("");
+      setSubmitNotice("已打开本轮运行设置，可切换模式、工作流、角色池和沙箱权限。");
+      return;
+    }
+    if (commandId === "memory") {
+      setMessage("");
+      navigate("/memory");
+      return;
+    }
+    if (commandId === "skills") {
+      setMessage("");
+      navigate("/skills");
+      return;
+    }
+    setMessage("");
+    navigate("/logs");
+  }
+
   function loadReferenceConversation() {
     if (!trimmedReferenceConversationId) return;
     void referenceConversation.refetch();
@@ -6481,6 +6609,7 @@ export function RunsPage() {
   const items = runListItems;
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
+  const slashCommandSuggestions = slashCommandsForQuery(message);
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
@@ -7364,6 +7493,22 @@ export function RunsPage() {
                   </button>
                 ) : null}
               </aside>
+            ) : null}
+            {slashCommandSuggestions.length > 0 ? (
+              <div className="slash-command-panel" role="listbox" aria-label="Slash 命令">
+                {slashCommandSuggestions.map((command) => (
+                  <button
+                    key={command.id}
+                    type="button"
+                    role="option"
+                    aria-selected="false"
+                    onClick={() => executeSlashCommand(command.id)}
+                  >
+                    <strong>{command.label}</strong>
+                    <small>{command.description}</small>
+                  </button>
+                ))}
+              </div>
             ) : null}
             <textarea
               value={message}

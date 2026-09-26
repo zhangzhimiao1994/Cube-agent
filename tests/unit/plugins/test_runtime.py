@@ -43,6 +43,7 @@ from agent_hub.plugins.dependency_policy import (
 from agent_hub.plugins.runtime import (
     BubblewrapPluginPackageProcessLauncher,
     HttpJsonPluginAdapter,
+    LocalCommandPluginAdapter,
     PluginInvocationContext,
     PluginPackageAdapter,
     PluginPackageExecutionTarget,
@@ -257,6 +258,124 @@ class RecordingPluginPackageRunner:
             "ok": True,
             "entrypoint": str(target.entrypoint),
         }
+
+
+@pytest.mark.asyncio
+async def test_local_command_plugin_adapter_invokes_strix_assessment_without_shell() -> None:
+    calls: list[tuple[tuple[str, ...], float, Mapping[str, str]]] = []
+
+    async def run_command(
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> tuple[int, str, str]:
+        del max_output_bytes
+        calls.append((argv, timeout_seconds, environment))
+        return 1, "critical finding\n", ""
+
+    adapter = LocalCommandPluginAdapter(command_runner=run_command)
+    target_plugin = plugin(
+        "security-testing",
+        capability_id="security.run_assessment",
+        adapter="local_command",
+        permission_class="security.testing",
+        sandbox_profile="local_process",
+        policy_effect="require_approval",
+        replay_safe=False,
+        resource_config={
+            "command": "strix",
+            "base_args": ["--non-interactive"],
+            "success_exit_codes": [0, 1],
+        },
+        capability_config={"argument_style": "strix_assessment"},
+    )
+
+    result = await adapter.invoke(
+        plugin=target_plugin,
+        capability=target_plugin.capabilities[0],
+        arguments={
+            "target": "https://owned.example",
+            "scan_mode": "quick",
+            "instruction": "Only test the approved staging host.",
+        },
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="strix-1",
+        ),
+    )
+
+    assert calls[0][0] == (
+        "strix",
+        "--non-interactive",
+        "--target",
+        "https://owned.example",
+        "--scan-mode",
+        "quick",
+        "--instruction",
+        "Only test the approved staging host.",
+    )
+    assert calls[0][1] == 10
+    assert "LLM_API_KEY" not in calls[0][2]
+    assert result["ok"] is True
+    assert result["exit_code"] == 1
+    assert result["stdout"] == "critical finding\n"
+
+
+@pytest.mark.asyncio
+async def test_local_command_plugin_adapter_rejects_missing_required_environment() -> None:
+    calls = 0
+
+    async def run_command(
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> tuple[int, str, str]:
+        nonlocal calls
+        del argv, timeout_seconds, environment, max_output_bytes
+        calls += 1
+        return 0, "", ""
+
+    adapter = LocalCommandPluginAdapter(command_runner=run_command)
+    target_plugin = plugin(
+        "security-testing",
+        capability_id="security.run_assessment",
+        adapter="local_command",
+        permission_class="security.testing",
+        sandbox_profile="local_process",
+        policy_effect="require_approval",
+        replay_safe=False,
+        resource_config={
+            "command": "strix",
+            "required_env_any": [
+                "AGENT_HUB_TEST_MISSING_STRIX_KEY_A",
+                "AGENT_HUB_TEST_MISSING_STRIX_KEY_B",
+            ],
+        },
+        capability_config={"argument_style": "strix_assessment"},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="required environment"):
+        await adapter.invoke(
+            plugin=target_plugin,
+            capability=target_plugin.capabilities[0],
+            arguments={"target": "https://owned.example"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="tester",
+                idempotency_key="strix-2",
+            ),
+        )
+
+    assert calls == 0
 
 
 def _argv_contains_ordered_pair(

@@ -138,10 +138,11 @@ def default_trusted_capability_entries() -> tuple[CapabilityCatalogEntry, ...]:
             plugin=PluginResourceRequest(
                 id="office-doc-search",
                 name="Office 文档搜索",
-                description="Search authorized Office documents through a reviewed HTTP JSON connector.",
+                description=(
+                    "Search authorized Office documents through a configured HTTP JSON connector. "
+                    "A real document index endpoint must be configured before installation."
+                ),
                 version="1.0.0",
-                endpoint_url="https://plugins.example/office-doc-search/invoke",
-                domain_allowlist=["plugins.example"],
                 capabilities=[
                     PluginCapabilityRequest(
                         id="office.search_documents",
@@ -165,19 +166,65 @@ def default_trusted_capability_entries() -> tuple[CapabilityCatalogEntry, ...]:
             plugin=PluginResourceRequest(
                 id="security-testing",
                 name="自动化安全测试",
-                description="Run approved security testing jobs through a controlled connector.",
+                description="Run approved Strix security testing jobs through the local Strix CLI.",
                 version="1.0.0",
-                endpoint_url="https://plugins.example/security-testing/invoke",
-                domain_allowlist=["plugins.example"],
+                resource_config={
+                    "command": "strix",
+                    "base_args": ["--non-interactive"],
+                    "required_commands": ["docker"],
+                    "required_env_any": [
+                        "STRIX_LLM",
+                        "STRIX_AGENT_MODEL",
+                        "LLM_API_KEY",
+                        "OPENAI_API_KEY",
+                        "ANTHROPIC_API_KEY",
+                    ],
+                    "runtime_requirements": [
+                        "Docker CLI/daemon 可用",
+                        "已配置 Strix 支持的 LLM API Key 或 Strix 登录态",
+                        "只允许对已授权目标发起扫描",
+                    ],
+                    "env_passthrough": [
+                        "STRIX_LLM",
+                        "STRIX_AGENT_MODEL",
+                        "LLM_API_KEY",
+                        "LLM_API_BASE",
+                        "OPENAI_API_KEY",
+                        "ANTHROPIC_API_KEY",
+                    ],
+                    "success_exit_codes": [0, 1],
+                    "max_output_bytes": 131072,
+                },
+                timeout_seconds=120,
                 capabilities=[
                     PluginCapabilityRequest(
                         id="security.run_assessment",
-                        adapter="http_json",
+                        adapter="local_command",
                         permission_class="security.testing",
-                        sandbox_profile="remote_connector",
+                        sandbox_profile="local_process",
                         policy_effect="require_approval",
                         replay_safe=False,
                         aliases=["pentest", "security_assessment", "strix"],
+                        capability_config={
+                            "argument_style": "strix_assessment",
+                            "target_flag": "--target",
+                            "scan_mode_flag": "--scan-mode",
+                            "instruction_flag": "--instruction",
+                            "allowed_extra_args": [
+                                "--target-list",
+                                "--instruction-file",
+                                "--workspace-file",
+                                "--scope-mode",
+                                "--diff-base",
+                                "--config",
+                                "--mcp-config",
+                                "--mcp-server",
+                                "--mcp-exclude",
+                                "--max-budget",
+                                "--max-budget-usd",
+                                "--max-turns",
+                            ],
+                        },
                     )
                 ],
             ),

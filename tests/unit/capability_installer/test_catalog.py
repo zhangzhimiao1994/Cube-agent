@@ -35,9 +35,37 @@ def test_catalog_builds_deterministic_install_plan_with_safe_plugin_payload() ->
         "读取 Office 文档索引",
         "执行前仍按能力策略审批",
     )
-    assert plan.plugin_request["endpoint_url"] == "https://plugins.example/office-doc-search/invoke"
+    assert "plugins.example" not in str(plan.plugin_request)
     capabilities = plan.plugin_request["capabilities"]
     assert isinstance(capabilities, list)
     assert isinstance(capabilities[0], dict)
     assert capabilities[0]["policy_effect"] == "require_approval"
     assert "credential_ref" not in plan.plugin_request
+
+
+def test_catalog_resolves_strix_security_testing_to_real_local_command_adapter() -> None:
+    catalog = TrustedCapabilityCatalog(default_trusted_capability_entries())
+
+    matches = catalog.resolve("需要 strix 自动化渗透能力")
+
+    assert matches
+    entry = matches[0]
+    assert entry.id == "security_testing"
+    assert entry.plugin.id == "security-testing"
+    assert entry.plugin.endpoint_url is None
+    assert entry.plugin.domain_allowlist == []
+    assert entry.plugin.resource_config["command"] == "strix"
+    assert entry.plugin.resource_config["base_args"] == ("--non-interactive",)
+    assert entry.plugin.resource_config["required_commands"] == ("docker",)
+    assert "OPENAI_API_KEY" in entry.plugin.resource_config["required_env_any"]
+    assert "--max-turns" in entry.plugin.capabilities[0].capability_config["allowed_extra_args"]
+    assert entry.plugin.capabilities[0].adapter == "local_command"
+    assert entry.plugin.capabilities[0].sandbox_profile == "local_process"
+    assert entry.plugin.capabilities[0].capability_config["argument_style"] == "strix_assessment"
+
+
+def test_default_capability_catalog_does_not_ship_placeholder_plugin_endpoints() -> None:
+    for entry in default_trusted_capability_entries():
+        payload = entry.plugin.model_dump(mode="json", exclude_none=True)
+
+        assert "plugins.example" not in str(payload)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -109,6 +110,17 @@ type HttpJsonPost = Callable[
 type PluginSecretResolver = Callable[[str], Awaitable[str]]
 
 
+class LocalCommandRunner(Protocol):
+    async def __call__(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        environment: Mapping[str, str],
+        max_output_bytes: int,
+    ) -> tuple[int, str, str]: ...
+
+
 class PluginPackageRunner(Protocol):
     async def invoke(
         self,
@@ -199,6 +211,69 @@ class HttpJsonPluginAdapter:
 
     def descriptor(self) -> Mapping[str, JsonValue]:
         return adapter_descriptor_with_contract(http_json_adapter_descriptor())
+
+
+class LocalCommandPluginAdapter:
+    def __init__(
+        self,
+        *,
+        command_runner: LocalCommandRunner | None = None,
+        command_resolver: Callable[[str], str | None] | None = None,
+    ) -> None:
+        self._command_runner = _run_local_command if command_runner is None else command_runner
+        self._command_resolver = shutil.which if command_resolver is None else command_resolver
+        self._check_command_available = command_runner is None
+
+    async def invoke(
+        self,
+        *,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]:
+        del context
+        command = _local_command_string(plugin.resource_config.get("command"))
+        executable = command
+        if self._check_command_available:
+            resolved = _resolve_local_command(command, self._command_resolver)
+            if resolved is None:
+                raise RuntimeCapabilityError("Plugin command unavailable")
+            executable = resolved
+        argv = _local_command_argv(executable, plugin=plugin, capability=capability, arguments=arguments)
+        environment = _local_command_environment(plugin.resource_config.get("env_passthrough"))
+        _ensure_local_command_prerequisites(
+            plugin=plugin,
+            environment=environment,
+            command_resolver=self._command_resolver,
+        )
+        max_output_bytes = _local_command_positive_int(
+            plugin.resource_config.get("max_output_bytes"),
+            default=65_536,
+            maximum=262_144,
+            field_name="max_output_bytes",
+        )
+        exit_code, stdout, stderr = await self._command_runner(
+            argv,
+            timeout_seconds=plugin.timeout_seconds,
+            environment=environment,
+            max_output_bytes=max_output_bytes,
+        )
+        success_exit_codes = _local_command_success_exit_codes(
+            plugin.resource_config.get("success_exit_codes")
+        )
+        ok = exit_code in success_exit_codes
+        return {
+            "ok": ok,
+            "status": "completed" if ok else "failed",
+            "command": command,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    def descriptor(self) -> Mapping[str, JsonValue]:
+        return adapter_descriptor_with_contract(_local_command_adapter_descriptor())
 
 
 class PluginPackageAdapter:
@@ -1178,6 +1253,7 @@ _PLUGIN_POLICY_ROLES = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
 
 def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:
     return {
+        "local_command": LocalCommandPluginAdapter(),
         "http_json": HttpJsonPluginAdapter(
             secret_resolver=_secret_resolver(admin_service),
         )
@@ -1260,6 +1336,284 @@ def _package_adapter_descriptor(adapter_id: str) -> Mapping[str, JsonValue]:
         "argument_schema": {"type": "object", "additionalProperties": True},
         "failure_codes": PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES,
     }
+
+
+def _local_command_adapter_descriptor() -> Mapping[str, JsonValue]:
+    return {
+        "id": "local_command",
+        "name": "Local Command",
+        "description": "Runs an approved local CLI command without shell interpolation.",
+        "resource_schema": {
+            "type": "object",
+            "required": ("command",),
+            "properties": {
+                "command": {"type": "string"},
+                "base_args": {"type": "array", "items": {"type": "string"}},
+                "env_passthrough": {"type": "array", "items": {"type": "string"}},
+                "required_commands": {"type": "array", "items": {"type": "string"}},
+                "required_env_any": {"type": "array", "items": {"type": "string"}},
+                "runtime_requirements": {"type": "array", "items": {"type": "string"}},
+                "success_exit_codes": {"type": "array", "items": {"type": "number"}},
+                "max_output_bytes": {"type": "number", "minimum": 1, "maximum": 262144},
+            },
+            "additionalProperties": False,
+        },
+        "capability_schema": {
+            "type": "object",
+            "properties": {
+                "sandbox_profile": {"type": "string", "enum": ("local_process",)},
+                "argument_style": {"type": "string", "enum": ("argv", "strix_assessment")},
+                "target_flag": {"type": "string"},
+                "scan_mode_flag": {"type": "string"},
+                "instruction_flag": {"type": "string"},
+                "allowed_extra_args": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": True,
+        },
+        "argument_schema": {"type": "object", "additionalProperties": True},
+        "failure_codes": PLUGIN_ADAPTER_RUNTIME_FAILURE_CODES,
+    }
+
+
+async def _run_local_command(
+    argv: tuple[str, ...],
+    *,
+    timeout_seconds: float,
+    environment: Mapping[str, str],
+    max_output_bytes: int,
+) -> tuple[int, str, str]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            env=dict(environment),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as error:
+        raise RuntimeCapabilityError("Plugin command unavailable") from error
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError as error:
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
+        raise RuntimeCapabilityError("Plugin tool timed out") from error
+    if len(stdout) + len(stderr) > max_output_bytes:
+        raise RuntimeCapabilityError("Plugin result is invalid")
+    return (
+        int(process.returncode or 0),
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def _local_command_argv(
+    command: str,
+    *,
+    plugin: PluginResourceResponse,
+    capability: PluginCapabilityRequest,
+    arguments: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    base_args = _local_command_string_list(plugin.resource_config.get("base_args"), "base_args")
+    style = capability.capability_config.get("argument_style")
+    if style == "strix_assessment":
+        return (
+            command,
+            *base_args,
+            *_strix_assessment_args(capability=capability, arguments=arguments),
+        )
+    if style not in {None, "argv"}:
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    args = _local_command_string_list(arguments.get("args"), "args")
+    return (command, *base_args, *args)
+
+
+def _strix_assessment_args(
+    *,
+    capability: PluginCapabilityRequest,
+    arguments: Mapping[str, JsonValue],
+) -> tuple[str, ...]:
+    target_flag = _local_command_config_string(
+        capability.capability_config.get("target_flag"),
+        default="--target",
+    )
+    scan_mode_flag = _local_command_config_string(
+        capability.capability_config.get("scan_mode_flag"),
+        default="--scan-mode",
+    )
+    instruction_flag = _local_command_config_string(
+        capability.capability_config.get("instruction_flag"),
+        default="--instruction",
+    )
+    argv: list[str] = []
+    for target in _strix_targets(arguments):
+        argv.extend((target_flag, target))
+    scan_mode = arguments.get("scan_mode")
+    if scan_mode is not None:
+        if not isinstance(scan_mode, str) or not _safe_cli_atom(scan_mode):
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        argv.extend((scan_mode_flag, scan_mode))
+    instruction = arguments.get("instruction")
+    if instruction is not None:
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        argv.extend((instruction_flag, instruction.strip()))
+    extra_args = _local_command_string_list(arguments.get("extra_args"), "extra_args")
+    if extra_args:
+        allowed = _local_command_string_list(
+            capability.capability_config.get("allowed_extra_args"),
+            "allowed_extra_args",
+        )
+        for extra_arg in extra_args:
+            if not any(extra_arg == item or extra_arg.startswith(f"{item}=") for item in allowed):
+                raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        argv.extend(extra_args)
+    return tuple(argv)
+
+
+def _strix_targets(arguments: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    targets: list[str] = []
+    raw_target = arguments.get("target")
+    if raw_target is not None:
+        if not isinstance(raw_target, str):
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        targets.append(raw_target)
+    raw_targets = arguments.get("targets")
+    if raw_targets is not None:
+        if not isinstance(raw_targets, Sequence) or isinstance(raw_targets, str | bytes):
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        for target in raw_targets:
+            if not isinstance(target, str):
+                raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+            targets.append(target)
+    cleaned = tuple(_safe_cli_value(target, "target") for target in targets)
+    if not cleaned:
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    return cleaned
+
+
+def _local_command_environment(value: object) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for key in ("PATH", "PATHEXT", "SystemRoot", "COMSPEC", "HOME", "LANG", "LC_ALL"):
+        current = os.environ.get(key)
+        if current:
+            environment[key] = current
+    for key in _local_command_string_list(value, "env_passthrough"):
+        current = os.environ.get(key)
+        if current is not None:
+            environment[key] = current
+    return environment
+
+
+def _ensure_local_command_prerequisites(
+    *,
+    plugin: PluginResourceResponse,
+    environment: Mapping[str, str],
+    command_resolver: Callable[[str], str | None],
+) -> None:
+    required_env_any = _local_command_string_list(
+        plugin.resource_config.get("required_env_any"),
+        "required_env_any",
+    )
+    if required_env_any and not any(key in environment for key in required_env_any):
+        raise RuntimeCapabilityError("Plugin command missing required environment")
+    for required_command in _local_command_string_list(
+        plugin.resource_config.get("required_commands"),
+        "required_commands",
+    ):
+        if _resolve_local_command(required_command, command_resolver) is None:
+            raise RuntimeCapabilityError("Plugin command unavailable")
+
+
+def _resolve_local_command(
+    command: str,
+    command_resolver: Callable[[str], str | None],
+) -> str | None:
+    if any(separator in command for separator in ("/", "\\")):
+        return command if Path(command).is_file() else None
+    resolved = command_resolver(command)
+    if resolved:
+        return resolved
+    for directory in ("Scripts", "bin"):
+        candidate = Path(sys.prefix) / directory / command
+        if candidate.is_file():
+            return str(candidate)
+        windows_candidate = candidate.with_suffix(".exe")
+        if windows_candidate.is_file():
+            return str(windows_candidate)
+    return None
+
+
+def _local_command_string(value: object) -> str:
+    if not isinstance(value, str) or not _safe_cli_atom(value):
+        raise RuntimeCapabilityError("Plugin command unavailable")
+    return value
+
+
+def _local_command_config_string(value: object, *, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str) or not _safe_cli_atom(value):
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    return value
+
+
+def _local_command_string_list(value: object, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _safe_cli_atom(item):
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        result.append(item)
+    if field_name == "args" and len(result) > 64:
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    return tuple(result)
+
+
+def _safe_cli_value(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or any(ord(char) < 32 for char in cleaned):
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    if field_name == "target" and len(cleaned) > 2048:
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    return cleaned
+
+
+def _safe_cli_atom(value: str) -> bool:
+    return bool(value.strip()) and not any(ord(char) < 32 for char in value)
+
+
+def _local_command_positive_int(
+    value: object,
+    *,
+    default: int,
+    maximum: int,
+    field_name: str,
+) -> int:
+    del field_name
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > maximum:
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    return value
+
+
+def _local_command_success_exit_codes(value: object) -> frozenset[int]:
+    if value is None:
+        return frozenset({0})
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+    codes: set[int] = set()
+    for item in value:
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0 or item > 255:
+            raise RuntimeCapabilityError("Plugin arguments do not match adapter schema")
+        codes.add(item)
+    return frozenset(codes or {0})
 
 
 def _plugin_package_runner_request(
@@ -1480,6 +1834,8 @@ def _secret_resolver(admin_service: object) -> PluginSecretResolver | None:
 __all__ = [
     "HttpJsonPluginAdapter",
     "HttpJsonPost",
+    "LocalCommandPluginAdapter",
+    "LocalCommandRunner",
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",

@@ -934,6 +934,81 @@ article:hover {
   overflow-wrap: anywhere;
 }
 
+.hermes-journey {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.9rem;
+  margin: 1rem 0;
+  padding: 1rem;
+}
+
+.hermes-journey-header {
+  align-items: start;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.hermes-journey-header h3 {
+  margin: 0.2rem 0 0;
+}
+
+.hermes-journey-header > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.hermes-journey-header strong,
+.hermes-journey li > a {
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.22);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 900;
+  padding: 0.28rem 0.58rem;
+  text-decoration: none;
+}
+
+.hermes-journey ol {
+  display: grid;
+  gap: 0.65rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hermes-journey li {
+  align-items: start;
+  background: rgba(3, 10, 20, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: minmax(8rem, 0.6fr) minmax(0, 2fr) auto;
+  padding: 0.8rem;
+}
+
+.hermes-journey time,
+.hermes-journey small,
+.hermes-journey span {
+  color: var(--muted);
+}
+
+.hermes-journey li > div {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.hermes-journey li strong {
+  overflow-wrap: anywhere;
+}
+
 .compact-page-intro {
   margin-bottom: 0.8rem;
 }
@@ -1494,22 +1569,59 @@ article:hover {
 }
 
 .conversation-checkpoints {
-  align-items: center;
   background: rgba(3, 10, 20, 0.34);
   border: 1px solid rgba(123, 225, 255, 0.14);
   border-radius: 8px;
   display: grid;
   gap: 0.5rem;
-  grid-template-columns: auto minmax(0, 1fr);
   max-width: 100%;
   padding: 0.46rem 0.52rem;
 }
 
-.conversation-checkpoints > span {
+.conversation-checkpoints-header {
+  align-items: center;
+  display: flex;
+  gap: 0.65rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.conversation-checkpoints-header > span {
   color: var(--accent);
   font-size: 0.72rem;
   font-weight: 950;
   letter-spacing: 0;
+}
+
+.conversation-checkpoints-header label {
+  align-items: center;
+  display: flex;
+  flex: 1 1 10rem;
+  gap: 0.45rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.conversation-checkpoints-header label > span {
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+.conversation-checkpoints-header input {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  max-width: 12rem;
+  min-height: 2rem;
+  min-width: 0;
+  padding: 0.28rem 0.62rem;
+  width: 100%;
 }
 
 .conversation-checkpoints > div {
@@ -1521,7 +1633,15 @@ article:hover {
   padding-bottom: 0.04rem;
 }
 
-.conversation-checkpoints button {
+.conversation-checkpoint-item {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 0.25rem;
+  max-width: min(24rem, 84vw);
+}
+
+.conversation-checkpoint-item button {
   align-items: center;
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(123, 225, 255, 0.18);
@@ -1531,18 +1651,21 @@ article:hover {
   display: inline-flex;
   flex: 0 0 auto;
   gap: 0.35rem;
-  max-width: min(18rem, 72vw);
   min-height: 2rem;
   padding: 0.3rem 0.58rem;
 }
 
-.conversation-checkpoints button:hover,
-.conversation-checkpoints button:focus-visible {
+.conversation-checkpoint-item > button:first-child {
+  max-width: min(18rem, 72vw);
+}
+
+.conversation-checkpoint-item button:hover,
+.conversation-checkpoint-item button:focus-visible {
   background: rgba(123, 225, 255, 0.14);
   border-color: rgba(123, 225, 255, 0.34);
 }
 
-.conversation-checkpoints small {
+.conversation-checkpoint-item small {
   align-items: center;
   background: rgba(85, 215, 255, 0.15);
   border-radius: 999px;
@@ -1556,13 +1679,31 @@ article:hover {
   width: 1.18rem;
 }
 
-.conversation-checkpoints strong {
+.conversation-checkpoint-item strong {
   font-size: 0.78rem;
   font-weight: 850;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.conversation-checkpoint-item em {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-style: normal;
+}
+
+.conversation-checkpoint-copy {
+  max-width: none;
+}
+
+.conversation-checkpoints-empty {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 0.78rem;
+  padding: 0.32rem 0.1rem;
 }
 
 .temporary-agent-summary-card {
@@ -4263,6 +4404,40 @@ article:hover {
   margin: 0;
 }
 
+.slash-command-panel {
+  background: rgba(3, 10, 20, 0.78);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 1rem 2.4rem rgba(0, 0, 0, 0.22);
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.45rem;
+}
+
+.slash-command-panel button {
+  align-items: start;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  gap: 0.15rem;
+  justify-items: start;
+  padding: 0.52rem 0.62rem;
+  text-align: left;
+}
+
+.slash-command-panel button:hover,
+.slash-command-panel button:focus-visible {
+  background: rgba(123, 225, 255, 0.12);
+  border-color: rgba(123, 225, 255, 0.24);
+}
+
+.slash-command-panel small {
+  color: var(--muted);
+}
+
 .composer-attachment-card small {
   color: var(--muted);
   display: block;
@@ -4621,6 +4796,24 @@ article:hover {
   font-size: 0.86rem;
   line-height: 1.5;
   margin: 0;
+}
+
+.plugin-readiness {
+  background: rgba(21, 184, 207, 0.08);
+  border: 1px solid rgba(21, 184, 207, 0.24);
+  border-radius: 0.75rem;
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+}
+
+.plugin-readiness p {
+  color: var(--text);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .toolbar {
@@ -5715,6 +5908,22 @@ article:hover {
     grid-template-columns: 1fr;
   }
 
+  .hermes-journey {
+    padding: 0.8rem;
+  }
+
+  .hermes-journey-header {
+    flex-direction: column;
+  }
+
+  .hermes-journey-header > div:last-child {
+    justify-content: flex-start;
+  }
+
+  .hermes-journey li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .two-column,
   .channel-console,
   .chat-console,
@@ -5924,18 +6133,39 @@ article:hover {
   .conversation-checkpoints {
     align-items: start;
     gap: 0.35rem;
-    grid-template-columns: minmax(0, 1fr);
     padding: 0.42rem;
+  }
+
+  .conversation-checkpoints-header {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .conversation-checkpoints-header label {
+    justify-content: stretch;
+  }
+
+  .conversation-checkpoints-header input {
+    max-width: none;
   }
 
   .conversation-checkpoints > div {
     width: 100%;
   }
 
-  .conversation-checkpoints button {
+  .conversation-checkpoint-item {
+    max-width: min(22rem, 88vw);
+  }
+
+  .conversation-checkpoint-item button {
     max-width: min(16rem, 78vw);
     min-height: 1.9rem;
     padding: 0.26rem 0.5rem;
+  }
+
+  .conversation-checkpoint-copy {
+    max-width: none;
   }
 
   .mode-entry-panel {

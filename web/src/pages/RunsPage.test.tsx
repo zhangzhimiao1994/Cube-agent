@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RunDetail } from "../api/client";
 import {
   agentInlineSummary,
+  ConversationCheckpointNav,
   conversationCheckpoints,
   conversationWorkspaceFiles,
   conversationMessages,
@@ -16,6 +17,7 @@ import {
   runConversationId,
   runDetailVersion,
   runProcessItems,
+  slashCommandsForQuery,
   processDetailValuePresentation,
   workbenchFileItems,
   workbenchActionDescriptor,
@@ -267,15 +269,81 @@ describe("conversation ordering", () => {
     expect(conversationCheckpoints(conversationMessages(runs))).toEqual([
       {
         id: "11111111-1111-4111-8111-111111111111-request",
+        anchorId: "chat-message-11111111-1111-4111-8111-111111111111-request",
+        artifactCount: 0,
+        href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
         label: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并...",
         index: 1,
       },
       {
         id: "33333333-3333-4333-8333-333333333333-request",
+        anchorId: "chat-message-33333333-3333-4333-8333-333333333333-request",
+        artifactCount: 0,
+        href: "#chat-message-33333333-3333-4333-8333-333333333333-request",
         label: "继续优化 UI 交互，重点检查文件预览和配置页面",
         index: 2,
       },
     ]);
+  });
+
+  it("adds copyable anchors and related artifact counts to conversation checkpoints", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    window.history.replaceState(null, "", "/runs?conversation=conv-checkpoints");
+    const runs: RunDetail[] = [
+      {
+        ...baseRun,
+        id: "11111111-1111-4111-8111-111111111111",
+        request: "第一轮做计划",
+        created_at: "2026-09-02T00:01:00Z",
+        artifacts: [
+          {
+            id: "plan",
+            kind: "markdown",
+            title: "计划",
+            text: "计划内容",
+            filename: "plan.md",
+            mime_type: "text/markdown",
+            size_bytes: 128,
+            sha256: "a".repeat(64),
+            download_url: "/download/plan",
+            presentation: "final_attachment",
+          },
+        ],
+      },
+      {
+        ...baseRun,
+        id: "33333333-3333-4333-8333-333333333333",
+        request: "第二轮检查 UI",
+        created_at: "2026-09-02T00:02:00Z",
+      },
+    ];
+    const checkpoints = conversationCheckpoints(conversationMessages(runs));
+
+    expect(checkpoints[0]).toMatchObject({
+      artifactCount: 1,
+      href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
+    });
+
+    render(<ConversationCheckpointNav checkpoints={checkpoints} />);
+
+    expect(screen.getByRole("searchbox", { name: "搜索对话检查点" })).not.toBeNull();
+    expect(screen.getByText("产物 1")).not.toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /复制检查点链接：第一轮做计划/ }));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        expect.stringContaining("#chat-message-11111111-1111-4111-8111-111111111111-request"),
+      ),
+    );
+
+    await userEvent.type(screen.getByRole("searchbox", { name: "搜索对话检查点" }), "第二轮");
+    expect(screen.queryByText("第一轮做计划")).toBeNull();
+    expect(screen.getByText("第二轮检查 UI")).not.toBeNull();
   });
 
   it("orders process cards by event sequence when backend events arrive out of order", () => {
@@ -482,6 +550,14 @@ describe("MessageBody", () => {
 
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("ssh -vvv user@host\nnc -v host 22"));
     expect(screen.getByRole("button", { name: "已复制 bash 代码" })).not.toBeNull();
+  });
+});
+
+describe("slashCommandsForQuery", () => {
+  it("suggests command palette entries by slash prefix and Chinese aliases", () => {
+    expect(slashCommandsForQuery("/m").map((command) => command.id)).toEqual(["memory", "mode"]);
+    expect(slashCommandsForQuery("/记忆").map((command) => command.id)).toEqual(["memory"]);
+    expect(slashCommandsForQuery("普通消息")).toEqual([]);
   });
 });
 

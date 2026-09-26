@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import shutil
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -13,9 +16,19 @@ from agent_hub.capability_installer.catalog import (
 )
 
 
+class CapabilityInstallUnavailable(RuntimeError):
+    pass
+
+
 class CapabilityInstallerService:
-    def __init__(self, catalog: TrustedCapabilityCatalog | None = None) -> None:
+    def __init__(
+        self,
+        catalog: TrustedCapabilityCatalog | None = None,
+        *,
+        command_resolver: Callable[[str], str | None] | None = None,
+    ) -> None:
         self._catalog = catalog or TrustedCapabilityCatalog(default_trusted_capability_entries())
+        self._command_resolver = shutil.which if command_resolver is None else command_resolver
 
     def catalog_entries(self) -> tuple[CapabilityCatalogEntry, ...]:
         return self._catalog.list()
@@ -46,6 +59,7 @@ class CapabilityInstallerService:
         if plan.id != plan_id:
             raise ValueError("capability install plan mismatch")
         entry = self._catalog.get(entry_id)
+        _ensure_plugin_backend_installable(entry, command_resolver=self._command_resolver)
         existing = _plugin_by_id(
             await admin_service.list_plugins(tenant_id=tenant_id),
             entry.plugin.id,
@@ -149,6 +163,66 @@ def _plugin_by_id(plugins: Sequence[Any], plugin_id: str) -> Any | None:
     return None
 
 
+def _ensure_plugin_backend_installable(
+    entry: CapabilityCatalogEntry,
+    *,
+    command_resolver: Callable[[str], str | None],
+) -> None:
+    plugin = entry.plugin
+    adapters = {capability.adapter for capability in plugin.capabilities}
+    if "http_json" in adapters:
+        endpoint = plugin.endpoint_url
+        if (
+            endpoint is None
+            or not endpoint.strip()
+            or "plugins.example" in endpoint
+            or not plugin.domain_allowlist
+        ):
+            raise CapabilityInstallUnavailable(
+                f"{entry.name_cn} 需要先配置真实 HTTP endpoint 后才能安装"
+            )
+    if "local_command" in adapters:
+        command = plugin.resource_config.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise CapabilityInstallUnavailable(
+                f"{entry.name_cn} 缺少本地命令配置，无法安装"
+            )
+        if not _local_command_exists(command.strip(), command_resolver):
+            raise CapabilityInstallUnavailable(
+                f"{entry.name_cn} 需要本机已安装命令 {command.strip()} 后才能安装"
+            )
+        for required_command in _resource_string_list(
+            plugin.resource_config.get("required_commands")
+        ):
+            if not _local_command_exists(required_command, command_resolver):
+                raise CapabilityInstallUnavailable(
+                    f"{entry.name_cn} 需要本机已安装命令 {required_command} 后才能安装"
+                )
+
+
+def _local_command_exists(
+    command: str,
+    command_resolver: Callable[[str], str | None],
+) -> bool:
+    if any(separator in command for separator in ("/", "\\")):
+        return Path(command).is_file()
+    if command_resolver(command) is not None:
+        return True
+    for directory in ("Scripts", "bin"):
+        candidate = Path(sys.prefix) / directory / command
+        if candidate.is_file() or candidate.with_suffix(".exe").is_file():
+            return True
+    return False
+
+
+def _resource_string_list(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(item.strip() for item in value if isinstance(item, str) and item.strip())
+
+
 def _plugin_request_snapshot(plugin: Any) -> str:
     payload = plugin.model_dump(
         mode="json",
@@ -188,4 +262,4 @@ def _previous_plugin_snapshot(value: object) -> Any | None:
     return None
 
 
-__all__ = ["CapabilityInstallerService"]
+__all__ = ["CapabilityInstallUnavailable", "CapabilityInstallerService"]

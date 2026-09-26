@@ -43,6 +43,20 @@ describe("HermesPage", () => {
               weight: 4,
               created_at: "2026-09-02T00:00:01Z",
             },
+            {
+              id: "hermes_scheduler_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              category: "scheduler",
+              outcome: "failure",
+              lesson: "UI expansion drawers should open as full reading sheets on mobile.",
+              summary: "Hermes captured a UI lesson from a failed mobile verification.",
+              user_summary: "移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。",
+              run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              conversation_id: "conv-ui-polish",
+              confirmed_at: "2026-09-02T00:10:00Z",
+              tags: ["ui", "mobile", "drawer"],
+              weight: 7,
+              created_at: "2026-09-02T00:05:01Z",
+            },
           ]);
         }
         if (path === "/api/v1/admin/settings") {
@@ -94,5 +108,17 @@ describe("HermesPage", () => {
       within(row).getByText("对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。"),
     ).not.toBeNull();
     expect(within(row).getByText("待确认")).not.toBeNull();
+  });
+
+  it("renders a journey timeline for confirmed and pending learning", async () => {
+    render(<TestApp initialPath="/hermes" />);
+
+    const journey = await screen.findByRole("region", { name: "Hermes 学习旅程" });
+
+    expect(within(journey).getByText("学习旅程")).not.toBeNull();
+    expect(within(journey).getByText("待确认 1")).not.toBeNull();
+    expect(within(journey).getByText("已确认 1")).not.toBeNull();
+    expect(within(journey).getByText("移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。")).not.toBeNull();
+    expect(within(journey).getByRole("link", { name: /查看 conv-ui-polish 的学习详情/ })).not.toBeNull();
   });
 });

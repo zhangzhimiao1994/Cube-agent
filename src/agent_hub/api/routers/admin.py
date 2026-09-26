@@ -5036,9 +5036,16 @@ def _plugin_resource_value_matches_schema(value: JsonValue, schema: Mapping[str,
             and _number_in_bounds(float(value), schema)
         )
     if schema_type == "array":
+        if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+            return False
         items = schema.get("items")
         if isinstance(items, Mapping) and items.get("type") == "string":
-            return isinstance(value, list) and all(isinstance(item, str) for item in value)
+            return all(isinstance(item, str) for item in value)
+        if isinstance(items, Mapping) and items.get("type") == "number":
+            return all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+        if isinstance(items, Mapping) and items.get("type") == "boolean":
+            return all(isinstance(item, bool) for item in value)
+        return True
     return True
 
 
@@ -13843,6 +13850,8 @@ async def capability_installer_install(
     _require(principal, "plugin:write")
     installer = _capability_installer_service(request)
     try:
+        from agent_hub.capability_installer.service import CapabilityInstallUnavailable
+
         expected_plan = installer.plan(body.entry_id, query=body.query)
         if expected_plan.id != body.plan_id:
             raise PublicAPIError(
@@ -13875,6 +13884,12 @@ async def capability_installer_install(
             409,
             "capability_install_confirmation_required",
             "capability install requires confirmation",
+        ) from None
+    except CapabilityInstallUnavailable as error:
+        raise PublicAPIError(
+            409,
+            "capability_install_backend_unavailable",
+            str(error),
         ) from None
     await service.record_audit_event(
         actor=str(principal.user_id),
