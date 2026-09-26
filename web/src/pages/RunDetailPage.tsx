@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
@@ -2712,7 +2712,12 @@ function DetailBoundedTextBlock({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const contentId = useId();
+  const contentRef = useRef<HTMLPreElement>(null);
   const shouldCollapse = shouldCollapseOverride ?? (text.length > 1200 || text.split("\n").length > 18);
+  useEffect(() => {
+    if (expanded) contentRef.current?.focus();
+  }, [expanded]);
   return (
     <div
       className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
@@ -2725,6 +2730,7 @@ function DetailBoundedTextBlock({
               type="button"
               className="text-button"
               aria-expanded={expanded}
+              aria-controls={contentId}
               onClick={() => setExpanded((current) => !current)}
             >
               {expanded ? expandLabel : collapseLabel}
@@ -2747,7 +2753,9 @@ function DetailBoundedTextBlock({
           </button>
         </div>
       </div>
-      <pre>{text}</pre>
+      <pre id={contentId} ref={contentRef} tabIndex={0} aria-label={`${label}完整内容`}>
+        {text}
+      </pre>
     </div>
   );
 }

@@ -727,6 +727,9 @@ describe("agentInlineSummary", () => {
 
     expect(source).toContain('shouldCollapse && expanded ? " is-expanded"');
     expect(source).toContain("aria-expanded={expanded}");
+    expect(source).toContain("aria-controls={contentId}");
+    expect(source).toContain("contentRef.current?.focus()");
+    expect(source).toContain("tabIndex={0}");
     expect(source).toContain("shouldCollapse={presentation.shouldCollapse}");
     expect(stylesCss).toMatch(
       /\.process-detail-modal\s*{[\s\S]*height:\s*min\(96dvh,\s*1040px\);[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
@@ -749,6 +752,7 @@ describe("agentInlineSummary", () => {
     expect(stylesCss).toMatch(
       /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[^}]*min-height:\s*0;/,
     );
+    expect(stylesCss).toMatch(/\.bounded-text-block pre\s*{[^}]*overscroll-behavior:\s*contain;/);
     expect(stylesCss).toMatch(
       /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-backdrop\s*{[\s\S]*align-items:\s*stretch;[\s\S]*padding:\s*env\(safe-area-inset-top\) 0 0;/,
     );

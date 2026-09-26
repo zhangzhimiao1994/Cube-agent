@@ -78,6 +78,9 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
   const source = readFileSync("src/pages/RunDetailPage.tsx", "utf8");
 
   expect(source).toContain("aria-expanded={expanded}");
+  expect(source).toContain("aria-controls={contentId}");
+  expect(source).toContain("contentRef.current?.focus()");
+  expect(source).toContain("tabIndex={0}");
   expect(source).toContain("shouldCollapse={presentation.shouldCollapse}");
 
   expect(stylesCss).toMatch(

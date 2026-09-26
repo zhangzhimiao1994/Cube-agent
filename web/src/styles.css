@@ -3789,6 +3789,7 @@ article:hover {
   max-height: 18rem;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 0.7rem;
   tab-size: 2;
   white-space: pre;
