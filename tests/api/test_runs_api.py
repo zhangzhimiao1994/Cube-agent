@@ -11,6 +11,7 @@ from typing import cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_hub.api.routers.runs import SubmittedRunResponse
@@ -704,7 +705,9 @@ def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
     assert details["requested_permissions"] == ["workspace.read", "workspace.write"]
 
 
-def test_run_submission_persists_selected_execution_backend(monkeypatch) -> None:
+def test_run_submission_persists_selected_execution_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
         lambda backend, sandbox_profile=None: None,
@@ -729,7 +732,9 @@ def test_run_submission_persists_selected_execution_backend(monkeypatch) -> None
     assert details["execution_backend"] == "docker"
 
 
-def test_run_submission_uses_tenant_default_execution_backend_when_omitted(monkeypatch) -> None:
+def test_run_submission_uses_tenant_default_execution_backend_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
         lambda backend, sandbox_profile=None: None,
@@ -748,7 +753,9 @@ def test_run_submission_uses_tenant_default_execution_backend_when_omitted(monke
     assert service.workspace_contexts[-1]["execution_backend"] == "docker"
 
 
-def test_run_submission_rejects_unavailable_execution_backend(monkeypatch) -> None:
+def test_run_submission_rejects_unavailable_execution_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
         lambda backend, sandbox_profile=None: (
@@ -773,7 +780,9 @@ def test_run_submission_rejects_unavailable_execution_backend(monkeypatch) -> No
     assert service.workspace_contexts == []
 
 
-def test_run_submission_rejects_backend_sandbox_profile_mismatch(monkeypatch) -> None:
+def test_run_submission_rejects_backend_sandbox_profile_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
         lambda backend, sandbox_profile=None: (

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from subprocess import CompletedProcess
+from typing import Any
+
+import pytest
 
 from agent_hub.execution_backends import (
     clear_execution_backend_probe_cache,
@@ -17,7 +20,9 @@ def teardown_function() -> None:
     clear_execution_backend_probe_cache()
 
 
-def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(monkeypatch) -> None:
+def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executables = {
         "systemd-run": "/usr/bin/systemd-run",
         "systemctl": "/usr/bin/systemctl",
@@ -40,7 +45,9 @@ def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(monkeypat
     assert statuses["docker"].adapter == "DockerSkillSandbox"
 
 
-def test_probe_explains_missing_docker_instead_of_advertising_placeholder(monkeypatch) -> None:
+def test_probe_explains_missing_docker_instead_of_advertising_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.execution_backends.shutil.which",
         lambda name: "/usr/bin/systemd-run" if name in {"systemd-run", "systemctl"} else None,
@@ -52,7 +59,9 @@ def test_probe_explains_missing_docker_instead_of_advertising_placeholder(monkey
     assert statuses["docker"].reason == "docker_cli_not_found"
 
 
-def test_probe_rejects_systemd_when_transient_units_cannot_start(monkeypatch) -> None:
+def test_probe_rejects_systemd_when_transient_units_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executables = {
         "systemd-run": "/usr/bin/systemd-run",
         "systemctl": "/usr/bin/systemctl",
@@ -63,7 +72,7 @@ def test_probe_rejects_systemd_when_transient_units_cannot_start(monkeypatch) ->
         lambda name: executables.get(name),
     )
 
-    def run(args, **kwargs):
+    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
         del kwargs
         if args[0] == "/usr/bin/systemd-run":
             return CompletedProcess(args=args, returncode=1, stdout="", stderr="Failed to connect to bus")
@@ -77,7 +86,9 @@ def test_probe_rejects_systemd_when_transient_units_cannot_start(monkeypatch) ->
     assert statuses["systemd"].reason == "systemd_transient_unit_unavailable"
 
 
-def test_systemd_probe_exercises_the_runtime_isolation_contract(monkeypatch) -> None:
+def test_systemd_probe_exercises_the_runtime_isolation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executables = {
         "systemd-run": "/usr/bin/systemd-run",
         "systemctl": "/usr/bin/systemctl",
@@ -88,7 +99,7 @@ def test_systemd_probe_exercises_the_runtime_isolation_contract(monkeypatch) -> 
     )
     commands: list[tuple[str, ...]] = []
 
-    def run(args, **kwargs):
+    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
         del kwargs
         commands.append(tuple(args))
         return CompletedProcess(args=args, returncode=0, stdout="", stderr="")
@@ -120,7 +131,9 @@ def test_systemd_probe_exercises_the_runtime_isolation_contract(monkeypatch) -> 
     assert "import agent_hub.skills.runner" in command
 
 
-def test_selected_backend_probe_is_cached_without_probing_other_backends(monkeypatch) -> None:
+def test_selected_backend_probe_is_cached_without_probing_other_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = {"systemd": 0, "docker": 0}
 
     def systemd_reason() -> None:
@@ -143,14 +156,16 @@ def test_selected_backend_probe_is_cached_without_probing_other_backends(monkeyp
     assert calls == {"systemd": 1, "docker": 0}
 
 
-def test_docker_probe_starts_the_hardened_runner_image(monkeypatch) -> None:
+def test_docker_probe_starts_the_hardened_runner_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         "agent_hub.execution_backends.shutil.which",
         lambda name: "/usr/bin/docker" if name == "docker" else None,
     )
     commands: list[tuple[str, ...]] = []
 
-    def run(args, **kwargs):
+    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
         del kwargs
         commands.append(tuple(args))
         return CompletedProcess(args=args, returncode=0, stdout="image-id\n", stderr="")

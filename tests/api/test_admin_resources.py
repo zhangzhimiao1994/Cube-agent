@@ -325,7 +325,9 @@ def test_execution_backends_endpoint_reports_only_real_implemented_adapters() ->
     assert all(isinstance(item["available"], bool) for item in payload)
 
 
-def test_settings_update_rejects_unavailable_default_execution_backend(monkeypatch) -> None:
+def test_settings_update_rejects_unavailable_default_execution_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         admin_router,
         "probe_execution_backends",
