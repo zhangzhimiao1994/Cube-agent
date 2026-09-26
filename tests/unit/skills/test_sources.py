@@ -14,6 +14,7 @@ from agent_hub.skills.sources import (
     SkillSourceFetchRequest,
     UnsafeSkillSource,
     normalize_github_repository_url,
+    snapshot_from_archive,
 )
 
 
@@ -52,6 +53,74 @@ def test_normalize_github_repository_url_accepts_only_repository_root() -> None:
     ):
         with pytest.raises(UnsafeSkillSource):
             normalize_github_repository_url(unsafe)
+
+
+def test_snapshot_from_archive_validates_commit_hash_and_filters_subdirectory() -> None:
+    archive_bytes = _repository_archive()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+
+    snapshot = snapshot_from_archive(
+        SkillSourceFetchRequest(
+            repository_url="https://github.com/acme/demo",
+            ref="main",
+            subdirectory="skills",
+            expected_archive_sha256=archive_sha256,
+        ),
+        "A" * 40,
+        archive_bytes,
+    )
+
+    assert snapshot.repository_url == "https://github.com/acme/demo"
+    assert snapshot.commit_sha == "a" * 40
+    assert snapshot.archive_sha256 == archive_sha256
+    assert snapshot.source_archive_bytes == len(archive_bytes)
+    with zipfile.ZipFile(io.BytesIO(snapshot.skill_archive)) as archive:
+        assert sorted(archive.namelist()) == [
+            "research/SKILL.md",
+            "research/references/guide.md",
+        ]
+
+
+@pytest.mark.parametrize("commit_sha", ["main", "a" * 39, "g" * 40])
+def test_snapshot_from_archive_rejects_invalid_commit(commit_sha: str) -> None:
+    with pytest.raises(SkillSourceFetchError, match="commit"):
+        snapshot_from_archive(
+            SkillSourceFetchRequest(
+                repository_url="https://github.com/acme/demo",
+                ref="main",
+            ),
+            commit_sha,
+            _repository_archive(),
+        )
+
+
+def test_snapshot_from_archive_rejects_hash_mismatch() -> None:
+    with pytest.raises(SkillSourceFetchError, match="hash"):
+        snapshot_from_archive(
+            SkillSourceFetchRequest(
+                repository_url="https://github.com/acme/demo",
+                ref="main",
+                expected_archive_sha256="0" * 64,
+            ),
+            "a" * 40,
+            _repository_archive(),
+        )
+
+
+def test_snapshot_from_archive_rejects_expected_commit_mismatch() -> None:
+    archive_bytes = _repository_archive()
+
+    with pytest.raises(SkillSourceFetchError, match="commit"):
+        snapshot_from_archive(
+            SkillSourceFetchRequest(
+                repository_url="https://github.com/acme/demo",
+                ref="main",
+                expected_commit_sha="b" * 40,
+                expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+            ),
+            "a" * 40,
+            archive_bytes,
+        )
 
 
 @pytest.mark.asyncio

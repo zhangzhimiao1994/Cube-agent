@@ -41,6 +41,7 @@ class SkillSourceFetchRequest:
     repository_url: str
     ref: str
     subdirectory: str = ""
+    expected_commit_sha: str | None = None
     expected_archive_sha256: str | None = None
     credential: str | None = None
 
@@ -62,6 +63,36 @@ class SystemResolver:
         except OSError as exc:
             raise UnsafeSkillSource("skill source host could not be resolved") from exc
         return list(dict.fromkeys(item[4][0] for item in results))
+
+
+def snapshot_from_archive(
+    request: SkillSourceFetchRequest,
+    commit_sha: str,
+    archive_bytes: bytes,
+) -> SkillSourceSnapshot:
+    repository_url = normalize_github_repository_url(request.repository_url)
+    normalize_source_ref(request.ref)
+    subdirectory = normalize_source_subdirectory(request.subdirectory)
+    normalized_commit_sha = commit_sha.lower()
+    if _COMMIT_SHA.fullmatch(normalized_commit_sha) is None:
+        raise SkillSourceFetchError("skill source commit SHA is invalid")
+    expected_commit_sha = request.expected_commit_sha
+    if (
+        expected_commit_sha is not None
+        and normalized_commit_sha != expected_commit_sha.lower()
+    ):
+        raise SkillSourceFetchError("skill source commit does not match expected commit")
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    expected_sha256 = request.expected_archive_sha256
+    if expected_sha256 is not None and archive_sha256 != expected_sha256.lower():
+        raise SkillSourceFetchError("skill source archive hash does not match")
+    return SkillSourceSnapshot(
+        repository_url=repository_url,
+        commit_sha=normalized_commit_sha,
+        archive_sha256=archive_sha256,
+        source_archive_bytes=len(archive_bytes),
+        skill_archive=_filter_repository_archive(archive_bytes, subdirectory),
+    )
 
 
 def normalize_github_repository_url(value: str) -> str:
@@ -124,7 +155,7 @@ class GitHubSkillSourceFetcher:
     async def fetch(self, request: SkillSourceFetchRequest) -> SkillSourceSnapshot:
         repository_url = normalize_github_repository_url(request.repository_url)
         ref = normalize_source_ref(request.ref)
-        subdirectory = normalize_source_subdirectory(request.subdirectory)
+        _ = normalize_source_subdirectory(request.subdirectory)
         owner, repository = repository_url.removeprefix("https://github.com/").split("/", 1)
         api_root = f"https://api.github.com/repos/{owner}/{repository}"
         headers = {
@@ -161,18 +192,7 @@ class GitHubSkillSourceFetcher:
             raise SkillSourceFetchError("skill source request timed out") from exc
         except httpx.HTTPError as exc:
             raise SkillSourceFetchError("skill source request failed") from exc
-        archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
-        expected_sha256 = request.expected_archive_sha256
-        if expected_sha256 is not None and archive_sha256 != expected_sha256.lower():
-            raise SkillSourceFetchError("skill source archive hash does not match")
-        filtered = _filter_repository_archive(archive_bytes, subdirectory)
-        return SkillSourceSnapshot(
-            repository_url=repository_url,
-            commit_sha=commit_sha,
-            archive_sha256=archive_sha256,
-            source_archive_bytes=len(archive_bytes),
-            skill_archive=filtered,
-        )
+        return snapshot_from_archive(request, commit_sha, archive_bytes)
 
     async def _request_bytes(
         self,
@@ -337,4 +357,5 @@ __all__ = [
     "normalize_github_repository_url",
     "normalize_source_ref",
     "normalize_source_subdirectory",
+    "snapshot_from_archive",
 ]

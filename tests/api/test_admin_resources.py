@@ -11884,9 +11884,9 @@ def skill_archive() -> bytes:
     return buffer.getvalue()
 
 
-def skill_archive_variant(*, entry_body: str) -> bytes:
+def skill_archive_variant(*, entry_body: str, name: str = "safe_skill") -> bytes:
     manifest = (
-        "name: safe_skill\n"
+        f"name: {name}\n"
         "version: 1.0.0\n"
         "entry_point: main.py\n"
         "compatible_runtime: python3.12\n"
@@ -11899,6 +11899,34 @@ def skill_archive_variant(*, entry_body: str) -> bytes:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("skill.yaml", manifest)
         archive.writestr("main.py", entry_body)
+    return buffer.getvalue()
+
+
+def skill_source_repository_archive(*, entry_body: str = "print('snapshot')\n") -> bytes:
+    package = skill_archive_variant(entry_body=entry_body)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(package)) as source, zipfile.ZipFile(buffer, "w") as target:
+        target.writestr("repository-root/README.md", "team skill tap")
+        target.writestr("repository-root/ignored.txt", "outside configured subdirectory")
+        for name in source.namelist():
+            target.writestr(f"repository-root/skills/safe/{name}", source.read(name))
+    return buffer.getvalue()
+
+
+def multi_skill_source_repository_archive() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for directory, skill_name in (("safe", "safe_skill"), ("audit", "audit_skill")):
+            package = skill_archive_variant(
+                entry_body=f"print('{skill_name}')\n",
+                name=skill_name,
+            )
+            with zipfile.ZipFile(io.BytesIO(package)) as source:
+                for name in source.namelist():
+                    target.writestr(
+                        f"repository-root/skills/{directory}/{name}",
+                        source.read(name),
+                    )
     return buffer.getvalue()
 
 
@@ -14276,6 +14304,893 @@ def test_skill_source_requires_trust_and_syncs_candidate_without_switching_curre
     assert candidate["source"]["commit_sha"] == "a" * 40
     assert skills[0]["current_version_id"] == current["id"]
     assert fetcher.requests[0].subdirectory == "skills"
+
+
+def test_skill_source_import_snapshot_requires_trust_and_imports_candidate() -> None:
+    api = client()
+    archive_bytes = skill_source_repository_archive()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    source = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "snapshot-source",
+            "name": "离线团队技能",
+            "repository_url": "https://github.com/example/security-skills",
+            "ref": "main",
+            "subdirectory": "skills",
+            "expected_commit_sha": "a" * 40,
+            "expected_archive_sha256": archive_sha256,
+        },
+    ).json()
+
+    blocked = api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": "a" * 40},
+        files={"archive": ("snapshot.zip", archive_bytes, "application/zip")},
+    )
+    api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/trust",
+        headers=headers(),
+        json={"reason": "已核对离线快照来源"},
+    )
+    imported = api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": "A" * 40},
+        files={"archive": ("snapshot.zip", archive_bytes, "application/zip")},
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "skill_source_untrusted"
+    assert imported.status_code == 200
+    payload = imported.json()
+    assert payload["source"]["resolved_commit_sha"] == "a" * 40
+    assert payload["source"]["archive_sha256"] == archive_sha256
+    assert payload["source"]["source_archive_bytes"] == len(archive_bytes)
+    assert payload["source"]["sync_state"] == "succeeded"
+    assert len(payload["upload"]["items"]) == 1
+    candidate = payload["upload"]["items"][0]
+    assert candidate["name"] == "safe_skill"
+    assert candidate["status"] == "scanned"
+    assert candidate["source"]["source_id"] == source["id"]
+    assert candidate["source"]["commit_sha"] == "a" * 40
+    assert candidate["source"]["archive_sha256"] == archive_sha256
+    assert candidate["current_version_id"] is None
+
+
+def test_skill_source_import_snapshot_requires_expected_archive_hash() -> None:
+    api = client()
+    archive_bytes = skill_source_repository_archive()
+    source = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "snapshot-without-hash",
+            "name": "未固定哈希的离线来源",
+            "repository_url": "https://github.com/example/security-skills",
+            "subdirectory": "skills",
+        },
+    ).json()
+    api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/trust",
+        headers=headers(),
+        json={"reason": "仅信任来源，尚未固定归档"},
+    )
+
+    response = api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": "a" * 40},
+        files={"archive": ("snapshot.zip", archive_bytes, "application/zip")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "skill_source_snapshot_hash_required"
+
+
+def test_skill_source_import_snapshot_requires_expected_commit_and_exact_match() -> None:
+    api = client()
+    archive_bytes = skill_source_repository_archive()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    source = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "snapshot-commit-bound",
+            "name": "固定提交的离线来源",
+            "repository_url": "https://github.com/example/security-skills",
+            "subdirectory": "skills",
+            "expected_commit_sha": "A" * 40,
+            "expected_archive_sha256": archive_sha256,
+        },
+    ).json()
+    assert source["expected_commit_sha"] == "a" * 40
+    api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/trust",
+        headers=headers(),
+        json={"reason": "提交与归档均已核对"},
+    )
+
+    mismatch = api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": "b" * 40},
+        files={"archive": ("snapshot.zip", archive_bytes, "application/zip")},
+    )
+
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["code"] == "skill_source_snapshot_commit_mismatch"
+
+
+def test_skill_source_expected_commit_change_revokes_trust() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "commit-sensitive-source",
+            "name": "提交敏感来源",
+            "repository_url": "https://github.com/example/security-skills",
+            "expected_commit_sha": "a" * 40,
+        },
+    ).json()
+    api.post(
+        f"/api/v1/admin/skill-sources/{created['id']}/trust",
+        headers=headers(),
+        json={"reason": "初次核对"},
+    )
+
+    updated = api.patch(
+        f"/api/v1/admin/skill-sources/{created['id']}",
+        headers=headers(),
+        json={"expected_commit_sha": "B" * 40},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["expected_commit_sha"] == "b" * 40
+    assert updated.json()["trust_state"] == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_skill_source_import_snapshot_preserves_service_error_status() -> None:
+    archive_bytes = skill_source_repository_archive()
+
+    class UnavailableStoreService(InMemoryAdminResourceService):
+        async def upload_skill_archive(
+            self,
+            filename: str,
+            archive_bytes: bytes,
+            **kwargs: object,
+        ) -> admin_router.SkillArchiveUploadResponse:
+            del filename, archive_bytes, kwargs
+            raise PublicAPIError(503, "skill_store_unavailable", "skill store is unavailable")
+
+    service = UnavailableStoreService()
+    source = await service.create_skill_source(
+        admin_router.SkillSourceCreateRequest(
+            id="snapshot-store-error",
+            name="离线存储错误",
+            repository_url="https://github.com/example/team-skills",
+            subdirectory="skills",
+            expected_commit_sha="d" * 40,
+            expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+    )
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=True,
+        reason="已固定归档",
+        actor=str(ACTOR_ID),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.import_skill_source_snapshot(
+            source.id,
+            commit_sha="d" * 40,
+            archive_bytes=archive_bytes,
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.code == "skill_store_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_skill_source_import_snapshot_records_source_audit() -> None:
+    archive_bytes = skill_source_repository_archive()
+    service = InMemoryAdminResourceService()
+    source = await service.create_skill_source(
+        admin_router.SkillSourceCreateRequest(
+            id="snapshot-audit-source",
+            name="离线审计来源",
+            repository_url="https://github.com/example/team-skills",
+            subdirectory="skills",
+            expected_commit_sha="e" * 40,
+            expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+    )
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=True,
+        reason="已固定归档",
+        actor=str(ACTOR_ID),
+    )
+
+    imported = await service.import_skill_source_snapshot(
+        source.id,
+        commit_sha="e" * 40,
+        archive_bytes=archive_bytes,
+    )
+    events = await service.list_audit_events("skill_source.snapshot.import")
+
+    assert imported.source.sync_state == "succeeded"
+    assert len(events) == 1
+    assert events[0].resource == f"skill_source:{source.id}"
+    assert events[0].details["commit_sha"] == "e" * 40
+    assert events[0].details["archive_sha256"] == hashlib.sha256(archive_bytes).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_skill_source_import_snapshot_skips_unowned_duplicate_content() -> None:
+    archive_bytes = skill_source_repository_archive()
+    service = InMemoryAdminResourceService()
+    existing = (
+        await service.upload_skill_archive(
+            "manual.zip",
+            skill_archive_variant(entry_body="print('snapshot')\n"),
+        )
+    ).items[0]
+    source = await service.create_skill_source(
+        admin_router.SkillSourceCreateRequest(
+            id="snapshot-duplicate-source",
+            name="离线重复来源",
+            repository_url="https://github.com/example/team-skills",
+            subdirectory="skills",
+            expected_commit_sha="f" * 40,
+            expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+    )
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=True,
+        reason="已固定归档",
+        actor=str(ACTOR_ID),
+    )
+
+    imported = await service.import_skill_source_snapshot(
+        source.id,
+        commit_sha="f" * 40,
+        archive_bytes=archive_bytes,
+    )
+
+    assert imported.upload.items == []
+    assert len(imported.upload.skipped) == 1
+    assert imported.upload.skipped[0].reason == "matching content belongs to another source"
+    assert existing.id not in imported.source.linked_skill_ids
+    assert (await service.list_skills())[0].source is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_import_cleans_partial_files_and_rows(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = multi_skill_source_repository_archive()
+
+    class FailingBatchService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+            self.skill_writes = 0
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            **_kwargs: object,
+        ) -> bool:
+            if kind == "skill":
+                self.skill_writes += 1
+                if self.skill_writes == 2:
+                    raise PublicAPIError(503, "database_unavailable", "database unavailable")
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+        async def _record_audit(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def _delete_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            **_kwargs: object,
+        ) -> bool | None:
+            return self.payloads.pop((kind, resource_id), None) is not None
+
+    service = FailingBatchService()
+    source = admin_router.SkillSourceResponse(
+        id="snapshot-partial-source",
+        name="离线原子导入",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        subdirectory="skills",
+        expected_commit_sha="1" * 40,
+        expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已固定归档",
+    )
+    service.skill_sources[source.id] = source
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.import_skill_source_snapshot(
+            source.id,
+            commit_sha="1" * 40,
+            archive_bytes=archive_bytes,
+        )
+
+    assert error.value.status_code == 503
+    assert not [key for key in service.payloads if key[0] == "skill"]
+    quarantine = tmp_path / str(TENANT_ID) / "quarantine"
+    assert not list(quarantine.glob("*.zip")) if quarantine.exists() else True
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_import_uses_one_locked_transaction(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = multi_skill_source_repository_archive()
+    source = admin_router.SkillSourceResponse(
+        id="snapshot-transaction-source",
+        name="离线事务导入",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        subdirectory="skills",
+        expected_commit_sha="2" * 40,
+        expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已固定归档",
+    )
+    source_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source",
+        resource_id=source.id,
+        payload=source.model_dump(mode="json"),
+    )
+    class TransactionSession:
+        def __init__(self) -> None:
+            self.statements: list[object] = []
+            self.lock_keys: list[str] = []
+            self.added: list[AdminResourceRow] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            self.statements.append(statement)
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            self.statements.append(statement)
+            return source_row
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            self.statements.append(statement)
+            return []
+
+        def add(self, row: AdminResourceRow) -> None:
+            self.added.append(row)
+
+    session = TransactionSession()
+    factory_calls = 0
+
+    def session_factory() -> TransactionSession:
+        nonlocal factory_calls
+        factory_calls += 1
+        return session
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, session_factory),
+    )
+
+    imported = await service.import_skill_source_snapshot(
+        source.id,
+        commit_sha="2" * 40,
+        archive_bytes=archive_bytes,
+    )
+
+    assert factory_calls == 1
+    assert "pg_advisory_xact_lock" in str(session.statements[0])
+    assert "FOR UPDATE" in str(session.statements[1])
+    assert session.lock_keys[0].endswith(f"skill-source:{source.id}")
+    skill_lock_keys = session.lock_keys[1:]
+    assert len(skill_lock_keys) == 2
+    assert skill_lock_keys == sorted(skill_lock_keys)
+    assert all(":skill:" in key for key in skill_lock_keys)
+    assert len(imported.upload.items) == 2
+    assert [row.kind for row in session.added].count("skill") == 2
+    assert [row.kind for row in session.added].count("audit") == 1
+    assert source_row.payload["sync_state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_update_and_sync_state_lock_source_first() -> None:
+    source = admin_router.SkillSourceResponse(
+        id="source-lock-protocol",
+        name="统一来源锁",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已核对",
+    )
+    row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source",
+        resource_id=source.id,
+        payload=source.model_dump(mode="json"),
+    )
+    calls: list[tuple[str, object | None]] = []
+
+    class LockedSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            calls.append((str(statement), parameters))
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            calls.append((str(statement), None))
+            return row
+
+    class LockProtocolService(PersistentAdminResourceService):
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            **_kwargs: object,
+        ) -> dict[str, object] | None:
+            assert kind == "skill_source"
+            assert resource_id == source.id
+            return dict(row.payload)
+
+        async def _record_audit(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    service = LockProtocolService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, LockedSession),
+    )
+
+    await service.update_skill_source(
+        source.id,
+        admin_router.SkillSourceUpdateRequest(name="统一来源锁（更新）"),
+    )
+    assert "pg_advisory_xact_lock" in calls[0][0]
+    assert cast(dict[str, str], calls[0][1])["lock_key"].endswith(
+        f"skill-source:{source.id}"
+    )
+
+    calls.clear()
+    syncing = await service._start_skill_source_sync(source.id, "sync-lock-protocol")
+    assert "pg_advisory_xact_lock" in calls[0][0]
+
+    calls.clear()
+    await service._finish_skill_source_sync(
+        source.id,
+        syncing.last_sync_id or "sync-lock-protocol",
+        updates={"sync_state": "succeeded"},
+        require_trusted=True,
+    )
+    assert "pg_advisory_xact_lock" in calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_import_cleans_files_before_releasing_locks(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = multi_skill_source_repository_archive()
+    source = admin_router.SkillSourceResponse(
+        id="snapshot-cleanup-lock-source",
+        name="锁内清理",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        subdirectory="skills",
+        expected_commit_sha="3" * 40,
+        expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已固定归档",
+    )
+    source_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source",
+        resource_id=source.id,
+        payload=source.model_dump(mode="json"),
+    )
+    failure_audits: list[AdminResourceRow] = []
+
+    class CleanupSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, exc_type: object, *_args: object) -> None:
+            if exc_type is not None:
+                quarantine = tmp_path / str(TENANT_ID) / "quarantine"
+                assert not list(quarantine.glob("*.zip")) if quarantine.exists() else True
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def scalar(self, _statement: object) -> AdminResourceRow:
+            return source_row
+
+        async def scalars(self, _statement: object) -> list[AdminResourceRow]:
+            return []
+
+        def add(self, added_row: AdminResourceRow) -> None:
+            if added_row.kind == "audit":
+                failure_audits.append(added_row)
+
+    class FailingWriteService(PersistentAdminResourceService):
+        write_count = 0
+
+        def _atomic_write_skill_archive(self, path: Path, archive_bytes: bytes) -> None:
+            self.write_count += 1
+            if self.write_count == 2:
+                raise PublicAPIError(503, "skill_store_unavailable", "store unavailable")
+            super()._atomic_write_skill_archive(path, archive_bytes)
+
+    service = FailingWriteService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, CleanupSession),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.import_skill_source_snapshot(
+            source.id,
+            commit_sha="3" * 40,
+            archive_bytes=archive_bytes,
+        )
+
+    assert error.value.status_code == 503
+    assert source_row.payload["sync_state"] == "failed"
+    assert source_row.payload["last_error"] == "skill_store_unavailable"
+    assert len(failure_audits) == 1
+    assert failure_audits[0].payload["action"] == "skill_source.snapshot.import.failed"
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_import_ids_isolate_concurrent_sources(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = skill_source_repository_archive()
+    archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    source_a = "Concurrent-Source"
+    source_b = "concurrent-source"
+    sources = {
+        source_id: admin_router.SkillSourceResponse(
+            id=source_id,
+            name=source_id,
+            repository_url=f"https://github.com/example/{source_id}",
+            ref="main",
+            subdirectory="skills",
+            expected_commit_sha="4" * 40,
+            expected_archive_sha256=archive_sha256,
+            trust_state="trusted",
+            trusted_by=str(ACTOR_ID),
+            trusted_at=datetime.now(UTC),
+            trust_reason="已固定归档",
+        )
+        for source_id in (source_a, source_b)
+    }
+    source_rows = {
+        source_id: AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source",
+            resource_id=source_id,
+            payload=source.model_dump(mode="json"),
+        )
+        for source_id, source in sources.items()
+    }
+
+    class ConcurrentImportSession:
+        def __init__(self) -> None:
+            self.source_id: str | None = None
+            self.added: list[AdminResourceRow] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, _statement: object, parameters: object | None = None
+        ) -> None:
+            if isinstance(parameters, dict):
+                lock_key = parameters.get("lock_key")
+                if isinstance(lock_key, str) and ":skill-source:" in lock_key:
+                    self.source_id = lock_key.rsplit(":", 1)[-1]
+            await asyncio.sleep(0)
+
+        async def scalar(self, _statement: object) -> AdminResourceRow:
+            assert self.source_id is not None
+            return source_rows[self.source_id]
+
+        async def scalars(self, _statement: object) -> list[AdminResourceRow]:
+            await asyncio.sleep(0)
+            return []
+
+        def add(self, row: AdminResourceRow) -> None:
+            self.added.append(row)
+
+    sessions: list[ConcurrentImportSession] = []
+
+    def session_factory() -> ConcurrentImportSession:
+        session = ConcurrentImportSession()
+        sessions.append(session)
+        return session
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, session_factory),
+    )
+
+    first, second = await asyncio.gather(
+        service.import_skill_source_snapshot(
+            source_a,
+            commit_sha="4" * 40,
+            archive_bytes=archive_bytes,
+        ),
+        service.import_skill_source_snapshot(
+            source_b,
+            commit_sha="4" * 40,
+            archive_bytes=archive_bytes,
+        ),
+    )
+
+    first_id = first.upload.items[0].id
+    second_id = second.upload.items[0].id
+    assert first_id != second_id
+    quarantine = tmp_path / str(TENANT_ID) / "quarantine"
+    assert (quarantine / f"{first_id}.zip").is_file()
+    assert (quarantine / f"{second_id}.zip").is_file()
+    manual = await InMemoryAdminResourceService().upload_skill_archive(
+        "manual.zip",
+        skill_archive_variant(entry_body="print('snapshot')\n"),
+    )
+    assert manual.items[0].id not in {first_id, second_id}
+
+    repeated = await service.import_skill_source_snapshot(
+        source_a,
+        commit_sha="4" * 40,
+        archive_bytes=archive_bytes,
+    )
+    assert repeated.upload.items[0].id == first_id
+
+
+@pytest.mark.asyncio
+async def test_skill_source_import_failure_does_not_overwrite_newer_sync() -> None:
+    source = admin_router.SkillSourceResponse(
+        id="stale-import-failure-source",
+        name="过期失败记录",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        sync_state="syncing",
+        last_sync_id="sync_newer",
+        sync_started_at=datetime.now(UTC),
+        trust_state="trusted",
+    )
+    source_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source",
+        resource_id=source.id,
+        payload=source.model_dump(mode="json"),
+    )
+    audit_rows: list[AdminResourceRow] = []
+
+    class FailureSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def scalar(self, _statement: object) -> AdminResourceRow:
+            return source_row
+
+        def add(self, row: AdminResourceRow) -> None:
+            audit_rows.append(row)
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, FailureSession),
+    )
+    original_payload = dict(source_row.payload)
+
+    await service._record_skill_source_import_failure(
+        source.id,
+        "import_older",
+        PublicAPIError(503, "skill_store_unavailable", "store unavailable"),
+    )
+
+    assert source_row.payload == original_payload
+    assert len(audit_rows) == 1
+    assert audit_rows[0].payload["details"]["sync_id"] == "import_older"
+    assert audit_rows[0].payload["details"]["stale"] == "True"
+
+
+@pytest.mark.asyncio
+async def test_skill_source_import_snapshot_cannot_restore_revoked_trust() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    archive_bytes = skill_source_repository_archive()
+
+    class BlockingImportService(InMemoryAdminResourceService):
+        async def upload_skill_archive(
+            self,
+            filename: str,
+            archive_bytes: bytes,
+            **kwargs: object,
+        ) -> admin_router.SkillArchiveUploadResponse:
+            started.set()
+            await release.wait()
+            return await super().upload_skill_archive(filename, archive_bytes, **kwargs)
+
+    service = BlockingImportService()
+    source = await service.create_skill_source(
+        admin_router.SkillSourceCreateRequest(
+            id="snapshot-race-source",
+            name="离线竞态来源",
+            repository_url="https://github.com/example/team-skills",
+            subdirectory="skills",
+            expected_commit_sha="b" * 40,
+            expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+    )
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=True,
+        reason="初次审核",
+        actor=str(ACTOR_ID),
+    )
+
+    import_task = asyncio.create_task(
+        service.import_skill_source_snapshot(
+            source.id,
+            commit_sha="b" * 40,
+            archive_bytes=archive_bytes,
+        )
+    )
+    await started.wait()
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=False,
+        reason="导入期间撤销",
+        actor=str(ACTOR_ID),
+    )
+    release.set()
+
+    with pytest.raises(PublicAPIError) as error:
+        await import_task
+    assert error.value.code == "skill_source_sync_stale"
+    assert service.skill_sources[source.id].trust_state == "revoked"
+    assert await service.list_skills() == ()
+
+
+def test_skill_source_import_snapshot_is_tenant_scoped() -> None:
+    app = create_app(auth_service=StubAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    app.state.admin_resource_service = service
+    app.state.settings = Settings.model_construct(
+        plugin_package_store_dir=Path(tempfile.gettempdir())
+        / f"agent-hub-test-plugin-packages-{uuid4()}"
+    )
+    tenant_api = TestClient(app)
+    created = tenant_api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "tenant-snapshot-source",
+            "name": "租户离线来源",
+            "repository_url": "https://github.com/example/team-skills",
+        },
+    )
+    tenant_api.post(
+        "/api/v1/admin/skill-sources/tenant-snapshot-source/trust",
+        headers=headers(),
+        json={"reason": "租户内批准"},
+    )
+
+    other_app = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    other_app.state.admin_resource_service = service
+    other_app.state.settings = app.state.settings
+    other_api = TestClient(other_app)
+    response = other_api.post(
+        "/api/v1/admin/skill-sources/tenant-snapshot-source/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": "c" * 40},
+        files={
+            "archive": (
+                "snapshot.zip",
+                skill_source_repository_archive(),
+                "application/zip",
+            )
+        },
+    )
+
+    assert created.status_code == 200
+    assert response.status_code == 404
 
 
 def test_skill_source_update_revoke_delete_and_listing() -> None:
