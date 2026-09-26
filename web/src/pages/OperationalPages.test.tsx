@@ -6,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import type {
   ChannelStatus,
+  ExecutionBackend,
   EvolutionRun,
   PluginAdapterDescriptor,
   PluginResource,
@@ -143,6 +144,7 @@ const runDetail: RunDetail = {
 const settings = {
   default_mode: "auto",
   default_workflow_id: null,
+  default_execution_backend: "systemd",
   default_agent_ids: [],
   log_level: "warning",
   hermes_enabled: true,
@@ -157,6 +159,31 @@ const settings = {
   attachment_retention_days: 7,
   attachment_max_mb: 25,
 };
+
+const executionBackends: ExecutionBackend[] = [
+  {
+    id: "systemd",
+    name: "本机 systemd 隔离",
+    adapter: "SystemdSkillSandbox",
+    description: "本机隔离执行",
+    isolation: "DynamicUser + 私有网络",
+    cost: "本机资源",
+    available: true,
+    reason: null,
+    supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+  },
+  {
+    id: "docker",
+    name: "Docker 容器隔离",
+    adapter: "DockerSkillSandbox",
+    description: "容器隔离执行",
+    isolation: "只读容器",
+    cost: "本机容器资源",
+    available: true,
+    reason: null,
+    supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+  },
+];
 
 const mainAgent = {
   model: null,
@@ -698,6 +725,9 @@ describe("operational management pages", () => {
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
   let holdActiveConversationRequest = false;
+  let visibleSettings = settings;
+  let visibleExecutionBackends = executionBackends;
+  let failExecutionBackendProbe = false;
 
   beforeEach(() => {
     requests.length = 0;
@@ -725,6 +755,9 @@ describe("operational management pages", () => {
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     holdActiveConversationRequest = false;
+    visibleSettings = settings;
+    visibleExecutionBackends = executionBackends;
+    failExecutionBackendProbe = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -1063,7 +1096,16 @@ describe("operational management pages", () => {
           });
         }
         if (path === "/api/v1/admin/settings") {
-          return jsonResponse(settings);
+          return jsonResponse(visibleSettings);
+        }
+        if (path === "/api/v1/admin/execution-backends") {
+          if (failExecutionBackendProbe) {
+            return jsonResponse(
+              { error: { code: "service_unavailable", message: "execution backend probe failed" } },
+              { status: 503 },
+            );
+          }
+          return jsonResponse(visibleExecutionBackends);
         }
         if (path === "/api/v1/admin/main-agent") {
           return jsonResponse(mainAgent);
@@ -2340,6 +2382,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByLabelText("项目文件夹"), "Mofang Agent");
     await user.type(screen.getByLabelText("项目名称"), "魔方 Agent");
     await user.click(screen.getByRole("button", { name: /项目写入/ }));
+    await user.selectOptions(screen.getByLabelText("执行环境"), "docker");
     expect(screen.getByText(/^工作区：projects\/mofang-agent\/sessions\/conv-/)).not.toBeNull();
 
     await user.type(screen.getByPlaceholderText(/输入消息/), "生成一个简单项目并打包。");
@@ -2353,6 +2396,7 @@ describe("operational management pages", () => {
         project_id: "Mofang Agent",
         project_label: "魔方 Agent",
         sandbox_profile: "workspace_write",
+        execution_backend: "docker",
         requested_permissions: ["workspace.read", "workspace.write", "command.run"],
       },
     });
@@ -7151,6 +7195,77 @@ describe("operational management pages", () => {
     await expandRunConfigDetails(user);
     expect(within(config).getByRole("group", { name: "选择本次运行沙箱权限" })).not.toBeNull();
     expect(within(config).getByText("角色池 · 自动")).not.toBeNull();
+  });
+
+  it("falls back to the first available execution backend when the configured default is unavailable", async () => {
+    const user = userEvent.setup();
+    visibleSettings = { ...settings, default_execution_backend: "docker" };
+    visibleExecutionBackends = [
+      { ...executionBackends[1], available: false, reason: "docker_daemon_unavailable" },
+      executionBackends[0],
+    ];
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByText("默认执行环境不可用，已自动切换到本机 systemd 隔离。")).not.toBeNull();
+    await openRunConfig(user);
+    await expandRunConfigDetails(user);
+
+    const selector = screen.getByLabelText("执行环境") as HTMLSelectElement;
+    await waitFor(() => expect(selector.value).toBe("systemd"));
+    expect(selector.disabled).toBe(false);
+    expect((within(selector).getByRole("option", { name: "Docker 容器隔离（不可用）" }) as HTMLOptionElement).disabled).toBe(true);
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "使用可用执行环境继续");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      body: { execution_backend: "systemd" },
+    });
+  });
+
+  it("warns without blocking ordinary chat when execution backend discovery fails", async () => {
+    const user = userEvent.setup();
+    failExecutionBackendProbe = true;
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByText("执行环境探测失败，普通对话仍可发送；本次不会指定 Skill 执行环境。")).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
+
+    await openRunConfig(user);
+    await expandRunConfigDetails(user);
+    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).disabled).toBe(true);
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
+    expect(requests.find((request) => request.path === "/api/v1/runs")?.body).not.toHaveProperty("execution_backend");
+  });
+
+  it("warns without blocking ordinary chat when no execution backend is available", async () => {
+    const user = userEvent.setup();
+    visibleExecutionBackends = executionBackends.map((backend) => ({
+      ...backend,
+      available: false,
+      reason: backend.id === "systemd" ? "systemd_manager_unavailable" : "docker_daemon_unavailable",
+    }));
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(
+      await screen.findByText("当前没有可用的 Skill 执行环境，普通对话仍可发送。"),
+    ).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
+
+    await openRunConfig(user);
+    await expandRunConfigDetails(user);
+    const selector = screen.getByLabelText("执行环境") as HTMLSelectElement;
+    expect(selector.disabled).toBe(true);
+    expect(within(selector).getAllByRole("option").every((option) => (option as HTMLOptionElement).disabled)).toBe(true);
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
+    expect(requests.find((request) => request.path === "/api/v1/runs")?.body).not.toHaveProperty("execution_backend");
   });
 
 

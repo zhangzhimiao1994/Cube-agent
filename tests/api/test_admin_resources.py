@@ -76,6 +76,7 @@ from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
+from agent_hub.execution_backends import ExecutionBackendStatus
 from agent_hub.mcp.client import InMemoryMcpClient
 from agent_hub.mcp.manifest import MCP_RUNTIME_FAILURE_CODES
 from agent_hub.mcp.runtime import build_runtime_mcp_service
@@ -301,12 +302,66 @@ def test_system_settings_default_openclaw_is_disabled() -> None:
     assert settings.tool_approval_mode == "auto_review"
     assert settings.openclaw_mode == "ask"
     assert settings.openclaw_allowed_commands == []
+    assert settings.default_execution_backend == "systemd"
     assert settings.model_dump()["vibe_coding_enabled"] is False
     assert settings.model_dump()["openclaw_enabled"] is False
     assert settings.model_dump()["plugin_package_subprocess_registration_status"] is None
     assert settings.model_dump()["tool_approval_mode"] == "auto_review"
     assert settings.model_dump()["openclaw_mode"] == "ask"
     assert settings.model_dump()["openclaw_allowed_commands"] == []
+    assert settings.model_dump()["default_execution_backend"] == "systemd"
+
+
+def test_execution_backends_endpoint_reports_only_real_implemented_adapters() -> None:
+    response = client().get("/api/v1/admin/execution-backends", headers=headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {item["id"] for item in payload} == {"systemd", "docker"}
+    assert {item["adapter"] for item in payload} == {
+        "SystemdSkillSandbox",
+        "DockerSkillSandbox",
+    }
+    assert all(isinstance(item["available"], bool) for item in payload)
+
+
+def test_settings_update_rejects_unavailable_default_execution_backend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        admin_router,
+        "probe_execution_backends",
+        lambda: (
+            ExecutionBackendStatus(
+                id="systemd",
+                name="本机 systemd 隔离",
+                adapter="SystemdSkillSandbox",
+                description="systemd",
+                isolation="systemd",
+                cost="本机资源",
+                available=True,
+                reason=None,
+                supported_sandbox_profiles=("workspace_write",),
+            ),
+            ExecutionBackendStatus(
+                id="docker",
+                name="Docker 容器隔离",
+                adapter="DockerSkillSandbox",
+                description="docker",
+                isolation="docker",
+                cost="本机资源",
+                available=False,
+                reason="docker_runner_image_not_found",
+                supported_sandbox_profiles=("workspace_write",),
+            ),
+        ),
+    )
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["default_execution_backend"] = "docker"
+
+    response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "execution_backend_unavailable"
 
 
 def test_settings_response_projects_plugin_package_subprocess_registration_status() -> None:
@@ -3668,6 +3723,12 @@ def test_routing_details_exposes_channel_directive_context() -> None:
     assert details["requested_mcp_servers"] == "filesystem"
     assert details["requested_plugins"] == "github"
     assert details["source"] == "evolution"
+
+
+def test_routing_details_exposes_execution_backend() -> None:
+    details = _routing_details({"execution_backend": "docker"})
+
+    assert details["execution_backend"] == "docker"
 
 
 def test_routing_details_exposes_harness_execution_profile() -> None:
@@ -11420,6 +11481,7 @@ class RecordingScheduledRunService:
         mode: TaskMode,
         workflow_id: str | None = None,
         channel_context: dict[str, str] | None = None,
+        execution_backend: str = "systemd",
         idempotency_key: str | None = None,
     ) -> SubmittedTaskRun:
         self.calls.append(
@@ -11431,6 +11493,7 @@ class RecordingScheduledRunService:
                 "mode": mode,
                 "workflow_id": workflow_id,
                 "channel_context": channel_context,
+                "execution_backend": execution_backend,
                 "idempotency_key": idempotency_key,
             }
         )
@@ -11569,6 +11632,40 @@ async def test_scheduled_task_submission_records_operator_role_snapshot() -> Non
     assert run_service.calls[0]["actor_role"] is Role.OPERATOR
     assert run_service.calls[0]["workflow_id"] == "nightly_check"
     assert run_service.calls[0]["channel_context"] == {"source": "scheduler"}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_task_submission_uses_tenant_default_execution_backend() -> None:
+    class TenantSettingsService:
+        def __init__(self) -> None:
+            self.scope_calls: list[tuple[UUID, UUID]] = []
+
+        def for_principal(self, tenant_id: UUID, actor_id: UUID) -> "TenantSettingsService":
+            self.scope_calls.append((tenant_id, actor_id))
+            return self
+
+        async def get_settings(self) -> SystemSettingsResponse:
+            return SystemSettingsResponse(default_execution_backend="docker")
+
+    app = FastAPI()
+    run_service = RecordingScheduledRunService()
+    settings_service = TenantSettingsService()
+    app.state.run_service = run_service
+    app.state.admin_resource_service = settings_service
+    request = TaskRequest(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="execute scheduled workflow",
+        mode=TaskMode.AUTO,
+        workflow="default_workflow",
+        budget=16_384,
+        idempotency_key="schedule:backend",
+    )
+
+    await _submit_scheduled_task(app, request)
+
+    assert settings_service.scope_calls == [(TENANT_ID, TENANT_ID)]
+    assert run_service.calls[0]["execution_backend"] == "docker"
 
 
 def model_payload() -> dict[str, object]:

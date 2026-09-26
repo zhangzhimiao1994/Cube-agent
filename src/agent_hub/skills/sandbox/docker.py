@@ -109,6 +109,8 @@ def build_docker_command(
         "--env",
         f"AGENT_HUB_OUTPUT_LIMIT_BYTES={invocation.output_limit_bytes}",
         "--env",
+        f"AGENT_HUB_SANDBOX_PROFILE={invocation.sandbox_profile}",
+        "--env",
         f"AGENT_HUB_WORKDIR={settings.container_workdir}",
     ]
     for index, input_path in enumerate(invocation.read_only_inputs):

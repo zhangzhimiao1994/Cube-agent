@@ -457,6 +457,7 @@ const EXPLICIT_DETAIL_LABELS: Record<string, string> = {
   workflow_adjustment_policy: "工作流调整",
   selected_agent_ids: "角色池",
   routing_reason: "路由原因",
+  execution_backend: "执行环境",
   conversation_id: "会话",
   direct_model: "直连模型",
   harness_provider: "Harness 服务商",

@@ -18,6 +18,7 @@ from agent_hub.auth.models import Role
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.execution_backends import normalize_execution_backend
 from agent_hub.harness.events import harness_started_event
 from agent_hub.harness.scheduler import HarnessSchedulingError
 from agent_hub.harness.types import (
@@ -104,6 +105,7 @@ class SubmittedRun:
     workspace_session_path: str | None = None
     workspace_artifacts_path: str | None = None
     sandbox_profile: str | None = None
+    execution_backend: str = "systemd"
     requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
@@ -472,6 +474,7 @@ class RunService:
         project_label: str | None = None,
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
+        execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
         channel_context: dict[str, str] | None = None,
@@ -485,6 +488,7 @@ class RunService:
             sandbox_profile=sandbox_profile,
             requested_permissions=requested_permissions,
         )
+        resolved_execution_backend = normalize_execution_backend(execution_backend)
         cleaned_direct_model = direct_model.strip() if direct_model else None
         if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
             raise ValueError("direct_model must be a safe logical model identifier")
@@ -500,6 +504,7 @@ class RunService:
             "attachment_ids": list(attachment_ids),
             "workspace_project_explicit": project_id is not None and bool(project_id.strip()),
             **workspace.routing_payload(),
+            "execution_backend": resolved_execution_backend,
         }
         if cleaned_direct_model:
             operator_selection["direct_model"] = cleaned_direct_model
@@ -2852,6 +2857,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         workspace_session_path=_string_or_none(decision.get("workspace_session_path")),
         workspace_artifacts_path=_string_or_none(decision.get("workspace_artifacts_path")),
         sandbox_profile=sandbox_profile,
+        execution_backend=_string_or_none(decision.get("execution_backend")) or "systemd",
         requested_permissions=requested_permissions,
         temporary_agent_proposal=cast(dict[str, object], proposal)
         if isinstance(proposal, dict)

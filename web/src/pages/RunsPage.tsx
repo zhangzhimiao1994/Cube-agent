@@ -31,6 +31,7 @@ const SANDBOX_OPTIONS = [
   { value: "workspace_write", label: "项目写入", summary: "允许在项目工作区读写和执行命令" },
 ] as const;
 type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
+type ExecutionBackendId = "systemd" | "docker";
 export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
   if (profile === "none") return [];
   if (profile === "read_only") return ["workspace.read"];
@@ -5631,6 +5632,10 @@ export function RunsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const executionBackends = useQuery({
+    queryKey: ["execution-backends"],
+    queryFn: () => api.executionBackends(),
+  });
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
@@ -5642,6 +5647,7 @@ export function RunsPage() {
   const [projectId, setProjectId] = useState("default");
   const [projectLabel, setProjectLabel] = useState("");
   const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
+  const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
@@ -5786,7 +5792,15 @@ export function RunsPage() {
     }
     setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
+    setExecutionBackend(settings.data.default_execution_backend);
   }, [settings.data]);
+
+  useEffect(() => {
+    const firstAvailableBackend = executionBackends.data?.find((backend) => backend.available);
+    if (!firstAvailableBackend) return;
+    if (executionBackends.data?.some((backend) => backend.id === executionBackend && backend.available)) return;
+    setExecutionBackend(firstAvailableBackend.id);
+  }, [executionBackend, executionBackends.data]);
 
   useEffect(() => {
     if (!selectedWorkflow) return;
@@ -6033,6 +6047,7 @@ export function RunsPage() {
         project_label: projectLabel.trim() || null,
         workspace_session_id: conversationId.trim() || null,
         sandbox_profile: sandboxProfile,
+        ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
         requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
@@ -6696,6 +6711,7 @@ export function RunsPage() {
     setMode(settings.data?.default_mode ?? "auto");
     setWorkflowId(settings.data?.default_workflow_id ?? "");
     setAgentIds(settings.data?.default_agent_ids ?? []);
+    setExecutionBackend(settings.data?.default_execution_backend ?? "systemd");
     setDirectModel("");
     setTemporaryApproval(null);
     setScheduleApproval(null);
@@ -6779,6 +6795,36 @@ export function RunsPage() {
   const visibleConversationItems = items.filter((item) => conversationMatchesSearch(item, conversationSearch, items));
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
+  const availableExecutionBackends = executionBackends.data?.filter((backend) => backend.available) ?? [];
+  const selectedExecutionBackend = executionBackends.data?.find((item) => item.id === executionBackend);
+  const configuredExecutionBackend = executionBackends.data?.find(
+    (backend) => backend.id === settings.data?.default_execution_backend,
+  );
+  const executionBackendFallbackNotice =
+    availableExecutionBackends.length > 0 &&
+    settings.data &&
+    (!configuredExecutionBackend || !configuredExecutionBackend.available) &&
+    executionBackend === availableExecutionBackends[0].id
+      ? `默认执行环境不可用，已自动切换到${availableExecutionBackends[0].name}。`
+      : null;
+  const executionBackendNotice = executionBackends.isLoading
+    ? "正在探测执行环境，请稍候。"
+    : executionBackends.isError
+      ? "执行环境探测失败，普通对话仍可发送；本次不会指定 Skill 执行环境。"
+      : availableExecutionBackends.length === 0
+        ? "当前没有可用的 Skill 执行环境，普通对话仍可发送。"
+        : null;
+  const executionBackendLabel = selectedExecutionBackend
+    ? `${selectedExecutionBackend.name}${selectedExecutionBackend.available ? "" : "（不可用）"}`
+    : executionBackendNotice
+      ? "未指定 Skill 执行环境"
+      : executionBackend;
+  const executionBackendStatus =
+    executionBackendFallbackNotice ??
+    executionBackendNotice ??
+    (selectedExecutionBackend
+      ? `${selectedExecutionBackend.isolation} · ${selectedExecutionBackend.cost}`
+      : "正在确认执行环境...");
   const slashCommandSuggestions = slashCommandsForQuery(message);
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
@@ -7053,6 +7099,7 @@ export function RunsPage() {
             <div>
               <span>{selectedMode.label}</span>
               <span>{selectedSandboxLabel}</span>
+              <span>{executionBackendLabel}</span>
               <span>{workflowId ? selectedWorkflow?.name ?? workflowId : "无固定工作流"}</span>
               <span>{mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 个角色` : "自动角色"}</span>
             </div>
@@ -7105,6 +7152,34 @@ export function RunsPage() {
                 ))}
               </div>
             </div>
+            <label htmlFor="execution-backend">
+              执行环境
+              <select
+                id="execution-backend"
+                aria-label="执行环境"
+                value={selectedExecutionBackend ? executionBackend : ""}
+                disabled={
+                  executionBackends.isLoading ||
+                  executionBackends.isError ||
+                  availableExecutionBackends.length === 0
+                }
+                onChange={(event) => setExecutionBackend(event.target.value as ExecutionBackendId)}
+              >
+                {!executionBackends.data || executionBackends.data.length === 0 ? (
+                  <option value="" disabled>
+                    {executionBackends.isLoading ? "正在探测执行环境..." : "暂无可用执行环境"}
+                  </option>
+                ) : null}
+                {(executionBackends.data ?? []).map((backend) => (
+                  <option key={backend.id} value={backend.id} disabled={!backend.available}>
+                    {backend.name}{backend.available ? "" : "（不可用）"}
+                  </option>
+                ))}
+              </select>
+              <span className="field-help" role="status">
+                {executionBackendStatus}
+              </span>
+            </label>
             <label htmlFor="conversation-id">
               会话 ID
               <input
@@ -7153,7 +7228,10 @@ export function RunsPage() {
             </button>
             <div className="mode-help">
               <span className="eyebrow">当前设置</span>
-              <p>工作区：{workspacePreviewPath(projectId, conversationId)} · {selectedMode.label} · {selectedSandboxLabel}</p>
+              <p>
+                工作区：{workspacePreviewPath(projectId, conversationId)} · {selectedMode.label} · {selectedSandboxLabel} ·
+                {executionBackendLabel}
+              </p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
               {settings.isError ? (
                 <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p>
@@ -7755,7 +7833,11 @@ export function RunsPage() {
                 ) : null}
                 <button
                   type="submit"
-                  disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
+                  disabled={
+                    createRun.isPending ||
+                    message.trim().length === 0 ||
+                    Boolean(directSendBlockedReason)
+                  }
                 >
                   {createRun.isPending ? "发送中..." : "发送"}
                 </button>
@@ -7763,6 +7845,10 @@ export function RunsPage() {
             </div>
             {directSendBlockedReason && !(mode === "direct" && savedModels.length === 0) ? (
               <p className="field-help" role="status">{directSendBlockedReason}</p>
+            ) : null}
+            {executionBackendFallbackNotice ? <p className="field-help" role="status">{executionBackendFallbackNotice}</p> : null}
+            {executionBackendNotice && !executionBackends.isLoading ? (
+              <p className="field-help" role="status">{executionBackendNotice}</p>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
             {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}

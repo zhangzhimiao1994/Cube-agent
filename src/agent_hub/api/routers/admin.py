@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import contextlib
@@ -64,6 +65,7 @@ from agent_hub.evolution import (
     create_evolution_run_response,
     plan_evolution_next_round,
 )
+from agent_hub.execution_backends import ExecutionBackendStatus, probe_execution_backends
 from agent_hub.files.generated import (
     ZIP_MIME_TYPE,
     GeneratedFileStore,
@@ -1641,6 +1643,7 @@ class SystemSettingsRequest(BaseModel):
         pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
     )
     default_workflow_id: str | None = Field(default=None, max_length=128)
+    default_execution_backend: str = Field(default="systemd", pattern=r"^(systemd|docker)$")
     default_agent_ids: list[str] = Field(default_factory=list, max_length=64)
     log_level: str = Field(default="warning", pattern=r"^(warning|error)$")
     hermes_enabled: bool = True
@@ -1680,6 +1683,34 @@ class SystemSettingsRequest(BaseModel):
 
 class SystemSettingsResponse(SystemSettingsRequest):
     pass
+
+
+class ExecutionBackendResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^(systemd|docker)$")
+    name: str
+    adapter: str
+    description: str
+    isolation: str
+    cost: str
+    available: bool
+    reason: str | None
+    supported_sandbox_profiles: tuple[str, ...]
+
+    @classmethod
+    def from_status(cls, status: ExecutionBackendStatus) -> ExecutionBackendResponse:
+        return cls(
+            id=status.id,
+            name=status.name,
+            adapter=status.adapter,
+            description=status.description,
+            isolation=status.isolation,
+            cost=status.cost,
+            available=status.available,
+            reason=status.reason,
+            supported_sandbox_profiles=status.supported_sandbox_profiles,
+        )
 
 
 _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
@@ -12619,6 +12650,7 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
         "workspace_artifacts_path",
         "sandbox_profile",
         "sandbox_permission_policy",
+        "execution_backend",
     ):
         value = routing_decision.get(key)
         if isinstance(value, str) and value:
@@ -13225,8 +13257,21 @@ async def get_settings(
     return _settings_with_runtime_status(await service.get_settings(), request)
 
 
+@router.get(
+    "/execution-backends",
+    response_model=tuple[ExecutionBackendResponse, ...],
+    responses=error_responses(401, 403, 422),
+)
+async def list_execution_backends(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> tuple[ExecutionBackendResponse, ...]:
+    _require(principal, "config:read")
+    statuses = await asyncio.to_thread(probe_execution_backends)
+    return tuple(ExecutionBackendResponse.from_status(item) for item in statuses)
+
+
 @router.put(
-    "/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422)
+    "/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 409, 422)
 )
 async def update_settings(
     body: SystemSettingsRequest,
@@ -13235,6 +13280,21 @@ async def update_settings(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
+    current = await service.get_settings()
+    if body.default_execution_backend != current.default_execution_backend:
+        statuses = await asyncio.to_thread(probe_execution_backends)
+        selected = next(
+            (item for item in statuses if item.id == body.default_execution_backend),
+            None,
+        )
+        if selected is None or not selected.available:
+            reason = selected.reason if selected is not None else "backend_not_registered"
+            raise PublicAPIError(
+                409,
+                "execution_backend_unavailable",
+                "execution backend is unavailable",
+                details={"backend": body.default_execution_backend, "reason": reason or "unknown"},
+            )
     return _settings_with_runtime_status(await service.update_settings(body), request)
 
 

@@ -33,13 +33,21 @@ class StubAuthService:
 @dataclass(slots=True)
 class StubSettingsService:
     vibe_coding_enabled: bool = False
+    default_execution_backend: str = "systemd"
     audit_events: list[dict[str, object]] = field(default_factory=list)
     download_path: Path | None = None
     download_filename: str = "artifact.zip"
     download_mime_type: str = "application/zip"
 
     async def get_settings(self) -> object:
-        return type("Settings", (), {"vibe_coding_enabled": self.vibe_coding_enabled})()
+        return type(
+            "Settings",
+            (),
+            {
+                "vibe_coding_enabled": self.vibe_coding_enabled,
+                "default_execution_backend": self.default_execution_backend,
+            },
+        )()
 
     async def record_audit_event(
         self,
@@ -129,6 +137,7 @@ class StubRunService:
         project_label: str | None = None,
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
+        execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
         idempotency_key: str | None = None,
@@ -152,6 +161,7 @@ class StubRunService:
                 "project_label": project_label,
                 "workspace_session_id": workspace_session_id,
                 "sandbox_profile": sandbox_profile,
+                "execution_backend": execution_backend,
                 "requested_permissions": requested_permissions,
             }
         )
@@ -185,6 +195,7 @@ class StubRunService:
                 project_label=project_label,
                 workspace_session_id=workspace_session_id,
                 sandbox_profile=sandbox_profile,
+                execution_backend=execution_backend,
                 requested_permissions=requested_permissions,
                 evolution_proposal={
                     "kind": "skill_optimization",
@@ -225,6 +236,7 @@ class StubRunService:
                 project_label=project_label,
                 workspace_session_id=workspace_session_id,
                 sandbox_profile=sandbox_profile,
+                execution_backend=execution_backend,
                 requested_permissions=requested_permissions,
                 evolution_proposal={
                     "kind": "skill_distillation",
@@ -265,6 +277,7 @@ class StubRunService:
                 project_label=project_label,
                 workspace_session_id=workspace_session_id,
                 sandbox_profile=sandbox_profile,
+                execution_backend=execution_backend,
                 requested_permissions=requested_permissions,
                 openclaw_proposal={
                     "kind": "server_command",
@@ -298,6 +311,7 @@ class StubRunService:
             project_label=project_label,
             workspace_session_id=workspace_session_id,
             sandbox_profile=sandbox_profile,
+            execution_backend=execution_backend,
             requested_permissions=requested_permissions,
         )
 
@@ -672,19 +686,116 @@ def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
     assert payload["project_label"] == "魔方 Agent"
     assert payload["workspace_session_id"] == "Conv Workspace 01"
     assert payload["sandbox_profile"] == "workspace_write"
+    assert payload["execution_backend"] == "systemd"
     assert payload["requested_permissions"] == ["workspace.read", "workspace.write"]
     assert service.workspace_contexts[-1] == {
         "project_id": "Mofang Agent",
         "project_label": "魔方 Agent",
         "workspace_session_id": "Conv Workspace 01",
         "sandbox_profile": "workspace_write",
+        "execution_backend": "systemd",
         "requested_permissions": ("workspace.read", "workspace.write"),
     }
     details = cast(dict[str, object], settings.audit_events[-1]["details"])
     assert details["project_id"] == "Mofang Agent"
     assert details["workspace_session_id"] == "Conv Workspace 01"
     assert details["sandbox_profile"] == "workspace_write"
+    assert details["execution_backend"] == "systemd"
     assert details["requested_permissions"] == ["workspace.read", "workspace.write"]
+
+
+def test_run_submission_persists_selected_execution_backend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
+        lambda backend, sandbox_profile=None: None,
+    )
+    settings = StubSettingsService()
+    client, service, _ = _client(settings_service=settings)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "在容器隔离中运行已安装技能",
+            "mode": "dispatch",
+            "execution_backend": "docker",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["execution_backend"] == "docker"
+    assert service.workspace_contexts[-1]["execution_backend"] == "docker"
+    details = cast(dict[str, object], settings.audit_events[-1]["details"])
+    assert details["execution_backend"] == "docker"
+
+
+def test_run_submission_uses_tenant_default_execution_backend_when_omitted(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
+        lambda backend, sandbox_profile=None: None,
+    )
+    settings = StubSettingsService(default_execution_backend="docker")
+    client, service, _ = _client(settings_service=settings)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "使用租户默认执行器", "mode": "dispatch"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["execution_backend"] == "docker"
+    assert service.workspace_contexts[-1]["execution_backend"] == "docker"
+
+
+def test_run_submission_rejects_unavailable_execution_backend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
+        lambda backend, sandbox_profile=None: (
+            "docker_runner_image_not_found" if backend == "docker" else None
+        ),
+        raising=False,
+    )
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "尝试在未安装运行镜像的后端执行",
+            "mode": "dispatch",
+            "execution_backend": "docker",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "execution_backend_unavailable"
+    assert service.workspace_contexts == []
+
+
+def test_run_submission_rejects_backend_sandbox_profile_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_hub.api.routers.runs.execution_backend_unavailable_reason",
+        lambda backend, sandbox_profile=None: (
+            "sandbox_profile_not_supported" if sandbox_profile == "none" else None
+        ),
+    )
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "使用不兼容权限配置",
+            "mode": "dispatch",
+            "execution_backend": "systemd",
+            "sandbox_profile": "none",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["details"]["reason"] == "sandbox_profile_not_supported"
+    assert service.workspace_contexts == []
 
 
 def test_run_submission_forwards_explicit_runtime_timeout() -> None:

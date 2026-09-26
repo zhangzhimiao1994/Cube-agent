@@ -7,12 +7,14 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 JsonValue = object
 _EXECUTION_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+SandboxProfile = Literal["none", "read_only", "restricted", "workspace_write"]
+SANDBOX_PROFILES = frozenset({"none", "read_only", "restricted", "workspace_write"})
 
 
 class SkillInvocation(BaseModel):
@@ -26,6 +28,7 @@ class SkillInvocation(BaseModel):
     output_limit_bytes: int = Field(ge=1, le=10_000_000)
     memory_limit_bytes: int = Field(ge=16 * 1024 * 1024, le=16 * 1024 * 1024 * 1024)
     cpu_quota_percent: int = Field(ge=1, le=1000)
+    sandbox_profile: SandboxProfile = "workspace_write"
     network_allowlist: tuple[str, ...] = Field(default_factory=tuple)
     read_only_inputs: tuple[Path, ...] = Field(default_factory=tuple)
     writable_tmp_path: Path

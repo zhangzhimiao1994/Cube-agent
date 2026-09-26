@@ -106,6 +106,8 @@ def build_systemd_run_command(
         "-E",
         f"AGENT_HUB_OUTPUT_LIMIT_BYTES={invocation.output_limit_bytes}",
         "-E",
+        f"AGENT_HUB_SANDBOX_PROFILE={invocation.sandbox_profile}",
+        "-E",
         f"AGENT_HUB_WORKDIR={_path_arg(invocation.writable_tmp_path)}",
         "-E",
         f"AGENT_HUB_TIMEOUT_SECONDS={invocation.timeout_seconds}",

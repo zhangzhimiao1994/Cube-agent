@@ -88,6 +88,10 @@ export function ConfigPage() {
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
+  const executionBackendsQuery = useQuery({
+    queryKey: ["execution-backends"],
+    queryFn: () => api.executionBackends(),
+  });
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -166,6 +170,7 @@ export function ConfigPage() {
 
   const agents = agentsQuery.data ?? [];
   const workflows = workflowsQuery.data ?? [];
+  const executionBackends = executionBackendsQuery.data ?? [];
   const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
   const agentCount = document?.agents.length || agents.length;
 
@@ -236,6 +241,7 @@ export function ConfigPage() {
 
       <div {...navTargetProps("workflows", "settings-shortcuts")}>
         <Link className="settings-shortcut-card" to="/models">配置模型与 API Key</Link>
+        <Link className="settings-shortcut-card" to="/execution-environments">查看执行环境</Link>
         <Link className="settings-shortcut-card" to="/openclaw">配置 OpenClaw</Link>
         <Link className="settings-shortcut-card" to="/agents">配置 Agent 角色</Link>
         <Link className="settings-shortcut-card" to="/workflows">配置工作流</Link>
@@ -274,6 +280,38 @@ export function ConfigPage() {
                 </option>
               ))}
             </select>
+          </label>
+          <label htmlFor="default-execution-backend">
+            默认执行环境
+            <select
+              id="default-execution-backend"
+              aria-label="默认执行环境"
+              value={settings.default_execution_backend}
+              disabled={executionBackendsQuery.isLoading || executionBackendsQuery.isError}
+              onChange={(event) =>
+                updateSettings({
+                  default_execution_backend: event.target.value as SystemSettings["default_execution_backend"],
+                })
+              }
+            >
+              {executionBackends.length === 0 ? (
+                <option value={settings.default_execution_backend}>{settings.default_execution_backend}</option>
+              ) : null}
+              {executionBackends.map((backend) => (
+                <option key={backend.id} value={backend.id} disabled={!backend.available}>
+                  {backend.name}{backend.available ? "" : "（不可用）"}
+                </option>
+              ))}
+            </select>
+            {executionBackendsQuery.isError ? (
+              <span className="field-help" role="alert">
+                {formatApiError(executionBackendsQuery.error, "执行环境探测失败")}。其他设置仍可正常使用。
+              </span>
+            ) : executionBackendsQuery.isLoading ? (
+              <span className="field-help">正在探测执行环境，其他设置可正常使用。</span>
+            ) : (
+              <span className="field-help">仅列出已真实接入的执行器；不可用环境不能作为新默认值。</span>
+            )}
           </label>
           <label htmlFor="log-level">
             日志收集等级

@@ -42,6 +42,7 @@ class RecordingRunService:
         conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
+        execution_backend: str = "systemd",
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         self.calls.append(
@@ -55,6 +56,7 @@ class RecordingRunService:
                 "conversation_id": conversation_id,
                 "channel_context": channel_context,
                 "vibe_coding": vibe_coding,
+                "execution_backend": execution_backend,
                 "idempotency_key": idempotency_key,
             }
         )
@@ -86,11 +88,20 @@ class RecordingRunService:
 @dataclass(frozen=True, slots=True)
 class StubSystemSettings:
     vibe_coding_enabled: bool = False
+    default_execution_backend: str = "systemd"
 
 
 class StubSettingsService:
-    def __init__(self, *, vibe_coding_enabled: bool) -> None:
-        self.settings = StubSystemSettings(vibe_coding_enabled=vibe_coding_enabled)
+    def __init__(
+        self,
+        *,
+        vibe_coding_enabled: bool = False,
+        default_execution_backend: str = "systemd",
+    ) -> None:
+        self.settings = StubSystemSettings(
+            vibe_coding_enabled=vibe_coding_enabled,
+            default_execution_backend=default_execution_backend,
+        )
 
     async def get_settings(self) -> StubSystemSettings:
         return self.settings
@@ -152,6 +163,19 @@ async def test_submitter_forwards_channel_text_to_main_agent_entry_with_attachme
     assert context["source_channel"] == "feishu"
     assert context["channel_entry_policy"] == "main_agent_decides"
     assert context["channel_message_id"] == "msg_1"
+
+
+async def test_submitter_uses_tenant_default_execution_backend() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(
+        run_service=run_service,
+        tenant_id=TENANT_ID,
+        settings_service=StubSettingsService(default_execution_backend="docker"),
+    )
+
+    await submitter.submit(_message("执行渠道任务"), idempotency_key="idem_backend")
+
+    assert run_service.calls[0]["execution_backend"] == "docker"
 
 
 async def test_submitter_uses_same_internal_conversation_for_same_channel_thread() -> None:

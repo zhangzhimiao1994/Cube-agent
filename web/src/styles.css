@@ -4918,6 +4918,35 @@ article:hover {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
+.execution-environment-grid {
+  margin: 1rem 0;
+}
+
+.execution-environment-card {
+  min-width: 0;
+}
+
+.execution-environment-heading {
+  align-items: start;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+}
+
+.execution-environment-heading h3 {
+  margin: 0.2rem 0 0;
+}
+
+.execution-environment-card .status-pill.success {
+  border-color: rgba(125, 255, 189, 0.45);
+  color: var(--success);
+}
+
+.execution-environment-card .status-pill.danger {
+  border-color: rgba(255, 118, 145, 0.45);
+  color: var(--danger);
+}
+
 .mini-card {
   background: rgba(3, 10, 20, 0.42);
   border: 1px solid var(--line);

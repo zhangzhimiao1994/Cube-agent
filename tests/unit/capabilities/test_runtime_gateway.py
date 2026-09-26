@@ -36,6 +36,22 @@ class FakeSandbox:
         del execution_id
 
 
+class UnavailableSandbox(FakeSandbox):
+    async def run(self, invocation: SkillInvocation) -> SkillResult:
+        raise FileNotFoundError(invocation.execution_id)
+
+
+class BackendFailureSandbox(FakeSandbox):
+    async def run(self, invocation: SkillInvocation) -> SkillResult:
+        self.invocations.append(invocation)
+        return SkillResult(
+            exit_code=125,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon",
+            timed_out=False,
+        )
+
+
 class FakeManifestSource:
     def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
         self.manifest = manifest
@@ -698,6 +714,141 @@ async def test_runtime_gateway_invokes_installed_skill_through_sandbox(tmp_path:
     assert len(sandbox.invocations) == 1
     assert sandbox.invocations[0].package_path == skill_dir / "docx.zip"
     assert sandbox.invocations[0].input["arguments"] == {"task": "draft"}
+
+
+async def test_runtime_gateway_uses_execution_backend_persisted_on_run(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    systemd = FakeSandbox()
+    docker = FakeSandbox()
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            execution_backend="docker",
+            sandbox_profile="read_only",
+        )
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+        skill_sandboxes={"systemd": systemd, "docker": docker},
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="writer",
+        name="docx",
+        arguments={"task": "draft"},
+        idempotency_key="skill_docker_1",
+    )
+
+    assert result["execution_backend"] == "docker"
+    assert systemd.invocations == []
+    assert len(docker.invocations) == 1
+    assert docker.invocations[0].sandbox_profile == "read_only"
+
+
+async def test_runtime_gateway_rejects_unknown_persisted_sandbox_profile(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    repository = FakeRunRepository(
+        stored_run(tenant=TENANT_ID, run=RUN_ID, sandbox_profile="unconfined")
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+        skill_sandboxes={"systemd": FakeSandbox(), "docker": FakeSandbox()},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="sandbox profile is not supported"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="writer",
+            name="docx",
+            arguments={"task": "draft"},
+            idempotency_key="skill_unknown_profile_1",
+        )
+
+
+async def test_runtime_gateway_rejects_unknown_persisted_execution_backend(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    repository = FakeRunRepository(
+        stored_run(tenant=TENANT_ID, run=RUN_ID, execution_backend="placeholder-cloud")
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+        skill_sandboxes={"systemd": FakeSandbox(), "docker": FakeSandbox()},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="execution backend is not supported"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="writer",
+            name="docx",
+            arguments={"task": "draft"},
+            idempotency_key="skill_unknown_1",
+        )
+
+
+async def test_runtime_gateway_reports_unavailable_selected_backend_without_leaking_os_error(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    repository = FakeRunRepository(
+        stored_run(tenant=TENANT_ID, run=RUN_ID, execution_backend="docker")
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+        skill_sandboxes={"systemd": FakeSandbox(), "docker": UnavailableSandbox()},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="execution backend is unavailable: docker"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="writer",
+            name="docx",
+            arguments={"task": "draft"},
+            idempotency_key="skill_unavailable_1",
+        )
+
+
+async def test_runtime_gateway_classifies_backend_process_failure_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    repository = FakeRunRepository(
+        stored_run(tenant=TENANT_ID, run=RUN_ID, execution_backend="docker")
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=repository,
+        skill_sandboxes={"systemd": FakeSandbox(), "docker": BackendFailureSandbox()},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="execution backend is unavailable: docker"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="writer",
+            name="docx",
+            arguments={"task": "draft"},
+            idempotency_key="skill_backend_failed_1",
+        )
 
 
 def test_runtime_gateway_is_available_matches_builtin_manifest_availability(

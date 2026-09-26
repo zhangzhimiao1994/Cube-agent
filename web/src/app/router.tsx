@@ -8,6 +8,7 @@ import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { ConfigPage } from "../pages/ConfigPage";
 import { EvolutionPage } from "../pages/EvolutionPage";
+import { ExecutionEnvironmentsPage } from "../pages/ExecutionEnvironmentsPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
@@ -51,6 +52,7 @@ export function AppRoutes() {
         ))}
         <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="evolution" element={<EvolutionPage />} />
+        <Route path="execution-environments" element={<ExecutionEnvironmentsPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />

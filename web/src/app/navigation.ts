@@ -170,6 +170,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         permission: "config:read",
         children: [
           { to: "/config?section=runtime", label: "运行默认值", permission: "config:read" },
+          { to: "/execution-environments", label: "执行环境", permission: "config:read" },
           { to: "/agents", label: "Agent 角色", permission: "agent:read" },
           { to: "/workflows?section=list", label: "工作流配置", permission: "agent:read" },
           { to: "/evolution", label: "进化任务", permission: "skill:read" },
@@ -182,6 +183,12 @@ export const MODULE_GROUPS: ModuleGroup[] = [
           { to: "/config?section=safety", label: "安全与学习", permission: "config:read" },
           { to: "/config?section=attachments", label: "附件存储", permission: "config:read" },
         ],
+      },
+      {
+        to: "/execution-environments",
+        label: "执行环境",
+        description: "查看 systemd、Docker 等已接入技能执行器的真实状态、隔离等级和可用原因。",
+        permission: "config:read",
       },
       {
         to: "/openclaw",

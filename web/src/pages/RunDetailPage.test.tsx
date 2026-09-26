@@ -228,6 +228,7 @@ const runDetail: RunDetail = {
   explicit_details: {
     selected_agent_ids: "writer",
     routing_reason: "workflow selected explicitly",
+    execution_backend: "docker",
   },
   failure_diagnostics: [],
   tool_lifecycle: [],
@@ -284,6 +285,12 @@ describe("RunDetailPage", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const routingArticle = screen
+      .getByRole("heading", { name: "模式、工作流与角色" })
+      .closest("article");
+    expect(routingArticle).not.toBeNull();
+    expect(within(routingArticle as HTMLElement).getByText("执行环境")).not.toBeNull();
+    expect(within(routingArticle as HTMLElement).getByText("docker")).not.toBeNull();
     expect(screen.queryByRole("status", { name: "模型结果摘要" })).toBeNull();
     expect(screen.queryByText(longArtifactText)).toBeNull();
     expect(screen.queryByText(rawPayloadOutput)).toBeNull();

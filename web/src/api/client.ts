@@ -251,6 +251,7 @@ const PluginPackageSubprocessRegistrationStatusSchema = z.enum([
 const SystemSettingsSchema = z.object({
   default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
   default_workflow_id: z.string().nullable(),
+  default_execution_backend: z.enum(["systemd", "docker"]).default("systemd"),
   default_agent_ids: z.array(z.string()),
   log_level: z.enum(["warning", "error"]),
   hermes_enabled: z.boolean(),
@@ -277,6 +278,20 @@ const SystemSettingsSchema = z.object({
 });
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
+
+const ExecutionBackendSchema = z.object({
+  id: z.enum(["systemd", "docker"]),
+  name: z.string(),
+  adapter: z.string(),
+  description: z.string(),
+  isolation: z.string(),
+  cost: z.string(),
+  available: z.boolean(),
+  reason: z.string().nullable(),
+  supported_sandbox_profiles: z.array(z.string()),
+});
+
+export type ExecutionBackend = z.infer<typeof ExecutionBackendSchema>;
 
 const OpenClawOperationRequestSchema = z.object({
   platform: z.enum(["linux", "windows", "macos"]),
@@ -658,6 +673,7 @@ const SubmittedRunSchema = z.object({
   workspace_session_path: z.string().nullable().optional(),
   workspace_artifacts_path: z.string().nullable().optional(),
   sandbox_profile: z.string().nullable().optional(),
+  execution_backend: z.enum(["systemd", "docker"]).default("systemd"),
   requested_permissions: z.array(z.string()).default([]),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
@@ -1997,6 +2013,13 @@ export const api = {
   settings(): Promise<SystemSettings> {
     return request("/api/v1/admin/settings", { method: "GET" }, SystemSettingsSchema);
   },
+  executionBackends(): Promise<ExecutionBackend[]> {
+    return request(
+      "/api/v1/admin/execution-backends",
+      { method: "GET" },
+      z.array(ExecutionBackendSchema),
+    );
+  },
   updateSettings(payload: SystemSettings): Promise<SystemSettings> {
     return request(
       "/api/v1/admin/settings",
@@ -2130,6 +2153,7 @@ export const api = {
     project_label?: string | null;
     workspace_session_id?: string | null;
     sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
+    execution_backend?: "systemd" | "docker";
     requested_permissions?: string[];
     attachment_ids?: string[];
     vibe_coding?: boolean;

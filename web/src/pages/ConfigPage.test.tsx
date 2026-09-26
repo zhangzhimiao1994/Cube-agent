@@ -13,6 +13,7 @@ const principal = {
 const settings = {
   default_mode: "auto",
   default_workflow_id: null,
+  default_execution_backend: "systemd",
   default_agent_ids: [],
   log_level: "warning",
   hermes_enabled: true,
@@ -48,11 +49,13 @@ describe("ConfigPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let openClawSessions: Array<Record<string, unknown>> = [];
   let lastOpenClawOperationBody: Record<string, unknown> = {};
+  let executionBackendsShouldFail = false;
 
   beforeEach(() => {
     requests.length = 0;
     openClawSessions = [];
     lastOpenClawOperationBody = {};
+    executionBackendsShouldFail = false;
     currentSettings = { ...settings };
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -69,6 +72,38 @@ describe("ConfigPage", () => {
         if (path === "/api/v1/admin/settings") {
           if (method === "PUT") return jsonResponse(JSON.parse(String(init?.body)));
           return jsonResponse(currentSettings);
+        }
+        if (path === "/api/v1/admin/execution-backends") {
+          if (executionBackendsShouldFail) {
+            return jsonResponse(
+              { error: { code: "execution_backend_probe_failed", message: "probe unavailable" } },
+              { status: 503 },
+            );
+          }
+          return jsonResponse([
+            {
+              id: "systemd",
+              name: "本机 systemd 隔离",
+              adapter: "SystemdSkillSandbox",
+              description: "在当前 Linux 服务器上通过 systemd transient unit 运行技能。",
+              isolation: "DynamicUser + 只读系统 + 私有网络",
+              cost: "本机资源",
+              available: true,
+              reason: null,
+              supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+            },
+            {
+              id: "docker",
+              name: "Docker 容器隔离",
+              adapter: "DockerSkillSandbox",
+              description: "在临时容器中运行技能。",
+              isolation: "容器隔离",
+              cost: "本机容器资源",
+              available: false,
+              reason: "docker_cli_not_found",
+              supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+            },
+          ]);
         }
         if (path === "/api/v1/admin/openclaw/operations" && method === "POST") {
           const body = JSON.parse(String(init?.body));
@@ -289,7 +324,8 @@ describe("ConfigPage", () => {
     expect(screen.getByText("版本 3")).not.toBeNull();
     expect(screen.queryByText("Vibe Coding")).toBeNull();
     expect(screen.queryByTestId("vibe-coding-toggle")).toBeNull();
-    expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(6);
+    expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(7);
+    expect(screen.getByLabelText(/^默认执行环境/)).not.toBeNull();
 
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
     await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");
@@ -319,6 +355,30 @@ describe("ConfigPage", () => {
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });
+  });
+
+  it("keeps other system settings available when execution backend probing fails", async () => {
+    executionBackendsShouldFail = true;
+    render(<TestApp initialPath="/config" />);
+
+    expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
+    expect(screen.getByLabelText("默认运行模式")).not.toBeNull();
+    expect((screen.getByRole("button", { name: "保存系统设置" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByLabelText("默认执行环境") as HTMLSelectElement).disabled).toBe(true);
+    expect(screen.getByText(/执行环境探测失败/)).not.toBeNull();
+    expect(screen.getByText(/其他设置仍可正常使用/)).not.toBeNull();
+  });
+
+  it("shows only real backend adapters and explains unavailable environments", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/execution-environments" />);
+
+    expect(await screen.findByRole("heading", { name: "执行环境" })).not.toBeNull();
+    expect(screen.getByText("本机 systemd 隔离")).not.toBeNull();
+    expect(screen.getByText("Docker 容器隔离")).not.toBeNull();
+    expect(screen.getByText("服务器未安装 Docker CLI。")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "重新探测" }));
+    await waitFor(() => expect(screen.getByText("当前可用")).not.toBeNull());
   });
 
   it("shows package subprocess registration status as runtime state", async () => {

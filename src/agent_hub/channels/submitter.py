@@ -45,6 +45,7 @@ class RunSubmissionService(Protocol):
         conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
+        execution_backend: str = "systemd",
         idempotency_key: str | None = None,
     ) -> SubmittedRunLike: ...
 
@@ -81,6 +82,7 @@ class RunServiceInboundSubmitter:
         hints = parse_channel_resource_hints(task_text)
         attachment_ids = _agent_hub_attachment_ids(message)
         task_text = _message_with_attachment_manifest(task_text, message)
+        execution_backend = await _default_execution_backend(self.settings_service)
         submitted = await self.run_service.submit(
             tenant_id=self.tenant_id,
             actor_id=actor_id,
@@ -91,9 +93,21 @@ class RunServiceInboundSubmitter:
             conversation_id=conversation_id,
             channel_context=_channel_context(message, hints=hints),
             vibe_coding=False,
+            execution_backend=execution_backend,
             idempotency_key=idempotency_key,
         )
         return submitted.id
+
+
+async def _default_execution_backend(settings_service: ChannelSettingsService | None) -> str:
+    if settings_service is None:
+        return "systemd"
+    try:
+        settings = await settings_service.get_settings()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return "systemd"
+    configured = getattr(settings, "default_execution_backend", "systemd")
+    return configured if configured in {"systemd", "docker"} else "systemd"
 
 
 def _numeric_choice_key(text: str) -> str | None:

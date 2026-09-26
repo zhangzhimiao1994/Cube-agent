@@ -60,12 +60,29 @@ def test_skill_runner_rejects_runtime_dependency_install() -> None:
     assert "dependencies are not installed" in result.stderr
 
 
+def test_skill_runner_rejects_unknown_sandbox_profile() -> None:
+    with _workspace_tmpdir() as tmp_path:
+        package = _skill_zip(tmp_path)
+
+        result = _run_runner(
+            package,
+            tmp_path,
+            input_text="{}",
+            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+            sandbox_profile="unconfined",
+        )
+
+    assert result.returncode == 78
+    assert "sandbox profile" in result.stderr
+
+
 def _run_runner(
     package: Path,
     tmp_path: Path,
     *,
     input_text: str,
     sha256: str,
+    sandbox_profile: str = "workspace_write",
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(
@@ -73,6 +90,7 @@ def _run_runner(
         AGENT_HUB_PACKAGE_SHA256=sha256,
         AGENT_HUB_WORKDIR=str(tmp_path / "work"),
         AGENT_HUB_TIMEOUT_SECONDS="5",
+        AGENT_HUB_SANDBOX_PROFILE=sandbox_profile,
         PYTHONPATH=str(Path.cwd() / "src"),
     )
     return subprocess.run(

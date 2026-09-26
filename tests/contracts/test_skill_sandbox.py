@@ -33,6 +33,7 @@ def invocation(**changes: object) -> SkillInvocation:
         "output_limit_bytes": 1024,
         "memory_limit_bytes": 128 * 1024 * 1024,
         "cpu_quota_percent": 50,
+        "sandbox_profile": "read_only",
         "network_allowlist": (),
         "read_only_inputs": (Path("/srv/agent-hub/input.txt"),),
         "writable_tmp_path": Path("/srv/agent-hub/tmp/exec_1"),
@@ -74,6 +75,7 @@ def test_docker_command_enforces_default_hardening_and_no_network() -> None:
     assert _value_after(command, "--memory") == str(128 * 1024 * 1024)
     assert _value_after(command, "--cpus") == "0.5"
     assert _value_after(command, "--network") == "none"
+    assert "AGENT_HUB_SANDBOX_PROFILE=read_only" in _environment_values(command, flag="--env")
     assert _value_after(command, "--workdir") == "/workspace"
     assert all("docker.sock" not in part for part in command)
     assert any("target=/package/skill.zip,readonly" in part for part in command)
@@ -134,6 +136,7 @@ def test_systemd_command_enforces_process_filesystem_and_network_restrictions() 
     assert properties["ReadWritePaths"] == "/srv/agent-hub/tmp/exec_1"
     assert properties["WorkingDirectory"] == "/srv/agent-hub/tmp/exec_1"
     assert "PYTHONPATH=/opt/agent-hub/current/src" in _environment_values(command)
+    assert "AGENT_HUB_SANDBOX_PROFILE=read_only" in _environment_values(command)
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/packages/pkg.zip" for item in _property_values(command))
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/input.txt" for item in _property_values(command))
     assert command[-3:] == (
@@ -177,8 +180,8 @@ def test_systemd_terminate_command_targets_unit_without_shell() -> None:
         build_systemd_terminate_command("../escape")
 
 
-def _environment_values(command: tuple[str, ...]) -> list[str]:
-    return [command[index + 1] for index, value in enumerate(command) if value == "-E"]
+def _environment_values(command: tuple[str, ...], *, flag: str = "-E") -> list[str]:
+    return [command[index + 1] for index, value in enumerate(command) if value == flag]
 
 
 def _value_after(command: tuple[str, ...], flag: str) -> str:

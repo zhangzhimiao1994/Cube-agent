@@ -1575,6 +1575,7 @@ async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> 
     if run_service is None or not hasattr(run_service, "submit"):
         raise RuntimeError("run service is unavailable")
     metadata = {str(key): str(value) for key, value in request.metadata.items()}
+    execution_backend = await _scheduled_task_execution_backend(application, request.tenant_id)
     return await cast(Any, run_service).submit(
         tenant_id=request.tenant_id,
         actor_id=request.actor_id,
@@ -1583,8 +1584,25 @@ async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> 
         mode=request.mode,
         workflow_id=request.workflow,
         channel_context=metadata,
+        execution_backend=execution_backend,
         idempotency_key=request.idempotency_key,
     )
+
+
+async def _scheduled_task_execution_backend(application: FastAPI, tenant_id: UUID) -> str:
+    service = getattr(application.state, "admin_resource_service", None)
+    if service is None or not hasattr(service, "get_settings"):
+        return "systemd"
+    try:
+        get_settings = _admin_settings_getter_for_tenant(
+            cast(admin.AdminResourceService, service),
+            tenant_id,
+        )
+        settings = await get_settings()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return "systemd"
+    configured = settings.default_execution_backend
+    return configured if configured in {"systemd", "docker"} else "systemd"
 
 
 async def _channel_runtime_config_from_request(request: Request) -> Mapping[str, str]:

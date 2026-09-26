@@ -32,7 +32,13 @@ from agent_hub.files.generated import (
 from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.project_preflight import build_project_preflight_files
 from agent_hub.runtime.contracts import JsonValue
-from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
+from agent_hub.skills.sandbox.base import (
+    SANDBOX_PROFILES,
+    SandboxProfile,
+    SkillInvocation,
+    SkillSandbox,
+)
+from agent_hub.skills.sandbox.docker import DockerSkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
@@ -106,6 +112,7 @@ class RuntimeCapabilityGateway:
         project_workspace_dir: Path | None = None,
         run_repository: object | None = None,
         skill_sandbox: SkillSandbox | None = None,
+        skill_sandboxes: Mapping[str, SkillSandbox] | None = None,
         calculator: Calculator | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
     ) -> None:
@@ -121,7 +128,17 @@ class RuntimeCapabilityGateway:
             if project_workspace_dir is not None
             else None
         )
-        self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
+        if skill_sandbox is not None and skill_sandboxes is not None:
+            raise ValueError("configure skill_sandbox or skill_sandboxes, not both")
+        if skill_sandboxes is not None:
+            self._skill_sandboxes = dict(skill_sandboxes)
+        elif skill_sandbox is not None:
+            self._skill_sandboxes = {"systemd": skill_sandbox}
+        else:
+            self._skill_sandboxes = {
+                "systemd": SystemdSkillSandbox(),
+                "docker": DockerSkillSandbox(),
+            }
         self._calculator = calculator or Calculator()
         self._tool_registry = tool_registry
         self._tenant_id = tenant_id
@@ -541,36 +558,86 @@ class RuntimeCapabilityGateway:
         writable_tmp_path = self._skill_store_dir / str(tenant_id) / "tmp" / execution_id
         writable_tmp_path.mkdir(parents=True, exist_ok=True)
         try:
-            result = await self._skill_sandbox.run(
-                SkillInvocation(
-                    execution_id=execution_id,
-                    package_path=package_path,
-                    package_sha256=package_sha256,
-                    input={
-                        "run_id": str(run_id),
-                        "actor": actor,
-                        "skill": skill_id,
-                        "arguments": _json_dict(arguments),
-                    },
-                    timeout_seconds=300,
-                    output_limit_bytes=1_000_000,
-                    memory_limit_bytes=512 * 1024 * 1024,
-                    cpu_quota_percent=100,
-                    writable_tmp_path=writable_tmp_path,
-                )
+            execution_backend, sandbox_profile, sandbox = await self._skill_sandbox_for_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
             )
+            try:
+                result = await sandbox.run(
+                    SkillInvocation(
+                        execution_id=execution_id,
+                        package_path=package_path,
+                        package_sha256=package_sha256,
+                        input={
+                            "run_id": str(run_id),
+                            "actor": actor,
+                            "skill": skill_id,
+                            "arguments": _json_dict(arguments),
+                        },
+                        timeout_seconds=300,
+                        output_limit_bytes=1_000_000,
+                        memory_limit_bytes=512 * 1024 * 1024,
+                        cpu_quota_percent=100,
+                        sandbox_profile=sandbox_profile,
+                        writable_tmp_path=writable_tmp_path,
+                    )
+                )
+            except OSError:
+                raise RuntimeCapabilityError(
+                    f"execution backend is unavailable: {execution_backend}"
+                ) from None
         finally:
             shutil.rmtree(writable_tmp_path, ignore_errors=True)
         if result.timed_out:
             raise RuntimeCapabilityError("skill execution timed out")
         if result.exit_code != 0:
+            if _backend_process_unavailable(execution_backend, result.stderr):
+                raise RuntimeCapabilityError(
+                    f"execution backend is unavailable: {execution_backend}"
+                )
             raise RuntimeCapabilityError("skill execution failed")
         parsed = _parse_stdout(result.stdout)
         return {
+            "execution_backend": execution_backend,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "result": parsed,
         }
+
+    async def _skill_sandbox_for_run(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> tuple[str, SandboxProfile, SkillSandbox]:
+        execution_backend = "systemd"
+        sandbox_profile: SandboxProfile = "workspace_write"
+        if self._run_repository is not None:
+            getter = getattr(self._run_repository, "get", None)
+            if not callable(getter):
+                raise RuntimeCapabilityError("run repository cannot resolve execution backend")
+            try:
+                record = await getter(tenant_id, run_id)
+            except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+                raise RuntimeCapabilityError("run execution backend could not be resolved") from error
+            routing_decision = getattr(record, "routing_decision", None)
+            if not isinstance(routing_decision, Mapping):
+                raise RuntimeCapabilityError("run execution backend could not be resolved")
+            configured_backend = routing_decision.get("execution_backend", "systemd")
+            if not isinstance(configured_backend, str):
+                raise RuntimeCapabilityError("execution backend is not supported")
+            execution_backend = configured_backend.strip().casefold()
+            configured_profile = routing_decision.get("sandbox_profile", "workspace_write")
+            if not isinstance(configured_profile, str):
+                raise RuntimeCapabilityError("sandbox profile is not supported")
+            normalized_profile = configured_profile.strip().casefold()
+            if normalized_profile not in SANDBOX_PROFILES:
+                raise RuntimeCapabilityError("sandbox profile is not supported")
+            sandbox_profile = cast(SandboxProfile, normalized_profile)
+        sandbox = self._skill_sandboxes.get(execution_backend)
+        if sandbox is None:
+            raise RuntimeCapabilityError("execution backend is not supported")
+        return execution_backend, sandbox_profile, sandbox
 
     def _skill_package_path(self, tenant_id: UUID, skill_id: str) -> Path:
         root = (self._skill_store_dir / str(tenant_id)).resolve()
@@ -1172,6 +1239,32 @@ def _file_result(
 def _execution_id(actor: str, skill_id: str, idempotency_key: str) -> str:
     digest = hashlib.sha256(f"{actor}:{skill_id}:{idempotency_key}".encode()).hexdigest()[:24]
     return f"skill_{digest}"
+
+
+def _backend_process_unavailable(execution_backend: str, stderr: str) -> bool:
+    normalized = stderr.casefold()
+    if execution_backend == "docker":
+        return any(
+            marker in normalized
+            for marker in (
+                "cannot connect to the docker daemon",
+                "error during connect",
+                "no such image",
+                "unable to find image",
+                "network agent-hub-skill-net not found",
+            )
+        )
+    if execution_backend == "systemd":
+        return any(
+            marker in normalized
+            for marker in (
+                "failed to connect to bus",
+                "access denied",
+                "authentication is required",
+                "failed to start transient service unit",
+            )
+        )
+    return False
 
 
 def _json_dict(value: Mapping[str, JsonValue]) -> dict[str, object]:

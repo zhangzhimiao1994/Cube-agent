@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -25,6 +26,7 @@ from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.execution_backends import execution_backend_unavailable_reason
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
@@ -85,6 +87,7 @@ class RunServiceProtocol(Protocol):
         project_label: str | None = None,
         workspace_session_id: str | None = None,
         sandbox_profile: str | None = None,
+        execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
         idempotency_key: str | None = None,
@@ -210,6 +213,7 @@ class CreateRunRequest(BaseModel):
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
     sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
+    execution_backend: Literal["systemd", "docker"] | None = None
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     runtime_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
 
@@ -325,6 +329,7 @@ class SubmittedRunResponse(BaseModel):
     workspace_session_path: str | None = None
     workspace_artifacts_path: str | None = None
     sandbox_profile: str | None = None
+    execution_backend: str = "systemd"
     requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
@@ -351,6 +356,7 @@ class SubmittedRunResponse(BaseModel):
             workspace_session_path=run.workspace_session_path,
             workspace_artifacts_path=run.workspace_artifacts_path,
             sandbox_profile=run.sandbox_profile,
+            execution_backend=run.execution_backend,
             requested_permissions=run.requested_permissions,
             temporary_agent_proposal=run.temporary_agent_proposal,
             schedule_proposal=run.schedule_proposal,
@@ -480,6 +486,18 @@ async def _vibe_coding_enabled(request: Request) -> bool:
     return getattr(settings, "vibe_coding_enabled", False) is True
 
 
+async def _default_execution_backend(request: Request) -> str:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    if service is None or not hasattr(service, "get_settings"):
+        return "systemd"
+    try:
+        settings = await service.get_settings()
+    except (AttributeError, RuntimeError, TypeError, ValueError, SQLAlchemyError):
+        return "systemd"
+    configured = getattr(settings, "default_execution_backend", "systemd")
+    return configured if configured in {"systemd", "docker"} else "systemd"
+
+
 async def _record_run_submit_audit(
     request: Request,
     principal: AuthenticatedPrincipal,
@@ -508,6 +526,7 @@ async def _record_run_submit_audit(
         "project_label": submitted.project_label,
         "workspace_session_id": submitted.workspace_session_id,
         "sandbox_profile": submitted.sandbox_profile,
+        "execution_backend": submitted.execution_backend,
         "requested_permissions": list(submitted.requested_permissions),
         "attachment_count": len(body.attachment_ids),
         "message_preview": preview,
@@ -935,6 +954,23 @@ async def create_run(
             "Vibe Coding is disabled in system settings",
         )
     try:
+        execution_backend = body.execution_backend or await _default_execution_backend(request)
+        if body.execution_backend is not None:
+            unavailable_reason = await asyncio.to_thread(
+                execution_backend_unavailable_reason,
+                execution_backend,
+                body.sandbox_profile,
+            )
+            if unavailable_reason is not None:
+                raise PublicAPIError(
+                    409,
+                    "execution_backend_unavailable",
+                    "execution backend is unavailable",
+                    details={
+                        "backend": execution_backend,
+                        "reason": unavailable_reason,
+                    },
+                )
         submitted = await service.submit(
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
@@ -954,6 +990,7 @@ async def create_run(
             project_label=body.project_label,
             workspace_session_id=body.workspace_session_id,
             sandbox_profile=body.sandbox_profile,
+            execution_backend=execution_backend,
             requested_permissions=body.requested_permissions,
             runtime_timeout_seconds=body.runtime_timeout_seconds,
             idempotency_key=idempotency_key,

@@ -17,6 +17,7 @@ from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 _DEFAULT_PACKAGE_PATH = Path("/package/skill.zip")
 _DEFAULT_WORKDIR = Path("/workspace")
 _DEPENDENCY_FILES = frozenset({"requirements.txt", "requirements.lock", "dependencies.lock"})
+_SANDBOX_PROFILES = frozenset({"none", "read_only", "restricted", "workspace_write"})
 
 
 class SkillRunnerError(RuntimeError):
@@ -28,9 +29,12 @@ def run_skill_from_environment() -> int:
     expected_sha256 = os.environ.get("AGENT_HUB_PACKAGE_SHA256", "")
     workdir = Path(os.environ.get("AGENT_HUB_WORKDIR", str(_DEFAULT_WORKDIR)))
     timeout_seconds = _int_env("AGENT_HUB_TIMEOUT_SECONDS", default=300)
+    sandbox_profile = os.environ.get("AGENT_HUB_SANDBOX_PROFILE", "workspace_write")
 
     stdin_bytes = sys.stdin.buffer.read()
     try:
+        if sandbox_profile not in _SANDBOX_PROFILES:
+            raise SkillRunnerError("sandbox profile is not supported")
         _validate_json_stdin(stdin_bytes)
         archive_bytes = package_path.read_bytes()
         actual_sha256 = hashlib.sha256(archive_bytes).hexdigest()
