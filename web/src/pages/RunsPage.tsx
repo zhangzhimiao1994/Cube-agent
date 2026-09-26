@@ -2954,7 +2954,7 @@ export function ConversationCheckpointNav({
           />
         </label>
       </div>
-      <div>
+      <div className="conversation-checkpoint-list">
         {visibleCheckpoints.length === 0 ? (
           <small className="conversation-checkpoints-empty">没有匹配的检查点</small>
         ) : (

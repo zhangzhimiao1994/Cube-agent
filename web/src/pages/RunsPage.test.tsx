@@ -377,9 +377,12 @@ describe("conversation ordering", () => {
       href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
     });
 
-    render(<ConversationCheckpointNav checkpoints={checkpoints} conversationId="conv-checkpoints" />);
+    const { container } = render(
+      <ConversationCheckpointNav checkpoints={checkpoints} conversationId="conv-checkpoints" />,
+    );
 
     expect(screen.getByRole("searchbox", { name: "搜索对话检查点" })).not.toBeNull();
+    expect(container.querySelector(".conversation-checkpoint-list")).not.toBeNull();
     expect(screen.getByText("产物 1")).not.toBeNull();
 
     await userEvent.click(screen.getByText("产物 1"));

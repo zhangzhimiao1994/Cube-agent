@@ -6809,7 +6809,7 @@ describe("operational management pages", () => {
     const conversationOpenButton = screen.getByRole("button", { name: conversationOpenButtonName });
     expect(conversationOpenButton).not.toBeNull();
     expect(conversationOpenButton.querySelector(".conversation-title-text")?.textContent).toBe(conversationHistoryTitle);
-    expect(screen.getByText("全选可删")).not.toBeNull();
+    expect(screen.getByText("全选当前结果")).not.toBeNull();
     expect(screen.getByRole("button", { name: /批量删除已选会话 0 条/ })).not.toBeNull();
     expect(screen.getByText("删除已选（0）")).not.toBeNull();
     expect(screen.getByText(conversationHistoryTitle)).not.toBeNull();

@@ -1678,7 +1678,7 @@ article:hover {
   width: 100%;
 }
 
-.conversation-checkpoints > div {
+.conversation-checkpoint-list {
   display: flex;
   gap: 0.35rem;
   min-width: 0;
@@ -6254,7 +6254,7 @@ article:hover {
     max-width: none;
   }
 
-  .conversation-checkpoints > div {
+  .conversation-checkpoint-list {
     width: 100%;
   }
 
