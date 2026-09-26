@@ -3350,7 +3350,7 @@ article:hover {
 }
 
 .agent-recruitment-card p {
-  color: rgba(178, 194, 216, 0.78);
+  color: var(--muted);
   font-size: 0.78rem;
   font-weight: 760;
   line-height: 1.35;
@@ -3439,7 +3439,7 @@ article:hover {
 }
 
 .run-process-toggle small {
-  color: rgba(178, 194, 216, 0.72);
+  color: var(--muted);
 }
 
 .run-detail-process-summary {
@@ -3543,7 +3543,7 @@ article:hover {
 }
 
 .run-process-detail small {
-  color: rgba(178, 194, 216, 0.72);
+  color: var(--muted);
 }
 
 .process-detail-card-grid {
@@ -3582,15 +3582,15 @@ article:hover {
   background: rgba(123, 225, 255, 0.1);
   border: 1px solid rgba(123, 225, 255, 0.16);
   border-radius: 999px;
-  color: rgba(178, 194, 216, 0.82);
-  font-size: 0.68rem;
+  color: var(--muted);
+  font-size: 0.78rem;
   font-weight: 900;
   padding: 0.14rem 0.42rem;
   width: fit-content;
 }
 
 .process-detail-card strong {
-  color: rgba(178, 194, 216, 0.84);
+  color: var(--muted);
   font-size: 0.8rem;
   font-weight: 820;
   min-width: 0;
@@ -3680,7 +3680,7 @@ article:hover {
 }
 
 .process-detail-modal dt {
-  color: rgba(178, 194, 216, 0.72);
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 900;
 }
@@ -3813,7 +3813,7 @@ article:hover {
   color: var(--accent);
   display: inline-flex;
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  font-size: 0.64rem;
+  font-size: 0.78rem;
   font-weight: 950;
   height: 2rem;
   justify-content: center;
@@ -3839,9 +3839,10 @@ article:hover {
 .artifact-file-main small {
   background: transparent;
   border: 0;
-  color: rgba(178, 194, 216, 0.74);
-  font-size: 0.72rem;
+  color: var(--muted);
+  font-size: 0.78rem;
   font-weight: 800;
+  line-height: 1.45;
   overflow: hidden;
   padding: 0;
   text-overflow: ellipsis;
@@ -3871,9 +3872,15 @@ article:hover {
 }
 
 .artifact-file-meta span:not(:last-child)::after {
-  color: rgba(178, 194, 216, 0.44);
+  color: #94a3b8;
   content: "/";
   margin-left: 0.35rem;
+}
+
+.artifact-file-card > small[role="alert"] {
+  color: var(--danger);
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 .artifact-file-card button {
@@ -4152,8 +4159,9 @@ article:hover {
 
 .conversation-file-link small {
   color: #0f766e;
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   font-weight: 900;
+  line-height: 1.4;
 }
 
 .conversation-file-link strong,
@@ -4172,8 +4180,9 @@ article:hover {
 
 .conversation-file-link span {
   color: #64748b;
-  font-size: 0.76rem;
+  font-size: 0.78rem;
   font-weight: 800;
+  line-height: 1.4;
 }
 
 .conversation-files-header {
@@ -7207,6 +7216,70 @@ article:hover {
   border-color: rgba(148, 163, 184, 0.28);
   box-shadow: 0 -24px 80px rgba(15, 23, 42, 0.24);
   z-index: 61;
+}
+
+/* Light process surface semantic colors. */
+.process-drawer,
+.process-detail-modal,
+.agent-cluster-status,
+.agent-recruitment,
+.run-task-chain,
+.run-failure-diagnostics,
+.run-execution-intents,
+.process-intermediate-card,
+.run-process-detail,
+.run-process-detail article,
+.process-detail-card,
+.bounded-text-block,
+.agent-workbench-file-preview,
+.agent-workbench-file-list button,
+.agent-workbench-preview-pane,
+.agent-workbench-brief-section,
+.agent-workbench-brief-section button,
+.agent-workbench-action-files button,
+.artifact-file-card,
+.conversation-artifact-summary,
+.conversation-file-link {
+  --accent: #0e7490;
+  --accent-2: #047857;
+  --danger: #b91c1c;
+  --ink: #0f172a;
+  --muted: #475569;
+  --panel: #ffffff;
+  --text: #0f172a;
+  color: var(--text);
+}
+
+.artifact-file-main small,
+.artifact-file-meta {
+  color: #475569;
+}
+
+.artifact-file-meta span:not(:last-child)::after {
+  color: #94a3b8;
+}
+
+.process-drawer small,
+.process-detail-modal small {
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.process-drawer dt,
+.process-detail-modal dt {
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.process-drawer .eyebrow,
+.process-detail-modal .eyebrow {
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.process-drawer .agent-workbench-action-meta span {
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 .process-drawer-handle {

@@ -666,6 +666,61 @@ describe("agentInlineSummary", () => {
     );
   });
 
+  it("keeps every light process surface on high-contrast semantic text colors", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+    const lightSurfaceTokens = stylesCss.match(
+      /\/\* Light process surface semantic colors\. \*\/([\s\S]*?)\n}/,
+    )?.[0] ?? "";
+
+    for (const selector of [
+      ".process-drawer",
+      ".process-detail-modal",
+      ".agent-workbench-file-preview",
+      ".agent-workbench-file-list button",
+      ".agent-workbench-preview-pane",
+      ".agent-workbench-action-files button",
+      ".artifact-file-card",
+      ".conversation-artifact-summary",
+      ".conversation-file-link",
+    ]) {
+      expect(lightSurfaceTokens).toContain(selector);
+    }
+    expect(lightSurfaceTokens).toContain("--text: #0f172a;");
+    expect(lightSurfaceTokens).toContain("--muted: #475569;");
+    expect(lightSurfaceTokens).toContain("--accent: #0e7490;");
+    expect(lightSurfaceTokens).toContain("color: var(--text);");
+    expect(stylesCss).toMatch(
+      /\.artifact-file-main small,\s*\.artifact-file-meta\s*{[^}]*color:\s*#475569;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.process-drawer small,\s*\.process-detail-modal small\s*{[^}]*font-size:\s*0\.78rem;[^}]*line-height:\s*1\.45;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.process-drawer dt,\s*\.process-detail-modal dt\s*{[^}]*font-size:\s*0\.78rem;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.process-drawer \.eyebrow,\s*\.process-detail-modal \.eyebrow\s*{[^}]*font-size:\s*0\.78rem;[^}]*line-height:\s*1\.4;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.process-drawer \.agent-workbench-action-meta span\s*{[^}]*font-size:\s*0\.75rem;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.artifact-file-icon\s*{[^}]*color:\s*var\(--accent\);[^}]*font-size:\s*0\.78rem;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.artifact-file-main small\s*{[^}]*color:\s*var\(--muted\);[^}]*font-size:\s*0\.78rem;[^}]*line-height:\s*1\.45;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.artifact-file-meta span:not\(:last-child\)::after\s*{[^}]*color:\s*#94a3b8;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.conversation-file-link small\s*{[^}]*font-size:\s*0\.78rem;[^}]*line-height:\s*1\.4;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.conversation-file-link span\s*{[^}]*font-size:\s*0\.78rem;[^}]*line-height:\s*1\.4;/,
+    );
+  });
+
   it("opens process detail expansions as full reading sheets instead of cramped cards", () => {
     const stylesCss = readFileSync("src/styles.css", "utf8");
     const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
