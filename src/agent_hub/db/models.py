@@ -153,6 +153,13 @@ class RunRow(Base):
             name="ck_agent_hub_runs_actor_role",
         ),
         Index("ix_agent_hub_runs_tenant_status", "tenant_id", "status"),
+        Index(
+            "ix_agent_hub_runs_tenant_conversation_created",
+            "tenant_id",
+            text("(routing_decision ->> 'conversation_id')"),
+            "created_at",
+            "id",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)

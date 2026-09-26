@@ -6532,13 +6532,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     async def get_conversation(self, conversation_id: str) -> ConversationResponse:
         if self._run_repository is None:
             return await super().get_conversation(conversation_id)
-        records = await self._run_repository.list_recent(self._tenant_id, limit=200)
-        runs: list[RunDetailResponse] = []
-        for record in records:
-            details = _routing_details(record.routing_decision)
-            if details.get("conversation_id") == conversation_id:
-                runs.append(await self._run_detail(record))
-        runs.reverse()
+        records = await self._run_repository.list_conversation(
+            self._tenant_id,
+            conversation_id,
+        )
+        runs = [await self._run_detail(record) for record in records]
         return ConversationResponse(conversation_id=conversation_id, runs=runs)
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:

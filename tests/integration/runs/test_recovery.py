@@ -1005,6 +1005,70 @@ async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_win
     assert all(item.run_id != current.id for item in items)
 
 
+async def test_list_conversation_returns_all_runs_in_chronological_order(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    other_tenant_id = uuid4()
+    user_id = uuid4()
+    conversation_id = "conv-complete-history"
+    repository = RunRepository(run_session_factory)
+
+    expected = []
+    for index in range(6):
+        record = await repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=user_id,
+            request=f"会话内容 {index}",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.COMPLETED,
+            idempotency_key=None,
+            routing_decision={"conversation_id": conversation_id},
+            enqueue=False,
+        )
+        expected.append(record.id)
+    await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="另一个会话",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": "conv-other"},
+        enqueue=False,
+    )
+    await repository.create_run(
+        tenant_id=other_tenant_id,
+        actor_id=user_id,
+        request="另一个租户",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    for index in range(201):
+        await repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=user_id,
+            request=f"最近窗口噪声 {index}",
+            mode=TaskMode.DIRECT,
+            status=RunStatus.COMPLETED,
+            idempotency_key=None,
+            routing_decision={"conversation_id": f"conv-noise-{index}"},
+            enqueue=False,
+        )
+
+    recent_ids = {
+        record.id for record in await repository.list_recent(tenant_id, limit=200)
+    }
+    assert recent_ids.isdisjoint(expected)
+
+    records = await repository.list_conversation(tenant_id, conversation_id)
+
+    assert [record.id for record in records] == expected
+
+
 async def test_dispatch_waits_for_user_before_creating_temporary_agent(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -11,7 +11,7 @@ from sqlalchemy import CheckConstraint, Table
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agent_hub.db.migrations import resolve_database_url
-from agent_hub.db.models import AdminResourceRow
+from agent_hub.db.models import AdminResourceRow, RunRow
 from agent_hub.db.session import Database, build_database, build_session_factory
 from agent_hub.settings import Settings
 
@@ -137,3 +137,34 @@ def test_latest_migration_allows_capability_install_admin_resources() -> None:
     assert migration.down_revision == "0023_runtime_artifacts"
     assert "capability_install" in migration._NEXT_KINDS
     assert "capability_install" not in migration._CURRENT_KINDS
+
+
+def test_run_conversation_index_covers_filter_and_chronological_order() -> None:
+    table = cast(Table, RunRow.__table__)
+    index = next(
+        index
+        for index in table.indexes
+        if str(index.name) == "ix_agent_hub_runs_tenant_conversation_created"
+    )
+
+    assert [str(expression) for expression in index.expressions] == [
+        "agent_hub_runs.tenant_id",
+        "(routing_decision ->> 'conversation_id')",
+        "agent_hub_runs.created_at",
+        "agent_hub_runs.id",
+    ]
+
+
+def test_conversation_index_migration_uses_non_blocking_postgres_ddl() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0025_run_conversation_index.py"
+    )
+    source = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "0024_capability_install"' in source
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in source
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in source
+    assert "routing_decision ->> 'conversation_id'" in source

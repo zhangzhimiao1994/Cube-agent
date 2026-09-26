@@ -330,6 +330,28 @@ class RunRepository:
             ).all()
             return tuple(self._record(row) for row in rows)
 
+    async def list_conversation(
+        self,
+        tenant_id: UUID,
+        conversation_id: str,
+    ) -> tuple[RunRecord, ...]:
+        normalized_conversation_id = conversation_id.strip()
+        if not normalized_conversation_id:
+            return ()
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(RunRow)
+                    .where(RunRow.tenant_id == tenant_id)
+                    .where(
+                        RunRow.routing_decision["conversation_id"].astext
+                        == normalized_conversation_id
+                    )
+                    .order_by(RunRow.created_at.asc(), RunRow.id.asc())
+                )
+            ).all()
+            return tuple(self._record(row) for row in rows)
+
     async def delete_run(self, tenant_id: UUID, run_id: UUID) -> None:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())

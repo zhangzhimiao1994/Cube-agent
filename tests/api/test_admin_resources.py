@@ -13536,21 +13536,14 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
     second_id = UUID("33333333-3333-4333-8333-333333333332")
 
     class FakeRunRepository:
-        async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
+        async def list_conversation(
+            self,
+            tenant_id: UUID,
+            conversation_id: str,
+        ) -> tuple[RunRecord, ...]:
             assert tenant_id == TENANT_ID
-            assert limit == 200
+            assert conversation_id == "conv-multi-turn"
             return (
-                RunRecord(
-                    id=second_id,
-                    tenant_id=TENANT_ID,
-                    actor_id=ACTOR_ID,
-                    request="第二轮：继续细化方案",
-                    mode=TaskMode.DISPATCH,
-                    status=RunStatus.COMPLETED,
-                    version=1,
-                    created_at=datetime.now(UTC),
-                    routing_decision={"conversation_id": "conv-multi-turn"},
-                ),
                 RunRecord(
                     id=first_id,
                     tenant_id=TENANT_ID,
@@ -13562,7 +13555,21 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
                     created_at=datetime.now(UTC),
                     routing_decision={"conversation_id": "conv-multi-turn"},
                 ),
+                RunRecord(
+                    id=second_id,
+                    tenant_id=TENANT_ID,
+                    actor_id=ACTOR_ID,
+                    request="第二轮：继续细化方案",
+                    mode=TaskMode.DISPATCH,
+                    status=RunStatus.COMPLETED,
+                    version=1,
+                    created_at=datetime.now(UTC),
+                    routing_decision={"conversation_id": "conv-multi-turn"},
+                ),
             )
+
+        async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
+            raise AssertionError("conversation loading must not depend on the recent-run window")
 
         async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> str:
             assert tenant_id == TENANT_ID
