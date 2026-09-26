@@ -785,6 +785,7 @@ def _ultra_portfolio_os_server_source() -> str:
     return r"""import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export function createInitialState() {
   return {
@@ -1024,7 +1025,7 @@ export function createServer() {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   createServer().listen(port, '127.0.0.1');
 }
@@ -1035,6 +1036,7 @@ def _medium_crm_server_source() -> str:
     return r"""import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export function createInitialState() {
   return { accounts: [], contacts: [], opportunities: [], reminders: [] };
@@ -1204,7 +1206,7 @@ export function createServer() {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   createServer().listen(port, '127.0.0.1');
 }
@@ -1215,6 +1217,7 @@ def _large_order_ops_server_source() -> str:
     return r"""import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export function createInitialState() {
   return { catalog: [], stock: {}, reservations: [], orders: [], fulfillment: [], audit: [] };
@@ -1390,7 +1393,7 @@ export function createServer() {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   createServer().listen(port, '127.0.0.1');
 }

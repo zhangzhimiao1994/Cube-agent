@@ -13,7 +13,6 @@ import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
 import { MainAgentPage } from "../pages/MainAgentPage";
 import { McpPage } from "../pages/McpPage";
-import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
 import { OpenClawPage } from "../pages/OpenClawPage";
 import { ModuleHubPage } from "../pages/ModuleHubPage";
@@ -64,7 +63,7 @@ export function AppRoutes() {
         <Route path="skills" element={<SkillsPage />} />
         <Route path="mcp" element={<McpPage />} />
         <Route path="channels" element={<ChannelsPage />} />
-        <Route path="memory" element={<MemoryPage />} />
+        <Route path="memory" element={<Navigate to="/hermes?view=memory" replace />} />
         <Route path="hermes" element={<HermesPage />} />
         <Route path="hermes/:insightId" element={<HermesPage />} />
         <Route path="users" element={<UsersPage />} />

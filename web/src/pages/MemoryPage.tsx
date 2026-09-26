@@ -106,13 +106,16 @@ export function MemoryPage() {
           </article>
         ) : (
           <div className="card-grid">
-            {records.map((record) => (
-              <article key={record.id}>
+            {records.map((record) => {
+              const hermesManaged = record.id.startsWith("hermes-rule-");
+              return (
+                <article key={record.id}>
                 <span className="eyebrow">{record.scope}</span>
                 <h3>{record.id}</h3>
                 <div className="inline-status-list">
                   <span>热度 {record.heat.toFixed(2)}</span>
                   <span>{record.locked ? "已锁定" : "未锁定"}</span>
+                  {hermesManaged ? <span>Hermes 审批记忆</span> : null}
                   {record.project_id ? <span>项目 {record.project_id}</span> : null}
                   {record.conversation_id ? <span>对话 {record.conversation_id}</span> : null}
                   {record.summary_period !== "none" ? <span>摘要 {record.summary_period}</span> : null}
@@ -123,25 +126,31 @@ export function MemoryPage() {
                   <textarea
                     aria-label={`Memory value ${record.id}`}
                     defaultValue={record.value}
+                    readOnly={hermesManaged}
                     onBlur={(event) =>
-                      update.mutate({ ...record, value: event.currentTarget.value })
+                      hermesManaged
+                        ? undefined
+                        : update.mutate({ ...record, value: event.currentTarget.value })
                     }
                   />
                 </label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    record.locked ? unlock.mutate(record.id) : lock.mutate(record.id)
-                  }
-                  disabled={lock.isPending || unlock.isPending}
-                >
-                  {record.locked ? "解除锁定" : "锁定记忆"}
-                </button>
+                {hermesManaged ? null : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      record.locked ? unlock.mutate(record.id) : lock.mutate(record.id)
+                    }
+                    disabled={lock.isPending || unlock.isPending}
+                  >
+                    {record.locked ? "解除锁定" : "锁定记忆"}
+                  </button>
+                )}
                 <button type="button" onClick={() => forget.mutate(record.id)}>
                   删除记忆
                 </button>
-              </article>
-            ))}
+                </article>
+              );
+            })}
           </div>
         )}
       </section>

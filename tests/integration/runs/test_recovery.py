@@ -1522,6 +1522,7 @@ async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
         "run_id": None,
         "conversation_id": "conv-hermes-runtime",
         "confirmed_at": None,
+        "owner_actor_id": str(actor_id),
     }
     async with run_session_factory() as session, session.begin():
         session.add(
@@ -1593,6 +1594,7 @@ async def test_persistent_hermes_runtime_advice_respects_main_agent_policy(
         "run_id": None,
         "conversation_id": "conv-hermes-policy",
         "confirmed_at": datetime.now(UTC).isoformat(),
+        "owner_actor_id": str(actor_id),
     }
     async with run_session_factory() as session, session.begin():
         session.add(

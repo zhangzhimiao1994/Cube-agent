@@ -941,6 +941,52 @@ class RecordingHermesAdvisor:
     async def record_outcome(self, outcome: HermesRunOutcome) -> None:
         self.outcomes.append(outcome)
 
+
+class ArtifactOutcomeRepository:
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert tenant_id == TENANT_ID
+        return (
+            {
+                "id": str(run_id),
+                "type": "workspace_file",
+                "producer": "implementer",
+                "content": {"filename": "project.zip"},
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_hermes_outcome_receives_persisted_artifact_metadata() -> None:
+    run_id = uuid4()
+    advisor = RecordingHermesAdvisor()
+    service = RunService(
+        ArtifactOutcomeRepository(),  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=advisor,
+    )
+
+    await service._safe_record_hermes_outcome(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=run_id,
+        status=RunStatus.COMPLETED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"workflow_id": "delivery", "conversation_id": "conv-artifact"},
+    )
+
+    assert len(advisor.outcomes) == 1
+    assert advisor.outcomes[0].artifacts == (
+        {
+            "id": str(run_id),
+            "type": "workspace_file",
+            "producer": "implementer",
+            "content": {"filename": "project.zip"},
+        },
+    )
+
+
 class RecordingHook:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail

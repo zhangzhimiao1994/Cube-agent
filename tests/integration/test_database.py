@@ -1,5 +1,7 @@
 import asyncio
+from datetime import UTC, datetime
 from io import StringIO
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,6 +10,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.api.routers.admin import PersistentAdminResourceService
 from agent_hub.app import ensure_bootstrap_tenant
 from agent_hub.db.models import AdminResourceRow, ConfigRevisionRow, TenantRow, UserRow
 from agent_hub.db.session import build_database
@@ -108,6 +111,125 @@ async def test_migrated_admin_resource_constraint_allows_capability_installs(
     )
 
     await db_session.commit()
+
+
+@pytest.mark.integration
+async def test_concurrent_hermes_review_keeps_candidate_and_memory_consistent(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    insight_id = "hermes-concurrent-review"
+    async with auth_session_factory() as session, session.begin():
+        session.add(TenantRow(id=tenant_id, slug=f"hermes-{uuid4()}", name="Hermes review"))
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="hermes",
+                resource_id=insight_id,
+                payload={
+                    "id": insight_id,
+                    "outcome": "success",
+                    "lesson": "Keep concurrent review outcomes consistent.",
+                    "tags": ["review"],
+                    "weight": 8,
+                    "owner_actor_id": str(actor_id),
+                    "created_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        )
+
+    def service() -> PersistentAdminResourceService:
+        return PersistentAdminResourceService(
+            config_service=cast(Any, object()),
+            secret_service=cast(Any, object()),
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            session_factory=auth_session_factory,
+        )
+
+    results = await asyncio.gather(
+        service().confirm_hermes_insight(insight_id),
+        service().reject_hermes_insight(insight_id),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(result, Exception) for result in results) == 1
+    assert sum(isinstance(result, ValueError) for result in results) == 1
+    async with auth_session_factory() as session:
+        rows = list(
+            await session.scalars(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind.in_(("hermes", "memory")))
+            )
+        )
+    hermes = next(row for row in rows if row.kind == "hermes")
+    memories = [row for row in rows if row.kind == "memory"]
+    if hermes.payload.get("promoted_memory_id") is None:
+        assert hermes.payload.get("rejected_at") is not None
+        assert memories == []
+    else:
+        assert hermes.payload.get("confirmed_at") is not None
+        assert [row.resource_id for row in memories] == [hermes.payload["promoted_memory_id"]]
+
+    forget_insight_id = "hermes-concurrent-forget"
+    forget_memory_id = "hermes-rule-hermes-concurrent-forget"
+    async with auth_session_factory() as session, session.begin():
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="hermes",
+                resource_id=forget_insight_id,
+                payload={
+                    "id": forget_insight_id,
+                    "outcome": "success",
+                    "lesson": "Serialize promotion and memory revocation.",
+                    "tags": ["review"],
+                    "weight": 8,
+                    "owner_actor_id": str(actor_id),
+                    "created_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        )
+
+    lock_key = f"agent-hub:{tenant_id}:hermes-memory:{forget_memory_id}"
+    async with auth_session_factory() as blocker, blocker.begin():
+        await blocker.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": lock_key},
+        )
+        confirm_task = asyncio.create_task(service().confirm_hermes_insight(forget_insight_id))
+        forget_task = asyncio.create_task(service().forget_memory(forget_memory_id))
+        await asyncio.sleep(0.1)
+        assert confirm_task.done() is False
+        assert forget_task.done() is False
+
+    await asyncio.gather(confirm_task, forget_task, return_exceptions=True)
+
+    async with auth_session_factory() as session:
+        forget_hermes = await session.scalar(
+            select(AdminResourceRow)
+            .where(AdminResourceRow.tenant_id == tenant_id)
+            .where(AdminResourceRow.kind == "hermes")
+            .where(AdminResourceRow.resource_id == forget_insight_id)
+        )
+        forget_memory = await session.scalar(
+            select(AdminResourceRow)
+            .where(AdminResourceRow.tenant_id == tenant_id)
+            .where(AdminResourceRow.kind == "memory")
+            .where(AdminResourceRow.resource_id == forget_memory_id)
+        )
+    assert forget_hermes is not None
+    if forget_hermes.payload.get("promotion_status") == "rejected" or forget_hermes.payload.get(
+        "rejected_at"
+    ):
+        assert forget_hermes.payload.get("promoted_memory_id") is None
+        assert forget_memory is None
+    else:
+        assert forget_hermes.payload.get("confirmed_at") is not None
+        assert forget_hermes.payload.get("promoted_memory_id") == forget_memory_id
+        assert forget_memory is not None
 
 
 @pytest.mark.integration

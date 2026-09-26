@@ -65,6 +65,15 @@ class CapturingHermesAdvisor(PersistentHermesRunAdvisor):
         del tenant_id
         self.payloads.append((resource_id, payload))
 
+    async def _insert_candidate(
+        self,
+        tenant_id: object,
+        resource_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        del tenant_id
+        self.payloads.append((resource_id, payload))
+
 
 @pytest.mark.asyncio
 async def test_runtime_advice_ignores_confirmed_scheduler_observations() -> None:
@@ -104,6 +113,7 @@ async def test_runtime_advice_ignores_confirmed_scheduler_observations() -> None
 
 @pytest.mark.asyncio
 async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
+    actor_id = uuid4()
     conversation_lesson = {
         "id": "hermes_conversation_review",
         "category": "conversation",
@@ -116,6 +126,112 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
         "run_id": None,
         "conversation_id": "conv-review",
         "confirmed_at": datetime.now(UTC).isoformat(),
+        "owner_actor_id": str(actor_id),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(conversation_lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="please run a debate review",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.recommended_mode is TaskMode.DISCUSS
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_does_not_treat_ownerless_legacy_learning_as_global() -> None:
+    conversation_lesson = {
+        "id": "hermes_legacy_ownerless_review",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use group chat when debate review is required.",
+        "tags": ["debate", "review"],
+        "weight": 10,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [[], [FakeRow({"hermes_policy": "suggest"})], [FakeRow(conversation_lesson)]]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="please run a debate review",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_ignores_learning_owned_by_another_actor() -> None:
+    actor_id = uuid4()
+    conversation_lesson = {
+        "id": "hermes_conversation_private_review",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use group chat when debate review is required.",
+        "summary": "Learned success pattern: debate review.",
+        "tags": ["debate", "review"],
+        "weight": 10,
+        "memory_type": "scheduling_rule",
+        "target": "main_agent",
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+        "owner_actor_id": str(uuid4()),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(conversation_lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="please run a debate review",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_ignores_rejected_learning() -> None:
+    conversation_lesson = {
+        "id": "hermes_conversation_rejected_review",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use group chat when debate review is required.",
+        "summary": "Learned success pattern: debate review.",
+        "tags": ["debate", "review"],
+        "weight": 10,
+        "memory_type": "scheduling_rule",
+        "target": "main_agent",
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+        "rejected_at": datetime.now(UTC).isoformat(),
     }
     session_factory = FakeSessionFactory(
         [
@@ -135,8 +251,7 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
         workflow_id=None,
     )
 
-    assert advice is not None
-    assert advice.recommended_mode is TaskMode.DISCUSS
+    assert advice is None
 
 
 @pytest.mark.asyncio
@@ -253,3 +368,86 @@ async def test_record_outcome_writes_conversation_ledger_for_failed_runs() -> No
     assert conversation_payload["conversation_id"] == "conv-cleared-then-continued"
     assert conversation_payload["weight"] == 2
     assert "对话记忆记录了一条风险提醒" in str(conversation_payload["user_summary"])
+
+
+@pytest.mark.asyncio
+async def test_completed_run_with_reviewable_artifacts_writes_rule_candidate() -> None:
+    advisor = CapturingHermesAdvisor()
+    run_id = uuid4()
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.HYBRID,
+            workflow_id="project-delivery",
+            conversation_id="conv-artifact-review",
+            agent_ids=("implementer", "tester"),
+            artifacts=(
+                {
+                    "id": str(uuid4()),
+                    "type": "tool_result",
+                    "producer": "project_generator",
+                    "content": {"filename": "project.zip", "files": ["README.md"]},
+                },
+                {
+                    "id": str(uuid4()),
+                    "type": "text",
+                    "producer": "implementer",
+                    "content": {"text": "ordinary response"},
+                },
+            ),
+        )
+    )
+
+    assert len(advisor.payloads) == 3
+    candidate_id, candidate = advisor.payloads[2]
+    assert candidate_id == f"hermes_candidate_artifact_{run_id.hex}"
+    assert candidate["memory_type"] == "scheduling_rule"
+    assert candidate["target"] == "main_agent"
+    assert candidate["candidate_source"] == "artifact_review"
+    assert candidate["source_artifact_count"] == 1
+    assert candidate["source_artifact_types"] == ["tool_result"]
+    assert candidate["confirmed_at"] is None
+    assert candidate["rejected_at"] is None
+    assert "tool_result" in str(candidate["evidence_summary"])
+    assert "project.zip" not in str(candidate)
+    assert "README.md" not in str(candidate)
+
+
+@pytest.mark.asyncio
+async def test_failed_run_with_scheduler_notice_writes_recovery_candidate() -> None:
+    advisor = CapturingHermesAdvisor()
+    run_id = uuid4()
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            workflow_id="project-delivery",
+            conversation_id="conv-recovery-review",
+            agent_ids=("implementer",),
+            scheduler_notices=(
+                {
+                    "trigger": "model_capacity_pressure",
+                    "action": "retry_with_fallback",
+                    "severity": "warning",
+                },
+            ),
+        )
+    )
+
+    assert len(advisor.payloads) == 3
+    candidate_id, candidate = advisor.payloads[2]
+    assert candidate_id == f"hermes_candidate_recovery_{run_id.hex}"
+    assert candidate["memory_type"] == "error_handling"
+    assert candidate["target"] == "main_agent"
+    assert candidate["candidate_source"] == "scheduler_review"
+    assert candidate["confirmed_at"] is None
+    assert candidate["rejected_at"] is None
+    assert "model_capacity_pressure" in str(candidate["evidence_summary"])

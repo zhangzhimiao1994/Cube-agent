@@ -389,6 +389,7 @@ class HermesRunOutcome:
     conversation_id: str | None
     agent_ids: tuple[str, ...]
     scheduler_notices: tuple[dict[str, object], ...] = ()
+    artifacts: tuple[dict[str, object], ...] = ()
 
 
 class HermesAdvisorProtocol(Protocol):
@@ -2468,6 +2469,11 @@ class RunService:
         if self._hermes_advisor is None:
             return
         decision = routing_decision or {}
+        artifacts: tuple[dict[str, object], ...] = ()
+        try:
+            artifacts = await self._repository.artifacts(tenant_id, run_id)
+        except Exception:
+            _LOGGER.exception("hermes_artifact_review_load_failed run_id=%s", run_id)
         try:
             await self._hermes_advisor.record_outcome(
                 HermesRunOutcome(
@@ -2480,6 +2486,7 @@ class RunService:
                     conversation_id=_string_or_none(decision.get("conversation_id")),
                     agent_ids=_string_tuple(decision.get("selected_agent_ids")),
                     scheduler_notices=scheduler_notices,
+                    artifacts=artifacts,
                 )
             )
         except Exception:

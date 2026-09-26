@@ -3965,6 +3965,10 @@ class TenantScopedAdminResourceService(InMemoryAdminResourceService):
         self.root.calls.append(("confirm_hermes", insight_id, self.tenant_id, self.actor_id))
         return await super().confirm_hermes_insight(insight_id)
 
+    async def reject_hermes_insight(self, insight_id: str) -> admin_router.HermesInsightResponse:
+        self.root.calls.append(("reject_hermes", insight_id, self.tenant_id, self.actor_id))
+        return await super().reject_hermes_insight(insight_id)
+
     async def delete_hermes_insight(self, insight_id: str) -> None:
         self.root.calls.append(("delete_hermes", insight_id, self.tenant_id, self.actor_id))
         await super().delete_hermes_insight(insight_id)
@@ -14383,7 +14387,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
             "weight": 5,
         },
     )
-    recommendation = api.post(
+    pending_recommendation = api.post(
         "/api/v1/admin/hermes/recommend",
         headers=headers(),
         json={
@@ -14412,6 +14416,19 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
     detail = api.get(f"/api/v1/admin/hermes/{insight_id}", headers=headers())
     confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
+    memory = api.get("/api/v1/admin/memory", headers=headers())
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Run a debate review for this architecture.",
+            "mode_candidates": ["dispatch", "group_chat"],
+            "model_candidates": ["deepseek-chat", "gpt-4o"],
+            "skill_candidates": ["architecture-review", "safe-shell"],
+        },
+    )
+    assert pending_recommendation.status_code == 200
+    assert pending_recommendation.json()["confidence"] == 0.35
     assert recommendation.status_code == 200
     assert detail.status_code == 200
     assert detail.json()["id"] == insight_id
@@ -14420,6 +14437,13 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed_at"] is not None
     assert confirmed.json()["promotion_status"] == "approved"
+    assert confirmed.json()["promoted_memory_id"] is not None
+    assert any(
+        item["id"] == confirmed.json()["promoted_memory_id"]
+        and item["value"] == "Use group chat when debate review is required."
+        and item["locked"] is True
+        for item in memory.json()
+    )
     assert recommendation.json()["recommended_mode"] == "group_chat"
     assert recommendation.json()["recommended_model"] == "deepseek-chat"
     assert recommendation.json()["confidence"] > 0.45
@@ -14430,6 +14454,186 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
         and insight["category"] == "conversation"
         for insight in insights.json()
     )
+
+
+def test_hermes_reject_preserves_candidate_but_excludes_it_from_recommendations() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Use hybrid for portfolio review tasks.",
+            "conversation_id": "conv-reject-learning",
+            "tags": ["portfolio", "review", "hybrid"],
+            "weight": 9,
+        },
+    ).json()
+
+    rejected = api.post(f"/api/v1/admin/hermes/{created['id']}/reject", headers=headers())
+    detail = api.get(f"/api/v1/admin/hermes/{created['id']}", headers=headers())
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Run a portfolio review.",
+            "mode_candidates": ["direct", "hybrid"],
+            "model_candidates": [],
+            "skill_candidates": [],
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["promotion_status"] == "rejected"
+    assert rejected.json()["rejected_at"] is not None
+    assert detail.status_code == 200
+    assert detail.json()["promotion_status"] == "rejected"
+    assert recommendation.status_code == 200
+    assert recommendation.json()["confidence"] == 0.35
+
+
+def test_hermes_ledger_only_record_cannot_be_promoted() -> None:
+    api = client()
+    service = cast(
+        admin_router.InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    service.hermes_insights["hermes-ledger-only"] = admin_router.HermesInsightResponse(
+        id="hermes-ledger-only",
+        category="conversation",
+        outcome="success",
+        lesson="Run completed with mode=hybrid.",
+        summary="Runtime ledger entry.",
+        tags=["hybrid"],
+        weight=2,
+        memory_type="conversation_outcome_summary",
+        target="learning_ledger",
+        promotion_status="ledger_only",
+        created_at=datetime.now(UTC),
+    )
+
+    response = api.post(
+        "/api/v1/admin/hermes/hermes-ledger-only/confirm",
+        headers=headers(),
+    )
+    rejected = api.post(
+        "/api/v1/admin/hermes/hermes-ledger-only/reject",
+        headers=headers(),
+    )
+
+    assert response.status_code == 422
+    assert rejected.status_code == 422
+    assert response.json()["error"]["code"] == "hermes_not_promotable"
+    assert "hermes-rule-hermes-ledger-only" not in service.memory
+
+
+def test_legacy_ledger_only_status_remains_non_promotable() -> None:
+    parsed = admin_router._hermes_response_from_payload(
+        {
+            "id": "legacy-ledger",
+            "outcome": "success",
+            "lesson": "Historical observation only.",
+            "promotion_status": "ledger_only",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+    assert parsed.promotion_status == "ledger_only"
+
+
+def test_hermes_review_state_is_terminal_without_explicit_reopen() -> None:
+    api = client()
+    rejected_candidate = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={"outcome": "success", "lesson": "Keep rejected guidance rejected.", "tags": ["review"]},
+    ).json()
+    approved_candidate = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={"outcome": "success", "lesson": "Keep approved guidance approved.", "tags": ["review"]},
+    ).json()
+
+    assert api.post(f"/api/v1/admin/hermes/{rejected_candidate['id']}/reject", headers=headers()).status_code == 200
+    assert api.post(f"/api/v1/admin/hermes/{approved_candidate['id']}/confirm", headers=headers()).status_code == 200
+
+    reconfirm = api.post(f"/api/v1/admin/hermes/{rejected_candidate['id']}/confirm", headers=headers())
+    rereject = api.post(f"/api/v1/admin/hermes/{approved_candidate['id']}/reject", headers=headers())
+
+    assert reconfirm.status_code == 422
+    assert rereject.status_code == 422
+    assert reconfirm.json()["error"]["code"] == "hermes_not_promotable"
+    assert rereject.json()["error"]["code"] == "hermes_not_promotable"
+
+
+def test_hermes_promoted_memory_cannot_be_overwritten_or_unlocked() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={"outcome": "success", "lesson": "Preserve approved guidance.", "tags": ["review"]},
+    ).json()
+    approved = api.post(f"/api/v1/admin/hermes/{created['id']}/confirm", headers=headers()).json()
+    memory_id = approved["promoted_memory_id"]
+
+    overwritten = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={"id": memory_id, "scope": "tenant", "value": "Bypass approval."},
+    )
+    edited = api.patch(
+        f"/api/v1/admin/memory/{memory_id}",
+        headers=headers(),
+        json={"value": "Bypass approval.", "locked": False},
+    )
+    unlocked = api.post(f"/api/v1/admin/memory/{memory_id}/unlock", headers=headers())
+    stored = next(
+        item for item in api.get("/api/v1/admin/memory", headers=headers()).json() if item["id"] == memory_id
+    )
+
+    assert overwritten.status_code == 409
+    assert edited.status_code == 409
+    assert unlocked.status_code == 409
+    assert overwritten.json()["error"]["code"] == "hermes_managed_memory"
+    assert stored["value"] == "Preserve approved guidance."
+    assert stored["locked"] is True
+
+
+def test_deleting_approved_hermes_record_removes_promoted_memory() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={"outcome": "success", "lesson": "Delete linked memory with its source.", "tags": ["cleanup"]},
+    ).json()
+    approved = api.post(f"/api/v1/admin/hermes/{created['id']}/confirm", headers=headers()).json()
+
+    assert api.delete(f"/api/v1/admin/hermes/{created['id']}", headers=headers()).status_code == 200
+    memories = api.get("/api/v1/admin/memory", headers=headers()).json()
+
+    assert all(memory["id"] != approved["promoted_memory_id"] for memory in memories)
+
+
+def test_forgetting_promoted_memory_revokes_hermes_recommendation() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={"outcome": "success", "lesson": "Use hybrid for cleanup review.", "tags": ["cleanup", "review"]},
+    ).json()
+    approved = api.post(f"/api/v1/admin/hermes/{created['id']}/confirm", headers=headers()).json()
+
+    assert api.delete(f"/api/v1/admin/memory/{approved['promoted_memory_id']}", headers=headers()).status_code == 200
+    detail = api.get(f"/api/v1/admin/hermes/{created['id']}", headers=headers()).json()
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={"task": "cleanup review", "mode_candidates": ["direct", "hybrid"], "model_candidates": [], "skill_candidates": []},
+    ).json()
+
+    assert detail["promotion_status"] == "rejected"
+    assert detail["promoted_memory_id"] is None
+    assert recommendation["confidence"] == 0.35
 
 
 def test_hermes_bulk_confirm_confirms_multiple_learning_records() -> None:
@@ -14670,6 +14874,121 @@ async def test_persistent_hermes_missing_payload_does_not_fallback_to_in_memory_
         await service.confirm_hermes_insight("hermes-1")
     with pytest.raises(KeyError):
         await service.delete_hermes_insight("hermes-1")
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate_owner() -> None:
+    owner_actor_id = uuid4()
+    row = admin_router.AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="hermes",
+        resource_id="hermes-owned",
+        payload={
+            "id": "hermes-owned",
+            "outcome": "success",
+            "lesson": "Use dispatch for owned work.",
+            "tags": ["dispatch"],
+            "weight": 8,
+            "owner_actor_id": str(owner_actor_id),
+            "confirmed_at": None,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    class ScalarResult:
+        def scalar_one_or_none(self) -> admin_router.AdminResourceRow:
+            return row
+
+    class CapturingSession:
+        def __init__(self) -> None:
+            self.statements: list[object] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> ScalarResult:
+            del parameters
+            self.statements.append(statement)
+            return ScalarResult()
+
+    session = CapturingSession()
+
+    class CapturingPromotionService(PersistentAdminResourceService):
+
+        async def _record_audit(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    service = CapturingPromotionService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, lambda: session),
+    )
+    result = await service.confirm_hermes_insight("hermes-owned")
+
+    assert result.promotion_status == "approved"
+    assert len(session.statements) == 4
+    assert "pg_advisory_xact_lock" in str(session.statements[0])
+    assert "FOR UPDATE" in str(session.statements[1])
+    assert row.payload["reviewed_by"] == str(ACTOR_ID)
+    assert row.payload["owner_actor_id"] == str(owner_actor_id)
+    assert row.payload["promoted_memory_id"] == "hermes-rule-hermes-owned"
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_recommendation_uses_only_current_actor_learning() -> None:
+    other_actor_id = uuid4()
+
+    class ActorScopedRecommendationService(PersistentAdminResourceService):
+        async def _list_admin_payloads(
+            self, kind: str, *, tenant_id: UUID | None = None
+        ) -> list[dict[str, object]] | None:
+            del tenant_id
+            assert kind == "hermes"
+            base = {
+                "outcome": "success",
+                "confirmed_at": datetime.now(UTC).isoformat(),
+                "memory_type": "scheduling_rule",
+                "target": "main_agent",
+                "confidence": 0.8,
+                "tags": ["review"],
+                "weight": 8,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            return [
+                {**base, "id": "other", "lesson": "Use group chat for review.", "owner_actor_id": str(other_actor_id)},
+                {**base, "id": "own", "lesson": "Use dispatch for review.", "owner_actor_id": str(ACTOR_ID)},
+            ]
+
+    service = ActorScopedRecommendationService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, object()),
+    )
+
+    result = await service.recommend_with_hermes(
+        admin_router.HermesRecommendationRequest(
+            task="review this change",
+            mode_candidates=["dispatch", "group_chat"],
+            model_candidates=[],
+            skill_candidates=[],
+        )
+    )
+
+    assert result.confidence > 0.45
+    assert result.reasons == ["Hermes lesson matched: Use dispatch for review."]
 
 
 @pytest.mark.asyncio

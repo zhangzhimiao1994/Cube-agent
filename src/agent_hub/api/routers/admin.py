@@ -39,7 +39,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -2607,6 +2607,8 @@ class HermesInsightResponse(BaseModel):
     run_id: UUID | None = None
     conversation_id: str | None = None
     confirmed_at: datetime | None = None
+    rejected_at: datetime | None = None
+    reviewed_by: str | None = Field(default=None, max_length=128)
     tags: list[str]
     weight: int
     memory_type: str = Field(default="conversation_advice", min_length=1, max_length=96)
@@ -2614,9 +2616,14 @@ class HermesInsightResponse(BaseModel):
     confidence: float = Field(default=0.5, ge=0, le=1)
     noise_risk: float = Field(default=0.0, ge=0, le=1)
     applies_to_modes: list[str] = Field(default_factory=list, max_length=8)
+    candidate_source: str = Field(default="manual_feedback", min_length=1, max_length=64)
+    evidence_summary: str | None = Field(default=None, max_length=1000)
+    source_artifact_count: int = Field(default=0, ge=0, le=10_000)
+    source_artifact_types: list[str] = Field(default_factory=list, max_length=16)
+    promoted_memory_id: str | None = Field(default=None, max_length=128)
     promotion_status: str = Field(
         default="pending_review",
-        pattern=r"^(pending_review|approved|ledger_only)$",
+        pattern=r"^(pending_review|approved|rejected|ledger_only)$",
     )
     created_at: datetime
 
@@ -3056,6 +3063,8 @@ class AdminResourceService(Protocol):
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
+
+    async def reject_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
     async def delete_hermes_insight(self, insight_id: str) -> None: ...
 
@@ -6051,6 +6060,7 @@ class InMemoryAdminResourceService:
         return tuple(self.memory.values())
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
+        _ensure_memory_is_user_managed(request.id)
         response = MemoryRecordResponse(**request.model_dump())
         self.memory[response.id] = response
         return response
@@ -6058,6 +6068,7 @@ class InMemoryAdminResourceService:
     async def update_memory(
         self, memory_id: str, request: MemoryRecordRequest
     ) -> MemoryRecordResponse:
+        _ensure_memory_is_user_managed(memory_id)
         current = self.memory[memory_id]
         updated = current.model_copy(update=request.model_dump(exclude_unset=True))
         self.memory[memory_id] = updated
@@ -6065,6 +6076,19 @@ class InMemoryAdminResourceService:
 
     async def forget_memory(self, memory_id: str) -> None:
         del self.memory[memory_id]
+        for insight_id, insight in tuple(self.hermes_insights.items()):
+            if insight.promoted_memory_id != memory_id:
+                continue
+            rejected_at = datetime.now(UTC)
+            self.hermes_insights[insight_id] = insight.model_copy(
+                update={
+                    "confirmed_at": None,
+                    "rejected_at": rejected_at,
+                    "reviewed_by": "in_memory_actor",
+                    "promoted_memory_id": None,
+                    "promotion_status": "rejected",
+                }
+            )
 
     async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
         events = self.audit_events
@@ -6314,14 +6338,44 @@ class InMemoryAdminResourceService:
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         current = self.hermes_insights[insight_id]
+        _ensure_hermes_promotable(current)
         confirmed_at = datetime.now(UTC)
+        promoted = _hermes_promoted_memory(current, scope="main_agent_rule")
+        self.memory[promoted.id] = promoted
         updated = current.model_copy(
             update={
                 "confirmed_at": confirmed_at,
+                "rejected_at": None,
+                "reviewed_by": "in_memory_actor",
+                "promoted_memory_id": promoted.id,
                 "promotion_status": _hermes_promotion_status(
                     target=current.target,
                     memory_type=current.memory_type,
                     confirmed_at=confirmed_at,
+                    rejected_at=None,
+                ),
+            }
+        )
+        self.hermes_insights[insight_id] = updated
+        return updated
+
+    async def reject_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        current = self.hermes_insights[insight_id]
+        _ensure_hermes_promotable(current)
+        rejected_at = datetime.now(UTC)
+        if current.promoted_memory_id is not None:
+            self.memory.pop(current.promoted_memory_id, None)
+        updated = current.model_copy(
+            update={
+                "confirmed_at": None,
+                "rejected_at": rejected_at,
+                "reviewed_by": "in_memory_actor",
+                "promoted_memory_id": None,
+                "promotion_status": _hermes_promotion_status(
+                    target=current.target,
+                    memory_type=current.memory_type,
+                    confirmed_at=None,
+                    rejected_at=rejected_at,
                 ),
             }
         )
@@ -6329,7 +6383,9 @@ class InMemoryAdminResourceService:
         return updated
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
-        del self.hermes_insights[insight_id]
+        current = self.hermes_insights.pop(insight_id)
+        if current.promoted_memory_id is not None:
+            self.memory.pop(current.promoted_memory_id, None)
 
     async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
@@ -6394,6 +6450,7 @@ class InMemoryAdminResourceService:
         matching_insights = [
             insight
             for insight in self.hermes_insights.values()
+            if insight.promotion_status == "approved"
             if any(tag.lower() in normalized_task for tag in insight.tags)
         ]
         if matching_insights:
@@ -6403,7 +6460,11 @@ class InMemoryAdminResourceService:
         if not reasons:
             reasons.append("No strong prior pattern matched; using conservative defaults.")
 
-        confidence = min(0.9, 0.45 + 0.1 * len(matching_insights) + 0.05 * len(recommended_skills))
+        confidence_base = 0.45 if matching_insights else 0.35
+        confidence = min(
+            0.9,
+            confidence_base + 0.1 * len(matching_insights) + 0.05 * len(recommended_skills),
+        )
         return HermesRecommendationResponse(
             recommended_mode=recommended_mode,
             recommended_model=recommended_model,
@@ -8414,6 +8475,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(MemoryRecordResponse.model_validate(payload) for payload in resources)
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
+        _ensure_memory_is_user_managed(request.id)
         response = MemoryRecordResponse(**request.model_dump())
         if not await self._upsert_admin_payload(
             "memory", response.id, response.model_dump(mode="json")
@@ -8425,6 +8487,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     async def update_memory(
         self, memory_id: str, request: MemoryRecordRequest
     ) -> MemoryRecordResponse:
+        _ensure_memory_is_user_managed(memory_id)
         existing = await self._get_admin_payload("memory", memory_id)
         if existing is None:
             return await super().update_memory(memory_id, request)
@@ -8437,13 +8500,46 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return response
 
     async def forget_memory(self, memory_id: str) -> None:
-        deleted = await self._delete_admin_payload("memory", memory_id)
-        if deleted is None:
+        if self._session_factory is None:
             await super().forget_memory(memory_id)
             return
-        if not deleted:
-            raise KeyError(memory_id)
-        await self._record_audit("memory.forget", f"memory:{memory_id}", {"id": memory_id})
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(session, memory_id)
+            hermes_rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "hermes")
+                    .where(AdminResourceRow.payload["promoted_memory_id"].astext == memory_id)
+                    .with_for_update()
+                )
+            ).scalars()
+            memory_row = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == memory_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if memory_row is None:
+                raise KeyError(memory_id)
+            rejected_at = datetime.now(UTC).isoformat()
+            for row in hermes_rows:
+                updated = dict(row.payload)
+                updated["confirmed_at"] = None
+                updated["rejected_at"] = rejected_at
+                updated["reviewed_by"] = str(self._actor_id)
+                updated["promoted_memory_id"] = None
+                row.payload = updated
+            await session.delete(memory_row)
+            await self._record_audit_in_session(
+                session,
+                "memory.forget",
+                f"memory:{memory_id}",
+                {"id": memory_id},
+            )
 
     async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
         resources = await self._list_admin_payloads("audit")
@@ -8514,25 +8610,163 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return _hermes_response_from_payload(payload)
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
-        payload = await self._get_admin_payload("hermes", insight_id)
-        if payload is None:
+        if self._session_factory is None:
+            payload = await self._get_admin_payload("hermes", insight_id)
+            if payload == {}:
+                raise KeyError(insight_id)
             return await super().confirm_hermes_insight(insight_id)
-        if not payload:
-            raise KeyError(insight_id)
-        payload["confirmed_at"] = datetime.now(UTC).isoformat()
-        if not await self._upsert_admin_payload("hermes", insight_id, payload):
-            return await super().confirm_hermes_insight(insight_id)
-        await self._record_audit("hermes.confirm", f"hermes:{insight_id}", {"id": insight_id})
+        async with self._session_factory() as session, session.begin():
+            promoted_memory_id = _hermes_promoted_memory_id(insight_id)
+            await self._lock_hermes_memory_relation(session, promoted_memory_id)
+            row = await self._locked_hermes_row(session, insight_id)
+            payload = dict(row.payload)
+            current = _hermes_response_from_payload(payload)
+            _ensure_hermes_promotable(current)
+            confirmed_at = datetime.now(UTC)
+            owner_actor_id = _optional_string(payload.get("owner_actor_id")) or str(self._actor_id)
+            promoted = _hermes_promoted_memory(current, scope=f"user:{owner_actor_id}")
+            payload["confirmed_at"] = confirmed_at.isoformat()
+            payload["rejected_at"] = None
+            payload["reviewed_by"] = str(self._actor_id)
+            payload["owner_actor_id"] = owner_actor_id
+            payload["promoted_memory_id"] = promoted.id
+            row.payload = payload
+            await session.execute(
+                insert(AdminResourceRow)
+                .values(
+                    id=uuid4(),
+                    tenant_id=self._tenant_id,
+                    kind="memory",
+                    resource_id=promoted.id,
+                    payload=promoted.model_dump(mode="json"),
+                )
+                .on_conflict_do_update(
+                    index_elements=[
+                        AdminResourceRow.tenant_id,
+                        AdminResourceRow.kind,
+                        AdminResourceRow.resource_id,
+                    ],
+                    set_={"payload": promoted.model_dump(mode="json")},
+                )
+            )
+            await self._record_audit_in_session(
+                session,
+                "hermes.confirm",
+                f"hermes:{insight_id}",
+                {"id": insight_id, "promoted_memory_id": promoted.id},
+            )
+        return _hermes_response_from_payload(payload)
+
+    async def reject_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        if self._session_factory is None:
+            payload = await self._get_admin_payload("hermes", insight_id)
+            if payload == {}:
+                raise KeyError(insight_id)
+            return await super().reject_hermes_insight(insight_id)
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(
+                session, _hermes_promoted_memory_id(insight_id)
+            )
+            row = await self._locked_hermes_row(session, insight_id)
+            payload = dict(row.payload)
+            _ensure_hermes_promotable(_hermes_response_from_payload(payload))
+            promoted_memory_id = _optional_string(payload.get("promoted_memory_id"))
+            payload["confirmed_at"] = None
+            payload["rejected_at"] = datetime.now(UTC).isoformat()
+            payload["reviewed_by"] = str(self._actor_id)
+            payload["promoted_memory_id"] = None
+            row.payload = payload
+            if promoted_memory_id is not None:
+                await session.execute(
+                    delete(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == promoted_memory_id)
+                )
+            await self._record_audit_in_session(
+                session,
+                "hermes.reject",
+                f"hermes:{insight_id}",
+                {"id": insight_id},
+            )
         return _hermes_response_from_payload(payload)
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
-        deleted = await self._delete_admin_payload("hermes", insight_id)
-        if deleted is None:
+        if self._session_factory is None:
+            payload = await self._get_admin_payload("hermes", insight_id)
+            if payload == {}:
+                raise KeyError(insight_id)
             await super().delete_hermes_insight(insight_id)
             return
-        if not deleted:
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(
+                session, _hermes_promoted_memory_id(insight_id)
+            )
+            row = await self._locked_hermes_row(session, insight_id)
+            promoted_memory_id = _optional_string(row.payload.get("promoted_memory_id"))
+            if promoted_memory_id is not None:
+                await session.execute(
+                    delete(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == promoted_memory_id)
+                )
+            await self._record_audit_in_session(
+                session,
+                "hermes.delete",
+                f"hermes:{insight_id}",
+                {"id": insight_id},
+            )
+            await session.delete(row)
+
+    async def _lock_hermes_memory_relation(
+        self, session: AsyncSession, memory_id: str
+    ) -> None:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"agent-hub:{self._tenant_id}:hermes-memory:{memory_id}"},
+        )
+
+    async def _locked_hermes_row(
+        self, session: AsyncSession, insight_id: str
+    ) -> AdminResourceRow:
+        row = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+                .where(AdminResourceRow.resource_id == insight_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None:
             raise KeyError(insight_id)
-        await self._record_audit("hermes.delete", f"hermes:{insight_id}", {"id": insight_id})
+        return row
+
+    async def _record_audit_in_session(
+        self,
+        session: AsyncSession,
+        action: str,
+        resource: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        event = AuditEventResponse(
+            id=f"audit_{uuid4().hex}",
+            actor=str(self._actor_id),
+            action=action,
+            resource=resource,
+            details=_safe_audit_details(payload),
+            created_at=datetime.now(UTC),
+        )
+        await session.execute(
+            insert(AdminResourceRow).values(
+                id=uuid4(),
+                tenant_id=self._tenant_id,
+                kind="audit",
+                resource_id=event.id,
+                payload=event.model_dump(mode="json"),
+            )
+        )
 
     async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
@@ -8567,11 +8801,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             confirmed_at=None,
             tags=request.tags,
             weight=request.weight,
+            candidate_source="manual_feedback",
             created_at=datetime.now(UTC),
         )
-        if not await self._upsert_admin_payload(
-            "hermes", insight_id, response.model_dump(mode="json")
-        ):
+        response_payload = response.model_dump(mode="json")
+        response_payload["owner_actor_id"] = str(self._actor_id)
+        if not await self._upsert_admin_payload("hermes", insight_id, response_payload):
             return await super().record_hermes_feedback(request)
         await self._record_audit("hermes.feedback", f"hermes:{insight_id}", {"id": insight_id})
         return response
@@ -8581,11 +8816,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     ) -> HermesRecommendationResponse:
         if self._session_factory is None:
             return await super().recommend_with_hermes(request)
-        previous = await self.list_hermes_insights()
+        payloads = await self._list_admin_payloads("hermes") or []
+        previous = tuple(
+            _hermes_response_from_payload(payload)
+            for payload in payloads
+            if _hermes_payload_is_owned_by(payload, self._actor_id)
+        )
         lowered_task = request.task.lower()
         matched = [
             insight
             for insight in previous
+            if _hermes_insight_is_recommendable(insight)
             if any(tag.lower() in lowered_task for tag in insight.tags)
             or any(word in lowered_task for word in insight.lesson.lower().split())
         ]
@@ -8797,6 +9038,44 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         async with self._session_factory() as session, session.begin():
             await session.execute(statement)
+        return True
+
+    async def _mutate_admin_payloads(
+        self,
+        *,
+        upserts: tuple[tuple[str, str, dict[str, object]], ...] = (),
+        deletes: tuple[tuple[str, str], ...] = (),
+    ) -> bool:
+        if self._session_factory is None:
+            return False
+        async with self._session_factory() as session, session.begin():
+            for kind, resource_id, payload in upserts:
+                statement = (
+                    insert(AdminResourceRow)
+                    .values(
+                        id=uuid4(),
+                        tenant_id=self._tenant_id,
+                        kind=kind,
+                        resource_id=resource_id,
+                        payload=payload,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[
+                            AdminResourceRow.tenant_id,
+                            AdminResourceRow.kind,
+                            AdminResourceRow.resource_id,
+                        ],
+                        set_={"payload": payload},
+                    )
+                )
+                await session.execute(statement)
+            for kind, resource_id in deletes:
+                await session.execute(
+                    delete(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .where(AdminResourceRow.resource_id == resource_id)
+                )
         return True
 
     async def _delete_admin_payload(
@@ -10928,6 +11207,8 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     raw_conversation_id = payload.get("conversation_id")
     raw_confirmed_at = payload.get("confirmed_at")
     confirmed_at = _datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None
+    raw_rejected_at = payload.get("rejected_at")
+    rejected_at = _datetime_from_json(raw_rejected_at) if raw_rejected_at else None
     memory_type = _bounded_hermes_string(
         payload.get("memory_type"),
         default="scheduler_observation" if category == "scheduler" else "conversation_advice",
@@ -10958,6 +11239,8 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         run_id=run_id,
         conversation_id=raw_conversation_id if isinstance(raw_conversation_id, str) else None,
         confirmed_at=confirmed_at,
+        rejected_at=rejected_at,
+        reviewed_by=_optional_string(payload.get("reviewed_by")),
         tags=normalized_tags,
         weight=weight,
         memory_type=memory_type,
@@ -10965,10 +11248,23 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         confidence=_bounded_hermes_float(payload.get("confidence"), default=0.5),
         noise_risk=_bounded_hermes_float(payload.get("noise_risk"), default=0.0),
         applies_to_modes=applies_to_modes,
+        candidate_source=_bounded_hermes_string(
+            payload.get("candidate_source"), default="runtime_observation" if run_id else "manual_feedback", limit=64
+        ),
+        evidence_summary=_optional_string(payload.get("evidence_summary")),
+        source_artifact_count=_bounded_nonnegative_int(
+            payload.get("source_artifact_count"), default=0, maximum=10_000
+        ),
+        source_artifact_types=_bounded_hermes_string_list(
+            payload.get("source_artifact_types"), limit=16
+        ),
+        promoted_memory_id=_optional_string(payload.get("promoted_memory_id")),
         promotion_status=_hermes_promotion_status(
             target=target,
             memory_type=memory_type,
             confirmed_at=confirmed_at,
+            rejected_at=rejected_at,
+            stored_status=payload.get("promotion_status"),
         ),
         created_at=_datetime_from_json(payload.get("created_at")),
     )
@@ -10981,6 +11277,13 @@ def _bounded_hermes_string(value: object, *, default: str, limit: int) -> str:
     if not cleaned:
         return default
     return cleaned[:limit]
+
+
+def _optional_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
 
 
 def _bounded_hermes_string_list(value: object, *, limit: int) -> list[str]:
@@ -11009,19 +11312,91 @@ def _bounded_hermes_float(value: object, *, default: float) -> float:
     return default
 
 
+def _bounded_nonnegative_int(value: object, *, default: int, maximum: int) -> int:
+    if type(value) is not int:
+        return default
+    return max(0, min(maximum, value))
+
+
 def _hermes_promotion_status(
     *,
     target: str,
     memory_type: str,
     confirmed_at: datetime | None,
-) -> Literal["pending_review", "approved", "ledger_only"]:
+    rejected_at: datetime | None = None,
+    stored_status: object = None,
+) -> Literal["pending_review", "approved", "rejected", "ledger_only"]:
+    if stored_status == "ledger_only":
+        return "ledger_only"
     if target in {"learning_ledger", "scheduler", "scheduler_observation"} or memory_type in {
         "conversation_outcome_summary",
         "scheduler_observation",
         "runtime_observation",
     }:
         return "ledger_only"
+    if rejected_at is not None:
+        return "rejected"
     return "approved" if confirmed_at is not None else "pending_review"
+
+
+def _hermes_promoted_memory_id(insight_id: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", insight_id.lower()).strip("-")
+    return f"hermes-rule-{normalized}"[:128]
+
+
+def _ensure_memory_is_user_managed(memory_id: str) -> None:
+    if memory_id.startswith("hermes-rule-"):
+        raise PublicAPIError(
+            409,
+            "hermes_managed_memory",
+            "Hermes promoted memory must be managed from the Hermes review page",
+        )
+
+
+def _hermes_promoted_memory(
+    insight: HermesInsightResponse,
+    *,
+    scope: str,
+) -> MemoryRecordResponse:
+    return MemoryRecordResponse(
+        id=_hermes_promoted_memory_id(insight.id),
+        scope=scope,
+        value=insight.lesson,
+        heat=max(0.5, insight.confidence),
+        locked=True,
+        conversation_id=insight.conversation_id,
+        summary_period="none",
+    )
+
+
+def _hermes_insight_is_recommendable(insight: HermesInsightResponse) -> bool:
+    return (
+        insight.promotion_status == "approved"
+        and insight.target == "main_agent"
+        and insight.memory_type
+        in {
+            "conversation_advice",
+            "user_preference",
+            "project_fact",
+            "ui_rule",
+            "error_handling",
+            "scheduling_rule",
+        }
+        and insight.confidence >= 0.45
+        and insight.noise_risk < 0.7
+    )
+
+
+def _hermes_payload_is_owned_by(payload: dict[str, object], actor_id: UUID) -> bool:
+    owner_actor_id = _optional_string(payload.get("owner_actor_id"))
+    if owner_actor_id is None:
+        return payload.get("tenant_global") is True
+    return owner_actor_id == str(actor_id)
+
+
+def _ensure_hermes_promotable(insight: HermesInsightResponse) -> None:
+    if insight.promotion_status != "pending_review":
+        raise ValueError("only pending Hermes candidates can be reviewed")
 
 
 def _hermes_feedback_summary(
@@ -14987,6 +15362,14 @@ async def bulk_confirm_hermes_insights(
                     message="Hermes learning record was not found",
                 )
             )
+        except ValueError:
+            failed.append(
+                BulkFailureResponse(
+                    id=insight_id,
+                    code="hermes_not_promotable",
+                    message="Hermes ledger records cannot be promoted",
+                )
+            )
     return HermesBulkConfirmResponse(confirmed=confirmed, failed=failed)
 
 
@@ -15054,6 +15437,33 @@ async def confirm_hermes_insight(
     except KeyError:
         raise PublicAPIError(
             404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
+    except ValueError:
+        raise PublicAPIError(
+            422, "hermes_not_promotable", "Hermes ledger records cannot be promoted"
+        ) from None
+
+
+@router.post(
+    "/hermes/{insight_id}/reject",
+    response_model=HermesInsightResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def reject_hermes_insight(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesInsightResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.reject_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
+    except ValueError:
+        raise PublicAPIError(
+            422, "hermes_not_promotable", "Hermes ledger records cannot be rejected"
         ) from None
 
 

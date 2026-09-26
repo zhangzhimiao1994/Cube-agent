@@ -16,7 +16,7 @@ describe("HermesPage", () => {
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = new URL(String(input), "https://agent-hub.test").pathname;
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
@@ -65,6 +65,22 @@ describe("HermesPage", () => {
             },
           ]);
         }
+        if (path === "/api/v1/admin/memory") {
+          return jsonResponse([
+            {
+              id: "hermes-rule-reviewed-guidance",
+              scope: "user:11111111-1111-4111-8111-111111111111",
+              value: "Preserve approved guidance.",
+              heat: 0.8,
+              locked: true,
+              project_id: null,
+              conversation_id: "conv-cleared-after-chat",
+              summary_period: "none",
+              recall_count: 0,
+              last_recalled_at: null,
+            },
+          ]);
+        }
         if (path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
           return jsonResponse({
             id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -76,8 +92,51 @@ describe("HermesPage", () => {
             run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             conversation_id: "conv-cleared-after-chat",
             confirmed_at: null,
+            rejected_at: null,
+            reviewed_by: null,
             tags: ["completed", "hybrid", "quality-review"],
             weight: 4,
+            memory_type: "scheduling_rule",
+            target: "main_agent",
+            confidence: 0.72,
+            noise_risk: 0.25,
+            applies_to_modes: ["hybrid"],
+            candidate_source: "artifact_review",
+            evidence_summary: "复盘 2 个可交付产物：project.zip、README.md。",
+            source_artifact_count: 2,
+            source_artifact_types: ["tool_result", "workspace_file"],
+            promotion_status: "pending_review",
+            created_at: "2026-09-02T00:00:01Z",
+          });
+        }
+        if (
+          path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/reject" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse({
+            id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            category: "conversation",
+            outcome: "success",
+            lesson: "Run completed with mode=hybrid, workflow=quality-review.",
+            summary: "Hermes recorded reusable conversation memory from conv-cleared-after-chat.",
+            user_summary: "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。",
+            run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            conversation_id: "conv-cleared-after-chat",
+            confirmed_at: null,
+            rejected_at: "2026-09-02T00:20:00Z",
+            reviewed_by: "11111111-1111-4111-8111-111111111111",
+            tags: ["completed", "hybrid", "quality-review"],
+            weight: 4,
+            memory_type: "scheduling_rule",
+            target: "main_agent",
+            confidence: 0.72,
+            noise_risk: 0.25,
+            applies_to_modes: ["hybrid"],
+            candidate_source: "artifact_review",
+            evidence_summary: "复盘 2 个可交付产物：project.zip、README.md。",
+            source_artifact_count: 2,
+            source_artifact_types: ["tool_result", "workspace_file"],
+            promotion_status: "rejected",
             created_at: "2026-09-02T00:00:01Z",
           });
         }
@@ -134,6 +193,23 @@ describe("HermesPage", () => {
     expect(within(row).getByText("待确认")).not.toBeNull();
   });
 
+  it("keeps the legacy memory route working inside the merged Hermes area", async () => {
+    render(<TestApp initialPath="/memory" />);
+
+    expect(await screen.findByRole("heading", { name: "记忆管理" })).not.toBeNull();
+    expect(screen.getAllByRole("link", { name: /Hermes 学习与记忆/ }).length).toBeGreaterThan(0);
+  });
+
+  it("keeps Hermes-approved memory read-only in the merged memory view", async () => {
+    render(<TestApp initialPath="/hermes?view=memory" />);
+
+    const value = await screen.findByLabelText("Memory value hermes-rule-reviewed-guidance");
+
+    expect(value.getAttribute("readonly")).not.toBeNull();
+    expect(screen.getByText("Hermes 审批记忆")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "解除锁定" })).toBeNull();
+  });
+
   it("filters Hermes ledger by memory layer", async () => {
     render(<TestApp initialPath="/hermes" />);
 
@@ -181,5 +257,16 @@ describe("HermesPage", () => {
     expect(within(approvalLoop).getByText("规则候选")).not.toBeNull();
     expect(within(approvalLoop).getByText("等待人工确认")).not.toBeNull();
     expect(within(approvalLoop).getByText("确认后进入主 Agent 可召回规则库")).not.toBeNull();
+    expect(within(approvalLoop).getByText("复盘 2 个可交付产物：project.zip、README.md。")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "拒绝入库" })).not.toBeNull();
+  });
+
+  it("rejects a learning candidate without deleting its audit record", async () => {
+    render(<TestApp initialPath="/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "拒绝入库" }));
+
+    expect(await screen.findByText("已拒绝入库")).not.toBeNull();
+    expect(screen.getByText("保留审计记录，不参与主 Agent 召回")).not.toBeNull();
   });
 });

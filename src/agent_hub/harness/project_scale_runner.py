@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1455,14 +1456,18 @@ def _run_generated_project_command(
     if not command or any(not isinstance(part, str) or not part for part in command):
         return "generated_project_validation: invalid validation command"
     safe_env = _generated_project_command_env()
+    executable = shutil.which(command[0], path=safe_env.get("PATH")) or command[0]
+    resolved_command = [executable, *command[1:]]
     try:
         completed = subprocess.run(
-            list(command),
+            resolved_command,
             cwd=cwd,
             env=safe_env,
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(timeout_seconds, 1),
         )
     except subprocess.TimeoutExpired:

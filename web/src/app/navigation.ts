@@ -61,10 +61,11 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       },
       {
         to: "/hermes",
-        label: "Hermes 学习",
-        description: "按类型查看学习沉淀，确认后再应用到系统行为。",
+        label: "Hermes 学习与记忆",
+        description: "统一管理学习候选、审批入库和长期记忆。",
         permission: "hermes:read",
         children: [
+          { to: "/hermes?view=memory", label: "长期记忆", permission: "memory:read" },
           { to: "/hermes?category=conversation", label: "对话记忆", permission: "hermes:read" },
           { to: "/hermes?category=scheduler", label: "调度观察", permission: "hermes:read" },
           { to: "/hermes?status=pending", label: "待确认学习", permission: "hermes:read" },
@@ -95,12 +96,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         ],
       },
 
-      {
-        to: "/memory",
-        label: "记忆",
-        description: "管理可被 Agent 参考的长期记忆、会话摘要和上下文资源。",
-        permission: "memory:read",
-      },
       {
         to: "/attachments",
         label: "附件",

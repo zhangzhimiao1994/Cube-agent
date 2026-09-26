@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type HermesInsight } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
+import { MemoryPage } from "./MemoryPage";
 
 type HermesSortKey = "created" | "category" | "conversation" | "summary" | "layer" | "outcome" | "status";
 
@@ -35,8 +36,11 @@ function parseList(value: string) {
     .filter(Boolean);
 }
 
-function statusLabel(confirmedAt: string | null) {
-  return confirmedAt ? "已确认" : "待确认";
+function statusLabel(insight: HermesInsight) {
+  if (insight.promotion_status === "approved") return "已确认";
+  if (insight.promotion_status === "rejected") return "已拒绝";
+  if (insight.promotion_status === "ledger_only") return "仅台账";
+  return "待确认";
 }
 
 function categoryLabel(category: HermesInsight["category"]) {
@@ -62,6 +66,7 @@ function memoryLayerFilterValue(insight: HermesInsight): HermesColumnFilters["la
 
 function promotionStatusLabel(status: HermesInsight["promotion_status"]) {
   if (status === "approved") return "已确认入库";
+  if (status === "rejected") return "已拒绝入库";
   if (status === "ledger_only") return "仅台账展示";
   return "待审批";
 }
@@ -75,13 +80,15 @@ function approvalCandidateLabel(insight: HermesInsight) {
 
 function approvalStateLabel(insight: HermesInsight) {
   if (insight.promotion_status === "ledger_only") return "无需入库审批";
-  return insight.confirmed_at ? "已人工确认" : "等待人工确认";
+  if (insight.promotion_status === "rejected") return "已拒绝入库";
+  return insight.promotion_status === "approved" ? "已人工确认" : "等待人工确认";
 }
 
 function approvalDestinationLabel(insight: HermesInsight) {
   if (insight.promotion_status === "ledger_only") return "仅保留在学习台账";
+  if (insight.promotion_status === "rejected") return "保留审计记录，不参与主 Agent 召回";
   const target = insight.target === "main_agent" ? "主 Agent" : insight.target;
-  if (insight.confirmed_at) return `已进入${target} 可召回规则库`;
+  if (insight.promotion_status === "approved") return `已进入${target} 可召回规则库`;
   return `确认后进入${target} 可召回规则库`;
 }
 
@@ -98,7 +105,9 @@ function normalizeCategory(value: string | null): HermesColumnFilters["category"
 }
 
 function normalizeStatus(value: string | null): HermesColumnFilters["status"] {
-  return value === "pending" || value === "confirmed" ? value : "all";
+  return value === "pending" || value === "confirmed" || value === "rejected" || value === "ledger"
+    ? value
+    : "all";
 }
 
 function toggle(values: string[], value: string) {
@@ -112,7 +121,7 @@ function hermesColumnValue(insight: HermesInsight, key: HermesSortKey) {
   if (key === "summary") return hermesLearningSummary(insight);
   if (key === "layer") return memoryLayerLabel(insight);
   if (key === "outcome") return insight.outcome;
-  return statusLabel(insight.confirmed_at);
+  return statusLabel(insight);
 }
 
 function matchesHermesSearch(insight: HermesInsight, query: string) {
@@ -126,7 +135,7 @@ function matchesHermesSearch(insight: HermesInsight, query: string) {
       hermesLearningSummary(insight),
       insight.summary,
       insight.lesson,
-      statusLabel(insight.confirmed_at),
+      statusLabel(insight),
       insight.created_at,
       ...insight.tags,
     ].join(" "),
@@ -135,7 +144,14 @@ function matchesHermesSearch(insight: HermesInsight, query: string) {
 }
 
 function matchesHermesColumns(insight: HermesInsight, filters: HermesColumnFilters) {
-  const status = insight.confirmed_at ? "confirmed" : "pending";
+  const status =
+    insight.promotion_status === "approved"
+      ? "confirmed"
+      : insight.promotion_status === "rejected"
+        ? "rejected"
+        : insight.promotion_status === "ledger_only"
+          ? "ledger"
+          : "pending";
   return (
     textContains(insight.created_at, filters.created) &&
     (filters.category === "all" || insight.category === filters.category) &&
@@ -153,8 +169,9 @@ function sortedHermesInsights(items: HermesInsight[], sort: SortState<HermesSort
 
 function HermesJourney({ insights }: { insights: HermesInsight[] }) {
   if (insights.length === 0) return null;
-  const pendingCount = insights.filter((insight) => insight.confirmed_at === null).length;
-  const confirmedCount = insights.length - pendingCount;
+  const pendingCount = insights.filter((insight) => insight.promotion_status === "pending_review").length;
+  const confirmedCount = insights.filter((insight) => insight.promotion_status === "approved").length;
+  const rejectedCount = insights.filter((insight) => insight.promotion_status === "rejected").length;
   const journeyItems = [...insights]
     .sort((left, right) => compareText(left.created_at, right.created_at, "desc"))
     .slice(0, 6);
@@ -168,6 +185,7 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
         <div aria-label="Hermes 学习状态统计">
           <strong>待确认 {pendingCount}</strong>
           <strong>已确认 {confirmedCount}</strong>
+          {rejectedCount > 0 ? <strong>已拒绝 {rejectedCount}</strong> : null}
         </div>
       </div>
       <ol>
@@ -175,7 +193,7 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
           <li key={insight.id}>
             <time dateTime={insight.created_at}>{insight.created_at}</time>
             <div>
-              <span>{categoryLabel(insight.category)} · {statusLabel(insight.confirmed_at)}</span>
+              <span>{categoryLabel(insight.category)} · {statusLabel(insight)}</span>
               <strong>{hermesLearningSummary(insight)}</strong>
               <small>
                 {memoryLayerLabel(insight)} · {promotionStatusLabel(insight.promotion_status)} · {insight.conversation_id ?? "未关联对话"} · {insight.outcome} · 权重 {insight.weight}
@@ -197,7 +215,9 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
 
 export function HermesPage() {
   const { insightId } = useParams();
+  const [searchParams] = useSearchParams();
   if (insightId) return <HermesInsightDetail insightId={insightId} />;
+  if (searchParams.get("view") === "memory") return <MemoryPage />;
   return <HermesLearningTable />;
 }
 
@@ -318,7 +338,9 @@ function HermesLearningTable() {
   const filteredInsights = items.filter((insight) => matchesHermesSearch(insight, searchTerm) && matchesHermesColumns(insight, columnFilters));
   const visibleInsights = sortedHermesInsights(filteredInsights, sort);
   const visibleIds = visibleInsights.map((insight) => insight.id);
-  const visibleConfirmableIds = visibleInsights.filter((insight) => insight.confirmed_at === null).map((insight) => insight.id);
+  const visibleConfirmableIds = visibleInsights
+    .filter((insight) => insight.promotion_status === "pending_review")
+    .map((insight) => insight.id);
   const selectedVisibleIds = selectedIds.filter((id) => visibleIds.includes(id));
   const selectedVisibleConfirmableIds = selectedIds.filter((id) => visibleConfirmableIds.includes(id));
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
@@ -479,6 +501,8 @@ function HermesLearningTable() {
                           <option value="all">全部</option>
                           <option value="pending">待确认</option>
                           <option value="confirmed">已确认</option>
+                          <option value="rejected">已拒绝</option>
+                          <option value="ledger">仅台账</option>
                         </select>
                       </th>
                       <th></th>
@@ -507,9 +531,9 @@ function HermesLearningTable() {
                           <small className="muted-inline">{promotionStatusLabel(insight.promotion_status)}</small>
                         </td>
                         <td>{insight.outcome}</td>
-                        <td>{statusLabel(insight.confirmed_at)}</td>
+                        <td>{statusLabel(insight)}</td>
                         <td className="table-actions">
-                          {insight.confirmed_at === null ? (
+                          {insight.promotion_status === "pending_review" ? (
                             <button
                               type="button"
                               className="secondary-action"
@@ -617,7 +641,14 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
     mutationFn: () => api.confirmHermesInsight(insightId),
     onSuccess: (updated) => {
       queryClient.setQueryData(["hermes", insightId], updated);
-      void queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      void queryClient.invalidateQueries({ queryKey: ["hermes"], exact: true });
+    },
+  });
+  const reject = useMutation({
+    mutationFn: () => api.rejectHermesInsight(insightId),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["hermes", insightId], updated);
+      void queryClient.invalidateQueries({ queryKey: ["hermes"], exact: true });
     },
   });
   const deleteInsight = useMutation({
@@ -632,7 +663,7 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
   if (insight.isLoading) return <p>正在加载 Hermes 学习详情...</p>;
   if (insight.isError) return <p role="alert">{formatApiError(insight.error, "Hermes 学习详情加载失败")}</p>;
 
-  const item = confirm.data ?? insight.data;
+  const item = insight.data;
   if (!item) return <p role="alert">Hermes 学习详情为空。</p>;
   return (
     <section>
@@ -642,13 +673,13 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
       <p className="eyebrow">Hermes detail</p>
       <h2>学习详情</h2>
       <article>
-        <span className="eyebrow">{statusLabel(item.confirmed_at)}</span>
+        <span className="eyebrow">{statusLabel(item)}</span>
         <h3>{hermesLearningSummary(item)}</h3>
         <p>{item.lesson}</p>
         <section className="hermes-approval-loop" aria-label="Hermes 审批入库闭环">
           <div>
             <span className="eyebrow">产物复盘</span>
-            <strong>{item.run_id ? "来自运行结果复盘" : "来自手动经验补充"}</strong>
+            <strong>{item.evidence_summary ?? (item.run_id ? "来自运行结果复盘" : "来自手动经验补充")}</strong>
           </div>
           <div>
             <span className="eyebrow">候选类型</span>
@@ -706,6 +737,14 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
             <dd>{item.confirmed_at ?? "尚未确认"}</dd>
           </div>
           <div>
+            <dt>拒绝时间</dt>
+            <dd>{item.rejected_at ?? "未拒绝"}</dd>
+          </div>
+          <div>
+            <dt>审批人</dt>
+            <dd>{item.reviewed_by ?? "尚未审批"}</dd>
+          </div>
+          <div>
             <dt>标签</dt>
             <dd>{item.tags.join(", ") || "无"}</dd>
           </div>
@@ -733,10 +772,34 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
             <dt>适用模式</dt>
             <dd>{item.applies_to_modes.join(", ") || "未限定"}</dd>
           </div>
+          <div>
+            <dt>候选来源</dt>
+            <dd>{item.candidate_source}</dd>
+          </div>
+          <div>
+            <dt>来源产物</dt>
+            <dd>{item.source_artifact_count} 个 · {item.source_artifact_types.join(", ") || "无"}</dd>
+          </div>
+          <div>
+            <dt>入库记忆 ID</dt>
+            <dd>{item.promoted_memory_id ?? "尚未入库"}</dd>
+          </div>
         </dl>
         <div className="inline-actions">
-          <button type="button" disabled={confirm.isPending || item.confirmed_at !== null} onClick={() => confirm.mutate()}>
-            {item.confirmed_at ? "已确认" : confirm.isPending ? "正在确认..." : "确认这条学习"}
+          <button
+            type="button"
+            disabled={confirm.isPending || reject.isPending || item.promotion_status !== "pending_review"}
+            onClick={() => confirm.mutate()}
+          >
+            {item.promotion_status === "approved" ? "已确认" : confirm.isPending ? "正在确认..." : "确认这条学习"}
+          </button>
+          <button
+            type="button"
+            className="secondary-action"
+            disabled={confirm.isPending || reject.isPending || item.promotion_status !== "pending_review"}
+            onClick={() => reject.mutate()}
+          >
+            {item.promotion_status === "rejected" ? "已拒绝" : reject.isPending ? "正在拒绝..." : "拒绝入库"}
           </button>
           <button
             type="button"
@@ -752,6 +815,7 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
           </button>
         </div>
         {confirm.isError ? <p role="alert">{formatApiError(confirm.error, "Hermes 学习确认失败")}</p> : null}
+        {reject.isError ? <p role="alert">{formatApiError(reject.error, "Hermes 学习拒绝失败")}</p> : null}
         {deleteInsight.isError ? <p role="alert">{formatApiError(deleteInsight.error, "Hermes 学习删除失败")}</p> : null}
       </article>
     </section>

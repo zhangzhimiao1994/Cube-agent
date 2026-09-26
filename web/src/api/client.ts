@@ -1470,6 +1470,8 @@ const HermesInsightSchema = z.object({
   run_id: z.string().nullable(),
   conversation_id: z.string().nullable(),
   confirmed_at: z.string().nullable(),
+  rejected_at: z.string().nullable().default(null),
+  reviewed_by: z.string().nullable().default(null),
   tags: z.array(z.string()),
   weight: z.number(),
   memory_type: z.string().default("conversation_advice"),
@@ -1477,7 +1479,12 @@ const HermesInsightSchema = z.object({
   confidence: z.number().default(0.5),
   noise_risk: z.number().default(0),
   applies_to_modes: z.array(z.string()).default([]),
-  promotion_status: z.enum(["pending_review", "approved", "ledger_only"]).default("pending_review"),
+  candidate_source: z.string().default("manual_feedback"),
+  evidence_summary: z.string().nullable().default(null),
+  source_artifact_count: z.number().default(0),
+  source_artifact_types: z.array(z.string()).default([]),
+  promoted_memory_id: z.string().nullable().default(null),
+  promotion_status: z.enum(["pending_review", "approved", "rejected", "ledger_only"]).default("pending_review"),
   created_at: z.string(),
 });
 
@@ -2639,6 +2646,9 @@ export const api = {
   },
   confirmHermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/confirm`, { method: "POST" }, HermesInsightSchema);
+  },
+  rejectHermesInsight(id: string): Promise<HermesInsight> {
+    return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/reject`, { method: "POST" }, HermesInsightSchema);
   },
   deleteHermesInsight(id: string): Promise<OperationStatus> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "DELETE" }, OperationStatusSchema);

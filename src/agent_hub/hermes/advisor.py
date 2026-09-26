@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -62,13 +63,16 @@ class PersistentHermesRunAdvisor:
         agent_ids: tuple[str, ...],
         workflow_id: str | None,
     ) -> HermesRunAdvice | None:
-        del actor_id
         if not await self._enabled(tenant_id):
             return None
         policy = await self._main_agent_hermes_policy(tenant_id)
         if policy in {"off", "observe"}:
             return None
-        lessons = [lesson for lesson in await self._lessons(tenant_id) if _lesson_is_conversation_advice(lesson)]
+        lessons = [
+            lesson
+            for lesson in await self._lessons(tenant_id, actor_id=actor_id)
+            if _lesson_is_conversation_advice(lesson)
+        ]
         if not lessons:
             return None
 
@@ -214,6 +218,7 @@ class PersistentHermesRunAdvisor:
             "created_at": datetime.now(UTC).isoformat(),
             "run_id": str(outcome.run_id),
             "conversation_id": outcome.conversation_id,
+            "owner_actor_id": str(outcome.actor_id) if outcome.actor_id is not None else None,
             "confirmed_at": None,
         }
         await self._upsert(outcome.tenant_id, lesson_id, payload)
@@ -246,9 +251,27 @@ class PersistentHermesRunAdvisor:
             "created_at": datetime.now(UTC).isoformat(),
             "run_id": str(outcome.run_id),
             "conversation_id": outcome.conversation_id,
+            "owner_actor_id": str(outcome.actor_id) if outcome.actor_id is not None else None,
             "confirmed_at": None,
         }
         await self._upsert(outcome.tenant_id, conversation_lesson_id, conversation_payload)
+        if outcome.status is RunStatus.COMPLETED:
+            artifact_candidate = _artifact_review_candidate(
+                outcome,
+                mode=mode,
+                workflow=workflow,
+            )
+            if artifact_candidate is not None:
+                candidate_id, candidate_payload = artifact_candidate
+                await self._insert_candidate(outcome.tenant_id, candidate_id, candidate_payload)
+        if scheduler_notices and outcome.status is not RunStatus.COMPLETED:
+            candidate_id, candidate_payload = _scheduler_review_candidate(
+                outcome,
+                mode=mode,
+                workflow=workflow,
+                notices=scheduler_notices,
+            )
+            await self._insert_candidate(outcome.tenant_id, candidate_id, candidate_payload)
 
     async def _enabled(self, tenant_id: UUID) -> bool:
         async with self._session_factory() as session:
@@ -281,7 +304,7 @@ class PersistentHermesRunAdvisor:
             return str(policy)
         return "observe"
 
-    async def _lessons(self, tenant_id: UUID) -> list[dict[str, object]]:
+    async def _lessons(self, tenant_id: UUID, *, actor_id: UUID) -> list[dict[str, object]]:
         async with self._session_factory() as session:
             rows = (
                 await session.execute(
@@ -292,7 +315,11 @@ class PersistentHermesRunAdvisor:
                     .limit(200)
                 )
             ).scalars()
-            return [dict(row.payload) for row in rows]
+            return [
+                payload
+                for row in rows
+                if _lesson_is_owned_by(payload := dict(row.payload), actor_id)
+            ]
 
     async def _upsert(self, tenant_id: UUID, resource_id: str, payload: dict[str, object]) -> None:
         statement = (
@@ -316,10 +343,157 @@ class PersistentHermesRunAdvisor:
         async with self._session_factory() as session, session.begin():
             await session.execute(statement)
 
+    async def _insert_candidate(
+        self,
+        tenant_id: UUID,
+        resource_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        statement = (
+            insert(AdminResourceRow)
+            .values(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                kind="hermes",
+                resource_id=resource_id,
+                payload=payload,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    AdminResourceRow.tenant_id,
+                    AdminResourceRow.kind,
+                    AdminResourceRow.resource_id,
+                ]
+            )
+        )
+        async with self._session_factory() as session, session.begin():
+            await session.execute(statement)
+
 
 def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:
     category = lesson.get("category")
     return category in {None, "conversation"}
+
+
+def _artifact_review_candidate(
+    outcome: HermesRunOutcome,
+    *,
+    mode: str,
+    workflow: str,
+) -> tuple[str, dict[str, object]] | None:
+    reviewable = [artifact for artifact in outcome.artifacts if _artifact_is_reviewable(artifact)]
+    if not reviewable:
+        return None
+    artifact_types = _unique_tags(
+        [str(artifact.get("type", "artifact")) for artifact in reviewable]
+    )[:8]
+    artifact_ids = _unique_tags(
+        [str(artifact.get("id", "")) for artifact in reviewable if artifact.get("id")]
+    )[:12]
+    evidence_items = artifact_types
+    evidence_summary = (
+        f"复盘 {len(reviewable)} 个可交付产物：{('、'.join(evidence_items))[:320]}。"
+    )
+    agents = ",".join(outcome.agent_ids[:6]) or "main_agent"
+    lesson = (
+        f"For workflow={workflow}, mode={mode}, agents={agents} produced "
+        f"reviewable artifacts of types={','.join(artifact_types)}. "
+        "Prefer this verified execution pattern for matching delivery tasks."
+    )
+    candidate_id = f"hermes_candidate_artifact_{outcome.run_id.hex}"
+    now = datetime.now(UTC).isoformat()
+    payload: dict[str, object] = {
+        "id": candidate_id,
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": lesson,
+        "summary": f"Artifact review candidate from {workflow}: {evidence_summary}",
+        "user_summary": f"产物复盘形成规则候选：{evidence_summary}",
+        "tags": _unique_tags([workflow, mode, *outcome.agent_ids[:8], *artifact_types]),
+        "weight": min(10, 5 + len(reviewable)),
+        "memory_type": "scheduling_rule",
+        "target": "main_agent",
+        "applies_to_modes": [mode] if mode != "unknown" else [],
+        "confidence": min(0.9, 0.66 + len(reviewable) * 0.03),
+        "noise_risk": 0.25,
+        "candidate_source": "artifact_review",
+        "evidence_summary": evidence_summary,
+        "source_artifact_count": len(reviewable),
+        "source_artifact_types": artifact_types,
+        "source_artifact_ids": artifact_ids,
+        "created_at": now,
+        "run_id": str(outcome.run_id),
+        "conversation_id": outcome.conversation_id,
+        "owner_actor_id": str(outcome.actor_id) if outcome.actor_id is not None else None,
+        "confirmed_at": None,
+        "rejected_at": None,
+        "reviewed_by": None,
+    }
+    return candidate_id, payload
+
+
+def _scheduler_review_candidate(
+    outcome: HermesRunOutcome,
+    *,
+    mode: str,
+    workflow: str,
+    notices: tuple[dict[str, str], ...],
+) -> tuple[str, dict[str, object]]:
+    triggers = _unique_tags(
+        [str(notice.get("trigger", "runtime_failure")) for notice in notices]
+    )[:6]
+    actions = _unique_tags(
+        [str(notice.get("action", "inspect_and_retry")) for notice in notices]
+    )[:6]
+    evidence_summary = (
+        f"复盘 {len(notices)} 条调度告警：{'、'.join(triggers)}；建议动作：{'、'.join(actions)}。"
+    )
+    lesson = (
+        f"When workflow={workflow} mode={mode} reports {','.join(triggers)}, "
+        f"apply {','.join(actions)} before retrying."
+    )
+    candidate_id = f"hermes_candidate_recovery_{outcome.run_id.hex}"
+    payload: dict[str, object] = {
+        "id": candidate_id,
+        "category": "conversation",
+        "outcome": "failure",
+        "lesson": lesson,
+        "summary": f"Scheduler review candidate from {workflow}: {evidence_summary}",
+        "user_summary": f"失败复盘形成修复规则候选：{evidence_summary}",
+        "tags": _unique_tags([workflow, mode, *triggers, *actions]),
+        "weight": min(10, 6 + len(notices)),
+        "memory_type": "error_handling",
+        "target": "main_agent",
+        "applies_to_modes": [mode] if mode != "unknown" else [],
+        "confidence": min(0.9, 0.72 + len(notices) * 0.03),
+        "noise_risk": 0.2,
+        "candidate_source": "scheduler_review",
+        "evidence_summary": evidence_summary,
+        "source_artifact_count": 0,
+        "source_artifact_types": [],
+        "source_artifact_ids": [],
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": str(outcome.run_id),
+        "conversation_id": outcome.conversation_id,
+        "owner_actor_id": str(outcome.actor_id) if outcome.actor_id is not None else None,
+        "confirmed_at": None,
+        "rejected_at": None,
+        "reviewed_by": None,
+    }
+    return candidate_id, payload
+
+
+def _artifact_is_reviewable(artifact: dict[str, object]) -> bool:
+    if artifact.get("producer") == "run_service":
+        return False
+    artifact_type = artifact.get("type")
+    if isinstance(artifact_type, str) and artifact_type != "text":
+        return True
+    content = artifact.get("content")
+    return isinstance(content, Mapping) and any(
+        key in content
+        for key in ("filename", "files", "path", "workspace_file", "download_url", "bundle")
+    )
 
 
 def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id: str | None) -> bool:
@@ -445,8 +619,18 @@ def _lesson_injection_reason(lesson: dict[str, object], score: float) -> str:
 
 
 def _lesson_is_confirmed(lesson: dict[str, object]) -> bool:
+    rejected_at = lesson.get("rejected_at")
+    if isinstance(rejected_at, str) and rejected_at.strip():
+        return False
     confirmed_at = lesson.get("confirmed_at")
     return isinstance(confirmed_at, str) and bool(confirmed_at.strip())
+
+
+def _lesson_is_owned_by(lesson: dict[str, object], actor_id: UUID) -> bool:
+    owner_actor_id = lesson.get("owner_actor_id")
+    if owner_actor_id is None:
+        return lesson.get("tenant_global") is True
+    return isinstance(owner_actor_id, str) and owner_actor_id == str(actor_id)
 
 
 def _lesson_weight(lesson: dict[str, object]) -> int:

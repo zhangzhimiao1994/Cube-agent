@@ -132,6 +132,17 @@ describe("AppShell presentation", () => {
     expect(within(systemDrawer).getByRole("link", { name: "计划任务" }).getAttribute("href")).toBe("/schedules");
   });
 
+  it("merges long-term memory into Hermes instead of a separate resource module", async () => {
+    render(<TestApp initialPath="/resources" />);
+
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
+    const resourceModules = screen.getByRole("list", { name: "资源模块" });
+    expect(within(resourceModules).queryByRole("link", { name: /^记忆/ })).toBeNull();
+
+    const resourceDrawer = screen.getByLabelText("资源二级导航");
+    expect(within(resourceDrawer).queryByRole("link", { name: /^记忆$/ })).toBeNull();
+  });
+
   it("shows tertiary settings navigation without adding primary entries", async () => {
     render(<TestApp initialPath="/evolution" />);
 
