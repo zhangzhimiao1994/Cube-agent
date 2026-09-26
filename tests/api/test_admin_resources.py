@@ -14271,8 +14271,8 @@ async def test_persistent_skill_archives_stay_quarantined_until_approved_and_act
             return True
 
         async def _list_admin_payloads_with_metadata(
-            self, kind: str, **_kwargs: object
-        ) -> list[tuple[str, dict[str, object], datetime, datetime]]:
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
             now = datetime.now(UTC)
             return [
                 (resource_id, dict(payload), now, now)
