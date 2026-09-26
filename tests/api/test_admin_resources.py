@@ -114,7 +114,11 @@ from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
 from agent_hub.settings import Settings
-from agent_hub.skills.sources import SkillSourceFetchRequest, SkillSourceSnapshot
+from agent_hub.skills.sources import (
+    SkillSourceFetchRequest,
+    SkillSourceSnapshot,
+    snapshot_from_archive,
+)
 
 
 class FakeConfigService:
@@ -14892,8 +14896,10 @@ async def test_persistent_skill_source_revision_activation_and_rollback_are_atom
             return {} if row is None else dict(row.payload)
 
         async def _list_admin_payloads_with_metadata(
-            self, kind: str, **_kwargs: object
-        ) -> list[tuple[str, dict[str, object], datetime, datetime]] | None:
+            self, kind: str
+        ) -> list[
+            tuple[str, dict[str, object], datetime | None, datetime | None]
+        ] | None:
             now = datetime.now(UTC)
             return [
                 (item.resource_id, dict(item.payload), now, now)
@@ -15001,9 +15007,9 @@ async def test_single_skill_activation_locks_global_map_before_skill(
     class ActivationService(PersistentAdminResourceService):
         async def _skill_versions_by_name(
             self, skill_name: str
-        ) -> list[admin_router._SkillVersionRecord]:
+        ) -> tuple[admin_router._SkillVersionRecord, ...]:
             assert skill_name == version.name
-            return []
+            return ()
 
     session = ActivationSession()
     service = ActivationService(
@@ -15385,7 +15391,7 @@ async def test_persistent_remote_sync_and_offline_import_share_batch_persistence
     tmp_path: Path,
 ) -> None:
     archive_bytes = skill_source_repository_archive()
-    snapshot = admin_router.snapshot_from_archive(
+    snapshot = snapshot_from_archive(
         SkillSourceFetchRequest(
             repository_url="https://github.com/example/team-skills",
             ref="main",
@@ -15559,8 +15565,10 @@ async def test_revision_management_recovers_files_from_database_active_mapping(
             return dict(payloads.get((kind, resource_id), {}))
 
         async def _list_admin_payloads_with_metadata(
-            self, kind: str, **_kwargs: object
-        ) -> list[tuple[str, dict[str, object], datetime, datetime]] | None:
+            self, kind: str
+        ) -> list[
+            tuple[str, dict[str, object], datetime | None, datetime | None]
+        ] | None:
             now = datetime.now(UTC)
             return [
                 (resource_id, dict(payload), now, now)

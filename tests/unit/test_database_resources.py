@@ -185,7 +185,7 @@ def test_skill_source_revision_migration_updates_and_restores_kind_constraint(
     assert "skill_source_revision" in migration._NEXT_KINDS
     assert "skill_source_revision" not in migration._CURRENT_KINDS
     assert upgrade_calls[-1][0] == "create"
-    assert "skill_source_revision" in upgrade_calls[-1][3]
+    assert "skill_source_revision" in str(upgrade_calls[-1][3])
     assert calls[1] == (
         "execute",
         (
@@ -208,7 +208,7 @@ def test_skill_source_revision_migration_updates_and_restores_kind_constraint(
         "DELETE FROM agent_hub_admin_resources WHERE kind = 'skill_source_revision'",
     )
     assert calls[-1][0] == "create"
-    assert "skill_source_revision" not in calls[-1][3]
+    assert "skill_source_revision" not in str(calls[-1][3])
 
 
 def test_run_conversation_index_covers_filter_and_chronological_order() -> None:
