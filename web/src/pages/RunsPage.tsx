@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -441,6 +441,10 @@ type ChatMessage = {
 type ConversationCheckpoint = {
   anchorId: string;
   artifactCount: number;
+  artifacts: Array<{
+    href: string;
+    label: string;
+  }>;
   href: string;
   id: string;
   label: string;
@@ -2785,6 +2789,39 @@ function conversationTitle(run: RunListItem, items: RunListItem[]) {
   return timestamp ? `${question} · ${timestamp}` : question;
 }
 
+export function conversationMatchesSearch(run: RunListItem, query: string, items: RunListItem[] = [run]) {
+  const tokens = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+  const conversationRuns = run.conversation_id
+    ? items.filter((item) => item.conversation_id === run.conversation_id)
+    : [run];
+  const haystack = [
+    ...conversationRuns.flatMap((item) => [item.request ?? "", item.id]),
+    run.conversation_id ?? "",
+    run.mode,
+    displayMode(run.mode),
+    run.status,
+    displayChatRunStatus(run.status),
+  ]
+    .join(" ")
+    .toLocaleLowerCase();
+  return tokens.every((token) => haystack.includes(token));
+}
+
+export function conversationSelectionIds(items: RunListItem[], query: string) {
+  return items
+    .filter((item) => conversationMatchesSearch(item, query, items) && TERMINAL_STATUSES.has(item.status))
+    .map((item) => item.id);
+}
+
+export function conversationIdFromSearch(search: string) {
+  return new URLSearchParams(search).get("conversation")?.trim() || null;
+}
+
+export function shouldShowModeEntry(search: string) {
+  return conversationIdFromSearch(search) === null;
+}
+
 export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
   const seenDownloadMessages = new Set<string>();
   return orderedConversationRuns(runs).flatMap((run) =>
@@ -2808,27 +2845,100 @@ export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
 export function conversationCheckpoints(messages: ChatMessage[]): ConversationCheckpoint[] {
   return messages
     .filter((message) => message.role === "user" && message.id.endsWith("-request"))
-    .map((message, index) => ({
-      anchorId: chatMessageAnchorId(message.id),
-      artifactCount: messages.filter((candidate) => candidate.run?.id === message.run?.id && candidate.artifact).length,
-      href: `#${chatMessageAnchorId(message.id)}`,
-      id: message.id,
-      label: normalizeConversationQuestion(message.body, `第 ${index + 1} 轮`),
-      index: index + 1,
-    }));
+    .map((message, index) => {
+      const artifacts = messages
+        .filter((candidate) => candidate.run?.id === message.run?.id && candidate.artifact)
+        .map((candidate) => ({
+          href: `#${chatMessageAnchorId(candidate.id)}`,
+          label: artifactDisplayName(candidate.artifact!),
+        }));
+      return {
+        anchorId: chatMessageAnchorId(message.id),
+        artifactCount: artifacts.length,
+        artifacts,
+        href: `#${chatMessageAnchorId(message.id)}`,
+        id: message.id,
+        label: normalizeConversationQuestion(message.body, `第 ${index + 1} 轮`),
+        index: index + 1,
+      };
+    });
 }
 
 function chatMessageAnchorId(messageId: string) {
   return `chat-message-${messageId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 }
 
-export function ConversationCheckpointNav({ checkpoints }: { checkpoints: ConversationCheckpoint[] }) {
+export function scrollToConversationHash(behavior: ScrollBehavior = "smooth") {
+  if (!window.location.hash.startsWith("#chat-message-")) return false;
+  let targetId: string;
+  try {
+    targetId = decodeURIComponent(window.location.hash.slice(1));
+  } catch {
+    return false;
+  }
+  const target = document.getElementById(targetId);
+  if (!target) return false;
+  target.scrollIntoView({ block: "start", behavior });
+  target.tabIndex = -1;
+  target.focus({ preventScroll: true });
+  return true;
+}
+
+function navigateToConversationHash(href: string) {
+  window.history.pushState(null, "", href);
+  scrollToConversationHash();
+}
+
+export function ConversationCheckpointNav({
+  checkpoints,
+  conversationId,
+}: {
+  checkpoints: ConversationCheckpoint[];
+  conversationId?: string;
+}) {
   const [query, setQuery] = useState("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [hashNotice, setHashNotice] = useState<string | null>(null);
+  const checkpointHashKey = checkpoints.map((checkpoint) => checkpoint.anchorId).join("|");
+  useEffect(() => {
+    let attempts = 0;
+    let retryTimer: number | undefined;
+    const restore = () => {
+      if (!window.location.hash.startsWith("#chat-message-")) {
+        setHashNotice(null);
+        return;
+      }
+      if (scrollToConversationHash(attempts === 0 ? "auto" : "smooth")) {
+        setHashNotice(null);
+        return;
+      }
+      attempts += 1;
+      if (attempts < 10) {
+        retryTimer = window.setTimeout(restore, 100);
+      } else {
+        setHashNotice("未找到这个检查点，可能已被删除或尚未加载。");
+      }
+    };
+    const restoreFromHistory = () => {
+      attempts = 0;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      restore();
+    };
+    restore();
+    window.addEventListener("hashchange", restoreFromHistory);
+    window.addEventListener("popstate", restoreFromHistory);
+    return () => {
+      if (retryTimer) window.clearTimeout(retryTimer);
+      window.removeEventListener("hashchange", restoreFromHistory);
+      window.removeEventListener("popstate", restoreFromHistory);
+    };
+  }, [checkpointHashKey]);
   if (checkpoints.length < 2) return null;
   const visibleCheckpoints = checkpoints.filter((checkpoint) =>
     `${checkpoint.index} ${checkpoint.label}`.toLowerCase().includes(query.trim().toLowerCase()),
   );
+  const expandedCheckpoint = checkpoints.find((checkpoint) => checkpoint.id === expandedId) ?? null;
   return (
     <nav className="conversation-checkpoints" aria-label="对话检查点" aria-live="off">
       <div className="conversation-checkpoints-header">
@@ -2853,22 +2963,31 @@ export function ConversationCheckpointNav({ checkpoints }: { checkpoints: Conver
               <button
                 type="button"
                 onClick={() => {
-                  document
-                    .getElementById(checkpoint.anchorId)
-                    ?.scrollIntoView({ block: "start", behavior: "smooth" });
+                  navigateToConversationHash(checkpoint.href);
                 }}
               >
                 <small>{checkpoint.index}</small>
                 <strong>{checkpoint.label}</strong>
-                {checkpoint.artifactCount > 0 ? <em>产物 {checkpoint.artifactCount}</em> : null}
               </button>
+              {checkpoint.artifactCount > 0 ? (
+                <button
+                  type="button"
+                  className="conversation-checkpoint-artifact-toggle"
+                  aria-expanded={expandedId === checkpoint.id}
+                  onClick={() => setExpandedId((current) => current === checkpoint.id ? null : checkpoint.id)}
+                >
+                  产物 {checkpoint.artifactCount}
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="conversation-checkpoint-copy"
                 aria-label={`复制检查点链接：${checkpoint.label}`}
                 onClick={() => {
-                  const link = `${window.location.origin}${window.location.pathname}${window.location.search}${checkpoint.href}`;
-                  void copyTextToClipboard(link)
+                  const link = new URL(window.location.href);
+                  if (conversationId?.trim()) link.searchParams.set("conversation", conversationId.trim());
+                  link.hash = checkpoint.href;
+                  void copyTextToClipboard(link.toString())
                     .then(() => {
                       setCopiedId(checkpoint.id);
                       window.setTimeout(() => setCopiedId(null), 1600);
@@ -2882,6 +3001,27 @@ export function ConversationCheckpointNav({ checkpoints }: { checkpoints: Conver
           ))
         )}
       </div>
+      {expandedCheckpoint ? (
+        <section className="conversation-checkpoint-artifacts" aria-label={`${expandedCheckpoint.label}的关联产物`}>
+          <strong>关联产物</strong>
+          <ul>
+            {expandedCheckpoint.artifacts.map((artifact) => (
+              <li key={`${expandedCheckpoint.id}-${artifact.href}`}>
+                <a
+                  href={artifact.href}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    navigateToConversationHash(artifact.href);
+                  }}
+                >
+                  {artifact.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {hashNotice ? <small role="status" className="conversation-checkpoints-empty">{hashNotice}</small> : null}
     </nav>
   );
 }
@@ -5455,6 +5595,8 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
 export function RunsPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const location = useLocation();
+  const linkedConversationId = conversationIdFromSearch(location.search);
   const runs = useQuery({
     queryKey: ["runs"],
     queryFn: () => api.runs(),
@@ -5477,7 +5619,9 @@ export function RunsPage() {
   const [mode, setMode] = useState<RunMode>("auto");
   const [workflowId, setWorkflowId] = useState("");
   const [agentIds, setAgentIds] = useState<string[]>([]);
-  const [conversationId, setConversationId] = useState(newConversationId);
+  const [conversationId, setConversationId] = useState(
+    () => linkedConversationId ?? newConversationId(),
+  );
   const [projectId, setProjectId] = useState("default");
   const [projectLabel, setProjectLabel] = useState("");
   const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
@@ -5487,8 +5631,9 @@ export function RunsPage() {
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [directModel, setDirectModel] = useState("");
-  const [showModeEntry, setShowModeEntry] = useState(true);
+  const [showModeEntry, setShowModeEntry] = useState(() => shouldShowModeEntry(location.search));
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [conversationSearch, setConversationSearch] = useState("");
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
@@ -5571,6 +5716,7 @@ export function RunsPage() {
   const activeConversationKnown =
     Boolean(selectedRun.data) ||
     Boolean(conversationRunCache[activeConversationId]) ||
+    linkedConversationId === activeConversationId ||
     runListItems.some((run) => run.conversation_id === activeConversationId);
   const activeConversation = useQuery({
     queryKey: ["conversation", activeConversationId],
@@ -5610,6 +5756,12 @@ export function RunsPage() {
     window.addEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
     return () => window.removeEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
   }, []);
+  useEffect(() => {
+    if (!linkedConversationId || linkedConversationId === conversationId) return;
+    setConversationId(linkedConversationId);
+    setSelectedRunId(null);
+    setShowModeEntry(false);
+  }, [conversationId, linkedConversationId]);
   useEffect(() => {
     if (!settings.data) return;
     if (!userSelectedMode.current) {
@@ -6607,6 +6759,7 @@ export function RunsPage() {
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runListItems;
+  const visibleConversationItems = items.filter((item) => conversationMatchesSearch(item, conversationSearch, items));
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const slashCommandSuggestions = slashCommandsForQuery(message);
@@ -6679,9 +6832,7 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
-  const deletableConversationIds = items
-    .filter((run) => TERMINAL_STATUSES.has(run.status))
-    .map((run) => run.id);
+  const deletableConversationIds = conversationSelectionIds(items, conversationSearch);
   const selectedDeletableConversationIds = selectedConversationIds.filter((id) =>
     deletableConversationIds.includes(id),
   );
@@ -6765,7 +6916,9 @@ export function RunsPage() {
           <div className="conversation-list-header">
             <div>
               <h3>会话</h3>
-              <span>{items.length} 条</span>
+              <span>
+                {conversationSearch.trim() ? `${visibleConversationItems.length}/${items.length}` : items.length} 条
+              </span>
             </div>
             <div className="conversation-list-actions">
               <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
@@ -6776,6 +6929,14 @@ export function RunsPage() {
               </button>
             </div>
           </div>
+          <input
+            type="search"
+            className="conversation-history-search"
+            aria-label="搜索历史会话"
+            placeholder="搜索最近会话、问题或 ID"
+            value={conversationSearch}
+            onChange={(event) => setConversationSearch(event.target.value)}
+          />
           {items.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
@@ -6786,7 +6947,7 @@ export function RunsPage() {
                   disabled={deletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                   onChange={toggleAllConversations}
                 />
-                全选可删
+                全选当前结果
               </label>
               <button
                 type="button"
@@ -6802,8 +6963,10 @@ export function RunsPage() {
           ) : null}
           {items.length === 0 ? (
             <p className="field-help">还没有会话。直接发送消息即可开始。</p>
+          ) : visibleConversationItems.length === 0 ? (
+            <p className="field-help">没有匹配的历史会话。</p>
           ) : (
-            items.map((run) => {
+            visibleConversationItems.map((run) => {
               const canDelete = TERMINAL_STATUSES.has(run.status);
               const title = conversationTitle(run, items);
               return (
@@ -7072,7 +7235,7 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
-            <ConversationCheckpointNav checkpoints={checkpoints} />
+            <ConversationCheckpointNav checkpoints={checkpoints} conversationId={activeConversationId} />
             {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
@@ -7160,7 +7323,7 @@ export function RunsPage() {
               <Fragment key={item.id}>
                 <article
                   className={`chat-message ${item.role}`}
-                  id={item.role === "user" ? chatMessageAnchorId(item.id) : undefined}
+                  id={chatMessageAnchorId(item.id)}
                 >
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>

@@ -8,6 +8,9 @@ import type { RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
+  conversationIdFromSearch,
+  conversationMatchesSearch,
+  conversationSelectionIds,
   conversationCheckpoints,
   conversationWorkspaceFiles,
   conversationMessages,
@@ -18,6 +21,8 @@ import {
   runDetailVersion,
   runProcessItems,
   slashCommandsForQuery,
+  shouldShowModeEntry,
+  scrollToConversationHash,
   processDetailValuePresentation,
   workbenchFileItems,
   workbenchActionDescriptor,
@@ -90,6 +95,42 @@ describe("runDetailVersion", () => {
 });
 
 describe("conversation ordering", () => {
+  it("searches conversation history by question, id, mode, and status", () => {
+    const run = {
+      ...baseRun,
+      conversation_id: "conv-office-search",
+      request: "构建 Office 文档搜索插件",
+      mode: "hybrid",
+      status: "completed",
+    };
+
+    const followUp = { ...run, id: "follow-up", request: "继续完善移动端预览" };
+
+    expect(conversationMatchesSearch(run, "Office 搜索", [run, followUp])).toBe(true);
+    expect(conversationMatchesSearch(run, "conv-office", [run, followUp])).toBe(true);
+    expect(conversationMatchesSearch(run, "混合 已完成", [run, followUp])).toBe(true);
+    expect(conversationMatchesSearch(run, "移动端预览", [run, followUp])).toBe(true);
+    expect(conversationMatchesSearch(run, "支付网关", [run, followUp])).toBe(false);
+  });
+
+  it("limits bulk conversation selection to visible terminal search results", () => {
+    const items = [
+      { ...baseRun, id: "office", conversation_id: "conv-office", request: "Office 搜索", status: "completed" },
+      { ...baseRun, id: "mobile", conversation_id: "conv-mobile", request: "移动端预览", status: "failed" },
+      { ...baseRun, id: "running", conversation_id: "conv-running", request: "Office 运行中", status: "running" },
+    ];
+
+    expect(conversationSelectionIds(items, "Office")).toEqual(["office"]);
+    expect(conversationSelectionIds(items, "")).toEqual(["office", "mobile"]);
+  });
+
+  it("restores a linked conversation id from the URL query", () => {
+    expect(conversationIdFromSearch("?conversation=conv-office-search")).toBe("conv-office-search");
+    expect(conversationIdFromSearch("?conversation=%20%20")).toBeNull();
+    expect(shouldShowModeEntry("?conversation=conv-office-search")).toBe(false);
+    expect(shouldShowModeEntry("")).toBe(true);
+  });
+
   it("renders conversation turns by run creation time even when incoming data is out of order", () => {
     const laterRun: RunDetail = {
       ...baseRun,
@@ -271,6 +312,7 @@ describe("conversation ordering", () => {
         id: "11111111-1111-4111-8111-111111111111-request",
         anchorId: "chat-message-11111111-1111-4111-8111-111111111111-request",
         artifactCount: 0,
+        artifacts: [],
         href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
         label: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并...",
         index: 1,
@@ -279,6 +321,7 @@ describe("conversation ordering", () => {
         id: "33333333-3333-4333-8333-333333333333-request",
         anchorId: "chat-message-33333333-3333-4333-8333-333333333333-request",
         artifactCount: 0,
+        artifacts: [],
         href: "#chat-message-33333333-3333-4333-8333-333333333333-request",
         label: "继续优化 UI 交互，重点检查文件预览和配置页面",
         index: 2,
@@ -325,25 +368,52 @@ describe("conversation ordering", () => {
 
     expect(checkpoints[0]).toMatchObject({
       artifactCount: 1,
+      artifacts: [
+        {
+          href: "#chat-message-11111111-1111-4111-8111-111111111111-artifact-plan",
+          label: "plan.md",
+        },
+      ],
       href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
     });
 
-    render(<ConversationCheckpointNav checkpoints={checkpoints} />);
+    render(<ConversationCheckpointNav checkpoints={checkpoints} conversationId="conv-checkpoints" />);
 
     expect(screen.getByRole("searchbox", { name: "搜索对话检查点" })).not.toBeNull();
     expect(screen.getByText("产物 1")).not.toBeNull();
+
+    await userEvent.click(screen.getByText("产物 1"));
+    expect(screen.getByRole("link", { name: "plan.md" })).not.toBeNull();
 
     await userEvent.click(screen.getByRole("button", { name: /复制检查点链接：第一轮做计划/ }));
 
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
-        expect.stringContaining("#chat-message-11111111-1111-4111-8111-111111111111-request"),
+        expect.stringContaining("?conversation=conv-checkpoints#chat-message-11111111-1111-4111-8111-111111111111-request"),
       ),
     );
 
     await userEvent.type(screen.getByRole("searchbox", { name: "搜索对话检查点" }), "第二轮");
     expect(screen.queryByText("第一轮做计划")).toBeNull();
     expect(screen.getByText("第二轮检查 UI")).not.toBeNull();
+  });
+
+  it("restores a conversation checkpoint from the current URL hash", () => {
+    const target = document.createElement("div");
+    target.id = "chat-message-deep-link";
+    const scrollIntoView = vi.fn();
+    const focus = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+    target.focus = focus;
+    document.body.append(target);
+    window.history.replaceState(null, "", "/runs#chat-message-deep-link");
+
+    expect(scrollToConversationHash("auto")).toBe(true);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "start", behavior: "auto" });
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+
+    target.remove();
+    window.history.replaceState(null, "", "/runs");
   });
 
   it("orders process cards by event sequence when backend events arrive out of order", () => {
