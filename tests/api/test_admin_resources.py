@@ -51,6 +51,7 @@ from agent_hub.api.routers.admin import (
     RunEventResponse,
     SecretCreateRequest,
     SecretReferenceResponse,
+    SkillSourceProvenanceResponse,
     SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
@@ -113,6 +114,7 @@ from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
 from agent_hub.settings import Settings
+from agent_hub.skills.sources import SkillSourceFetchRequest, SkillSourceSnapshot
 
 
 class FakeConfigService:
@@ -14084,6 +14086,269 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert skills.json()[0]["id"] == item["id"]
 
 
+def test_skill_source_requires_trust_and_syncs_candidate_without_switching_current() -> None:
+    class FakeSkillSourceFetcher:
+        def __init__(self) -> None:
+            self.requests: list[SkillSourceFetchRequest] = []
+
+        async def fetch(self, request: SkillSourceFetchRequest) -> SkillSourceSnapshot:
+            self.requests.append(request)
+            return SkillSourceSnapshot(
+                repository_url=request.repository_url,
+                commit_sha="a" * 40,
+                archive_sha256="b" * 64,
+                source_archive_bytes=1234,
+                skill_archive=skill_archive_variant(entry_body="print('team source')\n"),
+            )
+
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    fetcher = FakeSkillSourceFetcher()
+    service.skill_source_fetcher = fetcher
+
+    current = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('current')\n"),
+    ).json()["items"][0]
+    api.post(f"/api/v1/admin/skills/{current['id']}/approve", headers=headers())
+    created = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "name": "团队安全技能",
+            "repository_url": "https://github.com/example/security-skills",
+            "ref": "main",
+            "subdirectory": "skills",
+        },
+    )
+
+    assert created.status_code == 200
+    source = created.json()
+    assert source["trust_state"] == "untrusted"
+    blocked = api.post(f"/api/v1/admin/skill-sources/{source['id']}/sync", headers=headers())
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "skill_source_untrusted"
+
+    trusted = api.post(
+        f"/api/v1/admin/skill-sources/{source['id']}/trust",
+        headers=headers(),
+        json={"reason": "已审查仓库所有者和内容"},
+    )
+    synced = api.post(f"/api/v1/admin/skill-sources/{source['id']}/sync", headers=headers())
+    skills = api.get("/api/v1/admin/skills", headers=headers()).json()
+
+    assert trusted.status_code == 200
+    assert trusted.json()["trust_state"] == "trusted"
+    assert synced.status_code == 200
+    synced_body = synced.json()
+    assert synced_body["source"]["resolved_commit_sha"] == "a" * 40
+    assert synced_body["source"]["archive_sha256"] == "b" * 64
+    candidate = synced_body["upload"]["items"][0]
+    assert candidate["status"] == "scanned"
+    assert candidate["source"]["source_id"] == source["id"]
+    assert candidate["source"]["commit_sha"] == "a" * 40
+    assert skills[0]["current_version_id"] == current["id"]
+    assert fetcher.requests[0].subdirectory == "skills"
+
+
+def test_skill_source_update_revoke_delete_and_listing() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": "team-source",
+            "name": "团队技能",
+            "repository_url": "https://github.com/example/team-skills",
+            "credential_ref": f"secret://{SECRET_ID}",
+        },
+    )
+    updated = api.patch(
+        "/api/v1/admin/skill-sources/team-source",
+        headers=headers(),
+        json={"ref": "release/v2", "enabled": False},
+    )
+    trusted = api.post(
+        "/api/v1/admin/skill-sources/team-source/trust",
+        headers=headers(),
+        json={"reason": "首次审查通过"},
+    )
+    revoked = api.post(
+        "/api/v1/admin/skill-sources/team-source/revoke-trust",
+        headers=headers(),
+        json={"reason": "仓库权限发生变化"},
+    )
+    listed = api.get("/api/v1/admin/skill-sources", headers=headers())
+    deleted = api.delete("/api/v1/admin/skill-sources/team-source", headers=headers())
+
+    assert created.status_code == 200
+    assert created.json()["has_credential"] is True
+    assert "credential_ref" not in created.json()
+    assert updated.status_code == 200
+    assert updated.json()["ref"] == "release/v2"
+    assert updated.json()["enabled"] is False
+    assert trusted.json()["trust_state"] == "trusted"
+    assert revoked.json()["trust_state"] == "revoked"
+    assert [item["id"] for item in listed.json()] == ["team-source"]
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_skill_source_sync_cannot_restore_revoked_trust() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingFetcher:
+        async def fetch(self, request: SkillSourceFetchRequest) -> SkillSourceSnapshot:
+            started.set()
+            await release.wait()
+            return SkillSourceSnapshot(
+                repository_url=request.repository_url,
+                commit_sha="a" * 40,
+                archive_sha256="b" * 64,
+                source_archive_bytes=1234,
+                skill_archive=skill_archive_variant(entry_body="print('candidate')\n"),
+            )
+
+    service = InMemoryAdminResourceService()
+    service.skill_source_fetcher = BlockingFetcher()
+    source = await service.create_skill_source(
+        admin_router.SkillSourceCreateRequest(
+            id="race-source",
+            name="竞态来源",
+            repository_url="https://github.com/example/team-skills",
+        )
+    )
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=True,
+        reason="初次审核",
+        actor=str(ACTOR_ID),
+    )
+
+    sync_task = asyncio.create_task(service.sync_skill_source(source.id))
+    await started.wait()
+    await service.set_skill_source_trust(
+        source.id,
+        trusted=False,
+        reason="同步期间撤销",
+        actor=str(ACTOR_ID),
+    )
+    release.set()
+
+    with pytest.raises(PublicAPIError) as error:
+        await sync_task
+    assert error.value.code == "skill_source_sync_stale"
+    assert service.skill_sources[source.id].trust_state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_archives_stay_quarantined_until_approved_and_activated(
+    tmp_path: Path,
+) -> None:
+    class PersistentSkillHarness(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> dict[str, object] | None:
+            return dict(self.payloads.get((kind, resource_id), {}))
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: Mapping[str, object], **_kwargs: object
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str, **_kwargs: object
+        ) -> list[tuple[str, dict[str, object], datetime, datetime]]:
+            now = datetime.now(UTC)
+            return [
+                (resource_id, dict(payload), now, now)
+                for (payload_kind, resource_id), payload in self.payloads.items()
+                if payload_kind == kind
+            ]
+
+        async def _active_skill_versions(self) -> dict[str, str]:
+            return dict(self.skill_active_versions)
+
+        async def _record_audit(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    service = PersistentSkillHarness()
+    first = (
+        await service.upload_skill_archive(
+            "safe-skill.zip",
+            skill_archive_variant(entry_body="print('current')\n"),
+        )
+    ).items[0]
+    tenant_root = tmp_path / str(TENANT_ID)
+
+    assert not (tenant_root / f"{first.id}.zip").exists()
+    assert (tenant_root / "quarantine" / f"{first.id}.zip").is_file()
+
+    approved_first = await service.approve_skill(first.id)
+    assert approved_first.status == "enabled"
+    assert (tenant_root / f"{first.id}.zip").is_file()
+    assert service.skill_active_versions[first.name] == first.id
+
+    provenance = SkillSourceProvenanceResponse(
+        source_id="team-source",
+        sync_id="sync-1",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        commit_sha="a" * 40,
+        source_path="skills",
+        archive_sha256="b" * 64,
+        synced_at=datetime.now(UTC),
+    )
+    candidate = (
+        await service.upload_skill_archive(
+            "team-source.zip",
+            skill_archive_variant(entry_body="print('candidate')\n"),
+            strategy="new_version",
+            source=provenance,
+            activate=False,
+        )
+    ).items[0]
+    await service.approve_skill(candidate.id)
+
+    assert not (tenant_root / f"{candidate.id}.zip").exists()
+    assert (tenant_root / "approved" / f"{candidate.id}.zip").is_file()
+    assert service.skill_active_versions[first.name] == first.id
+
+    activated = await service.activate_skill_version(candidate.id, candidate.id)
+    assert activated.current_version_id == candidate.id
+    assert (tenant_root / f"{candidate.id}.zip").is_file()
+    assert not (tenant_root / f"{first.id}.zip").exists()
+
+    tampered = (
+        await service.upload_skill_archive(
+            "tampered.zip",
+            skill_archive_variant(entry_body="print('tampered')\n"),
+            strategy="new_version",
+            source=provenance,
+            activate=False,
+        )
+    ).items[0]
+    tampered_path = tenant_root / "quarantine" / f"{tampered.id}.zip"
+    tampered_path.write_bytes(tampered_path.read_bytes() + b"changed-container-metadata")
+    with pytest.raises(PublicAPIError) as error:
+        await service.approve_skill(tampered.id)
+    assert error.value.code == "skill_archive_changed"
+
+
 def test_skill_archive_upload_requires_choice_for_same_name_new_content() -> None:
     api = client()
 
@@ -14122,6 +14387,10 @@ def test_skill_archive_upload_overwrites_same_name_when_requested() -> None:
         headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
         content=skill_archive_variant(entry_body="print('two')\n"),
     )
+    api.post(
+        f"/api/v1/admin/skills/{overwritten.json()['items'][0]['id']}/approve",
+        headers=headers(),
+    )
     skills = api.get("/api/v1/admin/skills", headers=headers())
 
     assert first.status_code == 200
@@ -14155,6 +14424,10 @@ def test_skill_archive_upload_saves_same_name_as_new_version_when_requested() ->
         headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill-copy.zip"},
         content=skill_archive_variant(entry_body="print('two')\n"),
     )
+    api.post(
+        f"/api/v1/admin/skills/{second.json()['items'][0]['id']}/approve",
+        headers=headers(),
+    )
     skills = api.get("/api/v1/admin/skills", headers=headers())
 
     assert first.status_code == 200
@@ -14187,6 +14460,15 @@ def test_skill_version_activation_switches_current_version() -> None:
         headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
         content=skill_archive_variant(entry_body="print('two')\n"),
     ).json()["items"][0]
+
+    blocked = api.post(
+        f"/api/v1/admin/skills/{second['id']}/versions/{first['id']}/activate",
+        headers=headers(),
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "skill_version_not_approved"
+
+    api.post(f"/api/v1/admin/skills/{first['id']}/approve", headers=headers())
 
     activated = api.post(
         f"/api/v1/admin/skills/{second['id']}/versions/{first['id']}/activate",

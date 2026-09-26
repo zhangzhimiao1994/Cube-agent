@@ -46,6 +46,82 @@ describe("formatApiError", () => {
 });
 
 describe("api client transport", () => {
+  it("supports the complete team Skill source lifecycle", async () => {
+    const source = {
+      id: "team-skills",
+      name: "团队技能库",
+      repository_url: "https://github.com/example/team-skills",
+      ref: "main",
+      subdirectory: "skills",
+      enabled: true,
+      credential_ref: null,
+      expected_archive_sha256: null,
+      trust_state: "untrusted",
+      trusted_by: null,
+      trusted_at: null,
+      trust_reason: "",
+      sync_state: "never",
+      last_sync_id: null,
+      resolved_commit_sha: null,
+      archive_sha256: null,
+      source_archive_bytes: null,
+      last_synced_at: null,
+      last_error: null,
+      linked_skill_ids: [],
+    };
+    const response = (payload: unknown) =>
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response([source]))
+      .mockResolvedValueOnce(response(source))
+      .mockResolvedValueOnce(response({ ...source, name: "研发技能库" }))
+      .mockResolvedValueOnce(response({ ...source, trust_state: "trusted" }))
+      .mockResolvedValueOnce(response({ ...source, trust_state: "revoked" }))
+      .mockResolvedValueOnce(
+        response({
+          source: { ...source, sync_state: "succeeded", linked_skill_ids: ["repo-review"] },
+          upload: { filename: "team-skills.zip", bundle: true, items: [], skipped: [] },
+        }),
+      )
+      .mockResolvedValueOnce(response({ status: "deleted" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.skillSources();
+    await api.createSkillSource({
+      name: "团队技能库",
+      repository_url: source.repository_url,
+      ref: "main",
+      subdirectory: "skills",
+      enabled: true,
+      credential_ref: null,
+      expected_archive_sha256: null,
+    });
+    await api.updateSkillSource("team-skills", { name: "研发技能库", enabled: false });
+    await api.trustSkillSource("team-skills", "已核验仓库所有者");
+    await api.revokeSkillSourceTrust("team-skills", "仓库权限已变更");
+    await api.syncSkillSource("team-skills");
+    await api.deleteSkillSource("team-skills");
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/^\/api\/v1\/admin\/skill-sources\?_/);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/v1/admin/skill-sources",
+      expect.objectContaining({ method: "POST", body: expect.stringContaining('"repository_url":"https://github.com/example/team-skills"') }),
+    ]);
+    expect(fetchMock.mock.calls[2]).toEqual([
+      "/api/v1/admin/skill-sources/team-skills",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ name: "研发技能库", enabled: false }) }),
+    ]);
+    expect(fetchMock.mock.calls[3]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/trust");
+    expect(fetchMock.mock.calls[3]?.[1]).toEqual(expect.objectContaining({ body: JSON.stringify({ reason: "已核验仓库所有者" }) }));
+    expect(fetchMock.mock.calls[4]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/revoke-trust");
+    expect(fetchMock.mock.calls[5]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/sync");
+    expect(fetchMock.mock.calls[6]?.[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+  });
+
   it("accepts metadata-only responses when creating and updating conversations", async () => {
     const created = {
       conversation_id: "conv-project",

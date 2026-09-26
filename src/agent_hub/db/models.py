@@ -468,7 +468,7 @@ class AdminResourceRow(Base):
             name="uq_agent_hub_admin_resources_tenant_kind_resource",
         ),
         CheckConstraint(
-            "kind IN ('workflow', 'agent', 'main_agent', 'skill', 'mcp', 'memory', 'hermes', 'audit', 'log', 'setting', 'channel', 'openclaw', 'openclaw_session', 'schedule', 'evolution', 'plugin', 'plugin_signing_key', 'capability_install')",
+            "kind IN ('workflow', 'agent', 'main_agent', 'skill', 'skill_source', 'mcp', 'memory', 'hermes', 'audit', 'log', 'setting', 'channel', 'openclaw', 'openclaw_session', 'schedule', 'evolution', 'plugin', 'plugin_signing_key', 'capability_install')",
             name="ck_agent_hub_admin_resources_kind",
         ),
         Index("ix_agent_hub_admin_resources_tenant_kind", "tenant_id", "kind"),

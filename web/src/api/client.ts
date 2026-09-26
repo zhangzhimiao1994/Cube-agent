@@ -948,14 +948,27 @@ const WorkspaceFileListSchema = z.object({
 export type WorkspaceFile = z.infer<typeof WorkspaceFileSchema>;
 export type WorkspaceFileList = z.infer<typeof WorkspaceFileListSchema>;
 
+const SkillSourceProvenanceSchema = z.object({
+  source_id: z.string(),
+  sync_id: z.string(),
+  repository_url: z.string(),
+  ref: z.string(),
+  commit_sha: z.string(),
+  source_path: z.string().nullable().optional(),
+  archive_sha256: z.string(),
+  synced_at: z.string(),
+});
+
 const SkillVersionSchema = z.object({
   id: z.string(),
+  status: z.string().optional().default("unknown"),
   source_filename: z.string().nullable().optional(),
   package_version_id: z.string().nullable().optional(),
   content_sha256: z.string().nullable().optional(),
   created_at: z.string().nullable().optional(),
   updated_at: z.string().nullable().optional(),
   is_current: z.boolean(),
+  source: SkillSourceProvenanceSchema.nullable().optional(),
 });
 
 const SkillSchema = z.object({
@@ -969,10 +982,54 @@ const SkillSchema = z.object({
   content_sha256: z.string().nullable().optional(),
   current_version_id: z.string().nullable().optional(),
   versions: z.array(SkillVersionSchema).optional().default([]),
+  source: SkillSourceProvenanceSchema.nullable().optional(),
 });
 
 export type Skill = z.infer<typeof SkillSchema>;
 export type SkillVersion = z.infer<typeof SkillVersionSchema>;
+export type SkillSourceProvenance = z.infer<typeof SkillSourceProvenanceSchema>;
+
+const SkillSourceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  repository_url: z.string(),
+  ref: z.string(),
+  subdirectory: z.string().default(""),
+  enabled: z.boolean().default(true),
+  credential_ref: z.string().nullable().optional(),
+  has_credential: z.boolean().default(false),
+  expected_archive_sha256: z.string().nullable().optional(),
+  trust_state: z.enum(["untrusted", "trusted", "revoked"]).default("untrusted"),
+  trusted_by: z.string().nullable().optional(),
+  trusted_at: z.string().nullable().optional(),
+  trust_reason: z.string().default(""),
+  sync_state: z.enum(["never", "syncing", "succeeded", "failed"]).default("never"),
+  last_sync_id: z.string().nullable().optional(),
+  resolved_commit_sha: z.string().nullable().optional(),
+  archive_sha256: z.string().nullable().optional(),
+  source_archive_bytes: z.number().nullable().optional(),
+  last_synced_at: z.string().nullable().optional(),
+  last_error: z.string().nullable().optional(),
+  linked_skill_ids: z.array(z.string()).default([]),
+});
+
+export type SkillSource = z.infer<typeof SkillSourceSchema>;
+export type SkillSourceCreateInput = {
+  id?: string;
+  name: string;
+  repository_url: string;
+  ref?: string;
+  subdirectory?: string;
+  enabled?: boolean;
+  credential_ref?: string | null;
+  expected_archive_sha256?: string | null;
+};
+export type SkillSourceUpdateInput = Partial<
+  Pick<
+    SkillSourceCreateInput,
+    "name" | "ref" | "subdirectory" | "enabled" | "credential_ref" | "expected_archive_sha256"
+  >
+>;
 
 const SkillBulkDeleteSchema = z.object({
   deleted: z.array(z.string()),
@@ -994,6 +1051,13 @@ const SkillArchiveUploadSchema = z.object({
 });
 
 export type SkillArchiveUpload = z.infer<typeof SkillArchiveUploadSchema>;
+
+const SkillSourceSyncSchema = z.object({
+  source: SkillSourceSchema,
+  upload: SkillArchiveUploadSchema,
+});
+
+export type SkillSourceSync = z.infer<typeof SkillSourceSyncSchema>;
 
 const AttachmentUploadSchema = z.object({
   id: z.string(),
@@ -2395,6 +2459,51 @@ export const api = {
   },
   skills(): Promise<Skill[]> {
     return request("/api/v1/admin/skills", { method: "GET" }, z.array(SkillSchema));
+  },
+  skillSources(): Promise<SkillSource[]> {
+    return request("/api/v1/admin/skill-sources", { method: "GET" }, z.array(SkillSourceSchema));
+  },
+  createSkillSource(payload: SkillSourceCreateInput): Promise<SkillSource> {
+    return request(
+      "/api/v1/admin/skill-sources",
+      { method: "POST", body: JSON.stringify(payload) },
+      SkillSourceSchema,
+    );
+  },
+  updateSkillSource(id: string, payload: SkillSourceUpdateInput): Promise<SkillSource> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+      SkillSourceSchema,
+    );
+  },
+  trustSkillSource(id: string, reason: string): Promise<SkillSource> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/trust`,
+      { method: "POST", body: JSON.stringify({ reason }) },
+      SkillSourceSchema,
+    );
+  },
+  revokeSkillSourceTrust(id: string, reason: string): Promise<SkillSource> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/revoke-trust`,
+      { method: "POST", body: JSON.stringify({ reason }) },
+      SkillSourceSchema,
+    );
+  },
+  syncSkillSource(id: string): Promise<SkillSourceSync> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/sync`,
+      { method: "POST" },
+      SkillSourceSyncSchema,
+    );
+  },
+  deleteSkillSource(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
+    );
   },
   uploadSkill(filename: string): Promise<Skill> {
     return request(

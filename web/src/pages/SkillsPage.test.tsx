@@ -32,6 +32,7 @@ const skills = [
     versions: [
       {
         id: "version-1",
+        status: "enabled",
         source_filename: "deep-research-v1.zip",
         package_version_id: "pkg-v1",
         content_sha256: "sha256-old",
@@ -40,11 +41,41 @@ const skills = [
       },
       {
         id: "version-2",
+        status: "enabled",
         source_filename: "deep-research.zip",
         package_version_id: "pkg-v2",
         content_sha256: "sha256-current",
         created_at: "2026-08-15T01:00:00Z",
         is_current: true,
+        source: {
+          source_id: "team-skills",
+          sync_id: "sync-12",
+          repository_url: "https://github.com/example/team-skills",
+          ref: "main",
+          commit_sha: "1234567890abcdef1234567890abcdef12345678",
+          source_path: "skills/deep-research",
+          archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+          synced_at: "2026-08-15T01:00:00Z",
+        },
+      },
+      {
+        id: "version-3",
+        status: "scanned",
+        source_filename: "deep-research-source.zip",
+        package_version_id: "pkg-v3",
+        content_sha256: "sha256-candidate",
+        created_at: "2026-08-16T01:00:00Z",
+        is_current: false,
+        source: {
+          source_id: "team-skills",
+          sync_id: "sync-13",
+          repository_url: "https://github.com/example/team-skills",
+          ref: "main",
+          commit_sha: "abcdef1234567890abcdef1234567890abcdef12",
+          source_path: "skills/deep-research",
+          archive_sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+          synced_at: "2026-08-16T01:00:00Z",
+        },
       },
     ],
   },
@@ -61,6 +92,31 @@ const skills = [
     status: "enabled",
     scan_diff: [],
     requested_permissions: [],
+  },
+];
+
+const skillSources = [
+  {
+    id: "team-skills",
+    name: "团队技能库",
+    repository_url: "https://github.com/example/team-skills",
+    ref: "main",
+    subdirectory: "skills",
+    enabled: true,
+    credential_ref: null,
+    expected_archive_sha256: null,
+    trust_state: "trusted",
+    trusted_by: owner.id,
+    trusted_at: "2026-08-15T00:00:00Z",
+    trust_reason: "已核验团队仓库",
+    sync_state: "succeeded",
+    last_sync_id: "sync-12",
+    resolved_commit_sha: "1234567890abcdef1234567890abcdef12345678",
+    archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    source_archive_bytes: 4096,
+    last_synced_at: "2026-08-15T01:00:00Z",
+    last_error: null,
+    linked_skill_ids: ["deep-research"],
   },
 ];
 
@@ -86,6 +142,31 @@ describe("SkillsPage", () => {
         }
         if (path === "/api/v1/admin/skills" && (!init?.method || init.method === "GET")) {
           return jsonResponse(skills);
+        }
+        if (path === "/api/v1/admin/skill-sources" && (!init?.method || init.method === "GET")) {
+          return jsonResponse(skillSources);
+        }
+        if (path === "/api/v1/admin/skill-sources" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          return jsonResponse({ ...skillSources[0], id: "new-source", ...body, trust_state: "untrusted", sync_state: "never", linked_skill_ids: [] });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills" && init?.method === "PATCH") {
+          return jsonResponse({ ...skillSources[0], ...JSON.parse(String(init.body)) });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/trust" && init?.method === "POST") {
+          return jsonResponse({ ...skillSources[0], trust_state: "trusted", trust_reason: JSON.parse(String(init.body)).reason });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/revoke-trust" && init?.method === "POST") {
+          return jsonResponse({ ...skillSources[0], trust_state: "revoked", trust_reason: JSON.parse(String(init.body)).reason });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/sync" && init?.method === "POST") {
+          return jsonResponse({
+            source: skillSources[0],
+            upload: { filename: "team-skills.zip", bundle: true, items: [skills[0]], skipped: [] },
+          });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills" && init?.method === "DELETE") {
+          return jsonResponse({ status: "deleted" });
         }
         if (pathWithSearch === "/api/v1/admin/skills/upload" && init?.method === "POST") {
           const filename = (init.headers as Record<string, string>)["X-Agent-Hub-Skill-Filename"];
@@ -294,6 +375,66 @@ describe("SkillsPage", () => {
     });
     expect(await screen.findByText(/已创建进化任务：创建 自媒体视频 Skill/)).not.toBeNull();
   });
+
+  it("manages trusted team Skill sources and shows sync provenance", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    vi.spyOn(window, "prompt")
+      .mockReturnValueOnce("重新核验团队仓库")
+      .mockReturnValueOnce("暂停信任等待复核");
+    render(<TestApp initialPath="/skills" />);
+
+    const sourceRegion = await screen.findByRole("region", { name: "团队 Skill 来源" });
+    expect(await within(sourceRegion).findByText("团队技能库")).not.toBeNull();
+    expect(within(sourceRegion).getByText("已信任")).not.toBeNull();
+    expect(within(sourceRegion).getByText("同步成功")).not.toBeNull();
+    expect(within(sourceRegion).getByText(/1234567890ab/)).not.toBeNull();
+    expect(within(sourceRegion).getByText(/deep-research/)).not.toBeNull();
+    expect(within(sourceRegion).getByText(/同步只生成待审批候选/)).not.toBeNull();
+    expect(await screen.findByText(/来源提交：1234567890ab/)).not.toBeNull();
+
+    await user.clear(within(sourceRegion).getByLabelText("来源名称"));
+    await user.type(within(sourceRegion).getByLabelText("来源名称"), "产品技能库");
+    await user.clear(within(sourceRegion).getByLabelText("GitHub 仓库地址"));
+    await user.type(within(sourceRegion).getByLabelText("GitHub 仓库地址"), "https://github.com/example/product-skills");
+    await user.click(within(sourceRegion).getByRole("button", { name: "注册来源" }));
+
+    await user.click(within(sourceRegion).getByRole("button", { name: "编辑团队技能库" }));
+    await user.clear(within(sourceRegion).getByLabelText("来源名称"));
+    await user.type(within(sourceRegion).getByLabelText("来源名称"), "研发技能库");
+    await user.click(within(sourceRegion).getByRole("button", { name: "保存来源" }));
+    await user.click(within(sourceRegion).getByRole("button", { name: "重新信任团队技能库" }));
+    await user.click(within(sourceRegion).getByRole("button", { name: "撤销信任团队技能库" }));
+    await user.click(within(sourceRegion).getByRole("button", { name: "同步团队技能库" }));
+    await user.click(within(sourceRegion).getByRole("button", { name: "删除团队技能库" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources",
+        expect.objectContaining({ method: "POST" }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources/team-skills",
+        expect.objectContaining({ method: "PATCH", body: expect.stringContaining('"name":"研发技能库"') }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources/team-skills/trust",
+        expect.objectContaining({ body: JSON.stringify({ reason: "重新核验团队仓库" }) }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources/team-skills/revoke-trust",
+        expect.objectContaining({ body: JSON.stringify({ reason: "暂停信任等待复核" }) }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources/team-skills/sync",
+        expect.objectContaining({ method: "POST" }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skill-sources/team-skills",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+  });
   it("supports selecting multiple skills and approving them in one action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<TestApp initialPath="/skills" />);
@@ -371,9 +512,10 @@ describe("SkillsPage", () => {
     await screen.findByRole("heading", { name: "技能管理" });
     await userEvent.type(screen.getByRole("textbox", { name: "按 Skill 请求权限筛选" }), "filesystem");
 
-    expect(screen.getByText("docx")).not.toBeNull();
-    expect(screen.queryByText("deep-research")).toBeNull();
-    expect(screen.queryByText("pdf")).toBeNull();
+    const table = screen.getByRole("table", { name: "已上传 Skill" });
+    expect(within(table).getByText("docx")).not.toBeNull();
+    expect(within(table).queryByText("deep-research")).toBeNull();
+    expect(within(table).queryByText("pdf")).toBeNull();
     expect(screen.getByText("显示 1 / 3")).not.toBeNull();
   });
 
@@ -452,8 +594,20 @@ describe("SkillsPage", () => {
     const deepResearchRow = within(table).getByText("deep-research").closest("tr");
     expect(deepResearchRow).not.toBeNull();
     expect(within(deepResearchRow as HTMLTableRowElement).getByText(/当前版本：version-2/)).not.toBeNull();
-    expect(within(deepResearchRow as HTMLTableRowElement).getByText(/版本数：2/)).not.toBeNull();
+    expect(within(deepResearchRow as HTMLTableRowElement).getByText(/版本数：3/)).not.toBeNull();
     expect(within(deepResearchRow as HTMLTableRowElement).getByText(/deep-research.zip/)).not.toBeNull();
+
+    await user.click(
+      within(deepResearchRow as HTMLTableRowElement).getByRole("button", {
+        name: "审批版本 version-3",
+      }),
+    );
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/version-3/approve",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
 
     await user.click(within(deepResearchRow as HTMLTableRowElement).getByRole("button", { name: "激活 version-1" }));
 

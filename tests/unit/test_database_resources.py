@@ -99,6 +99,7 @@ def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() 
         "agent",
         "main_agent",
         "skill",
+        "skill_source",
         "mcp",
         "memory",
         "hermes",
@@ -207,3 +208,24 @@ def test_conversation_metadata_migration_follows_current_head() -> None:
 
     assert migration.revision == "0026_conversation_metadata"
     assert migration.down_revision == "0025_run_conversation_index"
+
+
+def test_skill_source_migration_follows_conversation_metadata() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0027_skill_source_admin_resources.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_0027_skill_sources", migration_path)
+    assert spec is not None
+    assert spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    assert migration.revision == "0027_skill_sources"
+    assert migration.down_revision == "0026_conversation_metadata"
+    assert "skill_source" in migration._NEXT_KINDS
+    assert "skill_source" not in migration._CURRENT_KINDS
+    migration_source = migration_path.read_text(encoding="utf-8")
+    assert "payload - 'source' - 'archive_sha256'" in migration_source

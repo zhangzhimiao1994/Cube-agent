@@ -1154,6 +1154,142 @@ article:hover {
   padding: 1rem;
 }
 
+.skill-source-panel {
+  margin: 1rem 0;
+}
+
+.skill-source-panel-header,
+.skill-source-card-heading {
+  align-items: start;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.skill-source-panel-header h3,
+.skill-source-card-heading strong {
+  margin: 0.18rem 0 0;
+}
+
+.skill-source-panel-header .field-help {
+  max-width: 42rem;
+}
+
+.skill-source-form {
+  align-items: end;
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.skill-source-form > *,
+.skill-source-card-heading > *,
+.skill-source-summary > div {
+  min-width: 0;
+}
+
+.skill-source-url-field,
+.skill-source-form-actions {
+  grid-column: span 2;
+}
+
+.skill-source-enabled {
+  align-self: center;
+  min-height: 2.6rem;
+}
+
+.skill-source-list {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+}
+
+.skill-source-card {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 0.7rem;
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.75rem;
+}
+
+.skill-source-card-heading small {
+  color: var(--muted);
+  display: block;
+  margin-top: 0.18rem;
+  overflow-wrap: anywhere;
+}
+
+.skill-source-statuses {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
+.skill-source-statuses .status-pill {
+  margin: 0;
+}
+
+.skill-source-summary {
+  display: grid;
+  gap: 0.42rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.skill-source-summary > div {
+  background: rgba(3, 10, 20, 0.3);
+  border-radius: 0.45rem;
+  padding: 0.5rem;
+}
+
+.skill-source-summary dt {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 850;
+}
+
+.skill-source-summary dd {
+  color: var(--text);
+  font-size: 0.8rem;
+  margin: 0.16rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.skill-source-provenance {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .skill-source-panel-header,
+  .skill-source-card-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .skill-source-form,
+  .skill-source-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .skill-source-url-field,
+  .skill-source-form-actions {
+    grid-column: auto;
+  }
+
+  .skill-source-statuses {
+    justify-content: flex-start;
+  }
+
+  .skill-source-card .table-actions button {
+    flex: 1 1 calc(50% - 0.4rem);
+  }
+}
+
 .stacked-form {
   display: grid;
   gap: 0.75rem;

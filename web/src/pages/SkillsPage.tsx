@@ -1,7 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
 
-import { ApiError, api, formatApiError, type Skill } from "../api/client";
+import {
+  ApiError,
+  api,
+  formatApiError,
+  type Skill,
+  type SkillSource,
+  type SkillSourceCreateInput,
+} from "../api/client";
 import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -20,6 +27,216 @@ type SkillUploadConflict = {
   file: File;
   name: string;
 };
+
+const EMPTY_SOURCE_FORM: SkillSourceCreateInput = {
+  name: "",
+  repository_url: "",
+  ref: "main",
+  subdirectory: "",
+  enabled: true,
+  credential_ref: null,
+  expected_archive_sha256: null,
+};
+
+const TRUST_LABELS: Record<SkillSource["trust_state"], string> = {
+  trusted: "已信任",
+  untrusted: "未信任",
+  revoked: "已撤销",
+};
+
+const SYNC_LABELS: Record<SkillSource["sync_state"], string> = {
+  never: "尚未同步",
+  syncing: "同步中",
+  succeeded: "同步成功",
+  failed: "同步失败",
+};
+
+function compactHash(value: string | null | undefined) {
+  return value ? value.slice(0, 12) : "未生成";
+}
+
+function optionalValue(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function SkillSourcesPanel() {
+  const queryClient = useQueryClient();
+  const sources = useQuery({ queryKey: ["skill-sources"], queryFn: () => api.skillSources() });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [form, setForm] = useState<SkillSourceCreateInput>(EMPTY_SOURCE_FORM);
+
+  const refresh = () => void queryClient.invalidateQueries({ queryKey: ["skill-sources"] });
+  const createSource = useMutation({ mutationFn: api.createSkillSource, onSuccess: () => { setForm(EMPTY_SOURCE_FORM); refresh(); } });
+  const updateSource = useMutation({
+    mutationFn: ({ id, payload }: { id: string; payload: SkillSourceCreateInput }) =>
+      api.updateSkillSource(id, {
+        name: payload.name,
+        ref: payload.ref,
+        subdirectory: payload.subdirectory,
+        enabled: payload.enabled,
+        credential_ref: payload.credential_ref,
+        expected_archive_sha256: payload.expected_archive_sha256,
+      }),
+    onSuccess: () => { setEditingId(null); setForm(EMPTY_SOURCE_FORM); refresh(); },
+  });
+  const trustSource = useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => api.trustSkillSource(id, reason),
+    onSuccess: refresh,
+  });
+  const revokeTrust = useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => api.revokeSkillSourceTrust(id, reason),
+    onSuccess: refresh,
+  });
+  const syncSource = useMutation({
+    mutationFn: api.syncSkillSource,
+    onSuccess: () => {
+      refresh();
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+  });
+  const deleteSource = useMutation({ mutationFn: api.deleteSkillSource, onSuccess: refresh });
+  const busy = createSource.isPending || updateSource.isPending || trustSource.isPending || revokeTrust.isPending || syncSource.isPending || deleteSource.isPending;
+  const mutationError = createSource.error ?? updateSource.error ?? trustSource.error ?? revokeTrust.error ?? syncSource.error ?? deleteSource.error;
+
+  function setField<K extends keyof SkillSourceCreateInput>(key: K, value: SkillSourceCreateInput[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function edit(source: SkillSource) {
+    setEditingId(source.id);
+    setForm({
+      name: source.name,
+      repository_url: source.repository_url,
+      ref: source.ref,
+      subdirectory: source.subdirectory,
+      enabled: source.enabled,
+      credential_ref: source.credential_ref ?? null,
+      expected_archive_sha256: source.expected_archive_sha256 ?? null,
+    });
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const payload: SkillSourceCreateInput = {
+      ...form,
+      name: form.name.trim(),
+      repository_url: form.repository_url.trim(),
+      ref: form.ref?.trim() || "main",
+      subdirectory: form.subdirectory?.trim() || "",
+      credential_ref: optionalValue(form.credential_ref),
+      expected_archive_sha256: optionalValue(form.expected_archive_sha256),
+    };
+    if (editingId && !form.credential_ref?.trim()) delete payload.credential_ref;
+    if (editingId) updateSource.mutate({ id: editingId, payload });
+    else createSource.mutate(payload);
+  }
+
+  function requestReason(source: SkillSource, action: "trust" | "revoke") {
+    const verb = action === "trust" ? "信任" : "撤销信任";
+    const reason = window.prompt(`请输入${verb}「${source.name}」的理由`);
+    if (!reason?.trim()) return;
+    if (action === "trust") trustSource.mutate({ id: source.id, reason: reason.trim() });
+    else revokeTrust.mutate({ id: source.id, reason: reason.trim() });
+  }
+
+  return (
+    <section className="resource-card skill-source-panel" aria-label="团队 Skill 来源">
+      <header className="skill-source-panel-header">
+        <div>
+          <span className="eyebrow">Team Skill Tap</span>
+          <h3>团队 Skill 来源</h3>
+        </div>
+        <p className="field-help">同步只生成待审批候选，不会自动激活；审批后仍需在版本区手动选择生效版本。</p>
+      </header>
+
+      <form className="skill-source-form" onSubmit={submit}>
+        <label>
+          来源名称
+          <input aria-label="来源名称" required value={form.name} onChange={(event) => setField("name", event.currentTarget.value)} />
+        </label>
+        <label className="skill-source-url-field">
+          GitHub 仓库地址
+          <input
+            aria-label="GitHub 仓库地址"
+            required
+            readOnly={editingId !== null}
+            value={form.repository_url}
+            onChange={(event) => setField("repository_url", event.currentTarget.value)}
+            placeholder="https://github.com/org/repo"
+          />
+        </label>
+        <label>
+          分支或标签
+          <input value={form.ref} onChange={(event) => setField("ref", event.currentTarget.value)} />
+        </label>
+        <label>
+          Skill 子目录
+          <input value={form.subdirectory} onChange={(event) => setField("subdirectory", event.currentTarget.value)} placeholder="可留空" />
+        </label>
+        <label>
+          凭据引用
+          <input value={form.credential_ref ?? ""} onChange={(event) => setField("credential_ref", event.currentTarget.value)} placeholder="私有仓库可填" />
+        </label>
+        <label>
+          预期归档 SHA-256
+          <input value={form.expected_archive_sha256 ?? ""} onChange={(event) => setField("expected_archive_sha256", event.currentTarget.value)} placeholder="可留空" />
+        </label>
+        <label className="inline-check compact-check skill-source-enabled">
+          <input type="checkbox" checked={form.enabled} onChange={(event) => setField("enabled", event.currentTarget.checked)} />
+          启用来源
+        </label>
+        <div className="channel-config-actions skill-source-form-actions">
+          <button type="submit" disabled={busy || !form.name.trim() || !form.repository_url.trim()}>
+            {editingId ? "保存来源" : "注册来源"}
+          </button>
+          {editingId ? (
+            <button type="button" className="secondary-action" onClick={() => { setEditingId(null); setForm(EMPTY_SOURCE_FORM); }}>
+              取消编辑
+            </button>
+          ) : null}
+        </div>
+      </form>
+
+      {mutationError ? <p role="alert">{formatApiError(mutationError, "Skill 来源操作失败")}</p> : null}
+      {sources.isLoading ? <p>正在加载团队 Skill 来源...</p> : null}
+      {sources.isError ? <p role="alert">{formatApiError(sources.error, "Skill 来源加载失败")}</p> : null}
+      {sources.data?.length === 0 ? <p className="field-help">还没有团队 Skill 来源。</p> : null}
+      <div className="skill-source-list">
+        {sources.data?.map((source) => (
+          <article className="skill-source-card" key={source.id}>
+            <div className="skill-source-card-heading">
+              <div>
+                <strong>{source.name}</strong>
+                <small>{source.repository_url}</small>
+              </div>
+              <div className="skill-source-statuses">
+                <span className={`status-pill ${source.trust_state === "trusted" ? "success" : "warning"}`}>{TRUST_LABELS[source.trust_state]}</span>
+                <span className={`status-pill ${source.sync_state === "succeeded" ? "success" : source.sync_state === "failed" ? "danger" : ""}`}>{SYNC_LABELS[source.sync_state]}</span>
+                {!source.enabled ? <span className="status-pill">已停用</span> : null}
+              </div>
+            </div>
+            <dl className="skill-source-summary">
+              <div><dt>引用</dt><dd>{source.ref}{source.subdirectory ? ` / ${source.subdirectory}` : ""}</dd></div>
+              <div><dt>Commit</dt><dd className="mono-copy">{compactHash(source.resolved_commit_sha)}</dd></div>
+              <div><dt>归档哈希</dt><dd className="mono-copy">{compactHash(source.archive_sha256)}</dd></div>
+              <div><dt>关联 Skill</dt><dd>{source.linked_skill_ids.join("、") || "暂无"}</dd></div>
+            </dl>
+            {source.trust_reason ? <p className="field-help">信任说明：{source.trust_reason}</p> : null}
+            {source.last_error ? <p className="danger-text">最近错误：{source.last_error}</p> : null}
+            <div className="table-actions">
+              <button type="button" className="secondary-action" disabled={busy} aria-label={`编辑${source.name}`} onClick={() => edit(source)}>编辑</button>
+              <button type="button" disabled={busy} aria-label={`${source.trust_state === "trusted" ? "重新信任" : "信任"}${source.name}`} onClick={() => requestReason(source, "trust")}>{source.trust_state === "trusted" ? "重新信任" : "信任"}</button>
+              <button type="button" className="secondary-action" disabled={busy || source.trust_state !== "trusted"} aria-label={`撤销信任${source.name}`} onClick={() => requestReason(source, "revoke")}>撤销信任</button>
+              <button type="button" disabled={busy || !source.enabled || source.trust_state !== "trusted"} aria-label={`同步${source.name}`} onClick={() => syncSource.mutate(source.id)}>{syncSource.isPending ? "同步中..." : "同步"}</button>
+              <button type="button" className="danger-action" disabled={busy} aria-label={`删除${source.name}`} onClick={() => { if (window.confirm(`确定删除来源「${source.name}」吗？已同步的 Skill 版本不会随之删除。`)) deleteSource.mutate(source.id); }}>删除</button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 const EMPTY_SKILL_FILTERS: SkillColumnFilters = {
   name: "",
@@ -267,6 +484,8 @@ export function SkillsPage() {
         {createSkillTask.isError ? <p role="alert">{formatApiError(createSkillTask.error, "Skill 创建任务创建失败")}</p> : null}
       </section>
 
+      <SkillSourcesPanel />
+
       <div className="two-column">
         <article {...navTargetProps("upload")}>
           <h3>上传并扫描 Skill</h3>
@@ -459,6 +678,19 @@ export function SkillsPage() {
                           <p className="field-help">当前版本：{currentVersionLabel(skill)}；版本数：{versionCount(skill)}</p>
                           {skill.source_filename ? <p className="field-help">来源：{skill.source_filename}</p> : null}
                           {skill.content_sha256 ? <p className="field-help">SHA256：{skill.content_sha256.slice(0, 12)}</p> : null}
+                          {skill.source ? (
+                            <p className="field-help skill-source-provenance">
+                              来源提交：{compactHash(skill.source.commit_sha)} · {skill.source.repository_url}
+                            </p>
+                          ) : null}
+                          {skill.versions.map((version) =>
+                            version.source ? (
+                              <p className="field-help skill-source-provenance" key={`${version.id}-source`}>
+                                {version.id} 来源提交：{compactHash(version.source.commit_sha)}
+                                {version.source.source_path ? ` · ${version.source.source_path}` : ""}
+                              </p>
+                            ) : null,
+                          )}
                         </td>
                         <td>{skill.status}</td>
                         <td>{skill.scan_diff.join("; ") || "无"}</td>
@@ -488,9 +720,15 @@ export function SkillsPage() {
                                     type="button"
                                     className="secondary-action"
                                     disabled={busy}
-                                    onClick={() => activateVersion.mutate({ skillId: skill.id, versionId: version.id })}
+                                    onClick={() => {
+                                      if (version.status === "enabled") {
+                                        activateVersion.mutate({ skillId: skill.id, versionId: version.id });
+                                      } else {
+                                        approve.mutate(version.id);
+                                      }
+                                    }}
                                   >
-                                    激活 {version.id}
+                                    {version.status === "enabled" ? `激活 ${version.id}` : `审批版本 ${version.id}`}
                                   </button>
                                 ))
                             : null}
