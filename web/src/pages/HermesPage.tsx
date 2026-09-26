@@ -619,7 +619,22 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
           </div>
           <div>
             <dt>对话 ID</dt>
-            <dd>{item.conversation_id ?? "未关联"}</dd>
+            <dd>
+              {item.conversation_id ? (
+                <>
+                  <span>{item.conversation_id}</span>
+                  <Link
+                    to={`/?conversation=${encodeURIComponent(item.conversation_id)}`}
+                    className="inline-link"
+                    aria-label={`打开关联对话 ${item.conversation_id}`}
+                  >
+                    打开关联对话
+                  </Link>
+                </>
+              ) : (
+                "未关联"
+              )}
+            </dd>
           </div>
           <div>
             <dt>运行 ID</dt>

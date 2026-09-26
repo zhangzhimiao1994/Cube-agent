@@ -934,6 +934,12 @@ article:hover {
   overflow-wrap: anywhere;
 }
 
+.detail-list .inline-link {
+  display: inline-block;
+  font-weight: 800;
+  margin-left: 0.65rem;
+}
+
 .hermes-journey {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(123, 225, 255, 0.14);

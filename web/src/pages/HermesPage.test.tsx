@@ -65,6 +65,22 @@ describe("HermesPage", () => {
             },
           ]);
         }
+        if (path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+          return jsonResponse({
+            id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            category: "conversation",
+            outcome: "success",
+            lesson: "Run completed with mode=hybrid, workflow=quality-review.",
+            summary: "Hermes recorded reusable conversation memory from conv-cleared-after-chat.",
+            user_summary: "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。",
+            run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            conversation_id: "conv-cleared-after-chat",
+            confirmed_at: null,
+            tags: ["completed", "hybrid", "quality-review"],
+            weight: 4,
+            created_at: "2026-09-02T00:00:01Z",
+          });
+        }
         if (path === "/api/v1/admin/settings") {
           return jsonResponse({
             default_mode: "auto",
@@ -129,5 +145,15 @@ describe("HermesPage", () => {
     expect(within(journey).getByText("移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。")).not.toBeNull();
     expect(within(journey).getByText(/已确认规则 · 已确认入库/)).not.toBeNull();
     expect(within(journey).getByRole("link", { name: /查看 conv-ui-polish 的学习详情/ })).not.toBeNull();
+  });
+
+  it("links Hermes detail records back to their source conversation", async () => {
+    render(<TestApp initialPath="/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />);
+
+    const sourceLink = await screen.findByRole("link", {
+      name: "打开关联对话 conv-cleared-after-chat",
+    });
+
+    expect(sourceLink.getAttribute("href")).toBe("/?conversation=conv-cleared-after-chat");
   });
 });
