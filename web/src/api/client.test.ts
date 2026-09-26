@@ -55,6 +55,7 @@ describe("api client transport", () => {
       subdirectory: "skills",
       enabled: true,
       credential_ref: null,
+      expected_commit_sha: null,
       expected_archive_sha256: null,
       trust_state: "untrusted",
       trusted_by: null,
@@ -85,8 +86,63 @@ describe("api client transport", () => {
         response({
           source: { ...source, sync_state: "succeeded", linked_skill_ids: ["repo-review"] },
           upload: { filename: "team-skills.zip", bundle: true, items: [], skipped: [] },
+          revision: {
+            id: "revision-1",
+            source_id: "team-skills",
+            sync_id: "sync-1",
+            commit_sha: "1".repeat(40),
+            archive_sha256: "a".repeat(64),
+            created_at: "2026-09-27T01:00:00Z",
+            items: [],
+            previous_revision_id: null,
+            previous_active_mapping: {},
+            active_mapping: {},
+            is_active: false,
+          },
         }),
       )
+      .mockResolvedValueOnce(response({
+        source: { ...source, sync_state: "succeeded" },
+        upload: { filename: "snapshot.zip", bundle: true, items: [], skipped: [] },
+        revision: {
+          id: "revision-1",
+          source_id: "team-skills",
+          sync_id: "sync-1",
+          commit_sha: "1".repeat(40),
+          archive_sha256: "a".repeat(64),
+          created_at: "2026-09-27T01:00:00Z",
+          items: [],
+          previous_revision_id: null,
+          previous_active_mapping: {},
+          active_mapping: {},
+          is_active: false,
+        },
+      }))
+      .mockResolvedValueOnce(response([{
+        id: "revision-1",
+        source_id: "team-skills",
+        sync_id: "sync-1",
+        commit_sha: "1".repeat(40),
+        archive_sha256: "a".repeat(64),
+        created_at: "2026-09-27T01:00:00Z",
+        items: [],
+        previous_revision_id: null,
+        previous_active_mapping: {},
+        active_mapping: {},
+        is_active: false,
+      }]))
+      .mockResolvedValueOnce(response({
+        id: "revision-1", source_id: "team-skills", sync_id: "sync-1",
+        commit_sha: "1".repeat(40), archive_sha256: "a".repeat(64),
+        created_at: "2026-09-27T01:00:00Z", items: [], previous_revision_id: null,
+        previous_active_mapping: {}, active_mapping: {}, is_active: true,
+      }))
+      .mockResolvedValueOnce(response({
+        id: "revision-1", source_id: "team-skills", sync_id: "sync-1",
+        commit_sha: "1".repeat(40), archive_sha256: "a".repeat(64),
+        created_at: "2026-09-27T01:00:00Z", items: [], previous_revision_id: null,
+        previous_active_mapping: {}, active_mapping: {}, is_active: false,
+      }))
       .mockResolvedValueOnce(response({ status: "deleted" }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -98,12 +154,18 @@ describe("api client transport", () => {
       subdirectory: "skills",
       enabled: true,
       credential_ref: null,
+      expected_commit_sha: null,
       expected_archive_sha256: null,
     });
     await api.updateSkillSource("team-skills", { name: "研发技能库", enabled: false });
     await api.trustSkillSource("team-skills", "已核验仓库所有者");
     await api.revokeSkillSourceTrust("team-skills", "仓库权限已变更");
     await api.syncSkillSource("team-skills");
+    const snapshot = new File(["snapshot"], "snapshot.zip", { type: "application/zip" });
+    await api.importSkillSourceSnapshot("team-skills", "1".repeat(40), snapshot);
+    await api.skillSourceRevisions("team-skills");
+    await api.activateSkillSourceRevision("team-skills", "revision-1");
+    await api.rollbackSkillSourceRevision("team-skills", "revision-1");
     await api.deleteSkillSource("team-skills");
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/^\/api\/v1\/admin\/skill-sources\?_/);
@@ -119,7 +181,16 @@ describe("api client transport", () => {
     expect(fetchMock.mock.calls[3]?.[1]).toEqual(expect.objectContaining({ body: JSON.stringify({ reason: "已核验仓库所有者" }) }));
     expect(fetchMock.mock.calls[4]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/revoke-trust");
     expect(fetchMock.mock.calls[5]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/sync");
-    expect(fetchMock.mock.calls[6]?.[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+    expect(fetchMock.mock.calls[6]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/import-snapshot");
+    const snapshotBody = fetchMock.mock.calls[6]?.[1]?.body;
+    expect(snapshotBody).toBeInstanceOf(FormData);
+    expect((snapshotBody as FormData).get("commit_sha")).toBe("1".repeat(40));
+    expect((snapshotBody as FormData).get("archive")).toBe(snapshot);
+    expect((fetchMock.mock.calls[6]?.[1]?.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+    expect(String(fetchMock.mock.calls[7]?.[0])).toMatch(/^\/api\/v1\/admin\/skill-sources\/team-skills\/revisions\?_/);
+    expect(fetchMock.mock.calls[8]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/revisions/revision-1/activate");
+    expect(fetchMock.mock.calls[9]?.[0]).toBe("/api/v1/admin/skill-sources/team-skills/revisions/revision-1/rollback");
+    expect(fetchMock.mock.calls[10]?.[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
   });
 
   it("accepts metadata-only responses when creating and updating conversations", async () => {

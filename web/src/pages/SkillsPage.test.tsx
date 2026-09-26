@@ -104,7 +104,8 @@ const skillSources = [
     subdirectory: "skills",
     enabled: true,
     credential_ref: null,
-    expected_archive_sha256: null,
+    expected_commit_sha: "1234567890abcdef1234567890abcdef12345678",
+    expected_archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
     trust_state: "trusted",
     trusted_by: owner.id,
     trusted_at: "2026-08-15T00:00:00Z",
@@ -117,14 +118,62 @@ const skillSources = [
     last_synced_at: "2026-08-15T01:00:00Z",
     last_error: null,
     linked_skill_ids: ["deep-research"],
+    active_revision_id: null,
+  },
+];
+
+const sourceRevisions = [
+  {
+    id: "revision-ready",
+    source_id: "team-skills",
+    sync_id: "sync-12",
+    commit_sha: "1234567890abcdef1234567890abcdef12345678",
+    archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    created_at: "2026-08-15T01:00:00Z",
+    items: [
+      {
+        skill_name: "deep-research",
+        version_id: "version-2",
+        source_path: "skills/deep-research",
+        content_sha256: "sha256-current",
+        archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      },
+    ],
+    previous_revision_id: "revision-old",
+    previous_active_mapping: { "deep-research": "version-1" },
+    active_mapping: { "deep-research": "version-2" },
+    is_active: false,
+  },
+  {
+    id: "revision-blocked",
+    source_id: "team-skills",
+    sync_id: "sync-13",
+    commit_sha: "abcdef1234567890abcdef1234567890abcdef12",
+    archive_sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    created_at: "2026-08-16T01:00:00Z",
+    items: [
+      {
+        skill_name: "deep-research",
+        version_id: "version-3",
+        source_path: "skills/deep-research",
+        content_sha256: "sha256-candidate",
+        archive_sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      },
+    ],
+    previous_revision_id: "revision-ready",
+    previous_active_mapping: { "deep-research": "version-2" },
+    active_mapping: { "deep-research": "version-3" },
+    is_active: false,
   },
 ];
 
 describe("SkillsPage", () => {
   let duplicateUploadAttempts = 0;
+  let revisionMode: "success" | "loading" | "error" = "success";
 
   beforeEach(() => {
     duplicateUploadAttempts = 0;
+    revisionMode = "success";
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -163,7 +212,26 @@ describe("SkillsPage", () => {
           return jsonResponse({
             source: skillSources[0],
             upload: { filename: "team-skills.zip", bundle: true, items: [skills[0]], skipped: [] },
+            revision: sourceRevisions[0],
           });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/import-snapshot" && init?.method === "POST") {
+          return jsonResponse({
+            source: skillSources[0],
+            upload: { filename: "snapshot.zip", bundle: true, items: [skills[0]], skipped: [] },
+            revision: sourceRevisions[1],
+          });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/revisions" && (!init?.method || init.method === "GET")) {
+          if (revisionMode === "loading") return new Promise<Response>(() => undefined);
+          if (revisionMode === "error") return jsonResponse({ error: { code: "revision_failed", message: "revision unavailable" } }, { status: 503 });
+          return jsonResponse(sourceRevisions);
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/revisions/revision-ready/activate" && init?.method === "POST") {
+          return jsonResponse({ ...sourceRevisions[0], is_active: true });
+        }
+        if (path === "/api/v1/admin/skill-sources/team-skills/revisions/revision-ready/rollback" && init?.method === "POST") {
+          return jsonResponse({ ...sourceRevisions[0], is_active: false });
         }
         if (path === "/api/v1/admin/skill-sources/team-skills" && init?.method === "DELETE") {
           return jsonResponse({ status: "deleted" });
@@ -388,7 +456,7 @@ describe("SkillsPage", () => {
     expect(await within(sourceRegion).findByText("团队技能库")).not.toBeNull();
     expect(within(sourceRegion).getByText("已信任")).not.toBeNull();
     expect(within(sourceRegion).getByText("同步成功")).not.toBeNull();
-    expect(within(sourceRegion).getByText(/1234567890ab/)).not.toBeNull();
+    expect(within(sourceRegion).getAllByText(/1234567890ab/)).toHaveLength(2);
     expect(within(sourceRegion).getByText(/deep-research/)).not.toBeNull();
     expect(within(sourceRegion).getByText(/同步只生成待审批候选/)).not.toBeNull();
     expect(await screen.findByText(/来源提交：1234567890ab/)).not.toBeNull();
@@ -434,6 +502,63 @@ describe("SkillsPage", () => {
         expect.objectContaining({ method: "DELETE" }),
       );
     });
+  });
+
+  it("imports trusted snapshots and manages bounded revision history", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    const sourceRegion = await screen.findByRole("region", { name: "团队 Skill 来源" });
+    expect(sourceRegion.classList.contains("resource-card")).toBe(false);
+    await user.click(await within(sourceRegion).findByRole("button", { name: "编辑团队技能库" }));
+    expect((within(sourceRegion).getByLabelText("预期 Commit SHA") as HTMLInputElement).value).toBe(skillSources[0].expected_commit_sha);
+    await user.click(within(sourceRegion).getByRole("button", { name: "查看团队技能库版本历史" }));
+
+    const history = await within(sourceRegion).findByRole("region", { name: "团队技能库版本历史" });
+    expect(within(history).getByText("共 2 个版本")).not.toBeNull();
+    expect(within(history).getAllByText("deep-research")).toHaveLength(2);
+    expect(within(history).getByText("已审批，可激活")).not.toBeNull();
+    expect(within(history).getByText("待审批，暂不可激活")).not.toBeNull();
+    expect((within(history).getByRole("button", { name: "激活版本 revision-blocked" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await user.click(within(history).getByRole("button", { name: "激活版本 revision-ready" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/admin/skill-sources/team-skills/revisions/revision-ready/activate",
+      expect.objectContaining({ method: "POST" }),
+    ));
+    await user.click(await within(history).findByRole("button", { name: "回滚版本 revision-ready" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/admin/skill-sources/team-skills/revisions/revision-ready/rollback",
+      expect.objectContaining({ method: "POST" }),
+    ));
+
+    const archive = new File(["snapshot"], "team-snapshot.zip", { type: "application/zip" });
+    await user.upload(within(sourceRegion).getByLabelText("可信快照 ZIP"), archive);
+    await user.click(within(sourceRegion).getByRole("button", { name: "导入团队技能库可信快照" }));
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/v1/admin/skill-sources/team-skills/import-snapshot" && init?.method === "POST");
+      expect(request).toBeTruthy();
+      expect((request?.[1]?.body as FormData).get("commit_sha")).toBe(skillSources[0].expected_commit_sha);
+      expect((request?.[1]?.body as FormData).get("archive")).toBe(archive);
+    });
+  });
+
+  it("shows revision loading and error states", async () => {
+    revisionMode = "loading";
+    render(<TestApp initialPath="/skills" />);
+    const sourceRegion = await screen.findByRole("region", { name: "团队 Skill 来源" });
+    await userEvent.click(await within(sourceRegion).findByRole("button", { name: "查看团队技能库版本历史" }));
+    expect(await within(sourceRegion).findByText("正在加载版本历史...")).not.toBeNull();
+  });
+
+  it("shows revision history errors without hiding the source", async () => {
+    revisionMode = "error";
+    render(<TestApp initialPath="/skills" />);
+    const sourceRegion = await screen.findByRole("region", { name: "团队 Skill 来源" });
+    await userEvent.click(await within(sourceRegion).findByRole("button", { name: "查看团队技能库版本历史" }));
+    expect((await within(sourceRegion).findByRole("alert")).textContent).toContain("版本历史加载失败");
+    expect(within(sourceRegion).getByText("团队技能库")).not.toBeNull();
   });
   it("supports selecting multiple skills and approving them in one action", async () => {
     const fetchMock = vi.mocked(fetch);

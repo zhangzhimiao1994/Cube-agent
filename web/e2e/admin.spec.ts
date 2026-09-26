@@ -34,11 +34,21 @@ async function mockAdminApi(page: Page) {
       return;
     }
     if (path === "/api/v1/admin/skills" && request.method() === "GET") {
+      const teamSkill = {
+        id: "team-skill",
+        name: "team-skill",
+        status: "enabled",
+        scan_diff: [],
+        requested_permissions: [],
+        current_version_id: "team-version-1",
+        versions: [{ id: "team-version-1", status: "enabled", is_current: true }],
+      };
       await route.fulfill({
         json:
           skillStatus === "missing"
-            ? []
+            ? [teamSkill]
             : [
+                teamSkill,
                 {
                   id: "safe-skill",
                   name: "safe-skill",
@@ -109,6 +119,59 @@ async function mockAdminApi(page: Page) {
       });
       return;
     }
+    if (path === "/api/v1/admin/skill-sources" && request.method() === "GET") {
+      await route.fulfill({
+        json: [{
+          id: "team-tap",
+          name: "研发团队 Tap",
+          repository_url: "https://github.com/example/team-tap",
+          ref: "main",
+          subdirectory: "skills",
+          enabled: true,
+          has_credential: false,
+          expected_commit_sha: "1".repeat(40),
+          expected_archive_sha256: "a".repeat(64),
+          trust_state: "trusted",
+          trusted_by: "admin",
+          trusted_at: "2026-09-27T00:00:00Z",
+          trust_reason: "已核验",
+          sync_state: "succeeded",
+          last_sync_id: "sync-1",
+          resolved_commit_sha: "1".repeat(40),
+          archive_sha256: "a".repeat(64),
+          source_archive_bytes: 1024,
+          last_synced_at: "2026-09-27T00:00:00Z",
+          last_error: null,
+          linked_skill_ids: ["team-skill"],
+          active_revision_id: null,
+        }],
+      });
+      return;
+    }
+    if (path === "/api/v1/admin/skill-sources/team-tap/revisions" && request.method() === "GET") {
+      await route.fulfill({
+        json: [{
+          id: "revision-1",
+          source_id: "team-tap",
+          sync_id: "sync-1",
+          commit_sha: "1".repeat(40),
+          archive_sha256: "a".repeat(64),
+          created_at: "2026-09-27T00:00:00Z",
+          items: [{
+            skill_name: "team-skill",
+            version_id: "team-version-1",
+            source_path: "skills/team-skill",
+            content_sha256: "b".repeat(64),
+            archive_sha256: "c".repeat(64),
+          }],
+          previous_revision_id: null,
+          previous_active_mapping: {},
+          active_mapping: { "team-skill": "team-version-1" },
+          is_active: false,
+        }],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/logs") {
       await route.fulfill({
         json: [
@@ -171,6 +234,23 @@ test("administrator uploads and approves a skill", async ({ page }) => {
   await expect(page.getByRole("row", { name: /safe-skill/ }).getByRole("cell", { name: "scanned" })).toBeVisible();
   await page.getByRole("button", { name: "审批启用" }).click();
   await expect(page.getByRole("row", { name: /safe-skill/ }).getByRole("cell", { name: "enabled" })).toBeVisible();
+});
+
+test("team Tap revisions stay usable without horizontal overflow", async ({ page }) => {
+  await mockAdminApi(page);
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    await page.goto("/skills");
+    const source = page.getByRole("region", { name: "团队 Skill 来源" });
+    await expect(source.getByText("研发团队 Tap")).toBeVisible();
+    await source.getByRole("button", { name: "查看研发团队 Tap版本历史" }).click();
+    const history = source.getByRole("region", { name: "研发团队 Tap版本历史" });
+    await expect(history.getByText("已审批，可激活")).toBeVisible();
+    await expect(history.getByText("team-skill", { exact: true })).toBeVisible();
+    await expect(source.getByLabel("可信快照 ZIP")).toBeVisible();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow).toBeLessThanOrEqual(1);
+  }
 });
 
 test("administrator can inspect MCP and export safe audit view", async ({ page }) => {

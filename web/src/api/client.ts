@@ -1049,6 +1049,7 @@ const SkillSourceSchema = z.object({
   enabled: z.boolean().default(true),
   credential_ref: z.string().nullable().optional(),
   has_credential: z.boolean().default(false),
+  expected_commit_sha: z.string().nullable().optional(),
   expected_archive_sha256: z.string().nullable().optional(),
   trust_state: z.enum(["untrusted", "trusted", "revoked"]).default("untrusted"),
   trusted_by: z.string().nullable().optional(),
@@ -1062,6 +1063,7 @@ const SkillSourceSchema = z.object({
   last_synced_at: z.string().nullable().optional(),
   last_error: z.string().nullable().optional(),
   linked_skill_ids: z.array(z.string()).default([]),
+  active_revision_id: z.string().nullable().optional(),
 });
 
 export type SkillSource = z.infer<typeof SkillSourceSchema>;
@@ -1073,12 +1075,13 @@ export type SkillSourceCreateInput = {
   subdirectory?: string;
   enabled?: boolean;
   credential_ref?: string | null;
+  expected_commit_sha?: string | null;
   expected_archive_sha256?: string | null;
 };
 export type SkillSourceUpdateInput = Partial<
   Pick<
     SkillSourceCreateInput,
-    "name" | "ref" | "subdirectory" | "enabled" | "credential_ref" | "expected_archive_sha256"
+    "name" | "ref" | "subdirectory" | "enabled" | "credential_ref" | "expected_commit_sha" | "expected_archive_sha256"
   >
 >;
 
@@ -1103,9 +1106,35 @@ const SkillArchiveUploadSchema = z.object({
 
 export type SkillArchiveUpload = z.infer<typeof SkillArchiveUploadSchema>;
 
+const SkillSourceRevisionItemSchema = z.object({
+  skill_name: z.string(),
+  version_id: z.string(),
+  source_path: z.string().nullable().optional(),
+  content_sha256: z.string(),
+  archive_sha256: z.string(),
+});
+
+const SkillSourceRevisionSchema = z.object({
+  id: z.string(),
+  source_id: z.string(),
+  sync_id: z.string(),
+  commit_sha: z.string(),
+  archive_sha256: z.string(),
+  created_at: z.string(),
+  items: z.array(SkillSourceRevisionItemSchema),
+  previous_revision_id: z.string().nullable().optional(),
+  previous_active_mapping: z.record(z.string(), z.string()).default({}),
+  active_mapping: z.record(z.string(), z.string()).default({}),
+  is_active: z.boolean().default(false),
+});
+
+export type SkillSourceRevision = z.infer<typeof SkillSourceRevisionSchema>;
+export type SkillSourceRevisionItem = z.infer<typeof SkillSourceRevisionItemSchema>;
+
 const SkillSourceSyncSchema = z.object({
   source: SkillSourceSchema,
   upload: SkillArchiveUploadSchema,
+  revision: SkillSourceRevisionSchema,
 });
 
 export type SkillSourceSync = z.infer<typeof SkillSourceSyncSchema>;
@@ -2638,6 +2667,37 @@ export const api = {
       `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/sync`,
       { method: "POST" },
       SkillSourceSyncSchema,
+    );
+  },
+  importSkillSourceSnapshot(id: string, commitSha: string, archive: File): Promise<SkillSourceSync> {
+    const body = new FormData();
+    body.set("commit_sha", commitSha);
+    body.set("archive", archive);
+    return requestBinary(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/import-snapshot`,
+      { method: "POST", body },
+      SkillSourceSyncSchema,
+    );
+  },
+  skillSourceRevisions(id: string): Promise<SkillSourceRevision[]> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/revisions`,
+      { method: "GET" },
+      z.array(SkillSourceRevisionSchema),
+    );
+  },
+  activateSkillSourceRevision(id: string, revisionId: string): Promise<SkillSourceRevision> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/revisions/${encodeURIComponent(revisionId)}/activate`,
+      { method: "POST" },
+      SkillSourceRevisionSchema,
+    );
+  },
+  rollbackSkillSourceRevision(id: string, revisionId: string): Promise<SkillSourceRevision> {
+    return request(
+      `/api/v1/admin/skill-sources/${encodeURIComponent(id)}/revisions/${encodeURIComponent(revisionId)}/rollback`,
+      { method: "POST" },
+      SkillSourceRevisionSchema,
     );
   },
   deleteSkillSource(id: string): Promise<{ status: string }> {

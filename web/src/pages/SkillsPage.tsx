@@ -8,6 +8,7 @@ import {
   type Skill,
   type SkillSource,
   type SkillSourceCreateInput,
+  type SkillSourceRevision,
 } from "../api/client";
 import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
@@ -35,6 +36,7 @@ const EMPTY_SOURCE_FORM: SkillSourceCreateInput = {
   subdirectory: "",
   enabled: true,
   credential_ref: null,
+  expected_commit_sha: null,
   expected_archive_sha256: null,
 };
 
@@ -60,9 +62,160 @@ function optionalValue(value: string | null | undefined) {
   return trimmed ? trimmed : null;
 }
 
+function revisionMemberApproved(skills: Skill[], skillName: string, versionId: string) {
+  const skill = skills.find((item) => item.name === skillName || item.id === skillName);
+  return skill?.versions.some((version) => version.id === versionId && version.status === "enabled") ?? false;
+}
+
+function revisionReady(revision: SkillSourceRevision, skills: Skill[]) {
+  return revision.items.length > 0 && revision.items.every((item) => revisionMemberApproved(skills, item.skill_name, item.version_id));
+}
+
+type SkillSourceEntryProps = {
+  source: SkillSource;
+  skills: Skill[];
+  busy: boolean;
+  onEdit: (source: SkillSource) => void;
+  onTrust: (source: SkillSource, action: "trust" | "revoke") => void;
+  onSync: (sourceId: string) => void;
+  onDelete: (source: SkillSource) => void;
+};
+
+function SkillSourceEntry({ source, skills, busy, onEdit, onTrust, onSync, onDelete }: SkillSourceEntryProps) {
+  const queryClient = useQueryClient();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [snapshotFile, setSnapshotFile] = useState<File | null>(null);
+  const revisionKey = ["skill-source-revisions", source.id];
+  const revisions = useQuery({
+    queryKey: revisionKey,
+    queryFn: () => api.skillSourceRevisions(source.id),
+    enabled: historyOpen,
+  });
+  const updateRevisionCache = (updated: SkillSourceRevision) => {
+    queryClient.setQueryData<SkillSourceRevision[]>(revisionKey, (current = []) =>
+      current.map((revision) => ({ ...revision, is_active: revision.id === updated.id ? updated.is_active : false })),
+    );
+    void queryClient.invalidateQueries({ queryKey: ["skill-sources"] });
+  };
+  const importSnapshot = useMutation({
+    mutationFn: () => api.importSkillSourceSnapshot(source.id, source.expected_commit_sha ?? "", snapshotFile as File),
+    onSuccess: () => {
+      setSnapshotFile(null);
+      setHistoryOpen(true);
+      void queryClient.invalidateQueries({ queryKey: revisionKey });
+      void queryClient.invalidateQueries({ queryKey: ["skill-sources"] });
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+  });
+  const activateRevision = useMutation({
+    mutationFn: (revisionId: string) => api.activateSkillSourceRevision(source.id, revisionId),
+    onSuccess: updateRevisionCache,
+  });
+  const rollbackRevision = useMutation({
+    mutationFn: (revisionId: string) => api.rollbackSkillSourceRevision(source.id, revisionId),
+    onSuccess: updateRevisionCache,
+  });
+  const revisionBusy = importSnapshot.isPending || activateRevision.isPending || rollbackRevision.isPending;
+  const revisionError = importSnapshot.error ?? activateRevision.error ?? rollbackRevision.error;
+  const snapshotReady = Boolean(
+    snapshotFile && source.enabled && source.trust_state === "trusted" && source.expected_commit_sha && source.expected_archive_sha256,
+  );
+
+  return (
+    <article className="skill-source-card">
+      <div className="skill-source-card-heading">
+        <div>
+          <strong>{source.name}</strong>
+          <small>{source.repository_url}</small>
+        </div>
+        <div className="skill-source-statuses">
+          <span className={`status-pill ${source.trust_state === "trusted" ? "success" : "warning"}`}>{TRUST_LABELS[source.trust_state]}</span>
+          <span className={`status-pill ${source.sync_state === "succeeded" ? "success" : source.sync_state === "failed" ? "danger" : ""}`}>{SYNC_LABELS[source.sync_state]}</span>
+          {source.active_revision_id ? <span className="status-pill success">已有生效版本</span> : null}
+          {!source.enabled ? <span className="status-pill">已停用</span> : null}
+        </div>
+      </div>
+      <dl className="skill-source-summary">
+        <div><dt>引用</dt><dd>{source.ref}{source.subdirectory ? ` / ${source.subdirectory}` : ""}</dd></div>
+        <div><dt>固定 Commit</dt><dd className="mono-copy">{compactHash(source.expected_commit_sha)}</dd></div>
+        <div><dt>最近 Commit</dt><dd className="mono-copy">{compactHash(source.resolved_commit_sha)}</dd></div>
+        <div><dt>归档哈希</dt><dd className="mono-copy">{compactHash(source.archive_sha256)}</dd></div>
+        <div><dt>关联 Skill</dt><dd>{source.linked_skill_ids.join("、") || "暂无"}</dd></div>
+      </dl>
+      {source.trust_reason ? <p className="field-help">信任说明：{source.trust_reason}</p> : null}
+      {source.last_error ? <p className="danger-text">最近错误：{source.last_error}</p> : null}
+      <div className="table-actions">
+        <button type="button" className="secondary-action" disabled={busy} aria-label={`编辑${source.name}`} onClick={() => onEdit(source)}>编辑</button>
+        <button type="button" disabled={busy} aria-label={`${source.trust_state === "trusted" ? "重新信任" : "信任"}${source.name}`} onClick={() => onTrust(source, "trust")}>{source.trust_state === "trusted" ? "重新信任" : "信任"}</button>
+        <button type="button" className="secondary-action" disabled={busy || source.trust_state !== "trusted"} aria-label={`撤销信任${source.name}`} onClick={() => onTrust(source, "revoke")}>撤销信任</button>
+        <button type="button" disabled={busy || !source.enabled || source.trust_state !== "trusted"} aria-label={`同步${source.name}`} onClick={() => onSync(source.id)}>同步</button>
+        <button type="button" className="secondary-action" aria-expanded={historyOpen} aria-label={`${historyOpen ? "收起" : "查看"}${source.name}版本历史`} onClick={() => setHistoryOpen((current) => !current)}>{historyOpen ? "收起版本" : "版本历史"}</button>
+        <button type="button" className="danger-action" disabled={busy} aria-label={`删除${source.name}`} onClick={() => onDelete(source)}>删除</button>
+      </div>
+
+      <form className="skill-source-snapshot" onSubmit={(event) => { event.preventDefault(); if (snapshotReady) importSnapshot.mutate(); }}>
+        <label>
+          可信快照 ZIP
+          <input aria-label="可信快照 ZIP" type="file" accept=".zip,application/zip" onChange={(event) => setSnapshotFile(event.currentTarget.files?.[0] ?? null)} />
+        </label>
+        <button type="submit" disabled={!snapshotReady || revisionBusy} aria-label={`导入${source.name}可信快照`}>
+          {importSnapshot.isPending ? "正在导入..." : "导入可信快照"}
+        </button>
+        {!source.expected_commit_sha || !source.expected_archive_sha256 ? <p className="field-help">先配置预期 Commit SHA 与归档 SHA-256，才能离线导入。</p> : null}
+      </form>
+
+      {revisionError ? <p role="alert">{formatApiError(revisionError, "版本操作失败")}</p> : null}
+      {historyOpen ? (
+        <section className="skill-source-revisions" aria-label={`${source.name}版本历史`}>
+          <header className="skill-source-revision-header">
+            <strong>版本历史</strong>
+            <span>{revisions.data ? `共 ${revisions.data.length} 个版本` : "正在读取"}</span>
+          </header>
+          {revisions.isLoading ? <p>正在加载版本历史...</p> : null}
+          {revisions.isError ? <p role="alert">{formatApiError(revisions.error, "版本历史加载失败")}</p> : null}
+          {revisions.data?.length === 0 ? <p className="field-help">还没有可管理的来源版本。</p> : null}
+          <div className="skill-source-revision-list">
+            {revisions.data?.map((revision) => {
+              const ready = revisionReady(revision, skills);
+              return (
+                <div className="skill-source-revision-row" key={revision.id}>
+                  <div className="skill-source-revision-meta">
+                    <strong>{compactHash(revision.commit_sha)}</strong>
+                    <span>{new Date(revision.created_at).toLocaleString("zh-CN")}</span>
+                    <span>{revision.items.length} 个成员</span>
+                    <span className={ready ? "success-text" : "warning-text"}>{ready ? "已审批，可激活" : "待审批，暂不可激活"}</span>
+                    {revision.is_active ? <span className="status-pill success">当前生效</span> : null}
+                  </div>
+                  <div className="skill-source-revision-members">
+                    {revision.items.map((item) => {
+                      const approved = revisionMemberApproved(skills, item.skill_name, item.version_id);
+                      return (
+                        <div key={`${revision.id}-${item.skill_name}-${item.version_id}`}>
+                          <strong>{item.skill_name}</strong>
+                          <span>{item.source_path || "来源根目录"}</span>
+                          <span className={approved ? "success-text" : "warning-text"}>{approved ? "已审批" : "待审批"}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="table-actions skill-source-revision-actions">
+                    <button type="button" disabled={!ready || revision.is_active || revisionBusy} aria-label={`激活版本 ${revision.id}`} onClick={() => activateRevision.mutate(revision.id)}>激活</button>
+                    <button type="button" className="secondary-action" disabled={!revision.is_active || !revision.previous_revision_id || revisionBusy} aria-label={`回滚版本 ${revision.id}`} onClick={() => rollbackRevision.mutate(revision.id)}>回滚</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+    </article>
+  );
+}
+
 function SkillSourcesPanel() {
   const queryClient = useQueryClient();
   const sources = useQuery({ queryKey: ["skill-sources"], queryFn: () => api.skillSources() });
+  const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<SkillSourceCreateInput>(EMPTY_SOURCE_FORM);
 
@@ -76,6 +229,7 @@ function SkillSourcesPanel() {
         subdirectory: payload.subdirectory,
         enabled: payload.enabled,
         credential_ref: payload.credential_ref,
+        expected_commit_sha: payload.expected_commit_sha,
         expected_archive_sha256: payload.expected_archive_sha256,
       }),
     onSuccess: () => { setEditingId(null); setForm(EMPTY_SOURCE_FORM); refresh(); },
@@ -112,6 +266,7 @@ function SkillSourcesPanel() {
       subdirectory: source.subdirectory,
       enabled: source.enabled,
       credential_ref: source.credential_ref ?? null,
+      expected_commit_sha: source.expected_commit_sha ?? null,
       expected_archive_sha256: source.expected_archive_sha256 ?? null,
     });
   }
@@ -125,6 +280,7 @@ function SkillSourcesPanel() {
       ref: form.ref?.trim() || "main",
       subdirectory: form.subdirectory?.trim() || "",
       credential_ref: optionalValue(form.credential_ref),
+      expected_commit_sha: optionalValue(form.expected_commit_sha),
       expected_archive_sha256: optionalValue(form.expected_archive_sha256),
     };
     if (editingId && !form.credential_ref?.trim()) delete payload.credential_ref;
@@ -141,7 +297,7 @@ function SkillSourcesPanel() {
   }
 
   return (
-    <section className="resource-card skill-source-panel" aria-label="团队 Skill 来源">
+    <section className="skill-source-panel" aria-label="团队 Skill 来源">
       <header className="skill-source-panel-header">
         <div>
           <span className="eyebrow">Team Skill Tap</span>
@@ -179,8 +335,12 @@ function SkillSourcesPanel() {
           <input value={form.credential_ref ?? ""} onChange={(event) => setField("credential_ref", event.currentTarget.value)} placeholder="私有仓库可填" />
         </label>
         <label>
+          预期 Commit SHA
+          <input aria-label="预期 Commit SHA" maxLength={40} pattern="[0-9a-fA-F]{40}" value={form.expected_commit_sha ?? ""} onChange={(event) => setField("expected_commit_sha", event.currentTarget.value)} placeholder="40 位 commit SHA" />
+        </label>
+        <label>
           预期归档 SHA-256
-          <input value={form.expected_archive_sha256 ?? ""} onChange={(event) => setField("expected_archive_sha256", event.currentTarget.value)} placeholder="可留空" />
+          <input maxLength={64} pattern="[0-9a-fA-F]{64}" value={form.expected_archive_sha256 ?? ""} onChange={(event) => setField("expected_archive_sha256", event.currentTarget.value)} placeholder="64 位 SHA-256，可留空" />
         </label>
         <label className="inline-check compact-check skill-source-enabled">
           <input type="checkbox" checked={form.enabled} onChange={(event) => setField("enabled", event.currentTarget.checked)} />
@@ -204,34 +364,16 @@ function SkillSourcesPanel() {
       {sources.data?.length === 0 ? <p className="field-help">还没有团队 Skill 来源。</p> : null}
       <div className="skill-source-list">
         {sources.data?.map((source) => (
-          <article className="skill-source-card" key={source.id}>
-            <div className="skill-source-card-heading">
-              <div>
-                <strong>{source.name}</strong>
-                <small>{source.repository_url}</small>
-              </div>
-              <div className="skill-source-statuses">
-                <span className={`status-pill ${source.trust_state === "trusted" ? "success" : "warning"}`}>{TRUST_LABELS[source.trust_state]}</span>
-                <span className={`status-pill ${source.sync_state === "succeeded" ? "success" : source.sync_state === "failed" ? "danger" : ""}`}>{SYNC_LABELS[source.sync_state]}</span>
-                {!source.enabled ? <span className="status-pill">已停用</span> : null}
-              </div>
-            </div>
-            <dl className="skill-source-summary">
-              <div><dt>引用</dt><dd>{source.ref}{source.subdirectory ? ` / ${source.subdirectory}` : ""}</dd></div>
-              <div><dt>Commit</dt><dd className="mono-copy">{compactHash(source.resolved_commit_sha)}</dd></div>
-              <div><dt>归档哈希</dt><dd className="mono-copy">{compactHash(source.archive_sha256)}</dd></div>
-              <div><dt>关联 Skill</dt><dd>{source.linked_skill_ids.join("、") || "暂无"}</dd></div>
-            </dl>
-            {source.trust_reason ? <p className="field-help">信任说明：{source.trust_reason}</p> : null}
-            {source.last_error ? <p className="danger-text">最近错误：{source.last_error}</p> : null}
-            <div className="table-actions">
-              <button type="button" className="secondary-action" disabled={busy} aria-label={`编辑${source.name}`} onClick={() => edit(source)}>编辑</button>
-              <button type="button" disabled={busy} aria-label={`${source.trust_state === "trusted" ? "重新信任" : "信任"}${source.name}`} onClick={() => requestReason(source, "trust")}>{source.trust_state === "trusted" ? "重新信任" : "信任"}</button>
-              <button type="button" className="secondary-action" disabled={busy || source.trust_state !== "trusted"} aria-label={`撤销信任${source.name}`} onClick={() => requestReason(source, "revoke")}>撤销信任</button>
-              <button type="button" disabled={busy || !source.enabled || source.trust_state !== "trusted"} aria-label={`同步${source.name}`} onClick={() => syncSource.mutate(source.id)}>{syncSource.isPending ? "同步中..." : "同步"}</button>
-              <button type="button" className="danger-action" disabled={busy} aria-label={`删除${source.name}`} onClick={() => { if (window.confirm(`确定删除来源「${source.name}」吗？已同步的 Skill 版本不会随之删除。`)) deleteSource.mutate(source.id); }}>删除</button>
-            </div>
-          </article>
+          <SkillSourceEntry
+            key={source.id}
+            source={source}
+            skills={skills.data ?? []}
+            busy={busy}
+            onEdit={edit}
+            onTrust={requestReason}
+            onSync={(sourceId) => syncSource.mutate(sourceId)}
+            onDelete={(item) => { if (window.confirm(`确定删除来源「${item.name}」吗？已同步的 Skill 版本不会随之删除。`)) deleteSource.mutate(item.id); }}
+          />
         ))}
       </div>
     </section>
