@@ -1209,9 +1209,10 @@ async def test_completed_run_records_bounded_hermes_outcome(
     user_id = uuid4()
     outcomes: list[HermesRunOutcome] = []
     advisor = RecordingHermesAdvisor(outcomes=outcomes)
+    runtime = FakeRuntime()
     service = RunService(
         RunRepository(run_session_factory),
-        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        runtime_registry=RuntimeRegistry((runtime,)),
         router=None,
         task_queue=RecordingQueue([]),
         hermes_advisor=advisor,
@@ -1226,6 +1227,12 @@ async def test_completed_run_records_bounded_hermes_outcome(
     )
 
     completed = await service.execute(submitted.id)
+    expected_artifact = Artifact(
+        id=runtime.artifact_id,
+        type="text",
+        producer="researcher",
+        content={"text": "research complete"},
+    )
 
     assert completed.status is RunStatus.COMPLETED
     assert outcomes == [
@@ -1238,6 +1245,7 @@ async def test_completed_run_records_bounded_hermes_outcome(
             workflow_id="short-video-dispatch",
             conversation_id=submitted.conversation_id,
             agent_ids=("director", "copywriter"),
+            artifacts=(expected_artifact.to_payload(),),
         )
     ]
 
