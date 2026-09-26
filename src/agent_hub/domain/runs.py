@@ -25,6 +25,16 @@ class RunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ConversationQueueStatus(StrEnum):
+    QUEUED = "queued"
+    REDIRECTING = "redirecting"
+    RELEASED = "released"
+    CANCELLED = "cancelled"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class InvalidTransition(ValueError):
     pass
 

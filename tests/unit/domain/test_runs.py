@@ -4,6 +4,7 @@ import pytest
 
 from agent_hub.domain.runs import (
     _ALLOWED_TRANSITIONS,
+    ConversationQueueStatus,
     InvalidTransition,
     RunStatus,
     TaskMode,
@@ -67,6 +68,18 @@ def test_all_run_statuses_have_stable_wire_values() -> None:
         "completed",
         "failed",
         "cancelled",
+    ]
+
+
+def test_all_conversation_queue_statuses_have_stable_wire_values() -> None:
+    assert [status.value for status in ConversationQueueStatus] == [
+        "queued",
+        "redirecting",
+        "released",
+        "cancelled",
+        "running",
+        "completed",
+        "failed",
     ]
 
 

@@ -205,6 +205,9 @@ class RunRow(Base):
     status: Mapped[str] = mapped_column(String(32))
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     routing_decision: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    blocked_by_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     worker_lease_token: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True), nullable=True
@@ -221,6 +224,56 @@ class RunRow(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ConversationQueueItemRow(Base):
+    __tablename__ = "agent_hub_conversation_queue_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_agent_hub_conversation_queue_tenant_idempotency",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'redirecting', 'released', 'cancelled', "
+            "'running', 'completed', 'failed')",
+            name="ck_agent_hub_conversation_queue_status",
+        ),
+        Index(
+            "ix_agent_hub_conversation_queue_order",
+            "tenant_id",
+            "conversation_id",
+            "position",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    predecessor_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    successor_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    attachments: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    references: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    position: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 
