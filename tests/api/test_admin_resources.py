@@ -13634,6 +13634,164 @@ def test_conversation_can_be_loaded_by_session_id() -> None:
     assert payload["runs"][0]["request"] == "Summarize current deployment readiness."
 
 
+def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
+    api = client()
+
+    created = api.post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-metadata",
+            "title": "初始标题",
+            "project_id": "Mofang Agent",
+            "project_label": "魔方 Agent",
+            "workspace_path": "Workspace Main",
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json().items() >= {
+        "conversation_id": "conv-metadata",
+        "title": "初始标题",
+        "project_id": "mofang-agent",
+        "project_label": "魔方 Agent",
+        "workspace_path": "workspace-main",
+        "archived_at": None,
+        "runs": [],
+    }.items()
+    listed = api.get("/api/v1/admin/conversations", headers=headers())
+    assert listed.status_code == 200
+    assert [item["conversation_id"] for item in listed.json()] == ["conv-metadata"]
+
+    updated = api.patch(
+        "/api/v1/admin/conversations/conv-metadata",
+        headers=headers(),
+        json={
+            "title": "重命名后的标题",
+            "project_id": "Team Project",
+            "project_label": "团队项目",
+            "workspace_path": "Workspace Two",
+            "archived": True,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json().items() >= {
+        "title": "重命名后的标题",
+        "project_id": "team-project",
+        "project_label": "团队项目",
+        "workspace_path": "workspace-two",
+        "runs": [],
+    }.items()
+    assert updated.json()["archived_at"] is not None
+    assert api.get("/api/v1/admin/conversations", headers=headers()).json() == []
+    archived = api.get(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        params={"archived": "true"},
+    )
+    assert [item["conversation_id"] for item in archived.json()] == ["conv-metadata"]
+
+    restored = api.patch(
+        "/api/v1/admin/conversations/conv-metadata",
+        headers=headers(),
+        json={"archived": False},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["archived_at"] is None
+    detail = api.get("/api/v1/admin/conversations/conv-metadata", headers=headers())
+    assert detail.status_code == 200
+    assert detail.json()["title"] == "重命名后的标题"
+    assert detail.json()["runs"] == []
+
+
+@pytest.mark.parametrize(
+    "workspace_path",
+    ("../escape", "nested/path", r"nested\path", "/absolute"),
+)
+def test_conversation_metadata_rejects_unsafe_workspace_path(workspace_path: str) -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-unsafe-workspace",
+            "title": "不安全工作区",
+            "project_id": "default",
+            "workspace_path": workspace_path,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_conversation_metadata_uses_default_title_when_client_omits_it() -> None:
+    response = client().post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-default-title",
+            "project_id": "default",
+            "workspace_path": "conv-default-title",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == "新会话"
+    assert response.json()["runs"] == []
+
+
+@pytest.mark.parametrize("field_name", ("title", "project_id", "project_label", "workspace_path"))
+def test_conversation_metadata_rejects_null_updates(field_name: str) -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-null-update",
+            "project_id": "default",
+            "workspace_path": "conv-null-update",
+        },
+    )
+    assert created.status_code == 201
+
+    response = api.patch(
+        "/api/v1/admin/conversations/conv-null-update",
+        headers=headers(),
+        json={field_name: None},
+    )
+
+    assert response.status_code == 422
+
+
+def test_conversation_metadata_is_tenant_scoped() -> None:
+    root = TenantScopedAdminResourceService()
+    app = create_app(auth_service=StubAuthService(), rate_limiter=object())
+    app.state.admin_resource_service = root
+    first = TestClient(app)
+    created = first.post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-private",
+            "title": "租户一会话",
+            "project_id": "default",
+            "workspace_path": "conv-private",
+        },
+    )
+    assert created.status_code == 201
+
+    other_app = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    other_app.state.admin_resource_service = root
+    other = TestClient(other_app)
+
+    assert other.get("/api/v1/admin/conversations", headers=headers()).json() == []
+    assert (
+        other.get("/api/v1/admin/conversations/conv-private", headers=headers()).status_code
+        == 404
+    )
+
+
 @pytest.mark.asyncio
 async def test_persistent_admin_conversation_keeps_chronological_messages() -> None:
     first_id = UUID("33333333-3333-4333-8333-333333333331")

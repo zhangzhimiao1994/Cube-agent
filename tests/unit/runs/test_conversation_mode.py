@@ -5,9 +5,12 @@ import time
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import pytest
+
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
+from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import (
     HermesMemoryInjection,
@@ -119,6 +122,18 @@ class ConversationModeRepository:
         )
 
 
+class ConversationMetadataRepository:
+    def __init__(self, record: ConversationRecord) -> None:
+        self.record = record
+        self.lookups: list[tuple[UUID, str]] = []
+
+    async def find(self, tenant_id: UUID, conversation_id: str) -> ConversationRecord | None:
+        self.lookups.append((tenant_id, conversation_id))
+        if tenant_id != self.record.tenant_id or conversation_id != self.record.conversation_id:
+            return None
+        return self.record
+
+
 class RecordingHermesAdvisor:
     def __init__(self, advice: HermesRunAdvice | None) -> None:
         self.advice = advice
@@ -197,6 +212,115 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
             "sandbox_profile": "workspace_write",
             "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
     }.items()
+
+
+async def test_reference_workflow_is_advisory_and_persisted_without_selecting_workflow() -> None:
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="参考短视频方案继续执行",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-reference-workflow",
+        reference_workflow_id="short-video-dispatch",
+    )
+
+    assert submitted.mode is TaskMode.HYBRID
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reference_workflow_id"] == "short-video-dispatch"
+    assert routing["workflow_id"] is None
+
+
+async def test_existing_conversation_metadata_overrides_temporary_run_workspace_values() -> None:
+    tenant_id = uuid4()
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    metadata_repository = ConversationMetadataRepository(
+        ConversationRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            conversation_id="conv-persisted",
+            title="持久化会话",
+            project_id="persisted-project",
+            project_label="持久化项目",
+            workspace_path="persisted-workspace",
+            archived_at=None,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+        conversation_repository=metadata_repository,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="继续处理",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-persisted",
+        project_id="temporary-project",
+        project_label="临时项目",
+        workspace_session_id="temporary-workspace",
+    )
+
+    assert submitted.project_id == "persisted-project"
+    assert submitted.project_label == "持久化项目"
+    assert submitted.workspace_session_id == "persisted-workspace"
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["project_id"] == "persisted-project"
+    assert routing["project_label"] == "持久化项目"
+    assert routing["workspace_session_id"] == "persisted-workspace"
+    assert metadata_repository.lookups == [(tenant_id, "conv-persisted")]
+
+
+async def test_archived_conversation_cannot_accept_a_new_run() -> None:
+    tenant_id = uuid4()
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    metadata_repository = ConversationMetadataRepository(
+        ConversationRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            conversation_id="conv-archived",
+            title="已归档",
+            project_id="default",
+            project_label="默认项目",
+            workspace_path="conv-archived",
+            archived_at=datetime.now(UTC),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+        conversation_repository=metadata_repository,
+    )
+
+    with pytest.raises(ConversationArchived, match="archived"):
+        await service.submit(
+            tenant_id=tenant_id,
+            actor_id=uuid4(),
+            message="继续处理",
+            mode=TaskMode.AUTO,
+            conversation_id="conv-archived",
+        )
+
+    assert repository.created == []
 
 
 async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:

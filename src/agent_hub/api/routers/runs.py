@@ -27,6 +27,7 @@ from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
+from agent_hub.runs.conversations import ConversationArchived
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
@@ -76,6 +77,7 @@ class RunServiceProtocol(Protocol):
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
@@ -203,6 +205,11 @@ class CreateRunRequest(BaseModel):
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
     )
     workflow_id: str | None = Field(default=None, max_length=128)
+    reference_workflow_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
     allow_workflow_adjustment: bool = False
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
@@ -979,6 +986,7 @@ async def create_run(
             mode=body.mode,
             agent_ids=body.agent_ids,
             workflow_id=body.workflow_id,
+            reference_workflow_id=body.reference_workflow_id,
             allow_workflow_adjustment=body.allow_workflow_adjustment,
             conversation_id=body.conversation_id,
             reference_conversation_id=body.reference_conversation_id,
@@ -1002,6 +1010,14 @@ async def create_run(
             "vibe_coding_unavailable",
             reason,
             details={"reason": reason},
+        ) from error
+    except ConversationArchived as error:
+        reason = str(error)
+        raise PublicAPIError(
+            409,
+            "conversation_archived",
+            reason,
+            details={"conversation_id": body.conversation_id or ""},
         ) from error
     except ValueError as error:
         reason = str(error)

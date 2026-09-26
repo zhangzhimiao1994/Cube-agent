@@ -7,11 +7,11 @@ from time import monotonic
 from typing import cast
 
 import pytest
-from sqlalchemy import CheckConstraint, Table
+from sqlalchemy import CheckConstraint, Table, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agent_hub.db.migrations import resolve_database_url
-from agent_hub.db.models import AdminResourceRow, RunRow
+from agent_hub.db.models import AdminResourceRow, ConversationRow, RunRow
 from agent_hub.db.session import Database, build_database, build_session_factory
 from agent_hub.settings import Settings
 
@@ -168,3 +168,42 @@ def test_conversation_index_migration_uses_non_blocking_postgres_ddl() -> None:
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in source
     assert "DROP INDEX CONCURRENTLY IF EXISTS" in source
     assert "routing_decision ->> 'conversation_id'" in source
+
+
+def test_conversation_metadata_model_is_unique_per_tenant_and_conversation() -> None:
+    table = cast(Table, ConversationRow.__table__)
+
+    unique_columns = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("tenant_id", "conversation_id") in unique_columns
+    assert {column.name for column in table.columns} >= {
+        "tenant_id",
+        "conversation_id",
+        "title",
+        "project_id",
+        "project_label",
+        "workspace_path",
+        "archived_at",
+        "created_at",
+        "updated_at",
+    }
+
+
+def test_conversation_metadata_migration_follows_current_head() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0026_conversation_metadata.py"
+    )
+    spec = importlib.util.spec_from_file_location("migration_0026_conversation_metadata", migration_path)
+    assert spec is not None
+    assert spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    assert migration.revision == "0026_conversation_metadata"
+    assert migration.down_revision == "0025_run_conversation_index"

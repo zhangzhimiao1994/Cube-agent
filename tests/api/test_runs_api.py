@@ -18,6 +18,7 @@ from agent_hub.api.routers.runs import SubmittedRunResponse
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.conversations import ConversationArchived
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 
 
@@ -111,11 +112,13 @@ class StubRunService:
     direct_models: list[str | None] | None = None
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
+    reference_workflow_ids: list[str | None] = field(default_factory=list)
     workspace_contexts: list[dict[str, object]] = field(default_factory=list)
     runtime_timeouts: list[float | None] = field(default_factory=list)
     paused: list[tuple[UUID, UUID]] = field(default_factory=list)
     resumed: list[tuple[UUID, UUID]] = field(default_factory=list)
     cancelled: list[tuple[UUID, UUID]] = field(default_factory=list)
+    archived_conversation_ids: set[str] = field(default_factory=set)
 
     async def submit(
         self,
@@ -127,6 +130,7 @@ class StubRunService:
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
@@ -144,6 +148,8 @@ class StubRunService:
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        if conversation_id in self.archived_conversation_ids:
+            raise ConversationArchived("archived conversation cannot accept new runs")
         if vibe_coding and "no capable harness" in message:
             raise VibeCodingUnavailable(
                 "Vibe Coding requires a harness-capable model deployment with text, "
@@ -151,6 +157,7 @@ class StubRunService:
                 "task support."
             )
         self.actor_roles.append(actor_role)
+        self.reference_workflow_ids.append(reference_workflow_id)
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
@@ -591,6 +598,23 @@ def test_run_submission_rejects_unsafe_idempotency_key_before_service_call() -> 
     assert service.submitted == []
 
 
+def test_run_submission_forwards_reference_workflow_as_advisory_context() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "参考方案继续执行",
+            "mode": "direct",
+            "reference_workflow_id": "short-video-dispatch",
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.reference_workflow_ids[-1] == "short-video-dispatch"
+
+
 def test_run_submission_records_user_conversation_audit_event() -> None:
     settings_service = StubSettingsService()
     client, service, principal = _client(settings_service=settings_service)
@@ -632,6 +656,25 @@ def test_run_submission_records_user_conversation_audit_event() -> None:
     assert isinstance(details["message_sha256"], str)
     assert service.enqueue_count == 1
     assert service.actor_roles == [principal.role]
+
+
+def test_run_submission_rejects_archived_conversation_with_conflict() -> None:
+    client, service, _ = _client()
+    service.archived_conversation_ids.add("conv-archived")
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "继续处理归档会话",
+            "mode": "auto",
+            "conversation_id": "conv-archived",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conversation_archived"
+    assert service.submitted == []
 
 def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
     client, service, principal = _client()

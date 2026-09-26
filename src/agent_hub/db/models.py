@@ -129,6 +129,40 @@ class ConfigRevisionRow(Base):
     )
 
 
+class ConversationRow(Base):
+    __tablename__ = "agent_hub_conversations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "conversation_id",
+            name="uq_agent_hub_conversations_tenant_conversation",
+        ),
+        Index(
+            "ix_agent_hub_conversations_tenant_archived_updated",
+            "tenant_id",
+            "archived_at",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    project_label: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    workspace_path: Mapped[str] = mapped_column(String(64), nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class RunRow(Base):
     __tablename__ = "agent_hub_runs"
     __table_args__ = (

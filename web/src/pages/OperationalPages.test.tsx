@@ -728,6 +728,18 @@ describe("operational management pages", () => {
   let visibleSettings = settings;
   let visibleExecutionBackends = executionBackends;
   let failExecutionBackendProbe = false;
+  let visibleConversationMetadata = {
+    conversation_id: "conv-previous",
+    title: "短视频脚本方案",
+    project_id: "default",
+    project_label: "默认项目",
+    workspace_path: "conv-previous",
+    archived_at: null as string | null,
+    created_at: "2026-08-07T08:00:00Z",
+    updated_at: "2026-08-07T08:00:00Z",
+  };
+  let createdConversationMetadataList: Array<typeof visibleConversationMetadata> = [];
+  let hideVisibleConversationMetadata = false;
 
   beforeEach(() => {
     requests.length = 0;
@@ -758,6 +770,18 @@ describe("operational management pages", () => {
     visibleSettings = settings;
     visibleExecutionBackends = executionBackends;
     failExecutionBackendProbe = false;
+    visibleConversationMetadata = {
+      conversation_id: "conv-previous",
+      title: "短视频脚本方案",
+      project_id: "default",
+      project_label: "默认项目",
+      workspace_path: "conv-previous",
+      archived_at: null,
+      created_at: "2026-08-07T08:00:00Z",
+      updated_at: "2026-08-07T08:00:00Z",
+    };
+    createdConversationMetadataList = [];
+    hideVisibleConversationMetadata = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -805,8 +829,44 @@ describe("operational management pages", () => {
           }
           return jsonResponse(visibleRunDetail);
         }
+        if (path === "/api/v1/admin/conversations" && method === "GET") {
+          const archived = new URL(requestPath, "https://agent-hub.test").searchParams.get("archived") === "true";
+          return jsonResponse(
+            [
+              ...(hideVisibleConversationMetadata ? [] : [visibleConversationMetadata]),
+              ...createdConversationMetadataList,
+            ].filter(
+              (item) => Boolean(item.archived_at) === archived,
+            ),
+          );
+        }
+        if (path === "/api/v1/admin/conversations" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const createdConversationMetadata = {
+            conversation_id: String(body.conversation_id),
+            title: String(body.title ?? ""),
+            project_id: String(body.project_id),
+            project_label: String(body.project_label ?? ""),
+            workspace_path: String(body.workspace_path),
+            archived_at: null,
+            created_at: "2026-09-26T08:00:00Z",
+            updated_at: "2026-09-26T08:00:00Z",
+          };
+          createdConversationMetadataList.push(createdConversationMetadata);
+          return jsonResponse(createdConversationMetadata);
+        }
+        if (path === "/api/v1/admin/conversations/conv-previous" && method === "PATCH") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          visibleConversationMetadata = {
+            ...visibleConversationMetadata,
+            ...(typeof body.title === "string" ? { title: body.title } : {}),
+            ...(body.archived === true ? { archived_at: "2026-09-26T08:00:00Z" } : {}),
+            ...(body.archived === false ? { archived_at: null } : {}),
+          };
+          return jsonResponse(visibleConversationMetadata);
+        }
         if (path === "/api/v1/admin/conversations/conv-previous") {
-          return jsonResponse({ conversation_id: "conv-previous", runs: visibleConversationRuns });
+          return jsonResponse({ ...visibleConversationMetadata, runs: visibleConversationRuns });
         }
         if (path === "/api/v1/workspaces/projects/default/sessions/conv-previous/files") {
           return jsonResponse(visibleWorkspaceFiles);
@@ -2336,7 +2396,7 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
   });
-  it("keeps run detail access inside the center chat stream and sends selected workflow roles", async () => {
+  it("keeps reference workflows advisory while main-agent routing stays automatic", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -2350,8 +2410,8 @@ describe("operational management pages", () => {
 
     await openRunConfig(user);
     await expandRunConfigDetails(user);
-    await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
-    expect(screen.getByText(/临场调整 开/)).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("参考方案"), "short-video-dispatch");
+    expect(screen.getByText(/仅供主 Agent 参考/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -2363,27 +2423,32 @@ describe("operational management pages", () => {
       method: "POST",
       body: {
         message: "给我做一个短视频脚本方案。",
-        mode: "dispatch",
-        workflow_id: "short-video-dispatch",
-        allow_workflow_adjustment: true,
-        agent_ids: ["director", "copywriter", "editor"],
+        mode: "auto",
+        reference_workflow_id: "short-video-dispatch",
+        allow_workflow_adjustment: false,
+        agent_ids: [],
       },
     });
   });
 
-  it("submits project workspace and sandbox permission choices from run settings", async () => {
+  it("uses project workspace chosen at conversation creation with run sandbox choices", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    const newConversation = screen.getByRole("dialog", { name: "新建会话" });
+    await user.clear(within(newConversation).getByLabelText("项目 ID"));
+    await user.type(within(newConversation).getByLabelText("项目 ID"), "mofang-agent");
+    await user.type(within(newConversation).getByLabelText("项目名称"), "魔方 Agent");
+    await user.clear(within(newConversation).getByLabelText("工作区目录名"));
+    await user.type(within(newConversation).getByLabelText("工作区目录名"), "app");
+    await user.click(within(newConversation).getByRole("button", { name: "创建会话" }));
     await openRunConfig(user);
     await expandRunConfigDetails(user);
-    await user.clear(screen.getByLabelText("项目文件夹"));
-    await user.type(screen.getByLabelText("项目文件夹"), "Mofang Agent");
-    await user.type(screen.getByLabelText("项目名称"), "魔方 Agent");
     await user.click(screen.getByRole("button", { name: /项目写入/ }));
     await user.selectOptions(screen.getByLabelText("执行环境"), "docker");
-    expect(screen.getByText(/^工作区：projects\/mofang-agent\/sessions\/conv-/)).not.toBeNull();
+    expect(screen.getByText(/工作区：projects\/mofang-agent\/sessions\/app/)).not.toBeNull();
 
     await user.type(screen.getByPlaceholderText(/输入消息/), "生成一个简单项目并打包。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -2393,7 +2458,7 @@ describe("operational management pages", () => {
       method: "POST",
       body: {
         message: "生成一个简单项目并打包。",
-        project_id: "Mofang Agent",
+        project_id: "mofang-agent",
         project_label: "魔方 Agent",
         sandbox_profile: "workspace_write",
         execution_backend: "docker",
@@ -2401,7 +2466,10 @@ describe("operational management pages", () => {
       },
     });
     const request = requests.find((item) => item.path === "/api/v1/runs");
-    expect((request?.body as { workspace_session_id?: string }).workspace_session_id).toMatch(/^conv-/);
+    expect((request?.body as { workspace_session_id?: string }).workspace_session_id).toBe("app");
+    expect(
+      requests.some((item) => item.path === "/api/v1/workspaces/projects/mofang-agent/sessions/app/files"),
+    ).toBe(true);
   });
 
   it("keeps step generated downloads inside the producing agent drawer", async () => {
@@ -2899,75 +2967,58 @@ describe("operational management pages", () => {
     });
   });
 
-  it("uses a selected direct model instead of a child agent when direct mode is selected", async () => {
+  it("routes direct-style requests through the main agent without manual mode controls", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    ["自动", "直连", "派单", "讨论", "混合"].forEach((label) => {
-      expect(screen.getByRole("button", { name: label })).not.toBeNull();
-    });
-    expect(screen.queryByRole("button", { name: "选择直连模式" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "选择直连" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "直连" }));
-    expect(await screen.findByText(/直连会由主 Agent 控场/)).not.toBeNull();
-    expect(screen.getByText(/1\. main/)).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "1 帮我写一段口播。");
+    expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "直接帮我写一段口播。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await screen.findByText(/这是最终回复正文/);
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
-        message: "帮我写一段口播。",
-        mode: "direct",
+        message: "直接帮我写一段口播。",
+        mode: "auto",
         allow_workflow_adjustment: false,
-        direct_model: "main",
+        direct_model: null,
         agent_ids: [],
       },
     });
   });
 
-  it("does not let direct mode silently fall back before a direct model is selected", async () => {
+  it("does not require a direct model before an ordinary auto-routed message", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "直连" }));
-    expect(screen.getByText(/直连需要先选择本次对话使用的模型\/API/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "直接回答这句话。");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-    expect(screen.getByText(/请先回复模型编号/)).not.toBeNull();
-    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
-
-    await user.clear(screen.getByPlaceholderText(/输入消息/));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "coder 直接回答这句话。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
         message: "直接回答这句话。",
-        mode: "direct",
-        direct_model: "coder",
+        mode: "auto",
+        direct_model: null,
         agent_ids: [],
       },
     });
   });
 
-  it("shows an actionable empty state when direct mode has no configured models", async () => {
+  it("keeps auto-routed chat available when no models are listed in the selector resource", async () => {
     const user = userEvent.setup();
     visibleRunListItems = [];
     visibleModels = [];
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "直连" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "请直接分析一下这个问题。");
-
-    expect(screen.getAllByText(/还没有可用于直连的已测试模型/).length).toBeGreaterThan(0);
-    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({ body: { mode: "auto" } });
   });
 
   it("renders text artifacts as assistant chat replies instead of artifact-only cards", async () => {
@@ -3132,14 +3183,15 @@ describe("operational management pages", () => {
     expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
 
-    await user.click(screen.getAllByRole("button", { name: "新建对话" }).at(-1) as HTMLElement);
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await user.click(within(screen.getByRole("dialog", { name: "新建会话" })).getByRole("button", { name: "创建会话" }));
     expect(within(stream).queryByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).toBeNull();
-    expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
+    expect(screen.getByText(/会话已创建/)).not.toBeNull();
 
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/会话：conv-previous/)).not.toBeNull();
+    expect(screen.getByText(/会话：短视频脚本方案/)).not.toBeNull();
   });
 
   it("opens a historical conversation and continues inside the same conversation id", async () => {
@@ -3148,7 +3200,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
+    await screen.findByText(/会话：短视频脚本方案/);
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -3393,12 +3445,12 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
-    await user.click(screen.getAllByRole("button", { name: "新建对话" })[0]);
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await user.click(within(screen.getByRole("dialog", { name: "新建会话" })).getByRole("button", { name: "创建会话" }));
 
     expect(screen.queryByRole("status", { name: "自修复确认" })).toBeNull();
     expect(screen.queryByText("受控自修复建议")).toBeNull();
-    expect(screen.getByText("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。")).not.toBeNull();
+    expect(screen.getByText("会话已创建，后续运行由主 Agent 自动判断模式和角色。")).not.toBeNull();
   });
   it("allows a pending sandbox capability from the composer card", async () => {
     const user = userEvent.setup();
@@ -3487,7 +3539,9 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
-    await screen.findByText(/已按原思路新建分支/);
+    expect(await screen.findByText(/创建后会引用原会话/)).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "创建会话" }));
+    await screen.findByText(/分支会话已创建/);
     await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -3506,7 +3560,8 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
-    await screen.findByText(/已按原思路新建分支/);
+    await user.click(await screen.findByRole("button", { name: "创建会话" }));
+    await screen.findByText(/分支会话已创建/);
     expect(screen.queryByRole("button", { name: "按照原思路" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "取消引用会话" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "不引用上一轮。");
@@ -3528,7 +3583,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
+    await screen.findByText(/会话：短视频脚本方案/);
 
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -3588,7 +3643,8 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
-    await screen.findByText(/已按原思路新建分支/);
+    await user.click(await screen.findByRole("button", { name: "创建会话" }));
+    await screen.findByText(/分支会话已创建/);
     expect(screen.queryByRole("button", { name: "自动" })).toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "接着前面的方向继续。");
@@ -6667,30 +6723,14 @@ describe("operational management pages", () => {
     expect(directorCard?.textContent).toContain("负责审查活动动线");
   });
 
-  it("refreshes newly saved agents in the run configuration without a manual page reload", async () => {
+  it("keeps saved agents out of the run configuration because the main agent owns role selection", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await openRunConfig(user);
     expect(screen.queryByText("测试工程师（qa-engineer）")).toBeNull();
-
-    visibleAgents = [
-      ...visibleAgents,
-      {
-        id: "qa-engineer",
-        name: "测试工程师",
-        enabled: true,
-        role: "测试工程师",
-        prompt: "负责从用户视角验证交付能力。",
-        model: "main",
-        skills: [],
-      },
-    ];
-
-    await waitFor(() => expect(screen.getByText("测试工程师（qa-engineer）")).not.toBeNull(), {
-      timeout: 2500,
-    });
+    expect(screen.queryByRole("group", { name: "角色池" })).toBeNull();
   });
 
   it("refreshes new process cards while a different process detail drawer stays open", async () => {
@@ -6863,6 +6903,123 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(chatConsole?.className).not.toContain("history-drawer-open");
   });
+
+  it("keeps one new-conversation entry and collects project metadata before creating", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: "新建对话" })).toHaveLength(1);
+
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    const dialog = screen.getByRole("dialog", { name: "新建会话" });
+    await user.type(within(dialog).getByLabelText("会话标题"), "浏览器插件开发");
+    await user.clear(within(dialog).getByLabelText("项目 ID"));
+    await user.type(within(dialog).getByLabelText("项目 ID"), "browser-tools");
+    await user.type(within(dialog).getByLabelText("项目名称"), "浏览器工具");
+    await user.clear(within(dialog).getByLabelText("工作区目录名"));
+    await user.type(within(dialog).getByLabelText("工作区目录名"), "plugin");
+    await user.click(within(dialog).getByRole("button", { name: "创建会话" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/conversations" && request.method === "POST")).toMatchObject({
+        body: {
+          title: "浏览器插件开发",
+          project_id: "browser-tools",
+          project_label: "浏览器工具",
+          workspace_path: "plugin",
+        },
+      }),
+    );
+    expect(screen.queryByRole("dialog", { name: "新建会话" })).toBeNull();
+    expect(screen.getByText("会话：浏览器插件开发")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    expect(screen.getByRole("button", { name: "进入会话 浏览器插件开发" })).not.toBeNull();
+  });
+
+  it("persists a default conversation before the first message in an empty tenant", async () => {
+    hideVisibleConversationMetadata = true;
+    visibleRunListItems = [];
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "第一次消息");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(requests.some((item) => item.path === "/api/v1/runs")).toBe(true));
+    const conversationRequestIndex = requests.findIndex(
+      (item) => item.path === "/api/v1/admin/conversations" && item.method === "POST",
+    );
+    const runRequestIndex = requests.findIndex((item) => item.path === "/api/v1/runs");
+    expect(conversationRequestIndex).toBeGreaterThanOrEqual(0);
+    expect(runRequestIndex).toBeGreaterThan(conversationRequestIndex);
+  });
+
+  it("rejects absolute or traversing workspace paths in the new-conversation form", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    const dialog = screen.getByRole("dialog", { name: "新建会话" });
+    const workspace = within(dialog).getByLabelText("工作区目录名");
+
+    await user.clear(workspace);
+    await user.type(workspace, "../outside");
+    expect(within(dialog).getByRole("alert").textContent).toContain("工作区目录名只能包含");
+    expect((within(dialog).getByRole("button", { name: "创建会话" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await user.clear(workspace);
+    await user.type(workspace, "C:\\temp\\outside");
+    expect((within(dialog).getByRole("button", { name: "创建会话" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("renames and archives the active conversation from its title menu", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    expect(await screen.findByText("会话：短视频脚本方案")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
+    const renameDialog = screen.getByRole("dialog", { name: "重命名会话" });
+    const titleInput = within(renameDialog).getByLabelText("会话标题");
+    await user.clear(titleInput);
+    await user.type(titleInput, "短视频脚本第二版");
+    await user.click(within(renameDialog).getByRole("button", { name: "保存名称" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/conversations/conv-previous" && request.method === "PATCH")).toMatchObject({
+        body: { title: "短视频脚本第二版" },
+      }),
+    );
+    expect(await screen.findByText("会话：短视频脚本第二版")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "归档" }));
+    await waitFor(() =>
+      expect([...requests].reverse().find((request) => request.path === "/api/v1/admin/conversations/conv-previous" && request.method === "PATCH")).toMatchObject({
+        body: { archived: true },
+      }),
+    );
+    expect((await screen.findAllByText("已归档")).length).toBeGreaterThan(0);
+    await user.type(screen.getByPlaceholderText(/输入消息/), "归档后不应继续发送");
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    await user.click(screen.getByRole("menuitem", { name: "恢复" }));
+    await waitFor(() =>
+      expect([...requests].reverse().find((request) => request.path === "/api/v1/admin/conversations/conv-previous" && request.method === "PATCH")).toMatchObject({
+        body: { archived: false },
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("已归档")).toBeNull());
+    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("keeps quick mode under main-agent auto routing without forcing direct", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -6881,12 +7038,13 @@ describe("operational management pages", () => {
     expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
   });
 
-  it("selects the chat mode from the compact entry panel before sending", async () => {
+  it("does not expose manual mode controls for ordinary conversations", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "讨论" }));
+    expect(screen.queryByRole("button", { name: "讨论" })).toBeNull();
+    expect(screen.queryByLabelText("模式")).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -6895,22 +7053,16 @@ describe("operational management pages", () => {
       method: "POST",
       body: {
         message: "请让多个角色评审这个方案。",
-        mode: "discuss",
+        mode: "auto",
       },
     });
   });
 
-  it("uses a mode keyword from the new-chat input without requiring numeric choices", async () => {
+  it("treats leading mode words as ordinary prompt text", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "直连" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "派单" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "讨论" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "混合" })).not.toBeNull();
-
     await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -6918,35 +7070,10 @@ describe("operational management pages", () => {
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
-        message: "请让多个角色评审这个方案。",
-        mode: "discuss",
+        message: "讨论 请让多个角色评审这个方案。",
+        mode: "auto",
       },
     });
-  });
-
-  it("does not ask again when a manually selected mode is returned as backend clarification", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/" />);
-
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "讨论" }));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "这个任务不应该二次确认。");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-
-    expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
-    expect(await screen.findByText(/不再重复确认模式/)).not.toBeNull();
-
-    await waitFor(() =>
-      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
-        method: "POST",
-        body: {
-          mode: "discuss",
-          decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
-          version: 1,
-          operator_note: "用户已在新对话入口明确选择该模式。",
-        },
-      }),
-    );
   });
 
   it("uploads an archive as a normal attachment first and installs it as a skill only after explicit action", async () => {
@@ -7086,7 +7213,7 @@ describe("operational management pages", () => {
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
     await openRunConfig(user);
     await expandRunConfigDetails(user);
-    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
+    await user.selectOptions(screen.getByLabelText("参考方案"), "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -7125,7 +7252,7 @@ describe("operational management pages", () => {
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
     await openRunConfig(user);
     await expandRunConfigDetails(user);
-    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
+    await user.selectOptions(screen.getByLabelText("参考方案"), "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -7183,10 +7310,10 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     expect(screen.queryByText("先选一个运行方式，也可以保持自动直接发送。")).toBeNull();
-    expect(screen.getByText("自动 · 主 Agent 判断，低把握才确认")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
 
     const composer = screen.getByRole("form", { name: "发送消息" });
-    expect(within(composer).getByText("自动 · 项目写入 · 自动角色")).not.toBeNull();
+    expect(within(composer).getByText("主 Agent 自动 · 项目写入")).not.toBeNull();
 
     await openRunConfig(user);
     const config = screen.getByRole("region", { name: "本次运行更多设置" });
@@ -7194,7 +7321,8 @@ describe("operational management pages", () => {
     expect(within(config).getByText("详细设置")).not.toBeNull();
     await expandRunConfigDetails(user);
     expect(within(config).getByRole("group", { name: "选择本次运行沙箱权限" })).not.toBeNull();
-    expect(within(config).getByText("角色池 · 自动")).not.toBeNull();
+    expect(within(config).getByText("主 Agent 自动")).not.toBeNull();
+    expect(within(config).queryByText("角色池 · 自动")).toBeNull();
   });
 
   it("falls back to the first available execution backend when the configured default is unavailable", async () => {

@@ -110,6 +110,7 @@ from agent_hub.routing.types import (
     RouteSource,
 )
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.conversations import ConversationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import (
     HarnessSchedulerProtocol,
@@ -1176,6 +1177,7 @@ def create_app(
                             else application.state.admin_resource_service,
                         ).get_main_agent_config
                     ),
+                    conversation_repository=ConversationRepository(active_sessions),
                 )
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router

@@ -541,6 +541,8 @@ const RunListItemSchema = z.object({
   mode: z.string(),
   version: z.number().optional(),
   conversation_id: z.string().nullable().optional(),
+  conversation_title: z.string().nullable().optional(),
+  conversation_archived_at: z.string().nullable().optional(),
   request: z.string().optional(),
   created_at: z.string().nullable().optional(),
   queue_wait_ms: z.number(),
@@ -900,12 +902,34 @@ export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
 export type BulkFailure = z.infer<typeof BulkFailureSchema>;
 export type RunBulkDeleteResult = z.infer<typeof RunBulkDeleteSchema>;
 
-const ConversationSchema = z.object({
+const ConversationMetadataSchema = z.object({
   conversation_id: z.string(),
+  title: z.string().nullable().optional(),
+  project_id: z.string().nullable().optional(),
+  project_label: z.string().nullable().optional(),
+  workspace_path: z.string().nullable().optional(),
+  archived_at: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+  updated_at: z.string().nullable().optional(),
+});
+
+const ConversationSchema = ConversationMetadataSchema.extend({
   runs: z.array(RunDetailSchema),
 });
 
 export type Conversation = z.infer<typeof ConversationSchema>;
+export type ConversationMetadata = z.infer<typeof ConversationMetadataSchema>;
+export type ConversationCreateRequest = {
+  conversation_id: string;
+  title?: string;
+  project_id: string;
+  project_label?: string | null;
+  workspace_path: string;
+};
+export type ConversationUpdateRequest = {
+  title?: string;
+  archived?: boolean;
+};
 
 const WorkspaceFileSchema = z.object({
   path: z.string(),
@@ -2146,6 +2170,7 @@ export const api = {
     agent_ids?: string[];
     direct_model?: string | null;
     workflow_id?: string | null;
+    reference_workflow_id?: string | null;
     allow_workflow_adjustment?: boolean;
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
@@ -2319,6 +2344,27 @@ export const api = {
       `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}`,
       { method: "GET" },
       ConversationSchema,
+    );
+  },
+  conversations(archived = false): Promise<ConversationMetadata[]> {
+    return request(
+      `/api/v1/admin/conversations?archived=${archived ? "true" : "false"}`,
+      { method: "GET" },
+      z.array(ConversationMetadataSchema),
+    );
+  },
+  createConversation(payload: ConversationCreateRequest): Promise<ConversationMetadata> {
+    return request(
+      "/api/v1/admin/conversations",
+      { method: "POST", body: JSON.stringify(payload) },
+      ConversationMetadataSchema,
+    );
+  },
+  updateConversation(conversationId: string, payload: ConversationUpdateRequest): Promise<ConversationMetadata> {
+    return request(
+      `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+      ConversationMetadataSchema,
     );
   },
   workspaceFiles(projectId: string, sessionId: string): Promise<WorkspaceFileList> {

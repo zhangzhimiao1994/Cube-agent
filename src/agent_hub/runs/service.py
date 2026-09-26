@@ -34,6 +34,7 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
+from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runs.self_repair import (
@@ -138,6 +139,10 @@ class TaskQueue(Protocol):
 
 class ModeRouterProtocol(Protocol):
     async def route(self, task_text: object) -> RouteDecision: ...
+
+
+class ConversationRepositoryProtocol(Protocol):
+    async def find(self, tenant_id: UUID, conversation_id: str) -> ConversationRecord | None: ...
 
 
 class TerminalRunHook(Protocol):
@@ -431,9 +436,11 @@ class RunService:
         worker_id: str | None = None,
         run_worker_lease_seconds: float = 60.0,
         instruction_context_loader: InstructionContextLoader | None = None,
+        conversation_repository: ConversationRepositoryProtocol | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
+        self._conversation_repository = conversation_repository
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -463,6 +470,7 @@ class RunService:
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
@@ -481,6 +489,15 @@ class RunService:
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
+        conversation = None
+        if conversation_id is not None and self._conversation_repository is not None:
+            conversation = await self._conversation_repository.find(tenant_id, conversation_id)
+        if conversation is not None:
+            if conversation.archived_at is not None:
+                raise ConversationArchived("archived conversation cannot accept new runs")
+            project_id = conversation.project_id
+            project_label = conversation.project_label
+            workspace_session_id = conversation.workspace_path
         workspace = workspace_selection(
             project_id=project_id,
             project_label=project_label,
@@ -506,6 +523,11 @@ class RunService:
             **workspace.routing_payload(),
             "execution_backend": resolved_execution_backend,
         }
+        if reference_workflow_id is not None:
+            cleaned_reference_workflow_id = reference_workflow_id.strip()
+            if _SAFE_ROLE_ID.fullmatch(cleaned_reference_workflow_id) is None:
+                raise ValueError("reference_workflow_id must be a safe workflow identifier")
+            operator_selection["reference_workflow_id"] = cleaned_reference_workflow_id
         if cleaned_direct_model:
             operator_selection["direct_model"] = cleaned_direct_model
         if vibe_coding:

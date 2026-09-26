@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import {
   ArtifactFileCard,
@@ -214,41 +214,6 @@ function parseChoiceText(
       : `${raw.slice(0, index)} ${raw.slice(index + matched.alias.length)}`
           .replace(/^[\s.、:：-]+|[\s.、:：-]+$/g, "")
           .trim();
-  return { option: matched.option, note };
-}
-
-function parseLeadingKeywordChoiceText(
-  text: string,
-  options: Array<{ value: string; label: string; aliases?: string[] }>,
-) {
-  const raw = text.trim();
-  if (!raw || options.length === 0) return null;
-  const candidates = options
-    .flatMap((option) =>
-      [option.label, option.value, ...(option.aliases ?? [])]
-        .filter(Boolean)
-        .map((alias) => ({ option, alias, lowerAlias: alias.toLowerCase() })),
-    )
-    .sort((left, right) => right.lowerAlias.length - left.lowerAlias.length);
-  const lower = raw.toLowerCase();
-  const matched = candidates.find(
-    (candidate) =>
-      lower === candidate.lowerAlias ||
-      lower.startsWith(`${candidate.lowerAlias} `) ||
-      lower.startsWith(`${candidate.lowerAlias}：`) ||
-      lower.startsWith(`${candidate.lowerAlias}:`) ||
-      lower.startsWith(`${candidate.lowerAlias}，`) ||
-      lower.startsWith(`${candidate.lowerAlias},`) ||
-      lower.startsWith(`${candidate.lowerAlias}。`) ||
-      lower.startsWith(`${candidate.lowerAlias}.`) ||
-      lower.startsWith(`${candidate.lowerAlias}、`) ||
-      lower.startsWith(`${candidate.lowerAlias}-`),
-  );
-  if (!matched) return null;
-  const note = raw
-    .slice(matched.alias.length)
-    .replace(/^[\s.、:：,，-]+/, "")
-    .trim();
   return { option: matched.option, note };
 }
 
@@ -2781,6 +2746,8 @@ function orderedRunEvents(events: RunDetail["events"]) {
 }
 
 function conversationTitle(run: RunListItem, items: RunListItem[]) {
+  const persistedTitle = run.conversation_title?.trim();
+  if (persistedTitle) return persistedTitle;
   const fallback = run.id.slice(0, 8);
   const conversationKey = run.conversation_id?.trim();
   const sameConversation = conversationKey ? items.filter((item) => item.conversation_id === conversationKey) : [];
@@ -5408,42 +5375,179 @@ function RunProcessDrawer({
   );
 }
 
-function ModeEntryPanel({
-  selectedMode,
-  onSelect,
+export function workspacePathError(value: string): string | null {
+  const path = value.trim();
+  if (!path) return "请填写工作区目录名。";
+  if (path.includes("/") || path.includes("\\") || path.includes("..") || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(path)) {
+    return "工作区目录名只能包含字母、数字、短横线和下划线，不能填写绝对路径或上级目录。";
+  }
+  return null;
+}
+
+type NewConversationDraft = {
+  conversationId: string;
+  title: string;
+  projectId: string;
+  projectLabel: string;
+  workspacePath: string;
+  referenceConversationId: string | null;
+};
+
+function ConversationDialogShell({
+  title,
+  children,
+  onClose,
 }: {
-  selectedMode: RunMode;
-  onSelect: (mode: RunMode) => void;
+  title: string;
+  children: ReactNode;
+  onClose: () => void;
 }) {
-  const entryModes = [
-    { value: "auto", label: "自动", description: "主 Agent 判断，低把握才确认" },
-    { value: "direct", label: "直连", description: "指定模型/API直接回答" },
-    { value: "dispatch", label: "派单", description: "拆给角色执行后汇总" },
-    { value: "discuss", label: "讨论", description: "多角色讨论后裁决" },
-    { value: "hybrid", label: "混合", description: "先讨论，再派单执行" },
-  ] as const;
-  const selected = entryModes.find((item) => item.value === selectedMode) ?? entryModes[0];
-  return (
-    <article className="mode-entry-panel">
-      <div className="mode-entry-heading">
-        <h3>新对话</h3>
-        <p>{selected.label} · {selected.description}</p>
-      </div>
-      <div className="mode-entry-tabs" role="list" aria-label="对话模式入口">
-        {entryModes.map((item) => (
-          <button
-            key={item.value}
-            type="button"
-            aria-label={item.label}
-            aria-pressed={selectedMode === item.value}
-            className={selectedMode === item.value ? "mode-entry-active" : ""}
-            onClick={() => onSelect(item.value)}
-          >
-            {item.label}
+  return createPortal(
+    <div className="conversation-dialog-backdrop" onMouseDown={onClose}>
+      <section
+        className="conversation-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className="eyebrow">Conversation</span>
+            <h3>{title}</h3>
+          </div>
+          <button type="button" className="conversation-dialog-close" aria-label={`关闭${title}`} onClick={onClose}>
+            ×
           </button>
-        ))}
-      </div>
-    </article>
+        </header>
+        {children}
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
+function NewConversationDialog({
+  draft,
+  pending,
+  error,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  draft: NewConversationDraft;
+  pending: boolean;
+  error: string | null;
+  onChange: (next: NewConversationDraft) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const workspaceError = workspacePathError(draft.workspacePath);
+  return (
+    <ConversationDialogShell title="新建会话" onClose={onClose}>
+      <form
+        className="conversation-dialog-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <label>
+          会话标题
+          <input
+            aria-label="会话标题"
+            value={draft.title}
+            maxLength={120}
+            onChange={(event) => onChange({ ...draft, title: event.target.value })}
+            placeholder="可选，默认显示为新会话"
+          />
+        </label>
+        <div className="conversation-dialog-grid">
+          <label>
+            项目 ID
+            <input
+              aria-label="项目 ID"
+              value={draft.projectId}
+              required
+              onChange={(event) => onChange({ ...draft, projectId: event.target.value })}
+              placeholder="default"
+            />
+          </label>
+          <label>
+            项目名称
+            <input
+              aria-label="项目名称"
+              value={draft.projectLabel}
+              onChange={(event) => onChange({ ...draft, projectLabel: event.target.value })}
+              placeholder="可选"
+            />
+          </label>
+        </div>
+        <label>
+          工作区目录名
+          <input
+            aria-label="工作区目录名"
+            value={draft.workspacePath}
+            required
+            aria-invalid={Boolean(workspaceError)}
+            onChange={(event) => onChange({ ...draft, workspacePath: event.target.value })}
+            placeholder="session-id"
+          />
+        </label>
+        <small>
+          实际位置：<code>{workspacePreviewPath(draft.projectId, draft.workspacePath)}</code>。系统工作区根目录由管理员配置。
+        </small>
+        {draft.referenceConversationId ? (
+          <small>创建后会引用原会话 <code>{draft.referenceConversationId}</code> 作为上下文。</small>
+        ) : null}
+        {workspaceError ? <p className="form-error" role="alert">{workspaceError}</p> : null}
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <div className="conversation-dialog-actions">
+          <button type="button" className="secondary-action" onClick={onClose}>取消</button>
+          <button type="submit" disabled={pending || !draft.projectId.trim() || Boolean(workspaceError)}>
+            {pending ? "创建中..." : "创建会话"}
+          </button>
+        </div>
+      </form>
+    </ConversationDialogShell>
+  );
+}
+
+function RenameConversationDialog({
+  value,
+  pending,
+  error,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  value: string;
+  pending: boolean;
+  error: string | null;
+  onChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <ConversationDialogShell title="重命名会话" onClose={onClose}>
+      <form
+        className="conversation-dialog-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <label>
+          会话标题
+          <input aria-label="会话标题" value={value} maxLength={120} onChange={(event) => onChange(event.target.value)} autoFocus />
+        </label>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <div className="conversation-dialog-actions">
+          <button type="button" className="secondary-action" onClick={onClose}>取消</button>
+          <button type="submit" disabled={pending || !value.trim()}>{pending ? "保存中..." : "保存名称"}</button>
+        </div>
+      </form>
+    </ConversationDialogShell>
   );
 }
 
@@ -5637,6 +5741,14 @@ export function RunsPage() {
     queryFn: () => api.executionBackends(),
   });
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
+  const conversations = useQuery({
+    queryKey: ["conversations", false],
+    queryFn: () => api.conversations(false),
+  });
+  const archivedConversations = useQuery({
+    queryKey: ["conversations", true],
+    queryFn: () => api.conversations(true),
+  });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
   const [workflowId, setWorkflowId] = useState("");
@@ -5654,8 +5766,22 @@ export function RunsPage() {
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [directModel, setDirectModel] = useState("");
-  const [showModeEntry, setShowModeEntry] = useState(() => shouldShowModeEntry(location.search));
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [newConversationOpen, setNewConversationOpen] = useState(false);
+  const [newConversationDraft, setNewConversationDraft] = useState<NewConversationDraft>(() => {
+    const draftConversationId = newConversationId();
+    return {
+      conversationId: draftConversationId,
+      title: "",
+      projectId: "default",
+      projectLabel: "",
+      workspacePath: draftConversationId,
+      referenceConversationId: null,
+    };
+  });
+  const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [renameConversationOpen, setRenameConversationOpen] = useState(false);
+  const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [conversationSearch, setConversationSearch] = useState("");
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
@@ -5706,7 +5832,6 @@ export function RunsPage() {
     proposal: RepairProposal;
   } | null>(null);
   const [capabilityApproval, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
-  const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
 
@@ -5736,10 +5861,15 @@ export function RunsPage() {
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
   const activeConversationId = conversationId.trim();
+  const listedConversationMetadata = [
+    ...(conversations.data ?? []),
+    ...(archivedConversations.data ?? []),
+  ].find((item) => item.conversation_id === activeConversationId);
   const activeConversationKnown =
     Boolean(selectedRun.data) ||
     Boolean(conversationRunCache[activeConversationId]) ||
     linkedConversationId === activeConversationId ||
+    Boolean(listedConversationMetadata) ||
     runListItems.some((run) => run.conversation_id === activeConversationId);
   const activeConversation = useQuery({
     queryKey: ["conversation", activeConversationId],
@@ -5753,10 +5883,14 @@ export function RunsPage() {
     },
     refetchIntervalInBackground: true,
   });
+  const activeWorkspaceProjectId =
+    activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
+  const activeWorkspaceSessionId =
+    activeConversation.data?.workspace_path?.trim() || listedConversationMetadata?.workspace_path?.trim() || activeConversationId;
   const activeWorkspaceFiles = useQuery({
-    queryKey: ["workspace-files", projectId.trim() || "default", activeConversationId],
-    queryFn: () => api.workspaceFiles(projectId.trim() || "default", activeConversationId),
-    enabled: Boolean(activeConversationId),
+    queryKey: ["workspace-files", activeWorkspaceProjectId, activeWorkspaceSessionId],
+    queryFn: () => api.workspaceFiles(activeWorkspaceProjectId, activeWorkspaceSessionId),
+    enabled: Boolean(activeWorkspaceSessionId),
     refetchInterval: 1500,
     refetchIntervalInBackground: true,
   });
@@ -5768,9 +5902,7 @@ export function RunsPage() {
     const surfaceConversationId = run.conversation_id?.trim() || activeConversationId;
     if (surfaceConversationId) {
       await queryClient.invalidateQueries({ queryKey: ["conversation", surfaceConversationId] });
-      await queryClient.invalidateQueries({
-        queryKey: ["workspace-files", projectId.trim() || "default", surfaceConversationId],
-      });
+      await queryClient.invalidateQueries({ queryKey: ["workspace-files"] });
     }
   }
 
@@ -5783,13 +5915,18 @@ export function RunsPage() {
     if (!linkedConversationId || linkedConversationId === conversationId) return;
     setConversationId(linkedConversationId);
     setSelectedRunId(null);
-    setShowModeEntry(false);
   }, [conversationId, linkedConversationId]);
   useEffect(() => {
+    if (linkedConversationId || selectedRunId || activeConversationKnown || message.trim()) return;
+    const latest = conversations.data?.[0];
+    if (!latest) return;
+    setConversationId(latest.conversation_id);
+    if (latest.project_id?.trim()) setProjectId(latest.project_id);
+    setProjectLabel(latest.project_label?.trim() ?? "");
+  }, [activeConversationKnown, conversations.data, linkedConversationId, message, selectedRunId]);
+  useEffect(() => {
     if (!settings.data) return;
-    if (!userSelectedMode.current) {
-      setMode(settings.data.default_mode);
-    }
+    setMode("auto");
     setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
     setExecutionBackend(settings.data.default_execution_backend);
@@ -5803,13 +5940,10 @@ export function RunsPage() {
   }, [executionBackend, executionBackends.data]);
 
   useEffect(() => {
-    if (!selectedWorkflow) return;
-    if (selectedWorkflow.mode) {
-      userSelectedMode.current = true;
-      setMode(selectedWorkflow.mode);
-    }
-    setAgentIds(selectedWorkflow.agent_ids ?? []);
-  }, [selectedWorkflow]);
+    if (!activeConversation.data) return;
+    if (activeConversation.data.project_id?.trim()) setProjectId(activeConversation.data.project_id);
+    setProjectLabel(activeConversation.data.project_label?.trim() ?? "");
+  }, [activeConversation.data]);
 
   useEffect(() => {
     const selection = modeSelectionFromRunDetail(selectedRun.data);
@@ -5956,7 +6090,12 @@ export function RunsPage() {
     setConversationPreviewFile(null);
   }, [selectedRunId]);
 
-  const pageOverlayOpen = Boolean(processDetailTarget) || Boolean(conversationPreviewFile) || historyOpen;
+  const pageOverlayOpen =
+    Boolean(processDetailTarget) ||
+    Boolean(conversationPreviewFile) ||
+    historyOpen ||
+    newConversationOpen ||
+    renameConversationOpen;
   useEffect(() => {
     if (!pageOverlayOpen) return undefined;
     const previousBodyOverflow = document.body.style.overflow;
@@ -6030,22 +6169,40 @@ export function RunsPage() {
   }, [selectedRun.data]);
 
   const createRun = useMutation({
-    mutationFn: (override?: RunSubmissionOverride) => {
+    mutationFn: async (override?: RunSubmissionOverride) => {
       const runMessage = (override?.message ?? message).trim();
-      const runMode = override?.mode ?? mode;
-      const selectedDirectModel = (override?.directModel ?? directModel).trim();
+      let conversationMetadata = activeConversation.data ?? listedConversationMetadata;
+      if (!conversationMetadata?.created_at) {
+        try {
+          const created = await api.createConversation({
+            conversation_id: conversationId,
+            project_id: projectId.trim() || "default",
+            project_label: projectLabel.trim() || null,
+            workspace_path: conversationId.trim(),
+          });
+          conversationMetadata = created;
+          queryClient.setQueryData<Conversation>(["conversation", created.conversation_id], {
+            ...created,
+            runs: activeConversation.data?.runs ?? [],
+          });
+          await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.code !== "conversation_conflict") throw error;
+          conversationMetadata = await api.conversation(conversationId);
+        }
+      }
       return api.createRun({
         message: runMessage,
-        mode: runMode,
-        workflow_id: workflowId || null,
-        allow_workflow_adjustment: runMode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
-        agent_ids: runMode === "direct" ? [] : agentIds,
-        direct_model: runMode === "direct" ? selectedDirectModel : null,
+        mode: "auto",
+        reference_workflow_id: workflowId || null,
+        allow_workflow_adjustment: false,
+        agent_ids: [],
+        direct_model: null,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
-        project_id: projectId.trim() || null,
-        project_label: projectLabel.trim() || null,
-        workspace_session_id: conversationId.trim() || null,
+        project_id: conversationMetadata.project_id?.trim() || projectId.trim() || null,
+        project_label: conversationMetadata.project_label?.trim() || projectLabel.trim() || null,
+        workspace_session_id: conversationMetadata.workspace_path?.trim() || conversationId.trim() || null,
         sandbox_profile: sandboxProfile,
         ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
         requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
@@ -6055,10 +6212,9 @@ export function RunsPage() {
     },
     onSuccess: async (run, override) => {
       setSelectedRunId(run.id);
-      setShowModeEntry(false);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
-      const submittedMode = override?.mode ?? mode;
+      const submittedMode: RunMode = "auto";
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
         setScheduleApproval(null);
@@ -6173,6 +6329,68 @@ export function RunsPage() {
       setAttachmentDraft(null);
       setArchiveInstallFile(null);
       await refreshRunSurfaces(run);
+    },
+  });
+
+  const createConversation = useMutation({
+    mutationFn: (draft: NewConversationDraft) =>
+      api.createConversation({
+        conversation_id: draft.conversationId,
+        ...(draft.title.trim() ? { title: draft.title.trim() } : {}),
+        project_id: draft.projectId.trim(),
+        project_label: draft.projectLabel.trim() || null,
+        workspace_path: draft.workspacePath.trim(),
+      }),
+    onSuccess: (created, draft) => {
+      queryClient.setQueryData<Conversation>(["conversation", created.conversation_id], {
+        ...created,
+        runs: [],
+      });
+      setConversationRunCache((current) => ({ ...current, [created.conversation_id]: [] }));
+      setConversationId(created.conversation_id);
+      setProjectId(created.project_id?.trim() || draft.projectId.trim());
+      setProjectLabel(created.project_label?.trim() || draft.projectLabel.trim());
+      setSelectedRunId(null);
+      clearConversationTransientState();
+      setReferenceConversationId(draft.referenceConversationId ?? "");
+      setNewConversationOpen(false);
+      setHistoryOpen(false);
+      setSubmitNotice(
+        draft.referenceConversationId
+          ? `分支会话已创建，将引用 ${draft.referenceConversationId} 作为上下文。`
+          : "会话已创建，后续运行由主 Agent 自动判断模式和角色。",
+      );
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      if (linkedConversationId) navigate("/", { replace: true });
+    },
+  });
+
+  const updateConversation = useMutation({
+    mutationFn: ({
+      conversationId: targetConversationId,
+      title,
+      archived,
+    }: {
+      conversationId: string;
+      title?: string;
+      archived?: boolean;
+    }) => api.updateConversation(targetConversationId, { title, archived }),
+    onSuccess: async (updated, variables) => {
+      queryClient.setQueryData<Conversation>(["conversation", updated.conversation_id], (current) => ({
+        ...updated,
+        runs: current?.runs ?? conversationRunCache[updated.conversation_id] ?? [],
+      }));
+      setRenameConversationOpen(false);
+      setConversationMenuOpen(false);
+      setSubmitNotice(
+        variables.title !== undefined
+          ? "会话名称已更新。"
+          : variables.archived
+            ? "会话已归档，需要时可从会话菜单恢复。"
+            : "会话已恢复。",
+      );
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
 
@@ -6644,71 +6862,13 @@ export function RunsPage() {
       });
       return;
     }
-    const initialModeChoice =
-      showModeEntry && !selectedRunId
-        ? parseLeadingKeywordChoiceText(
-            trimmed,
-            RUN_MODES.map((item) => ({
-              value: item.value,
-              label: item.label,
-              aliases: [item.value],
-            })),
-          )
-        : null;
-    const effectiveMode = (initialModeChoice?.option.value as RunMode | undefined) ?? mode;
-    const effectiveMessage = initialModeChoice?.note || trimmed;
-    if (initialModeChoice) {
-      userSelectedMode.current = true;
-      setMode(effectiveMode);
-      if (!effectiveMessage) {
-        setMessage("");
-        setSubmitNotice(`已切换到“${initialModeChoice.option.label}”。现在输入你的问题即可继续。`);
-        return;
-      }
-    }
-    if (effectiveMode === "direct") {
-      if (savedModels.length === 0) {
-        setSubmitNotice("还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。");
-        return;
-      }
-      const choice = parseChoiceText(
-        effectiveMessage,
-        savedModels.map((model) => ({
-          value: model.logical_model,
-          label: model.logical_model,
-          aliases: [model.upstream_model, model.provider],
-        })),
-      );
-      const selectedModel = choice?.option.value ?? directModel;
-      if (!selectedModel) {
-        setSubmitNotice("请先回复模型编号或模型关键词，例如“1”或“qwen-max”；也可以写成“2 帮我写一段口播”。");
-        return;
-      }
-      if (!registeredModelIds.has(selectedModel)) {
-        setSubmitNotice("所选直连模型/API 未注册或未通过配置，请先到模型页面修正。");
-        return;
-      }
-      setDirectModel(selectedModel);
-      const nextMessage = (choice?.note || (!choice ? effectiveMessage : "")).trim();
-      if (!nextMessage) {
-        setMessage("");
-        setSubmitNotice(`已选择直连模型/API：${selectedModel}。现在输入你的问题即可发送。`);
-        return;
-      }
-      createRun.mutate({ message: nextMessage, directModel: selectedModel, mode: effectiveMode });
-      return;
-    }
-    createRun.mutate({ message: effectiveMessage, mode: effectiveMode });
+    createRun.mutate({ message: trimmed, mode: "auto" });
   }
 
-  function startNewConversation() {
-    setSelectedRunId(null);
-    setShowModeEntry(true);
-    setConversationId(newConversationId());
+  function clearConversationTransientState() {
     setReferenceConversationId("");
     setMessage("");
-    userSelectedMode.current = false;
-    setMode(settings.data?.default_mode ?? "auto");
+    setMode("auto");
     setWorkflowId(settings.data?.default_workflow_id ?? "");
     setAgentIds(settings.data?.default_agent_ids ?? []);
     setExecutionBackend(settings.data?.default_execution_backend ?? "systemd");
@@ -6722,8 +6882,22 @@ export function RunsPage() {
     setCapabilityApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
+  }
+
+  function startNewConversation() {
+    const nextConversationId = newConversationId();
+    const nextProjectId = projectId.trim() || "default";
+    setNewConversationDraft({
+      conversationId: nextConversationId,
+      title: "",
+      projectId: nextProjectId,
+      projectLabel: "",
+      workspacePath: nextConversationId,
+      referenceConversationId: null,
+    });
+    createConversation.reset();
+    setNewConversationOpen(true);
     setHistoryOpen(false);
-    setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
 
   function startBranchConversation(sourceConversationId?: string | null) {
@@ -6732,23 +6906,18 @@ export function RunsPage() {
       setSubmitNotice("当前没有可引用的会话。");
       return;
     }
-    setSelectedRunId(null);
-    setShowModeEntry(false);
+    const nextConversationId = newConversationId();
+    setNewConversationDraft({
+      conversationId: nextConversationId,
+      title: "",
+      projectId: projectId.trim() || "default",
+      projectLabel,
+      workspacePath: nextConversationId,
+      referenceConversationId: trimmedSourceConversationId,
+    });
+    createConversation.reset();
+    setNewConversationOpen(true);
     setHistoryOpen(false);
-    setReferenceConversationId(trimmedSourceConversationId);
-    setConversationId(newConversationId());
-    setMessage("");
-    setDirectModel("");
-    setTemporaryApproval(null);
-    setScheduleApproval(null);
-    setEvolutionApproval(null);
-    setOpenClawApproval(null);
-    setProjectPreflightApproval(null);
-    setRepairApproval(null);
-    setCapabilityApproval(null);
-    setModeSelection(null);
-    setProcessDetailTarget(null);
-    setSubmitNotice(`已按原思路新建分支：新对话会读取 ${trimmedSourceConversationId} 作为参考上下文。`);
   }
 
   function cancelBranchReference() {
@@ -6764,7 +6933,7 @@ export function RunsPage() {
     if (commandId === "mode") {
       setConfigOpen(true);
       setMessage("");
-      setSubmitNotice("已打开本轮运行设置，可切换模式、工作流、角色池和沙箱权限。");
+      setSubmitNotice("已打开本轮运行设置，可调整参考方案、执行环境和沙箱权限。");
       return;
     }
     if (commandId === "memory") {
@@ -6792,8 +6961,32 @@ export function RunsPage() {
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runListItems;
-  const visibleConversationItems = items.filter((item) => conversationMatchesSearch(item, conversationSearch, items));
-  const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
+  const archivedConversationIds = new Set(
+    (archivedConversations.data ?? []).map((item) => item.conversation_id),
+  );
+  const conversationListItems = items.filter(
+    (item) => !archivedConversationIds.has(item.conversation_id ?? ""),
+  );
+  const visibleConversationItems = conversationListItems.filter(
+    (item) => conversationMatchesSearch(item, conversationSearch, items),
+  );
+  const runConversationIds = new Set(
+    items.map((item) => item.conversation_id).filter((value): value is string => Boolean(value)),
+  );
+  const metadataConversationItems = [
+    ...(conversations.data ?? []).filter((item) => !runConversationIds.has(item.conversation_id)),
+    ...(archivedConversations.data ?? []),
+  ];
+  const normalizedConversationSearch = conversationSearch.trim().toLocaleLowerCase();
+  const visibleMetadataConversationItems = metadataConversationItems.filter((item) =>
+    !normalizedConversationSearch
+      ? true
+      : [item.title, item.conversation_id, item.project_label, item.project_id, item.workspace_path]
+          .filter(Boolean)
+          .some((value) => value?.toLocaleLowerCase().includes(normalizedConversationSearch)),
+  );
+  const totalConversationCount = conversationListItems.length + metadataConversationItems.length;
+  const visibleConversationCount = visibleConversationItems.length + visibleMetadataConversationItems.length;
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const availableExecutionBackends = executionBackends.data?.filter((backend) => backend.available) ?? [];
   const selectedExecutionBackend = executionBackends.data?.find((item) => item.id === executionBackend);
@@ -6828,7 +7021,6 @@ export function RunsPage() {
   const slashCommandSuggestions = slashCommandsForQuery(message);
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
-  const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
@@ -6870,9 +7062,6 @@ export function RunsPage() {
     !!repairApproval && messages.some((item) => item.id === `${repairApproval.runId}-repair-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
   const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
-  const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
-  const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
-  const directModelName = directModelDeployment?.logical_model ?? (directModel || "未指定");
   const mainAgentModelName = mainAgent.data?.model
     ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
     : "未配置";
@@ -6887,14 +7076,6 @@ export function RunsPage() {
           runProcessItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
         )
       : processDetailTarget;
-  const directSendBlockedReason =
-    mode !== "direct"
-      ? null
-      : savedModels.length === 0
-        ? "还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。"
-        : directModel && !registeredModelIds.has(directModel)
-            ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
-          : null;
   const deletableConversationIds = conversationSelectionIds(items, conversationSearch);
   const selectedDeletableConversationIds = selectedConversationIds.filter((id) =>
     deletableConversationIds.includes(id),
@@ -6902,6 +7083,14 @@ export function RunsPage() {
   const allDeletableSelected =
     deletableConversationIds.length > 0 &&
     deletableConversationIds.every((id) => selectedConversationIds.includes(id));
+  const currentConversationListItem = items.find((item) => item.conversation_id === activeConversationId);
+  const currentConversationTitle =
+    activeConversation.data?.title?.trim() ||
+    (currentConversationListItem ? conversationTitle(currentConversationListItem, items) : conversationId);
+  const currentConversationArchived = Boolean(activeConversation.data?.archived_at);
+  const currentConversationPersisted = Boolean(
+    activeConversation.data?.created_at || listedConversationMetadata?.created_at,
+  );
 
   function deleteConversation(run: (typeof items)[number]) {
     if (!TERMINAL_STATUSES.has(run.status)) {
@@ -6924,11 +7113,6 @@ export function RunsPage() {
 
   function toggleConversation(runId: string) {
     setSelectedConversationIds((current) => toggle(current, runId));
-  }
-
-  function chooseRunMode(nextMode: RunMode) {
-    userSelectedMode.current = true;
-    setMode(nextMode);
   }
 
   function deleteSelectedConversations() {
@@ -6980,13 +7164,10 @@ export function RunsPage() {
             <div>
               <h3>会话</h3>
               <span>
-                {conversationSearch.trim() ? `${visibleConversationItems.length}/${items.length}` : items.length} 条
+                {conversationSearch.trim() ? `${visibleConversationCount}/${totalConversationCount}` : totalConversationCount} 条
               </span>
             </div>
             <div className="conversation-list-actions">
-              <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
-                新建
-              </button>
               <button type="button" className="conversation-close-button" aria-label="关闭历史对话" onClick={() => setHistoryOpen(false)}>
                 ×
               </button>
@@ -7024,12 +7205,53 @@ export function RunsPage() {
               <small>已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
-          {items.length === 0 ? (
+          {totalConversationCount === 0 ? (
             <p className="field-help">还没有会话。直接发送消息即可开始。</p>
-          ) : visibleConversationItems.length === 0 ? (
+          ) : visibleConversationCount === 0 ? (
             <p className="field-help">没有匹配的历史会话。</p>
           ) : (
-            visibleConversationItems.map((run) => {
+            <>
+              {visibleMetadataConversationItems.map((conversation: ConversationMetadata) => {
+                const title = conversation.title?.trim() || conversation.conversation_id;
+                const archived = Boolean(conversation.archived_at);
+                return (
+                  <div
+                    key={`metadata-${conversation.conversation_id}`}
+                    className={`conversation-row${activeConversationId === conversation.conversation_id ? " conversation-row-active" : ""}`}
+                  >
+                    <span className="conversation-select-placeholder" aria-hidden="true" />
+                    <button
+                      type="button"
+                      className="conversation-item"
+                      aria-label={`进入会话 ${title}`}
+                      onClick={() => {
+                        setConversationId(conversation.conversation_id);
+                        setSelectedRunId(null);
+                        if (conversation.project_id?.trim()) setProjectId(conversation.project_id);
+                        setProjectLabel(conversation.project_label?.trim() ?? "");
+                        setHistoryOpen(false);
+                      }}
+                    >
+                      <span className="conversation-mode-chip">{archived ? "归档" : "会话"}</span>
+                      <strong className="conversation-title-text">{title}</strong>
+                      <small className="conversation-meta-line">
+                        {conversation.project_label?.trim() || conversation.project_id || "默认项目"}
+                      </small>
+                    </button>
+                    <button
+                      type="button"
+                      className="conversation-branch-button"
+                      aria-label={`按原思路新建分支 ${title}`}
+                      title="引用这段会话新建分支"
+                      onClick={() => startBranchConversation(conversation.conversation_id)}
+                    >
+                      分支
+                    </button>
+                    <span className="conversation-metadata-status">{archived ? "已归档" : "未开始"}</span>
+                  </div>
+                );
+              })}
+              {visibleConversationItems.map((run) => {
               const canDelete = TERMINAL_STATUSES.has(run.status);
               const title = conversationTitle(run, items);
               return (
@@ -7050,7 +7272,6 @@ export function RunsPage() {
                     className="conversation-item"
                     aria-label={`进入会话 ${title}`}
                     onClick={() => {
-                      setShowModeEntry(false);
                       if (run.conversation_id) setConversationId(run.conversation_id);
                       setSelectedRunId(run.id);
                       setHistoryOpen(false);
@@ -7082,7 +7303,8 @@ export function RunsPage() {
                   </button>
                 </div>
               );
-            })
+              })}
+            </>
           )}
           {deleteRun.isError ? (
             <p className="form-error" role="alert">
@@ -7097,35 +7319,24 @@ export function RunsPage() {
           <div className="composer-config-summary" aria-label="本次运行设置概览">
             <strong>本次运行配置</strong>
             <div>
-              <span>{selectedMode.label}</span>
+              <span>主 Agent 自动</span>
               <span>{selectedSandboxLabel}</span>
               <span>{executionBackendLabel}</span>
-              <span>{workflowId ? selectedWorkflow?.name ?? workflowId : "无固定工作流"}</span>
-              <span>{mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 个角色` : "自动角色"}</span>
+              <span>{workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : "无参考方案"}</span>
             </div>
           </div>
           <details className="run-settings-panel" aria-label="本次运行设置">
             <summary aria-label="展开或收起本次运行设置">详细设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
-            <label htmlFor="run-mode">
-              模式
-              <select id="run-mode" value={mode} onChange={(event) => chooseRunMode(event.target.value as RunMode)}>
-                {RUN_MODES.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
             <label htmlFor="run-workflow">
-              工作流
+              参考方案
               <select
                 id="run-workflow"
-                aria-label="使用工作流"
+                aria-label="参考方案"
                 value={workflowId}
                 onChange={(event) => setWorkflowId(event.target.value)}
               >
-                <option value="">不使用固定工作流</option>
+                <option value="">不使用参考方案</option>
                 {savedWorkflows
                   .filter((workflow) => workflow.enabled)
                   .map((workflow) => (
@@ -7134,6 +7345,7 @@ export function RunsPage() {
                     </option>
                 ))}
               </select>
+              <span className="field-help">只把步骤与交付物作为主 Agent 的参考，不会固定模式或角色。</span>
             </label>
             <div className="sandbox-settings" aria-label="沙箱权限">
               <span className="field-label">沙箱权限</span>
@@ -7180,34 +7392,12 @@ export function RunsPage() {
                 {executionBackendStatus}
               </span>
             </label>
-            <label htmlFor="conversation-id">
-              会话 ID
-              <input
-                id="conversation-id"
-                value={conversationId}
-                onChange={(event) => setConversationId(event.target.value)}
-              />
-            </label>
-            <label htmlFor="project-id">
-              项目
-              <input
-                id="project-id"
-                aria-label="项目文件夹"
-                value={projectId}
-                onChange={(event) => setProjectId(event.target.value)}
-                placeholder="default"
-              />
-            </label>
-            <label htmlFor="project-label">
-              项目名
-              <input
-                id="project-label"
-                aria-label="项目名称"
-                value={projectLabel}
-                onChange={(event) => setProjectLabel(event.target.value)}
-                placeholder="可选"
-              />
-            </label>
+            <div className="conversation-workspace-summary">
+              <span className="field-label">会话工作区</span>
+              <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
+              <code>{workspacePreviewPath(activeWorkspaceProjectId, activeWorkspaceSessionId)}</code>
+              <small>项目归类和工作区在新建会话时确定，避免同一会话中途切换目录。</small>
+            </div>
             <label htmlFor="reference-conversation-id">
               参考会话
               <input
@@ -7229,7 +7419,7 @@ export function RunsPage() {
             <div className="mode-help">
               <span className="eyebrow">当前设置</span>
               <p>
-                工作区：{workspacePreviewPath(projectId, conversationId)} · {selectedMode.label} · {selectedSandboxLabel} ·
+                工作区：{workspacePreviewPath(activeWorkspaceProjectId, activeWorkspaceSessionId)} · 主 Agent 自动 · {selectedSandboxLabel} ·
                 {executionBackendLabel}
               </p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
@@ -7241,13 +7431,11 @@ export function RunsPage() {
               ) : null}
               {selectedWorkflow ? (
                 <>
-                  <p>工作流：{selectedWorkflow.name}{selectedWorkflow.task_type ? ` · ${selectedWorkflow.task_type}` : ""}</p>
-                  <p>
-                    临场调整 {settings.data?.allow_main_agent_override ? "开" : "关"} · 临时子 Agent {settings.data?.allow_temporary_agents ? "开" : "关"}
-                  </p>
+                  <p>参考方案：{selectedWorkflow.name}{selectedWorkflow.task_type ? ` · ${selectedWorkflow.task_type}` : ""}</p>
+                  <p>仅供主 Agent 参考，不会覆盖自动模式或角色判断。</p>
                 </>
               ) : (
-                <p>未固定工作流，由主 Agent 按任务和角色池判断。</p>
+                <p>未选择参考方案，由主 Agent 按任务自动判断。</p>
               )}
             </div>
             {referenceConversation.data ? (
@@ -7267,51 +7455,6 @@ export function RunsPage() {
             </div>
           </details>
 
-          <details className="inline-guide">
-            <summary>{mode === "direct" ? "直连模型" : `角色池 · ${agentIds.length > 0 ? `${agentIds.length} 已选` : "自动"}`}</summary>
-            {mode === "direct" ? (
-              <>
-                <p className="field-help">
-                  直连模型不在这里下拉选择。请回到主对话，按编号或模型关键词选择本次对话使用的模型/API。
-                </p>
-                {models.isLoading ? <p className="field-help">正在加载已测试模型...</p> : null}
-                {models.isError ? (
-                  <p className="field-help" role="alert">
-                    {formatApiError(models.error, "模型列表加载失败")}
-                  </p>
-                ) : null}
-                {savedModels.length === 0 ? (
-                  <p className="field-help">还没有可用于直连的已测试模型，请先到“模型与 API”页面配置。</p>
-                ) : null}
-              </>
-            ) : (
-              <>
-                <fieldset>
-                  <legend>角色池</legend>
-                  {agents.isLoading ? (
-                    <p className="field-help">正在加载 Agent 角色...</p>
-                  ) : agents.isError ? (
-                    <p className="field-help" role="alert">
-                      {formatApiError(agents.error, "Agent 列表加载失败")}
-                    </p>
-                  ) : savedAgents.length === 0 ? (
-                    <p className="field-help">还没有 Agent。请先到 Agent 页面创建角色。</p>
-                  ) : (
-                    savedAgents.map((agent) => (
-                      <label key={agent.id} className="inline-check">
-                        <input
-                          type="checkbox"
-                          checked={agentIds.includes(agent.id)}
-                          onChange={() => setAgentIds((current) => toggle(current, agent.id))}
-                        />
-                        {agent.name}（{agent.id}）
-                      </label>
-                    ))
-                  )}
-                </fieldset>
-              </>
-            )}
-          </details>
             </div>
           ) : null}
 
@@ -7323,45 +7466,58 @@ export function RunsPage() {
               <p role="alert">{formatApiError(activeConversation.error, "当前会话读取失败")}</p>
             ) : null}
             <div className="chat-session-toolbar" aria-label="当前对话操作">
-              <p className="chat-conversation-status">会话：{conversationId}</p>
-              <div>
+              <div className="chat-conversation-heading">
+                <p className="chat-conversation-status">会话：{currentConversationTitle}</p>
+                {currentConversationArchived ? <span className="conversation-archived-badge">已归档</span> : null}
+              </div>
+              <div className="chat-session-actions">
                 <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
                   新建
                 </button>
+                <div className="conversation-menu-anchor">
+                  <button
+                    type="button"
+                    className="conversation-menu-trigger"
+                    aria-label="会话操作"
+                    aria-expanded={conversationMenuOpen}
+                    disabled={!currentConversationPersisted}
+                    onClick={() => setConversationMenuOpen((current) => !current)}
+                  >
+                    ⋯
+                  </button>
+                  {conversationMenuOpen ? (
+                    <div className="conversation-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setRenameConversationTitle(currentConversationTitle);
+                          updateConversation.reset();
+                          setRenameConversationOpen(true);
+                          setConversationMenuOpen(false);
+                        }}
+                      >
+                        重命名
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={updateConversation.isPending}
+                        onClick={() =>
+                          updateConversation.mutate({
+                            conversationId: activeConversationId,
+                            archived: !currentConversationArchived,
+                          })
+                        }
+                      >
+                        {currentConversationArchived ? "恢复" : "归档"}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               </div>
             </div>
             <ConversationCheckpointNav checkpoints={checkpoints} conversationId={activeConversationId} />
-            {showModeEntry ? (
-              <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
-            ) : null}
-            {mode === "direct" && messages.length === 0 ? (
-              <article className="chat-message assistant" aria-label="直连模型选择">
-                <span className="eyebrow">{APP_BRAND_NAME}</span>
-                <h3>直连准备</h3>
-                {savedModels.length > 0 ? (
-                  <>
-                    <p>
-                      直连会由主 Agent 控场、组织提示词和记录过程；实际生成由你选择的模型/API完成。请回复编号或模型关键词，
-                      后面可以直接补充任务内容。
-                    </p>
-                    <ol className="choice-list">
-                      {savedModels.map((model, index) => (
-                        <li key={model.id}>
-                          {index + 1}. {model.logical_model}（{model.provider} / {model.upstream_model}）
-                        </li>
-                      ))}
-                    </ol>
-                    <p>
-                      {directModel
-                        ? `已选：${directModelName}。现在直接输入任务即可发送。`
-                        : "直连需要先选择本次对话使用的模型/API。例如：1 帮我写一段口播。"}
-                    </p>
-                  </>
-                ) : (
-                  <p>还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。</p>
-                )}
-              </article>
-            ) : null}
             {modeSelection ? (
               <article className="chat-message assistant" aria-label="运行模式确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
@@ -7813,9 +7969,9 @@ export function RunsPage() {
               <div className="composer-status-line" role="status">
                 <span>
                   {[
-                    displayMode(mode),
+                    "主 Agent 自动",
                     selectedSandboxLabel,
-                    mode === "direct" ? `模型 ${directModelName}` : agentIds.length > 0 ? `${agentIds.length} 角色` : "自动角色",
+                    workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : null,
                     referenceConversationId.trim() ? "已引用" : null,
                   ].filter(Boolean).join(" · ")}
                 </span>
@@ -7836,16 +7992,13 @@ export function RunsPage() {
                   disabled={
                     createRun.isPending ||
                     message.trim().length === 0 ||
-                    Boolean(directSendBlockedReason)
+                    currentConversationArchived
                   }
                 >
                   {createRun.isPending ? "发送中..." : "发送"}
                 </button>
               </div>
             </div>
-            {directSendBlockedReason && !(mode === "direct" && savedModels.length === 0) ? (
-              <p className="field-help" role="status">{directSendBlockedReason}</p>
-            ) : null}
             {executionBackendFallbackNotice ? <p className="field-help" role="status">{executionBackendFallbackNotice}</p> : null}
             {executionBackendNotice && !executionBackends.isLoading ? (
               <p className="field-help" role="status">{executionBackendNotice}</p>
@@ -7868,6 +8021,44 @@ export function RunsPage() {
           </form>
         </div>
       </div>
+
+      {newConversationOpen ? (
+        <NewConversationDialog
+          draft={newConversationDraft}
+          pending={createConversation.isPending}
+          error={createConversation.isError ? formatApiError(createConversation.error, "会话创建失败") : null}
+          onChange={(next) => {
+            createConversation.reset();
+            setNewConversationDraft(next);
+          }}
+          onClose={() => {
+            if (!createConversation.isPending) setNewConversationOpen(false);
+          }}
+          onSubmit={() => {
+            if (!newConversationDraft.projectId.trim() || workspacePathError(newConversationDraft.workspacePath)) return;
+            createConversation.mutate(newConversationDraft);
+          }}
+        />
+      ) : null}
+      {renameConversationOpen ? (
+        <RenameConversationDialog
+          value={renameConversationTitle}
+          pending={updateConversation.isPending}
+          error={updateConversation.isError ? formatApiError(updateConversation.error, "会话重命名失败") : null}
+          onChange={(value) => {
+            updateConversation.reset();
+            setRenameConversationTitle(value);
+          }}
+          onClose={() => {
+            if (!updateConversation.isPending) setRenameConversationOpen(false);
+          }}
+          onSubmit={() => {
+            const title = renameConversationTitle.trim();
+            if (!title || !activeConversationId) return;
+            updateConversation.mutate({ conversationId: activeConversationId, title });
+          }}
+        />
+      ) : null}
 
     </section>
   );

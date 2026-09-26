@@ -46,6 +46,59 @@ describe("formatApiError", () => {
 });
 
 describe("api client transport", () => {
+  it("accepts metadata-only responses when creating and updating conversations", async () => {
+    const created = {
+      conversation_id: "conv-project",
+      title: "项目讨论",
+      project_id: "cube-agent",
+      project_label: "魔方 Agent",
+      workspace_path: "projects/cube-agent/session-a",
+      archived_at: null,
+      created_at: "2026-09-26T08:00:00Z",
+      updated_at: "2026-09-26T08:00:00Z",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(created), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...created, title: "项目讨论第二版" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([created]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.createConversation({
+      conversation_id: "conv-project",
+      title: "项目讨论",
+      project_id: "cube-agent",
+      project_label: "魔方 Agent",
+      workspace_path: "projects/cube-agent/session-a",
+    });
+    const updated = await api.updateConversation("conv-project", { title: "项目讨论第二版" });
+    const conversations = await api.conversations();
+
+    expect(result).toEqual(created);
+    expect(updated.title).toBe("项目讨论第二版");
+    expect(conversations).toEqual([created]);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/conversations");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ method: "POST" }));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/conversations/conv-project");
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: "PATCH" }));
+    expect(String(fetchMock.mock.calls[2]?.[0])).toContain("/api/v1/admin/conversations?archived=false");
+  });
+
   it("disables browser caching for API reads used by live run surfaces", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify([]), {

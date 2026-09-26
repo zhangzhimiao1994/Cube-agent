@@ -119,6 +119,15 @@ from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_STRATEGY,
 )
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
+from agent_hub.runs.conversations import (
+    ConversationConflict,
+    ConversationNotFound,
+    ConversationRecord,
+    ConversationRepository,
+    normalize_conversation_id,
+    normalize_conversation_title,
+    normalize_conversation_workspace,
+)
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
@@ -629,11 +638,88 @@ class RunBulkDeleteResponse(BaseModel):
     failed: list[BulkFailureResponse]
 
 
-class ConversationResponse(BaseModel):
+class ConversationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
+    title: str = Field(default="新会话", min_length=1, max_length=200)
+    project_id: str = Field(min_length=1, max_length=128)
+    project_label: str | None = Field(default=None, max_length=80)
+    workspace_path: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def normalize_fields(self) -> ConversationCreateRequest:
+        self.conversation_id = normalize_conversation_id(self.conversation_id)
+        self.title = normalize_conversation_title(self.title)
+        self.project_id, self.project_label, self.workspace_path = normalize_conversation_workspace(
+            project_id=self.project_id,
+            project_label=self.project_label,
+            workspace_path=self.workspace_path,
+        )
+        return self
+
+
+class ConversationUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    project_label: str | None = Field(default=None, max_length=80)
+    workspace_path: str | None = Field(default=None, min_length=1, max_length=128)
+    archived: bool | None = None
+
+    @model_validator(mode="after")
+    def require_change(self) -> ConversationUpdateRequest:
+        if not self.model_fields_set:
+            raise ValueError("at least one conversation field is required")
+        for field_name in ("title", "project_id", "project_label", "workspace_path"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} must not be null")
+        if self.title is not None:
+            self.title = normalize_conversation_title(self.title)
+        if self.project_id is not None or self.workspace_path is not None:
+            project_id, project_label, workspace_path = normalize_conversation_workspace(
+                project_id=self.project_id or "default",
+                project_label=self.project_label,
+                workspace_path=self.workspace_path or "session-default",
+            )
+            if self.project_id is not None:
+                self.project_id = project_id
+            if self.project_label is not None:
+                self.project_label = project_label
+            if self.workspace_path is not None:
+                self.workspace_path = workspace_path
+        return self
+
+
+class ConversationMetadataResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str
+    title: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_path: str | None = None
+    archived_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ConversationResponse(ConversationMetadataResponse):
     runs: list[RunDetailResponse]
+
+
+def _conversation_metadata_response(record: ConversationRecord) -> ConversationMetadataResponse:
+    return ConversationMetadataResponse(
+        conversation_id=record.conversation_id,
+        title=record.title,
+        project_id=record.project_id,
+        project_label=record.project_label,
+        workspace_path=record.workspace_path,
+        archived_at=record.archived_at,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
 
 
 class SkillUploadRequest(BaseModel):
@@ -2776,7 +2862,19 @@ class AdminResourceService(Protocol):
         self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
     ) -> GeneratedArtifactDownload: ...
 
+    async def create_conversation(
+        self, request: ConversationCreateRequest
+    ) -> ConversationResponse: ...
+
+    async def list_conversations(
+        self, *, archived: bool = False
+    ) -> tuple[ConversationMetadataResponse, ...]: ...
+
     async def get_conversation(self, conversation_id: str) -> ConversationResponse: ...
+
+    async def update_conversation(
+        self, conversation_id: str, request: ConversationUpdateRequest
+    ) -> ConversationResponse: ...
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse: ...
 
@@ -5141,6 +5239,7 @@ class InMemoryAdminResourceService:
     generated_artifacts: dict[tuple[UUID, UUID], tuple[Path, str, str]] = field(
         default_factory=dict
     )
+    conversations: dict[str, ConversationMetadataResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -5434,15 +5533,76 @@ class InMemoryAdminResourceService:
             mime_type=mime_type,
         )
 
-    async def get_conversation(self, conversation_id: str) -> ConversationResponse:
-        return ConversationResponse(
-            conversation_id=conversation_id,
-            runs=[
-                run
-                for run in self.runs.values()
-                if run.explicit_details.get("conversation_id") == conversation_id
-            ],
+    async def create_conversation(
+        self, request: ConversationCreateRequest
+    ) -> ConversationResponse:
+        assert request.conversation_id is not None
+        if request.conversation_id in self.conversations:
+            raise ConversationConflict("conversation already exists")
+        now = datetime.now(UTC)
+        response = ConversationMetadataResponse(
+            conversation_id=request.conversation_id,
+            title=request.title,
+            project_id=request.project_id,
+            project_label=request.project_label,
+            workspace_path=request.workspace_path,
+            created_at=now,
+            updated_at=now,
         )
+        self.conversations[response.conversation_id] = response
+        return ConversationResponse(**response.model_dump(), runs=[])
+
+    async def list_conversations(
+        self, *, archived: bool = False
+    ) -> tuple[ConversationMetadataResponse, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self.conversations.values()
+                    if (item.archived_at is not None) is archived
+                ),
+                key=lambda item: item.updated_at or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+        )
+
+    async def get_conversation(self, conversation_id: str) -> ConversationResponse:
+        metadata = self.conversations.get(conversation_id)
+        runs = [
+            run
+            for run in self.runs.values()
+            if run.explicit_details.get("conversation_id") == conversation_id
+        ]
+        if metadata is None and not runs:
+            raise KeyError(conversation_id)
+        return ConversationResponse(
+            **(
+                metadata.model_dump()
+                if metadata is not None
+                else {"conversation_id": conversation_id}
+            ),
+            runs=runs,
+        )
+
+    async def update_conversation(
+        self, conversation_id: str, request: ConversationUpdateRequest
+    ) -> ConversationResponse:
+        current = self.conversations.get(conversation_id)
+        if current is None:
+            raise ConversationNotFound("conversation was not found")
+        changes = request.model_dump(exclude_unset=True, exclude={"archived"})
+        if request.archived is not None:
+            changes["archived_at"] = datetime.now(UTC) if request.archived else None
+        changes["updated_at"] = datetime.now(UTC)
+        updated = current.model_copy(update=changes)
+        self.conversations[conversation_id] = updated
+        runs = [
+            run
+            for run in self.runs.values()
+            if run.explicit_details.get("conversation_id") == conversation_id
+        ]
+        return ConversationResponse(**updated.model_dump(), runs=runs)
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:
         return self._set_run_status(run_id, "paused")
@@ -6521,6 +6681,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         skill_store_dir: Path | None = None,
         generated_artifact_dir: Path | None = None,
+        conversation_repository: ConversationRepository | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -6530,6 +6691,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._model_transport = model_transport or LiteLLMClient()
         self._run_repository = run_repository
         self._session_factory = session_factory
+        self._conversation_repository = conversation_repository or (
+            ConversationRepository(session_factory) if session_factory is not None else None
+        )
         self._skill_store_dir = skill_store_dir or Path("/var/lib/agent-hub/skills")
         self._generated_artifact_dir = generated_artifact_dir
         self._generated_file_store = (
@@ -6551,6 +6715,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             session_factory=self._session_factory,
             skill_store_dir=self._skill_store_dir,
             generated_artifact_dir=self._generated_artifact_dir,
+            conversation_repository=self._conversation_repository,
         )
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
@@ -6621,15 +6786,70 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             mime_type=metadata["mime_type"],
         )
 
+    async def create_conversation(
+        self, request: ConversationCreateRequest
+    ) -> ConversationResponse:
+        if self._conversation_repository is None:
+            return await super().create_conversation(request)
+        record = await self._conversation_repository.create(
+            tenant_id=self._tenant_id,
+            conversation_id=request.conversation_id,
+            title=request.title,
+            project_id=request.project_id,
+            project_label=request.project_label,
+            workspace_path=request.workspace_path,
+        )
+        return ConversationResponse(
+            **_conversation_metadata_response(record).model_dump(),
+            runs=[],
+        )
+
+    async def list_conversations(
+        self, *, archived: bool = False
+    ) -> tuple[ConversationMetadataResponse, ...]:
+        if self._conversation_repository is None:
+            return await super().list_conversations(archived=archived)
+        records = await self._conversation_repository.list(self._tenant_id, archived=archived)
+        return tuple(_conversation_metadata_response(record) for record in records)
+
     async def get_conversation(self, conversation_id: str) -> ConversationResponse:
+        metadata = None
+        if self._conversation_repository is not None:
+            metadata = await self._conversation_repository.find(self._tenant_id, conversation_id)
         if self._run_repository is None:
-            return await super().get_conversation(conversation_id)
+            if metadata is None:
+                return await super().get_conversation(conversation_id)
+            return ConversationResponse(**_conversation_metadata_response(metadata).model_dump(), runs=[])
         records = await self._run_repository.list_conversation(
             self._tenant_id,
             conversation_id,
         )
+        if metadata is None and not records:
+            raise KeyError(conversation_id)
         runs = [await self._run_detail(record) for record in records]
-        return ConversationResponse(conversation_id=conversation_id, runs=runs)
+        if metadata is None:
+            return ConversationResponse(conversation_id=conversation_id, runs=runs)
+        return ConversationResponse(**_conversation_metadata_response(metadata).model_dump(), runs=runs)
+
+    async def update_conversation(
+        self, conversation_id: str, request: ConversationUpdateRequest
+    ) -> ConversationResponse:
+        if self._conversation_repository is None:
+            return await super().update_conversation(conversation_id, request)
+        record = await self._conversation_repository.update(
+            tenant_id=self._tenant_id,
+            conversation_id=conversation_id,
+            title=request.title if "title" in request.model_fields_set else None,
+            project_id=request.project_id if "project_id" in request.model_fields_set else None,
+            project_label=(
+                request.project_label if "project_label" in request.model_fields_set else None
+            ),
+            workspace_path=(
+                request.workspace_path if "workspace_path" in request.model_fields_set else None
+            ),
+            archived=request.archived if "archived" in request.model_fields_set else None,
+        )
+        return await self.get_conversation(record.conversation_id)
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:
         if self._run_repository is None:
@@ -13847,6 +14067,38 @@ async def list_operational_runs(
     return list(await service.list_runs())
 
 
+@router.post(
+    "/conversations",
+    response_model=ConversationResponse,
+    status_code=201,
+    responses=error_responses(401, 403, 409, 422),
+)
+async def create_conversation(
+    body: ConversationCreateRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> ConversationResponse:
+    _require(principal, "run:create")
+    try:
+        return await service.create_conversation(body)
+    except ConversationConflict as error:
+        raise PublicAPIError(409, "conversation_conflict", str(error)) from error
+
+
+@router.get(
+    "/conversations",
+    response_model=list[ConversationMetadataResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_conversations(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    archived: Annotated[bool, Query()] = False,
+) -> list[ConversationMetadataResponse]:
+    _require(principal, "run:read")
+    return list(await service.list_conversations(archived=archived))
+
+
 @router.get(
     "/conversations/{conversation_id}",
     response_model=ConversationResponse,
@@ -13858,7 +14110,28 @@ async def get_conversation(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> ConversationResponse:
     _require(principal, "run:read")
-    return await service.get_conversation(conversation_id)
+    try:
+        return await service.get_conversation(conversation_id)
+    except (ConversationNotFound, KeyError) as error:
+        raise PublicAPIError(404, "conversation_not_found", "conversation was not found") from error
+
+
+@router.patch(
+    "/conversations/{conversation_id}",
+    response_model=ConversationResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def update_conversation(
+    conversation_id: str,
+    body: ConversationUpdateRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> ConversationResponse:
+    _require(principal, "run:create")
+    try:
+        return await service.update_conversation(conversation_id, body)
+    except (ConversationNotFound, KeyError) as error:
+        raise PublicAPIError(404, "conversation_not_found", "conversation was not found") from error
 
 
 @router.post(
