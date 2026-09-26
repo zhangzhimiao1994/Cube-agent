@@ -782,6 +782,30 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await page.getByRole("button", { name: "打开项目与会话" }).click();
     const manager = page.getByRole("navigation", { name: "项目与会话管理" });
     await expect(manager).toBeVisible();
+    await expect
+      .poll(() => manager.evaluate((element) => element.getBoundingClientRect().right))
+      .toBeLessThanOrEqual(viewport.width + 1);
+    const managerBounds = await manager.evaluate((element) => {
+      const container = element.getBoundingClientRect();
+      const children = Array.from(element.querySelectorAll<HTMLElement>("button, input"));
+      return {
+        container: { left: container.left, right: container.right },
+        viewportWidth: window.innerWidth,
+        escapedChildren: children
+          .map((child) => {
+            const bounds = child.getBoundingClientRect();
+            return {
+              label: child.getAttribute("aria-label") ?? child.textContent?.trim(),
+              left: bounds.left,
+              right: bounds.right,
+            };
+          })
+          .filter((bounds) => bounds.left < container.left - 1 || bounds.right > container.right + 1),
+      };
+    });
+    expect(managerBounds.container.left).toBeGreaterThanOrEqual(0);
+    expect(managerBounds.container.right).toBeLessThanOrEqual(managerBounds.viewportWidth + 1);
+    expect(managerBounds.escapedChildren).toEqual([]);
     await manager.getByRole("button", { name: "创建项目" }).click();
     const projectDialog = page.getByRole("dialog", { name: "新建项目工作区" });
     await expect(projectDialog).toBeVisible();
