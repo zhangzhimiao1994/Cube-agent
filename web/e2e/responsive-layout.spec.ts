@@ -193,6 +193,24 @@ async function mockLayoutApi(page: Page) {
       await route.fulfill({ json: [workflow] });
       return;
     }
+    if (path === "/api/v1/admin/execution-backends") {
+      await route.fulfill({
+        json: [
+          {
+            id: "systemd",
+            name: "本机 systemd 隔离",
+            adapter: "SystemdSkillSandbox",
+            description: "本机隔离执行",
+            isolation: "DynamicUser + 私有网络",
+            cost: "本机资源",
+            available: true,
+            reason: null,
+            supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+          },
+        ],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/runs") {
       await route.fulfill({ json: [run] });
       return;
@@ -210,6 +228,35 @@ async function mockLayoutApi(page: Page) {
             status: "scanned",
             scan_diff: ["added SKILL.md", "requested filesystem:read"],
             requested_permissions: ["filesystem:read", "network:https"],
+          },
+        ],
+      });
+      return;
+    }
+    if (path === "/api/v1/admin/skill-sources") {
+      await route.fulfill({
+        json: [
+          {
+            id: "team-skills",
+            name: "团队技能库",
+            repository_url: "https://github.com/example/team-skills",
+            ref: "main",
+            subdirectory: "skills",
+            enabled: true,
+            credential_ref: null,
+            expected_archive_sha256: null,
+            trust_state: "trusted",
+            trusted_by: currentUser.user_id,
+            trusted_at: now,
+            trust_reason: "已核验团队仓库",
+            sync_state: "succeeded",
+            last_sync_id: "sync-12",
+            resolved_commit_sha: "1234567890abcdef1234567890abcdef12345678",
+            archive_sha256: "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            source_archive_bytes: 4096,
+            last_synced_at: now,
+            last_error: null,
+            linked_skill_ids: ["safe-skill"],
           },
         ],
       });

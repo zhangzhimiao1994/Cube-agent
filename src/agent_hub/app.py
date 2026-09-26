@@ -110,6 +110,7 @@ from agent_hub.routing.types import (
     RouteSource,
 )
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.conversation_queue import ConversationQueueRepository
 from agent_hub.runs.conversations import ConversationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import (
@@ -1178,6 +1179,7 @@ def create_app(
                         ).get_main_agent_config
                     ),
                     conversation_repository=ConversationRepository(active_sessions),
+                    conversation_queue_repository=ConversationQueueRepository(active_sessions),
                 )
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router
@@ -1344,6 +1346,7 @@ def create_app(
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
     application.router.routes.extend(runs.router.routes)
+    application.router.routes.extend(runs.admin_queue_router.routes)
     application.router.routes.extend(workspaces.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)

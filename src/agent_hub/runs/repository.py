@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import Role
 from agent_hub.db.models import (
+    ConversationQueueItemRow,
     RunApprovalRow,
     RunArtifactRow,
     RunCheckpointRow,
@@ -66,6 +67,7 @@ class RunRecord:
     version: int
     created_at: datetime
     routing_decision: dict[str, object] | None
+    blocked_by_run_id: UUID | None = None
     actor_role: Role | None = None
 
 
@@ -208,8 +210,16 @@ class RunRepository:
         status: RunStatus,
         idempotency_key: str | None,
         routing_decision: dict[str, object] | None = None,
+        blocked_by_run_id: UUID | None = None,
         enqueue: bool,
     ) -> RunRecord:
+        if blocked_by_run_id is None and routing_decision is not None:
+            raw_blocked_by_run_id = routing_decision.get("blocked_by_run_id")
+            if isinstance(raw_blocked_by_run_id, str):
+                try:
+                    blocked_by_run_id = UUID(raw_blocked_by_run_id)
+                except ValueError:
+                    raise ValueError("blocked_by_run_id must be a UUID") from None
         run_id = uuid4()
         outbox_id = uuid4()
         outbox_key = f"{tenant_id}:{idempotency_key or run_id}"
@@ -233,11 +243,12 @@ class RunRepository:
                 status=status.value,
                 idempotency_key=idempotency_key,
                 routing_decision=routing_decision,
+                blocked_by_run_id=blocked_by_run_id,
                 version=1,
             )
             session.add(row)
             await session.flush()
-            if enqueue:
+            if enqueue and blocked_by_run_id is None:
                 session.add(
                     RunOutboxRow(
                         id=outbox_id,
@@ -360,6 +371,24 @@ class RunRepository:
             status = RunStatus(row.status)
             if status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
                 raise RunConflict("run must be completed, failed, or cancelled before deletion")
+
+            blocked_successor = await session.scalar(
+                select(RunRow.id)
+                .where(RunRow.tenant_id == tenant_id, RunRow.blocked_by_run_id == run_id)
+                .limit(1)
+            )
+            if blocked_successor is not None:
+                raise RunConflict("run still has a blocked conversation successor")
+
+            await session.execute(
+                delete(ConversationQueueItemRow).where(
+                    ConversationQueueItemRow.tenant_id == tenant_id,
+                    (
+                        (ConversationQueueItemRow.predecessor_run_id == run_id)
+                        | (ConversationQueueItemRow.successor_run_id == run_id)
+                    ),
+                )
+            )
 
             for table in (
                 RunOutboxRow,
@@ -735,6 +764,8 @@ class RunRepository:
             return self._record(row)
         if mode is None:
             return self._record(row)
+        if row.blocked_by_run_id is not None:
+            raise RunConflict("run is blocked by an active conversation run")
         if status is RunStatus.RUNNING and not allow_running_recovery:
             raise RunAlreadyActive("run is already active")
         if (
@@ -875,6 +906,8 @@ class RunRepository:
                 return self._record(row)
             if current in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
                 raise RunConflict("terminal run state is immutable")
+            if row.blocked_by_run_id is not None:
+                raise RunConflict("run is blocked by an active conversation run")
             if status is RunStatus.PAUSED and current not in {RunStatus.QUEUED, RunStatus.RUNNING}:
                 raise RunConflict("run cannot be paused from its current state")
             if status is RunStatus.CANCELLED and current is RunStatus.CANCELLED:
@@ -1612,6 +1645,7 @@ class RunRepository:
             version=row.version,
             created_at=row.created_at,
             routing_decision=None if row.routing_decision is None else dict(row.routing_decision),
+            blocked_by_run_id=getattr(row, "blocked_by_run_id", None),
         )
 
     @staticmethod

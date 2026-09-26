@@ -688,6 +688,24 @@ const SubmittedRunSchema = z.object({
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
 
+const ConversationQueueItemSchema = z.object({
+  id: z.string(),
+  conversation_id: z.string(),
+  predecessor_run_id: z.string(),
+  successor_run_id: z.string(),
+  message: z.string(),
+  position: z.number().int().positive(),
+  status: z.enum(["queued", "redirecting", "released", "cancelled", "running", "completed", "failed"]),
+  version: z.number().int().positive(),
+  attachment_count: z.number().int().nonnegative(),
+  references: z.record(z.string(), z.unknown()).default({}),
+  failure_detail: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+export type ConversationQueueItem = z.infer<typeof ConversationQueueItemSchema>;
+
 const RunEventSchema = z.object({
   sequence: z.number(),
   kind: z.string(),
@@ -2252,6 +2270,69 @@ export const api = {
       "/api/v1/runs",
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
+    );
+  },
+  queueConversationMessage(
+    conversationId: string,
+    idempotencyKey: string,
+    payload: {
+      message: string;
+      mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
+      attachment_ids?: string[];
+      reference_conversation_id?: string | null;
+      project_id?: string | null;
+      project_label?: string | null;
+      workspace_session_id?: string | null;
+      sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
+      execution_backend?: "systemd" | "docker";
+      requested_permissions?: string[];
+    },
+  ): Promise<ConversationQueueItem> {
+    return request(
+      `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}/queue`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(payload),
+      },
+      ConversationQueueItemSchema,
+    );
+  },
+  conversationQueue(conversationId: string): Promise<ConversationQueueItem[]> {
+    return request(
+      `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}/queue`,
+      { method: "GET" },
+      z.array(ConversationQueueItemSchema),
+    );
+  },
+  editConversationQueueItem(
+    queueItemId: string,
+    payload: { version: number; message: string },
+  ): Promise<ConversationQueueItem> {
+    return request(
+      `/api/v1/admin/conversation-queue/${encodeURIComponent(queueItemId)}`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+      ConversationQueueItemSchema,
+    );
+  },
+  redirectConversationQueueItem(
+    queueItemId: string,
+    payload: { version: number },
+  ): Promise<ConversationQueueItem> {
+    return request(
+      `/api/v1/admin/conversation-queue/${encodeURIComponent(queueItemId)}/redirect`,
+      { method: "POST", body: JSON.stringify(payload) },
+      ConversationQueueItemSchema,
+    );
+  },
+  cancelConversationQueueItem(
+    queueItemId: string,
+    payload: { version: number },
+  ): Promise<ConversationQueueItem> {
+    return request(
+      `/api/v1/admin/conversation-queue/${encodeURIComponent(queueItemId)}`,
+      { method: "DELETE", body: JSON.stringify(payload) },
+      ConversationQueueItemSchema,
     );
   },
   uploadAttachment(file: File): Promise<AttachmentUpload> {

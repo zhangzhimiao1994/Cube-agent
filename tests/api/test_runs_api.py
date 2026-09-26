@@ -5,6 +5,7 @@ import json
 import tarfile
 import zipfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -17,7 +18,8 @@ from fastapi.testclient import TestClient
 from agent_hub.api.routers.runs import SubmittedRunResponse
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
-from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.domain.runs import ConversationQueueStatus, RunStatus, TaskMode
+from agent_hub.runs.conversation_queue import ConversationQueueConflict, ConversationQueueItem
 from agent_hub.runs.conversations import ConversationArchived
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 
@@ -119,6 +121,8 @@ class StubRunService:
     resumed: list[tuple[UUID, UUID]] = field(default_factory=list)
     cancelled: list[tuple[UUID, UUID]] = field(default_factory=list)
     archived_conversation_ids: set[str] = field(default_factory=set)
+    queued_items: list[ConversationQueueItem] = field(default_factory=list)
+    conversation_active: bool = True
 
     async def submit(
         self,
@@ -526,6 +530,120 @@ class StubRunService:
             usage_cost_usd=summary.usage_cost_usd,
         )
 
+    async def queue_message(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        actor_role: Role | None,
+        conversation_id: str,
+        message: str,
+        mode: TaskMode,
+        attachment_ids: tuple[str, ...] = (),
+        reference_conversation_id: str | None = None,
+        idempotency_key: str,
+        **submit_options: object,
+    ) -> ConversationQueueItem:
+        del actor_id, actor_role, mode, submit_options
+        if not self.conversation_active:
+            raise ConversationQueueConflict("conversation has no active run")
+        now = datetime.now(UTC)
+        item = ConversationQueueItem(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            predecessor_run_id=uuid4(),
+            successor_run_id=uuid4(),
+            message=message,
+            attachments=tuple({"id": item} for item in attachment_ids),
+            references={"reference_conversation_id": reference_conversation_id}
+            if reference_conversation_id
+            else {},
+            position=len(self.queued_items) + 1,
+            idempotency_key=idempotency_key,
+            status=ConversationQueueStatus.QUEUED,
+            version=1,
+            failure_detail=None,
+            created_at=now,
+            updated_at=now,
+        )
+        self.queued_items.append(item)
+        return item
+
+    async def conversation_queue(
+        self, tenant_id: UUID, conversation_id: str
+    ) -> tuple[ConversationQueueItem, ...]:
+        return tuple(
+            item
+            for item in self.queued_items
+            if item.tenant_id == tenant_id and item.conversation_id == conversation_id
+        )
+
+    async def edit_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str
+    ) -> ConversationQueueItem:
+        item = self._queue_item(tenant_id, item_id, version)
+        updated = self._replace_queue_item(item, message=message, version=item.version + 1)
+        return updated
+
+    async def cancel_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int
+    ) -> ConversationQueueItem:
+        item = self._queue_item(tenant_id, item_id, version)
+        return self._replace_queue_item(
+            item,
+            status=ConversationQueueStatus.CANCELLED,
+            version=item.version + 1,
+        )
+
+    async def redirect_to_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int
+    ) -> ConversationQueueItem:
+        item = self._queue_item(tenant_id, item_id, version)
+        return self._replace_queue_item(
+            item,
+            status=ConversationQueueStatus.REDIRECTING,
+            version=item.version + 1,
+        )
+
+    def _queue_item(self, tenant_id: UUID, item_id: UUID, version: int) -> ConversationQueueItem:
+        item = next(
+            item
+            for item in self.queued_items
+            if item.tenant_id == tenant_id and item.id == item_id
+        )
+        if item.version != version:
+            raise ConversationQueueConflict("queue item version is stale")
+        return item
+
+    def _replace_queue_item(
+        self,
+        item: ConversationQueueItem,
+        *,
+        message: str | None = None,
+        status: ConversationQueueStatus | None = None,
+        version: int,
+    ) -> ConversationQueueItem:
+        updated = ConversationQueueItem(
+            id=item.id,
+            tenant_id=item.tenant_id,
+            conversation_id=item.conversation_id,
+            predecessor_run_id=item.predecessor_run_id,
+            successor_run_id=item.successor_run_id,
+            message=item.message if message is None else message,
+            attachments=item.attachments,
+            references=item.references,
+            position=item.position,
+            idempotency_key=item.idempotency_key,
+            status=item.status if status is None else status,
+            version=version,
+            failure_detail=item.failure_detail,
+            created_at=item.created_at,
+            updated_at=datetime.now(UTC),
+        )
+        self.queued_items[self.queued_items.index(item)] = updated
+        return updated
+
 
 def _client(
     role: Role = Role.OPERATOR,
@@ -549,6 +667,69 @@ def _client(
 
 def bearer() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
+
+
+def test_conversation_queue_supports_list_edit_redirect_and_cancel() -> None:
+    client, service, _ = _client()
+
+    queued = client.post(
+        "/api/v1/admin/conversations/conv-queue/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-api-1"},
+        json={"message": "先执行这个", "mode": "auto"},
+    )
+
+    assert queued.status_code == 202
+    item = queued.json()
+    assert item["message"] == "先执行这个"
+    assert item["status"] == "queued"
+    listed = client.get("/api/v1/admin/conversations/conv-queue/queue", headers=bearer())
+    assert [entry["id"] for entry in listed.json()] == [item["id"]]
+
+    edited = client.patch(
+        f"/api/v1/admin/conversation-queue/{item['id']}",
+        headers=bearer(),
+        json={"version": 1, "message": "修改后的排队信息"},
+    )
+    assert edited.status_code == 200
+    assert edited.json()["message"] == "修改后的排队信息"
+    assert edited.json()["version"] == 2
+
+    redirected = client.post(
+        f"/api/v1/admin/conversation-queue/{item['id']}/redirect",
+        headers=bearer(),
+        json={"version": 2},
+    )
+    assert redirected.status_code == 200
+    assert redirected.json()["status"] == "redirecting"
+
+    service.queued_items.clear()
+    replacement = client.post(
+        "/api/v1/admin/conversations/conv-queue/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-api-2"},
+        json={"message": "取消我", "mode": "auto"},
+    ).json()
+    cancelled = client.request(
+        "DELETE",
+        f"/api/v1/admin/conversation-queue/{replacement['id']}",
+        headers=bearer(),
+        json={"version": 1},
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+
+def test_conversation_queue_reports_when_active_run_finished_before_enqueue() -> None:
+    client, service, _ = _client()
+    service.conversation_active = False
+
+    response = client.post(
+        "/api/v1/admin/conversations/conv-queue/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-race"},
+        json={"message": "不要丢失", "mode": "auto"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conversation_not_active"
 
 
 def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_enqueue_runtime() -> (

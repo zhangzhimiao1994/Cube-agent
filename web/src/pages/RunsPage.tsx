@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef,
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import {
   ArtifactFileCard,
@@ -5750,6 +5750,8 @@ export function RunsPage() {
     queryFn: () => api.conversations(true),
   });
   const [message, setMessage] = useState("");
+  const [editingQueueItemId, setEditingQueueItemId] = useState<string | null>(null);
+  const [editingQueueMessage, setEditingQueueMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
   const [workflowId, setWorkflowId] = useState("");
   const [agentIds, setAgentIds] = useState<string[]>([]);
@@ -5881,6 +5883,13 @@ export function RunsPage() {
       if (data && activeConversationId === data.conversation_id) return 1000;
       return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
     },
+    refetchIntervalInBackground: true,
+  });
+  const conversationQueue = useQuery({
+    queryKey: ["conversation-queue", activeConversationId],
+    queryFn: () => api.conversationQueue(activeConversationId),
+    enabled: Boolean(activeConversationId && activeConversationKnown),
+    refetchInterval: 1000,
     refetchIntervalInBackground: true,
   });
   const activeWorkspaceProjectId =
@@ -6329,6 +6338,72 @@ export function RunsPage() {
       setAttachmentDraft(null);
       setArchiveInstallFile(null);
       await refreshRunSurfaces(run);
+    },
+  });
+
+  const queueMessage = useMutation({
+    mutationFn: (queuedMessage: string) =>
+      api.queueConversationMessage(
+        activeConversationId,
+        `queue-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        {
+          message: queuedMessage,
+          mode: "auto",
+          reference_conversation_id: referenceConversationId.trim() || null,
+          project_id: activeWorkspaceProjectId || null,
+          project_label: projectLabel.trim() || null,
+          workspace_session_id: activeWorkspaceSessionId || null,
+          sandbox_profile: sandboxProfile,
+          ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
+          requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
+          attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
+        },
+      ),
+    onSuccess: async () => {
+      setMessage("");
+      setAttachmentDraft(null);
+      setArchiveInstallFile(null);
+      setSubmitNotice("消息已排队，将在当前任务结束后执行。");
+      await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
+    },
+    onError: (error, queuedMessage) => {
+      if (error instanceof ApiError && error.code === "conversation_not_active") {
+        createRun.mutate({ message: queuedMessage, mode: "auto" });
+      }
+    },
+  });
+
+  const editQueueItem = useMutation({
+    mutationFn: ({ item, nextMessage }: { item: ConversationQueueItem; nextMessage: string }) =>
+      api.editConversationQueueItem(item.id, { version: item.version, message: nextMessage }),
+    onSuccess: async () => {
+      setEditingQueueItemId(null);
+      setEditingQueueMessage("");
+      setSubmitNotice("排队信息已更新，顺序和附件保持不变。");
+      await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
+    },
+  });
+
+  const redirectQueueItem = useMutation({
+    mutationFn: (item: ConversationQueueItem) =>
+      api.redirectConversationQueueItem(item.id, { version: item.version }),
+    onSuccess: async () => {
+      setSubmitNotice("已请求改变方向。当前任务安全停止后，将执行这条排队信息。");
+      await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
+      await queryClient.invalidateQueries({ queryKey: ["conversation", activeConversationId] });
+    },
+  });
+
+  const cancelQueueItem = useMutation({
+    mutationFn: (item: ConversationQueueItem) =>
+      api.cancelConversationQueueItem(item.id, { version: item.version }),
+    onSuccess: async (item) => {
+      if (editingQueueItemId === item.id) {
+        setEditingQueueItemId(null);
+        setEditingQueueMessage("");
+      }
+      setSubmitNotice("已取消这条排队信息。");
+      await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
     },
   });
 
@@ -6862,6 +6937,10 @@ export function RunsPage() {
       });
       return;
     }
+    if (canStopLatestRun) {
+      queueMessage.mutate(trimmed);
+      return;
+    }
     createRun.mutate({ message: trimmed, mode: "auto" });
   }
 
@@ -7060,7 +7139,18 @@ export function RunsPage() {
     messages.some((item) => item.id === `${projectPreflightApproval.runId}-project-preflight-approval`);
   const repairApprovalVisibleInMessages =
     !!repairApproval && messages.some((item) => item.id === `${repairApproval.runId}-repair-approval`);
-  const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
+  const blockedQueueSuccessorIds = new Set(
+    (conversationQueue.data ?? [])
+      .filter((item) => item.status === "queued" || item.status === "redirecting")
+      .map((item) => item.successor_run_id),
+  );
+  const latestVisibleRun =
+    [...visibleRuns]
+      .reverse()
+      .find((run) => !blockedQueueSuccessorIds.has(run.id)) ??
+    (selectedRun.data && !blockedQueueSuccessorIds.has(selectedRun.data.id)
+      ? selectedRun.data
+      : undefined);
   const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
   const mainAgentModelName = mainAgent.data?.model
     ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
@@ -7924,6 +8014,115 @@ export function RunsPage() {
                 ))}
               </div>
             ) : null}
+            {(conversationQueue.data ?? []).some((item) =>
+              ["queued", "redirecting", "released", "running"].includes(item.status),
+            ) ? (
+              <section className="conversation-queue" aria-label="排队信息">
+                <div className="conversation-queue-heading">
+                  <strong>等待执行</strong>
+                  <span>
+                    {(conversationQueue.data ?? []).filter((item) =>
+                      ["queued", "redirecting", "released", "running"].includes(item.status),
+                    ).length} 条
+                  </span>
+                </div>
+                {(conversationQueue.data ?? [])
+                  .filter((item) => ["queued", "redirecting", "released", "running"].includes(item.status))
+                  .map((item) => (
+                    <article className="conversation-queue-item" key={item.id}>
+                      <div className="conversation-queue-order" aria-label={`排队顺序 ${item.position}`}>
+                        {item.position}
+                      </div>
+                      <div className="conversation-queue-content">
+                        {editingQueueItemId === item.id ? (
+                          <label className="conversation-queue-editor">
+                            <span>编辑排队信息</span>
+                            <textarea
+                              aria-label="编辑排队信息"
+                              value={editingQueueMessage}
+                              onChange={(event) => setEditingQueueMessage(event.target.value)}
+                              autoFocus
+                            />
+                          </label>
+                        ) : (
+                          <p>{item.message}</p>
+                        )}
+                        <small>
+                          {item.status === "redirecting"
+                            ? "正在安全停止当前任务"
+                            : item.status === "released" || item.status === "running"
+                              ? "已进入执行"
+                              : `等待当前任务完成${item.attachment_count ? ` · ${item.attachment_count} 个附件` : ""}`}
+                        </small>
+                      </div>
+                      <div className="conversation-queue-actions">
+                        {editingQueueItemId === item.id ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={!editingQueueMessage.trim() || editQueueItem.isPending}
+                              onClick={() => editQueueItem.mutate({ item, nextMessage: editingQueueMessage.trim() })}
+                            >
+                              保存
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              onClick={() => {
+                                setEditingQueueItemId(null);
+                                setEditingQueueMessage("");
+                              }}
+                            >
+                              取消
+                            </button>
+                          </>
+                        ) : item.status === "queued" ? (
+                          <>
+                            <button
+                              type="button"
+                              className="secondary-action conversation-queue-redirect"
+                              disabled={redirectQueueItem.isPending}
+                              onClick={() => {
+                                if (window.confirm("停止当前任务，并改为优先执行这条排队信息？")) {
+                                  redirectQueueItem.mutate(item);
+                                }
+                              }}
+                            >
+                              改变方向
+                            </button>
+                            <button
+                              type="button"
+                              className="conversation-queue-icon"
+                              aria-label="编辑排队信息"
+                              title="编辑排队信息"
+                              onClick={() => {
+                                setEditingQueueItemId(item.id);
+                                setEditingQueueMessage(item.message);
+                              }}
+                            >
+                              ✎
+                            </button>
+                            <button
+                              type="button"
+                              className="conversation-queue-icon conversation-queue-cancel"
+                              aria-label="取消排队"
+                              title="取消排队"
+                              disabled={cancelQueueItem.isPending}
+                              onClick={() => {
+                                if (window.confirm("取消这条排队信息？此操作不会停止当前任务。")) {
+                                  cancelQueueItem.mutate(item);
+                                }
+                              }}
+                            >
+                              ×
+                            </button>
+                          </>
+                        ) : null}
+                      </div>
+                    </article>
+                  ))}
+              </section>
+            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
@@ -7991,11 +8190,19 @@ export function RunsPage() {
                   type="submit"
                   disabled={
                     createRun.isPending ||
+                    queueMessage.isPending ||
                     message.trim().length === 0 ||
                     currentConversationArchived
                   }
+                  title={canStopLatestRun ? "当前任务完成后执行这条消息" : "发送消息"}
                 >
-                  {createRun.isPending ? "发送中..." : "发送"}
+                  {queueMessage.isPending
+                    ? "排队中..."
+                    : createRun.isPending
+                      ? "发送中..."
+                      : canStopLatestRun
+                        ? "排队"
+                        : "发送"}
                 </button>
               </div>
             </div>
@@ -8017,6 +8224,12 @@ export function RunsPage() {
               </p>
             ) : null}
             {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "消息发送失败")}</p> : null}
+            {queueMessage.isError && (!(queueMessage.error instanceof ApiError) || queueMessage.error.code !== "conversation_not_active") ? (
+              <p role="alert">{formatApiError(queueMessage.error, "消息排队失败")}</p>
+            ) : null}
+            {editQueueItem.isError ? <p role="alert">{formatApiError(editQueueItem.error, "排队信息编辑失败；你的修改仍保留在输入框中")}</p> : null}
+            {redirectQueueItem.isError ? <p role="alert">{formatApiError(redirectQueueItem.error, "改变方向失败")}</p> : null}
+            {cancelQueueItem.isError ? <p role="alert">{formatApiError(cancelQueueItem.error, "取消排队失败")}</p> : null}
             {stopCurrentRun.isError ? <p role="alert">{formatApiError(stopCurrentRun.error, "停止运行失败")}</p> : null}
           </form>
         </div>

@@ -34,6 +34,12 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
+from agent_hub.runs.conversation_queue import (
+    ConversationQueueConflict,
+    ConversationQueueItem,
+    ConversationQueueRepository,
+    EnqueueConversationMessage,
+)
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
@@ -437,10 +443,12 @@ class RunService:
         run_worker_lease_seconds: float = 60.0,
         instruction_context_loader: InstructionContextLoader | None = None,
         conversation_repository: ConversationRepositoryProtocol | None = None,
+        conversation_queue_repository: ConversationQueueRepository | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
         self._conversation_repository = conversation_repository
+        self._conversation_queue_repository = conversation_queue_repository
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -487,6 +495,7 @@ class RunService:
         runtime_timeout_seconds: float | None = None,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
+        blocked_by_run_id: UUID | None = None,
     ) -> SubmittedRun:
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
         conversation = None
@@ -523,6 +532,8 @@ class RunService:
             **workspace.routing_payload(),
             "execution_backend": resolved_execution_backend,
         }
+        if blocked_by_run_id is not None:
+            operator_selection["blocked_by_run_id"] = str(blocked_by_run_id)
         if reference_workflow_id is not None:
             cleaned_reference_workflow_id = reference_workflow_id.strip()
             if _SAFE_ROLE_ID.fullmatch(cleaned_reference_workflow_id) is None:
@@ -1354,7 +1365,134 @@ class RunService:
         record = await self._repository.update_control_status(
             tenant_id, run_id, RunStatus.CANCELLED
         )
+        await self._release_conversation_successor(tenant_id, run_id)
         return await self._summary(record)
+
+    async def queue_message(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        actor_role: Role | None,
+        conversation_id: str,
+        message: str,
+        mode: TaskMode,
+        attachment_ids: tuple[str, ...] = (),
+        reference_conversation_id: str | None = None,
+        idempotency_key: str,
+        **submit_options: object,
+    ) -> ConversationQueueItem:
+        if self._conversation_queue_repository is None:
+            raise ConversationQueueConflict("conversation queue is unavailable")
+        active_runs = [
+            run
+            for run in await self._repository.list_conversation(tenant_id, conversation_id)
+            if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+        ]
+        if not active_runs:
+            raise ConversationQueueConflict("conversation has no active run")
+        predecessor = active_runs[-1]
+        submitted = await self.submit(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            message=message,
+            mode=mode,
+            conversation_id=conversation_id,
+            reference_conversation_id=reference_conversation_id,
+            attachment_ids=attachment_ids,
+            idempotency_key=f"queue-run:{idempotency_key}",
+            blocked_by_run_id=predecessor.id,
+            **submit_options,  # type: ignore[arg-type]
+        )
+        try:
+            return await self._conversation_queue_repository.enqueue(
+                EnqueueConversationMessage(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    predecessor_run_id=predecessor.id,
+                    successor_run_id=submitted.id,
+                    message=message,
+                    attachments=tuple({"id": attachment_id} for attachment_id in attachment_ids),
+                    references={"reference_conversation_id": reference_conversation_id}
+                    if reference_conversation_id
+                    else {},
+                    idempotency_key=idempotency_key,
+                )
+            )
+        except Exception:
+            # A blocked run without its queue record can never be released. Cancel the
+            # submitted run before surfacing the enqueue failure to keep state recoverable.
+            try:
+                await self._repository.update_control_status(
+                    tenant_id, submitted.id, RunStatus.CANCELLED
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "failed to cancel orphaned queued run",
+                    extra={"run_id": str(submitted.id)},
+                )
+            raise
+
+    async def conversation_queue(
+        self,
+        tenant_id: UUID,
+        conversation_id: str,
+    ) -> tuple[ConversationQueueItem, ...]:
+        if self._conversation_queue_repository is None:
+            return ()
+        return await self._conversation_queue_repository.list_for_conversation(
+            tenant_id, conversation_id
+        )
+
+    async def edit_queued_message(
+        self,
+        tenant_id: UUID,
+        item_id: UUID,
+        *,
+        version: int,
+        message: str,
+    ) -> ConversationQueueItem:
+        if self._conversation_queue_repository is None:
+            raise ConversationQueueConflict("conversation queue is unavailable")
+        return await self._conversation_queue_repository.edit(
+            tenant_id, item_id, expected_version=version, message=message
+        )
+
+    async def cancel_queued_message(
+        self,
+        tenant_id: UUID,
+        item_id: UUID,
+        *,
+        version: int,
+    ) -> ConversationQueueItem:
+        if self._conversation_queue_repository is None:
+            raise ConversationQueueConflict("conversation queue is unavailable")
+        return await self._conversation_queue_repository.cancel(
+            tenant_id, item_id, expected_version=version
+        )
+
+    async def redirect_to_queued_message(
+        self,
+        tenant_id: UUID,
+        item_id: UUID,
+        *,
+        version: int,
+    ) -> ConversationQueueItem:
+        if self._conversation_queue_repository is None:
+            raise ConversationQueueConflict("conversation queue is unavailable")
+        return await self._conversation_queue_repository.redirect(
+            tenant_id, item_id, expected_version=version
+        )
+
+    async def _release_conversation_successor(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> None:
+        if self._conversation_queue_repository is None:
+            return
+        await self._conversation_queue_repository.release_next_for_terminal_run(tenant_id, run_id)
 
     async def publish_pending(self, limit: int = 100) -> int:
         delivered = 0
@@ -1407,8 +1545,16 @@ class RunService:
                 )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
+                await self._release_conversation_successor(
+                    claimed_record.tenant_id,
+                    claimed_record.id,
+                )
                 return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
             if claimed_record.status in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
+                await self._release_conversation_successor(
+                    claimed_record.tenant_id,
+                    claimed_record.id,
+                )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
             return _submitted(claimed_record)
@@ -1668,6 +1814,7 @@ class RunService:
                 mode=failed.mode,
                 routing_decision=failed.routing_decision,
             )
+            await self._release_conversation_successor(failed.tenant_id, run_id)
             return await self._submitted_by_run_id(failed.tenant_id, run_id)
         if terminal is RunStatus.RUNNING:
             terminal = RunStatus.COMPLETED
@@ -1742,6 +1889,7 @@ class RunService:
                 mode=mode,
                 routing_decision=routing_decision,
             )
+            await self._release_conversation_successor(tenant_id, run_id)
         return await self._submitted_by_run_id(tenant_id, run_id)
 
     async def _safe_record_self_repair_execution_event(

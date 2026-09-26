@@ -175,6 +175,60 @@ describe("api client transport", () => {
     expect(String(fetchMock.mock.calls[2]?.[0])).toContain("/api/v1/admin/conversations?archived=false");
   });
 
+  it("supports the editable conversation queue lifecycle", async () => {
+    const item = {
+      id: "queue-1",
+      conversation_id: "conv-project",
+      predecessor_run_id: "run-active",
+      successor_run_id: "run-next",
+      message: "排队消息",
+      position: 1,
+      status: "queued",
+      version: 1,
+      attachment_count: 0,
+      references: {},
+      failure_detail: null,
+      created_at: "2026-09-26T08:00:00Z",
+      updated_at: "2026-09-26T08:00:00Z",
+    };
+    const response = (payload: unknown) =>
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(response(item))
+      .mockResolvedValueOnce(response([item]))
+      .mockResolvedValueOnce(response({ ...item, message: "已编辑", version: 2 }))
+      .mockResolvedValueOnce(response({ ...item, status: "redirecting", version: 3 }))
+      .mockResolvedValueOnce(response({ ...item, status: "cancelled", version: 4 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.queueConversationMessage("conv-project", "queue-key", {
+      message: "排队消息",
+      mode: "auto",
+    });
+    await api.conversationQueue("conv-project");
+    await api.editConversationQueueItem("queue-1", { version: 1, message: "已编辑" });
+    await api.redirectConversationQueueItem("queue-1", { version: 2 });
+    await api.cancelConversationQueueItem("queue-1", { version: 3 });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/conversations/conv-project/queue");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Idempotency-Key": "queue-key" }),
+      }),
+    );
+    expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(
+      /^\/api\/v1\/admin\/conversations\/conv-project\/queue\?_=/,
+    );
+    expect(fetchMock.mock.calls[2]?.[1]).toEqual(expect.objectContaining({ method: "PATCH" }));
+    expect(fetchMock.mock.calls[3]?.[0]).toBe("/api/v1/admin/conversation-queue/queue-1/redirect");
+    expect(fetchMock.mock.calls[4]?.[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+  });
+
   it("disables browser caching for API reads used by live run surfaces", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify([]), {

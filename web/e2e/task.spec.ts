@@ -507,6 +507,24 @@ async function mockCodingRunApi(
       await route.fulfill({ json: [] });
       return;
     }
+    if (path === "/api/v1/admin/execution-backends") {
+      await route.fulfill({
+        json: [
+          {
+            id: "systemd",
+            name: "本机 systemd 隔离",
+            adapter: "SystemdSkillSandbox",
+            description: "本机隔离执行",
+            isolation: "DynamicUser + 私有网络",
+            cost: "本机资源",
+            available: true,
+            reason: null,
+            supported_sandbox_profiles: ["read_only", "restricted", "workspace_write"],
+          },
+        ],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/settings") {
       await route.fulfill({
         json: {
@@ -547,6 +565,34 @@ async function mockCodingRunApi(
           max_review_rounds: 1,
         },
       });
+      return;
+    }
+    if (path === "/api/v1/admin/conversations" && request.method() === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+    if (path === "/api/v1/admin/conversations" && request.method() === "POST") {
+      const payload = request.postDataJSON() as {
+        conversation_id: string;
+        title?: string;
+        project_id: string;
+        project_label?: string | null;
+        workspace_path: string;
+      };
+      await route.fulfill({
+        json: {
+          ...payload,
+          title: payload.title ?? null,
+          project_label: payload.project_label ?? null,
+          archived_at: null,
+          created_at: "2026-08-31T00:00:00Z",
+          updated_at: "2026-08-31T00:00:00Z",
+        },
+      });
+      return;
+    }
+    if (/^\/api\/v1\/admin\/conversations\/[^/]+\/queue$/.test(path) && request.method() === "GET") {
+      await route.fulfill({ json: [] });
       return;
     }
     if (path === "/api/v1/runs" && request.method() === "POST") {
@@ -760,8 +806,8 @@ test("conversation checkpoints jump between user questions", async ({ page }) =>
 
   const checkpoints = page.getByRole("navigation", { name: "对话检查点" });
   await expect(checkpoints).toBeVisible();
-  await expect(checkpoints.getByRole("button", { name: /生成一个最简单的 hello world 项目/ })).toBeVisible();
-  await expect(checkpoints.getByRole("button", { name: /继续优化 UI 交互/ })).toBeVisible();
+  await expect(checkpoints.getByRole("button", { name: /^1 生成一个最简单的 hello world 项目/ })).toBeVisible();
+  await expect(checkpoints.getByRole("button", { name: /^2 继续优化 UI 交互/ })).toBeVisible();
 
   await page.evaluate(() => {
     const testWindow = window as unknown as { __lastConversationCheckpointTarget: string };
@@ -771,7 +817,7 @@ test("conversation checkpoints jump between user questions", async ({ page }) =>
     };
   });
 
-  await checkpoints.getByRole("button", { name: /继续优化 UI 交互/ }).click();
+  await checkpoints.getByRole("button", { name: /^2 继续优化 UI 交互/ }).click();
   await expect
     .poll(() =>
       page.evaluate(() => {
@@ -892,8 +938,10 @@ test("opened agent process drawer refreshes when new step events arrive", async 
 });
 
 test("process drawer keeps long fields behind summary detail cards", async ({ page }) => {
-  const fullOutputSentinel =
-    "完整输出字段应该只在二级详情中出现，不能直接铺在抽屉正文里。alpha beta gamma delta epsilon.";
+  const fullOutputSentinel = Array.from(
+    { length: 30 },
+    (_item, index) => `第 ${index + 1} 段：完整输出字段应该只在二级详情中出现，不能直接铺在抽屉正文里。alpha beta gamma delta epsilon.`,
+  ).join("\n");
   await mockCodingRunApi(page, { fullOutputSentinel });
 
   await page.goto("/");
@@ -911,6 +959,41 @@ test("process drawer keeps long fields behind summary detail cards", async ({ pa
   await drawer.getByRole("button", { name: /产物：/ }).click();
   const modal = page.getByRole("dialog", { name: "产物详情" });
   await expect(modal).toContainText(fullOutputSentinel);
+  const boundedBlock = modal.locator(".bounded-text-block").first();
+  await expect(boundedBlock).toBeVisible();
+  await expect
+    .poll(() =>
+      boundedBlock.evaluate((element) => {
+        const border = window.getComputedStyle(element, "::after");
+        return {
+          top: border.borderTopWidth,
+          right: border.borderRightWidth,
+          bottom: border.borderBottomWidth,
+          left: border.borderLeftWidth,
+        };
+      }),
+    )
+    .toEqual({ top: "1px", right: "1px", bottom: "1px", left: "1px" });
+
+  await boundedBlock.getByRole("button", { name: /展开/ }).click();
+  await expect(boundedBlock).toHaveClass(/is-expanded/);
+  await expect
+    .poll(() =>
+      boundedBlock.evaluate((element) => {
+        const border = window.getComputedStyle(element, "::after");
+        const rect = element.getBoundingClientRect();
+        return {
+          borders: [
+            border.borderTopWidth,
+            border.borderRightWidth,
+            border.borderBottomWidth,
+            border.borderLeftWidth,
+          ],
+          insideViewport: rect.left >= 0 && rect.right <= window.innerWidth,
+        };
+      }),
+    )
+    .toEqual({ borders: ["1px", "1px", "1px", "1px"], insideViewport: true });
 
   await page.locator(".process-detail-modal-backdrop").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "产物详情" })).toHaveCount(0);

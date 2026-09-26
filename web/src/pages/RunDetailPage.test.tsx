@@ -114,6 +114,9 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[^}]*min-height:\s*0;/,
   );
   expect(stylesCss).toMatch(
+    /\.bounded-text-block::after\s*{[^}]*border:\s*1px solid var\(--bounded-text-border\);[^}]*inset:\s*0;[^}]*pointer-events:\s*none;[^}]*position:\s*absolute;/,
+  );
+  expect(stylesCss).toMatch(
     /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(> \.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*hidden;/,
   );
   expect(stylesCss).toMatch(

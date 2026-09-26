@@ -3859,14 +3859,27 @@ article:hover {
 }
 
 .bounded-text-block {
+  --bounded-text-border: rgba(123, 225, 255, 0.34);
   background: rgba(2, 6, 23, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.18);
   border-radius: 8px;
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
   max-width: 100%;
   min-width: 0;
   overflow: hidden;
+  position: relative;
+}
+
+.bounded-text-block::after {
+  border: 1px solid var(--bounded-text-border);
+  border-radius: inherit;
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+  z-index: 2;
 }
 
 .bounded-text-block-header {
@@ -4701,6 +4714,123 @@ article:hover {
   justify-self: center;
   max-width: 780px;
   width: 100%;
+}
+
+.conversation-queue {
+  display: grid;
+  gap: 0.55rem;
+  justify-self: center;
+  max-width: 780px;
+  width: 100%;
+}
+
+.conversation-queue-heading {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-size: 0.82rem;
+  justify-content: space-between;
+}
+
+.conversation-queue-heading strong {
+  color: var(--ink);
+}
+
+.conversation-queue-item {
+  align-items: center;
+  background: rgba(8, 17, 35, 0.74);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 0.5rem;
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: 2rem minmax(0, 1fr) auto;
+  padding: 0.65rem;
+}
+
+.conversation-queue-order {
+  align-items: center;
+  background: rgba(42, 195, 255, 0.14);
+  border-radius: 50%;
+  color: var(--accent);
+  display: flex;
+  font-size: 0.78rem;
+  font-weight: 800;
+  height: 2rem;
+  justify-content: center;
+  width: 2rem;
+}
+
+.conversation-queue-content {
+  min-width: 0;
+}
+
+.conversation-queue-content p {
+  display: -webkit-box;
+  margin: 0 0 0.2rem;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.conversation-queue-content small {
+  color: var(--muted);
+}
+
+.conversation-queue-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.35rem;
+}
+
+.conversation-queue-actions button {
+  min-height: 2.75rem;
+}
+
+.conversation-queue-icon {
+  align-items: center;
+  display: inline-flex;
+  font-size: 1.1rem;
+  height: 2.75rem;
+  justify-content: center;
+  min-width: 2.75rem;
+  padding: 0;
+  width: 2.75rem;
+}
+
+.conversation-queue-cancel {
+  color: var(--danger);
+}
+
+.conversation-queue-editor {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.conversation-queue-editor span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.chat-composer .conversation-queue-editor textarea {
+  max-width: none;
+  min-height: 4.5rem;
+}
+
+@media (max-width: 720px) {
+  .conversation-queue-item {
+    align-items: start;
+    grid-template-columns: 2rem minmax(0, 1fr);
+  }
+
+  .conversation-queue-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+
+  .conversation-queue-redirect {
+    flex: 1 1 auto;
+  }
 }
 
 .composer-tool-row,
@@ -7551,6 +7681,10 @@ article:hover {
 .bounded-text-block {
   background: #ffffff;
   border-color: rgba(148, 163, 184, 0.28);
+}
+
+.bounded-text-block {
+  --bounded-text-border: rgba(100, 116, 139, 0.42);
 }
 
 .bounded-text-block-header {

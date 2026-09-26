@@ -752,6 +752,9 @@ describe("agentInlineSummary", () => {
     expect(stylesCss).toMatch(
       /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[^}]*min-height:\s*0;/,
     );
+    expect(stylesCss).toMatch(
+      /\.bounded-text-block::after\s*{[^}]*border:\s*1px solid var\(--bounded-text-border\);[^}]*inset:\s*0;[^}]*pointer-events:\s*none;[^}]*position:\s*absolute;/,
+    );
     expect(stylesCss).toMatch(/\.bounded-text-block pre\s*{[^}]*overscroll-behavior:\s*contain;/);
     expect(stylesCss).toMatch(
       /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-backdrop\s*{[\s\S]*align-items:\s*stretch;[\s\S]*padding:\s*env\(safe-area-inset-top\) 0 0;/,

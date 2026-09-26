@@ -12,6 +12,7 @@ from sqlalchemy.dialects import postgresql
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import (
     RunAlreadyActive,
+    RunConflict,
     RunRecord,
     RunRepository,
     _is_recovery_replayable_event_kind,
@@ -32,6 +33,7 @@ class _FakeRunRow:
     version: int
     created_at: datetime
     routing_decision: dict[str, object] | None
+    blocked_by_run_id: UUID | None = None
     worker_id: str | None = None
     worker_lease_token: UUID | None = None
     worker_lease_expires_at: datetime | None = None
@@ -611,6 +613,29 @@ async def test_repeated_cancel_returns_cancelled_record_without_version_bump() -
 
 
 @pytest.mark.asyncio
+async def test_cancel_refuses_a_blocked_conversation_successor() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="queued successor",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.QUEUED.value,
+        version=1,
+        created_at=datetime.now(UTC),
+        routing_decision={"conversation_id": "conv-queue"},
+    )
+    row.blocked_by_run_id = uuid4()
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="blocked by an active conversation run"):
+        await repository.update_control_status(row.tenant_id, row.id, RunStatus.CANCELLED)
+
+
+@pytest.mark.asyncio
 async def test_repeated_temporary_agent_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(
@@ -732,6 +757,26 @@ async def test_claim_for_execution_records_worker_lease() -> None:
     assert repository.row.worker_lease_token == repository.lease_token
     assert repository.row.worker_lease_expires_at == repository.lease_expires_at
     assert repository.row.worker_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_claim_for_execution_refuses_a_blocked_conversation_successor() -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.QUEUED,
+        routing_decision=None,
+        blocked_after_sequence=0,
+    )
+    repository.row.blocked_by_run_id = uuid4()
+
+    with pytest.raises(
+        RunConflict,
+        match="blocked by an active conversation run",
+    ):
+        await repository.claim_for_execution(
+            cast(Any, _FakeTransaction()),
+            repository.run_id,
+            allow_running_recovery=False,
+        )
 
 
 @pytest.mark.asyncio

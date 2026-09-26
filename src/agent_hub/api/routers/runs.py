@@ -27,6 +27,11 @@ from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
+from agent_hub.runs.conversation_queue import (
+    ConversationQueueConflict,
+    ConversationQueueItem,
+    ConversationQueueNotFound,
+)
 from agent_hub.runs.conversations import ConversationArchived
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
@@ -37,6 +42,11 @@ router = APIRouter(
     prefix="/api/v1/runs",
     tags=["runs"],
     responses=error_responses(401, 403, 404, 405, 409, 413, 422, 500, 503),
+)
+admin_queue_router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["conversation-queue"],
+    responses=error_responses(401, 403, 404, 405, 409, 422, 500, 503),
 )
 
 ARCHIVE_EXTENSIONS = (
@@ -178,6 +188,37 @@ class RunServiceProtocol(Protocol):
 
     async def cancel(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
+    async def queue_message(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        actor_role: Role | None,
+        conversation_id: str,
+        message: str,
+        mode: TaskMode,
+        attachment_ids: tuple[str, ...] = (),
+        reference_conversation_id: str | None = None,
+        idempotency_key: str,
+        **submit_options: object,
+    ) -> ConversationQueueItem: ...
+
+    async def edit_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str
+    ) -> ConversationQueueItem: ...
+
+    async def conversation_queue(
+        self, tenant_id: UUID, conversation_id: str
+    ) -> tuple[ConversationQueueItem, ...]: ...
+
+    async def cancel_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int
+    ) -> ConversationQueueItem: ...
+
+    async def redirect_to_queued_message(
+        self, tenant_id: UUID, item_id: UUID, *, version: int
+    ) -> ConversationQueueItem: ...
+
 
 class GeneratedArtifactDownloadProtocol(Protocol):
     path: Path
@@ -283,6 +324,48 @@ class CreateRunRequest(BaseModel):
             requested_permissions=self.requested_permissions,
         ).requested_permissions
         return self
+
+
+class QueueItemMutationRequest(BaseModel):
+    version: int = Field(ge=1)
+
+
+class QueueItemEditRequest(QueueItemMutationRequest):
+    message: str = Field(min_length=1, max_length=65_536)
+
+
+class ConversationQueueItemResponse(BaseModel):
+    id: UUID
+    conversation_id: str
+    predecessor_run_id: UUID
+    successor_run_id: UUID
+    message: str
+    position: int
+    status: str
+    version: int
+    attachment_count: int
+    references: dict[str, object]
+    failure_detail: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_item(cls, item: ConversationQueueItem) -> ConversationQueueItemResponse:
+        return cls(
+            id=item.id,
+            conversation_id=item.conversation_id,
+            predecessor_run_id=item.predecessor_run_id,
+            successor_run_id=item.successor_run_id,
+            message=item.message,
+            position=item.position,
+            status=item.status.value,
+            version=item.version,
+            attachment_count=len(item.attachments),
+            references=item.references,
+            failure_detail=item.failure_detail,
+            created_at=item.created_at,
+            updated_at=item.updated_at,
+        )
 
 
 class ChooseModeRequest(BaseModel):
@@ -544,6 +627,35 @@ async def _record_run_submit_audit(
         action="run.submit",
         resource=str(submitted.id),
         details=details,
+    )
+
+
+async def _record_queue_audit(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+    *,
+    action: str,
+    item: ConversationQueueItem,
+) -> None:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    recorder = getattr(service, "record_audit_event", None)
+    if recorder is None:
+        return
+    await recorder(
+        actor=str(principal.user_id),
+        action=f"conversation_queue.{action}",
+        resource=str(item.id),
+        details={
+            "user_id": str(principal.user_id),
+            "user_role": principal.role.value,
+            "conversation_id": item.conversation_id,
+            "predecessor_run_id": str(item.predecessor_run_id),
+            "successor_run_id": str(item.successor_run_id),
+            "position": item.position,
+            "status": item.status.value,
+            "attachment_count": len(item.attachments),
+            "message_sha256": hashlib.sha256(item.message.encode("utf-8")).hexdigest(),
+        },
     )
 
 
@@ -934,6 +1046,18 @@ def _run_conflict(error: RunConflict) -> PublicAPIError:
     )
 
 
+def _queue_error(error: Exception) -> PublicAPIError:
+    if isinstance(error, ConversationQueueNotFound):
+        return PublicAPIError(404, "conversation_queue_not_found", "排队信息不存在")
+    reason = str(error) or "排队信息状态冲突"
+    code = (
+        "conversation_not_active"
+        if reason == "conversation has no active run"
+        else "conversation_queue_conflict"
+    )
+    return PublicAPIError(409, code, reason, details={"reason": reason})
+
+
 @router.post(
     "",
     response_model=SubmittedRunResponse,
@@ -1029,6 +1153,151 @@ async def create_run(
         ) from error
     await _record_run_submit_audit(request, principal, body, submitted)
     return SubmittedRunResponse.from_submitted(submitted)
+
+
+@admin_queue_router.post(
+    "/conversations/{conversation_id}/queue",
+    response_model=ConversationQueueItemResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def queue_conversation_message(
+    conversation_id: str,
+    body: CreateRunRequest,
+    request: Request,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=1,
+            max_length=90,
+            pattern=r"^[A-Za-z0-9._:-]+$",
+        ),
+    ],
+) -> ConversationQueueItemResponse:
+    if body.conversation_id not in {None, conversation_id}:
+        raise PublicAPIError(422, "request_validation", "conversation_id does not match path")
+    try:
+        execution_backend = body.execution_backend or await _default_execution_backend(request)
+        item = await service.queue_message(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            conversation_id=conversation_id,
+            message=body.message,
+            mode=body.mode,
+            attachment_ids=body.attachment_ids,
+            reference_conversation_id=body.reference_conversation_id,
+            idempotency_key=idempotency_key,
+            agent_ids=body.agent_ids,
+            workflow_id=body.workflow_id,
+            reference_workflow_id=body.reference_workflow_id,
+            allow_workflow_adjustment=body.allow_workflow_adjustment,
+            direct_model=body.direct_model,
+            vibe_coding=body.vibe_coding,
+            skip_evolution_proposal=body.skip_evolution_proposal,
+            project_id=body.project_id,
+            project_label=body.project_label,
+            workspace_session_id=body.workspace_session_id,
+            sandbox_profile=body.sandbox_profile,
+            execution_backend=execution_backend,
+            requested_permissions=body.requested_permissions,
+            runtime_timeout_seconds=body.runtime_timeout_seconds,
+        )
+    except (ConversationQueueConflict, ConversationQueueNotFound) as error:
+        raise _queue_error(error) from error
+    except ConversationArchived as error:
+        raise PublicAPIError(409, "conversation_archived", str(error)) from error
+    except ValueError as error:
+        raise PublicAPIError(422, "request_validation", str(error)) from error
+    await _record_queue_audit(request, principal, action="enqueue", item=item)
+    return ConversationQueueItemResponse.from_item(item)
+
+
+@admin_queue_router.get(
+    "/conversations/{conversation_id}/queue",
+    response_model=list[ConversationQueueItemResponse],
+)
+async def list_conversation_queue(
+    conversation_id: str,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> list[ConversationQueueItemResponse]:
+    return [
+        ConversationQueueItemResponse.from_item(item)
+        for item in await service.conversation_queue(principal.tenant_id, conversation_id)
+    ]
+
+
+@admin_queue_router.patch(
+    "/conversation-queue/{queue_item_id}",
+    response_model=ConversationQueueItemResponse,
+)
+async def edit_conversation_queue_item(
+    queue_item_id: UUID,
+    body: QueueItemEditRequest,
+    request: Request,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> ConversationQueueItemResponse:
+    try:
+        item = await service.edit_queued_message(
+            principal.tenant_id,
+            queue_item_id,
+            version=body.version,
+            message=body.message,
+        )
+    except (ConversationQueueConflict, ConversationQueueNotFound) as error:
+        raise _queue_error(error) from error
+    await _record_queue_audit(request, principal, action="edit", item=item)
+    return ConversationQueueItemResponse.from_item(item)
+
+
+@admin_queue_router.post(
+    "/conversation-queue/{queue_item_id}/redirect",
+    response_model=ConversationQueueItemResponse,
+)
+async def redirect_conversation_queue_item(
+    queue_item_id: UUID,
+    body: QueueItemMutationRequest,
+    request: Request,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:cancel"))],
+) -> ConversationQueueItemResponse:
+    try:
+        item = await service.redirect_to_queued_message(
+            principal.tenant_id,
+            queue_item_id,
+            version=body.version,
+        )
+    except (ConversationQueueConflict, ConversationQueueNotFound) as error:
+        raise _queue_error(error) from error
+    await _record_queue_audit(request, principal, action="redirect", item=item)
+    return ConversationQueueItemResponse.from_item(item)
+
+
+@admin_queue_router.delete(
+    "/conversation-queue/{queue_item_id}",
+    response_model=ConversationQueueItemResponse,
+)
+async def cancel_conversation_queue_item(
+    queue_item_id: UUID,
+    body: QueueItemMutationRequest,
+    request: Request,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:cancel"))],
+) -> ConversationQueueItemResponse:
+    try:
+        item = await service.cancel_queued_message(
+            principal.tenant_id,
+            queue_item_id,
+            version=body.version,
+        )
+    except (ConversationQueueConflict, ConversationQueueNotFound) as error:
+        raise _queue_error(error) from error
+    await _record_queue_audit(request, principal, action="cancel", item=item)
+    return ConversationQueueItemResponse.from_item(item)
 
 
 @router.post(

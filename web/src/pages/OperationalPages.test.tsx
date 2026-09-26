@@ -739,12 +739,27 @@ describe("operational management pages", () => {
     updated_at: "2026-08-07T08:00:00Z",
   };
   let createdConversationMetadataList: Array<typeof visibleConversationMetadata> = [];
+  let visibleConversationQueue: Array<{
+    id: string;
+    conversation_id: string;
+    predecessor_run_id: string;
+    successor_run_id: string;
+    message: string;
+    position: number;
+    status: "queued" | "redirecting" | "cancelled";
+    version: number;
+    attachment_count: number;
+    references: Record<string, unknown>;
+    failure_detail: null;
+    created_at: string;
+    updated_at: string;
+  }> = [];
   let hideVisibleConversationMetadata = false;
 
   beforeEach(() => {
     requests.length = 0;
-    visibleRunListItem = runListItem;
-    visibleRunDetail = runDetail;
+    visibleRunListItem = { ...runListItem, status: "completed" };
+    visibleRunDetail = { ...runDetail, status: "completed" };
     visibleConversationRuns = [visibleRunDetail];
     visibleRunListItems = [visibleRunListItem];
     visibleAgents = agents;
@@ -781,6 +796,7 @@ describe("operational management pages", () => {
       updated_at: "2026-08-07T08:00:00Z",
     };
     createdConversationMetadataList = [];
+    visibleConversationQueue = [];
     hideVisibleConversationMetadata = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -854,6 +870,47 @@ describe("operational management pages", () => {
           };
           createdConversationMetadataList.push(createdConversationMetadata);
           return jsonResponse(createdConversationMetadata);
+        }
+        const queueConversationMatch = path.match(/^\/api\/v1\/admin\/conversations\/([^/]+)\/queue$/);
+        if (queueConversationMatch && method === "GET") {
+          return jsonResponse(visibleConversationQueue);
+        }
+        if (queueConversationMatch && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const queued = {
+            id: `queue-${visibleConversationQueue.length + 1}`,
+            conversation_id: decodeURIComponent(queueConversationMatch[1]),
+            predecessor_run_id: runId,
+            successor_run_id: secondRunId,
+            message: String(body.message ?? ""),
+            position: visibleConversationQueue.length + 1,
+            status: "queued" as const,
+            version: 1,
+            attachment_count: Array.isArray(body.attachment_ids) ? body.attachment_ids.length : 0,
+            references: {},
+            failure_detail: null,
+            created_at: "2026-09-26T08:00:00Z",
+            updated_at: "2026-09-26T08:00:00Z",
+          };
+          visibleConversationQueue.push(queued);
+          return jsonResponse(queued);
+        }
+        const queueItemMatch = path.match(/^\/api\/v1\/admin\/conversation-queue\/([^/]+)(\/redirect)?$/);
+        if (queueItemMatch) {
+          const itemIndex = visibleConversationQueue.findIndex((item) => item.id === queueItemMatch[1]);
+          const current = visibleConversationQueue[itemIndex];
+          if (!current) return jsonResponse({ error: { code: "conversation_queue_not_found", message: "not found" } }, { status: 404 });
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const updated = {
+            ...current,
+            ...(method === "PATCH" ? { message: String(body.message ?? current.message) } : {}),
+            ...(method === "DELETE" ? { status: "cancelled" as const } : {}),
+            ...(method === "POST" && queueItemMatch[2] ? { status: "redirecting" as const } : {}),
+            version: current.version + 1,
+            updated_at: "2026-09-26T08:01:00Z",
+          };
+          visibleConversationQueue[itemIndex] = updated;
+          return jsonResponse(updated);
         }
         if (path === "/api/v1/admin/conversations/conv-previous" && method === "PATCH") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
@@ -1718,6 +1775,10 @@ describe("operational management pages", () => {
   }
 
   it("shows run operations and supports pause control on the detail page", async () => {
+    visibleRunListItem = runListItem;
+    visibleRunDetail = runDetail;
+    visibleRunListItems = [visibleRunListItem];
+    visibleConversationRuns = [visibleRunDetail];
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
@@ -1759,6 +1820,7 @@ describe("operational management pages", () => {
 
   it("renders run detail as a Vibe Engineer debugging summary", async () => {
     const user = userEvent.setup();
+    visibleRunListItem = runListItem;
     visibleRunDetail = {
       ...runDetail,
       explicit_details: {
@@ -1872,6 +1934,7 @@ describe("operational management pages", () => {
         },
       ],
     };
+    visibleRunListItems = [visibleRunListItem];
     visibleConversationRuns = [visibleRunDetail];
 
     render(<TestApp initialPath={`/runs/${runId}`} />);
@@ -2382,6 +2445,10 @@ describe("operational management pages", () => {
   });
 
   it("stops the current running chat from the conversation composer", async () => {
+    visibleRunListItem = runListItem;
+    visibleRunDetail = runDetail;
+    visibleRunListItems = [visibleRunListItem];
+    visibleConversationRuns = [visibleRunDetail];
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -2396,6 +2463,92 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
   });
+
+  it("stops the active run instead of a blocked queued successor", async () => {
+    const queuedRun = {
+      ...runDetail,
+      id: secondRunId,
+      status: "queued",
+      request: "排队中的后续消息",
+      created_at: "2026-08-07T00:01:00Z",
+    };
+    visibleRunListItem = runListItem;
+    visibleRunDetail = runDetail;
+    visibleRunListItems = [runListItem, queuedRun];
+    visibleConversationRuns = [runDetail, queuedRun];
+    visibleConversationQueue = [
+      {
+        id: "queue-stop-target",
+        conversation_id: "conv-previous",
+        predecessor_run_id: runId,
+        successor_run_id: secondRunId,
+        message: "排队中的后续消息",
+        position: 1,
+        status: "queued",
+        version: 1,
+        attachment_count: 0,
+        references: {},
+        failure_detail: null,
+        created_at: "2026-08-07T00:01:00Z",
+        updated_at: "2026-08-07T00:01:00Z",
+      },
+    ];
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    const conversationButtons = await screen.findAllByRole("button", { name: /进入会话/ });
+    await user.click(conversationButtons[0]);
+    await screen.findByRole("button", { name: "停止生成" });
+    await user.click(await screen.findByRole("button", { name: "停止生成" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === `/api/v1/admin/runs/${runId}/cancel`)).toBe(true),
+    );
+    expect(
+      requests.some((request) => request.path === `/api/v1/admin/runs/${secondRunId}/cancel`),
+    ).toBe(false);
+  });
+
+  it("queues, edits, redirects, and cancels messages while a run is active", async () => {
+    visibleRunListItem = runListItem;
+    visibleRunDetail = runDetail;
+    visibleRunListItems = [visibleRunListItem];
+    visibleConversationRuns = [visibleRunDetail];
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
+    expect(screen.queryByRole("button", { name: /插话/ })).toBeNull();
+    const composer = screen.getByRole("form", { name: "发送消息" });
+    const composerInput = within(composer).getByPlaceholderText(/输入消息/);
+    await user.type(composerInput, "先排队处理这条");
+    await user.click(within(composer).getByRole("button", { name: "排队" }));
+
+    expect(await screen.findByText("先排队处理这条")).not.toBeNull();
+    expect(screen.getByText("消息已排队，将在当前任务结束后执行。")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "编辑排队信息" }));
+    const editor = screen.getByRole("textbox", { name: "编辑排队信息" });
+    await user.clear(editor);
+    await user.type(editor, "编辑后的排队信息");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByText("编辑后的排队信息")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "改变方向" }));
+    expect(await screen.findByText(/已请求改变方向/)).not.toBeNull();
+    expect(vi.mocked(window.confirm)).toHaveBeenCalledWith(
+      "停止当前任务，并改为优先执行这条排队信息？",
+    );
+
+    await user.type(composerInput, "这条稍后取消");
+    await user.click(within(composer).getByRole("button", { name: "排队" }));
+    expect(await screen.findByText("这条稍后取消")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "取消排队" }));
+    await waitFor(() => expect(screen.queryByText("这条稍后取消")).toBeNull());
+    expect(requests.some((request) => request.path.endsWith("/redirect") && request.method === "POST")).toBe(true);
+    expect(requests.some((request) => request.path.includes("/conversation-queue/") && request.method === "DELETE")).toBe(true);
+  });
+
   it("keeps reference workflows advisory while main-agent routing stays automatic", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -3482,8 +3635,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请生成一个项目压缩包");
-    await user.click(screen.getByRole("button", { name: "发送" }));
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
 
     const card = await screen.findByRole("status", { name: "沙箱权限确认" });
     expect(within(card).getByText("工具调用需要授权")).not.toBeNull();
@@ -3609,6 +3761,7 @@ describe("operational management pages", () => {
     const secondRunDetail = {
       ...runDetail,
       id: secondRunId,
+      status: "completed" as const,
       request: "再给我一个更强的开头。",
       artifacts: [
         {

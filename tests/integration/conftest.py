@@ -12,6 +12,7 @@ from agent_hub.db.models import (
     BootstrapCodeRow,
     ChannelDedupRow,
     ConfigRevisionRow,
+    ConversationQueueItemRow,
     ConversationRow,
     RunApprovalRow,
     RunArtifactRow,
@@ -149,6 +150,7 @@ async def _clean_database(
 async def _delete_run_rows(session: AsyncSession) -> None:
     for table in (
         RunOutboxRow,
+        ConversationQueueItemRow,
         RunUsageRow,
         RunApprovalRow,
         RunCheckpointRow,
