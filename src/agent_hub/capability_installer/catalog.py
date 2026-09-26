@@ -170,29 +170,29 @@ def default_trusted_capability_entries() -> tuple[CapabilityCatalogEntry, ...]:
                 version="1.0.0",
                 resource_config={
                     "command": "strix",
-                    "base_args": ["--non-interactive"],
-                    "required_commands": ["docker"],
-                    "required_env_any": [
+                    "base_args": ("--non-interactive",),
+                    "required_commands": ("docker",),
+                    "required_env_any": (
                         "STRIX_LLM",
                         "STRIX_AGENT_MODEL",
                         "LLM_API_KEY",
                         "OPENAI_API_KEY",
                         "ANTHROPIC_API_KEY",
-                    ],
-                    "runtime_requirements": [
+                    ),
+                    "runtime_requirements": (
                         "Docker CLI/daemon 可用",
                         "已配置 Strix 支持的 LLM API Key 或 Strix 登录态",
                         "只允许对已授权目标发起扫描",
-                    ],
-                    "env_passthrough": [
+                    ),
+                    "env_passthrough": (
                         "STRIX_LLM",
                         "STRIX_AGENT_MODEL",
                         "LLM_API_KEY",
                         "LLM_API_BASE",
                         "OPENAI_API_KEY",
                         "ANTHROPIC_API_KEY",
-                    ],
-                    "success_exit_codes": [0, 1],
+                    ),
+                    "success_exit_codes": (0, 1),
                     "max_output_bytes": 131072,
                 },
                 timeout_seconds=120,
@@ -210,7 +210,7 @@ def default_trusted_capability_entries() -> tuple[CapabilityCatalogEntry, ...]:
                             "target_flag": "--target",
                             "scan_mode_flag": "--scan-mode",
                             "instruction_flag": "--instruction",
-                            "allowed_extra_args": [
+                            "allowed_extra_args": (
                                 "--target-list",
                                 "--instruction-file",
                                 "--workspace-file",
@@ -223,7 +223,7 @@ def default_trusted_capability_entries() -> tuple[CapabilityCatalogEntry, ...]:
                                 "--max-budget",
                                 "--max-budget-usd",
                                 "--max-turns",
-                            ],
+                            ),
                         },
                     )
                 ],

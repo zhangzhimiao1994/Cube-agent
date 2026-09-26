@@ -19,11 +19,11 @@ class RecordingAdminService:
     def __init__(self) -> None:
         self.upserts = 0
 
-    async def list_plugins(self, *, tenant_id: UUID):
+    async def list_plugins(self, *, tenant_id: UUID) -> tuple[object, ...]:
         del tenant_id
         return ()
 
-    async def upsert_plugin(self, *args, **kwargs):
+    async def upsert_plugin(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
         self.upserts += 1
 

@@ -2609,6 +2609,15 @@ class HermesInsightResponse(BaseModel):
     confirmed_at: datetime | None = None
     tags: list[str]
     weight: int
+    memory_type: str = Field(default="conversation_advice", min_length=1, max_length=96)
+    target: str = Field(default="main_agent", min_length=1, max_length=128)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    noise_risk: float = Field(default=0.0, ge=0, le=1)
+    applies_to_modes: list[str] = Field(default_factory=list, max_length=8)
+    promotion_status: str = Field(
+        default="pending_review",
+        pattern=r"^(pending_review|approved|ledger_only)$",
+    )
     created_at: datetime
 
 
@@ -6305,7 +6314,17 @@ class InMemoryAdminResourceService:
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         current = self.hermes_insights[insight_id]
-        updated = current.model_copy(update={"confirmed_at": datetime.now(UTC)})
+        confirmed_at = datetime.now(UTC)
+        updated = current.model_copy(
+            update={
+                "confirmed_at": confirmed_at,
+                "promotion_status": _hermes_promotion_status(
+                    target=current.target,
+                    memory_type=current.memory_type,
+                    confirmed_at=confirmed_at,
+                ),
+            }
+        )
         self.hermes_insights[insight_id] = updated
         return updated
 
@@ -10910,6 +10929,18 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     run_id = _uuid_from_json(payload.get("run_id"))
     raw_conversation_id = payload.get("conversation_id")
     raw_confirmed_at = payload.get("confirmed_at")
+    confirmed_at = _datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None
+    memory_type = _bounded_hermes_string(
+        payload.get("memory_type"),
+        default="scheduler_observation" if category == "scheduler" else "conversation_advice",
+        limit=96,
+    )
+    target = _bounded_hermes_string(
+        payload.get("target"),
+        default="scheduler" if category == "scheduler" else "main_agent",
+        limit=128,
+    )
+    applies_to_modes = _bounded_hermes_string_list(payload.get("applies_to_modes"), limit=8)
     return HermesInsightResponse(
         id=str(payload.get("id", "")),
         category=category,
@@ -10928,11 +10959,71 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         else _hermes_user_summary(outcome=outcome, lesson=lesson, category=category),
         run_id=run_id,
         conversation_id=raw_conversation_id if isinstance(raw_conversation_id, str) else None,
-        confirmed_at=_datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None,
+        confirmed_at=confirmed_at,
         tags=normalized_tags,
         weight=weight,
+        memory_type=memory_type,
+        target=target,
+        confidence=_bounded_hermes_float(payload.get("confidence"), default=0.5),
+        noise_risk=_bounded_hermes_float(payload.get("noise_risk"), default=0.0),
+        applies_to_modes=applies_to_modes,
+        promotion_status=_hermes_promotion_status(
+            target=target,
+            memory_type=memory_type,
+            confirmed_at=confirmed_at,
+        ),
         created_at=_datetime_from_json(payload.get("created_at")),
     )
+
+
+def _bounded_hermes_string(value: object, *, default: str, limit: int) -> str:
+    if not isinstance(value, str):
+        return default
+    cleaned = " ".join(value.strip().split())
+    if not cleaned:
+        return default
+    return cleaned[:limit]
+
+
+def _bounded_hermes_string_list(value: object, *, limit: int) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        cleaned = " ".join(item.strip().split())
+        if cleaned:
+            result.append(cleaned[:96])
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _bounded_hermes_float(value: object, *, default: float) -> float:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except ValueError:
+            return default
+    return default
+
+
+def _hermes_promotion_status(
+    *,
+    target: str,
+    memory_type: str,
+    confirmed_at: datetime | None,
+) -> Literal["pending_review", "approved", "ledger_only"]:
+    if target in {"learning_ledger", "scheduler", "scheduler_observation"} or memory_type in {
+        "conversation_outcome_summary",
+        "scheduler_observation",
+        "runtime_observation",
+    }:
+        return "ledger_only"
+    return "approved" if confirmed_at is not None else "pending_review"
 
 
 def _hermes_feedback_summary(

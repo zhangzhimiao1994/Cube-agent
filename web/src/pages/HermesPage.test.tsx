@@ -55,6 +55,12 @@ describe("HermesPage", () => {
               confirmed_at: "2026-09-02T00:10:00Z",
               tags: ["ui", "mobile", "drawer"],
               weight: 7,
+              memory_type: "ui_rule",
+              target: "main_agent",
+              confidence: 0.82,
+              noise_risk: 0.15,
+              applies_to_modes: ["dispatch"],
+              promotion_status: "approved",
               created_at: "2026-09-02T00:05:01Z",
             },
           ]);
@@ -107,6 +113,8 @@ describe("HermesPage", () => {
     expect(
       within(row).getByText("对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。"),
     ).not.toBeNull();
+    expect(within(row).getByText("待审候选")).not.toBeNull();
+    expect(within(row).getByText("待审批")).not.toBeNull();
     expect(within(row).getByText("待确认")).not.toBeNull();
   });
 
@@ -119,6 +127,7 @@ describe("HermesPage", () => {
     expect(within(journey).getByText("待确认 1")).not.toBeNull();
     expect(within(journey).getByText("已确认 1")).not.toBeNull();
     expect(within(journey).getByText("移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。")).not.toBeNull();
+    expect(within(journey).getByText(/已确认规则 · 已确认入库/)).not.toBeNull();
     expect(within(journey).getByRole("link", { name: /查看 conv-ui-polish 的学习详情/ })).not.toBeNull();
   });
 });

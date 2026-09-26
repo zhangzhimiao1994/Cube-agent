@@ -6,7 +6,7 @@ import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type HermesInsight } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
-type HermesSortKey = "created" | "category" | "conversation" | "summary" | "outcome" | "status";
+type HermesSortKey = "created" | "category" | "conversation" | "summary" | "layer" | "outcome" | "status";
 
 type HermesColumnFilters = {
   category: "all" | "conversation" | "scheduler";
@@ -41,6 +41,25 @@ function categoryLabel(category: HermesInsight["category"]) {
   return category === "scheduler" ? "调度观察" : "对话记忆";
 }
 
+function memoryLayerLabel(insight: HermesInsight) {
+  if (insight.promotion_status === "ledger_only") return "任务台账";
+  if (insight.promotion_status === "approved") return "已确认规则";
+  if (insight.memory_type.includes("preference")) return "偏好候选";
+  if (insight.memory_type.includes("fact")) return "事实候选";
+  if (insight.memory_type.includes("rule")) return "规则候选";
+  return "待审候选";
+}
+
+function promotionStatusLabel(status: HermesInsight["promotion_status"]) {
+  if (status === "approved") return "已确认入库";
+  if (status === "ledger_only") return "仅台账展示";
+  return "待审批";
+}
+
+function confidenceLabel(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
 function hermesLearningSummary(insight: HermesInsight) {
   return insight.user_summary?.trim() || insight.summary;
 }
@@ -62,6 +81,7 @@ function hermesColumnValue(insight: HermesInsight, key: HermesSortKey) {
   if (key === "category") return categoryLabel(insight.category);
   if (key === "conversation") return insight.conversation_id ?? "未关联";
   if (key === "summary") return hermesLearningSummary(insight);
+  if (key === "layer") return memoryLayerLabel(insight);
   if (key === "outcome") return insight.outcome;
   return statusLabel(insight.confirmed_at);
 }
@@ -128,7 +148,7 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
               <span>{categoryLabel(insight.category)} · {statusLabel(insight.confirmed_at)}</span>
               <strong>{hermesLearningSummary(insight)}</strong>
               <small>
-                {insight.conversation_id ?? "未关联对话"} · {insight.outcome} · 权重 {insight.weight}
+                {memoryLayerLabel(insight)} · {promotionStatusLabel(insight.promotion_status)} · {insight.conversation_id ?? "未关联对话"} · {insight.outcome} · 权重 {insight.weight}
                 {insight.tags.length > 0 ? ` · ${insight.tags.join(" / ")}` : ""}
               </small>
             </div>
@@ -389,6 +409,7 @@ function HermesLearningTable() {
                       <th><SortHeader column="created" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
                       <th><SortHeader column="conversation" label="对话 ID" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>对话 ID</SortHeader></th>
                       <th><SortHeader column="summary" label="中文学习摘要" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>中文学习摘要</SortHeader></th>
+                      <th><SortHeader column="layer" label="记忆层" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>记忆层</SortHeader></th>
                       <th><SortHeader column="outcome" label="结果" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>结果</SortHeader></th>
                       <th><SortHeader column="status" label="确认状态" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>确认状态</SortHeader></th>
                       <th>操作</th>
@@ -405,6 +426,7 @@ function HermesLearningTable() {
                       <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
                       <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
                       <th><input aria-label="按 Hermes 中文学习摘要筛选" value={columnFilters.summary} onChange={(event) => updateColumnFilter("summary", event.currentTarget.value)} placeholder="摘要关键词" /></th>
+                      <th></th>
                       <th>
                         <select aria-label="按 Hermes 结果筛选" value={columnFilters.outcome} onChange={(event) => updateColumnFilter("outcome", event.currentTarget.value)}>
                           <option value="all">全部</option>
@@ -441,6 +463,10 @@ function HermesLearningTable() {
                         </td>
                         <td>{insight.conversation_id ?? "未关联"}</td>
                         <td>{hermesLearningSummary(insight)}</td>
+                        <td>
+                          <span className="status-pill">{memoryLayerLabel(insight)}</span>
+                          <small className="muted-inline">{promotionStatusLabel(insight.promotion_status)}</small>
+                        </td>
                         <td>{insight.outcome}</td>
                         <td>{statusLabel(insight.confirmed_at)}</td>
                         <td className="table-actions">
@@ -614,6 +640,26 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
           <div>
             <dt>权重</dt>
             <dd>{item.weight}</dd>
+          </div>
+          <div>
+            <dt>记忆层</dt>
+            <dd>{memoryLayerLabel(item)} · {promotionStatusLabel(item.promotion_status)}</dd>
+          </div>
+          <div>
+            <dt>记忆类型</dt>
+            <dd>{item.memory_type}</dd>
+          </div>
+          <div>
+            <dt>目标</dt>
+            <dd>{item.target}</dd>
+          </div>
+          <div>
+            <dt>置信度 / 噪音风险</dt>
+            <dd>{confidenceLabel(item.confidence)} / {confidenceLabel(item.noise_risk)}</dd>
+          </div>
+          <div>
+            <dt>适用模式</dt>
+            <dd>{item.applies_to_modes.join(", ") || "未限定"}</dd>
           </div>
         </dl>
         <div className="inline-actions">

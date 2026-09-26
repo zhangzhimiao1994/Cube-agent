@@ -286,8 +286,8 @@ async def test_local_command_plugin_adapter_invokes_strix_assessment_without_she
         replay_safe=False,
         resource_config={
             "command": "strix",
-            "base_args": ["--non-interactive"],
-            "success_exit_codes": [0, 1],
+            "base_args": ("--non-interactive",),
+            "success_exit_codes": (0, 1),
         },
         capability_config={"argument_style": "strix_assessment"},
     )
@@ -353,10 +353,10 @@ async def test_local_command_plugin_adapter_rejects_missing_required_environment
         replay_safe=False,
         resource_config={
             "command": "strix",
-            "required_env_any": [
+            "required_env_any": (
                 "AGENT_HUB_TEST_MISSING_STRIX_KEY_A",
                 "AGENT_HUB_TEST_MISSING_STRIX_KEY_B",
-            ],
+            ),
         },
         capability_config={"argument_style": "strix_assessment"},
     )

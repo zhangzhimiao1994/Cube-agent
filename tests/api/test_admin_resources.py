@@ -14393,6 +14393,12 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert feedback.json()["category"] == "conversation"
     assert feedback.json()["conversation_id"] == "conv-architecture-1"
     assert feedback.json()["confirmed_at"] is None
+    assert feedback.json()["memory_type"] == "conversation_advice"
+    assert feedback.json()["target"] == "main_agent"
+    assert feedback.json()["confidence"] == 0.5
+    assert feedback.json()["noise_risk"] == 0.0
+    assert feedback.json()["applies_to_modes"] == []
+    assert feedback.json()["promotion_status"] == "pending_review"
     assert feedback.json()["summary"] == (
         "Learned success pattern: Use group chat when debate review is required. "
         "Tags: debate, review. Weight: 5."
@@ -14403,8 +14409,10 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert detail.status_code == 200
     assert detail.json()["id"] == insight_id
     assert detail.json()["conversation_id"] == "conv-architecture-1"
+    assert detail.json()["promotion_status"] == "pending_review"
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed_at"] is not None
+    assert confirmed.json()["promotion_status"] == "approved"
     assert recommendation.json()["recommended_mode"] == "group_chat"
     assert recommendation.json()["recommended_model"] == "deepseek-chat"
     assert recommendation.json()["confidence"] > 0.45

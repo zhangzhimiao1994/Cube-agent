@@ -1472,6 +1472,12 @@ const HermesInsightSchema = z.object({
   confirmed_at: z.string().nullable(),
   tags: z.array(z.string()),
   weight: z.number(),
+  memory_type: z.string().default("conversation_advice"),
+  target: z.string().default("main_agent"),
+  confidence: z.number().default(0.5),
+  noise_risk: z.number().default(0),
+  applies_to_modes: z.array(z.string()).default([]),
+  promotion_status: z.enum(["pending_review", "approved", "ledger_only"]).default("pending_review"),
   created_at: z.string(),
 });
 

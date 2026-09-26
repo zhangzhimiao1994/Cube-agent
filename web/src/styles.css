@@ -1009,6 +1009,26 @@ article:hover {
   overflow-wrap: anywhere;
 }
 
+.status-pill {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.22);
+  border-radius: 999px;
+  color: var(--text);
+  display: inline-flex;
+  font-size: 0.78rem;
+  font-weight: 900;
+  padding: 0.18rem 0.5rem;
+  width: fit-content;
+}
+
+.muted-inline {
+  color: var(--muted);
+  display: block;
+  font-size: 0.76rem;
+  margin-top: 0.22rem;
+}
+
 .compact-page-intro {
   margin-bottom: 0.8rem;
 }

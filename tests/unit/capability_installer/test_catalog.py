@@ -57,8 +57,12 @@ def test_catalog_resolves_strix_security_testing_to_real_local_command_adapter()
     assert entry.plugin.resource_config["command"] == "strix"
     assert entry.plugin.resource_config["base_args"] == ("--non-interactive",)
     assert entry.plugin.resource_config["required_commands"] == ("docker",)
-    assert "OPENAI_API_KEY" in entry.plugin.resource_config["required_env_any"]
-    assert "--max-turns" in entry.plugin.capabilities[0].capability_config["allowed_extra_args"]
+    required_env = entry.plugin.resource_config["required_env_any"]
+    allowed_extra_args = entry.plugin.capabilities[0].capability_config["allowed_extra_args"]
+    assert isinstance(required_env, tuple)
+    assert isinstance(allowed_extra_args, tuple)
+    assert "OPENAI_API_KEY" in required_env
+    assert "--max-turns" in allowed_extra_args
     assert entry.plugin.capabilities[0].adapter == "local_command"
     assert entry.plugin.capabilities[0].sandbox_profile == "local_process"
     assert entry.plugin.capabilities[0].capability_config["argument_style"] == "strix_assessment"
