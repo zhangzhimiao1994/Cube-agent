@@ -8,13 +8,13 @@ import tarfile
 import tempfile
 import threading
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, NoReturn, Self, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -11930,6 +11930,25 @@ def multi_skill_source_repository_archive() -> bytes:
     return buffer.getvalue()
 
 
+def skill_source_repository_archive_with_skills(
+    skills: Mapping[str, str],
+) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for directory, entry_body in skills.items():
+            package = skill_archive_variant(
+                entry_body=entry_body,
+                name=f"{directory}_skill",
+            )
+            with zipfile.ZipFile(io.BytesIO(package)) as source:
+                for name in source.namelist():
+                    target.writestr(
+                        f"repository-root/skills/{directory}/{name}",
+                        source.read(name),
+                    )
+    return buffer.getvalue()
+
+
 def skill_tar_archive() -> bytes:
     manifest = (
         "name: safe_tar_skill\n"
@@ -14299,9 +14318,17 @@ def test_skill_source_requires_trust_and_syncs_candidate_without_switching_curre
     assert synced_body["source"]["resolved_commit_sha"] == "a" * 40
     assert synced_body["source"]["archive_sha256"] == "b" * 64
     candidate = synced_body["upload"]["items"][0]
+    revision = synced_body["revision"]
     assert candidate["status"] == "scanned"
     assert candidate["source"]["source_id"] == source["id"]
     assert candidate["source"]["commit_sha"] == "a" * 40
+    assert revision["commit_sha"] == "a" * 40
+    assert revision["archive_sha256"] == "b" * 64
+    assert revision["items"][0]["version_id"] == candidate["id"]
+    assert api.get(
+        f"/api/v1/admin/skill-sources/{source['id']}/revisions",
+        headers=headers(),
+    ).json() == [revision]
     assert skills[0]["current_version_id"] == current["id"]
     assert fetcher.requests[0].subdirectory == "skills"
 
@@ -14738,8 +14765,956 @@ async def test_persistent_skill_source_import_uses_one_locked_transaction(
     assert all(":skill:" in key for key in skill_lock_keys)
     assert len(imported.upload.items) == 2
     assert [row.kind for row in session.added].count("skill") == 2
+    assert [row.kind for row in session.added].count("skill_source_revision") == 1
     assert [row.kind for row in session.added].count("audit") == 1
+    assert imported.revision.source_id == source.id
+    assert {item.version_id for item in imported.revision.items} == {
+        item.id for item in imported.upload.items
+    }
     assert source_row.payload["sync_state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_source_revision_activation_and_rollback_are_atomic(
+    tmp_path: Path,
+) -> None:
+    source = admin_router.SkillSourceResponse(
+        id="atomic-revision-source",
+        name="原子激活来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已核对",
+    )
+    source_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source",
+        resource_id=source.id,
+        payload=source.model_dump(mode="json"),
+    )
+    package = skill_archive_variant(entry_body="print('atomic')\n", name="atomic_skill")
+    _bundle, scanned_archives, _skipped = admin_router._scan_skill_archive_upload(
+        "atomic.zip", package
+    )
+    scanned = scanned_archives[0]
+    version = admin_router._skill_response_from_scanned_archive(
+        scanned, "skill_atomic_revision"
+    ).model_copy(update={"status": "enabled"})
+    skill_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill",
+        resource_id=version.id,
+        payload=version.model_dump(mode="json"),
+    )
+    revision = admin_router.SkillSourceRevisionResponse(
+        id="revision_atomic",
+        source_id=source.id,
+        sync_id="sync_atomic",
+        commit_sha="a" * 40,
+        archive_sha256="b" * 64,
+        created_at=datetime.now(UTC),
+        items=[
+            admin_router.SkillSourceRevisionItemResponse(
+                skill_name=version.name,
+                version_id=version.id,
+                content_sha256=cast(str, version.content_sha256),
+                archive_sha256=cast(str, version.archive_sha256),
+            )
+        ],
+        previous_active_mapping={},
+        active_mapping={version.name: version.id},
+    )
+    revision_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="skill_source_revision",
+        resource_id=revision.id,
+        payload=revision.model_dump(mode="json"),
+    )
+    setting_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="setting",
+        resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+        payload={"active_versions": {}},
+    )
+
+    class RevisionSession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+            self.rows = [source_row, revision_row, setting_row, skill_row]
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return self.rows
+
+        def add(self, row: AdminResourceRow) -> None:
+            self.rows.append(row)
+
+        async def delete(self, row: AdminResourceRow) -> None:
+            self.rows.remove(row)
+
+    class RevisionService(PersistentAdminResourceService):
+        async def _get_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> dict[str, object] | None:
+            row = next(
+                (
+                    item
+                    for item in session.rows
+                    if item.kind == kind and item.resource_id == resource_id
+                ),
+                None,
+            )
+            return {} if row is None else dict(row.payload)
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str, **_kwargs: object
+        ) -> list[tuple[str, dict[str, object], datetime, datetime]] | None:
+            now = datetime.now(UTC)
+            return [
+                (item.resource_id, dict(item.payload), now, now)
+                for item in session.rows
+                if item.kind == kind
+            ]
+
+        async def _delete_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> bool | None:
+            before = len(session.rows)
+            session.rows[:] = [
+                item
+                for item in session.rows
+                if not (item.kind == kind and item.resource_id == resource_id)
+            ]
+            return len(session.rows) != before
+
+    session = RevisionSession()
+    service = RevisionService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, lambda: session),
+    )
+    approved_path = service._skill_approved_archive_path(version.id)
+    approved_path.parent.mkdir(parents=True, exist_ok=True)
+    approved_path.write_bytes(scanned.archive_bytes)
+
+    activated = await service.activate_skill_source_revision(source.id, revision.id)
+
+    assert session.lock_keys[:2] == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-source:{source.id}",
+    ]
+    assert source_row.payload["active_revision_id"] == revision.id
+    assert setting_row.payload == {"active_versions": revision.active_mapping}
+    assert service._skill_archive_path(version.id).is_file()
+    assert activated.is_active is True
+
+    rolled_back = await service.rollback_skill_source_revision(source.id, revision.id)
+
+    assert source_row.payload["active_revision_id"] is None
+    assert setting_row.payload == {"active_versions": {}}
+    assert not service._skill_archive_path(version.id).exists()
+    assert rolled_back.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_single_skill_activation_locks_global_map_before_skill(
+    tmp_path: Path,
+) -> None:
+    package = skill_archive_variant(entry_body="print('locked')\n", name="locked_skill")
+    _bundle, scanned_archives, _skipped = admin_router._scan_skill_archive_upload(
+        "locked.zip", package
+    )
+    scanned = scanned_archives[0]
+    version = admin_router._skill_response_from_scanned_archive(
+        scanned, "skill_locked_version"
+    ).model_copy(update={"status": "enabled"})
+    setting_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="setting",
+        resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+        payload={"active_versions": {}},
+    )
+
+    class ActivationSession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            del statement
+            return setting_row
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return []
+
+        def add(self, row: AdminResourceRow) -> None:
+            raise AssertionError(f"unexpected row: {row.resource_id}")
+
+    class ActivationService(PersistentAdminResourceService):
+        async def _skill_versions_by_name(
+            self, skill_name: str
+        ) -> list[admin_router._SkillVersionRecord]:
+            assert skill_name == version.name
+            return []
+
+    session = ActivationSession()
+    service = ActivationService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, lambda: session),
+    )
+
+    await service._activate_skill_archive(version.name, version, scanned.archive_bytes)
+
+    assert session.lock_keys == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-active:{version.name}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_in_memory_single_skill_changes_require_active_revision_rollback() -> None:
+    service = InMemoryAdminResourceService()
+    current = admin_router.SkillResponse(
+        id="skill_revision_current",
+        name="revision_guarded_skill",
+        status="enabled",
+        scan_diff=[],
+        requested_permissions=[],
+    )
+    replacement = current.model_copy(update={"id": "skill_revision_replacement"})
+    source = admin_router.SkillSourceResponse(
+        id="revision-guard-source",
+        name="活跃版本来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        active_revision_id="revision_guard",
+    )
+    revision = admin_router.SkillSourceRevisionResponse(
+        id="revision_guard",
+        source_id=source.id,
+        sync_id="sync_guard",
+        commit_sha="a" * 40,
+        archive_sha256="b" * 64,
+        created_at=datetime.now(UTC),
+        items=[],
+        previous_active_mapping={},
+        active_mapping={current.name: current.id},
+        is_active=True,
+    )
+    service.skills = {current.id: current, replacement.id: replacement}
+    service.skill_sources = {source.id: source}
+    service.skill_source_revisions = {revision.id: revision}
+    service.skill_active_versions = dict(revision.active_mapping)
+
+    with pytest.raises(PublicAPIError) as activate_error:
+        await service.activate_skill_version(current.id, replacement.id)
+    assert activate_error.value.status_code == 409
+    assert activate_error.value.code == "skill_source_revision_active"
+    assert service.skill_active_versions == revision.active_mapping
+
+    with pytest.raises(PublicAPIError) as delete_error:
+        await service.delete_skill(current.id)
+    assert delete_error.value.status_code == 409
+    assert delete_error.value.code == "skill_source_revision_active"
+    assert current.id in service.skills
+
+
+@pytest.mark.asyncio
+async def test_persistent_single_skill_activation_rejects_active_revision_under_global_lock(
+    tmp_path: Path,
+) -> None:
+    current = admin_router.SkillResponse(
+        id="skill_guarded_current",
+        name="guarded_skill",
+        status="enabled",
+        scan_diff=[],
+        requested_permissions=[],
+    )
+    replacement = current.model_copy(update={"id": "skill_guarded_replacement"})
+    source = admin_router.SkillSourceResponse(
+        id="guarded-source",
+        name="受保护来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        active_revision_id="guarded-revision",
+    )
+    revision = admin_router.SkillSourceRevisionResponse(
+        id="guarded-revision",
+        source_id=source.id,
+        sync_id="sync_guarded",
+        commit_sha="a" * 40,
+        archive_sha256="b" * 64,
+        created_at=datetime.now(UTC),
+        items=[],
+        previous_active_mapping={},
+        active_mapping={current.name: current.id},
+        is_active=True,
+    )
+    rows = [
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source",
+            resource_id=source.id,
+            payload=source.model_dump(mode="json"),
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source_revision",
+            resource_id=revision.id,
+            payload=revision.model_dump(mode="json"),
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="setting",
+            resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+            payload={"active_versions": revision.active_mapping},
+        ),
+    ]
+
+    class GuardedActivationSession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            del statement
+            return rows[-1]
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return rows
+
+        def add(self, row: AdminResourceRow) -> None:
+            rows.append(row)
+
+    class GuardedActivationService(PersistentAdminResourceService):
+        async def _skill_versions_by_name(
+            self, skill_name: str
+        ) -> tuple[admin_router._SkillVersionRecord, ...]:
+            assert skill_name == replacement.name
+            return ()
+
+    session = GuardedActivationSession()
+    service = GuardedActivationService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, lambda: session),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service._activate_skill_archive(
+            replacement.name,
+            replacement,
+            skill_archive_variant(name=replacement.name, entry_body="print('blocked')\n"),
+        )
+
+    assert error.value.code == "skill_source_revision_active"
+    assert session.lock_keys == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-active:{replacement.name}",
+    ]
+    assert rows[-1].payload == {"active_versions": revision.active_mapping}
+
+
+@pytest.mark.asyncio
+async def test_persistent_clear_active_skill_locks_global_map_before_skill(
+    tmp_path: Path,
+) -> None:
+    setting_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="setting",
+        resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+        payload={"active_versions": {"clear_skill": "clear_version"}},
+    )
+
+    class ClearSession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            del statement
+            return setting_row
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return []
+
+    session = ClearSession()
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, lambda: session),
+    )
+
+    await service._clear_active_skill_version("clear_skill", "clear_version")
+
+    assert session.lock_keys == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-active:clear_skill",
+    ]
+    assert setting_row.payload == {"active_versions": {}}
+
+
+@pytest.mark.asyncio
+async def test_persistent_delete_rejects_active_revision_inside_global_lock(
+    tmp_path: Path,
+) -> None:
+    skill = admin_router.SkillResponse(
+        id="delete_guarded_version",
+        name="delete_guarded_skill",
+        status="enabled",
+        scan_diff=[],
+        requested_permissions=[],
+    )
+    source = admin_router.SkillSourceResponse(
+        id="delete-guard-source",
+        name="删除保护来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        active_revision_id="delete-guard-revision",
+    )
+    revision = admin_router.SkillSourceRevisionResponse(
+        id="delete-guard-revision",
+        source_id=source.id,
+        sync_id="sync_delete_guard",
+        commit_sha="a" * 40,
+        archive_sha256="b" * 64,
+        created_at=datetime.now(UTC),
+        items=[],
+        previous_active_mapping={},
+        active_mapping={skill.name: skill.id},
+        is_active=True,
+    )
+    setting_row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="setting",
+        resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+        payload={"active_versions": revision.active_mapping},
+    )
+    rows = [
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source",
+            resource_id=source.id,
+            payload=source.model_dump(mode="json"),
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source_revision",
+            resource_id=revision.id,
+            payload=revision.model_dump(mode="json"),
+        ),
+        setting_row,
+    ]
+
+    class DeleteSession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalar(self, statement: object) -> AdminResourceRow:
+            del statement
+            return setting_row
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return rows
+
+    class DeleteGuardService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+                session_factory=cast(Any, lambda: session),
+            )
+            self.deleted = False
+
+        async def _get_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> dict[str, object] | None:
+            assert kind == "skill"
+            assert resource_id == skill.id
+            return skill.model_dump(mode="json")
+
+        async def _delete_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> bool | None:
+            assert kind == "skill"
+            assert resource_id == skill.id
+            self.deleted = True
+            return True
+
+    session = DeleteSession()
+    service = DeleteGuardService()
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.delete_skill(skill.id)
+
+    assert error.value.code == "skill_source_revision_active"
+    assert session.lock_keys == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-active:{skill.name}",
+    ]
+    assert service.deleted is False
+
+
+@pytest.mark.asyncio
+async def test_persistent_remote_sync_and_offline_import_share_batch_persistence(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = skill_source_repository_archive()
+    snapshot = admin_router.snapshot_from_archive(
+        SkillSourceFetchRequest(
+            repository_url="https://github.com/example/team-skills",
+            ref="main",
+            subdirectory="skills",
+            expected_commit_sha="a" * 40,
+            expected_archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        ),
+        "a" * 40,
+        archive_bytes,
+    )
+    source = admin_router.SkillSourceResponse(
+        id="shared-batch-source",
+        name="共享批事务",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        subdirectory="skills",
+        expected_commit_sha=snapshot.commit_sha,
+        expected_archive_sha256=snapshot.archive_sha256,
+        trust_state="trusted",
+        trusted_by=str(ACTOR_ID),
+        trusted_at=datetime.now(UTC),
+        trust_reason="已核对",
+    )
+
+    class Fetcher:
+        async def fetch(self, request: SkillSourceFetchRequest) -> SkillSourceSnapshot:
+            del request
+            return snapshot
+
+    class SharedBatchService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+                session_factory=cast(Any, object()),
+                skill_source_fetcher=Fetcher(),
+            )
+            self.calls: list[tuple[str, str]] = []
+
+        async def _get_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> dict[str, object] | None:
+            assert kind == "skill_source"
+            assert resource_id == source.id
+            return admin_router._skill_source_storage_payload(source)
+
+        async def _start_skill_source_sync(
+            self, source_id: str, sync_id: str
+        ) -> admin_router.SkillSourceResponse:
+            assert source_id == source.id
+            return source.model_copy(update={"last_sync_id": sync_id, "sync_state": "syncing"})
+
+        async def _persist_skill_source_snapshot_batch(
+            self,
+            source_id: str,
+            snapshot_value: SkillSourceSnapshot | None,
+            *,
+            sync_id: str,
+            audit_action: str,
+            commit_sha: str | None = None,
+            archive_bytes: bytes | None = None,
+        ) -> admin_router.SkillSourceSyncResponse:
+            self.calls.append((source_id, audit_action))
+            del commit_sha, archive_bytes
+            snapshot_value = snapshot_value or snapshot
+            item = admin_router.SkillResponse(
+                id=f"skill_{audit_action.replace('.', '_')}",
+                name="shared_batch_skill",
+                status="scanned",
+                scan_diff=[],
+                requested_permissions=[],
+                content_sha256="c" * 64,
+                archive_sha256="d" * 64,
+            )
+            upload = admin_router.SkillArchiveUploadResponse(
+                filename="source.zip", bundle=False, items=[item]
+            )
+            succeeded = source.model_copy(
+                update={
+                    "last_sync_id": sync_id,
+                    "sync_state": "succeeded",
+                    "resolved_commit_sha": snapshot_value.commit_sha,
+                    "archive_sha256": snapshot_value.archive_sha256,
+                }
+            )
+            revision = admin_router._new_skill_source_revision(
+                succeeded,
+                upload,
+                sync_id=sync_id,
+                commit_sha=snapshot_value.commit_sha,
+                archive_sha256=snapshot_value.archive_sha256,
+                previous_revision=None,
+                previous_active_mapping={},
+            )
+            return admin_router.SkillSourceSyncResponse(
+                source=succeeded, upload=upload, revision=revision
+            )
+
+        async def upload_skill_archive(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise AssertionError("batch persistence must not call standalone upload")
+
+        async def _finish_skill_source_sync(self, *_args: object, **_kwargs: object) -> NoReturn:
+            raise AssertionError("batch persistence must finish the source transaction")
+
+    service = SharedBatchService()
+
+    remote = await service.sync_skill_source(source.id)
+    offline = await service.import_skill_source_snapshot(
+        source.id,
+        commit_sha=snapshot.commit_sha,
+        archive_bytes=archive_bytes,
+    )
+
+    assert remote.source.sync_state == "succeeded"
+    assert offline.source.sync_state == "succeeded"
+    assert service.calls == [
+        (source.id, "skill_source.sync"),
+        (source.id, "skill_source.snapshot.import"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("database_is_switched", [False, True])
+async def test_revision_management_recovers_files_from_database_active_mapping(
+    tmp_path: Path,
+    database_is_switched: bool,
+) -> None:
+    package = skill_archive_variant(entry_body="print('recover')\n", name="recover_skill")
+    _bundle, scanned_archives, _skipped = admin_router._scan_skill_archive_upload(
+        "recover.zip", package
+    )
+    scanned = scanned_archives[0]
+    version = admin_router._skill_response_from_scanned_archive(
+        scanned, "skill_recovery_version"
+    ).model_copy(update={"status": "enabled"})
+    source = admin_router.SkillSourceResponse(
+        id="recovery-source",
+        name="恢复来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        trust_state="trusted",
+        active_revision_id="revision_recovery" if database_is_switched else None,
+    )
+    mapping = {version.name: version.id} if database_is_switched else {}
+    intent_id = admin_router._skill_source_revision_recovery_intent_id(source.id)
+    payloads: dict[tuple[str, str], dict[str, object]] = {
+        ("skill_source", source.id): admin_router._skill_source_storage_payload(source),
+        ("skill", version.id): version.model_dump(mode="json"),
+        (
+            "setting",
+            admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+        ): {"active_versions": mapping},
+        (
+            "setting",
+            intent_id,
+        ): {
+            "source_id": source.id,
+            "operation_id": "switch_recovery",
+            "target_revision_id": "revision_recovery",
+            "target_mapping": {version.name: version.id},
+        },
+    }
+
+    class RecoveryService(PersistentAdminResourceService):
+        async def _get_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> dict[str, object] | None:
+            return dict(payloads.get((kind, resource_id), {}))
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str, **_kwargs: object
+        ) -> list[tuple[str, dict[str, object], datetime, datetime]] | None:
+            now = datetime.now(UTC)
+            return [
+                (resource_id, dict(payload), now, now)
+                for (payload_kind, resource_id), payload in payloads.items()
+                if payload_kind == kind
+            ]
+
+        async def _delete_admin_payload(
+            self, kind: str, resource_id: str, **_kwargs: object
+        ) -> bool | None:
+            return payloads.pop((kind, resource_id), None) is not None
+
+    service = RecoveryService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+    )
+    approved_path = service._skill_approved_archive_path(version.id)
+    approved_path.parent.mkdir(parents=True, exist_ok=True)
+    approved_path.write_bytes(scanned.archive_bytes)
+    active_path = service._skill_archive_path(version.id)
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    if not database_is_switched:
+        active_path.write_bytes(scanned.archive_bytes)
+
+    await service.list_skill_source_revisions(source.id)
+
+    assert active_path.is_file() is database_is_switched
+    if database_is_switched:
+        assert active_path.read_bytes() == scanned.archive_bytes
+    assert ("setting", intent_id) not in payloads
+
+
+@pytest.mark.asyncio
+async def test_revision_recovery_does_not_delete_newer_intent(
+    tmp_path: Path,
+) -> None:
+    package = skill_archive_variant(entry_body="print('recover')\n", name="recover_skill")
+    _bundle, scanned_archives, _skipped = admin_router._scan_skill_archive_upload(
+        "recover.zip", package
+    )
+    scanned = scanned_archives[0]
+    version = admin_router._skill_response_from_scanned_archive(
+        scanned, "skill_recovery_version"
+    ).model_copy(update={"status": "enabled"})
+    source = admin_router.SkillSourceResponse(
+        id="recovery-race-source",
+        name="恢复并发来源",
+        repository_url="https://github.com/example/team-skills",
+        ref="main",
+        trust_state="trusted",
+        active_revision_id="revision_recovery",
+    )
+    intent_id = admin_router._skill_source_revision_recovery_intent_id(source.id)
+    rows = [
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill_source",
+            resource_id=source.id,
+            payload=admin_router._skill_source_storage_payload(source),
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="skill",
+            resource_id=version.id,
+            payload=version.model_dump(mode="json"),
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="setting",
+            resource_id=admin_router._SKILL_ACTIVE_VERSIONS_SETTING_ID,
+            payload={"active_versions": {version.name: version.id}},
+        ),
+        AdminResourceRow(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            kind="setting",
+            resource_id=intent_id,
+            payload={
+                "source_id": source.id,
+                "operation_id": "old-operation",
+                "target_revision_id": "revision_recovery",
+                "target_mapping": {version.name: version.id},
+            },
+        ),
+    ]
+    intent_row = rows[-1]
+
+    class RecoverySession:
+        def __init__(self) -> None:
+            self.lock_keys: list[str] = []
+            self.deleted: list[AdminResourceRow] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> None:
+            if (
+                "pg_advisory_xact_lock" in str(statement)
+                and isinstance(parameters, dict)
+                and isinstance(parameters.get("lock_key"), str)
+            ):
+                self.lock_keys.append(parameters["lock_key"])
+
+        async def scalars(self, statement: object) -> list[AdminResourceRow]:
+            del statement
+            return rows
+
+        async def delete(self, row: AdminResourceRow) -> None:
+            self.deleted.append(row)
+            rows.remove(row)
+
+    class RecoveryService(PersistentAdminResourceService):
+        def _atomic_write_skill_archive(self, target: Path, archive_bytes: bytes) -> None:
+            super()._atomic_write_skill_archive(target, archive_bytes)
+            intent_row.payload = {
+                **intent_row.payload,
+                "operation_id": "new-operation",
+            }
+
+    session = RecoverySession()
+    service = RecoveryService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        skill_store_dir=tmp_path,
+        session_factory=cast(Any, lambda: session),
+    )
+    approved_path = service._skill_approved_archive_path(version.id)
+    approved_path.parent.mkdir(parents=True, exist_ok=True)
+    approved_path.write_bytes(scanned.archive_bytes)
+
+    await service._recover_skill_source_revision_switch(source.id)
+
+    assert session.lock_keys == [
+        f"agent-hub:{TENANT_ID}:skill-active-map",
+        f"agent-hub:{TENANT_ID}:skill-source:{source.id}",
+    ]
+    assert intent_row not in session.deleted
+    assert intent_row.payload["operation_id"] == "new-operation"
 
 
 @pytest.mark.asyncio
@@ -15086,8 +16061,9 @@ async def test_skill_source_import_failure_does_not_overwrite_newer_sync() -> No
 
     assert source_row.payload == original_payload
     assert len(audit_rows) == 1
-    assert audit_rows[0].payload["details"]["sync_id"] == "import_older"
-    assert audit_rows[0].payload["details"]["stale"] == "True"
+    details = cast(dict[str, object], audit_rows[0].payload["details"])
+    assert details["sync_id"] == "import_older"
+    assert details["stale"] == "True"
 
 
 @pytest.mark.asyncio
@@ -15101,11 +16077,22 @@ async def test_skill_source_import_snapshot_cannot_restore_revoked_trust() -> No
             self,
             filename: str,
             archive_bytes: bytes,
-            **kwargs: object,
+            *,
+            strategy: str | None = None,
+            source: SkillSourceProvenanceResponse | None = None,
+            activate: bool = True,
+            before_persist: Callable[[], Awaitable[None]] | None = None,
         ) -> admin_router.SkillArchiveUploadResponse:
             started.set()
             await release.wait()
-            return await super().upload_skill_archive(filename, archive_bytes, **kwargs)
+            return await super().upload_skill_archive(
+                filename,
+                archive_bytes,
+                strategy=strategy,
+                source=source,
+                activate=activate,
+                before_persist=before_persist,
+            )
 
     service = BlockingImportService()
     source = await service.create_skill_source(
@@ -15191,6 +16178,286 @@ def test_skill_source_import_snapshot_is_tenant_scoped() -> None:
 
     assert created.status_code == 200
     assert response.status_code == 404
+
+
+def _create_trusted_snapshot_source(
+    api: TestClient,
+    *,
+    source_id: str,
+    commit_sha: str,
+    archive_bytes: bytes,
+) -> None:
+    created = api.post(
+        "/api/v1/admin/skill-sources",
+        headers=headers(),
+        json={
+            "id": source_id,
+            "name": f"团队来源 {source_id}",
+            "repository_url": "https://github.com/example/team-skills",
+            "subdirectory": "skills",
+            "expected_commit_sha": commit_sha,
+            "expected_archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        },
+    )
+    assert created.status_code == 200
+    trusted = api.post(
+        f"/api/v1/admin/skill-sources/{source_id}/trust",
+        headers=headers(),
+        json={"reason": "已核对提交与归档"},
+    )
+    assert trusted.status_code == 200
+
+
+def _import_snapshot_revision(
+    api: TestClient,
+    *,
+    source_id: str,
+    commit_sha: str,
+    archive_bytes: bytes,
+) -> dict[str, Any]:
+    response = api.post(
+        f"/api/v1/admin/skill-sources/{source_id}/import-snapshot",
+        headers=headers(),
+        data={"commit_sha": commit_sha},
+        files={"archive": ("snapshot.zip", archive_bytes, "application/zip")},
+    )
+    assert response.status_code == 200
+    return cast(dict[str, Any], response.json())
+
+
+def test_skill_source_snapshot_creates_immutable_revision_after_batch_success() -> None:
+    api = client()
+    archive_bytes = multi_skill_source_repository_archive()
+    _create_trusted_snapshot_source(
+        api,
+        source_id="revision-source",
+        commit_sha="1" * 40,
+        archive_bytes=archive_bytes,
+    )
+
+    imported = _import_snapshot_revision(
+        api,
+        source_id="revision-source",
+        commit_sha="1" * 40,
+        archive_bytes=archive_bytes,
+    )
+    listed = api.get(
+        "/api/v1/admin/skill-sources/revision-source/revisions",
+        headers=headers(),
+    )
+
+    assert imported["revision"]["source_id"] == "revision-source"
+    assert imported["revision"]["sync_id"] == imported["source"]["last_sync_id"]
+    assert imported["revision"]["commit_sha"] == "1" * 40
+    assert imported["revision"]["archive_sha256"] == hashlib.sha256(
+        archive_bytes
+    ).hexdigest()
+    assert len(imported["revision"]["items"]) == 2
+    assert {item["version_id"] for item in imported["revision"]["items"]} == {
+        item["id"] for item in imported["upload"]["items"]
+    }
+    assert listed.status_code == 200
+    assert listed.json() == [imported["revision"]]
+
+
+def test_skill_source_revision_is_tenant_scoped_and_survives_source_delete() -> None:
+    root = TenantScopedAdminResourceService()
+    app = create_app(auth_service=StubAuthService(), rate_limiter=object())
+    app.state.admin_resource_service = root
+    tenant_api = TestClient(app)
+    archive_bytes = skill_source_repository_archive()
+    _create_trusted_snapshot_source(
+        tenant_api,
+        source_id="retained-revision-source",
+        commit_sha="2" * 40,
+        archive_bytes=archive_bytes,
+    )
+    imported = _import_snapshot_revision(
+        tenant_api,
+        source_id="retained-revision-source",
+        commit_sha="2" * 40,
+        archive_bytes=archive_bytes,
+    )
+    revision_id = imported["revision"]["id"]
+
+    deleted = tenant_api.delete(
+        "/api/v1/admin/skill-sources/retained-revision-source",
+        headers=headers(),
+    )
+    retained = tenant_api.get(
+        f"/api/v1/admin/skill-sources/retained-revision-source/revisions/{revision_id}",
+        headers=headers(),
+    )
+    other_app = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    other_app.state.admin_resource_service = root
+    other_api = TestClient(other_app)
+    hidden = other_api.get(
+        f"/api/v1/admin/skill-sources/retained-revision-source/revisions/{revision_id}",
+        headers=headers(),
+    )
+
+    assert deleted.status_code == 200
+    assert retained.status_code == 200
+    assert retained.json()["id"] == revision_id
+    assert hidden.status_code == 404
+
+
+def test_skill_source_revision_activation_requires_every_item_approved() -> None:
+    api = client()
+    archive_bytes = multi_skill_source_repository_archive()
+    _create_trusted_snapshot_source(
+        api,
+        source_id="approval-gated-source",
+        commit_sha="3" * 40,
+        archive_bytes=archive_bytes,
+    )
+    imported = _import_snapshot_revision(
+        api,
+        source_id="approval-gated-source",
+        commit_sha="3" * 40,
+        archive_bytes=archive_bytes,
+    )
+    revision = imported["revision"]
+    first_id, second_id = [item["version_id"] for item in revision["items"]]
+    approved = api.post(
+        f"/api/v1/admin/skills/{first_id}/approve",
+        headers=headers(),
+    )
+
+    blocked = api.post(
+        f"/api/v1/admin/skill-sources/approval-gated-source/revisions/{revision['id']}/activate",
+        headers=headers(),
+    )
+    api.post(f"/api/v1/admin/skills/{second_id}/approve", headers=headers())
+    activated = api.post(
+        f"/api/v1/admin/skill-sources/approval-gated-source/revisions/{revision['id']}/activate",
+        headers=headers(),
+    )
+
+    assert approved.status_code == 200
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "skill_source_revision_not_ready"
+    assert activated.status_code == 200
+    assert activated.json()["is_active"] is True
+    assert activated.json()["active_mapping"] == {
+        item["skill_name"]: item["version_id"] for item in revision["items"]
+    }
+
+    blocked_delete = api.delete(
+        "/api/v1/admin/skill-sources/approval-gated-source",
+        headers=headers(),
+    )
+    assert blocked_delete.status_code == 409
+    assert blocked_delete.json()["error"]["code"] == "skill_source_active"
+
+
+def test_skill_source_revision_rollback_restores_complete_previous_mapping() -> None:
+    api = client()
+    first_archive = skill_source_repository_archive_with_skills(
+        {"core": "print('core-v1')\n"}
+    )
+    _create_trusted_snapshot_source(
+        api,
+        source_id="rollback-source",
+        commit_sha="4" * 40,
+        archive_bytes=first_archive,
+    )
+    first = _import_snapshot_revision(
+        api,
+        source_id="rollback-source",
+        commit_sha="4" * 40,
+        archive_bytes=first_archive,
+    )["revision"]
+    first_version_id = first["items"][0]["version_id"]
+    api.post(f"/api/v1/admin/skills/{first_version_id}/approve", headers=headers())
+    assert api.post(
+        f"/api/v1/admin/skill-sources/rollback-source/revisions/{first['id']}/activate",
+        headers=headers(),
+    ).status_code == 200
+
+    second_archive = skill_source_repository_archive_with_skills(
+        {"core": "print('core-v2')\n", "extra": "print('extra-v1')\n"}
+    )
+    updated = api.patch(
+        "/api/v1/admin/skill-sources/rollback-source",
+        headers=headers(),
+        json={
+            "expected_commit_sha": "5" * 40,
+            "expected_archive_sha256": hashlib.sha256(second_archive).hexdigest(),
+        },
+    )
+    assert updated.status_code == 200
+    api.post(
+        "/api/v1/admin/skill-sources/rollback-source/trust",
+        headers=headers(),
+        json={"reason": "已核对第二版"},
+    )
+    second = _import_snapshot_revision(
+        api,
+        source_id="rollback-source",
+        commit_sha="5" * 40,
+        archive_bytes=second_archive,
+    )["revision"]
+    for item in second["items"]:
+        api.post(
+            f"/api/v1/admin/skills/{item['version_id']}/approve",
+            headers=headers(),
+        )
+    activated = api.post(
+        f"/api/v1/admin/skill-sources/rollback-source/revisions/{second['id']}/activate",
+        headers=headers(),
+    )
+    rolled_back = api.post(
+        f"/api/v1/admin/skill-sources/rollback-source/revisions/{second['id']}/rollback",
+        headers=headers(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers()).json()
+    current_by_name = {item["name"]: item["current_version_id"] for item in skills}
+
+    assert activated.status_code == 200
+    assert set(activated.json()["active_mapping"]) == {"core_skill", "extra_skill"}
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["id"] == first["id"]
+    assert rolled_back.json()["is_active"] is True
+    assert current_by_name["core_skill"] == first_version_id
+    assert current_by_name["extra_skill"] is None
+
+
+def test_skill_source_revision_lifecycle_is_audited() -> None:
+    api = client()
+    archive_bytes = skill_source_repository_archive()
+    _create_trusted_snapshot_source(
+        api,
+        source_id="revision-audit-source",
+        commit_sha="6" * 40,
+        archive_bytes=archive_bytes,
+    )
+    revision = _import_snapshot_revision(
+        api,
+        source_id="revision-audit-source",
+        commit_sha="6" * 40,
+        archive_bytes=archive_bytes,
+    )["revision"]
+    version_id = revision["items"][0]["version_id"]
+    api.post(f"/api/v1/admin/skills/{version_id}/approve", headers=headers())
+    api.post(
+        f"/api/v1/admin/skill-sources/revision-audit-source/revisions/{revision['id']}/activate",
+        headers=headers(),
+    )
+    api.post(
+        f"/api/v1/admin/skill-sources/revision-audit-source/revisions/{revision['id']}/rollback",
+        headers=headers(),
+    )
+
+    actions = {
+        item["action"]
+        for item in api.get("/api/v1/admin/audit", headers=headers()).json()
+    }
+    assert {
+        "skill_source.revision.create",
+        "skill_source.revision.activate",
+        "skill_source.revision.rollback",
+    }.issubset(actions)
 
 
 def test_skill_source_update_revoke_delete_and_listing() -> None:

@@ -936,6 +936,33 @@ class SkillSourceResponse(BaseModel):
     last_synced_at: datetime | None = None
     last_error: str | None = None
     linked_skill_ids: list[str] = Field(default_factory=list)
+    active_revision_id: str | None = None
+
+
+class SkillSourceRevisionItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str
+    version_id: str
+    source_path: str | None = None
+    content_sha256: str
+    archive_sha256: str
+
+
+class SkillSourceRevisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source_id: str
+    sync_id: str
+    commit_sha: str
+    archive_sha256: str
+    created_at: datetime
+    items: list[SkillSourceRevisionItemResponse]
+    previous_revision_id: str | None = None
+    previous_active_mapping: dict[str, str] = Field(default_factory=dict)
+    active_mapping: dict[str, str] = Field(default_factory=dict)
+    is_active: bool = False
 
 
 class SkillBulkDeleteRequest(BaseModel):
@@ -972,6 +999,7 @@ class SkillSourceSyncResponse(BaseModel):
 
     source: SkillSourceResponse
     upload: SkillArchiveUploadResponse
+    revision: SkillSourceRevisionResponse
 
 
 class PluginCapabilityRequest(BaseModel):
@@ -3173,6 +3201,22 @@ class AdminResourceService(Protocol):
         archive_bytes: bytes,
     ) -> SkillSourceSyncResponse: ...
 
+    async def list_skill_source_revisions(
+        self, source_id: str
+    ) -> tuple[SkillSourceRevisionResponse, ...]: ...
+
+    async def get_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse: ...
+
+    async def activate_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse: ...
+
+    async def rollback_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse: ...
+
     async def delete_skill_source(self, source_id: str) -> None: ...
 
     async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse: ...
@@ -3891,6 +3935,10 @@ def _skill_version_sort_key(record: _SkillVersionRecord) -> tuple[datetime, int]
 _SKILL_ACTIVE_VERSIONS_SETTING_ID = "skill-active-versions"
 
 
+def _skill_source_revision_recovery_intent_id(source_id: str) -> str:
+    return f"skill-source-recovery-{source_id}"
+
+
 def _skill_source_id(request: SkillSourceCreateRequest) -> str:
     if request.id is not None:
         return request.id
@@ -3910,6 +3958,89 @@ def _skill_source_storage_payload(source: SkillSourceResponse) -> dict[str, obje
     payload = source.model_dump(mode="json")
     payload["credential_ref"] = source.credential_ref
     return payload
+
+
+def _skill_source_revision_id(
+    source_id: str,
+    sync_id: str,
+    commit_sha: str,
+    archive_sha256: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{source_id}:{sync_id}:{commit_sha}:{archive_sha256}".encode()
+    ).hexdigest()[:24]
+    return f"revision_{digest}"
+
+
+def _skill_source_revision_items(
+    items: Iterable[SkillResponse],
+) -> list[SkillSourceRevisionItemResponse]:
+    revisions: list[SkillSourceRevisionItemResponse] = []
+    for item in items:
+        if item.content_sha256 is None or item.archive_sha256 is None:
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_identity_missing",
+                "Skill source revision item is missing archive identity",
+            )
+        revisions.append(
+            SkillSourceRevisionItemResponse(
+                skill_name=item.name,
+                version_id=item.id,
+                source_path=(
+                    item.source.source_path if item.source is not None else None
+                ),
+                content_sha256=item.content_sha256,
+                archive_sha256=item.archive_sha256,
+            )
+        )
+    return sorted(revisions, key=lambda item: (item.skill_name, item.version_id))
+
+
+def _new_skill_source_revision(
+    source: SkillSourceResponse,
+    upload: SkillArchiveUploadResponse,
+    *,
+    sync_id: str,
+    commit_sha: str,
+    archive_sha256: str,
+    previous_revision: SkillSourceRevisionResponse | None,
+    previous_active_mapping: Mapping[str, str],
+) -> SkillSourceRevisionResponse:
+    items = _skill_source_revision_items(upload.items)
+    active_mapping = dict(previous_active_mapping)
+    if previous_revision is not None:
+        for previous_item in previous_revision.items:
+            active_mapping.pop(previous_item.skill_name, None)
+    active_mapping.update({item.skill_name: item.version_id for item in items})
+    return SkillSourceRevisionResponse(
+        id=_skill_source_revision_id(
+            source.id, sync_id, commit_sha, archive_sha256
+        ),
+        source_id=source.id,
+        sync_id=sync_id,
+        commit_sha=commit_sha,
+        archive_sha256=archive_sha256,
+        created_at=datetime.now(UTC),
+        items=items,
+        previous_revision_id=(
+            previous_revision.id if previous_revision is not None else None
+        ),
+        previous_active_mapping=dict(previous_active_mapping),
+        active_mapping=active_mapping,
+    )
+
+
+def _skill_source_revision_response(
+    payload: Mapping[str, object],
+    resource_id: str,
+    *,
+    active_revision_id: str | None = None,
+) -> SkillSourceRevisionResponse:
+    response = SkillSourceRevisionResponse.model_validate(
+        {**dict(payload), "id": resource_id}
+    )
+    return response.model_copy(update={"is_active": response.id == active_revision_id})
 
 
 def _recover_stale_skill_source_sync(source: SkillSourceResponse) -> SkillSourceResponse:
@@ -5544,6 +5675,9 @@ class InMemoryAdminResourceService:
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     skill_active_versions: dict[str, str] = field(default_factory=dict)
     skill_sources: dict[str, SkillSourceResponse] = field(default_factory=dict)
+    skill_source_revisions: dict[str, SkillSourceRevisionResponse] = field(
+        default_factory=dict
+    )
     skill_source_fetcher: SkillSourceFetcherProtocol = field(
         default_factory=GitHubSkillSourceFetcher,
         repr=False,
@@ -6558,7 +6692,7 @@ class InMemoryAdminResourceService:
             require_trusted=True,
         )
         await self.record_audit_event(
-            actor="system",
+            actor=source.trusted_by or str(UUID(int=0)),
             action="skill_source.snapshot.import",
             resource=f"skill_source:{source_id}",
             details={
@@ -6569,7 +6703,18 @@ class InMemoryAdminResourceService:
                 "skipped": [item.model_dump(mode="json") for item in upload.skipped],
             },
         )
-        return SkillSourceSyncResponse(source=succeeded, upload=upload)
+        revision = await self._create_in_memory_skill_source_revision(
+            succeeded,
+            upload,
+            sync_id=sync_id,
+            commit_sha=snapshot.commit_sha,
+            archive_sha256=snapshot.archive_sha256,
+        )
+        return SkillSourceSyncResponse(
+            source=succeeded,
+            upload=upload,
+            revision=revision,
+        )
 
     async def sync_skill_source(self, source_id: str) -> SkillSourceSyncResponse:
         source = self.skill_sources[source_id]
@@ -6661,9 +6806,178 @@ class InMemoryAdminResourceService:
             }
         )
         self.skill_sources[source_id] = succeeded
-        return SkillSourceSyncResponse(source=succeeded, upload=upload)
+        revision = await self._create_in_memory_skill_source_revision(
+            succeeded,
+            upload,
+            sync_id=sync_id,
+            commit_sha=snapshot.commit_sha,
+            archive_sha256=snapshot.archive_sha256,
+        )
+        return SkillSourceSyncResponse(
+            source=succeeded,
+            upload=upload,
+            revision=revision,
+        )
+
+    async def _create_in_memory_skill_source_revision(
+        self,
+        source: SkillSourceResponse,
+        upload: SkillArchiveUploadResponse,
+        *,
+        sync_id: str,
+        commit_sha: str,
+        archive_sha256: str,
+    ) -> SkillSourceRevisionResponse:
+        previous = (
+            self.skill_source_revisions.get(source.active_revision_id)
+            if source.active_revision_id is not None
+            else None
+        )
+        revision = _new_skill_source_revision(
+            source,
+            upload,
+            sync_id=sync_id,
+            commit_sha=commit_sha,
+            archive_sha256=archive_sha256,
+            previous_revision=previous,
+            previous_active_mapping=self.skill_active_versions,
+        )
+        self.skill_source_revisions[revision.id] = revision
+        await self.record_audit_event(
+            actor=source.trusted_by or str(UUID(int=0)),
+            action="skill_source.revision.create",
+            resource=f"skill_source_revision:{revision.id}",
+            details={
+                "source_id": source.id,
+                "sync_id": sync_id,
+                "commit_sha": commit_sha,
+                "archive_sha256": archive_sha256,
+            },
+        )
+        return revision
+
+    async def list_skill_source_revisions(
+        self, source_id: str
+    ) -> tuple[SkillSourceRevisionResponse, ...]:
+        active_revision_id = self.skill_sources.get(source_id, SkillSourceResponse(
+            id=source_id,
+            name=source_id,
+            repository_url="https://github.com/deleted/source",
+            ref="main",
+        )).active_revision_id
+        return tuple(
+            revision.model_copy(
+                update={"is_active": revision.id == active_revision_id}
+            )
+            for revision in sorted(
+                (
+                    item
+                    for item in self.skill_source_revisions.values()
+                    if item.source_id == source_id
+                ),
+                key=lambda item: item.created_at,
+            )
+        )
+
+    async def get_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        revision = self.skill_source_revisions[revision_id]
+        if revision.source_id != source_id:
+            raise KeyError(revision_id)
+        active_revision_id = (
+            self.skill_sources[source_id].active_revision_id
+            if source_id in self.skill_sources
+            else None
+        )
+        return revision.model_copy(
+            update={"is_active": revision.id == active_revision_id}
+        )
+
+    async def activate_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        source = self.skill_sources[source_id]
+        revision = await self.get_skill_source_revision(source_id, revision_id)
+        if source.trust_state != "trusted" or not source.enabled:
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_source_untrusted",
+                "Skill source must remain trusted before revision activation",
+            )
+        if self.skill_active_versions != revision.previous_active_mapping:
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_stale",
+                "Active Skill mapping changed after revision creation",
+            )
+        for item in revision.items:
+            skill = self.skills.get(item.version_id)
+            if skill is None or skill.status != "enabled":
+                raise PublicAPIError(
+                    409,
+                    "skill_source_revision_not_ready",
+                    "Every Skill revision item must be approved before activation",
+                )
+            if (
+                skill.content_sha256 != item.content_sha256
+                or skill.archive_sha256 != item.archive_sha256
+            ):
+                raise PublicAPIError(
+                    409,
+                    "skill_archive_changed",
+                    "Skill archive changed after revision creation",
+                )
+        self.skill_active_versions = dict(revision.active_mapping)
+        self.skill_sources[source_id] = source.model_copy(
+            update={"active_revision_id": revision.id}
+        )
+        await self.record_audit_event(
+            actor=source.trusted_by or str(UUID(int=0)),
+            action="skill_source.revision.activate",
+            resource=f"skill_source_revision:{revision.id}",
+            details={"source_id": source_id, "active_mapping": revision.active_mapping},
+        )
+        return revision.model_copy(update={"is_active": True})
+
+    async def rollback_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        source = self.skill_sources[source_id]
+        revision = await self.get_skill_source_revision(source_id, revision_id)
+        if source.active_revision_id != revision.id:
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_not_active",
+                "Only the active Skill source revision can be rolled back",
+            )
+        self.skill_active_versions = dict(revision.previous_active_mapping)
+        self.skill_sources[source_id] = source.model_copy(
+            update={"active_revision_id": revision.previous_revision_id}
+        )
+        await self.record_audit_event(
+            actor="system",
+            action="skill_source.revision.rollback",
+            resource=f"skill_source_revision:{revision.id}",
+            details={
+                "source_id": source_id,
+                "restored_revision_id": revision.previous_revision_id,
+                "active_mapping": revision.previous_active_mapping,
+            },
+        )
+        if revision.previous_revision_id is None:
+            return revision.model_copy(update={"is_active": False})
+        previous = self.skill_source_revisions[revision.previous_revision_id]
+        return previous.model_copy(update={"is_active": True})
 
     async def delete_skill_source(self, source_id: str) -> None:
+        source = self.skill_sources[source_id]
+        if source.active_revision_id is not None:
+            raise PublicAPIError(
+                409,
+                "skill_source_active",
+                "Active Skill source must be rolled back before deletion",
+            )
         del self.skill_sources[source_id]
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
@@ -6692,12 +7006,38 @@ class InMemoryAdminResourceService:
                 "skill_version_not_approved",
                 "skill version must be approved before activation",
             )
+        self._assert_skill_source_revision_not_active(skill.name)
         self.skill_active_versions[skill.name] = version.id
         grouped = await self.list_skills()
         return next(item for item in grouped if item.name == skill.name)
 
     async def delete_skill(self, skill_id: str) -> None:
+        skill = self.skills[skill_id]
+        self._assert_skill_source_revision_not_active(skill.name, version_id=skill_id)
         del self.skills[skill_id]
+
+    def _assert_skill_source_revision_not_active(
+        self,
+        skill_name: str,
+        *,
+        version_id: str | None = None,
+    ) -> None:
+        for source in self.skill_sources.values():
+            if source.active_revision_id is None:
+                continue
+            revision = self.skill_source_revisions.get(source.active_revision_id)
+            if revision is None:
+                continue
+            active_version_id = revision.active_mapping.get(skill_name)
+            if active_version_id is None or (
+                version_id is not None and active_version_id != version_id
+            ):
+                continue
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_active",
+                "Active Skill source revision must be rolled back first",
+            )
 
     async def list_plugins(
         self,
@@ -8895,6 +9235,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         commit_sha: str,
         archive_bytes: bytes,
+        _snapshot: SkillSourceSnapshot | None = None,
+        _sync_id: str | None = None,
+        _audit_action: str = "skill_source.snapshot.import",
+        _batch: bool = False,
     ) -> SkillSourceSyncResponse:
         if self._session_factory is None:
             return await super().import_skill_source_snapshot(
@@ -8903,7 +9247,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 archive_bytes=archive_bytes,
             )
 
-        sync_id = f"import_{uuid4().hex}"
+        if not _batch:
+            return await self._persist_skill_source_snapshot_batch(
+                source_id,
+                _snapshot,
+                sync_id=f"import_{uuid4().hex}",
+                audit_action="skill_source.snapshot.import",
+                commit_sha=commit_sha,
+                archive_bytes=archive_bytes,
+            )
+
+        sync_id = _sync_id or f"import_{uuid4().hex}"
         created_archive_paths: list[Path] = []
 
         @contextlib.asynccontextmanager
@@ -8943,7 +9297,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     raise PublicAPIError(
                         409, "skill_source_untrusted", "Skill source is not trusted"
                     )
-                if (
+                if _audit_action == "skill_source.snapshot.import" and (
                     source.expected_commit_sha is None
                     or source.expected_archive_sha256 is None
                 ):
@@ -8952,25 +9306,46 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                         "skill_source_snapshot_hash_required",
                         "Offline Skill source import requires expected_commit_sha and expected_archive_sha256",
                     )
-                normalized_commit_sha = commit_sha.lower()
-                if normalized_commit_sha != source.expected_commit_sha:
+                if _snapshot is None:
+                    try:
+                        snapshot = snapshot_from_archive(
+                            SkillSourceFetchRequest(
+                                repository_url=source.repository_url,
+                                ref=source.ref,
+                                subdirectory=source.subdirectory,
+                                expected_commit_sha=source.expected_commit_sha,
+                                expected_archive_sha256=source.expected_archive_sha256,
+                            ),
+                            commit_sha,
+                            archive_bytes,
+                        )
+                    except SkillSourceFetchError as error:
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_snapshot_commit_mismatch",
+                            "Offline Skill source snapshot does not match the trusted source",
+                            details={"reason": _skill_source_error_detail(error)},
+                        ) from None
+                else:
+                    snapshot = _snapshot
+                if (
+                    source.expected_commit_sha is not None
+                    and snapshot.commit_sha != source.expected_commit_sha
+                ):
                     raise PublicAPIError(
                         409,
                         "skill_source_snapshot_commit_mismatch",
                         "Offline Skill source snapshot commit does not match the trusted commit",
                     )
-
-                snapshot = snapshot_from_archive(
-                    SkillSourceFetchRequest(
-                        repository_url=source.repository_url,
-                        ref=source.ref,
-                        subdirectory=source.subdirectory,
-                        expected_commit_sha=source.expected_commit_sha,
-                        expected_archive_sha256=source.expected_archive_sha256,
-                    ),
-                    commit_sha,
-                    archive_bytes,
-                )
+                if (
+                    source.expected_archive_sha256 is not None
+                    and snapshot.archive_sha256 != source.expected_archive_sha256
+                ):
+                    raise PublicAPIError(
+                        409,
+                        "skill_source_snapshot_hash_mismatch",
+                        "Skill source snapshot archive does not match the trusted hash",
+                    )
                 try:
                     bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
                         f"{source.id}-{snapshot.commit_sha[:12]}.zip",
@@ -9115,7 +9490,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 event = AuditEventResponse(
                     id=f"audit_{uuid4().hex}",
                     actor=str(self._actor_id),
-                    action="skill_source.snapshot.import",
+                    action=_audit_action,
                     resource=f"skill_source:{source_id}",
                     details=_safe_audit_details(
                         {
@@ -9145,9 +9520,75 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     items=items,
                     skipped=skipped_responses,
                 )
-            return SkillSourceSyncResponse(source=succeeded, upload=upload)
+                revision_context_rows = list(
+                    await session.scalars(
+                        select(AdminResourceRow)
+                        .where(AdminResourceRow.tenant_id == self._tenant_id)
+                        .where(
+                            AdminResourceRow.kind.in_(
+                                ["setting", "skill_source_revision"]
+                            )
+                        )
+                        .with_for_update()
+                    )
+                )
+                active_mapping: dict[str, str] = {}
+                previous_revision: SkillSourceRevisionResponse | None = None
+                for context_row in revision_context_rows:
+                    if (
+                        context_row.kind == "setting"
+                        and context_row.resource_id
+                        == _SKILL_ACTIVE_VERSIONS_SETTING_ID
+                    ):
+                        active_mapping = _active_skill_versions_from_payload(
+                            context_row.payload
+                        )
+                    elif (
+                        context_row.kind == "skill_source_revision"
+                        and context_row.resource_id == source.active_revision_id
+                    ):
+                        previous_revision = _skill_source_revision_response(
+                            context_row.payload,
+                            context_row.resource_id,
+                            active_revision_id=source.active_revision_id,
+                        )
+                revision = _new_skill_source_revision(
+                    succeeded,
+                    upload,
+                    sync_id=sync_id,
+                    commit_sha=snapshot.commit_sha,
+                    archive_sha256=snapshot.archive_sha256,
+                    previous_revision=previous_revision,
+                    previous_active_mapping=active_mapping,
+                )
+                session.add(
+                    AdminResourceRow(
+                        id=uuid4(),
+                        tenant_id=self._tenant_id,
+                        kind="skill_source_revision",
+                        resource_id=revision.id,
+                        payload=revision.model_dump(mode="json"),
+                    )
+                )
+                await self._record_audit_in_session(
+                    session,
+                    "skill_source.revision.create",
+                    f"skill_source_revision:{revision.id}",
+                    {
+                        "source_id": source_id,
+                        "sync_id": sync_id,
+                        "commit_sha": snapshot.commit_sha,
+                        "archive_sha256": snapshot.archive_sha256,
+                    },
+                )
+            return SkillSourceSyncResponse(
+                source=succeeded,
+                upload=upload,
+                revision=revision,
+            )
         except PublicAPIError as error:
-            await self._record_skill_source_import_failure(source_id, sync_id, error)
+            if _audit_action == "skill_source.snapshot.import":
+                await self._record_skill_source_import_failure(source_id, sync_id, error)
             raise
         except SkillSourceFetchError as error:
             public_error = PublicAPIError(
@@ -9156,13 +9597,41 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "Skill source snapshot import failed",
                 details={"reason": _skill_source_error_detail(error)},
             )
-            await self._record_skill_source_import_failure(
-                source_id, sync_id, public_error
-            )
+            if _audit_action == "skill_source.snapshot.import":
+                await self._record_skill_source_import_failure(
+                    source_id, sync_id, public_error
+                )
             raise public_error from None
         except Exception as error:
-            await self._record_skill_source_import_failure(source_id, sync_id, error)
+            if _audit_action == "skill_source.snapshot.import":
+                await self._record_skill_source_import_failure(source_id, sync_id, error)
             raise
+
+    async def _persist_skill_source_snapshot_batch(
+        self,
+        source_id: str,
+        snapshot: SkillSourceSnapshot | None,
+        *,
+        sync_id: str,
+        audit_action: str,
+        commit_sha: str | None = None,
+        archive_bytes: bytes | None = None,
+    ) -> SkillSourceSyncResponse:
+        return await self.import_skill_source_snapshot(
+            source_id,
+            commit_sha=(
+                snapshot.commit_sha
+                if snapshot is not None
+                else cast(str, commit_sha)
+            ),
+            archive_bytes=(
+                b"" if snapshot is not None else cast(bytes, archive_bytes)
+            ),
+            _snapshot=snapshot,
+            _sync_id=sync_id,
+            _audit_action=audit_action,
+            _batch=True,
+        )
 
     async def _record_skill_source_import_failure(
         self,
@@ -9261,21 +9730,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     credential=credential,
                 )
             )
-            synced_at = datetime.now(UTC)
-            upload = await self.upload_skill_archive(
-                f"{source.id}-{snapshot.commit_sha[:12]}.zip",
-                snapshot.skill_archive,
-                strategy="new_version",
-                source=_skill_source_provenance(
-                    source,
-                    snapshot,
-                    sync_id=sync_id,
-                    synced_at=synced_at,
-                ),
-                activate=False,
+            return await self._persist_skill_source_snapshot_batch(
+                source_id,
+                snapshot,
+                sync_id=sync_id,
+                audit_action="skill_source.sync",
             )
-            if not upload.items:
-                raise SkillSourceFetchError("skill source contains no importable Skill")
         except Exception as error:  # noqa: BLE001 - persist a safe terminal sync state
             failure_reason = _skill_source_error_detail(error)
             await self._finish_skill_source_sync(
@@ -9299,34 +9759,575 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "Skill source synchronization failed",
                 details={"reason": failure_reason},
             ) from None
-        linked_ids = list(
-            dict.fromkeys([*source.linked_skill_ids, *(item.id for item in upload.items)])
+
+    async def _persist_skill_source_revision(
+        self,
+        source: SkillSourceResponse,
+        upload: SkillArchiveUploadResponse,
+        *,
+        sync_id: str,
+        commit_sha: str,
+        archive_sha256: str,
+    ) -> SkillSourceRevisionResponse:
+        if self._session_factory is None:
+            return await self._create_in_memory_skill_source_revision(
+                source,
+                upload,
+                sync_id=sync_id,
+                commit_sha=commit_sha,
+                archive_sha256=archive_sha256,
+            )
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-source:{source.id}"},
+            )
+            rows = list(
+                await session.scalars(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(
+                        AdminResourceRow.kind.in_(
+                            ["skill_source", "skill_source_revision", "setting"]
+                        )
+                    )
+                    .with_for_update()
+                )
+            )
+            source_row = next(
+                (
+                    row
+                    for row in rows
+                    if row.kind == "skill_source" and row.resource_id == source.id
+                ),
+                None,
+            )
+            if source_row is None:
+                raise PublicAPIError(
+                    409,
+                    "skill_source_sync_stale",
+                    "Skill source changed during synchronization",
+                )
+            current = _skill_source_response(source_row.payload, source.id)
+            if (
+                current.last_sync_id != sync_id
+                or current.sync_state != "succeeded"
+                or current.trust_state != "trusted"
+                or not current.enabled
+                or current.resolved_commit_sha != commit_sha
+                or current.archive_sha256 != archive_sha256
+            ):
+                raise PublicAPIError(
+                    409,
+                    "skill_source_sync_stale",
+                    "Skill source changed during synchronization",
+                )
+            active_mapping: dict[str, str] = {}
+            previous_revision: SkillSourceRevisionResponse | None = None
+            for row in rows:
+                if (
+                    row.kind == "setting"
+                    and row.resource_id == _SKILL_ACTIVE_VERSIONS_SETTING_ID
+                ):
+                    active_mapping = _active_skill_versions_from_payload(row.payload)
+                elif (
+                    row.kind == "skill_source_revision"
+                    and row.resource_id == current.active_revision_id
+                ):
+                    previous_revision = _skill_source_revision_response(
+                        row.payload,
+                        row.resource_id,
+                        active_revision_id=current.active_revision_id,
+                    )
+            revision = _new_skill_source_revision(
+                current,
+                upload,
+                sync_id=sync_id,
+                commit_sha=commit_sha,
+                archive_sha256=archive_sha256,
+                previous_revision=previous_revision,
+                previous_active_mapping=active_mapping,
+            )
+            session.add(
+                AdminResourceRow(
+                    id=uuid4(),
+                    tenant_id=self._tenant_id,
+                    kind="skill_source_revision",
+                    resource_id=revision.id,
+                    payload=revision.model_dump(mode="json"),
+                )
+            )
+            await self._record_audit_in_session(
+                session,
+                "skill_source.revision.create",
+                f"skill_source_revision:{revision.id}",
+                {
+                    "source_id": source.id,
+                    "sync_id": sync_id,
+                    "commit_sha": commit_sha,
+                    "archive_sha256": archive_sha256,
+                },
+            )
+        return revision
+
+    async def list_skill_source_revisions(
+        self, source_id: str
+    ) -> tuple[SkillSourceRevisionResponse, ...]:
+        await self._recover_skill_source_revision_switch(source_id)
+        rows = await self._list_admin_payloads_with_metadata("skill_source_revision")
+        if rows is None:
+            return await super().list_skill_source_revisions(source_id)
+        source_payload = await self._get_admin_payload("skill_source", source_id)
+        active_revision_id = (
+            _skill_source_response(source_payload, source_id).active_revision_id
+            if source_payload
+            else None
         )
-        succeeded = await self._finish_skill_source_sync(
+        return tuple(
+            _skill_source_revision_response(
+                payload,
+                resource_id,
+                active_revision_id=active_revision_id,
+            )
+            for resource_id, payload, _created_at, _updated_at in rows
+            if payload.get("source_id") == source_id
+        )
+
+    async def get_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        await self._recover_skill_source_revision_switch(source_id)
+        payload = await self._get_admin_payload("skill_source_revision", revision_id)
+        if payload is None:
+            return await super().get_skill_source_revision(source_id, revision_id)
+        if not payload or payload.get("source_id") != source_id:
+            raise KeyError(revision_id)
+        source_payload = await self._get_admin_payload("skill_source", source_id)
+        active_revision_id = (
+            _skill_source_response(source_payload, source_id).active_revision_id
+            if source_payload
+            else None
+        )
+        return _skill_source_revision_response(
+            payload,
+            revision_id,
+            active_revision_id=active_revision_id,
+        )
+
+    async def activate_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        if self._session_factory is None:
+            return await super().activate_skill_source_revision(source_id, revision_id)
+        return await self._switch_skill_source_revision(
             source_id,
-            sync_id,
-            updates={
-                "sync_state": "succeeded",
-                "sync_started_at": None,
-                "resolved_commit_sha": snapshot.commit_sha,
-                "archive_sha256": snapshot.archive_sha256,
-                "source_archive_bytes": snapshot.source_archive_bytes,
-                "last_synced_at": synced_at,
-                "last_error": None,
-                "linked_skill_ids": linked_ids,
-            },
-            require_trusted=True,
+            revision_id,
+            rollback=False,
         )
-        await self._record_audit(
-            "skill_source.sync",
-            f"skill_source:{source_id}",
-            {
-                "commit_sha": snapshot.commit_sha,
-                "archive_sha256": snapshot.archive_sha256,
-                "skill_ids": linked_ids,
-            },
+
+    async def rollback_skill_source_revision(
+        self, source_id: str, revision_id: str
+    ) -> SkillSourceRevisionResponse:
+        if self._session_factory is None:
+            return await super().rollback_skill_source_revision(source_id, revision_id)
+        return await self._switch_skill_source_revision(
+            source_id,
+            revision_id,
+            rollback=True,
         )
-        return SkillSourceSyncResponse(source=succeeded, upload=upload)
+
+    async def _switch_skill_source_revision(
+        self,
+        source_id: str,
+        revision_id: str,
+        *,
+        rollback: bool,
+    ) -> SkillSourceRevisionResponse:
+        if self._session_factory is None:
+            raise RuntimeError("persistent revision switch requires a session factory")
+        await self._recover_skill_source_revision_switch(source_id)
+        intent_id = _skill_source_revision_recovery_intent_id(source_id)
+        async with self._session_factory() as session, session.begin():
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+                    ),
+                    {"lock_key": f"agent-hub:{self._tenant_id}:skill-active-map"},
+                )
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+                    ),
+                    {
+                        "lock_key": (
+                            f"agent-hub:{self._tenant_id}:skill-source:{source_id}"
+                        )
+                    },
+                )
+                rows = list(
+                    await session.scalars(
+                        select(AdminResourceRow)
+                        .where(AdminResourceRow.tenant_id == self._tenant_id)
+                        .where(
+                            AdminResourceRow.kind.in_(
+                                [
+                                    "skill_source",
+                                    "skill_source_revision",
+                                    "skill",
+                                    "setting",
+                                ]
+                            )
+                        )
+                        .with_for_update()
+                    )
+                )
+                source_row = next(
+                    (
+                        row
+                        for row in rows
+                        if row.kind == "skill_source"
+                        and row.resource_id == source_id
+                    ),
+                    None,
+                )
+                revision_row = next(
+                    (
+                        row
+                        for row in rows
+                        if row.kind == "skill_source_revision"
+                        and row.resource_id == revision_id
+                    ),
+                    None,
+                )
+                if source_row is None or revision_row is None:
+                    raise KeyError(revision_id if revision_row is None else source_id)
+                source = _skill_source_response(source_row.payload, source_id)
+                revision = _skill_source_revision_response(
+                    revision_row.payload,
+                    revision_id,
+                    active_revision_id=source.active_revision_id,
+                )
+                if revision.source_id != source_id:
+                    raise KeyError(revision_id)
+                setting_row = next(
+                    (
+                        row
+                        for row in rows
+                        if row.kind == "setting"
+                        and row.resource_id == _SKILL_ACTIVE_VERSIONS_SETTING_ID
+                    ),
+                    None,
+                )
+                current_mapping = (
+                    {}
+                    if setting_row is None
+                    else _active_skill_versions_from_payload(setting_row.payload)
+                )
+                if rollback:
+                    if (
+                        source.active_revision_id != revision.id
+                        or current_mapping != revision.active_mapping
+                    ):
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_revision_not_active",
+                            "Only the active Skill source revision can be rolled back",
+                        )
+                    target_mapping = dict(revision.previous_active_mapping)
+                    target_revision_id = revision.previous_revision_id
+                    action = "skill_source.revision.rollback"
+                else:
+                    if source.trust_state != "trusted" or not source.enabled:
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_revision_source_untrusted",
+                            "Skill source must remain trusted before revision activation",
+                        )
+                    if (
+                        source.active_revision_id != revision.previous_revision_id
+                        or current_mapping != revision.previous_active_mapping
+                    ):
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_revision_stale",
+                            "Active Skill mapping changed after revision creation",
+                        )
+                    target_mapping = dict(revision.active_mapping)
+                    target_revision_id = revision.id
+                    action = "skill_source.revision.activate"
+
+                skill_rows = {
+                    row.resource_id: row for row in rows if row.kind == "skill"
+                }
+                target_archives: dict[str, tuple[SkillResponse, bytes]] = {}
+                for skill_name, version_id in target_mapping.items():
+                    skill_row = skill_rows.get(version_id)
+                    if skill_row is None:
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_revision_not_ready",
+                            "Every active Skill version must still exist",
+                        )
+                    skill = _skill_response_from_payload(
+                        skill_row.payload, resource_id=version_id
+                    )
+                    if skill.name != skill_name or skill.status != "enabled":
+                        raise PublicAPIError(
+                            409,
+                            "skill_source_revision_not_ready",
+                            "Every Skill revision item must be approved before activation",
+                        )
+                    archive_path = self._skill_activatable_archive_path(version_id)
+                    if archive_path is None:
+                        raise PublicAPIError(
+                            409,
+                            "skill_archive_missing",
+                            "approved skill archive is missing",
+                        )
+                    target_archives[version_id] = (
+                        skill,
+                        self._validated_skill_archive_bytes(skill, archive_path),
+                    )
+                if not rollback:
+                    for item in revision.items:
+                        skill_row = skill_rows.get(item.version_id)
+                        if skill_row is None:
+                            raise PublicAPIError(
+                                409,
+                                "skill_source_revision_not_ready",
+                                "Every Skill revision item must still exist",
+                            )
+                        skill = _skill_response_from_payload(
+                            skill_row.payload, resource_id=item.version_id
+                        )
+                        if (
+                            skill.status != "enabled"
+                            or skill.content_sha256 != item.content_sha256
+                            or skill.archive_sha256 != item.archive_sha256
+                        ):
+                            raise PublicAPIError(
+                                409,
+                                "skill_source_revision_not_ready",
+                                "Every Skill revision item must be approved and unchanged",
+                            )
+
+                if setting_row is None:
+                    setting_row = AdminResourceRow(
+                        id=uuid4(),
+                        tenant_id=self._tenant_id,
+                        kind="setting",
+                        resource_id=_SKILL_ACTIVE_VERSIONS_SETTING_ID,
+                        payload={"active_versions": target_mapping},
+                    )
+                    session.add(setting_row)
+                else:
+                    setting_row.payload = {"active_versions": target_mapping}
+                source_row.payload = _skill_source_storage_payload(
+                    source.model_copy(
+                        update={"active_revision_id": target_revision_id}
+                    )
+                )
+                intent_row = next(
+                    (
+                        row
+                        for row in rows
+                        if row.kind == "setting" and row.resource_id == intent_id
+                    ),
+                    None,
+                )
+                intent_payload: dict[str, object] = {
+                    "source_id": source_id,
+                    "operation_id": f"revision_switch_{uuid4().hex}",
+                    "requested_revision_id": revision_id,
+                    "target_revision_id": target_revision_id,
+                    "target_mapping": target_mapping,
+                    "action": "rollback" if rollback else "activate",
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+                if intent_row is None:
+                    session.add(
+                        AdminResourceRow(
+                            id=uuid4(),
+                            tenant_id=self._tenant_id,
+                            kind="setting",
+                            resource_id=intent_id,
+                            payload=intent_payload,
+                        )
+                    )
+                else:
+                    intent_row.payload = intent_payload
+                await self._record_audit_in_session(
+                    session,
+                    action,
+                    f"skill_source_revision:{revision.id}",
+                    {
+                        "source_id": source_id,
+                        "revision_id": revision.id,
+                        "restored_revision_id": target_revision_id,
+                        "active_mapping": target_mapping,
+                    },
+                )
+        await self._recover_skill_source_revision_switch(source_id)
+        if rollback and revision.previous_revision_id is not None:
+            previous_row = next(
+                (
+                    row
+                    for row in rows
+                    if row.kind == "skill_source_revision"
+                    and row.resource_id == revision.previous_revision_id
+                ),
+                None,
+            )
+            if previous_row is not None:
+                result = _skill_source_revision_response(
+                    previous_row.payload,
+                    previous_row.resource_id,
+                    active_revision_id=revision.previous_revision_id,
+                )
+            else:
+                result = revision.model_copy(update={"is_active": False})
+        else:
+            result = revision.model_copy(update={"is_active": not rollback})
+        return result
+
+    async def _recover_skill_source_revision_switch(self, source_id: str) -> None:
+        if self._session_factory is None:
+            await self._recover_in_memory_skill_source_revision_switch(source_id)
+            return
+        intent_id = _skill_source_revision_recovery_intent_id(source_id)
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-active-map"},
+            )
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {
+                    "lock_key": (
+                        f"agent-hub:{self._tenant_id}:skill-source:{source_id}"
+                    )
+                },
+            )
+            rows = list(
+                await session.scalars(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind.in_(["skill", "setting"]))
+                    .with_for_update()
+                )
+            )
+            intent_row = next(
+                (
+                    row
+                    for row in rows
+                    if row.kind == "setting" and row.resource_id == intent_id
+                ),
+                None,
+            )
+            if intent_row is None:
+                return
+            operation_id = intent_row.payload.get("operation_id")
+            if (
+                intent_row.payload.get("source_id") != source_id
+                or not isinstance(operation_id, str)
+                or not operation_id
+            ):
+                raise PublicAPIError(
+                    409,
+                    "skill_source_recovery_invalid",
+                    "Skill source recovery intent is invalid",
+                )
+            setting_row = next(
+                (
+                    row
+                    for row in rows
+                    if row.kind == "setting"
+                    and row.resource_id == _SKILL_ACTIVE_VERSIONS_SETTING_ID
+                ),
+                None,
+            )
+            target_mapping = _active_skill_versions_from_payload(
+                {} if setting_row is None else setting_row.payload
+            )
+            skills = {
+                row.resource_id: _skill_response_from_payload(
+                    row.payload, resource_id=row.resource_id
+                )
+                for row in rows
+                if row.kind == "skill"
+            }
+            self._materialize_skill_active_mapping(target_mapping, skills)
+            if intent_row.payload.get("operation_id") == operation_id:
+                await session.delete(intent_row)
+
+    async def _recover_in_memory_skill_source_revision_switch(
+        self, source_id: str
+    ) -> None:
+        intent_id = _skill_source_revision_recovery_intent_id(source_id)
+        intent = await self._get_admin_payload("setting", intent_id)
+        if not intent:
+            return
+        if intent.get("source_id") != source_id:
+            raise PublicAPIError(
+                409,
+                "skill_source_recovery_invalid",
+                "Skill source recovery intent is invalid",
+            )
+        setting = await self._get_admin_payload(
+            "setting", _SKILL_ACTIVE_VERSIONS_SETTING_ID
+        )
+        target_mapping = _active_skill_versions_from_payload(setting or {})
+        skill_rows = await self._list_admin_payloads_with_metadata("skill")
+        if skill_rows is None:
+            return
+        skills = {
+            resource_id: _skill_response_from_payload(
+                payload, resource_id=resource_id
+            )
+            for resource_id, payload, _created_at, _updated_at in skill_rows
+        }
+        self._materialize_skill_active_mapping(target_mapping, skills)
+        current_intent = await self._get_admin_payload("setting", intent_id)
+        if current_intent and current_intent.get("operation_id") == intent.get(
+            "operation_id"
+        ):
+            await self._delete_admin_payload("setting", intent_id)
+
+    def _materialize_skill_active_mapping(
+        self,
+        target_mapping: Mapping[str, str],
+        skills: Mapping[str, SkillResponse],
+    ) -> None:
+        archive_bytes_by_id: dict[str, bytes] = {}
+        for skill_name, version_id in target_mapping.items():
+            skill = skills.get(version_id)
+            if skill is None or skill.name != skill_name or skill.status != "enabled":
+                raise PublicAPIError(
+                    409,
+                    "skill_source_recovery_not_ready",
+                    "Database active Skill mapping cannot be restored",
+                )
+            archive_path = self._skill_activatable_archive_path(version_id)
+            if archive_path is None:
+                raise PublicAPIError(
+                    409,
+                    "skill_archive_missing",
+                    "approved skill archive is missing",
+                )
+            archive_bytes_by_id[version_id] = self._validated_skill_archive_bytes(
+                skill, archive_path
+            )
+
+        target_ids = set(target_mapping.values())
+        for version_id in skills:
+            active_path = self._skill_archive_path(version_id)
+            if version_id in target_ids:
+                active_path.parent.mkdir(parents=True, exist_ok=True)
+                self._atomic_write_skill_archive(
+                    active_path, archive_bytes_by_id[version_id]
+                )
+            else:
+                active_path.unlink(missing_ok=True)
 
     async def _start_skill_source_sync(
         self, source_id: str, sync_id: str
@@ -9418,15 +10419,37 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return updated
 
     async def delete_skill_source(self, source_id: str) -> None:
-        deleted = await self._delete_admin_payload("skill_source", source_id)
-        if deleted is None:
+        if self._session_factory is None:
             await super().delete_skill_source(source_id)
             return
-        if not deleted:
-            raise KeyError(source_id)
-        await self._record_audit(
-            "skill_source.delete", f"skill_source:{source_id}", {"id": source_id}
-        )
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-source:{source_id}"},
+            )
+            row = await session.scalar(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind == "skill_source")
+                .where(AdminResourceRow.resource_id == source_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError(source_id)
+            source = _skill_source_response(row.payload, source_id)
+            if source.active_revision_id is not None:
+                raise PublicAPIError(
+                    409,
+                    "skill_source_active",
+                    "Active Skill source must be rolled back before deletion",
+                )
+            await session.delete(row)
+            await self._record_audit_in_session(
+                session,
+                "skill_source.delete",
+                f"skill_source:{source_id}",
+                {"id": source_id},
+            )
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
         skill_id = _manual_skill_upload_id(request.filename)
@@ -9666,14 +10689,52 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             if payload
             else None
         )
-        if skill is not None:
-            await self._clear_active_skill_version(skill.name, skill_id)
-        deleted = await self._delete_admin_payload("skill", skill_id)
-        if deleted is None:
+        if payload is None:
             await super().delete_skill(skill_id)
             return
-        if not deleted:
+        if skill is None:
             raise KeyError(skill_id)
+        if self._session_factory is None:
+            await super().delete_skill(skill_id)
+            return
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-active-map"},
+            )
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-active:{skill.name}"},
+            )
+            await self._assert_skill_source_revision_not_active_in_session(
+                session,
+                skill.name,
+                version_id=skill_id,
+            )
+            setting_row = await session.scalar(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind == "setting")
+                .where(AdminResourceRow.resource_id == _SKILL_ACTIVE_VERSIONS_SETTING_ID)
+                .with_for_update()
+            )
+            if setting_row is not None:
+                active_versions = _active_skill_versions_from_payload(setting_row.payload)
+                if active_versions.get(skill.name) == skill_id:
+                    active_versions.pop(skill.name, None)
+                    setting_row.payload = {"active_versions": active_versions}
+            await session.execute(
+                delete(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind == "skill")
+                .where(AdminResourceRow.resource_id == skill_id)
+            )
+            await self._record_audit_in_session(
+                session,
+                "skill.delete",
+                f"skill:{skill_id}",
+                {"id": skill_id},
+            )
         try:
             for archive_path in self._skill_archive_paths(skill_id):
                 archive_path.unlink(missing_ok=True)
@@ -9686,7 +10747,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 source="skills.delete",
                 details={"feature": "skills", "skill_id": skill_id},
             )
-        await self._record_audit("skill.delete", f"skill:{skill_id}", {"id": skill_id})
 
     async def list_plugins(
         self,
@@ -10293,8 +11353,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         try:
             async with self._session_factory() as session, session.begin():
                 await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+                    ),
+                    {"lock_key": f"agent-hub:{self._tenant_id}:skill-active-map"},
+                )
+                await session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
                     {"lock_key": f"agent-hub:{self._tenant_id}:skill-active:{skill_name}"},
+                )
+                await self._assert_skill_source_revision_not_active_in_session(
+                    session,
+                    skill_name,
                 )
                 row = await session.scalar(
                     select(AdminResourceRow)
@@ -10332,13 +11402,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def _clear_active_skill_version(self, skill_name: str, version_id: str) -> None:
         if self._session_factory is None:
+            self._assert_skill_source_revision_not_active(
+                skill_name,
+                version_id=version_id,
+            )
             if self.skill_active_versions.get(skill_name) == version_id:
                 self.skill_active_versions.pop(skill_name, None)
             return
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"agent-hub:{self._tenant_id}:skill-active-map"},
+            )
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
                 {"lock_key": f"agent-hub:{self._tenant_id}:skill-active:{skill_name}"},
+            )
+            await self._assert_skill_source_revision_not_active_in_session(
+                session,
+                skill_name,
+                version_id=version_id,
             )
             row = await session.scalar(
                 select(AdminResourceRow)
@@ -10354,6 +11437,49 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 return
             active_versions.pop(skill_name, None)
             row.payload = {"active_versions": active_versions}
+
+    async def _assert_skill_source_revision_not_active_in_session(
+        self,
+        session: AsyncSession,
+        skill_name: str,
+        *,
+        version_id: str | None = None,
+    ) -> None:
+        rows = list(
+            await session.scalars(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind.in_(["skill_source", "skill_source_revision"]))
+                .with_for_update()
+            )
+        )
+        revision_rows = {
+            row.resource_id: row for row in rows if row.kind == "skill_source_revision"
+        }
+        for source_row in rows:
+            if source_row.kind != "skill_source":
+                continue
+            source = _skill_source_response(source_row.payload, source_row.resource_id)
+            if source.active_revision_id is None:
+                continue
+            revision_row = revision_rows.get(source.active_revision_id)
+            if revision_row is None:
+                continue
+            revision = _skill_source_revision_response(
+                revision_row.payload,
+                revision_row.resource_id,
+                active_revision_id=source.active_revision_id,
+            )
+            active_version_id = revision.active_mapping.get(skill_name)
+            if active_version_id is None or (
+                version_id is not None and active_version_id != version_id
+            ):
+                continue
+            raise PublicAPIError(
+                409,
+                "skill_source_revision_active",
+                "Active Skill source revision must be rolled back first",
+            )
 
     async def list_mcp_servers(
         self,
@@ -16325,6 +17451,74 @@ async def import_skill_source_snapshot(
             commit_sha=commit_sha,
             archive_bytes=archive_bytes,
         )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.get(
+    "/skill-sources/{source_id}/revisions",
+    response_model=list[SkillSourceRevisionResponse],
+    responses=error_responses(401, 403, 404, 422),
+)
+async def list_skill_source_revisions(
+    source_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[SkillSourceRevisionResponse]:
+    _require(principal, "skill:read")
+    return list(await service.list_skill_source_revisions(source_id))
+
+
+@router.get(
+    "/skill-sources/{source_id}/revisions/{revision_id}",
+    response_model=SkillSourceRevisionResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def get_skill_source_revision(
+    source_id: str,
+    revision_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillSourceRevisionResponse:
+    _require(principal, "skill:read")
+    try:
+        return await service.get_skill_source_revision(source_id, revision_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.post(
+    "/skill-sources/{source_id}/revisions/{revision_id}/activate",
+    response_model=SkillSourceRevisionResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def activate_skill_source_revision(
+    source_id: str,
+    revision_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillSourceRevisionResponse:
+    _require(principal, "skill:approve")
+    try:
+        return await service.activate_skill_source_revision(source_id, revision_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.post(
+    "/skill-sources/{source_id}/revisions/{revision_id}/rollback",
+    response_model=SkillSourceRevisionResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def rollback_skill_source_revision(
+    source_id: str,
+    revision_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillSourceRevisionResponse:
+    _require(principal, "skill:approve")
+    try:
+        return await service.rollback_skill_source_revision(source_id, revision_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
 

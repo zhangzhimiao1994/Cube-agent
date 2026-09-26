@@ -100,6 +100,7 @@ def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() 
         "main_agent",
         "skill",
         "skill_source",
+        "skill_source_revision",
         "mcp",
         "memory",
         "hermes",
@@ -138,6 +139,76 @@ def test_latest_migration_allows_capability_install_admin_resources() -> None:
     assert migration.down_revision == "0023_runtime_artifacts"
     assert "capability_install" in migration._NEXT_KINDS
     assert "capability_install" not in migration._CURRENT_KINDS
+
+
+def test_skill_source_revision_migration_updates_and_restores_kind_constraint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0030_skill_source_revisions.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migration_0030_skill_source_revisions", migration_path
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        migration.op,
+        "drop_constraint",
+        lambda *args, **kwargs: calls.append(("drop", *args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_check_constraint",
+        lambda *args, **kwargs: calls.append(("create", *args, kwargs)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "execute",
+        lambda statement: calls.append(("execute", statement)),
+    )
+
+    migration.upgrade()
+    upgrade_calls = list(calls)
+    calls.clear()
+    migration.downgrade()
+
+    assert migration.revision == "0030_skill_source_revisions"
+    assert migration.down_revision == "0029_project_workspaces"
+    assert "skill_source_revision" in migration._NEXT_KINDS
+    assert "skill_source_revision" not in migration._CURRENT_KINDS
+    assert upgrade_calls[-1][0] == "create"
+    assert "skill_source_revision" in upgrade_calls[-1][3]
+    assert calls[1] == (
+        "execute",
+        (
+            "DELETE FROM agent_hub_admin_resources "
+            "WHERE kind = 'setting' "
+            "AND resource_id LIKE 'skill-source-recovery-%'"
+        ),
+    )
+    assert calls[2] == (
+        "execute",
+        (
+            "UPDATE agent_hub_admin_resources "
+            "SET payload = payload - 'active_revision_id' "
+            "WHERE kind = 'skill_source' "
+            "AND payload ? 'active_revision_id'"
+        ),
+    )
+    assert calls[3] == (
+        "execute",
+        "DELETE FROM agent_hub_admin_resources WHERE kind = 'skill_source_revision'",
+    )
+    assert calls[-1][0] == "create"
+    assert "skill_source_revision" not in calls[-1][3]
 
 
 def test_run_conversation_index_covers_filter_and_chronological_order() -> None:
