@@ -73,6 +73,7 @@ from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PLUGIN_RUNTIME_FAILURE_CODES
 from agent_hub.capability_installer.service import CapabilityInstallerService
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
 from agent_hub.mcp.client import InMemoryMcpClient
@@ -14879,7 +14880,7 @@ async def test_persistent_hermes_missing_payload_does_not_fallback_to_in_memory_
 @pytest.mark.asyncio
 async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate_owner() -> None:
     owner_actor_id = uuid4()
-    row = admin_router.AdminResourceRow(
+    row = AdminResourceRow(
         id=uuid4(),
         tenant_id=TENANT_ID,
         kind="hermes",
@@ -14897,7 +14898,7 @@ async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate
     )
 
     class ScalarResult:
-        def scalar_one_or_none(self) -> admin_router.AdminResourceRow:
+        def scalar_one_or_none(self) -> AdminResourceRow:
             return row
 
     class CapturingSession:
