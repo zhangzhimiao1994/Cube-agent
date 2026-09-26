@@ -2,16 +2,190 @@
 
 from __future__ import annotations
 
+import os
+import platform as platform_module
 import re
+import shutil
+import subprocess
 import zipfile
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from itertools import islice
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Literal
 from urllib.parse import quote
 from uuid import UUID
 
 WORKSPACE_ZIP_MIME_TYPE = "application/zip"
 _SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+WorkspacePlatform = Literal["windows", "linux", "other"]
+ExecutableFinder = Callable[[str], str | None]
+_MAX_DIRECTORY_SCAN = 2_048
+_MAX_DIRECTORY_RESULTS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRootDescription:
+    platform: WorkspacePlatform
+    separator: str
+    configured_root: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativePickerCapability:
+    available: bool
+    unavailable_reason: str | None
+    executable: str | None
+    picker: Literal["windows-folder-browser", "zenity", "kdialog"] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectWorkspaceDirectoryListing:
+    project_id: str
+    platform: WorkspacePlatform
+    separator: str
+    configured_root: str
+    logical_root: str
+    directories: tuple[str, ...]
+    native_picker_available: bool
+    unavailable_reason: str | None
+
+    def to_public_dict(self) -> dict[str, str | bool | tuple[str, ...] | None]:
+        return asdict(self)
+
+
+class NativePickerUnavailable(RuntimeError):
+    pass
+
+
+class NativePickerCancelled(RuntimeError):
+    pass
+
+
+def describe_workspace_root(
+    root: PurePath,
+    *,
+    system_name: str | None = None,
+) -> WorkspaceRootDescription:
+    name = (system_name or platform_module.system()).strip().casefold()
+    if name == "windows":
+        workspace_platform: WorkspacePlatform = "windows"
+        separator = "\\"
+    elif name == "linux":
+        workspace_platform = "linux"
+        separator = "/"
+    else:
+        workspace_platform = "other"
+        separator = "\\" if isinstance(root, PureWindowsPath) else "/"
+    return WorkspaceRootDescription(
+        platform=workspace_platform,
+        separator=separator,
+        configured_root=str(root),
+    )
+
+
+def native_picker_capability(
+    *,
+    system_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    executable_finder: ExecutableFinder = shutil.which,
+) -> NativePickerCapability:
+    environment = os.environ if environ is None else environ
+    name = (system_name or platform_module.system()).strip().casefold()
+    if name == "windows":
+        session_name = environment.get("SESSIONNAME", "").strip().casefold()
+        if not session_name or session_name == "services":
+            return NativePickerCapability(
+                False,
+                "interactive Windows desktop is unavailable",
+                None,
+                None,
+            )
+        executable = executable_finder("powershell.exe") or executable_finder("pwsh.exe")
+        if executable is None:
+            return NativePickerCapability(False, "PowerShell is unavailable", None, None)
+        return NativePickerCapability(True, None, executable, "windows-folder-browser")
+    if name == "linux":
+        if not (environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY")):
+            return NativePickerCapability(
+                False,
+                "interactive Linux display is unavailable",
+                None,
+                None,
+            )
+        zenity = executable_finder("zenity")
+        if zenity is not None:
+            return NativePickerCapability(True, None, zenity, "zenity")
+        kdialog = executable_finder("kdialog")
+        if kdialog is not None:
+            return NativePickerCapability(True, None, kdialog, "kdialog")
+        return NativePickerCapability(False, "zenity and kdialog are unavailable", None, None)
+    return NativePickerCapability(False, "native directory picker is unsupported", None, None)
+
+
+def build_native_picker_command(
+    sessions_root: PurePath,
+    capability: NativePickerCapability,
+) -> tuple[str, ...]:
+    if not capability.available or capability.executable is None or capability.picker is None:
+        raise NativePickerUnavailable(
+            capability.unavailable_reason or "native directory picker is unavailable"
+        )
+    if capability.picker == "windows-folder-browser":
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "$dialog.SelectedPath = $args[0]; "
+            "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "Write-Output $dialog.SelectedPath }"
+        )
+        return (
+            capability.executable,
+            "-NoProfile",
+            "-STA",
+            "-Command",
+            script,
+            str(sessions_root),
+        )
+    if capability.picker == "zenity":
+        selected_root = f"{str(sessions_root).rstrip('/')}/"
+        return (
+            capability.executable,
+            "--file-selection",
+            "--directory",
+            "--filename",
+            selected_root,
+        )
+    return (capability.executable, "--getexistingdirectory", str(sessions_root))
+
+
+def pick_native_directory(
+    sessions_root: Path,
+    capability: NativePickerCapability,
+) -> Path | None:
+    command = build_native_picker_command(sessions_root, capability)
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise NativePickerUnavailable("native directory picker timed out") from exc
+    except (OSError, UnicodeError) as exc:
+        raise NativePickerUnavailable("native directory picker failed to start") from exc
+    if completed.returncode == 1:
+        return None
+    if completed.returncode != 0:
+        raise NativePickerUnavailable("native directory picker failed")
+    selected = completed.stdout.strip().splitlines()
+    return Path(selected[0]) if selected else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +245,9 @@ class ProjectWorkspaceStore:
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
-        return self._metadata_for(tenant_id, project_id, session_id, safe_path, destination, mime_type)
+        return self._metadata_for(
+            tenant_id, project_id, session_id, safe_path, destination, mime_type
+        )
 
     def list_files(
         self,
@@ -165,12 +341,68 @@ class ProjectWorkspaceStore:
         session = _safe_workspace_segment(session_id)
         return f"/api/v1/workspaces/projects/{project}/sessions/{session}/bundle/download"
 
-    def session_root(self, tenant_id: UUID, project_id: str, session_id: str) -> Path:
+    def list_session_directories(
+        self,
+        tenant_id: UUID,
+        project_id: str,
+    ) -> ProjectWorkspaceDirectoryListing:
         project = _safe_workspace_segment(project_id)
-        session = _safe_workspace_segment(session_id)
+        sessions_root = self.project_sessions_root(tenant_id, project)
+        root_description = describe_workspace_root(self._root)
+        capability = native_picker_capability()
+        directories: list[str] = []
+        if sessions_root.exists():
+            for candidate in sorted(
+                islice(sessions_root.iterdir(), _MAX_DIRECTORY_SCAN),
+                key=lambda item: (item.name.casefold(), item.name),
+            ):
+                if _SAFE_SEGMENT.fullmatch(candidate.name) is None:
+                    continue
+                try:
+                    if candidate.is_symlink() or candidate.is_junction() or not candidate.is_dir():
+                        continue
+                    resolved = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if resolved != candidate or resolved.parent != sessions_root:
+                    continue
+                directories.append(candidate.name)
+                if len(directories) >= _MAX_DIRECTORY_RESULTS:
+                    break
+        separator = root_description.separator
+        logical_root = separator.join((str(tenant_id), "projects", project, "sessions"))
+        return ProjectWorkspaceDirectoryListing(
+            project_id=project,
+            platform=root_description.platform,
+            separator=separator,
+            configured_root=root_description.configured_root,
+            logical_root=logical_root,
+            directories=tuple(directories),
+            native_picker_available=capability.available,
+            unavailable_reason=capability.unavailable_reason,
+        )
+
+    def select_native_session_directory(
+        self,
+        tenant_id: UUID,
+        project_id: str,
+    ) -> str:
+        sessions_root = self.project_sessions_root(tenant_id, project_id)
+        capability = native_picker_capability()
+        if not capability.available:
+            raise NativePickerUnavailable(
+                capability.unavailable_reason or "native directory picker is unavailable"
+            )
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        selected = pick_native_directory(sessions_root, capability)
+        if selected is None:
+            raise NativePickerCancelled("native directory selection was cancelled")
+        return self._validated_selected_session(sessions_root, selected)
+
+    def project_sessions_root(self, tenant_id: UUID, project_id: str) -> Path:
+        project = _safe_workspace_segment(project_id)
         root = self._root
-        # Scope directories must not alias another tenant/project/session inside the store.
-        for component in (str(tenant_id), "projects", project, "sessions", session):
+        for component in (str(tenant_id), "projects", project, "sessions"):
             root = root / component
             if root.is_symlink() or root.is_junction():
                 raise ValueError("workspace path aliases another scope")
@@ -178,6 +410,29 @@ class ProjectWorkspaceStore:
         if resolved != root or not resolved.is_relative_to(self._root):
             raise ValueError("workspace path escapes authorized scope")
         return resolved
+
+    def session_root(self, tenant_id: UUID, project_id: str, session_id: str) -> Path:
+        session = _safe_workspace_segment(session_id)
+        root = self.project_sessions_root(tenant_id, project_id) / session
+        if root.is_symlink() or root.is_junction():
+            raise ValueError("workspace path aliases another scope")
+        resolved = root.resolve()
+        if resolved != root or not resolved.is_relative_to(self._root):
+            raise ValueError("workspace path escapes authorized scope")
+        return resolved
+
+    @staticmethod
+    def _validated_selected_session(sessions_root: Path, selected: Path) -> str:
+        if not selected.is_absolute():
+            raise ValueError("selected workspace directory must be absolute")
+        if selected.is_symlink() or selected.is_junction() or not selected.is_dir():
+            raise ValueError("selected workspace directory is not a safe directory")
+        resolved = selected.resolve(strict=True)
+        if resolved != selected or resolved.parent != sessions_root:
+            raise ValueError("selected workspace directory escapes sessions root")
+        if _SAFE_SEGMENT.fullmatch(resolved.name) is None:
+            raise ValueError("selected workspace directory has an unsafe session name")
+        return resolved.name
 
     def _resolve_candidate(
         self,

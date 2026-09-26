@@ -188,8 +188,11 @@ class ConversationQueueRepository:
         if not normalized_message:
             raise ValueError("message is required")
         async with self._session_factory() as session, session.begin():
+            conversation_id = await self._item_conversation_id(session, tenant_id, item_id)
+            await self._lock_conversation(session, tenant_id, conversation_id)
             row = await self._locked_item(session, tenant_id, item_id)
-            await self._lock_conversation(session, tenant_id, row.conversation_id)
+            if row.conversation_id != conversation_id:
+                raise ConversationQueueConflict("queue item moved to another conversation")
             if row.version != expected_version:
                 raise ConversationQueueConflict("queue item version is stale")
             if row.status != ConversationQueueStatus.QUEUED.value:
@@ -202,6 +205,7 @@ class ConversationQueueRepository:
             successor.request = normalized_message
             successor.version += 1
             await session.flush()
+            await session.refresh(row)
             return self._item(row)
 
     async def cancel(
@@ -212,8 +216,11 @@ class ConversationQueueRepository:
         expected_version: int,
     ) -> ConversationQueueItem:
         async with self._session_factory() as session, session.begin():
+            conversation_id = await self._item_conversation_id(session, tenant_id, item_id)
+            await self._lock_conversation(session, tenant_id, conversation_id)
             row = await self._locked_item(session, tenant_id, item_id)
-            await self._lock_conversation(session, tenant_id, row.conversation_id)
+            if row.conversation_id != conversation_id:
+                raise ConversationQueueConflict("queue item moved to another conversation")
             if row.version != expected_version:
                 raise ConversationQueueConflict("queue item version is stale")
             if row.status == ConversationQueueStatus.CANCELLED.value:
@@ -254,6 +261,7 @@ class ConversationQueueRepository:
                 )
             )
             await session.flush()
+            await session.refresh(row)
             return self._item(row)
 
     async def redirect(
@@ -264,8 +272,11 @@ class ConversationQueueRepository:
         expected_version: int,
     ) -> ConversationQueueItem:
         async with self._session_factory() as session, session.begin():
+            conversation_id = await self._item_conversation_id(session, tenant_id, item_id)
+            await self._lock_conversation(session, tenant_id, conversation_id)
             row = await self._locked_item(session, tenant_id, item_id)
-            await self._lock_conversation(session, tenant_id, row.conversation_id)
+            if row.conversation_id != conversation_id:
+                raise ConversationQueueConflict("queue item moved to another conversation")
             if row.version != expected_version:
                 raise ConversationQueueConflict("queue item version is stale")
             if row.status == ConversationQueueStatus.REDIRECTING.value:
@@ -360,6 +371,7 @@ class ConversationQueueRepository:
                 )
                 await self._release_item(session, tenant_id, row, selected_successor)
             await session.flush()
+            await session.refresh(row)
             return self._item(row)
 
     async def release_next_for_terminal_run(
@@ -368,12 +380,15 @@ class ConversationQueueRepository:
         predecessor_run_id: UUID,
     ) -> ConversationQueueItem | None:
         async with self._session_factory() as session, session.begin():
-            predecessor = await self._tenant_run(session, tenant_id, predecessor_run_id)
-            routing = {} if predecessor.routing_decision is None else predecessor.routing_decision
-            conversation_id = str(routing.get("conversation_id") or "").strip()
+            conversation_id = await self._run_conversation_id_snapshot(
+                session, tenant_id, predecessor_run_id
+            )
             if not conversation_id:
                 return None
             await self._lock_conversation(session, tenant_id, conversation_id)
+            predecessor = await self._tenant_run(session, tenant_id, predecessor_run_id)
+            if self._run_conversation_id(predecessor) != conversation_id:
+                raise ConversationQueueConflict("queue run moved to another conversation")
             terminal_status = RunStatus(predecessor.status)
             if terminal_status not in {
                 RunStatus.COMPLETED,
@@ -426,6 +441,7 @@ class ConversationQueueRepository:
                 return self._item(next_item)
             await self._release_item(session, tenant_id, next_item, successor)
             await session.flush()
+            await session.refresh(next_item)
             return self._item(next_item)
 
     @staticmethod
@@ -489,6 +505,43 @@ class ConversationQueueRepository:
         if row is None:
             raise ConversationQueueNotFound("queue item was not found")
         return row
+
+    @staticmethod
+    async def _item_conversation_id(
+        session: AsyncSession,
+        tenant_id: UUID,
+        item_id: UUID,
+    ) -> str:
+        conversation_id = await session.scalar(
+            select(ConversationQueueItemRow.conversation_id).where(
+                ConversationQueueItemRow.tenant_id == tenant_id,
+                ConversationQueueItemRow.id == item_id,
+            )
+        )
+        if conversation_id is None:
+            raise ConversationQueueNotFound("queue item was not found")
+        return conversation_id
+
+    @staticmethod
+    async def _run_conversation_id_snapshot(
+        session: AsyncSession,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> str:
+        routing = await session.scalar(
+            select(RunRow.routing_decision).where(
+                RunRow.tenant_id == tenant_id,
+                RunRow.id == run_id,
+            )
+        )
+        if routing is None:
+            exists = await session.scalar(
+                select(RunRow.id).where(RunRow.tenant_id == tenant_id, RunRow.id == run_id)
+            )
+            if exists is None:
+                raise ConversationQueueConflict("queue run was not found")
+            return ""
+        return str(routing.get("conversation_id") or "").strip()
 
     @staticmethod
     def _item(row: ConversationQueueItemRow) -> ConversationQueueItem:

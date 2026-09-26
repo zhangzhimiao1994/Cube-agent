@@ -13,6 +13,7 @@ import type {
   PluginSigningKey,
   RunDetail,
   RunListItem,
+  WorkspaceDirectoryList,
 } from "../api/client";
 import { AppRoutes, TestApp } from "../app/router";
 import { AuthProvider } from "../auth/AuthProvider";
@@ -722,6 +723,16 @@ describe("operational management pages", () => {
     }>,
     bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
   };
+  let visibleWorkspaceDirectories: WorkspaceDirectoryList = {
+    project_id: "default",
+    platform: "linux",
+    separator: "/",
+    configured_root: "/var/lib/agent-hub/workspaces",
+    logical_root: "33333333-3333-4333-8333-333333333333/projects/default/sessions",
+    directories: ["conv-previous", "main", "scratch"],
+    native_picker_available: false,
+    unavailable_reason: "remote_client",
+  };
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
   let holdActiveConversationRequest = false;
@@ -787,6 +798,16 @@ describe("operational management pages", () => {
     visibleWorkspaceFiles = {
       items: [],
       bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
+    visibleWorkspaceDirectories = {
+      project_id: "default",
+      platform: "linux",
+      separator: "/",
+      configured_root: "/var/lib/agent-hub/workspaces",
+      logical_root: "33333333-3333-4333-8333-333333333333/projects/default/sessions",
+      directories: ["conv-previous", "main", "scratch"],
+      native_picker_available: false,
+      unavailable_reason: "remote_client",
     };
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
@@ -854,6 +875,17 @@ describe("operational management pages", () => {
           };
           visibleProjectWorkspaces = [created, ...visibleProjectWorkspaces];
           return jsonResponse(created, { status: 201 });
+        }
+        const workspaceDirectoriesMatch = path.match(/^\/api\/v1\/workspaces\/projects\/([^/]+)\/directories$/);
+        const nativeWorkspaceDirectoryMatch = path.match(/^\/api\/v1\/workspaces\/projects\/([^/]+)\/directories\/select-native$/);
+        if (workspaceDirectoriesMatch && method === "GET") {
+          return jsonResponse(visibleWorkspaceDirectories);
+        }
+        if (nativeWorkspaceDirectoryMatch && method === "POST") {
+          return jsonResponse({
+            session_id: "plugin",
+            path: `${visibleWorkspaceDirectories.configured_root}${visibleWorkspaceDirectories.separator}plugin`,
+          });
         }
         if (path === `/api/v1/admin/runs/${runId}` && method === "DELETE") {
           deletedRunIds.add(runId);
@@ -1807,6 +1839,23 @@ describe("operational management pages", () => {
     await user.click(screen.getByText("详细设置"));
   }
 
+  async function openProjectConversationManager(user: ReturnType<typeof userEvent.setup>) {
+    if (document.querySelector(".chat-console.history-drawer-open")) return;
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+  }
+
+  async function openNewProjectDialog(user: ReturnType<typeof userEvent.setup>) {
+    await openProjectConversationManager(user);
+    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    return screen.getByRole("dialog", { name: "新建项目工作区" });
+  }
+
+  async function openNewConversationDialog(user: ReturnType<typeof userEvent.setup>) {
+    await openProjectConversationManager(user);
+    await user.click(screen.getByRole("button", { name: /在.+中新建会话/ }));
+    return screen.getByRole("dialog", { name: "新建会话" });
+  }
+
   it("shows run operations and supports pause control on the detail page", async () => {
     visibleRunListItem = runListItem;
     visibleRunDetail = runDetail;
@@ -2622,8 +2671,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
-    const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    const projectDialog = await openNewProjectDialog(user);
     await user.type(within(projectDialog).getByLabelText("项目名称"), "魔方 Agent");
     await user.type(within(projectDialog).getByLabelText("项目 ID"), "mofang-agent");
     await user.clear(within(projectDialog).getByLabelText("共享工作区名称"));
@@ -3371,7 +3419,7 @@ describe("operational management pages", () => {
     expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
 
-    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await openNewConversationDialog(user);
     await user.click(within(screen.getByRole("dialog", { name: "新建会话" })).getByRole("button", { name: "创建会话" }));
     expect(within(stream).queryByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).toBeNull();
     expect(screen.getByText(/会话已创建/)).not.toBeNull();
@@ -3633,7 +3681,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await openNewConversationDialog(user);
     await user.click(within(screen.getByRole("dialog", { name: "新建会话" })).getByRole("button", { name: "创建会话" }));
 
     expect(screen.queryByRole("status", { name: "自修复确认" })).toBeNull();
@@ -6641,7 +6689,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
 
     expect(document.body.style.overflow).toBe("hidden");
     expect(document.body.style.touchAction).not.toBe("none");
@@ -7059,7 +7107,7 @@ describe("operational management pages", () => {
   });
 
 
-  it("opens conversation history as a right drawer", async () => {
+  it("opens project and conversation management as a right drawer", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -7070,14 +7118,17 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(shell?.className).toContain("mobile-nav-open");
 
-    const historyTrigger = screen.getByRole("button", { name: "打开历史对话" });
+    const historyTrigger = screen.getByRole("button", { name: "打开项目与会话" });
     expect(historyTrigger.className).toContain("mobile-nav-trigger");
     expect(historyTrigger.className).toContain("conversation-drawer-trigger");
 
     await user.click(historyTrigger);
     expect(shell?.className).not.toContain("mobile-nav-open");
     expect(chatConsole?.className).toContain("history-drawer-open");
-    expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
+    expect(screen.getByRole("navigation", { name: "项目与会话管理" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "项目与会话" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "创建项目" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "在默认项目中新建会话" })).not.toBeNull();
     const conversationOpenButton = screen.getByRole("button", { name: conversationOpenButtonName });
     expect(conversationOpenButton).not.toBeNull();
     expect(conversationOpenButton.querySelector(".conversation-title-text")?.textContent).toBe(conversationHistoryTitle);
@@ -7086,10 +7137,72 @@ describe("operational management pages", () => {
     expect(screen.getByText("删除已选（0）")).not.toBeNull();
     expect(screen.getByText(conversationHistoryTitle)).not.toBeNull();
     expect(screen.queryByText("22222222")).toBeNull();
-    expect(screen.getAllByRole("button", { name: "关闭历史对话" }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "关闭项目与会话" }).length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(chatConsole?.className).not.toContain("history-drawer-open");
+  });
+
+  it("chooses a project workspace from a platform-aware server directory dialog", async () => {
+    const user = userEvent.setup();
+    visibleWorkspaceDirectories = {
+      project_id: "browser-tools",
+      platform: "windows",
+      separator: "\\",
+      configured_root: "D:\\AgentHub\\workspaces",
+      logical_root: "33333333-3333-4333-8333-333333333333\\projects\\browser-tools\\sessions",
+      directories: ["main", "plugin"],
+      native_picker_available: true,
+      unavailable_reason: null,
+    };
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    await user.type(within(projectDialog).getByLabelText("项目名称"), "浏览器工具");
+    await user.type(within(projectDialog).getByLabelText("项目 ID"), "browser-tools");
+    await user.click(within(projectDialog).getByRole("button", { name: "选择项目工作目录" }));
+
+    const directoryDialog = await screen.findByRole("dialog", { name: "选择项目工作目录" });
+    expect(within(directoryDialog).getByText("Windows 本机")).not.toBeNull();
+    expect(within(directoryDialog).getByText(/D:\\AgentHub\\workspaces/)).not.toBeNull();
+    await user.click(within(directoryDialog).getByRole("button", { name: "打开 Explorer 选择目录" }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path.endsWith("/directories/select-native") && request.method === "POST")).toBe(true),
+    );
+    expect((within(projectDialog).getByLabelText("共享工作区名称") as HTMLInputElement).value).toBe("plugin");
+  });
+
+  it("uses a temporary server workspace selected in run settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await openRunConfig(user);
+    await expandRunConfigDetails(user);
+    const settingsDialog = screen.getByRole("dialog", { name: "本次运行设置" });
+    expect((within(settingsDialog).getByLabelText("执行环境") as HTMLSelectElement).value).toBe("systemd");
+    await user.click(within(settingsDialog).getByRole("button", { name: "选择本次工作目录" }));
+    const directoryDialog = await screen.findByRole("dialog", { name: "选择本次工作目录" });
+    expect(within(directoryDialog).getByText("Linux 服务器")).not.toBeNull();
+    await user.click(within(directoryDialog).getByRole("button", { name: "选择目录 scratch" }));
+    await user.click(within(settingsDialog).getByRole("button", { name: "关闭运行设置" }));
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "使用临时目录执行");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      body: { workspace_session_id: "scratch", execution_backend: "systemd" },
+    });
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "第二次恢复默认目录");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(requests.filter((request) => request.path === "/api/v1/runs")).toHaveLength(2));
+    expect(requests.filter((request) => request.path === "/api/v1/runs").at(-1)).toMatchObject({
+      body: { workspace_session_id: "conv-previous", execution_backend: "systemd" },
+    });
   });
 
   it("keeps one new-conversation entry and collects project metadata before creating", async () => {
@@ -7097,9 +7210,11 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(screen.getAllByRole("button", { name: "新建对话" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "新建对话" })).toBeNull();
+    await openProjectConversationManager(user);
+    expect(screen.getAllByRole("button", { name: /在.+中新建会话/ })).toHaveLength(1);
 
-    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
+    await user.click(screen.getByRole("button", { name: "创建项目" }));
     const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
     expect(within(projectDialog).queryByLabelText("会话标题")).toBeNull();
     await user.type(within(projectDialog).getByLabelText("项目名称"), "浏览器工具");
@@ -7125,7 +7240,7 @@ describe("operational management pages", () => {
     );
     expect(screen.queryByRole("dialog", { name: "新建会话" })).toBeNull();
     expect(screen.getByText("会话：浏览器插件开发")).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
     expect(screen.getByRole("button", { name: "进入会话 浏览器插件开发" })).not.toBeNull();
   });
 
@@ -7167,10 +7282,17 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    const projectTrigger = screen.getByRole("button", { name: "新建项目工作区" });
+    await openProjectConversationManager(user);
+    const projectTrigger = screen.getByRole("button", { name: "创建项目" });
     await user.click(projectTrigger);
     const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
     expect(document.body.style.overflow).toBe("hidden");
+    await user.type(within(projectDialog).getByLabelText("项目 ID"), "escape-project");
+    await user.click(within(projectDialog).getByRole("button", { name: "选择项目工作目录" }));
+    expect(await screen.findByRole("dialog", { name: "选择项目工作目录" })).not.toBeNull();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "选择项目工作目录" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
     await user.click(within(projectDialog).getByText("项目名称"));
     expect(screen.getByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
     await user.click(document.querySelector(".conversation-dialog-backdrop") as HTMLElement);
@@ -7180,6 +7302,12 @@ describe("operational management pages", () => {
     await openRunConfig(user);
     const settingsDialog = screen.getByRole("dialog", { name: "本次运行设置" });
     expect(document.body.style.overflow).toBe("hidden");
+    await user.click(within(settingsDialog).getByText("详细设置"));
+    await user.click(within(settingsDialog).getByRole("button", { name: "选择本次工作目录" }));
+    expect(await screen.findByRole("dialog", { name: "选择本次工作目录" })).not.toBeNull();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "选择本次工作目录" })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
     await user.click(within(settingsDialog).getByText("本次运行设置"));
     expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
     await user.keyboard("{Escape}");
@@ -7212,8 +7340,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
-    const dialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    const dialog = await openNewProjectDialog(user);
     await user.type(within(dialog).getByLabelText("项目 ID"), "safe-project");
     const workspace = within(dialog).getByLabelText("共享工作区名称");
 
@@ -7548,7 +7675,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
+    expect(screen.getByRole("navigation", { name: "项目与会话管理" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
     await openRunConfig(user);

@@ -979,6 +979,23 @@ const WorkspaceFileListSchema = z.object({
   bundle_download_url: z.string(),
 });
 
+const WorkspaceDirectoryListSchema = z.object({
+  project_id: z.string(),
+  platform: z.enum(["windows", "linux", "other"]),
+  separator: z.enum(["/", "\\"]),
+  configured_root: z.string(),
+  logical_root: z.string(),
+  directories: z.array(z.string()),
+  native_picker_available: z.boolean().default(false),
+  unavailable_reason: z.string().nullable().default(null),
+});
+
+const WorkspaceDirectorySelectionSchema = z.object({
+  session_id: z.string(),
+});
+
+export type WorkspaceDirectoryList = z.infer<typeof WorkspaceDirectoryListSchema>;
+
 export type WorkspaceFile = z.infer<typeof WorkspaceFileSchema>;
 export type WorkspaceFileList = z.infer<typeof WorkspaceFileListSchema>;
 
@@ -2547,6 +2564,20 @@ export const api = {
       `/api/v1/workspaces/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/files`,
       { method: "GET" },
       WorkspaceFileListSchema,
+    );
+  },
+  workspaceDirectories(projectId: string): Promise<WorkspaceDirectoryList> {
+    return request(
+      `/api/v1/workspaces/projects/${encodeURIComponent(projectId)}/directories`,
+      { method: "GET" },
+      WorkspaceDirectoryListSchema,
+    );
+  },
+  selectNativeWorkspaceDirectory(projectId: string): Promise<z.infer<typeof WorkspaceDirectorySelectionSchema>> {
+    return request(
+      `/api/v1/workspaces/projects/${encodeURIComponent(projectId)}/directories/select-native`,
+      { method: "POST" },
+      WorkspaceDirectorySelectionSchema,
     );
   },
   pauseRun(id: string): Promise<RunDetail> {

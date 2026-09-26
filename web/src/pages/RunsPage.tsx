@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef,
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import {
   ArtifactFileCard,
@@ -5430,14 +5430,18 @@ function ConversationDialogShell({
   title,
   children,
   onClose,
+  suspended = false,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
+  suspended?: boolean;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
+  const suspendedRef = useRef(suspended);
   onCloseRef.current = onClose;
+  suspendedRef.current = suspended;
   useEffect(() => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
@@ -5445,6 +5449,7 @@ function ConversationDialogShell({
       dialog?.querySelector<HTMLElement>("input, select, textarea, button")?.focus();
     }, 0);
     function onKeyDown(event: KeyboardEvent) {
+      if (suspendedRef.current) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
@@ -5471,6 +5476,7 @@ function ConversationDialogShell({
         className="conversation-dialog"
         role="dialog"
         aria-modal="true"
+        aria-hidden={suspended || undefined}
         aria-label={title}
       >
         <header>
@@ -5576,6 +5582,8 @@ function NewProjectDialog({
   pending,
   error,
   onChange,
+  onPickDirectory,
+  suspended,
   onClose,
   onSubmit,
 }: {
@@ -5583,13 +5591,15 @@ function NewProjectDialog({
   pending: boolean;
   error: string | null;
   onChange: (next: NewProjectDraft) => void;
+  onPickDirectory: () => void;
+  suspended: boolean;
   onClose: () => void;
   onSubmit: () => void;
 }) {
   const workspaceError = workspacePathError(draft.workspacePath);
   const projectIdError = workspacePathError(draft.projectId);
   return (
-    <ConversationDialogShell title="新建项目工作区" onClose={onClose}>
+    <ConversationDialogShell title="新建项目工作区" onClose={onClose} suspended={suspended}>
       <form
         className="conversation-dialog-form"
         onSubmit={(event) => {
@@ -5630,6 +5640,14 @@ function NewProjectDialog({
             placeholder="例如 main"
           />
         </label>
+        <button
+          type="button"
+          className="secondary-action inline-action"
+          disabled={Boolean(projectIdError)}
+          onClick={onPickDirectory}
+        >
+          选择项目工作目录
+        </button>
         <small>
           该项目下的多个会话将共享 <code>{workspacePreviewPath(draft.projectId, draft.workspacePath)}</code>。
         </small>
@@ -5646,6 +5664,96 @@ function NewProjectDialog({
           </button>
         </div>
       </form>
+    </ConversationDialogShell>
+  );
+}
+
+function workspacePlatformLabel(platform: WorkspaceDirectoryList["platform"], native: boolean): string {
+  if (platform === "windows") return native ? "Windows 本机" : "Windows 服务器";
+  if (platform === "linux") return native ? "Linux 本机" : "Linux 服务器";
+  return native ? "本机" : "服务器";
+}
+
+function workspaceDirectoryRoot(directory: WorkspaceDirectoryList): string {
+  if (directory.configured_root === directory.logical_root) return directory.logical_root;
+  const separator = directory.separator;
+  return `${directory.configured_root.replace(/[\\/]+$/, "")}${separator}${directory.logical_root.replace(/^[\\/]+/, "")}`;
+}
+
+function WorkspaceDirectoryDialog({
+  title,
+  projectId,
+  currentValue,
+  onClose,
+  onSelect,
+}: {
+  title: string;
+  projectId: string;
+  currentValue: string;
+  onClose: () => void;
+  onSelect: (value: string) => void;
+}) {
+  const directories = useQuery({
+    queryKey: ["workspace-directories", projectId],
+    queryFn: () => api.workspaceDirectories(projectId),
+    enabled: !workspacePathError(projectId),
+  });
+  const nativePicker = useMutation({
+    mutationFn: () => api.selectNativeWorkspaceDirectory(projectId),
+    onSuccess: (selection) => onSelect(selection.session_id),
+  });
+  const platform = directories.data?.platform ?? "other";
+  const nativeAvailable = directories.data?.native_picker_available === true;
+  return (
+    <ConversationDialogShell title={title} onClose={onClose}>
+      <div className="workspace-directory-dialog-body">
+        {directories.isLoading ? <p>正在读取工作目录...</p> : null}
+        {directories.isError ? (
+          <p className="form-error" role="alert">{formatApiError(directories.error, "工作目录读取失败")}</p>
+        ) : null}
+        {directories.data ? (
+          <>
+            <section className="workspace-directory-source">
+              <div className="workspace-directory-heading">
+                <h4>{workspacePlatformLabel(platform, nativeAvailable)}</h4>
+                <span className="workspace-platform-badge">{directories.data.separator === "\\" ? "Windows 路径" : "POSIX 路径"}</span>
+              </div>
+              <code className="workspace-configured-root">{workspaceDirectoryRoot(directories.data)}</code>
+              {nativeAvailable ? (
+                <button type="button" disabled={nativePicker.isPending} onClick={() => nativePicker.mutate()}>
+                  {nativePicker.isPending
+                    ? "正在打开..."
+                    : platform === "windows"
+                      ? "打开 Explorer 选择目录"
+                      : "打开系统目录选择器"}
+                </button>
+              ) : (
+                <small>当前运行环境无法打开系统目录选择器，请使用下面的受控服务器目录列表。</small>
+              )}
+            </section>
+            <section className="workspace-directory-source">
+              <h4>受控工作目录</h4>
+              <div className="workspace-directory-options" role="list" aria-label="服务器工作目录">
+                {Array.from(new Set([currentValue, ...directories.data.directories])).filter(Boolean).map((directory) => (
+                  <button
+                    key={directory}
+                    type="button"
+                    className={directory === currentValue ? "selected" : "secondary-action"}
+                    aria-label={`选择目录 ${directory}`}
+                    onClick={() => onSelect(directory)}
+                  >
+                    <span aria-hidden="true">▣</span>
+                    {directory}
+                  </button>
+                ))}
+              </div>
+            </section>
+          </>
+        ) : null}
+        {nativePicker.isError ? (
+          <p className="form-error" role="alert">{formatApiError(nativePicker.error, "系统目录选择器打开失败")}</p>
+        ) : null}
+      </div>
     </ConversationDialogShell>
   );
 }
@@ -5925,6 +6033,7 @@ export function RunsPage() {
   const [projectLabel, setProjectLabel] = useState("");
   const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
   const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
+  const [runWorkspacePath, setRunWorkspacePath] = useState("");
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
@@ -5934,8 +6043,13 @@ export function RunsPage() {
   const configTriggerRef = useRef<HTMLButtonElement>(null);
   const [directModel, setDirectModel] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [managedProjectId, setManagedProjectId] = useState("");
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [workspaceDirectoryTarget, setWorkspaceDirectoryTarget] = useState<{
+    kind: "project" | "run";
+    projectId: string;
+  } | null>(null);
   const initialProjectSetupPromptedRef = useRef(false);
   const [newProjectDraft, setNewProjectDraft] = useState<NewProjectDraft>({
     projectId: "",
@@ -6068,10 +6182,16 @@ export function RunsPage() {
     activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
   const activeWorkspaceSessionId =
     activeConversation.data?.workspace_path?.trim() || listedConversationMetadata?.workspace_path?.trim() || activeConversationId;
+  const selectedRunWorkspaceSessionId = runWorkspacePath.trim() || activeWorkspaceSessionId;
+  const inspectedRunWorkspaceSessionId =
+    selectedRun.data && runConversationId(selectedRun.data) === activeConversationId
+      ? selectedRun.data.explicit_details.workspace_session_id?.trim()
+      : null;
+  const visibleWorkspaceSessionId = inspectedRunWorkspaceSessionId || selectedRunWorkspaceSessionId;
   const activeWorkspaceFiles = useQuery({
-    queryKey: ["workspace-files", activeWorkspaceProjectId, activeWorkspaceSessionId],
-    queryFn: () => api.workspaceFiles(activeWorkspaceProjectId, activeWorkspaceSessionId),
-    enabled: Boolean(activeWorkspaceSessionId),
+    queryKey: ["workspace-files", activeWorkspaceProjectId, visibleWorkspaceSessionId],
+    queryFn: () => api.workspaceFiles(activeWorkspaceProjectId, visibleWorkspaceSessionId),
+    enabled: Boolean(visibleWorkspaceSessionId),
     refetchInterval: 1500,
     refetchIntervalInBackground: true,
   });
@@ -6125,6 +6245,9 @@ export function RunsPage() {
     if (activeConversation.data.project_id?.trim()) setProjectId(activeConversation.data.project_id);
     setProjectLabel(activeConversation.data.project_label?.trim() ?? "");
   }, [activeConversation.data]);
+  useEffect(() => {
+    setRunWorkspacePath("");
+  }, [activeConversationId]);
 
   useEffect(() => {
     const selection = modeSelectionFromRunDetail(selectedRun.data);
@@ -6278,7 +6401,8 @@ export function RunsPage() {
     configOpen ||
     newProjectOpen ||
     newConversationOpen ||
-    renameConversationOpen;
+    renameConversationOpen ||
+    Boolean(workspaceDirectoryTarget);
   useEffect(() => {
     if (!pageOverlayOpen) return undefined;
     const previousBodyOverflow = document.body.style.overflow;
@@ -6326,7 +6450,7 @@ export function RunsPage() {
   }, [archivedConversations.data, archivedConversations.isSuccess, conversationProjects, conversations.data, conversations.isSuccess, projectWorkspaces.isSuccess]);
 
   useEffect(() => {
-    if (!configOpen) return undefined;
+    if (!configOpen || workspaceDirectoryTarget?.kind === "run") return undefined;
     const dialog = configDialogRef.current;
     const focusTimer = window.setTimeout(() => {
       dialog?.querySelector<HTMLElement>("button, select, input, textarea")?.focus();
@@ -6345,7 +6469,7 @@ export function RunsPage() {
       window.removeEventListener("keydown", onKeyDown);
       window.setTimeout(() => configTriggerRef.current?.focus(), 0);
     };
-  }, [configOpen]);
+  }, [configOpen, workspaceDirectoryTarget?.kind]);
 
   useEffect(() => {
     if (!processDetailTarget) return undefined;
@@ -6441,7 +6565,8 @@ export function RunsPage() {
         reference_conversation_id: referenceConversationId.trim() || null,
         project_id: conversationMetadata.project_id?.trim() || projectId.trim() || null,
         project_label: conversationMetadata.project_label?.trim() || projectLabel.trim() || null,
-        workspace_session_id: conversationMetadata.workspace_path?.trim() || conversationId.trim() || null,
+        workspace_session_id:
+          runWorkspacePath.trim() || conversationMetadata.workspace_path?.trim() || conversationId.trim() || null,
         sandbox_profile: sandboxProfile,
         ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
         requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
@@ -6450,6 +6575,7 @@ export function RunsPage() {
       });
     },
     onSuccess: async (run, override) => {
+      setRunWorkspacePath("");
       setSelectedRunId(run.id);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
@@ -6582,7 +6708,7 @@ export function RunsPage() {
           reference_conversation_id: referenceConversationId.trim() || null,
           project_id: activeWorkspaceProjectId || null,
           project_label: projectLabel.trim() || null,
-          workspace_session_id: activeWorkspaceSessionId || null,
+          workspace_session_id: selectedRunWorkspaceSessionId || null,
           sandbox_profile: sandboxProfile,
           ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
           requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
@@ -6590,6 +6716,7 @@ export function RunsPage() {
         },
       ),
     onSuccess: async () => {
+      setRunWorkspacePath("");
       setMessage("");
       setAttachmentDraft(null);
       setArchiveInstallFile(null);
@@ -7222,8 +7349,8 @@ export function RunsPage() {
     setProcessDetailTarget(null);
   }
 
-  function startNewConversation() {
-    const selectedProject =
+  function startNewConversationForProject(requestedProject?: ConversationProjectOption) {
+    const selectedProject = requestedProject ??
       conversationProjects.find((item) => item.id === projectId.trim()) ?? conversationProjects[0];
     if (!selectedProject) {
       if (projectWorkspaces.isLoading || conversations.isLoading || archivedConversations.isLoading) {
@@ -7253,6 +7380,10 @@ export function RunsPage() {
     createConversation.reset();
     setNewConversationOpen(true);
     setHistoryOpen(false);
+  }
+
+  function startNewConversation() {
+    startNewConversationForProject();
   }
 
   function startNewProject() {
@@ -7346,7 +7477,18 @@ export function RunsPage() {
   const conversationListItems = items.filter(
     (item) => !archivedConversationIds.has(item.conversation_id ?? ""),
   );
-  const visibleConversationItems = conversationListItems.filter(
+  const managerProjectId = managedProjectId.trim() || projectId.trim() || conversationProjects[0]?.id || "";
+  const conversationProjectById = new Map(
+    [...(conversations.data ?? []), ...(archivedConversations.data ?? [])]
+      .filter((item) => item.project_id?.trim())
+      .map((item) => [item.conversation_id, item.project_id?.trim() ?? ""]),
+  );
+  const projectConversationListItems = conversationListItems.filter((item) => {
+    if (!managerProjectId) return true;
+    const itemProjectId = item.conversation_id ? conversationProjectById.get(item.conversation_id) : null;
+    return itemProjectId ? itemProjectId === managerProjectId : managerProjectId === activeWorkspaceProjectId;
+  });
+  const visibleConversationItems = projectConversationListItems.filter(
     (item) => conversationMatchesSearch(item, conversationSearch, items),
   );
   const runConversationIds = new Set(
@@ -7358,11 +7500,12 @@ export function RunsPage() {
   ];
   const normalizedConversationSearch = conversationSearch.trim().toLocaleLowerCase();
   const visibleMetadataConversationItems = metadataConversationItems.filter((item) =>
-    !normalizedConversationSearch
+    (!managerProjectId || item.project_id === managerProjectId) &&
+    (!normalizedConversationSearch
       ? true
       : [item.title, item.conversation_id, item.project_label, item.project_id, item.workspace_path]
           .filter(Boolean)
-          .some((value) => value?.toLocaleLowerCase().includes(normalizedConversationSearch)),
+          .some((value) => value?.toLocaleLowerCase().includes(normalizedConversationSearch))),
   );
   const totalConversationCount = conversationListItems.length + metadataConversationItems.length;
   const visibleConversationCount = visibleConversationItems.length + visibleMetadataConversationItems.length;
@@ -7527,7 +7670,7 @@ export function RunsPage() {
       <button
         type="button"
         className="mobile-nav-trigger conversation-drawer-trigger"
-        aria-label={historyOpen ? "关闭历史对话" : "打开历史对话"}
+        aria-label={historyOpen ? "关闭项目与会话" : "打开项目与会话"}
         aria-expanded={historyOpen}
         onClick={() => {
           const next = !historyOpen;
@@ -7546,22 +7689,50 @@ export function RunsPage() {
         <button
           type="button"
           className="conversation-drawer-backdrop"
-          aria-label="关闭历史对话"
+          aria-label="关闭项目与会话"
           onClick={() => setHistoryOpen(false)}
         />
-        <nav className="conversation-list" aria-label="会话导航">
+        <nav className="conversation-list" aria-label="项目与会话管理">
           <div className="conversation-list-header">
             <div>
-              <h3>会话</h3>
+              <h3>项目与会话</h3>
               <span>
                 {conversationSearch.trim() ? `${visibleConversationCount}/${totalConversationCount}` : totalConversationCount} 条
               </span>
             </div>
             <div className="conversation-list-actions">
-              <button type="button" className="conversation-close-button" aria-label="关闭历史对话" onClick={() => setHistoryOpen(false)}>
+              <button type="button" className="secondary-action" onClick={startNewProject}>
+                创建项目
+              </button>
+              <button type="button" className="conversation-close-button" aria-label="关闭项目与会话" onClick={() => setHistoryOpen(false)}>
                 ×
               </button>
             </div>
+          </div>
+          <div className="conversation-projects" aria-label="项目列表">
+            {conversationProjects.map((project) => (
+              <article key={project.id} className={`conversation-project${project.id === managerProjectId ? " selected" : ""}`}>
+                <button
+                  type="button"
+                  className="conversation-project-select"
+                  aria-label={`进入项目 ${project.label}`}
+                  onClick={() => {
+                    setManagedProjectId(project.id);
+                  }}
+                >
+                  <strong>{project.label}</strong>
+                  <code>{project.workspacePath}</code>
+                </button>
+                <button
+                  type="button"
+                  className="conversation-project-new"
+                  aria-label={`在${project.label}中新建会话`}
+                  onClick={() => startNewConversationForProject(project)}
+                >
+                  +
+                </button>
+              </article>
+            ))}
           </div>
           <input
             type="search"
@@ -7805,10 +7976,24 @@ export function RunsPage() {
               </span>
             </label>
             <div className="conversation-workspace-summary">
-              <span className="field-label">会话工作区</span>
+              <span className="field-label">本次工作目录</span>
               <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
-              <code>{workspacePreviewPath(activeWorkspaceProjectId, activeWorkspaceSessionId)}</code>
-              <small>项目归类和工作区在新建会话时确定，避免同一会话中途切换目录。</small>
+              <code>{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)}</code>
+              <small>{runWorkspacePath ? "仅覆盖本次运行，不修改项目默认目录。" : "当前使用项目默认工作目录。"}</small>
+              <div className="conversation-workspace-actions">
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => setWorkspaceDirectoryTarget({ kind: "run", projectId: activeWorkspaceProjectId })}
+                >
+                  选择本次工作目录
+                </button>
+                {runWorkspacePath ? (
+                  <button type="button" className="secondary-action" onClick={() => setRunWorkspacePath("")}>
+                    恢复项目默认
+                  </button>
+                ) : null}
+              </div>
             </div>
             <label htmlFor="reference-conversation-id">
               参考会话
@@ -7831,7 +8016,7 @@ export function RunsPage() {
             <div className="mode-help">
               <span className="eyebrow">当前设置</span>
               <p>
-                工作区：{workspacePreviewPath(activeWorkspaceProjectId, activeWorkspaceSessionId)} · 主 Agent 自动 · {selectedSandboxLabel} ·
+                工作区：{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)} · 主 Agent 自动 · {selectedSandboxLabel} ·
                 {executionBackendLabel}
               </p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
@@ -7886,12 +8071,6 @@ export function RunsPage() {
                 {currentConversationArchived ? <span className="conversation-archived-badge">已归档</span> : null}
               </div>
               <div className="chat-session-actions">
-                <button type="button" className="secondary-action" aria-label="新建项目工作区" onClick={startNewProject}>
-                  项目
-                </button>
-                <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
-                  新建
-                </button>
                 <div className="conversation-menu-anchor">
                   <button
                     type="button"
@@ -8573,6 +8752,12 @@ export function RunsPage() {
             createProjectWorkspace.reset();
             setNewProjectDraft(next);
           }}
+          onPickDirectory={() => {
+            if (!workspacePathError(newProjectDraft.projectId)) {
+              setWorkspaceDirectoryTarget({ kind: "project", projectId: newProjectDraft.projectId.trim() });
+            }
+          }}
+          suspended={workspaceDirectoryTarget?.kind === "project"}
           onClose={() => {
             if (!createProjectWorkspace.isPending) setNewProjectOpen(false);
           }}
@@ -8583,6 +8768,22 @@ export function RunsPage() {
               workspacePathError(newProjectDraft.workspacePath)
             ) return;
             createProjectWorkspace.mutate(newProjectDraft);
+          }}
+        />
+      ) : null}
+      {workspaceDirectoryTarget ? (
+        <WorkspaceDirectoryDialog
+          title={workspaceDirectoryTarget.kind === "project" ? "选择项目工作目录" : "选择本次工作目录"}
+          projectId={workspaceDirectoryTarget.projectId}
+          currentValue={workspaceDirectoryTarget.kind === "project" ? newProjectDraft.workspacePath : selectedRunWorkspaceSessionId}
+          onClose={() => setWorkspaceDirectoryTarget(null)}
+          onSelect={(value) => {
+            if (workspaceDirectoryTarget.kind === "project") {
+              setNewProjectDraft((current) => ({ ...current, workspacePath: value }));
+            } else {
+              setRunWorkspacePath(value);
+            }
+            setWorkspaceDirectoryTarget(null);
           }}
         />
       ) : null}

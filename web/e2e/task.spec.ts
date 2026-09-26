@@ -619,6 +619,21 @@ async function mockCodingRunApi(
       });
       return;
     }
+    if (/^\/api\/v1\/workspaces\/projects\/[^/]+\/directories$/.test(path) && request.method() === "GET") {
+      await route.fulfill({
+        json: {
+          project_id: path.split("/")[5],
+          platform: "linux",
+          separator: "/",
+          configured_root: "/var/lib/agent-hub/workspaces",
+          logical_root: "tenant/projects/default/sessions",
+          directories: ["main", "scratch"],
+          native_picker_available: false,
+          unavailable_reason: "interactive Linux display is unavailable",
+        },
+      });
+      return;
+    }
     if (/^\/api\/v1\/admin\/conversations\/[^/]+\/queue$/.test(path) && request.method() === "GET") {
       await route.fulfill({ json: [] });
       return;
@@ -764,18 +779,35 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await page.keyboard.press("Escape");
     await expect(initialConversationDialog).toHaveCount(0);
 
-    await page.getByRole("button", { name: "新建项目工作区" }).click();
+    await page.getByRole("button", { name: "打开项目与会话" }).click();
+    const manager = page.getByRole("navigation", { name: "项目与会话管理" });
+    await expect(manager).toBeVisible();
+    await manager.getByRole("button", { name: "创建项目" }).click();
     const projectDialog = page.getByRole("dialog", { name: "新建项目工作区" });
     await expect(projectDialog).toBeVisible();
     await expect(projectDialog.getByLabel("项目名称")).toBeVisible();
     await expect(projectDialog.getByLabel("会话标题")).toHaveCount(0);
+    await projectDialog.getByLabel("项目名称").fill("浏览器工具");
+    await projectDialog.getByLabel("项目 ID").fill("browser-tools");
+    await projectDialog.getByRole("button", { name: "选择项目工作目录" }).click();
+    const projectDirectoryDialog = page.getByRole("dialog", { name: "选择项目工作目录" });
+    await expect(projectDirectoryDialog.getByText("Linux 服务器")).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath(`project-directory-${viewport.name}.png`) });
+    await page.keyboard.press("Escape");
+    await expect(projectDirectoryDialog).toHaveCount(0);
+    await expect(projectDialog).toBeVisible();
+    await projectDialog.getByRole("button", { name: "选择项目工作目录" }).click();
+    await projectDirectoryDialog.getByRole("button", { name: "选择目录 main" }).click();
+    await expect(projectDirectoryDialog).toHaveCount(0);
     await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("hidden");
     await projectDialog.getByText("项目名称").click();
     await expect(projectDialog).toBeVisible();
     await page.locator(".conversation-dialog-backdrop").click({ position: { x: 5, y: 5 } });
     await expect(projectDialog).toHaveCount(0);
 
-    await page.getByRole("button", { name: "新建对话" }).click();
+    await page.getByRole("button", { name: "打开项目与会话" }).click();
+    await expect(manager).toBeVisible();
+    await manager.getByRole("button", { name: "在默认项目中新建会话" }).click();
     const conversationDialog = page.getByRole("dialog", { name: "新建会话" });
     await expect(conversationDialog).toBeVisible();
     await expect(conversationDialog.getByLabel("会话标题")).toBeVisible();
@@ -795,6 +827,17 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await expect(settingsSummary).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(closeSettings).toBeFocused();
+    await settingsSummary.click();
+    await settingsDialog.getByRole("button", { name: "选择本次工作目录" }).click();
+    const runDirectoryDialog = page.getByRole("dialog", { name: "选择本次工作目录" });
+    await page.screenshot({ path: testInfo.outputPath(`run-directory-${viewport.name}.png`) });
+    await page.keyboard.press("Escape");
+    await expect(runDirectoryDialog).toHaveCount(0);
+    await expect(settingsDialog).toBeVisible();
+    await settingsDialog.getByRole("button", { name: "选择本次工作目录" }).click();
+    await runDirectoryDialog.getByRole("button", { name: "选择目录 scratch" }).click();
+    await expect(runDirectoryDialog).toHaveCount(0);
+    await expect(settingsDialog.getByText("仅覆盖本次运行，不修改项目默认目录。")).toBeVisible();
     const layout = await page.evaluate(() => ({
       bodyWidth: document.body.scrollWidth,
       documentWidth: document.documentElement.scrollWidth,

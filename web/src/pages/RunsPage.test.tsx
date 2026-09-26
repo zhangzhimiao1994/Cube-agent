@@ -767,8 +767,12 @@ describe("agentInlineSummary", () => {
   it("closes the history drawer when starting a new blank conversation", () => {
     const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
     const startNewConversationMatch = source.match(/function startNewConversation\(\) \{[\s\S]*?\n  \}/);
+    const projectConversationMatch = source.match(
+      /function startNewConversationForProject\([\s\S]*?\n  \}\n\n  function startNewConversation\(\)/,
+    );
 
-    expect(startNewConversationMatch?.[0]).toContain("setHistoryOpen(false)");
+    expect(startNewConversationMatch?.[0]).toContain("startNewConversationForProject()");
+    expect(projectConversationMatch?.[0]).toContain("setHistoryOpen(false)");
   });
 
   it("keeps approval cards cancellable when an action would otherwise proceed", () => {
