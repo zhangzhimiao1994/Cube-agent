@@ -330,7 +330,7 @@ def test_native_picker_timeout_is_reported_as_unavailable(
     def timeout(*args: object, **kwargs: object) -> None:
         raise subprocess.TimeoutExpired(cmd="picker", timeout=120)
 
-    monkeypatch.setattr(workspace_module.subprocess, "run", timeout)
+    monkeypatch.setattr(subprocess, "run", timeout)
 
     with pytest.raises(workspace_module.NativePickerUnavailable, match="timed out"):
         workspace_module.pick_native_directory(tmp_path, capability)
