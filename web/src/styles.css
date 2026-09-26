@@ -940,6 +940,29 @@ article:hover {
   margin-left: 0.65rem;
 }
 
+.hermes-approval-loop {
+  display: grid;
+  gap: 0.65rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 1rem 0;
+}
+
+.hermes-approval-loop > div {
+  background: rgba(85, 215, 255, 0.08);
+  border: 1px solid rgba(85, 215, 255, 0.18);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+  padding: 0.75rem;
+}
+
+.hermes-approval-loop strong {
+  color: var(--text);
+  font-size: 0.94rem;
+  overflow-wrap: anywhere;
+}
+
 .hermes-journey {
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(123, 225, 255, 0.14);
@@ -5936,6 +5959,10 @@ article:hover {
 
   .hermes-journey {
     padding: 0.8rem;
+  }
+
+  .hermes-approval-loop {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .hermes-journey-header {

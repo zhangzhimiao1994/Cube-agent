@@ -56,6 +56,25 @@ function promotionStatusLabel(status: HermesInsight["promotion_status"]) {
   return "待审批";
 }
 
+function approvalCandidateLabel(insight: HermesInsight) {
+  if (insight.promotion_status === "ledger_only") return "台账观察";
+  if (insight.memory_type.includes("preference")) return "偏好候选";
+  if (insight.memory_type.includes("fact")) return "事实候选";
+  return "规则候选";
+}
+
+function approvalStateLabel(insight: HermesInsight) {
+  if (insight.promotion_status === "ledger_only") return "无需入库审批";
+  return insight.confirmed_at ? "已人工确认" : "等待人工确认";
+}
+
+function approvalDestinationLabel(insight: HermesInsight) {
+  if (insight.promotion_status === "ledger_only") return "仅保留在学习台账";
+  const target = insight.target === "main_agent" ? "主 Agent" : insight.target;
+  if (insight.confirmed_at) return `已进入${target} 可召回规则库`;
+  return `确认后进入${target} 可召回规则库`;
+}
+
 function confidenceLabel(value: number) {
   return `${Math.round(value * 100)}%`;
 }
@@ -606,6 +625,24 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
         <span className="eyebrow">{statusLabel(item.confirmed_at)}</span>
         <h3>{hermesLearningSummary(item)}</h3>
         <p>{item.lesson}</p>
+        <section className="hermes-approval-loop" aria-label="Hermes 审批入库闭环">
+          <div>
+            <span className="eyebrow">产物复盘</span>
+            <strong>{item.run_id ? "来自运行结果复盘" : "来自手动经验补充"}</strong>
+          </div>
+          <div>
+            <span className="eyebrow">候选类型</span>
+            <strong>{approvalCandidateLabel(item)}</strong>
+          </div>
+          <div>
+            <span className="eyebrow">审批状态</span>
+            <strong>{approvalStateLabel(item)}</strong>
+          </div>
+          <div>
+            <span className="eyebrow">入库去向</span>
+            <strong>{approvalDestinationLabel(item)}</strong>
+          </div>
+        </section>
         <dl className="detail-list">
           {item.summary !== hermesLearningSummary(item) ? (
             <div>

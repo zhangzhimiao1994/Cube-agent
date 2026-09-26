@@ -156,4 +156,15 @@ describe("HermesPage", () => {
 
     expect(sourceLink.getAttribute("href")).toBe("/?conversation=conv-cleared-after-chat");
   });
+
+  it("explains the approval loop before a Hermes candidate is promoted", async () => {
+    render(<TestApp initialPath="/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />);
+
+    const approvalLoop = await screen.findByRole("region", { name: "Hermes 审批入库闭环" });
+
+    expect(within(approvalLoop).getByText("产物复盘")).not.toBeNull();
+    expect(within(approvalLoop).getByText("规则候选")).not.toBeNull();
+    expect(within(approvalLoop).getByText("等待人工确认")).not.toBeNull();
+    expect(within(approvalLoop).getByText("确认后进入主 Agent 可召回规则库")).not.toBeNull();
+  });
 });
