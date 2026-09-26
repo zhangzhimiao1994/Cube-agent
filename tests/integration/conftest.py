@@ -14,6 +14,7 @@ from agent_hub.db.models import (
     ConfigRevisionRow,
     ConversationQueueItemRow,
     ConversationRow,
+    ProjectWorkspaceRow,
     RunApprovalRow,
     RunArtifactRow,
     RunCheckpointRow,
@@ -83,6 +84,7 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
             await session.rollback()
             await _delete_run_rows(session)
             await session.execute(delete(ConversationRow))
+            await session.execute(delete(ProjectWorkspaceRow))
             await session.execute(delete(ChannelDedupRow))
             await session.execute(delete(BootstrapCodeRow))
             await session.execute(delete(SecretRow))
@@ -96,6 +98,7 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
                 await session.rollback()
                 await _delete_run_rows(session)
                 await session.execute(delete(ConversationRow))
+                await session.execute(delete(ProjectWorkspaceRow))
                 await session.execute(delete(ChannelDedupRow))
                 await session.execute(delete(BootstrapCodeRow))
                 await session.execute(delete(SecretRow))
@@ -139,6 +142,7 @@ async def _clean_database(
     async with session_factory() as session, session.begin():
         await _delete_run_rows(session)
         await session.execute(delete(ConversationRow))
+        await session.execute(delete(ProjectWorkspaceRow))
         await session.execute(delete(ChannelDedupRow))
         await session.execute(delete(BootstrapCodeRow))
         await session.execute(delete(SecretRow))
