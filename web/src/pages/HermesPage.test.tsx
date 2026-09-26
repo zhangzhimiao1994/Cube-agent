@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
@@ -129,9 +129,24 @@ describe("HermesPage", () => {
     expect(
       within(row).getByText("对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。"),
     ).not.toBeNull();
-    expect(within(row).getByText("待审候选")).not.toBeNull();
+    expect(within(row).getByText("规则候选")).not.toBeNull();
     expect(within(row).getByText("待审批")).not.toBeNull();
     expect(within(row).getByText("待确认")).not.toBeNull();
+  });
+
+  it("filters Hermes ledger by memory layer", async () => {
+    render(<TestApp initialPath="/hermes" />);
+
+    const ledger = await screen.findByRole("table", { name: "Hermes 学习台账" });
+
+    fireEvent.change(screen.getByLabelText("按 Hermes 记忆层筛选"), {
+      target: { value: "approved_rule" },
+    });
+
+    expect(within(ledger).queryByText("conv-cleared-after-chat")).toBeNull();
+    expect(within(ledger).getByText("conv-ui-polish")).not.toBeNull();
+    const row = within(ledger).getByRole("row", { name: /conv-ui-polish/ });
+    expect(within(row).getByText("已确认规则")).not.toBeNull();
   });
 
   it("renders a journey timeline for confirmed and pending learning", async () => {

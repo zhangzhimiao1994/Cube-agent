@@ -12,6 +12,7 @@ type HermesColumnFilters = {
   category: "all" | "conversation" | "scheduler";
   conversation: string;
   created: string;
+  layer: "all" | "rule_candidate" | "preference_candidate" | "fact_candidate" | "approved_rule" | "ledger_only";
   outcome: string;
   status: string;
   summary: string;
@@ -21,6 +22,7 @@ const EMPTY_HERMES_FILTERS: HermesColumnFilters = {
   category: "all",
   conversation: "",
   created: "",
+  layer: "all",
   outcome: "all",
   status: "all",
   summary: "",
@@ -47,7 +49,15 @@ function memoryLayerLabel(insight: HermesInsight) {
   if (insight.memory_type.includes("preference")) return "偏好候选";
   if (insight.memory_type.includes("fact")) return "事实候选";
   if (insight.memory_type.includes("rule")) return "规则候选";
-  return "待审候选";
+  return "规则候选";
+}
+
+function memoryLayerFilterValue(insight: HermesInsight): HermesColumnFilters["layer"] {
+  if (insight.promotion_status === "ledger_only") return "ledger_only";
+  if (insight.promotion_status === "approved") return "approved_rule";
+  if (insight.memory_type.includes("preference")) return "preference_candidate";
+  if (insight.memory_type.includes("fact")) return "fact_candidate";
+  return "rule_candidate";
 }
 
 function promotionStatusLabel(status: HermesInsight["promotion_status"]) {
@@ -131,6 +141,7 @@ function matchesHermesColumns(insight: HermesInsight, filters: HermesColumnFilte
     (filters.category === "all" || insight.category === filters.category) &&
     textContains(insight.conversation_id ?? "未关联", filters.conversation) &&
     textContains(hermesLearningSummary(insight), filters.summary) &&
+    (filters.layer === "all" || memoryLayerFilterValue(insight) === filters.layer) &&
     (filters.outcome === "all" || insight.outcome === filters.outcome) &&
     (filters.status === "all" || status === filters.status)
   );
@@ -445,7 +456,16 @@ function HermesLearningTable() {
                       <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
                       <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
                       <th><input aria-label="按 Hermes 中文学习摘要筛选" value={columnFilters.summary} onChange={(event) => updateColumnFilter("summary", event.currentTarget.value)} placeholder="摘要关键词" /></th>
-                      <th></th>
+                      <th>
+                        <select aria-label="按 Hermes 记忆层筛选" value={columnFilters.layer} onChange={(event) => updateColumnFilter("layer", event.currentTarget.value)}>
+                          <option value="all">全部</option>
+                          <option value="rule_candidate">规则候选</option>
+                          <option value="preference_candidate">偏好候选</option>
+                          <option value="fact_candidate">事实候选</option>
+                          <option value="approved_rule">已确认规则</option>
+                          <option value="ledger_only">任务台账</option>
+                        </select>
+                      </th>
                       <th>
                         <select aria-label="按 Hermes 结果筛选" value={columnFilters.outcome} onChange={(event) => updateColumnFilter("outcome", event.currentTarget.value)}>
                           <option value="all">全部</option>
