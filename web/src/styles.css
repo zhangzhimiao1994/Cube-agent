@@ -6247,7 +6247,9 @@ article:hover {
   }
 
   .conversation-checkpoints-header label {
+    flex: 0 0 auto;
     justify-content: stretch;
+    width: 100%;
   }
 
   .conversation-checkpoints-header input {
