@@ -755,6 +755,15 @@ describe("operational management pages", () => {
     updated_at: string;
   }> = [];
   let hideVisibleConversationMetadata = false;
+  let visibleProjectWorkspaces = [
+    {
+      project_id: "default",
+      label: "默认项目",
+      workspace_path: "main",
+      created_at: "2026-08-07T08:00:00Z",
+      updated_at: "2026-08-07T08:00:00Z",
+    },
+  ];
 
   beforeEach(() => {
     requests.length = 0;
@@ -798,6 +807,15 @@ describe("operational management pages", () => {
     createdConversationMetadataList = [];
     visibleConversationQueue = [];
     hideVisibleConversationMetadata = false;
+    visibleProjectWorkspaces = [
+      {
+        project_id: "default",
+        label: "默认项目",
+        workspace_path: "main",
+        created_at: "2026-08-07T08:00:00Z",
+        updated_at: "2026-08-07T08:00:00Z",
+      },
+    ];
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -821,6 +839,21 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/runs") {
           return jsonResponse(visibleRunListItems.filter((item) => !deletedRunIds.has(item.id)));
+        }
+        if (path === "/api/v1/admin/project-workspaces" && method === "GET") {
+          return jsonResponse(visibleProjectWorkspaces);
+        }
+        if (path === "/api/v1/admin/project-workspaces" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const created = {
+            project_id: String(body.project_id),
+            label: String(body.label),
+            workspace_path: String(body.workspace_path),
+            created_at: "2026-09-27T00:00:00Z",
+            updated_at: "2026-09-27T00:00:00Z",
+          };
+          visibleProjectWorkspaces = [created, ...visibleProjectWorkspaces];
+          return jsonResponse(created, { status: 201 });
         }
         if (path === `/api/v1/admin/runs/${runId}` && method === "DELETE") {
           deletedRunIds.add(runId);
@@ -2589,13 +2622,15 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
+    const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    await user.type(within(projectDialog).getByLabelText("项目名称"), "魔方 Agent");
+    await user.type(within(projectDialog).getByLabelText("项目 ID"), "mofang-agent");
+    await user.clear(within(projectDialog).getByLabelText("共享工作区名称"));
+    await user.type(within(projectDialog).getByLabelText("共享工作区名称"), "app");
+    await user.click(within(projectDialog).getByRole("button", { name: "创建项目" }));
     const newConversation = screen.getByRole("dialog", { name: "新建会话" });
-    await user.clear(within(newConversation).getByLabelText("项目 ID"));
-    await user.type(within(newConversation).getByLabelText("项目 ID"), "mofang-agent");
-    await user.type(within(newConversation).getByLabelText("项目名称"), "魔方 Agent");
-    await user.clear(within(newConversation).getByLabelText("工作区目录名"));
-    await user.type(within(newConversation).getByLabelText("工作区目录名"), "app");
+    expect((within(newConversation).getByLabelText("所属项目") as HTMLSelectElement).value).toBe("mofang-agent");
     await user.click(within(newConversation).getByRole("button", { name: "创建会话" }));
     await openRunConfig(user);
     await expandRunConfigDetails(user);
@@ -7064,14 +7099,18 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     expect(screen.getAllByRole("button", { name: "新建对话" })).toHaveLength(1);
 
-    await user.click(screen.getByRole("button", { name: "新建对话" }));
+    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
+    const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    expect(within(projectDialog).queryByLabelText("会话标题")).toBeNull();
+    await user.type(within(projectDialog).getByLabelText("项目名称"), "浏览器工具");
+    await user.type(within(projectDialog).getByLabelText("项目 ID"), "browser-tools");
+    await user.clear(within(projectDialog).getByLabelText("共享工作区名称"));
+    await user.type(within(projectDialog).getByLabelText("共享工作区名称"), "plugin");
+    await user.click(within(projectDialog).getByRole("button", { name: "创建项目" }));
     const dialog = screen.getByRole("dialog", { name: "新建会话" });
+    expect(within(dialog).queryByLabelText("共享工作区名称")).toBeNull();
     await user.type(within(dialog).getByLabelText("会话标题"), "浏览器插件开发");
-    await user.clear(within(dialog).getByLabelText("项目 ID"));
-    await user.type(within(dialog).getByLabelText("项目 ID"), "browser-tools");
-    await user.type(within(dialog).getByLabelText("项目名称"), "浏览器工具");
-    await user.clear(within(dialog).getByLabelText("工作区目录名"));
-    await user.type(within(dialog).getByLabelText("工作区目录名"), "plugin");
+    expect((within(dialog).getByLabelText("所属项目") as HTMLSelectElement).value).toBe("browser-tools");
     await user.click(within(dialog).getByRole("button", { name: "创建会话" }));
 
     await waitFor(() =>
@@ -7088,6 +7127,65 @@ describe("operational management pages", () => {
     expect(screen.getByText("会话：浏览器插件开发")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "打开历史对话" }));
     expect(screen.getByRole("button", { name: "进入会话 浏览器插件开发" })).not.toBeNull();
+  });
+
+  it("starts an empty tenant with project setup before conversation setup", async () => {
+    visibleProjectWorkspaces = [];
+    visibleRunListItems = [];
+    visibleConversationRuns = [];
+    hideVisibleConversationMetadata = true;
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
+    expect(screen.queryByRole("dialog", { name: "新建会话" })).toBeNull();
+    expect(screen.getByText("请先创建项目工作区，再创建第一条会话。")).not.toBeNull();
+  });
+
+  it("starts a tenant with an existing project and no conversations at conversation setup", async () => {
+    visibleProjectWorkspaces = [
+      {
+        project_id: "browser-tools",
+        label: "浏览器工具",
+        workspace_path: "shared-main",
+        created_at: "2026-09-27T00:00:00Z",
+        updated_at: "2026-09-27T00:00:00Z",
+      },
+    ];
+    visibleRunListItems = [];
+    visibleConversationRuns = [];
+    hideVisibleConversationMetadata = true;
+    render(<TestApp initialPath="/" />);
+
+    const dialog = await screen.findByRole("dialog", { name: "新建会话" });
+    expect((within(dialog).getByLabelText("所属项目") as HTMLSelectElement).value).toBe("browser-tools");
+    expect(screen.queryByRole("dialog", { name: "新建项目工作区" })).toBeNull();
+    expect(screen.getByText("请选择项目并创建第一条会话。")).not.toBeNull();
+  });
+
+  it("closes project and run settings dialogs from the backdrop or Escape without closing from dialog content", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const projectTrigger = screen.getByRole("button", { name: "新建项目工作区" });
+    await user.click(projectTrigger);
+    const projectDialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    expect(document.body.style.overflow).toBe("hidden");
+    await user.click(within(projectDialog).getByText("项目名称"));
+    expect(screen.getByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
+    await user.click(document.querySelector(".conversation-dialog-backdrop") as HTMLElement);
+    expect(screen.queryByRole("dialog", { name: "新建项目工作区" })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(projectTrigger));
+
+    await openRunConfig(user);
+    const settingsDialog = screen.getByRole("dialog", { name: "本次运行设置" });
+    expect(document.body.style.overflow).toBe("hidden");
+    await user.click(within(settingsDialog).getByText("本次运行设置"));
+    expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "本次运行设置" })).toBeNull();
+    expect(document.body.style.overflow).toBe("");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "打开本次运行配置" })));
   });
 
   it("persists a default conversation before the first message in an empty tenant", async () => {
@@ -7109,23 +7207,24 @@ describe("operational management pages", () => {
     expect(runRequestIndex).toBeGreaterThan(conversationRequestIndex);
   });
 
-  it("rejects absolute or traversing workspace paths in the new-conversation form", async () => {
+  it("rejects absolute or traversing workspace paths in the new-project form", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "新建对话" }));
-    const dialog = screen.getByRole("dialog", { name: "新建会话" });
-    const workspace = within(dialog).getByLabelText("工作区目录名");
+    await user.click(screen.getByRole("button", { name: "新建项目工作区" }));
+    const dialog = screen.getByRole("dialog", { name: "新建项目工作区" });
+    await user.type(within(dialog).getByLabelText("项目 ID"), "safe-project");
+    const workspace = within(dialog).getByLabelText("共享工作区名称");
 
     await user.clear(workspace);
     await user.type(workspace, "../outside");
     expect(within(dialog).getByRole("alert").textContent).toContain("工作区目录名只能包含");
-    expect((within(dialog).getByRole("button", { name: "创建会话" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(dialog).getByRole("button", { name: "创建项目" }) as HTMLButtonElement).disabled).toBe(true);
 
     await user.clear(workspace);
     await user.type(workspace, "C:\\temp\\outside");
-    expect((within(dialog).getByRole("button", { name: "创建会话" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(dialog).getByRole("button", { name: "创建项目" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("renames and archives the active conversation from its title menu", async () => {
@@ -7453,6 +7552,7 @@ describe("operational management pages", () => {
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
     await openRunConfig(user);
+    expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
     expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
     expect(screen.getByText("详细设置")).not.toBeNull();
   });
@@ -7469,6 +7569,7 @@ describe("operational management pages", () => {
     expect(within(composer).getByText("主 Agent 自动 · 项目写入")).not.toBeNull();
 
     await openRunConfig(user);
+    expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
     const config = screen.getByRole("region", { name: "本次运行更多设置" });
     expect(within(config).getByLabelText("本次运行设置概览")).not.toBeNull();
     expect(within(config).getByText("详细设置")).not.toBeNull();
@@ -7476,6 +7577,9 @@ describe("operational management pages", () => {
     expect(within(config).getByRole("group", { name: "选择本次运行沙箱权限" })).not.toBeNull();
     expect(within(config).getByText("主 Agent 自动")).not.toBeNull();
     expect(within(config).queryByText("角色池 · 自动")).toBeNull();
+    await user.click(within(screen.getByRole("dialog", { name: "本次运行设置" })).getByRole("button", { name: "关闭运行设置" }));
+    expect(screen.queryByRole("dialog", { name: "本次运行设置" })).toBeNull();
+    expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
   });
 
   it("falls back to the first available execution backend when the configured default is unavailable", async () => {

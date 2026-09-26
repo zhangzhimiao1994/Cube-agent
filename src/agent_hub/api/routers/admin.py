@@ -128,6 +128,13 @@ from agent_hub.runs.conversations import (
     normalize_conversation_title,
     normalize_conversation_workspace,
 )
+from agent_hub.runs.projects import (
+    ProjectWorkspaceConflict,
+    ProjectWorkspaceNotFound,
+    ProjectWorkspaceRecord,
+    ProjectWorkspaceRepository,
+    normalize_project_workspace,
+)
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
@@ -669,36 +676,59 @@ class ConversationCreateRequest(BaseModel):
         return self
 
 
+class ProjectWorkspaceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=80)
+    workspace_path: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def normalize_fields(self) -> ProjectWorkspaceCreateRequest:
+        self.project_id, self.label, self.workspace_path = normalize_project_workspace(
+            project_id=self.project_id,
+            label=self.label,
+            workspace_path=self.workspace_path,
+        )
+        return self
+
+
+class ProjectWorkspaceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    label: str
+    workspace_path: str
+    legacy_workspace_count: int = Field(default=1, ge=1)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+def _project_workspace_response(record: ProjectWorkspaceRecord) -> ProjectWorkspaceResponse:
+    return ProjectWorkspaceResponse(
+        project_id=record.project_id,
+        label=record.label,
+        workspace_path=record.workspace_path,
+        legacy_workspace_count=record.legacy_workspace_count,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
 class ConversationUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(default=None, min_length=1, max_length=200)
-    project_id: str | None = Field(default=None, min_length=1, max_length=128)
-    project_label: str | None = Field(default=None, max_length=80)
-    workspace_path: str | None = Field(default=None, min_length=1, max_length=128)
     archived: bool | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> ConversationUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("at least one conversation field is required")
-        for field_name in ("title", "project_id", "project_label", "workspace_path"):
-            if field_name in self.model_fields_set and getattr(self, field_name) is None:
-                raise ValueError(f"{field_name} must not be null")
+        if "title" in self.model_fields_set and self.title is None:
+            raise ValueError("title must not be null")
         if self.title is not None:
             self.title = normalize_conversation_title(self.title)
-        if self.project_id is not None or self.workspace_path is not None:
-            project_id, project_label, workspace_path = normalize_conversation_workspace(
-                project_id=self.project_id or "default",
-                project_label=self.project_label,
-                workspace_path=self.workspace_path or "session-default",
-            )
-            if self.project_id is not None:
-                self.project_id = project_id
-            if self.project_label is not None:
-                self.project_label = project_label
-            if self.workspace_path is not None:
-                self.workspace_path = workspace_path
         return self
 
 
@@ -3008,6 +3038,12 @@ class AdminResourceService(Protocol):
     async def create_conversation(
         self, request: ConversationCreateRequest
     ) -> ConversationResponse: ...
+
+    async def create_project_workspace(
+        self, request: ProjectWorkspaceCreateRequest
+    ) -> ProjectWorkspaceResponse: ...
+
+    async def list_project_workspaces(self) -> tuple[ProjectWorkspaceResponse, ...]: ...
 
     async def list_conversations(
         self, *, archived: bool = False
@@ -5481,6 +5517,7 @@ class InMemoryAdminResourceService:
     generated_artifacts: dict[tuple[UUID, UUID], tuple[Path, str, str]] = field(
         default_factory=dict
     )
+    project_workspaces: dict[str, ProjectWorkspaceResponse] = field(default_factory=dict)
     conversations: dict[str, ConversationMetadataResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -5775,19 +5812,48 @@ class InMemoryAdminResourceService:
             mime_type=mime_type,
         )
 
+    async def create_project_workspace(
+        self, request: ProjectWorkspaceCreateRequest
+    ) -> ProjectWorkspaceResponse:
+        if request.project_id in self.project_workspaces:
+            raise ProjectWorkspaceConflict(request.project_id)
+        now = datetime.now(UTC)
+        response = ProjectWorkspaceResponse(
+            project_id=request.project_id,
+            label=request.label,
+            workspace_path=request.workspace_path,
+            legacy_workspace_count=1,
+            created_at=now,
+            updated_at=now,
+        )
+        self.project_workspaces[response.project_id] = response
+        return response
+
+    async def list_project_workspaces(self) -> tuple[ProjectWorkspaceResponse, ...]:
+        return tuple(
+            sorted(
+                self.project_workspaces.values(),
+                key=lambda item: (item.updated_at or datetime.min.replace(tzinfo=UTC)),
+                reverse=True,
+            )
+        )
+
     async def create_conversation(
         self, request: ConversationCreateRequest
     ) -> ConversationResponse:
         assert request.conversation_id is not None
         if request.conversation_id in self.conversations:
             raise ConversationConflict("conversation already exists")
+        project = self.project_workspaces.get(request.project_id)
+        if project is None:
+            raise ProjectWorkspaceNotFound(request.project_id)
         now = datetime.now(UTC)
         response = ConversationMetadataResponse(
             conversation_id=request.conversation_id,
             title=request.title,
-            project_id=request.project_id,
-            project_label=request.project_label,
-            workspace_path=request.workspace_path,
+            project_id=project.project_id,
+            project_label=project.label,
+            workspace_path=project.workspace_path,
             created_at=now,
             updated_at=now,
         )
@@ -7103,6 +7169,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         skill_source_fetcher: SkillSourceFetcherProtocol | None = None,
         generated_artifact_dir: Path | None = None,
         conversation_repository: ConversationRepository | None = None,
+        project_workspace_repository: ProjectWorkspaceRepository | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -7114,6 +7181,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._session_factory = session_factory
         self._conversation_repository = conversation_repository or (
             ConversationRepository(session_factory) if session_factory is not None else None
+        )
+        self._project_workspace_repository = project_workspace_repository or (
+            ProjectWorkspaceRepository(session_factory) if session_factory is not None else None
         )
         self._skill_store_dir = skill_store_dir or Path("/var/lib/agent-hub/skills")
         self._skill_source_fetcher = skill_source_fetcher or GitHubSkillSourceFetcher()
@@ -7140,6 +7210,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             skill_source_fetcher=self._skill_source_fetcher,
             generated_artifact_dir=self._generated_artifact_dir,
             conversation_repository=self._conversation_repository,
+            project_workspace_repository=self._project_workspace_repository,
         )
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
@@ -7210,18 +7281,44 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             mime_type=metadata["mime_type"],
         )
 
+    async def create_project_workspace(
+        self, request: ProjectWorkspaceCreateRequest
+    ) -> ProjectWorkspaceResponse:
+        if self._project_workspace_repository is None:
+            return await super().create_project_workspace(request)
+        record = await self._project_workspace_repository.create(
+            tenant_id=self._tenant_id,
+            project_id=request.project_id,
+            label=request.label,
+            workspace_path=request.workspace_path,
+        )
+        return _project_workspace_response(record)
+
+    async def list_project_workspaces(self) -> tuple[ProjectWorkspaceResponse, ...]:
+        if self._project_workspace_repository is None:
+            return await super().list_project_workspaces()
+        records = await self._project_workspace_repository.list(self._tenant_id)
+        return tuple(_project_workspace_response(record) for record in records)
+
     async def create_conversation(
         self, request: ConversationCreateRequest
     ) -> ConversationResponse:
         if self._conversation_repository is None:
             return await super().create_conversation(request)
+        project = None
+        if self._project_workspace_repository is not None:
+            project = await self._project_workspace_repository.find(
+                self._tenant_id, request.project_id
+            )
+            if project is None:
+                raise ProjectWorkspaceNotFound(request.project_id)
         record = await self._conversation_repository.create(
             tenant_id=self._tenant_id,
             conversation_id=request.conversation_id,
             title=request.title,
-            project_id=request.project_id,
-            project_label=request.project_label,
-            workspace_path=request.workspace_path,
+            project_id=project.project_id if project is not None else request.project_id,
+            project_label=project.label if project is not None else request.project_label,
+            workspace_path=project.workspace_path if project is not None else request.workspace_path,
         )
         return ConversationResponse(
             **_conversation_metadata_response(record).model_dump(),
@@ -7264,13 +7361,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             tenant_id=self._tenant_id,
             conversation_id=conversation_id,
             title=request.title if "title" in request.model_fields_set else None,
-            project_id=request.project_id if "project_id" in request.model_fields_set else None,
-            project_label=(
-                request.project_label if "project_label" in request.model_fields_set else None
-            ),
-            workspace_path=(
-                request.workspace_path if "workspace_path" in request.model_fields_set else None
-            ),
             archived=request.archived if "archived" in request.model_fields_set else None,
         )
         return await self.get_conversation(record.conversation_id)
@@ -14986,6 +15076,37 @@ async def list_operational_runs(
 
 
 @router.post(
+    "/project-workspaces",
+    response_model=ProjectWorkspaceResponse,
+    status_code=201,
+    responses=error_responses(401, 403, 409, 422),
+)
+async def create_project_workspace(
+    body: ProjectWorkspaceCreateRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> ProjectWorkspaceResponse:
+    _require(principal, "run:create")
+    try:
+        return await service.create_project_workspace(body)
+    except ProjectWorkspaceConflict as error:
+        raise PublicAPIError(409, "project_workspace_conflict", str(error)) from error
+
+
+@router.get(
+    "/project-workspaces",
+    response_model=list[ProjectWorkspaceResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_project_workspaces(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[ProjectWorkspaceResponse]:
+    _require(principal, "run:read")
+    return list(await service.list_project_workspaces())
+
+
+@router.post(
     "/conversations",
     response_model=ConversationResponse,
     status_code=201,
@@ -15001,6 +15122,12 @@ async def create_conversation(
         return await service.create_conversation(body)
     except ConversationConflict as error:
         raise PublicAPIError(409, "conversation_conflict", str(error)) from error
+    except ProjectWorkspaceNotFound as error:
+        raise PublicAPIError(
+            409,
+            "project_workspace_required",
+            "Create or select a project workspace before creating a conversation.",
+        ) from error
 
 
 @router.get(

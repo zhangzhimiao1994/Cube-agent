@@ -949,6 +949,22 @@ export type ConversationUpdateRequest = {
   archived?: boolean;
 };
 
+const ProjectWorkspaceSchema = z.object({
+  project_id: z.string(),
+  label: z.string(),
+  workspace_path: z.string(),
+  legacy_workspace_count: z.number().int().positive().default(1),
+  created_at: z.string().nullable().optional(),
+  updated_at: z.string().nullable().optional(),
+});
+
+export type ProjectWorkspace = z.infer<typeof ProjectWorkspaceSchema>;
+export type ProjectWorkspaceCreateRequest = {
+  project_id: string;
+  label: string;
+  workspace_path: string;
+};
+
 const WorkspaceFileSchema = z.object({
   path: z.string(),
   filename: z.string(),
@@ -2496,6 +2512,20 @@ export const api = {
       `/api/v1/admin/conversations?archived=${archived ? "true" : "false"}`,
       { method: "GET" },
       z.array(ConversationMetadataSchema),
+    );
+  },
+  projectWorkspaces(): Promise<ProjectWorkspace[]> {
+    return request(
+      "/api/v1/admin/project-workspaces",
+      { method: "GET" },
+      z.array(ProjectWorkspaceSchema),
+    );
+  },
+  createProjectWorkspace(payload: ProjectWorkspaceCreateRequest): Promise<ProjectWorkspace> {
+    return request(
+      "/api/v1/admin/project-workspaces",
+      { method: "POST", body: JSON.stringify(payload) },
+      ProjectWorkspaceSchema,
     );
   },
   createConversation(payload: ConversationCreateRequest): Promise<ConversationMetadata> {

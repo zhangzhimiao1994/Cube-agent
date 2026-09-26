@@ -13636,8 +13636,103 @@ def test_conversation_can_be_loaded_by_session_id() -> None:
     assert payload["runs"][0]["request"] == "Summarize current deployment readiness."
 
 
+def create_project_workspace_for_test(
+    api: TestClient,
+    *,
+    project_id: str = "default",
+    label: str = "默认项目",
+    workspace_path: str = "main",
+) -> None:
+    response = api.post(
+        "/api/v1/admin/project-workspaces",
+        headers=headers(),
+        json={
+            "project_id": project_id,
+            "label": label,
+            "workspace_path": workspace_path,
+        },
+    )
+    assert response.status_code == 201
+
+
+def test_project_workspace_is_created_once_and_shared_by_multiple_conversations() -> None:
+    api = client()
+
+    project = api.post(
+        "/api/v1/admin/project-workspaces",
+        headers=headers(),
+        json={
+            "project_id": "Shared Product",
+            "label": "共享产品",
+            "workspace_path": "Product Workspace",
+        },
+    )
+    assert project.status_code == 201
+    assert project.json().items() >= {
+        "project_id": "shared-product",
+        "label": "共享产品",
+        "workspace_path": "product-workspace",
+        "legacy_workspace_count": 1,
+    }.items()
+
+    for conversation_id in ("conv-shared-one", "conv-shared-two"):
+        created = api.post(
+            "/api/v1/admin/conversations",
+            headers=headers(),
+            json={
+                "conversation_id": conversation_id,
+                "title": conversation_id,
+                "project_id": "shared-product",
+                "project_label": "不会覆盖项目名称",
+                "workspace_path": f"{conversation_id}-workspace",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json().items() >= {
+            "project_id": "shared-product",
+            "project_label": "共享产品",
+            "workspace_path": "product-workspace",
+        }.items()
+
+    listed = api.get("/api/v1/admin/project-workspaces", headers=headers())
+    assert listed.status_code == 200
+    assert [item["project_id"] for item in listed.json()] == ["shared-product"]
+
+    duplicate = api.post(
+        "/api/v1/admin/project-workspaces",
+        headers=headers(),
+        json={
+            "project_id": "shared-product",
+            "label": "重复项目",
+            "workspace_path": "another-workspace",
+        },
+    )
+    assert duplicate.status_code == 409
+
+
+def test_conversation_requires_an_existing_project_workspace() -> None:
+    response = client().post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-missing-project",
+            "project_id": "missing-project",
+            "workspace_path": "ignored-workspace",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "project_workspace_required"
+
+
 def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
     api = client()
+    create_project_workspace_for_test(
+        api,
+        project_id="Mofang Agent",
+        label="魔方 Agent",
+        workspace_path="Workspace Main",
+    )
 
     created = api.post(
         "/api/v1/admin/conversations",
@@ -13670,18 +13765,15 @@ def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
         headers=headers(),
         json={
             "title": "重命名后的标题",
-            "project_id": "Team Project",
-            "project_label": "团队项目",
-            "workspace_path": "Workspace Two",
             "archived": True,
         },
     )
     assert updated.status_code == 200
     assert updated.json().items() >= {
         "title": "重命名后的标题",
-        "project_id": "team-project",
-        "project_label": "团队项目",
-        "workspace_path": "workspace-two",
+        "project_id": "mofang-agent",
+        "project_label": "魔方 Agent",
+        "workspace_path": "workspace-main",
         "runs": [],
     }.items()
     assert updated.json()["archived_at"] is not None
@@ -13727,8 +13819,40 @@ def test_conversation_metadata_rejects_unsafe_workspace_path(workspace_path: str
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("field_name", ("project_id", "project_label", "workspace_path"))
+def test_conversation_update_rejects_project_workspace_changes(field_name: str) -> None:
+    api = client()
+    create_project_workspace_for_test(
+        api,
+        project_id="fixed-project",
+        label="固定项目",
+        workspace_path="fixed-workspace",
+    )
+    created = api.post(
+        "/api/v1/admin/conversations",
+        headers=headers(),
+        json={
+            "conversation_id": "conv-fixed-project",
+            "project_id": "fixed-project",
+            "project_label": "固定项目",
+            "workspace_path": "fixed-workspace",
+        },
+    )
+    assert created.status_code == 201
+
+    response = api.patch(
+        "/api/v1/admin/conversations/conv-fixed-project",
+        headers=headers(),
+        json={field_name: "another-value"},
+    )
+
+    assert response.status_code == 422
+
+
 def test_conversation_metadata_uses_default_title_when_client_omits_it() -> None:
-    response = client().post(
+    api = client()
+    create_project_workspace_for_test(api)
+    response = api.post(
         "/api/v1/admin/conversations",
         headers=headers(),
         json={
@@ -13743,9 +13867,10 @@ def test_conversation_metadata_uses_default_title_when_client_omits_it() -> None
     assert response.json()["runs"] == []
 
 
-@pytest.mark.parametrize("field_name", ("title", "project_id", "project_label", "workspace_path"))
+@pytest.mark.parametrize("field_name", ("title",))
 def test_conversation_metadata_rejects_null_updates(field_name: str) -> None:
     api = client()
+    create_project_workspace_for_test(api)
     created = api.post(
         "/api/v1/admin/conversations",
         headers=headers(),
@@ -13771,6 +13896,7 @@ def test_conversation_metadata_is_tenant_scoped() -> None:
     app = create_app(auth_service=StubAuthService(), rate_limiter=object())
     app.state.admin_resource_service = root
     first = TestClient(app)
+    create_project_workspace_for_test(first)
     created = first.post(
         "/api/v1/admin/conversations",
         headers=headers(),

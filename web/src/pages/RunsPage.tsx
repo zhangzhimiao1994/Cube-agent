@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef,
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import {
   ArtifactFileCard,
@@ -5393,6 +5393,39 @@ type NewConversationDraft = {
   referenceConversationId: string | null;
 };
 
+type ConversationProjectOption = {
+  id: string;
+  label: string;
+  workspacePath: string;
+  legacyWorkspaceCount: number;
+};
+
+type NewProjectDraft = {
+  projectId: string;
+  label: string;
+  workspacePath: string;
+};
+
+function keepFocusInsideDialog(event: KeyboardEvent, dialog: HTMLElement) {
+  if (event.key !== "Tab") return;
+  const focusable = [...dialog.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => {
+    const collapsedDetails = element.closest("details:not([open])");
+    return !element.hidden && (!collapsedDetails || element.tagName === "SUMMARY");
+  });
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function ConversationDialogShell({
   title,
   children,
@@ -5402,14 +5435,43 @@ function ConversationDialogShell({
   children: ReactNode;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const focusTimer = window.setTimeout(() => {
+      dialog?.querySelector<HTMLElement>("input, select, textarea, button")?.focus();
+    }, 0);
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (dialog) keepFocusInsideDialog(event, dialog);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", onKeyDown);
+      window.setTimeout(() => opener?.focus(), 0);
+    };
+  }, []);
   return createPortal(
-    <div className="conversation-dialog-backdrop" onMouseDown={onClose}>
+    <div
+      className="conversation-dialog-backdrop"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
+        ref={dialogRef}
         className="conversation-dialog"
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        onMouseDown={(event) => event.stopPropagation()}
       >
         <header>
           <div>
@@ -5429,6 +5491,7 @@ function ConversationDialogShell({
 
 function NewConversationDialog({
   draft,
+  projects,
   pending,
   error,
   onChange,
@@ -5436,13 +5499,14 @@ function NewConversationDialog({
   onSubmit,
 }: {
   draft: NewConversationDraft;
+  projects: ConversationProjectOption[];
   pending: boolean;
   error: string | null;
   onChange: (next: NewConversationDraft) => void;
   onClose: () => void;
   onSubmit: () => void;
 }) {
-  const workspaceError = workspacePathError(draft.workspacePath);
+  const knownProject = projects.find((project) => project.id === draft.projectId) ?? null;
   return (
     <ConversationDialogShell title="新建会话" onClose={onClose}>
       <form
@@ -5462,50 +5526,123 @@ function NewConversationDialog({
             placeholder="可选，默认显示为新会话"
           />
         </label>
-        <div className="conversation-dialog-grid">
-          <label>
-            项目 ID
-            <input
-              aria-label="项目 ID"
-              value={draft.projectId}
-              required
-              onChange={(event) => onChange({ ...draft, projectId: event.target.value })}
-              placeholder="default"
-            />
-          </label>
-          <label>
-            项目名称
-            <input
-              aria-label="项目名称"
-              value={draft.projectLabel}
-              onChange={(event) => onChange({ ...draft, projectLabel: event.target.value })}
-              placeholder="可选"
-            />
-          </label>
-        </div>
         <label>
-          工作区目录名
+          所属项目
+          <select
+            aria-label="所属项目"
+            value={knownProject?.id ?? ""}
+            onChange={(event) => {
+              const project = projects.find((item) => item.id === event.target.value);
+              if (project) {
+                onChange({
+                  ...draft,
+                  projectId: project.id,
+                  projectLabel: project.label,
+                  workspacePath: project.workspacePath,
+                });
+              }
+            }}
+          >
+            {projects.length === 0 ? <option value="">请先创建项目工作区</option> : null}
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.label}{project.legacyWorkspaceCount > 1 ? `（历史目录 ${project.legacyWorkspaceCount} 个）` : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        {knownProject ? (
+          <small>项目工作区：<code>{workspacePreviewPath(knownProject.id, knownProject.workspacePath)}</code></small>
+        ) : (
+          <p className="form-error" role="status">请先关闭此窗口并创建项目工作区。</p>
+        )}
+        {draft.referenceConversationId ? (
+          <small>创建后会引用原会话 <code>{draft.referenceConversationId}</code> 作为上下文。</small>
+        ) : null}
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <div className="conversation-dialog-actions">
+          <button type="button" className="secondary-action" onClick={onClose}>取消</button>
+          <button type="submit" disabled={pending || !knownProject}>
+            {pending ? "创建中..." : "创建会话"}
+          </button>
+        </div>
+      </form>
+    </ConversationDialogShell>
+  );
+}
+
+function NewProjectDialog({
+  draft,
+  pending,
+  error,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  draft: NewProjectDraft;
+  pending: boolean;
+  error: string | null;
+  onChange: (next: NewProjectDraft) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const workspaceError = workspacePathError(draft.workspacePath);
+  const projectIdError = workspacePathError(draft.projectId);
+  return (
+    <ConversationDialogShell title="新建项目工作区" onClose={onClose}>
+      <form
+        className="conversation-dialog-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <label>
+          项目名称
           <input
-            aria-label="工作区目录名"
+            aria-label="项目名称"
+            value={draft.label}
+            required
+            maxLength={80}
+            onChange={(event) => onChange({ ...draft, label: event.target.value })}
+            placeholder="例如 魔方 Agent"
+          />
+        </label>
+        <label>
+          项目标识
+          <input
+            aria-label="项目 ID"
+            value={draft.projectId}
+            required
+            aria-invalid={Boolean(projectIdError)}
+            onChange={(event) => onChange({ ...draft, projectId: event.target.value })}
+            placeholder="例如 mofang-agent"
+          />
+        </label>
+        <label>
+          共享工作区名称
+          <input
+            aria-label="共享工作区名称"
             value={draft.workspacePath}
             required
             aria-invalid={Boolean(workspaceError)}
             onChange={(event) => onChange({ ...draft, workspacePath: event.target.value })}
-            placeholder="session-id"
+            placeholder="例如 main"
           />
         </label>
         <small>
-          实际位置：<code>{workspacePreviewPath(draft.projectId, draft.workspacePath)}</code>。系统工作区根目录由管理员配置。
+          该项目下的多个会话将共享 <code>{workspacePreviewPath(draft.projectId, draft.workspacePath)}</code>。
         </small>
-        {draft.referenceConversationId ? (
-          <small>创建后会引用原会话 <code>{draft.referenceConversationId}</code> 作为上下文。</small>
-        ) : null}
+        {projectIdError ? <p className="form-error" role="alert">项目标识格式不正确。</p> : null}
         {workspaceError ? <p className="form-error" role="alert">{workspaceError}</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <div className="conversation-dialog-actions">
           <button type="button" className="secondary-action" onClick={onClose}>取消</button>
-          <button type="submit" disabled={pending || !draft.projectId.trim() || Boolean(workspaceError)}>
-            {pending ? "创建中..." : "创建会话"}
+          <button
+            type="submit"
+            disabled={pending || !draft.label.trim() || Boolean(projectIdError) || Boolean(workspaceError)}
+          >
+            {pending ? "创建中..." : "创建项目"}
           </button>
         </div>
       </form>
@@ -5749,6 +5886,32 @@ export function RunsPage() {
     queryKey: ["conversations", true],
     queryFn: () => api.conversations(true),
   });
+  const projectWorkspaces = useQuery({
+    queryKey: ["project-workspaces"],
+    queryFn: () => api.projectWorkspaces(),
+  });
+  const conversationProjects = useMemo(() => {
+    const projects = new Map<string, ConversationProjectOption>();
+    for (const project of projectWorkspaces.data ?? []) {
+      projects.set(project.project_id, {
+        id: project.project_id,
+        label: project.label,
+        workspacePath: project.workspace_path,
+        legacyWorkspaceCount: project.legacy_workspace_count,
+      });
+    }
+    for (const conversation of [...(conversations.data ?? []), ...(archivedConversations.data ?? [])]) {
+      const id = conversation.project_id?.trim();
+      if (!id || projects.has(id)) continue;
+      projects.set(id, {
+        id,
+        label: conversation.project_label?.trim() || (id === "default" ? "默认项目" : id),
+        workspacePath: conversation.workspace_path?.trim() || "main",
+        legacyWorkspaceCount: 1,
+      });
+    }
+    return [...projects.values()].sort((left, right) => left.label.localeCompare(right.label, "zh-CN"));
+  }, [archivedConversations.data, conversations.data, projectWorkspaces.data]);
   const [message, setMessage] = useState("");
   const [editingQueueItemId, setEditingQueueItemId] = useState<string | null>(null);
   const [editingQueueMessage, setEditingQueueMessage] = useState("");
@@ -5767,9 +5930,18 @@ export function RunsPage() {
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
+  const configDialogRef = useRef<HTMLElement>(null);
+  const configTriggerRef = useRef<HTMLButtonElement>(null);
   const [directModel, setDirectModel] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const initialProjectSetupPromptedRef = useRef(false);
+  const [newProjectDraft, setNewProjectDraft] = useState<NewProjectDraft>({
+    projectId: "",
+    label: "",
+    workspacePath: "main",
+  });
   const [newConversationDraft, setNewConversationDraft] = useState<NewConversationDraft>(() => {
     const draftConversationId = newConversationId();
     return {
@@ -6103,6 +6275,8 @@ export function RunsPage() {
     Boolean(processDetailTarget) ||
     Boolean(conversationPreviewFile) ||
     historyOpen ||
+    configOpen ||
+    newProjectOpen ||
     newConversationOpen ||
     renameConversationOpen;
   useEffect(() => {
@@ -6116,6 +6290,62 @@ export function RunsPage() {
       document.documentElement.style.overflow = previousDocumentOverflow || "";
     };
   }, [pageOverlayOpen]);
+
+  useEffect(() => {
+    if (
+      initialProjectSetupPromptedRef.current ||
+      !projectWorkspaces.isSuccess ||
+      !conversations.isSuccess ||
+      !archivedConversations.isSuccess ||
+      conversations.data.length > 0 ||
+      archivedConversations.data.length > 0
+    ) return;
+    initialProjectSetupPromptedRef.current = true;
+    const firstProject = conversationProjects[0];
+    if (firstProject) {
+      const nextConversationId = newConversationId();
+      setProjectId(firstProject.id);
+      setProjectLabel(firstProject.label);
+      setNewConversationDraft({
+        conversationId: nextConversationId,
+        title: "",
+        projectId: firstProject.id,
+        projectLabel: firstProject.label,
+        workspacePath: firstProject.workspacePath,
+        referenceConversationId: null,
+      });
+      setNewProjectOpen(false);
+      setNewConversationOpen(true);
+      setSubmitNotice("请选择项目并创建第一条会话。");
+      return;
+    }
+    setNewProjectDraft({ projectId: "", label: "", workspacePath: "main" });
+    setNewConversationOpen(false);
+    setNewProjectOpen(true);
+    setSubmitNotice("请先创建项目工作区，再创建第一条会话。");
+  }, [archivedConversations.data, archivedConversations.isSuccess, conversationProjects, conversations.data, conversations.isSuccess, projectWorkspaces.isSuccess]);
+
+  useEffect(() => {
+    if (!configOpen) return undefined;
+    const dialog = configDialogRef.current;
+    const focusTimer = window.setTimeout(() => {
+      dialog?.querySelector<HTMLElement>("button, select, input, textarea")?.focus();
+    }, 0);
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setConfigOpen(false);
+        return;
+      }
+      if (dialog) keepFocusInsideDialog(event, dialog);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", onKeyDown);
+      window.setTimeout(() => configTriggerRef.current?.focus(), 0);
+    };
+  }, [configOpen]);
 
   useEffect(() => {
     if (!processDetailTarget) return undefined;
@@ -6404,6 +6634,35 @@ export function RunsPage() {
       }
       setSubmitNotice("已取消这条排队信息。");
       await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
+    },
+  });
+
+  const createProjectWorkspace = useMutation({
+    mutationFn: (draft: NewProjectDraft) =>
+      api.createProjectWorkspace({
+        project_id: draft.projectId.trim(),
+        label: draft.label.trim(),
+        workspace_path: draft.workspacePath.trim(),
+      }),
+    onSuccess: (created: ProjectWorkspace) => {
+      queryClient.setQueryData<ProjectWorkspace[]>(["project-workspaces"], (current) => [
+        created,
+        ...(current ?? []).filter((item) => item.project_id !== created.project_id),
+      ]);
+      setProjectId(created.project_id);
+      setProjectLabel(created.label);
+      setNewProjectOpen(false);
+      const nextConversationId = newConversationId();
+      setNewConversationDraft({
+        conversationId: nextConversationId,
+        title: "",
+        projectId: created.project_id,
+        projectLabel: created.label,
+        workspacePath: created.workspace_path,
+        referenceConversationId: null,
+      });
+      setNewConversationOpen(true);
+      setSubmitNotice("项目工作区已创建，现在可以在该项目下创建第一条会话。");
     },
   });
 
@@ -6964,18 +7223,43 @@ export function RunsPage() {
   }
 
   function startNewConversation() {
+    const selectedProject =
+      conversationProjects.find((item) => item.id === projectId.trim()) ?? conversationProjects[0];
+    if (!selectedProject) {
+      if (projectWorkspaces.isLoading || conversations.isLoading || archivedConversations.isLoading) {
+        setSubmitNotice("正在读取项目工作区，请稍候再试。");
+        return;
+      }
+      if (projectWorkspaces.isError) {
+        setSubmitNotice("项目工作区读取失败，请重试后再新建会话。");
+        void projectWorkspaces.refetch();
+        return;
+      }
+      setNewProjectDraft({ projectId: "", label: "", workspacePath: "main" });
+      createProjectWorkspace.reset();
+      setNewProjectOpen(true);
+      setSubmitNotice("请先创建项目工作区，再在项目下新建会话。");
+      return;
+    }
     const nextConversationId = newConversationId();
-    const nextProjectId = projectId.trim() || "default";
     setNewConversationDraft({
       conversationId: nextConversationId,
       title: "",
-      projectId: nextProjectId,
-      projectLabel: "",
-      workspacePath: nextConversationId,
+      projectId: selectedProject.id,
+      projectLabel: selectedProject.label,
+      workspacePath: selectedProject.workspacePath,
       referenceConversationId: null,
     });
     createConversation.reset();
     setNewConversationOpen(true);
+    setHistoryOpen(false);
+  }
+
+  function startNewProject() {
+    setNewProjectDraft({ projectId: "", label: "", workspacePath: "main" });
+    createProjectWorkspace.reset();
+    setNewProjectOpen(true);
+    setNewConversationOpen(false);
     setHistoryOpen(false);
   }
 
@@ -6986,12 +7270,28 @@ export function RunsPage() {
       return;
     }
     const nextConversationId = newConversationId();
+    const selectedProject =
+      conversationProjects.find((item) => item.id === projectId.trim()) ?? conversationProjects[0];
+    if (!selectedProject) {
+      if (projectWorkspaces.isLoading || conversations.isLoading || archivedConversations.isLoading) {
+        setSubmitNotice("正在读取项目工作区，请稍候再创建分支会话。");
+        return;
+      }
+      if (projectWorkspaces.isError) {
+        setSubmitNotice("项目工作区读取失败，请重试后再创建分支会话。");
+        void projectWorkspaces.refetch();
+        return;
+      }
+      startNewProject();
+      setSubmitNotice("请先创建项目工作区，再创建分支会话。");
+      return;
+    }
     setNewConversationDraft({
       conversationId: nextConversationId,
       title: "",
-      projectId: projectId.trim() || "default",
-      projectLabel,
-      workspacePath: nextConversationId,
+      projectId: selectedProject.id,
+      projectLabel: selectedProject.label,
+      workspacePath: selectedProject.workspacePath,
       referenceConversationId: trimmedSourceConversationId,
     });
     createConversation.reset();
@@ -7403,9 +7703,31 @@ export function RunsPage() {
           ) : null}
         </nav>
 
-        <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>
-          {configOpen ? (
-              <div className="composer-config-sheet" role="region" aria-label="本次运行更多设置">
+        <div className="chat-panel">
+          {configOpen ? createPortal(
+            <div
+              className="composer-settings-backdrop"
+              onPointerDown={(event) => {
+                if (event.target === event.currentTarget) setConfigOpen(false);
+              }}
+            >
+              <section
+                ref={configDialogRef}
+                className="composer-settings-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-label="本次运行设置"
+              >
+                <header className="composer-settings-header">
+                  <div>
+                    <span className="eyebrow">Run settings</span>
+                    <h3>本次运行设置</h3>
+                  </div>
+                  <button type="button" className="secondary-action" aria-label="关闭运行设置" onClick={() => setConfigOpen(false)}>
+                    关闭
+                  </button>
+                </header>
+                <div className="composer-config-sheet" role="region" aria-label="本次运行更多设置">
           <div className="composer-config-summary" aria-label="本次运行设置概览">
             <strong>本次运行配置</strong>
             <div>
@@ -7545,7 +7867,10 @@ export function RunsPage() {
             </div>
           </details>
 
-            </div>
+                </div>
+              </section>
+            </div>,
+            document.body,
           ) : null}
 
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
@@ -7561,6 +7886,9 @@ export function RunsPage() {
                 {currentConversationArchived ? <span className="conversation-archived-badge">已归档</span> : null}
               </div>
               <div className="chat-session-actions">
+                <button type="button" className="secondary-action" aria-label="新建项目工作区" onClick={startNewProject}>
+                  项目
+                </button>
                 <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
                   新建
                 </button>
@@ -8156,6 +8484,7 @@ export function RunsPage() {
                   </button>
                 ) : null}
                 <button
+                  ref={configTriggerRef}
                   type="button"
                   className="composer-plus-button"
                   aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
@@ -8235,9 +8564,32 @@ export function RunsPage() {
         </div>
       </div>
 
+      {newProjectOpen ? (
+        <NewProjectDialog
+          draft={newProjectDraft}
+          pending={createProjectWorkspace.isPending}
+          error={createProjectWorkspace.isError ? formatApiError(createProjectWorkspace.error, "项目工作区创建失败") : null}
+          onChange={(next) => {
+            createProjectWorkspace.reset();
+            setNewProjectDraft(next);
+          }}
+          onClose={() => {
+            if (!createProjectWorkspace.isPending) setNewProjectOpen(false);
+          }}
+          onSubmit={() => {
+            if (
+              !newProjectDraft.label.trim() ||
+              workspacePathError(newProjectDraft.projectId) ||
+              workspacePathError(newProjectDraft.workspacePath)
+            ) return;
+            createProjectWorkspace.mutate(newProjectDraft);
+          }}
+        />
+      ) : null}
       {newConversationOpen ? (
         <NewConversationDialog
           draft={newConversationDraft}
+          projects={conversationProjects}
           pending={createConversation.isPending}
           error={createConversation.isError ? formatApiError(createConversation.error, "会话创建失败") : null}
           onChange={(next) => {
@@ -8248,7 +8600,7 @@ export function RunsPage() {
             if (!createConversation.isPending) setNewConversationOpen(false);
           }}
           onSubmit={() => {
-            if (!newConversationDraft.projectId.trim() || workspacePathError(newConversationDraft.workspacePath)) return;
+            if (!newConversationDraft.projectId.trim()) return;
             createConversation.mutate(newConversationDraft);
           }}
         />

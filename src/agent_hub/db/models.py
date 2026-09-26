@@ -129,6 +129,35 @@ class ConfigRevisionRow(Base):
     )
 
 
+class ProjectWorkspaceRow(Base):
+    __tablename__ = "agent_hub_project_workspaces"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "project_id",
+            name="uq_agent_hub_project_workspaces_tenant_project",
+        ),
+        Index("ix_agent_hub_project_workspaces_tenant_updated", "tenant_id", "updated_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(80), nullable=False)
+    workspace_path: Mapped[str] = mapped_column(String(64), nullable=False)
+    legacy_workspace_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ConversationRow(Base):
     __tablename__ = "agent_hub_conversations"
     __table_args__ = (

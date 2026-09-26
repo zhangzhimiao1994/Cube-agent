@@ -264,6 +264,15 @@ async function mockCodingRunApi(
     longPreviewSentinel,
   ].join("\n");
   let detailRequests = 0;
+  const projectWorkspaces = [
+    {
+      project_id: "default",
+      label: "默认项目",
+      workspace_path: "main",
+      created_at: "2026-08-31T00:00:00Z",
+      updated_at: "2026-08-31T00:00:00Z",
+    },
+  ];
   const plannedRoles = options.largeWorkbench
     ? [
         {
@@ -571,6 +580,25 @@ async function mockCodingRunApi(
       await route.fulfill({ json: [] });
       return;
     }
+    if (path === "/api/v1/admin/project-workspaces" && request.method() === "GET") {
+      await route.fulfill({ json: projectWorkspaces });
+      return;
+    }
+    if (path === "/api/v1/admin/project-workspaces" && request.method() === "POST") {
+      const payload = request.postDataJSON() as {
+        project_id: string;
+        label: string;
+        workspace_path: string;
+      };
+      const created = {
+        ...payload,
+        created_at: "2026-08-31T00:00:00Z",
+        updated_at: "2026-08-31T00:00:00Z",
+      };
+      projectWorkspaces.unshift(created);
+      await route.fulfill({ status: 201, json: created });
+      return;
+    }
     if (path === "/api/v1/admin/conversations" && request.method() === "POST") {
       const payload = request.postDataJSON() as {
         conversation_id: string;
@@ -720,10 +748,73 @@ async function mockCodingRunApi(
   });
 }
 
+test("project conversation and run settings dialogs stay separate and usable on desktop and mobile", async ({ page }, testInfo) => {
+  await mockCodingRunApi(page);
+
+  for (const viewport of [
+    { name: "desktop", width: 1280, height: 900 },
+    { name: "mobile", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.goto("/");
+
+    const initialConversationDialog = page.getByRole("dialog", { name: "新建会话" });
+    await expect(initialConversationDialog).toBeVisible();
+    await expect(initialConversationDialog.getByLabel("所属项目")).toHaveValue("default");
+    await page.keyboard.press("Escape");
+    await expect(initialConversationDialog).toHaveCount(0);
+
+    await page.getByRole("button", { name: "新建项目工作区" }).click();
+    const projectDialog = page.getByRole("dialog", { name: "新建项目工作区" });
+    await expect(projectDialog).toBeVisible();
+    await expect(projectDialog.getByLabel("项目名称")).toBeVisible();
+    await expect(projectDialog.getByLabel("会话标题")).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("hidden");
+    await projectDialog.getByText("项目名称").click();
+    await expect(projectDialog).toBeVisible();
+    await page.locator(".conversation-dialog-backdrop").click({ position: { x: 5, y: 5 } });
+    await expect(projectDialog).toHaveCount(0);
+
+    await page.getByRole("button", { name: "新建对话" }).click();
+    const conversationDialog = page.getByRole("dialog", { name: "新建会话" });
+    await expect(conversationDialog).toBeVisible();
+    await expect(conversationDialog.getByLabel("会话标题")).toBeVisible();
+    await expect(conversationDialog.getByLabel("所属项目")).toHaveValue("default");
+    await expect(conversationDialog.getByLabel("共享工作区名称")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(conversationDialog).toHaveCount(0);
+
+    await page.getByRole("button", { name: "打开本次运行配置" }).click();
+    const settingsDialog = page.getByRole("dialog", { name: "本次运行设置" });
+    await expect(settingsDialog).toBeVisible();
+    const closeSettings = settingsDialog.getByRole("button", { name: "关闭运行设置" });
+    const settingsSummary = settingsDialog.locator("summary");
+    await expect(closeSettings).toBeVisible();
+    await expect(closeSettings).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(settingsSummary).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(closeSettings).toBeFocused();
+    const layout = await page.evaluate(() => ({
+      bodyWidth: document.body.scrollWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+    }));
+    expect(layout.bodyWidth).toBeLessThanOrEqual(layout.viewportWidth + 1);
+    expect(layout.documentWidth).toBeLessThanOrEqual(layout.viewportWidth + 1);
+    await page.screenshot({ path: testInfo.outputPath(`project-conversation-settings-${viewport.name}.png`) });
+    await page.locator(".composer-settings-backdrop").click({ position: { x: 5, y: 5 } });
+    await expect(settingsDialog).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("");
+  }
+});
+
 test("operator validates a simple coding run and downloads final and intermediate artifacts", async ({ page }, testInfo) => {
   await mockCodingRunApi(page);
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
@@ -801,6 +892,8 @@ test("conversation checkpoints jump between user questions", async ({ page }) =>
   await mockCodingRunApi(page, { multiTurnHistory: true });
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
@@ -833,6 +926,8 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
@@ -867,6 +962,8 @@ test("mobile conversation file preview scrolls long files to the end", async ({ 
   await page.setViewportSize({ width: 390, height: 844 });
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
@@ -925,6 +1022,8 @@ test("opened agent process drawer refreshes when new step events arrive", async 
   await mockCodingRunApi(page, { liveRefresh: true });
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
@@ -945,6 +1044,8 @@ test("process drawer keeps long fields behind summary detail cards", async ({ pa
   await mockCodingRunApi(page, { fullOutputSentinel });
 
   await page.goto("/");
+  await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 

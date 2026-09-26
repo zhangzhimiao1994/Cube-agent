@@ -229,3 +229,18 @@ def test_skill_source_migration_follows_conversation_metadata() -> None:
     assert "skill_source" not in migration._CURRENT_KINDS
     migration_source = migration_path.read_text(encoding="utf-8")
     assert "payload - 'source' - 'archive_sha256'" in migration_source
+
+
+def test_project_workspace_migration_records_legacy_workspace_conflicts() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0029_project_workspaces.py"
+    )
+    source = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "0028_conversation_run_queue"' in source
+    assert "COUNT(DISTINCT workspace_path) AS workspace_count" in source
+    assert "legacy_workspace_count" in source
+    assert "UPDATE agent_hub_conversations" not in source
