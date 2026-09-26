@@ -4,12 +4,16 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.conversation_queue import ConversationQueueRepository
+from agent_hub.runs.conversation_queue import (
+    ConversationQueueItem,
+    ConversationQueueRepository,
+    EnqueueConversationMessage,
+)
 from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -20,29 +24,33 @@ class QueueServiceRepository:
         self.predecessor = predecessor
         self.cancelled: list[tuple[object, object, RunStatus]] = []
 
-    async def list_conversation(self, tenant_id, conversation_id):
+    async def list_conversation(
+        self, tenant_id: UUID, conversation_id: str
+    ) -> tuple[RunRecord, ...]:
         del tenant_id, conversation_id
         return (self.predecessor,)
 
-    async def update_control_status(self, tenant_id, run_id, status):
+    async def update_control_status(
+        self, tenant_id: UUID, run_id: UUID, status: RunStatus
+    ) -> RunRecord:
         self.cancelled.append((tenant_id, run_id, status))
         return self.predecessor
 
-    async def completed_step_ids(self, tenant_id, run_id):
+    async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
         del tenant_id, run_id
         return ()
 
-    async def artifact_ids(self, tenant_id, run_id):
+    async def artifact_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[UUID, ...]:
         del tenant_id, run_id
         return ()
 
-    async def usage_cost(self, tenant_id, run_id):
+    async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> Decimal:
         del tenant_id, run_id
         return Decimal(0)
 
 
 class FailingConversationQueue:
-    async def enqueue(self, command):
+    async def enqueue(self, command: EnqueueConversationMessage) -> ConversationQueueItem:
         del command
         raise RuntimeError("queue write failed")
 
@@ -51,8 +59,11 @@ class TrackingConversationQueue:
     def __init__(self) -> None:
         self.released: list[tuple[object, object]] = []
 
-    async def release_next_for_terminal_run(self, tenant_id, run_id):
+    async def release_next_for_terminal_run(
+        self, tenant_id: UUID, run_id: UUID
+    ) -> ConversationQueueItem | None:
         self.released.append((tenant_id, run_id))
+        return None
 
 
 @pytest.mark.asyncio

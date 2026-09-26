@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -19,11 +19,11 @@ from agent_hub.runs.conversation_queue import (
 async def _run(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    tenant_id,
+    tenant_id: UUID,
     request: str,
-    blocked_by_run_id=None,
+    blocked_by_run_id: UUID | None = None,
     status: RunStatus = RunStatus.QUEUED,
-    worker_lease_expires_at=None,
+    worker_lease_expires_at: datetime | None = None,
 ) -> RunRow:
     row = RunRow(
         id=uuid4(),

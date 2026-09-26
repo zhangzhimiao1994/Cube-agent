@@ -1,4 +1,6 @@
-from sqlalchemy import UniqueConstraint
+from typing import cast
+
+from sqlalchemy import Table, UniqueConstraint
 
 from agent_hub.db.models import ConversationQueueItemRow, RunRow
 from agent_hub.domain.runs import ConversationQueueStatus
@@ -25,13 +27,15 @@ def test_run_row_exposes_a_nullable_blocking_predecessor() -> None:
 
 
 def test_conversation_queue_has_tenant_idempotency_and_ordering_contracts() -> None:
-    table = ConversationQueueItemRow.__table__
+    table = cast(Table, ConversationQueueItemRow.__table__)
     unique_columns = {
         tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
     }
-    indexes = {index.name: tuple(column.name for column in index.columns) for index in table.indexes}
+    indexes = {
+        str(index.name): tuple(column.name for column in index.columns) for index in table.indexes
+    }
 
     assert ("tenant_id", "idempotency_key") in unique_columns
     assert indexes["ix_agent_hub_conversation_queue_order"] == (
@@ -41,4 +45,3 @@ def test_conversation_queue_has_tenant_idempotency_and_ordering_contracts() -> N
     )
     assert table.c.version.server_default is not None
     assert table.c.failure_detail.nullable is True
-
