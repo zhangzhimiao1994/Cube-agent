@@ -5215,18 +5215,20 @@ function BoundedTextBlock({
   copyAriaLabel,
   label,
   text,
+  shouldCollapse: shouldCollapseOverride,
   collapseLabel = "展开",
   expandLabel = "收起",
 }: {
   copyAriaLabel: string;
   label: string;
   text: string;
+  shouldCollapse?: boolean;
   collapseLabel?: string;
   expandLabel?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
-  const shouldCollapse = text.length > 1200 || text.split("\n").length > 18;
+  const shouldCollapse = shouldCollapseOverride ?? (text.length > 1200 || text.split("\n").length > 18);
   return (
     <div
       className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
@@ -5235,7 +5237,12 @@ function BoundedTextBlock({
         <span>{label}</span>
         <div>
           {shouldCollapse ? (
-            <button type="button" className="text-button" onClick={() => setExpanded((current) => !current)}>
+            <button
+              type="button"
+              className="text-button"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((current) => !current)}
+            >
               {expanded ? expandLabel : collapseLabel}
             </button>
           ) : null}
@@ -5272,6 +5279,7 @@ function ProcessDetailValueBlock({ row }: { row: { label: string; value: string 
         copyAriaLabel={presentation.copyLabel}
         label={row.label}
         text={presentation.text}
+        shouldCollapse={presentation.shouldCollapse}
         collapseLabel="展开全文"
         expandLabel="收起"
       />
@@ -5282,6 +5290,7 @@ function ProcessDetailValueBlock({ row }: { row: { label: string; value: string 
       copyAriaLabel={presentation.copyLabel}
       label={presentation.label}
       text={presentation.text}
+      shouldCollapse={presentation.shouldCollapse}
     />
   );
 }

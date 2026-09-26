@@ -3698,6 +3698,30 @@ article:hover {
   word-break: normal;
 }
 
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dt,
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dd {
+  display: none;
+}
+
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dt:has(+ dd > .bounded-text-block.is-expanded) {
+  display: block;
+  flex: 0 0 auto;
+  margin-bottom: 0.42rem;
+}
+
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dd:has(> .bounded-text-block.is-expanded) {
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .bounded-text-block {
   background: rgba(2, 6, 23, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.18);
@@ -3779,11 +3803,12 @@ article:hover {
 }
 
 .process-detail-modal .bounded-text-block.is-expanded {
-  min-height: min(72dvh, 48rem);
+  height: 100%;
+  min-height: 0;
 }
 
 .process-detail-modal .bounded-text-block.is-expanded pre {
-  min-height: min(58dvh, 38rem);
+  min-height: 0;
 }
 
 .artifact-file-card {
@@ -6590,11 +6615,12 @@ article:hover {
   }
 
   .process-detail-modal .bounded-text-block.is-expanded {
-    min-height: calc(100dvh - 11rem - env(safe-area-inset-top));
+    height: 100%;
+    min-height: 0;
   }
 
   .process-detail-modal .bounded-text-block.is-expanded pre {
-    min-height: calc(100dvh - 15rem - env(safe-area-inset-top));
+    min-height: 0;
   }
 
   .chat-session-toolbar {

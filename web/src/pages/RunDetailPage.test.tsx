@@ -75,6 +75,10 @@ it("keeps mobile nested process drawers anchored while only details scroll", () 
 
 it("keeps nested process detail modals full-width and readable on mobile", () => {
   const stylesCss = readFileSync("src/styles.css", "utf8");
+  const source = readFileSync("src/pages/RunDetailPage.tsx", "utf8");
+
+  expect(source).toContain("aria-expanded={expanded}");
+  expect(source).toContain("shouldCollapse={presentation.shouldCollapse}");
 
   expect(stylesCss).toMatch(
     /\.process-detail-modal\s*{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*min-width:\s*0;[\s\S]*overflow:\s*hidden;[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
@@ -101,7 +105,13 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\)\s*{[\s\S]*height:\s*min\(98dvh,\s*1120px\);[\s\S]*width:\s*min\(99vw,\s*1360px\);/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[\s\S]*min-height:\s*min\(58dvh,\s*38rem\);/,
+    /\.process-detail-modal \.bounded-text-block\.is-expanded\s*{[^}]*height:\s*100%;[^}]*min-height:\s*0;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal \.bounded-text-block\.is-expanded pre\s*{[^}]*min-height:\s*0;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(> \.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*hidden;/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
