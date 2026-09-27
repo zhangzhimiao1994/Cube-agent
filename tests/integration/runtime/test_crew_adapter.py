@@ -3420,10 +3420,13 @@ class BatchedToolGateway(FakeGateway):
     def __init__(self, batches: tuple[int, ...]) -> None:
         super().__init__()
         self.batches = list(batches)
+        self.next_query_index = 0
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
         count = self.batches.pop(0) if self.batches else 0
+        query_start = self.next_query_index
+        self.next_query_index += count
         response = (
             ModelResponse(
                 text=None,
@@ -3431,7 +3434,7 @@ class BatchedToolGateway(FakeGateway):
                     ToolCall(
                         id=f"provider-{len(self.requests)}-{index}",
                         name="web.search",
-                        arguments={"q": str(index)},
+                        arguments={"q": str(query_start + index)},
                     )
                     for index in range(count)
                 ),
