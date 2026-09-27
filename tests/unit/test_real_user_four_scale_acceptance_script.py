@@ -347,6 +347,9 @@ def test_real_user_matrix_creates_unique_projects_and_conversations_for_all_scal
     assert delegate.project_workspace_paths == expected_workspace_paths
     assert delegate.conversation_workspace_paths == expected_workspace_paths
     assert all(plan.requests[0].body["mode"] == "auto" for plan in plans)
+    assert [
+        plan.requests[0].body["workspace_session_id"] for plan in plans
+    ] == expected_workspace_paths
     assert payload["core_acceptance_ok"] is True
     assert payload["status"] == "pending"
     assert payload["acceptance_complete"] is False

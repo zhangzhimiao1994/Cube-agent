@@ -394,7 +394,7 @@ def run_real_user_four_scale_acceptance(
                 project_id=project_id,
                 project_label=project_label,
                 conversation_id=conversation_id,
-                workspace_session_id=conversation_id,
+                workspace_session_id=workspace_session_id,
             )
             effective_wait = _effective_execute_wait_seconds(
                 plan,
