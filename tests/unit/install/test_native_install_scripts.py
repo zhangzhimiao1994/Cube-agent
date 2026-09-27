@@ -805,6 +805,9 @@ def test_native_install_keeps_root_broker_runtime_unwritable_by_service_user() -
     assert 'chown -R root:agent-hub "$release"' in installer
     assert 'chmod -R u+rwX,g+rX,o-rwx "$release"' in installer
     assert 'chmod -R g-w,o-rwx "$release"' in installer
+    assert installer.index('chmod -R g-w,o-rwx "$release"') < installer.index(
+        'chmod 0755 "$release"'
+    )
     assert 'chown -R agent-hub:agent-hub "$release"' not in installer
     assert 'chown -h root:root "$INSTALL_ROOT/current"' in installer
     assert installer.index('fix_native_release_permissions "$release"') < installer.index(

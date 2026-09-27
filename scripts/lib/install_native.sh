@@ -513,9 +513,9 @@ fix_native_release_permissions() {
 
   chown -R root:agent-hub "$release"
   chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
-  chmod 0755 "$release"
   chmod -R u+rwX,g+rX,o-rwx "$release"
   chmod -R g-w,o-rwx "$release"
+  chmod 0755 "$release"
   find "$release" -type f -exec chmod u-s,g-s {} +
   if [[ -d "$release/web" ]]; then
     chmod 0755 "$release/web"
