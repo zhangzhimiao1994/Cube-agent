@@ -690,12 +690,28 @@ class DirectRuntime:
                     gateway_task = None
                     del text, response, completion, request, included_source_ids, context
                     _raise_execution_error("model response text is empty")
-            if len(text.encode("utf-8")) > _max_output_bytes_for_context(context):
+            extracted_workspace_bundle = _project_scale_workspace_bundle_from_model_text(text)
+            output_byte_limit = (
+                _MAX_PROJECT_SCALE_OUTPUT_BYTES
+                if extracted_workspace_bundle is not None
+                else _max_output_bytes_for_context(context)
+            )
+            if len(text.encode("utf-8")) > output_byte_limit:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
-                del text, response, completion, request, included_source_ids, context
+                del (
+                    extracted_workspace_bundle,
+                    output_byte_limit,
+                    text,
+                    response,
+                    completion,
+                    request,
+                    included_source_ids,
+                    context,
+                )
                 _raise_execution_error("model response is invalid")
+            del output_byte_limit
             budget_outcome = self._verified_budget_usage(
                 response.usage,
                 prompt_estimate=prompt_estimate,
@@ -727,11 +743,8 @@ class DirectRuntime:
             )
 
             is_project_scale_capability = _is_project_scale_capability_request(context.request)
-            project_scale_workspace_bundle = (
-                _project_scale_workspace_bundle_from_model_text(text)
-                if is_project_scale_capability
-                else None
-            )
+            project_scale_workspace_bundle = extracted_workspace_bundle
+            del extracted_workspace_bundle
             deterministic_project_scale_recovery = (
                 is_project_scale_capability
                 and _can_recover_project_scale_capability_request(context.request)

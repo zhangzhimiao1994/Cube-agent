@@ -1099,6 +1099,35 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
     assert events[-1].inputs
 
 
+async def test_direct_accepts_large_markdown_workspace_bundle_for_natural_project_request() -> None:
+    source = "export const chunk = " + json.dumps("网盘实现\n" * 12_000) + ";\n"
+    text = (
+        "项目文件如下。\n\n"
+        "## `README.md`\n\n"
+        "```markdown\n# 网盘网站\n\n运行与验收说明。\n```\n\n"
+        "## `src/server.ts`\n\n"
+        f"```ts\n{source}```"
+    )
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=text, usage=TokenUsage(1, 1, 2))),
+        logical_model="general",
+    )
+
+    events = await collect(runtime, context(request="编写一个网盘网站", token_budget=100_000))
+
+    assert len(text.encode("utf-8")) > 65_536
+    completed = events[-1]
+    assert completed.kind is EventKind.RUNTIME_COMPLETED
+    assert completed.inputs
+    assert completed.inputs[0].type == "tool_result"
+    assert completed.inputs[0].content["workspace_bundle"] == {
+        "files": {
+            "README.md": "# 网盘网站\n\n运行与验收说明。\n",
+            "src/server.ts": source,
+        }
+    }
+
+
 async def test_direct_extracts_project_scale_markdown_bundle_with_level_two_headings() -> None:
     text = """
 Below is the bundle.
