@@ -3360,6 +3360,31 @@ article:hover {
   white-space: pre;
 }
 
+.agent-workbench-preview-mode {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  max-width: 100%;
+}
+
+.agent-workbench-preview-mode .secondary-action[aria-pressed="true"] {
+  background: #e0f2fe;
+  border-color: #0891b2;
+  color: #0e7490;
+}
+
+.agent-workbench-html-preview {
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  border-radius: 8px;
+  box-sizing: border-box;
+  display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-height: min(70dvh, 44rem);
+  overflow: hidden;
+}
+
 .agent-workbench-agent-card.status-异常 {
   border-color: rgba(255, 101, 118, 0.34);
 }
@@ -8327,6 +8352,10 @@ article:hover {
 }
 
 @media (max-width: 640px) {
+  .agent-workbench-html-preview {
+    min-height: min(62dvh, 36rem);
+  }
+
   .artifact-file-card {
     align-items: start;
     grid-template-columns: auto minmax(0, 1fr);

@@ -1642,6 +1642,53 @@ function isDetailTextPreviewCandidate(file: DetailWorkbenchFileItem) {
   return /\.(?:txt|md|json|js|jsx|ts|tsx|py|css|html|xml|yaml|yml|toml|ini|sh|sql|csv|log)$/i.test(name);
 }
 
+function isDetailHtmlPreviewCandidate(file: DetailWorkbenchFileItem) {
+  const mime = file.mimeType?.toLowerCase().split(";", 1)[0]?.trim() ?? "";
+  return mime === "text/html" || /\.html?$/i.test(file.filename);
+}
+
+const DETAIL_HTML_LIVE_PREVIEW_MAX_BYTES = 512 * 1024;
+
+function detailHtmlPreviewByteLength(text: string) {
+  if (text.length > DETAIL_HTML_LIVE_PREVIEW_MAX_BYTES) return text.length;
+  return new TextEncoder().encode(text).byteLength;
+}
+
+function isClearlySelfContainedDetailHtml(html: string) {
+  if (!/<(?:!doctype\s+html|html(?:\s|>))/i.test(html)) return false;
+  const resourceAttributes = html.matchAll(/\b(?:src|href|poster|action|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi);
+  for (const match of resourceAttributes) {
+    const value = (match[1] ?? match[2] ?? match[3] ?? "").trim().toLowerCase();
+    if (value && !/^(?:#|data:|blob:|about:blank|javascript:)/.test(value)) return false;
+  }
+  for (const match of html.matchAll(/url\(\s*(['"]?)([^)'"\s]+)\1\s*\)/gi)) {
+    const value = (match[2] ?? "").trim().toLowerCase();
+    if (value && !/^(?:#|data:|blob:)/.test(value)) return false;
+  }
+  return !/(?:@import\b|\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\s*\(|\bEventSource\s*\()/i.test(html);
+}
+
+function detailHtmlLivePreviewState(file: DetailWorkbenchFileItem, text: string | null) {
+  const isPreviewFile = /^preview\.html?$/i.test(file.filename.trim());
+  const eligible = Boolean(text) && (isPreviewFile || isClearlySelfContainedDetailHtml(text as string));
+  const oversized = eligible && detailHtmlPreviewByteLength(text as string) > DETAIL_HTML_LIVE_PREVIEW_MAX_BYTES;
+  return { eligible, oversized, available: eligible && !oversized };
+}
+
+function detailSourcePreviewText(text: string | null) {
+  if (!text) return "";
+  return text.length > 8000 ? `${text.slice(0, 8000)}\n\n...已截断，仅预览前 8000 字符` : text;
+}
+
+function detailSandboxedHtmlDocument(html: string) {
+  const securityHead = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:; connect-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'">
+<meta name="referrer" content="no-referrer">
+<script>document.addEventListener('click',function(event){var anchor=event.target.closest&&event.target.closest('a[href]');if(anchor){var href=anchor.getAttribute('href')||'';if(href&&!href.startsWith('#'))event.preventDefault();}},true);document.addEventListener('submit',function(event){event.preventDefault();},true);</script>`;
+  if (/<head(?:\s[^>]*)?>/i.test(html)) return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${securityHead}`);
+  if (/<html(?:\s[^>]*)?>/i.test(html)) return html.replace(/<html(?:\s[^>]*)?>/i, (root) => `${root}<head>${securityHead}</head>`);
+  return `<!doctype html><html><head>${securityHead}</head><body>${html}</body></html>`;
+}
+
 async function readDetailWorkbenchPreviewText(payload: unknown): Promise<string> {
   if (typeof payload === "string") return payload;
   if (payload instanceof Response) return payload.text();
@@ -2984,35 +3031,38 @@ function DetailWorkbenchFilePreview({
   onOpenSource: (card: DetailProcessCard) => void;
 }) {
   const [previewText, setPreviewText] = useState<string | null>(file.text);
+  const [previewMode, setPreviewMode] = useState<"source" | "live">("source");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const canPreview = isDetailTextPreviewCandidate(file);
+  const htmlPreview = isDetailHtmlPreviewCandidate(file) ? detailHtmlLivePreviewState(file, previewText) : null;
+  const downloadUrl = file.download.download_url;
 
   useEffect(() => {
+    let active = true;
     setPreviewText(file.text);
+    setPreviewMode("source");
     setLoading(false);
     setError(null);
-  }, [file.id, file.text]);
-
-  async function loadPreview() {
-    if (!canPreview || previewText) return;
+    if (!canPreview || file.text?.trim() || !downloadUrl) return () => {
+      active = false;
+    };
     setLoading(true);
-    setError(null);
-    try {
-      const blob = await api.downloadGeneratedArtifact(file.download.download_url);
-      const text = await readDetailWorkbenchPreviewText(blob);
-      setPreviewText(text.length > 8000 ? `${text.slice(0, 8000)}\n\n...已截断，仅预览前 8000 字符` : text);
-    } catch (caught) {
-      setError(formatApiError(caught, "文件预览失败"));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (canPreview && !previewText) void loadPreview();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file.id]);
+    void (async () => {
+      try {
+        const blob = await api.downloadGeneratedArtifact(downloadUrl);
+        const text = await readDetailWorkbenchPreviewText(blob);
+        if (active) setPreviewText(text);
+      } catch (caught) {
+        if (active) setError(formatApiError(caught, "文件预览失败"));
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [canPreview, downloadUrl, file.id, file.text]);
 
   return (
     <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
@@ -3040,8 +3090,35 @@ function DetailWorkbenchFilePreview({
           查看来源动作
         </button>
       ) : null}
-      {canPreview ? (
-        <pre className="agent-workbench-file-code">{loading ? "正在读取文件预览..." : previewText || "暂无可预览内容"}</pre>
+      {canPreview && htmlPreview?.eligible ? (
+        <div className="agent-workbench-preview-mode" role="group" aria-label="预览方式">
+          <button type="button" className="secondary-action" aria-pressed={previewMode === "source"} onClick={() => setPreviewMode("source")}>
+            源码预览
+          </button>
+          <button
+            type="button"
+            className="secondary-action"
+            aria-pressed={previewMode === "live"}
+            disabled={loading || !htmlPreview.available}
+            onClick={() => setPreviewMode("live")}
+          >
+            运行预览
+          </button>
+        </div>
+      ) : null}
+      {htmlPreview?.oversized ? (
+        <p className="agent-workbench-compressed-note">HTML 超过 512 KB，为避免移动端内存不足，仅提供源码预览。</p>
+      ) : null}
+      {canPreview && htmlPreview?.available && previewMode === "live" && previewText ? (
+        <iframe
+          className="agent-workbench-html-preview"
+          title={`${file.filename} 运行预览`}
+          sandbox="allow-scripts"
+          referrerPolicy="no-referrer"
+          srcDoc={detailSandboxedHtmlDocument(previewText)}
+        />
+      ) : canPreview ? (
+        <pre className="agent-workbench-file-code">{loading ? "正在读取文件预览..." : detailSourcePreviewText(previewText) || "暂无可预览内容"}</pre>
       ) : (
         <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
       )}

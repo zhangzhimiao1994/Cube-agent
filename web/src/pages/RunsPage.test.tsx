@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { RunDetail } from "../api/client";
+import { api, type RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
@@ -19,6 +19,7 @@ import {
   conversationCheckpoints,
   conversationWorkspaceFiles,
   conversationMessages,
+  WorkbenchFilePreview,
   MessageBody,
   mergeConversationRuns,
   requestedPermissionsForSandbox,
@@ -763,6 +764,203 @@ describe("MessageBody", () => {
 
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("ssh -vvv user@host\nnc -v host 22"));
     expect(screen.getByRole("button", { name: "已复制 bash 代码" })).not.toBeNull();
+  });
+});
+
+describe("WorkbenchFilePreview", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("switches a complete HTML artifact from source to a restricted live preview", async () => {
+    const user = userEvent.setup();
+    const trailingMarker = "HTML_AFTER_SOURCE_PREVIEW_LIMIT";
+    const html = `<!doctype html><html><head><title>Preview</title></head><body><button id="counter">0</button><script>document.querySelector('#counter').onclick = () => document.querySelector('#counter').textContent = '1';</script>${"x".repeat(8_100)}${trailingMarker}</body></html>`;
+    const downloadSpy = vi
+      .spyOn(api, "downloadGeneratedArtifact")
+      .mockResolvedValue(new Response(html, { headers: { "Content-Type": "text/html" } }) as unknown as Blob);
+
+    const { rerender } = render(
+      <WorkbenchFilePreview
+        file={{
+          id: "readme",
+          title: "README.md",
+          filename: "README.md",
+          path: "README.md",
+          kind: "workspace_file",
+          operation: "读取文件",
+          mimeType: "text/markdown",
+          size: "1 KB",
+          sha256: null,
+          text: "previous file",
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+      />,
+    );
+    rerender(
+      <WorkbenchFilePreview
+        file={{
+          id: "preview-html",
+          title: "preview.html",
+          filename: "preview.html",
+          path: "preview.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "9 KB",
+          sha256: null,
+          text: null,
+          download: {
+            id: "preview-html",
+            kind: "workspace_file",
+            title: "preview.html",
+            filename: "preview.html",
+            mime_type: "text/html",
+            size_bytes: html.length,
+            sha256: "a".repeat(64),
+            download_url: "/api/v1/artifacts/preview-html/download",
+          },
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTitle("preview.html 运行预览")).toBeNull();
+    await waitFor(() => expect(screen.getByRole("button", { name: "源码预览" }).getAttribute("aria-pressed")).toBe("true"));
+    expect(screen.getByRole("button", { name: "运行预览" }).hasAttribute("disabled")).toBe(false);
+    expect(downloadSpy).toHaveBeenCalledWith("/api/v1/artifacts/preview-html/download");
+
+    await user.click(screen.getByRole("button", { name: "运行预览" }));
+
+    const iframe = screen.getByTitle("preview.html 运行预览");
+    expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-top-navigation");
+    expect(iframe.getAttribute("srcdoc")).toContain(trailingMarker);
+    expect(iframe.getAttribute("srcdoc")).toContain("default-src 'none'");
+    expect(iframe.getAttribute("srcdoc")).toContain("form-action 'none'");
+  });
+
+  it("does not offer a live preview for HTML that depends on external files", () => {
+    render(
+      <WorkbenchFilePreview
+        file={{
+          id: "external-index",
+          title: "index.html",
+          filename: "index.html",
+          path: "index.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "2 KB",
+          sha256: null,
+          text: '<!doctype html><html><head><link rel="stylesheet" href="styles.css"></head><body><script src="app.js"></script></body></html>',
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/<!doctype html>/)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "运行预览" })).toBeNull();
+  });
+
+  it("keeps oversized HTML source readable without creating a live iframe", async () => {
+    const user = userEvent.setup();
+    const html = `<!doctype html><html><body>${"大".repeat(180_000)}</body></html>`;
+    render(
+      <WorkbenchFilePreview
+        file={{
+          id: "oversized-preview",
+          title: "preview.html",
+          filename: "preview.html",
+          path: "preview.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "528 KB",
+          sha256: null,
+          text: html,
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/已截断，仅预览前 8000 字符/)).not.toBeNull();
+    expect(screen.getByText(/超过 512 KB/)).not.toBeNull();
+    const liveButton = screen.getByRole("button", { name: "运行预览" });
+    expect(liveButton.hasAttribute("disabled")).toBe(true);
+    await user.click(liveButton);
+    expect(screen.queryByTitle("preview.html 运行预览")).toBeNull();
+  });
+
+  it("ignores a stale HTML download after the user switches files", async () => {
+    const user = userEvent.setup();
+    let resolveOld: ((value: Blob) => void) | undefined;
+    let resolveCurrent: ((value: Blob) => void) | undefined;
+    const oldDownload = new Promise<Blob>((resolve) => {
+      resolveOld = resolve;
+    });
+    const currentDownload = new Promise<Blob>((resolve) => {
+      resolveCurrent = resolve;
+    });
+    vi.spyOn(api, "downloadGeneratedArtifact").mockImplementation((path) =>
+      path.includes("old") ? oldDownload : currentDownload,
+    );
+    const file = (id: string, url: string) => ({
+      id,
+      title: "preview.html",
+      filename: "preview.html",
+      path: `${id}/preview.html`,
+      kind: "workspace_file",
+      operation: "创建文件" as const,
+      mimeType: "text/html",
+      size: "1 KB",
+      sha256: null,
+      text: null,
+      download: {
+        id,
+        kind: "workspace_file",
+        title: "preview.html",
+        filename: "preview.html",
+        mime_type: "text/html",
+        size_bytes: 1024,
+        sha256: "b".repeat(64),
+        download_url: url,
+      },
+      source: null,
+    });
+
+    const { rerender } = render(
+      <WorkbenchFilePreview file={file("old", "/api/v1/artifacts/old/download")} onOpenSource={vi.fn()} />,
+    );
+    rerender(
+      <WorkbenchFilePreview file={file("current", "/api/v1/artifacts/current/download")} onOpenSource={vi.fn()} />,
+    );
+
+    resolveCurrent?.(new Response("<!doctype html><html><body>CURRENT_FILE</body></html>") as unknown as Blob);
+    await waitFor(() => expect(screen.getByText(/CURRENT_FILE/)).not.toBeNull());
+    await user.click(screen.getByRole("button", { name: "运行预览" }));
+    const iframe = screen.getByTitle("preview.html 运行预览");
+    expect(iframe.getAttribute("srcdoc")).toContain("CURRENT_FILE");
+
+    resolveOld?.(new Response("<!doctype html><html><body>STALE_FILE</body></html>") as unknown as Blob);
+    await waitFor(() => expect(iframe.getAttribute("srcdoc")).not.toContain("STALE_FILE"));
+    expect(iframe.getAttribute("srcdoc")).toContain("CURRENT_FILE");
+  });
+
+  it("keeps the live HTML preview bounded on desktop and mobile", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /\.agent-workbench-html-preview\s*{[\s\S]*display:\s*block;[\s\S]*inline-size:\s*100%;[\s\S]*max-inline-size:\s*100%;[\s\S]*overflow:\s*hidden;/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-html-preview\s*{[\s\S]*min-height:\s*min\(62dvh,\s*36rem\);/,
+    );
   });
 });
 

@@ -837,6 +837,91 @@ describe("RunDetailPage", () => {
     expect(within(previewPane).getByText(longArtifactText)).not.toBeNull();
   });
 
+  it("runs an index.html artifact in a restricted iframe while keeping source as the default", async () => {
+    const user = userEvent.setup();
+    const trailingMarker = "DETAIL_HTML_AFTER_SOURCE_PREVIEW_LIMIT";
+    const html = `<!doctype html><html><body><button>可交互页面</button>${"y".repeat(8_100)}${trailingMarker}</body></html>`;
+    const htmlArtifact = {
+      ...runDetail.artifacts[0],
+      id: "artifact-index-html",
+      kind: "workspace_file",
+      title: "index.html",
+      filename: "index.html",
+      mime_type: "text/html",
+      text: html,
+      download_url: "/api/v1/artifacts/index-html/download",
+    };
+    const externalHtmlArtifact = {
+      ...htmlArtifact,
+      id: "artifact-external-html",
+      title: "app.html",
+      filename: "app.html",
+      text: '<!doctype html><html><head><link rel="stylesheet" href="app.css"></head><body></body></html>',
+      download_url: "/api/v1/artifacts/external-html/download",
+    };
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "artifact.created",
+          summary: "创建文件 index.html",
+          payload: { operation_kind: "file_create", artifact_id: htmlArtifact.id },
+          artifact: htmlArtifact,
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 2,
+          kind: "artifact.created",
+          summary: "创建文件 app.html",
+          payload: { operation_kind: "file_create", artifact_id: externalHtmlArtifact.id },
+          artifact: externalHtmlArtifact,
+        },
+      ],
+      artifacts: [htmlArtifact, externalHtmlArtifact],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
+    const workspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
+    const fileList = within(workspace).getByLabelText("文件操作列表");
+    await user.click(within(fileList).getByRole("button", { name: /index\.html/ }));
+
+    expect(within(workspace).getByRole("button", { name: "源码预览" }).getAttribute("aria-pressed")).toBe("true");
+    expect(within(workspace).queryByTitle("index.html 运行预览")).toBeNull();
+    await user.click(within(workspace).getByRole("button", { name: "运行预览" }));
+
+    const iframe = within(workspace).getByTitle("index.html 运行预览");
+    expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(iframe.getAttribute("srcdoc")).toContain(trailingMarker);
+
+    await user.click(within(fileList).getByRole("button", { name: /app\.html/ }));
+    expect(within(workspace).queryByRole("button", { name: "运行预览" })).toBeNull();
+    expect(within(workspace).queryByTitle("index.html 运行预览")).toBeNull();
+  });
+
   it("shows safe command and workspace path summaries for detail action rows without downloadable files", async () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {
