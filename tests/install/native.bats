@@ -22,11 +22,12 @@
 @test "python systemd services load the active release source tree" {
   for unit in \
     deploy/native/systemd/agent-hub-api.service \
-    deploy/native/systemd/agent-hub-worker.service \
-    deploy/native/systemd/agent-hub-skill@.service
+    deploy/native/systemd/agent-hub-worker.service
   do
     grep -q '^Environment=PYTHONPATH=/opt/agent-hub/current/src' "$unit"
   done
+  grep -q '^Environment=PYTHONPATH=/opt/agent-hub/current/src' \
+    deploy/native/systemd/agent-hub-skill-broker.service
 }
 @test "native installer deploys a release before starting systemd services" {
   grep -q 'deploy_native_release' scripts/lib/install_native.sh
