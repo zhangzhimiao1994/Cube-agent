@@ -1619,6 +1619,12 @@ const MemoryRecordSchema = z.object({
   summary_period: z.enum(["none", "day", "week", "month"]).default("none"),
   recall_count: z.number().default(0),
   last_recalled_at: z.string().nullable().default(null),
+  layer: z.enum(["working", "episodic", "core"]).default("core"),
+  category: z
+    .enum(["preference", "fact", "task", "summary", "decision", "lesson", "other"])
+    .default("other"),
+  confidence: z.number().min(0).max(1).default(1),
+  owner_actor_id: z.string().nullable().default(null),
 });
 
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
@@ -2983,17 +2989,26 @@ export const api = {
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));
   },
-  createMemory(payload: { id: string; scope: string; value: string }): Promise<MemoryRecord> {
+  createMemory(payload: {
+    id: string;
+    scope: string;
+    value: string;
+    layer?: MemoryRecord["layer"];
+    category?: MemoryRecord["category"];
+    confidence?: number;
+    project_id?: string | null;
+    conversation_id?: string | null;
+  }): Promise<MemoryRecord> {
     return request(
       "/api/v1/admin/memory",
       { method: "POST", body: JSON.stringify(payload) },
       MemoryRecordSchema,
     );
   },
-  updateMemory(id: string, value: string): Promise<MemoryRecord> {
+  updateMemory(id: string, payload: Partial<Omit<MemoryRecord, "id" | "scope" | "owner_actor_id">>): Promise<MemoryRecord> {
     return request(
       `/api/v1/admin/memory/${encodeURIComponent(id)}`,
-      { method: "PATCH", body: JSON.stringify({ value }) },
+      { method: "PATCH", body: JSON.stringify(payload) },
       MemoryRecordSchema,
     );
   },

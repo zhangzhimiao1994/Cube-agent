@@ -66,7 +66,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
-from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
 from agent_hub.runtime.project_scale_artifact import (
@@ -1373,7 +1373,7 @@ def _dispatch_plan(
             )
     )
     request_text = str(context.request)
-    hermes_context = hermes_memory_context_text(context.routing_decision)
+    hermes_context = runtime_memory_context_text(context.routing_decision)
     memory_guidance = (
         f"\nHermes+ confirmed memory guidance:\n{hermes_context}\n"
         if hermes_context

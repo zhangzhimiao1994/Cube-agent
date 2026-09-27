@@ -84,7 +84,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
-from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -1952,7 +1952,7 @@ class AutoGenDiscussionRuntime:
             f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(_artifact_prompt_content(item), ensure_ascii=False, sort_keys=True)}"
             for item in context.artifacts
         )
-        hermes_context = hermes_memory_context_text(context.routing_decision)
+        hermes_context = runtime_memory_context_text(context.routing_decision)
         repair_context = self_repair_context_text(context.routing_decision)
         task = (
             context.request

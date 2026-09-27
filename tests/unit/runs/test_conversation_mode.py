@@ -9,6 +9,7 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.memory.persistent import RuntimeMemoryItem
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.repository import RunRecord
@@ -169,6 +170,95 @@ class SlowHermesAdvisor(RecordingHermesAdvisor):
     async def advise(self, **kwargs: object) -> HermesRunAdvice | None:
         await asyncio.sleep(2)
         return None
+
+
+class RecordingRuntimeMemoryRecall:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def recall(self, **kwargs: object) -> tuple[RuntimeMemoryItem, ...]:
+        self.calls.append(kwargs)
+        return (
+            RuntimeMemoryItem(
+                id="project-test-policy",
+                summary="Use pytest for backend verification.",
+                layer="episodic",
+                category="fact",
+                score=0.91,
+                reason="当前项目记忆",
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID],
+)
+async def test_explicit_modes_receive_persistent_memory_without_changing_mode(
+    mode: TaskMode,
+) -> None:
+    repository = ConversationModeRepository(None)
+    recall = RecordingRuntimeMemoryRecall()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(mode),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        runtime_memory_recall=recall,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="verify the backend",
+        mode=mode,
+        project_id="cube-agent",
+        conversation_id="conv-memory",
+    )
+
+    assert submitted.mode is mode
+    routing = repository.created[-1]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["memory"] == {
+        "items": [
+            {
+                "id": "project-test-policy",
+                "summary": "Use pytest for backend verification.",
+                "layer": "episodic",
+                "category": "fact",
+                "score": 0.91,
+                "reason": "当前项目记忆",
+            }
+        ]
+    }
+    assert recall.calls[0]["project_id"] == "cube-agent"
+    assert recall.calls[0]["conversation_id"] == "conv-memory"
+
+
+async def test_auto_conversation_continuation_receives_persistent_memory() -> None:
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    recall = RecordingRuntimeMemoryRecall()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+        runtime_memory_recall=recall,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="continue backend verification",
+        mode=TaskMode.AUTO,
+        project_id="cube-agent",
+        conversation_id="conv-memory",
+    )
+
+    assert submitted.mode is TaskMode.HYBRID
+    routing = repository.created[-1]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert isinstance(routing.get("memory"), dict)
 
 
 async def test_auto_submission_reuses_previous_mode_for_same_conversation_without_reasking() -> None:

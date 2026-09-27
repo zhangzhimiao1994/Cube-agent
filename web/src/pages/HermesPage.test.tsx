@@ -78,6 +78,10 @@ describe("HermesPage", () => {
               summary_period: "none",
               recall_count: 0,
               last_recalled_at: null,
+              layer: "core",
+              category: "lesson",
+              confidence: 0.8,
+              owner_actor_id: "11111111-1111-4111-8111-111111111111",
             },
           ]);
         }
@@ -208,6 +212,9 @@ describe("HermesPage", () => {
     expect(value.getAttribute("readonly")).not.toBeNull();
     expect(screen.getByText("Hermes 审批记忆")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "解除锁定" })).toBeNull();
+    expect(screen.getAllByText("长期核心规则").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("经验教训").length).toBeGreaterThan(0);
+    expect(screen.getByText("置信度 0.80")).not.toBeNull();
   });
 
   it("filters Hermes ledger by memory layer", async () => {

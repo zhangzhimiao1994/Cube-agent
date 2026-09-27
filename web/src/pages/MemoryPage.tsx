@@ -7,19 +7,34 @@ export function MemoryPage() {
   const queryClient = useQueryClient();
   const memory = useQuery({ queryKey: ["memory"], queryFn: () => api.memory() });
   const [memoryId, setMemoryId] = useState("project-policy");
-  const [scope, setScope] = useState("tenant");
+  const [scope, setScope] = useState("user");
   const [value, setValue] = useState("Only non-dangerous operations may run without approval.");
+  const [layer, setLayer] = useState<MemoryRecord["layer"]>("core");
+  const [category, setCategory] = useState<MemoryRecord["category"]>("preference");
+  const [confidence, setConfidence] = useState(1);
+  const [projectId, setProjectId] = useState("");
+  const [conversationId, setConversationId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
   const create = useMutation({
-    mutationFn: () => api.createMemory({ id: memoryId.trim(), scope: scope.trim(), value: value.trim() }),
+    mutationFn: () =>
+      api.createMemory({
+        id: memoryId.trim(),
+        scope: scope.trim(),
+        value: value.trim(),
+        layer,
+        category,
+        confidence,
+        project_id: projectId.trim() || null,
+        conversation_id: conversationId.trim() || null,
+      }),
     onSuccess: async () => {
       setMessage("记忆已保存。");
       await queryClient.invalidateQueries({ queryKey: ["memory"] });
     },
   });
   const update = useMutation({
-    mutationFn: ({ id, value: nextValue }: MemoryRecord) => api.updateMemory(id, nextValue),
+    mutationFn: ({ id, value: nextValue }: MemoryRecord) => api.updateMemory(id, { value: nextValue }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
   });
   const forget = useMutation({
@@ -70,10 +85,60 @@ export function MemoryPage() {
           />
 
           <label htmlFor="memory-scope">作用域</label>
-          <input id="memory-scope" value={scope} onChange={(event) => setScope(event.target.value)} required />
+          <select id="memory-scope" value={scope} onChange={(event) => setScope(event.target.value)}>
+            <option value="user">仅当前用户</option>
+            <option value="tenant">当前租户共享</option>
+          </select>
 
           <label htmlFor="memory-value">内容</label>
           <textarea id="memory-value" value={value} onChange={(event) => setValue(event.target.value)} required />
+
+          <label htmlFor="memory-layer">记忆层级</label>
+          <select
+            id="memory-layer"
+            value={layer}
+            onChange={(event) => setLayer(event.target.value as MemoryRecord["layer"])}
+          >
+            <option value="core">长期核心规则</option>
+            <option value="episodic">项目或会话经验</option>
+            <option value="working">当前任务工作记忆</option>
+          </select>
+
+          <label htmlFor="memory-category">内容类型</label>
+          <select
+            id="memory-category"
+            value={category}
+            onChange={(event) => setCategory(event.target.value as MemoryRecord["category"])}
+          >
+            <option value="preference">用户偏好</option>
+            <option value="fact">事实</option>
+            <option value="task">任务信息</option>
+            <option value="summary">摘要</option>
+            <option value="decision">决策</option>
+            <option value="lesson">经验教训</option>
+            <option value="other">其他</option>
+          </select>
+
+          <label htmlFor="memory-confidence">置信度</label>
+          <input
+            id="memory-confidence"
+            type="number"
+            min="0"
+            max="1"
+            step="0.05"
+            value={confidence}
+            onChange={(event) => setConfidence(Number(event.target.value))}
+          />
+
+          <label htmlFor="memory-project">项目 ID（可选）</label>
+          <input id="memory-project" value={projectId} onChange={(event) => setProjectId(event.target.value)} />
+
+          <label htmlFor="memory-conversation">会话 ID（可选）</label>
+          <input
+            id="memory-conversation"
+            value={conversationId}
+            onChange={(event) => setConversationId(event.target.value)}
+          />
 
           <button type="submit" disabled={create.isPending || value.trim().length === 0}>
             {create.isPending ? "正在保存..." : "保存记忆"}
@@ -115,6 +180,9 @@ export function MemoryPage() {
                 <div className="inline-status-list">
                   <span>热度 {record.heat.toFixed(2)}</span>
                   <span>{record.locked ? "已锁定" : "未锁定"}</span>
+                  <span>{memoryLayerLabel(record.layer)}</span>
+                  <span>{memoryCategoryLabel(record.category)}</span>
+                  <span>置信度 {record.confidence.toFixed(2)}</span>
                   {hermesManaged ? <span>Hermes 审批记忆</span> : null}
                   {record.project_id ? <span>项目 {record.project_id}</span> : null}
                   {record.conversation_id ? <span>对话 {record.conversation_id}</span> : null}
@@ -156,4 +224,23 @@ export function MemoryPage() {
       </section>
     </section>
   );
+}
+
+function memoryLayerLabel(layer: MemoryRecord["layer"]): string {
+  if (layer === "working") return "当前任务工作记忆";
+  if (layer === "episodic") return "项目或会话经验";
+  return "长期核心规则";
+}
+
+function memoryCategoryLabel(category: MemoryRecord["category"]): string {
+  const labels: Record<MemoryRecord["category"], string> = {
+    preference: "用户偏好",
+    fact: "事实",
+    task: "任务信息",
+    summary: "摘要",
+    decision: "决策",
+    lesson: "经验教训",
+    other: "其他",
+  };
+  return labels[category];
 }

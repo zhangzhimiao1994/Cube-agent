@@ -27,6 +27,7 @@ from agent_hub.harness.types import (
     HarnessTaskRequirements,
     HermesContextHint,
 )
+from agent_hub.memory.persistent import RuntimeMemoryItem, RuntimeMemoryRecall
 from agent_hub.models.types import ModelCapability
 from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_FAILURE_KINDS,
@@ -431,6 +432,7 @@ class RunService:
         router: ModeRouterProtocol | None,
         task_queue: TaskQueue,
         hermes_advisor: HermesAdvisorProtocol | None = None,
+        runtime_memory_recall: RuntimeMemoryRecall | None = None,
         temporary_agent_policy: TemporaryAgentPolicyProtocol | None = None,
         runtime_timeout_seconds: float = 300.0,
         runtime_token_budget: int = 1_000_000,
@@ -453,6 +455,7 @@ class RunService:
         self._router = router
         self._queue = task_queue
         self._hermes_advisor = hermes_advisor
+        self._runtime_memory_recall = runtime_memory_recall
         self._temporary_agent_policy = temporary_agent_policy
         self._runtime_timeout_seconds = _runtime_timeout_seconds(
             TaskMode.DIRECT, configured_seconds=runtime_timeout_seconds
@@ -532,6 +535,17 @@ class RunService:
             **workspace.routing_payload(),
             "execution_backend": resolved_execution_backend,
         }
+        recalled_memories = await self._safe_runtime_memory_recall(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            message=message,
+            project_id=workspace.project_id,
+            conversation_id=effective_conversation_id,
+        )
+        if recalled_memories:
+            operator_selection["memory"] = {
+                "items": [_runtime_memory_payload(item) for item in recalled_memories]
+            }
         if blocked_by_run_id is not None:
             operator_selection["blocked_by_run_id"] = str(blocked_by_run_id)
         if reference_workflow_id is not None:
@@ -2446,6 +2460,34 @@ class RunService:
             _LOGGER.exception("hermes_advice_failed tenant_id=%s", tenant_id)
             return None
 
+    async def _safe_runtime_memory_recall(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        project_id: str | None,
+        conversation_id: str | None,
+    ) -> tuple[RuntimeMemoryItem, ...]:
+        if self._runtime_memory_recall is None:
+            return ()
+        try:
+            async with asyncio.timeout(0.8):
+                return await self._runtime_memory_recall.recall(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    query=message,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    limit=3,
+                )
+        except TimeoutError:
+            _LOGGER.warning("runtime_memory_recall_timeout tenant_id=%s", tenant_id)
+            return ()
+        except Exception:
+            _LOGGER.exception("runtime_memory_recall_failed tenant_id=%s", tenant_id)
+            return ()
+
     async def _safe_temporary_agent_proposal(
         self,
         *,
@@ -4306,6 +4348,17 @@ def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
             }
             for item in advice.skipped_memories[:5]
         ],
+    }
+
+
+def _runtime_memory_payload(item: RuntimeMemoryItem) -> dict[str, object]:
+    return {
+        "id": item.id,
+        "summary": item.summary,
+        "layer": item.layer,
+        "category": item.category,
+        "score": item.score,
+        "reason": item.reason,
     }
 
 

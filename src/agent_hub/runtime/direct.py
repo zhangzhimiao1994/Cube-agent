@@ -30,7 +30,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
-from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
 from agent_hub.runtime.project_scale_artifact import (
     is_project_scale_artifact_request,
@@ -1020,7 +1020,7 @@ class DirectRuntime:
                 sort_keys=True,
                 separators=(",", ":"),
             ).replace("<", "\\u003c").replace(">", "\\u003e")
-            hermes_context = hermes_memory_context_text(context.routing_decision)
+            hermes_context = runtime_memory_context_text(context.routing_decision)
             repair_context = self_repair_context_text(context.routing_decision)
             preflight_context = project_preflight_context_text(context.routing_decision)
             guidance_context = (

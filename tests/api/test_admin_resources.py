@@ -14457,7 +14457,7 @@ def test_memory_api_exposes_hermes_plus_fields_and_lock_controls() -> None:
         headers=headers(),
         json={
             "id": "hermes-plus-policy",
-            "scope": "cube-agent",
+            "scope": "tenant",
             "value": "Hermes+ must finish before harness refactor.",
             "heat": 0.7,
             "project_id": "cube-agent",
@@ -14469,6 +14469,10 @@ def test_memory_api_exposes_hermes_plus_fields_and_lock_controls() -> None:
     assert body["heat"] == 0.7
     assert body["locked"] is False
     assert body["summary_period"] == "none"
+    assert body["layer"] == "core"
+    assert body["category"] == "other"
+    assert body["confidence"] == 1.0
+    assert body["owner_actor_id"] is None
 
     locked = api.post("/api/v1/admin/memory/hermes-plus-policy/lock", headers=headers())
     assert locked.status_code == 200
@@ -14477,6 +14481,72 @@ def test_memory_api_exposes_hermes_plus_fields_and_lock_controls() -> None:
     unlocked = api.post("/api/v1/admin/memory/hermes-plus-policy/unlock", headers=headers())
     assert unlocked.status_code == 200
     assert unlocked.json()["locked"] is False
+
+
+def test_memory_api_accepts_layered_memory_fields() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "project-test-policy",
+            "scope": "user",
+            "value": "This project uses pytest for backend verification.",
+            "layer": "episodic",
+            "category": "fact",
+            "confidence": 0.85,
+            "project_id": "cube-agent",
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json() == {
+        "id": "project-test-policy",
+        "scope": "user",
+        "value": "This project uses pytest for backend verification.",
+        "heat": 0.5,
+        "locked": False,
+        "project_id": "cube-agent",
+        "conversation_id": None,
+        "summary_period": "none",
+        "recall_count": 0,
+        "last_recalled_at": None,
+        "layer": "episodic",
+        "category": "fact",
+        "confidence": 0.85,
+        "owner_actor_id": None,
+    }
+
+
+def test_memory_api_rejects_unknown_scope() -> None:
+    response = client().post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "invalid-scope",
+            "scope": "old-project-name",
+            "value": "Must not become a shared memory.",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_memory_api_rejects_secret_like_content() -> None:
+    api = client()
+
+    created = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "unsafe-secret",
+            "scope": "user",
+            "value": "API key sk-secret-value",
+        },
+    )
+
+    assert created.status_code == 422
+    assert created.json()["error"]["code"] == "sensitive_memory"
 
 
 def test_unified_logs_include_audit_model_mode_and_feature_errors() -> None:
@@ -18104,7 +18174,7 @@ async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate
         config_service=FakeConfigService(),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
         tenant_id=TENANT_ID,
-        actor_id=ACTOR_ID,
+        actor_id=owner_actor_id,
         session_factory=cast(Any, lambda: session),
     )
     result = await service.confirm_hermes_insight("hermes-owned")
@@ -18113,7 +18183,7 @@ async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate
     assert len(session.statements) == 4
     assert "pg_advisory_xact_lock" in str(session.statements[0])
     assert "FOR UPDATE" in str(session.statements[1])
-    assert row.payload["reviewed_by"] == str(ACTOR_ID)
+    assert row.payload["reviewed_by"] == str(owner_actor_id)
     assert row.payload["owner_actor_id"] == str(owner_actor_id)
     assert row.payload["promoted_memory_id"] == "hermes-rule-hermes-owned"
 
@@ -18162,6 +18232,82 @@ async def test_persistent_hermes_recommendation_uses_only_current_actor_learning
 
     assert result.confidence > 0.45
     assert result.reasons == ["Hermes lesson matched: Use dispatch for review."]
+
+
+@pytest.mark.asyncio
+async def test_persistent_memory_list_hides_other_actor_records() -> None:
+    other_actor_id = uuid4()
+
+    class ActorScopedMemoryService(PersistentAdminResourceService):
+        async def _list_admin_payloads(
+            self, kind: str, *, tenant_id: UUID | None = None
+        ) -> list[dict[str, object]] | None:
+            del tenant_id
+            assert kind == "memory"
+            return [
+                {
+                    "id": "own",
+                    "scope": f"user:{ACTOR_ID}",
+                    "owner_actor_id": str(ACTOR_ID),
+                    "value": "Own memory.",
+                },
+                {
+                    "id": "other",
+                    "scope": f"user:{other_actor_id}",
+                    "owner_actor_id": str(other_actor_id),
+                    "value": "Other memory.",
+                },
+                {"id": "tenant", "scope": "tenant", "value": "Shared memory."},
+                {"id": "legacy-user", "scope": "user", "value": "Legacy private memory."},
+                {"id": "legacy-unknown", "scope": "project", "value": "Unknown scope."},
+            ]
+
+    service = ActorScopedMemoryService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, object()),
+    )
+
+    memories = await service.list_memory()
+
+    assert [memory.id for memory in memories] == ["own", "tenant"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_list_hides_other_actor_candidates() -> None:
+    other_actor_id = uuid4()
+
+    class ActorScopedHermesService(PersistentAdminResourceService):
+        async def _list_admin_payloads(
+            self, kind: str, *, tenant_id: UUID | None = None
+        ) -> list[dict[str, object]] | None:
+            del tenant_id
+            assert kind == "hermes"
+            base = {
+                "outcome": "success",
+                "lesson": "Keep verification evidence.",
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            return [
+                {**base, "id": "own", "owner_actor_id": str(ACTOR_ID)},
+                {**base, "id": "other", "owner_actor_id": str(other_actor_id)},
+                {**base, "id": "global", "tenant_global": True},
+                {**base, "id": "legacy-private"},
+            ]
+
+    service = ActorScopedHermesService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, object()),
+    )
+
+    insights = await service.list_hermes_insights()
+
+    assert [insight.id for insight in insights] == ["own", "global"]
 
 
 @pytest.mark.asyncio

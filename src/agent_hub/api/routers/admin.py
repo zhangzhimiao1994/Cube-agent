@@ -1863,11 +1863,16 @@ class MemoryRecordRequest(BaseModel):
     summary_period: str = Field(default="none", pattern=r"^(none|day|week|month)$")
     recall_count: int = Field(default=0, ge=0)
     last_recalled_at: str | None = None
+    layer: Literal["working", "episodic", "core"] = "core"
+    category: Literal[
+        "preference", "fact", "task", "summary", "decision", "lesson", "other"
+    ] = "other"
+    confidence: float = Field(default=1.0, ge=0, le=1)
 
 
 class MemoryCreateRequest(MemoryRecordRequest):
     id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
-    scope: str = Field(default="tenant", min_length=1, max_length=128)
+    scope: Literal["user", "tenant"] = "user"
 
 
 class MemoryRecordResponse(BaseModel):
@@ -1883,6 +1888,12 @@ class MemoryRecordResponse(BaseModel):
     summary_period: str = Field(default="none", pattern=r"^(none|day|week|month)$")
     recall_count: int = Field(default=0, ge=0)
     last_recalled_at: str | None = None
+    layer: Literal["working", "episodic", "core"] = "core"
+    category: Literal[
+        "preference", "fact", "task", "summary", "decision", "lesson", "other"
+    ] = "other"
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    owner_actor_id: str | None = None
 
 
 class AuditEventResponse(BaseModel):
@@ -11882,31 +11893,85 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         resources = await self._list_admin_payloads("memory")
         if resources is None:
             return await super().list_memory()
-        return tuple(MemoryRecordResponse.model_validate(payload) for payload in resources)
+        return tuple(
+            response
+            for payload in resources
+            if _memory_payload_visible_to_actor(payload, self._actor_id)
+            for response in (MemoryRecordResponse.model_validate(payload),)
+        )
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
         _ensure_memory_is_user_managed(request.id)
-        response = MemoryRecordResponse(**request.model_dump())
-        if not await self._upsert_admin_payload(
-            "memory", response.id, response.model_dump(mode="json")
-        ):
+        scope: str = request.scope
+        owner_actor_id: str | None = None
+        if scope == "user":
+            owner_actor_id = str(self._actor_id)
+            scope = f"user:{owner_actor_id}"
+        response = MemoryRecordResponse(
+            **request.model_dump(exclude={"scope"}),
+            scope=scope,
+            owner_actor_id=owner_actor_id,
+        )
+        if self._session_factory is None:
             return await super().create_memory(request)
-        await self._record_audit("memory.upsert", f"memory:{response.id}", {"id": response.id})
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(session, response.id)
+            row = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == response.id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is not None and not _memory_payload_visible_to_actor(
+                dict(row.payload), self._actor_id
+            ):
+                raise PublicAPIError(409, "memory_id_conflict", "memory id is already in use")
+            if row is None:
+                session.add(
+                    AdminResourceRow(
+                        tenant_id=self._tenant_id,
+                        kind="memory",
+                        resource_id=response.id,
+                        payload=response.model_dump(mode="json"),
+                    )
+                )
+            else:
+                row.payload = response.model_dump(mode="json")
+            await self._record_audit_in_session(
+                session, "memory.upsert", f"memory:{response.id}", {"id": response.id}
+            )
         return response
 
     async def update_memory(
         self, memory_id: str, request: MemoryRecordRequest
     ) -> MemoryRecordResponse:
         _ensure_memory_is_user_managed(memory_id)
-        existing = await self._get_admin_payload("memory", memory_id)
-        if existing is None:
+        if self._session_factory is None:
             return await super().update_memory(memory_id, request)
-        if not existing:
-            raise KeyError(memory_id)
-        current = MemoryRecordResponse.model_validate(existing)
-        response = current.model_copy(update=request.model_dump(exclude_unset=True))
-        await self._upsert_admin_payload("memory", memory_id, response.model_dump(mode="json"))
-        await self._record_audit("memory.update", f"memory:{memory_id}", {"id": memory_id})
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(session, memory_id)
+            row = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == memory_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None or not _memory_payload_visible_to_actor(
+                dict(row.payload), self._actor_id
+            ):
+                raise KeyError(memory_id)
+            current = MemoryRecordResponse.model_validate(dict(row.payload))
+            response = current.model_copy(update=request.model_dump(exclude_unset=True))
+            row.payload = response.model_dump(mode="json")
+            await self._record_audit_in_session(
+                session, "memory.update", f"memory:{memory_id}", {"id": memory_id}
+            )
         return response
 
     async def forget_memory(self, memory_id: str) -> None:
@@ -11934,6 +11999,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 )
             ).scalar_one_or_none()
             if memory_row is None:
+                raise KeyError(memory_id)
+            if not _memory_payload_visible_to_actor(dict(memory_row.payload), self._actor_id):
                 raise KeyError(memory_id)
             rejected_at = datetime.now(UTC).isoformat()
             for row in hermes_rows:
@@ -12009,13 +12076,19 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         resources = await self._list_admin_payloads("hermes")
         if resources is None:
             return await super().list_hermes_insights()
-        return tuple(_hermes_response_from_payload(payload) for payload in resources)
+        return tuple(
+            _hermes_response_from_payload(payload)
+            for payload in resources
+            if _hermes_payload_is_owned_by(payload, self._actor_id)
+        )
 
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
         if payload is None:
             return await super().get_hermes_insight(insight_id)
         if not payload:
+            raise KeyError(insight_id)
+        if not _hermes_payload_is_owned_by(payload, self._actor_id):
             raise KeyError(insight_id)
         return _hermes_response_from_payload(payload)
 
@@ -12030,6 +12103,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             await self._lock_hermes_memory_relation(session, promoted_memory_id)
             row = await self._locked_hermes_row(session, insight_id)
             payload = dict(row.payload)
+            if not _hermes_payload_is_owned_by(payload, self._actor_id):
+                raise KeyError(insight_id)
             current = _hermes_response_from_payload(payload)
             _ensure_hermes_promotable(current)
             confirmed_at = datetime.now(UTC)
@@ -12079,6 +12154,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
             row = await self._locked_hermes_row(session, insight_id)
             payload = dict(row.payload)
+            if not _hermes_payload_is_owned_by(payload, self._actor_id):
+                raise KeyError(insight_id)
             _ensure_hermes_promotable(_hermes_response_from_payload(payload))
             promoted_memory_id = _optional_string(payload.get("promoted_memory_id"))
             payload["confirmed_at"] = None
@@ -12113,6 +12190,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 session, _hermes_promoted_memory_id(insight_id)
             )
             row = await self._locked_hermes_row(session, insight_id)
+            if not _hermes_payload_is_owned_by(dict(row.payload), self._actor_id):
+                raise KeyError(insight_id)
             promoted_memory_id = _optional_string(row.payload.get("promoted_memory_id"))
             if promoted_memory_id is not None:
                 await session.execute(
@@ -14788,6 +14867,18 @@ def _ensure_memory_is_user_managed(memory_id: str) -> None:
         )
 
 
+def _memory_payload_visible_to_actor(payload: dict[str, object], actor_id: UUID) -> bool:
+    scope = _optional_string(payload.get("scope"))
+    owner_actor_id = _optional_string(payload.get("owner_actor_id"))
+    if owner_actor_id is not None and owner_actor_id != str(actor_id):
+        return False
+    if scope == "tenant":
+        return owner_actor_id is None
+    if scope == f"user:{actor_id}":
+        return owner_actor_id in {None, str(actor_id)}
+    return False
+
+
 def _hermes_promoted_memory(
     insight: HermesInsightResponse,
     *,
@@ -14801,6 +14892,10 @@ def _hermes_promoted_memory(
         locked=True,
         conversation_id=insight.conversation_id,
         summary_period="none",
+        layer="core",
+        category="lesson",
+        confidence=insight.confidence,
+        owner_actor_id=scope.removeprefix("user:") if scope.startswith("user:") else None,
     )
 
 
@@ -18966,6 +19061,8 @@ async def create_memory(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> MemoryRecordResponse:
     _require(principal, "memory:write")
+    if _contains_sensitive_marker(body.value):
+        raise PublicAPIError(422, "sensitive_memory", "memory cannot contain secrets")
     return await service.create_memory(body)
 
 
@@ -18981,6 +19078,8 @@ async def update_memory(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> MemoryRecordResponse:
     _require(principal, "memory:write")
+    if _contains_sensitive_marker(body.value):
+        raise PublicAPIError(422, "sensitive_memory", "memory cannot contain secrets")
     try:
         return await service.update_memory(memory_id, body)
     except KeyError:
@@ -19051,6 +19150,7 @@ def _memory_request_from_response(
     data = current.model_dump()
     data.pop("id", None)
     data.pop("scope", None)
+    data.pop("owner_actor_id", None)
     data.update(updates)
     return MemoryRecordRequest.model_validate(data)
 

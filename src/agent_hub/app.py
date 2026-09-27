@@ -78,6 +78,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.config import harness_scheduler_from_config
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import build_runtime_mcp_service
+from agent_hub.memory.persistent import PersistentRuntimeMemoryRecall
 from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
@@ -1371,6 +1372,7 @@ def create_app(
                     task_queue=queue,
                     harness_scheduler=active_harness_scheduler,
                     hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
+                    runtime_memory_recall=PersistentRuntimeMemoryRecall(active_sessions),
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                     runtime_timeout_seconds=configured.runtime_timeout_seconds,
                     runtime_token_budget=configured.runtime_token_budget,

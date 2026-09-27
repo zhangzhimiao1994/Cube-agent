@@ -21,6 +21,7 @@ from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import RuntimeMcpService
+from agent_hub.memory.persistent import PersistentRuntimeMemoryRecall
 from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
 from agent_hub.plugins.runtime import (
     RuntimePluginService,
@@ -357,6 +358,7 @@ def build_worker_service(
         router=None,
         task_queue=queue,
         hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
+        runtime_memory_recall=PersistentRuntimeMemoryRecall(database.session_factory),
         runtime_timeout_seconds=settings.runtime_timeout_seconds,
         runtime_token_budget=settings.runtime_token_budget,
         terminal_run_hooks=_evolution_terminal_hooks(

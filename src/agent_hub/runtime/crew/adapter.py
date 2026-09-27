@@ -86,7 +86,7 @@ from agent_hub.runtime.generated_file_recovery import (
     final_attachment_text_conflicts,
     reusable_generated_file_result,
 )
-from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.instruction_context import model_request_sha256
 from agent_hub.runtime.project_scale_artifact import (
     PROJECT_SCALE_ARTIFACT_TOOL_NAME,
@@ -3916,7 +3916,7 @@ class CrewDispatchRuntime:
             "task": step.task,
             "untrusted_source_artifacts": source_payload,
         }
-        hermes_context = hermes_memory_context_text(context.routing_decision)
+        hermes_context = runtime_memory_context_text(context.routing_decision)
         if hermes_context:
             user["hermes_memory_context"] = hermes_context
         repair_context = self_repair_context_text(context.routing_decision)
