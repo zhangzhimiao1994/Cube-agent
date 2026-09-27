@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -416,13 +417,15 @@ class BubblewrapPluginPackageProcessLauncher:
                 str(target.dependency_root),
                 str(target.dependency_root),
             )
-        readonly_bind_paths = self._readonly_bind_paths or (
-            _default_python_runtime_readonly_bind_paths(python_executable)
+        readonly_bind_mounts = (
+            tuple((path, path) for path in self._readonly_bind_paths)
+            if self._readonly_bind_paths
+            else _default_python_runtime_readonly_bind_paths(python_executable)
         )
         readonly_bind_args = tuple(
             argument
-            for path in readonly_bind_paths
-            for argument in ("--ro-bind", str(path), str(path))
+            for source, destination in readonly_bind_mounts
+            for argument in ("--ro-bind", str(source), str(destination))
         )
         return (
             str(self._bubblewrap_executable),
@@ -451,21 +454,28 @@ class BubblewrapPluginPackageProcessLauncher:
         )
 
 
-def _default_python_runtime_readonly_bind_paths(python_executable: str) -> tuple[Path, ...]:
+def _readonly_bind_mount(path: Path) -> tuple[Path, Path]:
+    return path.resolve(), path
+
+
+def _default_python_runtime_readonly_bind_paths(
+    python_executable: str,
+) -> tuple[tuple[Path, Path], ...]:
     candidates = [
         Path(python_executable).resolve().parent,
-        Path(sys.prefix).resolve(),
-        Path(sys.base_prefix).resolve(),
+        Path(sys.prefix),
+        Path(sys.base_prefix),
     ]
     for system_path in (Path("/lib"), Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")):
         if system_path.exists():
-            candidates.append(system_path.resolve())
-    deduped: list[Path] = []
-    seen: set[str] = set()
+            candidates.append(system_path)
+    deduped: list[tuple[Path, Path]] = []
+    seen: set[tuple[str, str]] = set()
     for path in candidates:
-        key = str(path)
+        source, destination = _readonly_bind_mount(path)
+        key = str(source), str(destination)
         if path.exists() and key not in seen:
-            deduped.append(path)
+            deduped.append((source, destination))
             seen.add(key)
     return tuple(deduped)
 
@@ -1783,6 +1793,7 @@ def build_plugin_package_subprocess_adapters(
     max_stdin_bytes: int = 262_144,
     max_stdout_bytes: int = 262_144,
     dependency_policy: PluginPackageDependencyPolicy | None = None,
+    launcher_probe: Callable[[Path], bool] | None = None,
 ) -> dict[str, PluginAdapter]:
     if any(adapter_id == "http_json" for adapter_id in adapter_ids):
         raise ValueError("plugin package subprocess adapter id is reserved")
@@ -1792,6 +1803,7 @@ def build_plugin_package_subprocess_adapters(
             adapter_ids=adapter_ids,
             isolation_backend=isolation_backend,
             bubblewrap_executable=bubblewrap_executable,
+            launcher_probe=launcher_probe,
         )
         != "ready"
     ):
@@ -1823,6 +1835,7 @@ def _plugin_package_subprocess_registration_status(
     adapter_ids: Sequence[str],
     isolation_backend: Literal["disabled", "bubblewrap"],
     bubblewrap_executable: Path | None,
+    launcher_probe: Callable[[Path], bool] | None = None,
 ) -> str:
     if not enabled:
         return "disabled"
@@ -1840,7 +1853,42 @@ def _plugin_package_subprocess_registration_status(
         return "unsupported_isolation_backend"
     if os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK):
         return "launcher_not_executable"
+    probe = launcher_probe or _probe_bubblewrap_launcher
+    if not probe(bubblewrap_executable):
+        return "launcher_probe_failed"
     return "ready"
+
+
+def _probe_bubblewrap_launcher(executable: Path) -> bool:
+    try:
+        result = subprocess.run(
+            (
+                str(executable),
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-net",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "/bin/true",
+            ),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _plugin_schema_validator(

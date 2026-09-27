@@ -245,6 +245,7 @@ const PluginPackageSubprocessRegistrationStatusSchema = z.enum([
   "launcher_path_not_absolute",
   "launcher_not_found",
   "launcher_not_executable",
+  "launcher_probe_failed",
   "ready",
 ]);
 

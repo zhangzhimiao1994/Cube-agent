@@ -440,6 +440,39 @@ remove_legacy_native_skill_unit() {
   rm -f /etc/systemd/system/agent-hub-skill@.service
 }
 
+probe_native_plugin_sandbox() {
+  [[ -x /usr/bin/bwrap ]] || return 1
+  command -v runuser >/dev/null 2>&1 || return 1
+  runuser -u agent-hub -- /usr/bin/bwrap \
+    --die-with-parent \
+    --new-session \
+    --unshare-net \
+    --unshare-pid \
+    --unshare-ipc \
+    --unshare-uts \
+    --ro-bind / / \
+    --dev /dev \
+    --proc /proc \
+    -- /bin/true
+}
+
+install_native_plugin_sandbox_profile() {
+  local restriction profile_source profile_target
+  restriction="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+  profile_source="$AGENT_HUB_SOURCE_DIR/deploy/native/apparmor/agent-hub-bwrap"
+  profile_target="/etc/apparmor.d/agent-hub-bwrap"
+
+  [[ -x /usr/bin/bwrap ]] || die "bubblewrap is required for local process plugins"
+  if [[ -r "$restriction" && "$(cat "$restriction")" == "1" ]]; then
+    command -v apparmor_parser >/dev/null 2>&1 \
+      || die "AppArmor parser is required for the bubblewrap sandbox"
+    install -D -m 0644 "$profile_source" "$profile_target"
+    apparmor_parser -r "$profile_target"
+  fi
+  probe_native_plugin_sandbox \
+    || die "bubblewrap cannot create the required sandbox; check AppArmor and user namespace policy"
+}
+
 native_public_url() {
   if [[ -f "$SECRETS_FILE" ]]; then
     native_secret_value AGENT_HUB_PUBLIC_URL
@@ -732,6 +765,7 @@ install_native_mode() {
     chown agent-hub:agent-hub /run/agent-hub "$STATE_DIR" /var/log/agent-hub 2>/dev/null || true
     chmod 0750 /run/agent-hub "$STATE_DIR" /var/log/agent-hub
   fi
+  install_native_plugin_sandbox_profile
   deploy_native_release
   write_litellm_config
   install_native_caddy

@@ -51,6 +51,7 @@ from agent_hub.plugins.runtime import (
     RuntimePluginService,
     _plugin_package_execution_target,
     _plugin_package_subprocess_registration_status,
+    _readonly_bind_mount,
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
 )
@@ -2372,6 +2373,18 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     assert argv[-2:] == (str(dependency_root), str(entrypoint))
 
 
+def test_readonly_bind_mount_preserves_symlink_destination(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    runtime_link = tmp_path / "runtime-link"
+    try:
+        runtime_link.symlink_to(runtime_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    assert _readonly_bind_mount(runtime_link) == (runtime_root.resolve(), runtime_link)
+
+
 def test_build_plugin_package_subprocess_adapters_requires_explicit_enablement(
     tmp_path: Path,
 ) -> None:
@@ -2456,8 +2469,30 @@ def test_plugin_package_subprocess_registration_status_reports_ready(tmp_path: P
             adapter_ids=("calendar_python",),
             isolation_backend="bubblewrap",
             bubblewrap_executable=bubblewrap_executable,
+            launcher_probe=lambda _path: True,
         )
         == "ready"
+    )
+
+
+def test_plugin_package_subprocess_registration_status_reports_unusable_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.name", "posix")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.access", lambda _path, _mode: True)
+
+    assert (
+        _plugin_package_subprocess_registration_status(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+            launcher_probe=lambda _path: False,
+        )
+        == "launcher_probe_failed"
     )
 
 
@@ -2579,6 +2614,7 @@ def test_build_plugin_package_subprocess_adapters_accepts_dependency_policy(
         isolation_backend="bubblewrap",
         bubblewrap_executable=bubblewrap_executable,
         dependency_policy=dependency_policy,
+        launcher_probe=lambda _path: True,
     )
 
     assert cast(Any, adapters["calendar_python"])._dependency_policy is dependency_policy
@@ -2623,6 +2659,7 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
         package_store_dir=tmp_path,
         isolation_backend="bubblewrap",
         bubblewrap_executable=bubblewrap_executable,
+        launcher_probe=lambda _path: True,
         timeout_seconds=1,
         max_stdout_bytes=1024,
         dependency_policy=dependency_policy,
@@ -2644,6 +2681,28 @@ def test_build_plugin_package_subprocess_adapters_registers_allowed_adapter_ids(
         "runtime_sandbox_profiles": ("local_process", "remote_connector"),
     }
     assert cast(Any, adapters["crm-python"]).descriptor()["id"] == "crm-python"
+
+
+def test_build_plugin_package_subprocess_adapters_rejects_launcher_that_cannot_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bubblewrap_executable = tmp_path / "bwrap"
+    bubblewrap_executable.write_text("")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.name", "posix")
+    monkeypatch.setattr("agent_hub.plugins.runtime.os.access", lambda _path, _mode: True)
+
+    assert (
+        build_plugin_package_subprocess_adapters(
+            enabled=True,
+            adapter_ids=("calendar_python",),
+            package_store_dir=tmp_path,
+            isolation_backend="bubblewrap",
+            bubblewrap_executable=bubblewrap_executable,
+            launcher_probe=lambda _path: False,
+        )
+        == {}
+    )
 
 
 def test_build_plugin_package_subprocess_adapters_rejects_reserved_adapter_id(

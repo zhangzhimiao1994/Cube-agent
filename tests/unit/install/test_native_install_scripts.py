@@ -102,6 +102,22 @@ def test_release_verifier_is_registered_and_checks_current_revision() -> None:
     assert "agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service" in command
 
 
+def test_native_installer_configures_and_probes_bubblewrap_apparmor_sandbox() -> None:
+    packages = read("deploy/native/install-packages.sh")
+    installer = read("scripts/lib/install_native.sh")
+    profile = read("deploy/native/apparmor/agent-hub-bwrap")
+
+    assert "bubblewrap" in packages
+    assert "apparmor" in packages
+    assert "install_native_plugin_sandbox_profile" in installer
+    assert "/proc/sys/kernel/apparmor_restrict_unprivileged_userns" in installer
+    assert "apparmor_parser -r" in installer
+    assert "runuser -u agent-hub --" in installer
+    assert "--unshare-net" in installer
+    assert "profile agent_hub_bwrap /usr/bin/bwrap flags=(unconfined)" in profile
+    assert "userns," in profile
+
+
 def test_harness_acceptance_command_is_registered_for_real_machine_and_stress_checks() -> None:
     launcher = read("scripts/agent-hub")
     command = read("scripts/commands/harness-acceptance.sh")

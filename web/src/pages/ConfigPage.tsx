@@ -75,6 +75,8 @@ function pluginPackageSubprocessStatusText(
       return "启动器文件不可用，未注册本地进程适配器。";
     case "launcher_not_executable":
       return "启动器不可执行，未注册本地进程适配器。";
+    case "launcher_probe_failed":
+      return "隔离启动器无法创建安全沙箱，请检查 AppArmor 或用户命名空间配置。";
     default:
       return "状态未上报。";
   }

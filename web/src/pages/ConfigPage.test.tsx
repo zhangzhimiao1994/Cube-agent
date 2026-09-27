@@ -406,6 +406,7 @@ describe("ConfigPage", () => {
     ["missing_isolation_launcher", "未配置隔离启动器。"],
     ["launcher_path_not_absolute", "启动器路径不是绝对路径。"],
     ["launcher_not_found", "启动器文件不可用，未注册本地进程适配器。"],
+    ["launcher_probe_failed", "隔离启动器无法创建安全沙箱，请检查 AppArmor 或用户命名空间配置。"],
     ["launcher_not_executable", "启动器不可执行，未注册本地进程适配器。"],
   ])("renders package subprocess registration status %s", async (status, text) => {
     currentSettings = {

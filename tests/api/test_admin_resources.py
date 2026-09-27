@@ -385,6 +385,17 @@ def test_settings_response_projects_plugin_package_subprocess_registration_statu
     assert payload["plugin_package_subprocess_registration_status"] == "launcher_not_found"
 
 
+def test_settings_response_projects_failed_plugin_sandbox_probe() -> None:
+    api = client()
+    cast(Any, api.app).state.plugin_package_subprocess_registration_status = (
+        "launcher_probe_failed"
+    )
+
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+
+    assert payload["plugin_package_subprocess_registration_status"] == "launcher_probe_failed"
+
+
 def test_settings_update_accepts_projected_plugin_package_subprocess_registration_status() -> None:
     api = client()
     cast(Any, api.app).state.plugin_package_subprocess_registration_status = (
