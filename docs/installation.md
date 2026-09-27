@@ -10,8 +10,10 @@ sudo bash install.sh --mode auto --yes
 
 `--mode auto` selects:
 
-1. Native mode when systemd plus apt/dnf support are detected.
-2. Docker mode only when native is unsupported or Docker is explicitly requested.
+1. Native mode when systemd and a recognized apt/dnf family are detected.
+2. Docker mode otherwise, or whenever `--mode docker` is explicitly requested.
+
+Distribution-version validation happens after automatic mode selection. On an older or otherwise unsupported apt/dnf distribution, choose `--mode docker` explicitly instead of relying on automatic fallback.
 
 ## Network-limited servers
 
@@ -64,4 +66,3 @@ Diagnostics print fix suggestions without printing secrets.
 ## Existing installation behavior
 
 Existing `/etc/agent-hub/secrets.env` and `/var/lib/agent-hub` are preserved. Re-running the installer enters repair/upgrade behavior and never replaces generated secrets.
-

@@ -1,271 +1,176 @@
-# Cube Agent (魔方 agent)
+# Cube Agent
 
-Cube Agent is a self-hosted multi-agent operations console. The internal Python package is still named `agent_hub`, but the product-facing UI is Cube Agent / 魔方 agent.
+Cube Agent (魔方 Agent) is a self-hosted agent operations platform for running model-backed conversations, multi-agent work, governed tools, scheduled tasks, and durable learning from one responsive Web console.
 
-It combines a Web console, Feishu/channel entry points, model pools, workflow and role routing, governed Skills/MCP, scheduled tasks, multimedia generation routing, OpenClaw computer/server operations, Hermes learning, and audit logs.
+The product name is **Cube Agent**. The Python package and service names remain `agent_hub` for compatibility.
 
-[中文使用说明](README.zh-CN.md)
+[中文说明](README.zh-CN.md) · [Installation](docs/installation.md) · [Operations](docs/operations.md) · [Security](docs/security.md)
 
-## What You Can Do
+## Current Scope
 
-- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration.
-- Configure normal chat/tool models separately from multimedia AI models.
-- Route image/video/audio generation only to models marked with the matching generation capability.
-- Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
-- Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion.
-- Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
-- Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
-- Review Hermes learning, logs, and audit records. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
+Cube Agent is built for teams that need more than a chat UI: projects and conversations are persistent, execution is approval-aware, capabilities have an auditable lifecycle, and learned knowledge is separated from raw conversation history.
 
-## Quick Install
+Currently implemented:
 
-On a clean supported Linux server:
+- A project-based conversation workspace with renaming, archiving, branching, attachments, queued follow-up messages, direction changes, and cancellation.
+- Main-agent routing across `auto`, `direct`, `dispatch`, `discuss`, and `hybrid` modes.
+- User-question checkpoints, full-history question search, deep links, and project/archive-aware history filtering.
+- Model pools for ordinary reasoning/tool use and capability-tagged multimedia generation.
+- Governed Skills, MCP servers, plugins, capability installation proposals, schedules, channels, OpenClaw operations, audit logs, and structured run diagnostics.
+- Hermes learning candidates plus PostgreSQL-backed working, episodic, and core memory with user, tenant, project, and conversation scopes.
+- Responsive desktop and mobile management surfaces for runs, artifacts, execution environments, Skills, plugins, logs, and settings.
+
+The dedicated Open Harness / DeepSeek Harness redesign is **not** part of the current public workflow. Existing runtime and project-generation paths are available, but the UI does not advertise a separate Vibe Coding mode or promise an unrestricted autonomous coding environment.
+
+## Architecture
+
+```text
+Browser / channel adapters
+          |
+       Caddy
+          |
+   FastAPI control plane -------- PostgreSQL
+          |                         durable state,
+          |                         audit, memory
+          +---------------------- Redis
+          |                         coordination
+          |
+       Worker ------------------- LiteLLM
+          |                         model routing
+          |
+   capability gateway
+      |          |
+ systemd       Docker
+  broker       sandbox
+      |
+ versioned Skill / plugin environments
+```
+
+The Web application is React, TypeScript, and Vite. The backend uses Python 3.12, FastAPI, SQLAlchemy, Alembic, PostgreSQL, Redis, and LiteLLM. Native Linux deployments run the API, worker, LiteLLM, and the privileged Skill broker as separate systemd units. Docker Compose is also supported.
+
+The API and worker remain unprivileged. Native Skill execution crosses a Unix socket into a constrained systemd broker; Docker execution is only reported as available when a usable Docker CLI and daemon are present.
+
+## Quick Start
+
+### Native Linux installation
+
+On a clean supported systemd host (Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, or AlmaLinux 9):
 
 ```bash
-git clone https://github.com/zhangzhimiao1994/mutilagent.git
-cd mutilagent
+git clone https://github.com/zhangzhimiao1994/Cube-agent.git
+cd Cube-agent
 sudo bash install.sh --mode auto --yes
 ```
 
-`auto` prefers native mode on supported systemd Linux hosts: Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9. Docker mode is available as an optional fallback.
-
-If the server does not have `git`:
-
-```bash
-tmp="$(mktemp -d /tmp/agent-hub-install.XXXXXX)"
-curl -fL https://github.com/zhangzhimiao1994/mutilagent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
-mkdir -p "$tmp/source"
-tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"
-cd "$tmp/source"
-sudo bash install.sh --mode auto --yes
-```
-
-Do not extract the archive directly into `/root` with `--strip-components=1`; that flattens the source tree and leaves later commands in the wrong directory.
-
-For China-region package mirrors:
+`auto` selects native mode when systemd and a recognized apt/dnf family are detected; otherwise it selects Docker. Distribution-version validation happens after that selection, so use `--mode docker` explicitly on an unsupported native distribution. For a network-constrained server in China:
 
 ```bash
 sudo env AGENT_HUB_MIRROR_MODE=auto bash install.sh --mode auto --yes
 ```
 
-For HTTPS with your own certificate:
+The installer creates or preserves secrets, initializes the database, runs migrations, starts services, performs health checks, and prints a `/setup` URL with a one-time setup code. Existing `/etc/agent-hub/secrets.env` and `/var/lib/agent-hub` are preserved during repair or upgrade runs.
+
+### Docker Compose
 
 ```bash
-sudo env AGENT_HUB_PUBLIC_URL=https://agent.example.com \
-  AGENT_HUB_TLS_CERT_FILE=/root/certs/fullchain.pem \
-  AGENT_HUB_TLS_KEY_FILE=/root/certs/privkey.pem \
-  bash install.sh --mode auto --yes
-```
-
-After installation, the script prints a management URL ending in `/setup` and a one-time setup code. Create the first super admin there.
-
-## Offline Docker Initial Deployment Package
-
-If the target machine cannot reach the public internet but can run Docker, build and export the images on an online machine first. This package starts a new empty system. It does not include the current production database, users, model configuration, Hermes+ memories, attachments, or secrets.
-
-### 1. Prepare configuration on the online build machine
-
-```bash
-cd CubeAgent
 cp deploy/compose/.env.example deploy/compose/.env
+# Replace every placeholder secret in deploy/compose/.env.
+docker compose -f deploy/compose/docker-compose.yml \
+  --env-file deploy/compose/.env up -d --build
 ```
 
-Edit `deploy/compose/.env` and replace at least these placeholder values:
+The Compose stack contains migration/bootstrap jobs plus API, worker, LiteLLM, PostgreSQL, Redis, and Caddy services. The initial LiteLLM model list is empty; configure a reachable provider before expecting model-backed runs to work.
 
-- `AGENT_HUB_MASTER_KEY`
-- `AGENT_HUB_JWT_SIGNING_KEY`
-- `POSTGRES_PASSWORD`
-- `LITELLM_MASTER_KEY`
-- `AGENT_HUB_SETUP_CODE`
-
-You can generate random values with:
-
-```bash
-openssl rand -base64 32
-openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
-```
-
-`deploy/compose/litellm.yaml` starts with an empty model list:
-
-```yaml
-model_list: []
-litellm_settings:
-  drop_params: true
-  request_timeout: 600
-```
-
-For model calls in an offline environment, configure a local model service, an internal OpenAI-compatible relay, or another reachable provider from the Web console. A disconnected machine does not automatically have external model access.
-
-### 2. Build and pull all required images
-
-```bash
-docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env build
-docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env pull postgres redis caddy litellm
-```
-
-The offline image set must include:
-
-- `agent-hub:latest`
-- `postgres:16-alpine`
-- `redis:7-alpine`
-- `caddy:2-alpine`
-- `ghcr.io/berriai/litellm:main-stable`
-
-### 3. Export the images and compose configuration
-
-```bash
-docker save \
-  agent-hub:latest \
-  postgres:16-alpine \
-  redis:7-alpine \
-  caddy:2-alpine \
-  ghcr.io/berriai/litellm:main-stable \
-  -o mofang-agent-offline-images.tar
-
-tar -czf mofang-agent-offline-compose.tgz \
-  deploy/compose/docker-compose.yml \
-  deploy/compose/Caddyfile \
-  deploy/compose/healthcheck.sh \
-  deploy/compose/litellm.yaml \
-  deploy/compose/.env
-```
-
-`mofang-agent-offline-compose.tgz` contains `.env`; treat it as a secret file. Do not commit it to Git or send it to untrusted locations.
-
-### 4. Import and start on the offline target machine
-
-```bash
-mkdir -p /opt/mofang-agent
-cd /opt/mofang-agent
-
-docker load -i /path/to/mofang-agent-offline-images.tar
-tar -xzf /path/to/mofang-agent-offline-compose.tgz --strip-components=2
-
-chmod 600 .env
-docker compose --env-file .env up -d
-docker compose --env-file .env ps
-```
-
-On first startup, the `migrate` service runs `alembic upgrade head` to create an empty database schema. The `bootstrap` service uses `AGENT_HUB_SETUP_CODE` from `.env` to prepare the first-admin setup flow. Open `AGENT_HUB_PUBLIC_URL/setup` and create the first super admin.
-
-If you only need an offline fresh install, you do not need to export production database dumps or Docker volumes.
+For HTTPS, offline image transfer, mirrors, minimum host requirements, and repair behavior, see [Installation](docs/installation.md).
 
 ## First Setup
 
-1. Sign in to the Web console.
-2. Open **Models** and add at least one normal model for the main agent.
-3. Open **Main Agent** and choose the model, control mode, decision policy, Hermes policy, and review limits.
-4. Open **System Settings** and enable only the system features you need: multimedia generation and OpenClaw. Project-level Vibe Coding is not exposed in the current UI; its backend metadata field is retained for a future harness/runtime integration.
-5. Configure optional modules: Skills, MCP, channels, multimedia models, schedules, memories, and users.
+1. Open the installer-provided `/setup` URL and create the first super administrator.
+2. Add at least one normal model under **Models**.
+3. Configure the main-agent model and decision policy.
+4. Create a project and choose its workspace. Conversations created inside that project inherit the shared workspace.
+5. Enable only the execution backends, channels, Skills, MCP servers, plugins, multimedia providers, and OpenClaw operations that the deployment actually supports.
 
-## Models
+A Windows desktop session can use the native Explorer folder picker for a local project workspace. Linux desktops use `zenity` or `kdialog` when available. Remote browsers receive a tenant-scoped server directory browser and never receive absolute server paths.
 
-Models are split into two categories.
+## Conversations And Runs
 
-**Normal Models** are used for chat, reasoning, tool calling, structured output, coding, and multimodal understanding when the deployment is marked with the relevant capability. Providers include OpenAI, DeepSeek, Anthropic, Kimi/Moonshot, Qwen/DashScope, Qwen Token Plan, MiniMax, OpenAI-compatible relays, and Anthropic-message relays.
+The conversation page is the primary work surface. The main agent can select a mode automatically or an operator can choose a supported mode explicitly:
 
-**Multimedia AI** is used for generation jobs, not ordinary chat. Presets include Sora, OpenAI Audio, MiniMax Hailuo, MiniMax Audio, Google Veo, Kling, Alibaba Wan, Seedance, Seedream, and relay/custom providers. Capability tags such as `image_generation`, `video_generation`, and `audio_generation` control routing. A video request is rejected before submission if the selected deployment is not recognized as a video-capable model.
+| Mode | Behavior |
+| --- | --- |
+| `auto` | The main agent chooses the execution strategy. |
+| `direct` | One selected model handles the run. |
+| `dispatch` | Work is delegated to configured agents. |
+| `discuss` | Agents collaborate through a discussion workflow. |
+| `hybrid` | Dispatch and discussion are combined. |
 
-MiniMax/Hailuo video generation is implemented by the current multimedia executor. Other preset providers are stored and routed by capability, and can be extended by adding provider clients behind the common multimedia provider interface.
+While a run is active, a new message can be queued or used to change direction. Queued messages can be edited or cancelled before release. Run details expose structured agent activity, tool lifecycle, approvals, generated artifacts, diagnostics, and resumable runtime blockers without dumping raw internal payloads into the main transcript.
 
-## Chat, Evolution, And Modes
+Each user question becomes a conversation checkpoint. Checkpoints can be searched within the current conversation, while server-backed full-history search finds older questions across projects and archived conversations using cursor pagination and bounded excerpts.
 
-The first screen is the actual work surface. Use the left navigation drawer for modules and the right conversation drawer for historical chats. Conversation names use the first user request plus a timestamp, so repeated topics stay distinguishable.
+Long conversations are compacted before they exceed the selected model's context window. Compaction preserves the original goal and recent decisions; it is separate from Hermes learning.
 
-The chat page supports:
+## Models And Multimedia
 
-- `auto`: main agent decides the execution mode.
-- `direct`: use one selected model directly.
-- `dispatch`: route work to configured agents.
-- `discuss`: run a discussion-style workflow.
-- `hybrid`: combine dispatch and discussion.
+Normal model deployments handle chat, reasoning, structured output, tool use, coding, or multimodal understanding when their deployment advertises those capabilities. The configuration layer supports OpenAI, DeepSeek, Anthropic, Moonshot/Kimi, Qwen/DashScope, MiniMax, and compatible relay endpoints.
 
-Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+Multimedia deployments are routed separately by capability tags such as `image_generation`, `video_generation`, and `audio_generation`. MiniMax/Hailuo text-to-video has a concrete executor. Other presets require a configured provider implementation and valid credentials; storing a preset alone does not make that provider executable.
 
-Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
+## Plugins, Skills, And MCP
 
-Evolution is for durable asset improvement: Skill distillation, Darwin-style iteration, agent/workflow/prompt improvement, and score-gated candidate testing. Normal Q&A, one-off plans, and ordinary research do not enter Evolution unless the request asks to improve or create a durable asset.
+These are related but intentionally different capability types:
 
-Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
+- **Plugins** register reviewed capabilities and adapters. The trusted capability installer can search a curated catalog, resolve aliases, generate a plan, request approval, install, cancel, health-check, and roll back installer-owned entries.
+- **Skills** are versioned packages uploaded as `.zip`, `.tar`, `.tar.gz`, or `.tgz`. They are quarantined, scanned, permission-reviewed, and approved before activation.
+- **MCP servers** are configured with a transport, command or URL, tool allowlist, executable/domain allowlists, and timeouts.
 
-Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then create a grounded Evolution run instead of installing an unverified Skill directly.
+The capability installer is not a general internet package manager. It does not install arbitrary URLs or code merely because a user asks. A catalog entry becomes usable only after its declared runtime, commands, credentials, transport, and health checks are real. Missing prerequisites produce an actionable approval/configuration blocker instead of a fake enabled plugin.
 
-## OpenClaw
+Team Skill sources support trusted repository synchronization or pinned offline ZIP snapshots. Imports create immutable source revisions; every member must be approved before atomic activation. Rollback restores the complete prior Skill mapping.
 
-OpenClaw is a system-level feature switch for controlled computer and server operations.
+See [Skills and MCP](docs/skills-and-mcp.md).
 
-Supported operation kinds are:
+## Execution Environments
 
-- `server_command`
-- `desktop_action`
-- `screen_read`
-- `file_read`
+Cube Agent separates a capability manifest from the environment that executes it. Capability environments are immutable and versioned, with hash-verified materialization, smoke checks, atomic switching, rollback, quota cleanup, and reference protection.
 
-Permission modes are:
+Supported execution backends:
 
-- `ask`: require approval before operations.
-- `read_only`: allow only read-style operations.
-- `auto_review`: auto-review low-risk operations and require approval for higher risk.
-- `trusted_auto`: for trusted environments only.
+- **systemd**: the default native Linux backend. A socket-activated privileged broker creates constrained transient units and enforces caller identity, package path/hash, resource limits, network policy, filesystem bindings, output limits, timeout, and termination.
+- **Docker**: an optional sandbox backend. It is unavailable unless both the Docker CLI and daemon pass runtime probes.
 
-Operations use configured command allowlists and adapter records. Local Linux server commands can run through the bundled adapter. Remote adapters can also perform bounded `file_read` operations without an argv command when `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON` is configured with explicit absolute roots; output is capped by `OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES`. Screen reads can be exposed through a fixed adapter-side driver command in `OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON`, so Cube Agent requests `screen_read` without sending arbitrary argv. Desktop actions can likewise use `OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON`; the adapter passes the bounded operation JSON to that fixed driver over stdin. Windows, Linux desktop, macOS, screen, and filesystem targets should be connected with dedicated credentials and least privilege. Every remote adapter must expose `/v1/openclaw/health` with its platform and supported capabilities; Cube Agent checks that health response before execution so unsupported desktop, screen, or file operations are not treated as available.
+If a run needs an absent runtime, Cube Agent can pause it in `waiting_approval`, show the concrete install/configure/enable action, and resume the same run after the blocker is resolved. Model-provider failures and unsafe recovery conditions remain terminal rather than being mislabeled as installable dependencies.
 
-Useful command:
+## Hermes Learning And Memory
 
-```bash
-scripts/agent-hub openclaw-adapter
-```
+Hermes is an experience and memory layer, not online model training and not an autonomous permission system.
 
-## Skills And MCP
+After eligible work, Hermes can create an evidence-backed learning candidate. Candidates move through pending, approved, rejected, and ledger states. Approval promotes a locked, scoped long-term memory; rejection, deletion, or forgetting removes it from future recall. Mutations are serialized and audited.
 
-Skills are uploaded as archives, scanned, and approved before use. Accepted outer archive names are `.zip`, `.tar`, `.tar.gz`, and `.tgz`.
+Persistent memory is divided into:
 
-A package may contain a single Skill or multiple Skill directories. Multi-skill bundles can include extra directory layers; the scanner looks for valid skill manifests and reports skipped entries. Each individual Skill still goes through path traversal checks, size limits, file count limits, dependency pinning checks, forbidden extension checks, permission diffing, and approval.
+- **Working memory** for bounded near-term context.
+- **Episodic memory** for task and experience records.
+- **Core memory** for durable approved facts or preferences.
 
-MCP servers are configured separately with transport, command or URL, allowed tools, executable allowlists, domain allowlists, and timeouts.
+Recall is actor- and tenant-isolated and may also be scoped to a project or conversation. Memory is injected into every runtime mode through a bounded, delimiter-safe envelope. It cannot grant permissions, select a mode, bypass approval, or override tool policy. Values that look like secrets are rejected.
 
-The trusted capability installer can propose cataloged plugin capabilities from a run detail card when the main Agent detects a missing ability. Operators can also search, plan, install, cancel, and roll back catalog entries from the MCP page. Installs are bound to the reviewed plan, and installer rollback state is kept outside plugin `resource_config`. It is fail-closed, approval-gated, and does not install arbitrary internet plugins.
+See [Hermes](docs/hermes.md).
 
-## Channels
+## Channels, Schedules, And OpenClaw
 
-The channel layer connects external chat platforms to the main agent. The console includes configuration surfaces for Feishu, DingTalk, WeCom, WeChat, Telegram, Slack, QQ, and custom webhook entries. Feishu has first-class setup documentation and runtime integration.
+The channel layer provides configuration surfaces for Feishu, DingTalk, WeCom, WeChat, Telegram, Slack, QQ, and custom webhooks. Feishu has the currently documented first-class runtime path; another platform's presence in the console should not be read as proof that every vendor feature is implemented.
 
-Feishu supports long connection mode with App ID and App Secret. Webhook mode remains available as a fallback when you need platform-side URL verification or event encryption.
+Messages with a concrete time and executable action can become schedule proposals. A proposal must be confirmed before a one-time or cron schedule is created.
 
-Channel messages now enter the main agent first. The channel layer does not choose Direct, Dispatch, Discussion, Hybrid, Vibe Coding, Help, OpenClaw, or schedule mode by command text; the main agent judges the entry and route from the full message. Follow-up turns in the same channel conversation continue the latest resolved mode by default. Explicit phrases such as switching to discussion mode change mode, while explicit new-topic/new-conversation phrases return to fresh main-agent routing.
+OpenClaw provides governed computer and server operations such as `server_command`, `desktop_action`, `screen_read`, and `file_read`. Availability depends on a configured adapter. Permission modes range from approval-required to trusted automation, with command allowlists, bounded file roots, fixed driver commands, capability health checks, and audit records.
 
-When a user needs to request specific resources, place a contiguous selector block at the very beginning of the message:
+See [Feishu setup](docs/feishu-setup.md) and [Operations](docs/operations.md).
 
-- `@github`: request a plugin.
-- `&research`: request a Skill.
-- `#filesystem`: request an MCP server.
+## Production Operations
 
-For example, `@github &research #filesystem Review this repository plan` attaches resource hints while preserving the original message text. `@`, `&`, and `#` appearing after normal text are treated as ordinary content, so phrases like `C#`, `#heading`, or `@someone` do not become resource calls.
-
-Feishu replies use rich post payloads for structured run sections and markdown tables. Long plain text is split across reply bubbles, while oversized markdown tables are truncated at complete row boundaries with a notice so table formatting is not cut mid-row.
-
-The legacy Feishu field `FEISHU_COMMAND_ALIASES` is kept only for backward-compatible configuration storage. Saved aliases are no longer active routing commands and are not shown as effective channel commands.
-
-See [docs/feishu-setup.md](docs/feishu-setup.md).
-
-## Logs, Audit, And Hermes
-
-The Logs center separates audit logs, model errors, mode errors, feature errors, agent errors, and channel errors. Each log table supports search, column filters, sorting, selection, and JSON export.
-
-Audit records cover administrative changes and user-triggered conversation submissions. For `run.submit`, the audit details include:
-
-- `user_id` and `user_role`
-- `run_id`
-- `conversation_id` and `reference_conversation_id`
-- requested mode and accepted mode
-- workflow, selected agents, direct model, the backend-compatible Vibe Coding metadata flag, and attachment count
-- message preview and `message_sha256`
-
-Hermes stores learning records separately from chat. Conversation memory and scheduler observations are separated into distinct record categories, and records can be filtered, sorted, confirmed, or deleted individually or in bulk.
-
-## Operations
-
-Common commands after native installation:
+Native installations are managed through `scripts/agent-hub`:
 
 ```bash
 scripts/agent-hub status
@@ -273,25 +178,23 @@ scripts/agent-hub logs
 scripts/agent-hub doctor
 scripts/agent-hub backup /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub backup verify /tmp/agent-hub-backup.tar.gz
-scripts/agent-hub restore /tmp/agent-hub-backup.tar.gz
-scripts/agent-hub upgrade
+scripts/agent-hub restore /tmp/agent-hub-backup.tar.gz --target /tmp/agent-hub-restore
 scripts/agent-hub prune-releases --keep 2
+scripts/agent-hub prune-releases --keep 2 --execute
 ```
 
-See [docs/operations.md](docs/operations.md) and [docs/installation.md](docs/installation.md).
+The backup helper archives only `AGENT_HUB_STATE_DIR` (normally `/var/lib/agent-hub`). It does not back up PostgreSQL, Redis, or `/etc/agent-hub/secrets.env`; keep independent database and secret backups. `backup verify` checks archive readability, and `restore` only extracts into the explicit target for review.
 
-## Security Notes
+`scripts/agent-hub upgrade` is currently a low-level version-marker rehearsal, not a release downloader or service upgrader. Use the installer or the versioned release deployment procedure for an application upgrade. Release pruning is a dry run unless `--execute` is supplied and always protects the active `current` target. Caddy is the intended public entry point; the API remains bound to loopback in a native deployment.
 
-- The installer does not modify cloud security groups. Open public ports deliberately in your cloud console.
-- API keys and secrets are stored as secret references and must not be submitted through chat.
-- OpenClaw, Skills, MCP, and tool execution are governed by explicit capabilities, allowlists, approval records, and audit logs.
-- Logs and audit details are designed to avoid leaking raw secrets.
+## Development And Testing
 
-See [docs/security.md](docs/security.md).
-
-## Development
+Prerequisites: Python 3.12, Node.js/npm, PostgreSQL for integration tests, and Docker only for Docker-specific tests or deployment.
 
 ```bash
+uv sync --all-groups
+npm --prefix web install
+
 uv run ruff check .
 uv run mypy --strict src tests
 uv run pytest -q
@@ -300,8 +203,24 @@ npm --prefix web run test -- --run
 npm --prefix web run build
 ```
 
-## More Documentation
+The repository includes unit, contract, API, PostgreSQL integration, resilience, migration, frontend component, and responsive browser tests. Tests that require PostgreSQL, Docker, external providers, or platform-specific adapters need those dependencies to be running; a passing unit suite does not certify an unavailable external runtime.
 
+## Security Boundaries
+
+- Secrets live in `/etc/agent-hub/secrets.env` with mode `0600` in native deployments. Logs and API projections redact credential-like fields.
+- The installer does not alter cloud firewalls or security groups.
+- Skills are quarantined and scanned for traversal, size, file-count, forbidden-extension, dependency-pinning, and permission issues before approval.
+- Plugin, Skill, MCP, OpenClaw, and scheduler actions are capability-scoped, approval-aware, and audited.
+- Remote HTTP/MCP transports reject unsafe destinations and redirect-based SSRF.
+- The system fails closed when a runtime, credential, backend, or health check is missing. A stored manifest is not evidence that a capability can execute.
+- A Strix entry does not provide a completed penetration-test environment by itself. Real scans still require an authorized target, a functioning Strix runtime, its backend prerequisites, and valid model credentials.
+- Hermes memory never grants authority and does not store obvious secrets.
+
+Read [Security](docs/security.md) before exposing a deployment to untrusted users or networks.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
 - [Installation](docs/installation.md)
 - [Operations](docs/operations.md)
 - [Model pools](docs/model-pools.md)

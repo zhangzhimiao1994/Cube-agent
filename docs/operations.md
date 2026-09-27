@@ -8,12 +8,17 @@ scripts/agent-hub logs
 scripts/agent-hub doctor
 scripts/agent-hub backup /tmp/agent-hub-backup.tar.gz
 scripts/agent-hub backup verify /tmp/agent-hub-backup.tar.gz
-scripts/agent-hub upgrade --version 0.2.0
+scripts/agent-hub restore /tmp/agent-hub-backup.tar.gz --target /tmp/agent-hub-restore
 scripts/agent-hub prune-releases --keep 2
 scripts/agent-hub prune-releases --keep 2 --execute
 ```
 
-Upgrades create a backup first. If readiness fails, the command restores the previous application version marker.
+The backup helper archives only `AGENT_HUB_STATE_DIR` (normally `/var/lib/agent-hub`). It does not include PostgreSQL, Redis, or `/etc/agent-hub/secrets.env`; operate independent database and secret backups. `backup verify` checks that the tar archive is readable, not that its generated SHA-256 manifest matches every payload file.
+
+`restore` extracts a previously inspected backup into the explicit target directory. It does not replace live state, restore a database, or restart services.
+
+The current `scripts/agent-hub upgrade --version VERSION` helper only backs up the state directory and changes its version marker. It is a low-level rollback rehearsal, not a release downloader, release switcher, service restart, or readiness check. Use the installer or the versioned release deployment procedure for a real application upgrade.
+
 Release pruning is a dry run by default. It always protects the active `current` release target and only removes old directories under the configured native release directory when `--execute` is passed.
 
 ## Logs
