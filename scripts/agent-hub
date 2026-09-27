@@ -20,6 +20,8 @@ Commands:
   harness-acceptance  Run Codex/DeepSeek harness acceptance smoke and stress checks.
   project-scale-acceptance
                       Run project-scale acceptance fixture planning and execution.
+  real-user-four-scale-acceptance
+                      Run logged-in small/medium/large/ultra acceptance.
   openclaw-adapter     Start a local OpenClaw Adapter.
   build-skill-runner  Build the isolated Docker Skill runner image.
   package-release     Build a deployable source archive including web/dist.
@@ -35,6 +37,9 @@ fi
 shift || true
 
 case "$command" in
+  real-user-four-scale-acceptance)
+    exec bash "$COMMAND_DIR/real-user-four-scale-acceptance.sh" "$@"
+    ;;
   doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|build-skill-runner|package-release)
     exec "$COMMAND_DIR/$command.sh" "$@"
     ;;

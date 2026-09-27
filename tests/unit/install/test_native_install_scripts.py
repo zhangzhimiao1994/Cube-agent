@@ -766,6 +766,18 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
 
 
+def test_real_user_four_scale_acceptance_command_is_registered() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/real-user-four-scale-acceptance.sh")
+
+    assert "real-user-four-scale-acceptance" in launcher
+    assert "Run logged-in small/medium/large/ultra acceptance." in launcher
+    assert "Usage: scripts/agent-hub real-user-four-scale-acceptance" in command
+    assert "real_user_four_scale_acceptance.py" in command
+    assert 'export PYTHONPATH="$SOURCE_DIR/src:${PYTHONPATH:-}"' in command
+    assert 'exec bash "$COMMAND_DIR/real-user-four-scale-acceptance.sh" "$@"' in launcher
+
+
 def test_native_installer_deploys_release_before_starting_services() -> None:
     script = read("scripts/lib/install_native.sh")
 
