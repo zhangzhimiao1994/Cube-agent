@@ -786,6 +786,12 @@ def test_native_install_deploys_minimal_privilege_skill_broker_units() -> None:
     assert "polkit" not in installer.casefold()
     assert "agent-hub-skill-broker.socket" in api_unit
     assert "agent-hub-skill-broker.socket" in worker_unit
+    capability_root = (
+        "Environment=AGENT_HUB_CAPABILITY_ENVIRONMENT_ROOT_DIR="
+        "/var/lib/agent-hub/capability-environments"
+    )
+    assert capability_root in api_unit
+    assert capability_root in worker_unit
     assert "remove_legacy_native_skill_unit" in installer
     assert 'rm -f /etc/systemd/system/agent-hub-skill@.service' in installer
     assert "systemctl enable --now agent-hub-skill-broker.socket" in installer

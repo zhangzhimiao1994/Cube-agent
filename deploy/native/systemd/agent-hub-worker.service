@@ -8,6 +8,7 @@ Type=simple
 User=agent-hub
 Group=agent-hub
 EnvironmentFile=/etc/agent-hub/secrets.env
+Environment=AGENT_HUB_CAPABILITY_ENVIRONMENT_ROOT_DIR=/var/lib/agent-hub/capability-environments
 Environment=PYTHONPATH=/opt/agent-hub/current/src
 WorkingDirectory=/opt/agent-hub/current
 ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.runtime.worker

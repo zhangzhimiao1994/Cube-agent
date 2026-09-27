@@ -2,7 +2,6 @@
 
 import base64
 import binascii
-import os
 import re
 import tempfile
 from functools import lru_cache
@@ -21,9 +20,7 @@ from agent_hub.security.network import canonical_ip
 
 
 def _default_capability_environment_root_dir() -> Path:
-    if os.name == "nt":
-        return Path(tempfile.gettempdir()) / "agent-hub" / "capability-environments"
-    return Path("/var/lib/agent-hub/capability-environments")
+    return Path(tempfile.gettempdir()) / "agent-hub" / "capability-environments"
 
 
 class Settings(BaseSettings):

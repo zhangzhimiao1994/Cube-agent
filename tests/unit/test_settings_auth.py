@@ -1,5 +1,6 @@
 import base64
 import secrets
+import tempfile
 from pathlib import Path
 from uuid import uuid4
 
@@ -147,6 +148,10 @@ def test_scheduler_background_loop_has_safe_defaults_and_bounded_interval() -> N
 
 
 def test_capability_environment_store_has_configurable_root_and_bounded_quota() -> None:
+    assert Settings.model_validate({}).capability_environment_root_dir == (
+        Path(tempfile.gettempdir()) / "agent-hub" / "capability-environments"
+    )
+
     settings = Settings.model_validate(
         {
             "capability_environment_root_dir": "C:/agent-hub/capability-envs",
