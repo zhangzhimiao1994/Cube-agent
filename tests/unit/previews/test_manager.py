@@ -188,17 +188,11 @@ def test_start_rejects_missing_preview_and_unsafe_workspace_aliases(tmp_path: Pa
             _start(manager, project_id="../other")
 
 
-def test_server_and_proxy_reject_traversal_directory_listing_and_symlinks(tmp_path: Path) -> None:
+def test_server_and_proxy_reject_traversal_and_directory_listing(tmp_path: Path) -> None:
     session_root = _session_root(tmp_path)
     _write(session_root, "dist/index.html", "home")
     _write(session_root, "dist/assets/app.js", "asset")
     _write(session_root, "secret.txt", "secret")
-    symlink_candidate = session_root / "dist" / "assets" / "secret-link.txt"
-    symlink: Path | None = symlink_candidate
-    try:
-        symlink_candidate.symlink_to(session_root / "secret.txt")
-    except OSError:
-        symlink = None
 
     with PreviewManager(tmp_path) as manager:
         launch = _start(manager)
@@ -217,9 +211,20 @@ def test_server_and_proxy_reject_traversal_directory_listing_and_symlinks(tmp_pa
         assert connection.getresponse().status == 404
         connection.close()
 
-        if symlink is not None:
-            with pytest.raises(InvalidPreviewPath):
-                manager.read(launch.state.preview_id, launch.token, "assets/secret-link.txt")
+
+def test_start_rejects_nested_file_symlink(tmp_path: Path) -> None:
+    session_root = _session_root(tmp_path)
+    _write(session_root, "dist/index.html", "home")
+    _write(session_root, "secret.txt", "secret")
+    symlink = session_root / "dist" / "assets" / "secret-link.txt"
+    symlink.parent.mkdir(parents=True)
+    try:
+        symlink.symlink_to(session_root / "secret.txt")
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+
+    with PreviewManager(tmp_path) as manager, pytest.raises(InvalidPreviewPath, match="alias"):
+        _start(manager)
 
 
 @pytest.mark.parametrize("path", ["//other-host/asset.js", "https://other-host/asset.js"])
