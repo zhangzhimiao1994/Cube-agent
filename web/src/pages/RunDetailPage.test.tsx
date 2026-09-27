@@ -1924,7 +1924,7 @@ describe("RunDetailPage", () => {
     expect(within(approval).getByText(/插件运行时不可用/)).not.toBeNull();
     expect(within(approval).getByText(/修复插件端点或适配器/)).not.toBeNull();
 
-    await user.click(within(approval).getByRole("button", { name: "接受修复" }));
+    await user.click(within(approval).getByRole("button", { name: "修复并继续" }));
 
     await waitFor(() => {
       expect(requests).toEqual([
@@ -2526,7 +2526,28 @@ describe("RunDetailPage", () => {
     const user = userEvent.setup();
     const proposalRun: RunDetail = {
       ...runDetail,
-      status: "failed",
+      status: "waiting_approval",
+      version: 5,
+      decision_token: "runtime-install-token",
+      repair_proposal: {
+        kind: "self_repair",
+        title: "需要处理后继续",
+        summary: "任务已暂停。确认后系统会处理当前阻塞项并继续原任务。",
+        repair_action: "draft_repair_proposal",
+        failure_kind: "plugin_adapter_unavailable",
+        source_run_id: runId,
+        source_event_sequence: 4,
+        attempt: 1,
+        max_attempts: 1,
+        instruction: "安装缺少的可信运行时。",
+        requires_approval: true,
+        replay_safe: false,
+        automatic_execution: false,
+        fingerprint: "runtime-install-fingerprint",
+        resolution_kind: "install_runtime",
+        resolution_label: "安装并继续",
+        pauses_run: true,
+      },
       capability_install_proposal: {
         entry_id: "office_doc_search",
         plan_id: "capability-plan-office_doc_search-1234",
@@ -2603,6 +2624,22 @@ describe("RunDetailPage", () => {
           },
         });
       }
+      if (path === `/api/v1/runs/${runId}/accept-repair`) {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          decision_token: "runtime-install-token",
+          version: 5,
+        });
+        return jsonResponse({
+          id: runId,
+          tenant_id: "33333333-3333-4333-8333-333333333333",
+          status: "queued",
+          mode: "hybrid",
+          version: 6,
+          decision_token: null,
+          clarification_reason: null,
+          repair_proposal: null,
+        });
+      }
       if (path === "/api/v1/admin/capability-installer/cancel") {
         expect(JSON.parse(String(init?.body))).toEqual({
           entry_id: "office_doc_search",
@@ -2640,23 +2677,30 @@ describe("RunDetailPage", () => {
     const card = await screen.findByRole("status", { name: "能力安装建议" });
     expect(within(card).getByText("Office 文档搜索")).not.toBeNull();
     expect(within(card).getByText("安装只读 Office 文档索引与搜索能力。")).not.toBeNull();
-    await user.click(within(card).getByRole("button", { name: "安装能力 Office 文档搜索" }));
+    await user.click(within(card).getByRole("button", { name: "安装并继续 Office 文档搜索" }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/admin/capability-installer/install",
         expect.any(Object),
       ),
     );
-    expect(await within(card).findByText("能力已安装：Office 文档搜索")).not.toBeNull();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/v1/runs/${runId}/accept-repair`,
+        expect.any(Object),
+      ),
+    );
+    expect(await screen.findByText("能力已安装，原任务已继续：Office 文档搜索")).not.toBeNull();
 
-    await user.click(within(card).getByRole("button", { name: "取消安装建议" }));
+    const refreshedCard = await screen.findByRole("status", { name: "能力安装建议" });
+    await user.click(within(refreshedCard).getByRole("button", { name: "取消安装建议" }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/admin/capability-installer/cancel",
         expect.any(Object),
       ),
     );
-    expect(await within(card).findByText("已取消安装建议：Office 文档搜索")).not.toBeNull();
+    expect(await screen.findByText("已取消安装建议：Office 文档搜索")).not.toBeNull();
   });
 
   it("does not show sandbox controls for non-capability waiting approvals", async () => {

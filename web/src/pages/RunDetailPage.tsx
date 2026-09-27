@@ -520,7 +520,12 @@ function runDetailVersion(run: RunDetail) {
 }
 
 function repairApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  if (
+    !run ||
+    !["failed", "waiting_approval"].includes(run.status) ||
+    !run.decision_token ||
+    !run.repair_proposal
+  ) return null;
   return {
     runId: run.id,
     decisionToken: run.decision_token,
@@ -532,7 +537,7 @@ function repairApprovalFromRunDetail(run: RunDetail | undefined) {
 function repairProposalBody(proposal: RepairProposal) {
   return [
     proposal.summary,
-    `失败类型：${repairFailureKindLabel(proposal.failure_kind)}`,
+    `${proposal.pauses_run ? "阻塞类型" : "失败类型"}：${repairFailureKindLabel(proposal.failure_kind)}`,
     `修复动作：${repairActionLabel(proposal.repair_action)}`,
     `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
     proposal.instruction ? `受控指令：${proposal.instruction}` : "",
@@ -540,10 +545,23 @@ function repairProposalBody(proposal: RepairProposal) {
     proposal.orchestration_recovery_hint
       ? `角色交接恢复：${repairRecoveryStrategyLabel(proposal.orchestration_recovery_hint)}`
       : "",
-    proposal.automatic_execution
+    proposal.pauses_run
+      ? "任务会保持暂停；完成安装或配置并确认后，系统才会继续原任务。"
+      : proposal.automatic_execution
       ? "该修复提案标记为自动执行。"
       : "不会自动执行；只有确认后才会重新排队一次。",
   ].filter(Boolean).join("\n\n");
+}
+
+function repairRequiresConfiguration(proposal: RepairProposal) {
+  return [
+    "install_runtime",
+    "configure_credentials",
+    "enable_runtime",
+    "restart_runtime",
+    "adjust_permissions",
+    "repair_configuration",
+  ].includes(proposal.resolution_kind ?? "");
 }
 
 function capabilityApprovalFromRunDetail(run: RunDetail | undefined): CapabilityApproval | null {
@@ -3394,15 +3412,29 @@ export function RunDetailPage() {
   });
   const [capabilityInstallMessage, setCapabilityInstallMessage] = useState("");
   const installMissingCapability = useMutation({
-    mutationFn: (proposal: CapabilityInstallProposal) =>
-      api.installCapability({
+    mutationFn: async (proposal: CapabilityInstallProposal) => {
+      const result = await api.installCapability({
         entry_id: proposal.entry_id,
         query: proposal.query,
         plan_id: proposal.plan_id,
         confirm: true,
-      }),
-    onSuccess: async (result) => {
-      setCapabilityInstallMessage(`能力已安装：${result.plan.name_cn}`);
+      });
+      const approval = repairApprovalFromRunDetail(run.data);
+      if (approval?.proposal.resolution_kind === "install_runtime") {
+        await api.acceptSelfRepair(approval.runId, {
+          decision_token: approval.decisionToken,
+          version: approval.version,
+        });
+        return { result, resumed: true };
+      }
+      return { result, resumed: false };
+    },
+    onSuccess: async ({ result, resumed }) => {
+      setCapabilityInstallMessage(
+        resumed
+          ? `能力已安装，原任务已继续：${result.plan.name_cn}`
+          : `能力已安装：${result.plan.name_cn}`,
+      );
       await queryClient.invalidateQueries({ queryKey: ["run", runId] });
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["plugins"] });
@@ -3701,17 +3733,30 @@ export function RunDetailPage() {
                 </div>
               </aside>
             ) : null}
-            {repairApproval ? (
+            {repairApproval && !capabilityInstallProposal ? (
               <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
                 <div>
-                  <span className="eyebrow">自修复待确认</span>
+                  <span className="eyebrow">
+                    {repairApproval.proposal.pauses_run ? "任务已暂停" : "自修复待确认"}
+                  </span>
                   <strong>{repairApproval.proposal.title}</strong>
                   <small>{repairApproval.proposal.summary}</small>
                 </div>
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
-                <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
-                  {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
-                </button>
+                <div className="composer-card-actions">
+                  {repairRequiresConfiguration(repairApproval.proposal) ? (
+                    <Link className="button-link" to="/mcp">
+                      打开能力配置
+                    </Link>
+                  ) : null}
+                  <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                    {acceptSelfRepair.isPending
+                      ? "处理中..."
+                      : repairRequiresConfiguration(repairApproval.proposal)
+                        ? "已处理，继续原任务"
+                        : repairApproval.proposal.resolution_label || "修复并继续"}
+                  </button>
+                </div>
               </aside>
             ) : null}
             {capabilityInstallProposal ? (
@@ -3739,7 +3784,11 @@ export function RunDetailPage() {
                     disabled={installMissingCapability.isPending || cancelCapabilityInstall.isPending}
                     onClick={() => installMissingCapability.mutate(capabilityInstallProposal)}
                   >
-                    {installMissingCapability.isPending ? "安装中..." : `安装能力 ${capabilityInstallProposal.name_cn}`}
+                    {installMissingCapability.isPending
+                      ? "安装并恢复中..."
+                      : repairApproval?.proposal.resolution_kind === "install_runtime"
+                        ? `安装并继续 ${capabilityInstallProposal.name_cn}`
+                        : `安装能力 ${capabilityInstallProposal.name_cn}`}
                   </button>
                   <button
                     type="button"

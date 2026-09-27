@@ -657,7 +657,10 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
-            if RunStatus(row.status) is not RunStatus.FAILED:
+            if RunStatus(row.status) not in {
+                RunStatus.FAILED,
+                RunStatus.WAITING_APPROVAL,
+            }:
                 if _self_repair_acceptance_already_applied(routing_decision, decision_token):
                     return self._record(row)
                 raise RunConflict("run is not waiting for self repair")
@@ -1586,6 +1589,8 @@ class RunRepository:
             "decision_token": decision_token,
             "repair_proposal": proposal,
         }
+        if proposal.get("pauses_run") is True:
+            row.status = RunStatus.WAITING_APPROVAL.value
         row.version += 1
 
     async def run_transaction(self) -> AsyncSession:

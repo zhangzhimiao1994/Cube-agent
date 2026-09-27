@@ -644,6 +644,9 @@ const RepairProposalSchema = z.object({
   fingerprint: z.string(),
   recovery_strategy: z.string().optional(),
   orchestration_recovery_hint: z.string().optional(),
+  resolution_kind: z.string().optional(),
+  resolution_label: z.string().optional(),
+  pauses_run: z.boolean().optional(),
 });
 
 const CapabilityInstallProposalSchema = z.object({

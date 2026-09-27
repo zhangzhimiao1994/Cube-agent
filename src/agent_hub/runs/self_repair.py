@@ -210,6 +210,19 @@ _MANUAL_APPROVAL_FAILURE_CATEGORIES = frozenset(
     }
 )
 _GENERIC_FAILURE_CATEGORIES = frozenset({"runtime_failure", "tool_failure", "step_failure"})
+_MODEL_FAILURE_CATEGORIES = frozenset(
+    {
+        "outcome_uncertain",
+        "empty_model_response",
+        "structured_output_invalid",
+        "model_capability_routing_unavailable",
+        "model_credential_unavailable",
+        "model_quota_or_billing_unavailable",
+        "model_deployment_unavailable",
+        "model_request_contract_invalid",
+        "capacity_pressure",
+    }
+)
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -231,6 +244,9 @@ _REPAIR_PROPOSAL_FIELDS = frozenset(
         "error_code",
         "suggested_action",
         "role_capability_requirements",
+        "resolution_kind",
+        "resolution_label",
+        "pauses_run",
     }
 )
 
@@ -272,6 +288,10 @@ class SelfRepairDecision:
     suggested_action: str | None = None
     blocked_contract_ids: tuple[str, ...] = ()
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = ()
+
+    @property
+    def pauses_run(self) -> bool:
+        return self.kind == "repair.classified" and self.failure_category not in _MODEL_FAILURE_CATEGORIES
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
         return SelfRepairDecision(
@@ -334,11 +354,15 @@ class SelfRepairDecision:
         if self.kind != "repair.classified":
             return None
         automatic_execution = self.automatic_execution and not self.requires_approval
+        resolution_kind, resolution_label = _repair_resolution(self.failure_category)
+        pauses_run = self.pauses_run
         proposal: dict[str, object] = {
             "kind": "self_repair",
-            "title": "受控自修复建议",
+            "title": "需要处理后继续" if pauses_run else "受控自修复建议",
             "summary": (
-                "运行失败已分类，可自动创建一次受控修复重试。"
+                "任务已暂停。确认后系统会处理当前阻塞项并继续原任务。"
+                if pauses_run
+                else "运行失败已分类，可自动创建一次受控修复重试。"
                 if automatic_execution
                 else "运行失败已分类，可在审批后创建一次受控修复重试。"
             ),
@@ -356,6 +380,9 @@ class SelfRepairDecision:
             "replay_safe": False,
             "automatic_execution": automatic_execution,
             "fingerprint": self.fingerprint,
+            "resolution_kind": resolution_kind,
+            "resolution_label": resolution_label,
+            "pauses_run": pauses_run,
         }
         if self.recovery_strategy is not None:
             proposal["recovery_strategy"] = self.recovery_strategy
@@ -370,6 +397,30 @@ class SelfRepairDecision:
         if self.role_capability_requirements:
             proposal["role_capability_requirements"] = self.role_capability_requirements
         return proposal
+
+
+def _repair_resolution(failure_category: str) -> tuple[str, str]:
+    if failure_category in _MODEL_FAILURE_CATEGORIES:
+        return "model_failure", "查看模型配置"
+    if failure_category in {
+        "plugin_adapter_unavailable",
+        "mcp_server_not_discovered",
+        "mcp_tool_unavailable",
+    }:
+        return "install_runtime", "安装并继续"
+    if failure_category == "plugin_credential_unavailable":
+        return "configure_credentials", "配置凭据后继续"
+    if failure_category == "plugin_disabled":
+        return "enable_runtime", "启用并继续"
+    if failure_category in {"plugin_runtime_unavailable", "mcp_runtime_unavailable"}:
+        return "restart_runtime", "修复运行时并继续"
+    if failure_category == "plugin_sandbox_unsupported":
+        return "adjust_permissions", "调整权限后继续"
+    if failure_category in {"plugin_invalid_arguments", "plugin_invalid_result"}:
+        return "repair_configuration", "修复配置后继续"
+    if failure_category == "runtime_recovery_blocked":
+        return "review_checkpoint", "确认恢复点后继续"
+    return "retry_recoverable", "修复并继续"
 
 
 def classify_terminal_run(

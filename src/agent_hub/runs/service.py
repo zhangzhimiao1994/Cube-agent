@@ -1540,6 +1540,12 @@ class RunService:
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
                 await self._safe_record_self_repair_decision_for_record(claimed_record)
+                refreshed = await self._submitted_by_run_id(
+                    claimed_record.tenant_id,
+                    claimed_record.id,
+                )
+                if refreshed.status is RunStatus.WAITING_APPROVAL:
+                    return refreshed
                 await self._safe_record_empty_response_closure_artifact_for_record(
                     claimed_record
                 )
@@ -1785,6 +1791,8 @@ class RunService:
                     decision=repair_decision,
                     source_sequence_from_latest=True,
                 )
+                if repair_decision.pauses_run:
+                    return await self._submitted_by_run_id(failed.tenant_id, run_id)
             await self._safe_record_empty_response_closure_artifact(
                 tenant_id=failed.tenant_id,
                 run_id=run_id,
@@ -1857,6 +1865,8 @@ class RunService:
                 run_id=run_id,
                 decision=repair_decision,
             )
+            if repair_decision.pauses_run:
+                return await self._submitted_by_run_id(tenant_id, run_id)
         if terminal is RunStatus.FAILED:
             await self._safe_record_empty_response_closure_artifact(
                 tenant_id=tenant_id,

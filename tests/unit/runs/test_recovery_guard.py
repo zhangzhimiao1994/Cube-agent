@@ -327,6 +327,66 @@ async def test_accept_self_repair_records_current_event_sequence_as_recovery_bas
 
 
 @pytest.mark.asyncio
+async def test_accept_self_repair_resumes_recoverable_waiting_run() -> None:
+    repository = _AcceptSelfRepairRepository(latest_event_sequence=3)
+    repository.row.status = RunStatus.WAITING_APPROVAL.value
+
+    record = await repository.accept_self_repair_and_enqueue(
+        tenant_id=repository.tenant_id,
+        run_id=repository.run_id,
+        decision_token="repair-token",
+        version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_record_non_model_repair_proposal_pauses_run_for_resolution() -> None:
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="install missing runtime",
+        mode=TaskMode.HYBRID.value,
+        status=RunStatus.FAILED.value,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+    )
+    session = _AcceptSelfRepairSession(row)
+    repository = RunRepository(cast(Any, None))
+
+    async def persist_event(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    repository.persist_event = cast(Any, persist_event)
+    await repository.record_self_repair_decision(
+        cast(Any, session),
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        event=RunEvent(
+            kind="repair.classified",
+            sequence=2,
+            run_id=row.id,
+            payload={"schema_version": 1},
+        ),
+        proposal={
+            "kind": "self_repair",
+            "attempt": 1,
+            "max_attempts": 1,
+            "pauses_run": True,
+            "resolution_kind": "install_runtime",
+        },
+        decision_token="repair-token",
+    )
+
+    assert row.status == RunStatus.WAITING_APPROVAL.value
+    assert row.version == 5
+
+
+@pytest.mark.asyncio
 async def test_repeated_self_repair_accept_returns_record_without_duplicate_outbox() -> None:
     token_hash = hashlib.sha256(b"repair-token").hexdigest()
     row = _FakeRunRow(

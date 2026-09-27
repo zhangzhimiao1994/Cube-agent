@@ -213,6 +213,8 @@ class ExecutableFakeRepository:
                 "decision_token": decision_token,
                 "repair_proposal": proposal,
             }
+            if proposal.get("pauses_run") is True:
+                self.row.status = RunStatus.WAITING_APPROVAL.value
             self.row.version += 1
 
     async def accept_self_repair_and_enqueue(
@@ -226,8 +228,11 @@ class ExecutableFakeRepository:
         assert tenant_id == TENANT_ID
         assert run_id == self.run_id
         routing_decision = {} if self.row.routing_decision is None else dict(self.row.routing_decision)
-        if self.row.status != RunStatus.FAILED.value:
-            raise AssertionError("run must be failed")
+        if self.row.status not in {
+            RunStatus.FAILED.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AssertionError("run must be failed or waiting for resolution")
         if routing_decision.get("approval_kind") != "self_repair":
             raise AssertionError("run must be waiting for self repair")
         if routing_decision.get("decision_token") != decision_token:
@@ -1413,6 +1418,9 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
         "replay_safe": False,
         "automatic_execution": False,
         "fingerprint": repair.payload["fingerprint"],
+        "resolution_kind": "model_failure",
+        "resolution_label": "查看模型配置",
+        "pauses_run": False,
     }
     assert "secret" not in repr(submitted.repair_proposal)
 
@@ -1500,7 +1508,7 @@ async def test_execute_persists_manual_repair_proposal_for_external_tool_failure
 
     submitted = await service.execute(repository.run_id)
 
-    assert submitted.status is RunStatus.FAILED
+    assert submitted.status is RunStatus.WAITING_APPROVAL
     assert repository.event_log[0].kind is EventKind.TOOL_FAILED
     assert repository.event_log[1].kind is EventKind.RUNTIME_FAILED
     assert repository.event_log[-1].kind == "repair.classified"
@@ -1515,6 +1523,8 @@ async def test_execute_persists_manual_repair_proposal_for_external_tool_failure
     assert submitted.decision_token is not None
     assert submitted.repair_proposal is not None
     assert submitted.repair_proposal["failure_kind"] == failure_kind
+    assert submitted.repair_proposal["resolution_kind"] == "install_runtime"
+    assert submitted.repair_proposal["pauses_run"] is True
     assert submitted.repair_proposal["source_event_sequence"] == 1
     assert submitted.repair_proposal["requires_approval"] is True
     assert submitted.repair_proposal["automatic_execution"] is False
@@ -2100,7 +2110,7 @@ async def test_execute_classifies_runtime_exception_failure() -> None:
 
     submitted = await service.execute(repository.run_id)
 
-    assert submitted.status is RunStatus.FAILED
+    assert submitted.status is RunStatus.WAITING_APPROVAL
     assert [event.kind for event in repository.event_log] == [
         EventKind.RUNTIME_FAILED,
         "repair.classified",
@@ -2450,7 +2460,7 @@ async def test_recover_persists_repair_classification_for_failed_running_recover
 
     submitted = await service.recover(repository.run_id)
 
-    assert submitted.status is RunStatus.FAILED
+    assert submitted.status is RunStatus.WAITING_APPROVAL
     repair_events = [event for event in repository.event_log if event.kind == "repair.classified"]
     assert len(repair_events) == 1
     assert repair_events[0].payload["source_kind"] == "step.failed"

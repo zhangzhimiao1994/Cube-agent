@@ -3644,7 +3644,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "接受修复" }));
+    await user.click(screen.getByRole("button", { name: "修复并继续" }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/accept-repair`)).toMatchObject({

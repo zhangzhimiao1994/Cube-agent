@@ -2278,7 +2278,7 @@ function projectPreflightApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function repairApprovalFromSubmittedRun(run: SubmittedRun) {
-  if (run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  if (!["failed", "waiting_approval"].includes(run.status) || !run.decision_token || !run.repair_proposal) return null;
   return {
     runId: run.id,
     decisionToken: run.decision_token,
@@ -2288,7 +2288,12 @@ function repairApprovalFromSubmittedRun(run: SubmittedRun) {
 }
 
 function repairApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  if (
+    !run ||
+    !["failed", "waiting_approval"].includes(run.status) ||
+    !run.decision_token ||
+    !run.repair_proposal
+  ) return null;
   return {
     runId: run.id,
     decisionToken: run.decision_token,
@@ -2352,7 +2357,7 @@ function formatEventPayloadDisplayValue(key: string, value: unknown) {
 function repairProposalBody(proposal: RepairProposal) {
   return [
     proposal.summary,
-    `失败类型：${repairFailureKindLabel(proposal.failure_kind)}`,
+    `${proposal.pauses_run ? "阻塞类型" : "失败类型"}：${repairFailureKindLabel(proposal.failure_kind)}`,
     `修复动作：${repairActionLabel(proposal.repair_action)}`,
     `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
     proposal.instruction ? `受控指令：${proposal.instruction}` : "",
@@ -2360,7 +2365,9 @@ function repairProposalBody(proposal: RepairProposal) {
     proposal.orchestration_recovery_hint
       ? `角色交接恢复：${repairRecoveryStrategyLabel(proposal.orchestration_recovery_hint)}`
       : "",
-    proposal.automatic_execution
+    proposal.pauses_run
+      ? "任务会保持暂停；完成安装或配置并确认后，系统才会继续原任务。"
+      : proposal.automatic_execution
       ? "该修复提案标记为自动执行。"
       : "不会自动执行；只有确认后才会重新排队一次。",
   ].filter(Boolean).join("\n\n");
@@ -6673,7 +6680,11 @@ export function RunsPage() {
         setProjectPreflightApproval(null);
         setDismissedRepairApprovalRunIds((current) => current.filter((id) => id !== repair.runId));
         setRepairApproval(repair);
-        setSubmitNotice("运行失败已生成受控自修复建议，需要确认后才会重新排队。");
+        setSubmitNotice(
+          repair.proposal.pauses_run
+            ? "任务已暂停，处理当前环境阻塞后会继续原任务。"
+            : "运行失败已生成受控自修复建议，需要确认后才会重新排队。",
+        );
       } else if (run.openclaw_proposal) {
         setModeSelection(null);
         setTemporaryApproval(null);
@@ -6975,6 +6986,7 @@ export function RunsPage() {
     setRepairApproval(null);
     setSubmitNotice("已取消本次受控自修复建议。");
   };
+  const repairNeedsInstaller = repairApproval?.proposal.resolution_kind === "install_runtime";
 
   const approveProjectPreflight = useMutation({
     mutationFn: () => {
@@ -7328,8 +7340,12 @@ export function RunsPage() {
       return;
     }
     if (repairApproval) {
+      if (repairApproval.proposal.resolution_kind === "install_runtime") {
+        setSubmitNotice("当前任务缺少运行时，请打开运行详情确认安装；安装完成后系统会自动继续原任务。");
+        return;
+      }
       const choice = parseChoiceText(trimmed, [
-        { value: "accept", label: "接受修复", aliases: ["接受", "修复", "重试", "approve", "yes", "fix"] },
+        { value: "accept", label: "修复并继续", aliases: ["接受", "修复", "重试", "approve", "yes", "fix"] },
         { value: "cancel", label: "取消修复", aliases: ["取消", "忽略", "不修复", "拒绝", "cancel", "reject", "no"] },
       ]);
       if (!choice) {
@@ -8456,15 +8472,25 @@ export function RunsPage() {
             {repairApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
                 <div>
-                  <span className="eyebrow">自修复待确认</span>
+                  <span className="eyebrow">
+                    {repairApproval.proposal.pauses_run ? "任务已暂停" : "自修复待确认"}
+                  </span>
                   <strong>{repairApproval.proposal.title}</strong>
                   <small>{repairApproval.proposal.summary}</small>
                 </div>
                 <p>{repairProposalBody(repairApproval.proposal)}</p>
                 <div className="composer-card-actions">
-                  <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
-                    {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
-                  </button>
+                  {repairNeedsInstaller ? (
+                    <Link className="button-link" to={`/runs/${repairApproval.runId}`}>
+                      选择运行时并继续
+                    </Link>
+                  ) : (
+                    <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                      {acceptSelfRepair.isPending
+                        ? "处理中..."
+                        : repairApproval.proposal.resolution_label || "修复并继续"}
+                    </button>
+                  )}
                   <button type="button" className="secondary-action" disabled={acceptSelfRepair.isPending} onClick={cancelSelfRepair}>
                     取消修复
                   </button>
