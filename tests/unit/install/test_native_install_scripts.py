@@ -799,6 +799,18 @@ def test_native_install_deploys_minimal_privilege_skill_broker_units() -> None:
     assert "require_native_service_active agent-hub-skill-broker.socket" in installer
 
 
+def test_native_upgrade_restarts_every_release_bound_process_after_switch() -> None:
+    installer = read("scripts/lib/install_native.sh")
+    switch = installer.index('ln -sfn "$release" "$INSTALL_ROOT/current"')
+    broker_stop = installer.index("systemctl stop agent-hub-skill-broker.service")
+    litellm_restart = installer.index("systemctl restart agent-hub-litellm.service")
+    api_restart = installer.index("systemctl restart agent-hub-api.service")
+    worker_restart = installer.index("systemctl restart agent-hub-worker.service")
+    readiness = installer.index("require_native_readiness", worker_restart)
+
+    assert switch < broker_stop < litellm_restart < api_restart < worker_restart < readiness
+
+
 def test_native_install_keeps_root_broker_runtime_unwritable_by_service_user() -> None:
     installer = read("scripts/lib/install_native.sh")
     service_unit = read("deploy/native/systemd/agent-hub-skill-broker.service")

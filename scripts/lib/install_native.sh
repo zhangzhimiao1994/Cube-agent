@@ -744,6 +744,10 @@ install_native_mode() {
   systemctl reload-or-restart caddy || systemctl restart caddy
   systemctl enable --now agent-hub-skill-broker.socket
   systemctl enable --now agent-hub.target
+  systemctl stop agent-hub-skill-broker.service 2>/dev/null || true
+  systemctl restart agent-hub-litellm.service
+  systemctl restart agent-hub-api.service
+  systemctl restart agent-hub-worker.service
   require_native_service_active agent-hub-skill-broker.socket
   require_native_service_active caddy.service
   require_native_service_active agent-hub-api.service

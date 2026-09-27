@@ -41,6 +41,13 @@
   grep -q 'uv sync --frozen --no-dev' scripts/lib/install_native.sh
 }
 
+@test "native upgrades restart every process bound to the active release" {
+  grep -q 'systemctl stop agent-hub-skill-broker.service' scripts/lib/install_native.sh
+  grep -q 'systemctl restart agent-hub-litellm.service' scripts/lib/install_native.sh
+  grep -q 'systemctl restart agent-hub-api.service' scripts/lib/install_native.sh
+  grep -q 'systemctl restart agent-hub-worker.service' scripts/lib/install_native.sh
+}
+
 @test "native installer creates runtime directories and runs migrations before services" {
   grep -q 'systemd-tmpfiles --create' scripts/lib/install_native.sh
   grep -q 'alembic upgrade head' scripts/lib/install_native.sh
