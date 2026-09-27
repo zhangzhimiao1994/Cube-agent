@@ -25,6 +25,20 @@ RUN uv sync --frozen --no-dev --no-editable \
     || (uv venv --clear .venv \
       && uv pip install --python .venv/bin/python --index-url "${AGENT_HUB_PYPI_MIRROR}" .)
 
+FROM ${PYTHON_IMAGE} AS skill-runner
+ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/workspace
+WORKDIR /opt/agent-hub
+RUN groupadd --gid 65532 skill-runner \
+    && useradd --uid 65532 --gid 65532 --home-dir /workspace --shell /usr/sbin/nologin skill-runner \
+    && mkdir -p /package /workspace \
+    && chown -R 65532:65532 /opt/agent-hub /package /workspace
+COPY --from=python-build --chown=65532:65532 /opt/agent-hub/.venv ./.venv
+USER 65532:65532
+CMD ["python", "-m", "agent_hub.skills.runner"]
+
 FROM ${PYTHON_IMAGE} AS runtime
 ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \

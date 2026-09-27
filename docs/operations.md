@@ -21,6 +21,22 @@ The current `scripts/agent-hub upgrade --version VERSION` helper only backs up t
 
 Release pruning is a dry run by default. It always protects the active `current` release target and only removes old directories under the configured native release directory when `--execute` is passed.
 
+## Docker Skill Runner
+
+Build the isolated runner image from the current checkout:
+
+```bash
+scripts/agent-hub build-skill-runner
+```
+
+The default image is `agent-hub-skill-runner:latest`. Use explicit source and image values for another checkout or registry tag:
+
+```bash
+scripts/agent-hub build-skill-runner --source /srv/cube-agent --image registry.example/cube/skill-runner:1.0
+```
+
+The command invokes Docker directly without evaluating shell text. The resulting target runs as UID/GID `65532:65532` and starts `python -m agent_hub.skills.runner`; the Docker sandbox still applies its read-only filesystem, dropped capabilities, network policy, resource limits, and package/workspace mounts at invocation time.
+
 ## Logs
 
 Runtime logs are JSON and are filtered before they are written. New installs default to:

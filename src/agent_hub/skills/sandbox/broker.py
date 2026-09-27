@@ -3,14 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import importlib
+import json
 import logging
 import os
 import shutil
 import socket
 import struct
 import subprocess
+import tempfile
+import textwrap
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -26,6 +31,7 @@ from agent_hub.skills.sandbox.base import (
 
 BROKER_SOCKET_PATH = Path("/run/agent-hub/skill-broker.sock")
 _PROTOCOL_VERSION: Literal[1] = 1
+BrokerBackend = Literal["systemd", "docker"]
 _MAX_REQUEST_BYTES = 2_000_000
 _MAX_RESPONSE_BYTES = 22_000_000
 _FRAME_HEADER_BYTES = 4
@@ -41,6 +47,7 @@ class BrokerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     version: Literal[1] = _PROTOCOL_VERSION
+    backend: BrokerBackend = "systemd"
     action: Literal["probe", "run", "terminate"]
     invocation: SkillInvocation | None = None
     execution_id: str | None = None
@@ -59,17 +66,27 @@ class BrokerRequest(BaseModel):
         return self
 
     @classmethod
-    def probe(cls) -> BrokerRequest:
-        return cls(action="probe")
+    def probe(cls, *, backend: BrokerBackend = "systemd") -> BrokerRequest:
+        return cls(action="probe", backend=backend)
 
     @classmethod
-    def run(cls, invocation: SkillInvocation) -> BrokerRequest:
-        return cls(action="run", invocation=invocation)
+    def run(
+        cls,
+        invocation: SkillInvocation,
+        *,
+        backend: BrokerBackend = "systemd",
+    ) -> BrokerRequest:
+        return cls(action="run", invocation=invocation, backend=backend)
 
     @classmethod
-    def terminate(cls, execution_id: str) -> BrokerRequest:
+    def terminate(
+        cls,
+        execution_id: str,
+        *,
+        backend: BrokerBackend = "systemd",
+    ) -> BrokerRequest:
         validate_execution_id(execution_id)
-        return cls(action="terminate", execution_id=execution_id)
+        return cls(action="terminate", execution_id=execution_id, backend=backend)
 
 
 class BrokerResponse(BaseModel):
@@ -84,11 +101,14 @@ class BrokerResponse(BaseModel):
 class BrokerPolicy:
     skill_root: Path = Path("/var/lib/agent-hub/skills")
     allowed_uid: int = 10001
+    allowed_gid: int = 10001
     service_group: str = "agent-hub"
     python: str = "/opt/agent-hub/current/.venv/bin/python"
     source_path: Path = Path("/opt/agent-hub/current/src")
     systemd_run: str = "/usr/bin/systemd-run"
     systemctl: str = "/usr/bin/systemctl"
+    docker: str = "/usr/bin/docker"
+    runtime_root: Path = Path("/run/agent-hub")
     read_only_roots: tuple[Path, ...] = (
         Path("/var/lib/agent-hub/attachments"),
         Path("/var/lib/agent-hub/workspaces"),
@@ -108,9 +128,9 @@ def validate_broker_request(
         if invocation is None:
             raise BrokerRequestError("run invocation is missing")
         if invocation.network_allowlist:
-            raise BrokerRequestError("network allowlist is not supported by the systemd broker")
+            raise BrokerRequestError("network allowlist is not supported by the Skill broker")
         if invocation.selected_secret_refs:
-            raise BrokerRequestError("secret references are not supported by the systemd broker")
+            raise BrokerRequestError("secret references are not supported by the Skill broker")
         _require_regular_file(invocation.package_path, policy.skill_root, "package path")
         if invocation.package_path.suffix.casefold() != ".zip":
             raise BrokerRequestError("package path must identify a zip archive")
@@ -227,7 +247,7 @@ def build_broker_terminate_command(execution_id: str, policy: BrokerPolicy) -> t
     )
 
 
-async def request_systemd_broker(
+async def request_skill_broker(
     request: BrokerRequest,
     *,
     socket_path: Path = BROKER_SOCKET_PATH,
@@ -235,7 +255,7 @@ async def request_systemd_broker(
     try:
         open_unix_connection = cast(Any, _module_attribute(asyncio, "open_unix_connection"))
     except AttributeError:
-        raise OSError("Unix sockets are unavailable for the systemd Skill broker") from None
+        raise OSError("Unix sockets are unavailable for the Skill broker") from None
     timeout_seconds = request.invocation.timeout_seconds + 10 if request.invocation else 10
     async with asyncio.timeout(timeout_seconds):
         reader, writer = await open_unix_connection(socket_path.as_posix())
@@ -248,27 +268,42 @@ async def request_systemd_broker(
             await writer.wait_closed()
 
 
-def probe_systemd_broker(socket_path: Path = BROKER_SOCKET_PATH) -> str | None:
+def probe_skill_broker(
+    backend: BrokerBackend,
+    socket_path: Path = BROKER_SOCKET_PATH,
+) -> str | None:
     try:
         address_family = _module_attribute(socket, "AF_UNIX")
         with socket.socket(address_family, socket.SOCK_STREAM) as client:
             client.settimeout(6)
             client.connect(socket_path.as_posix())
-            payload = BrokerRequest.probe().model_dump_json().encode("utf-8")
+            payload = BrokerRequest.probe(backend=backend).model_dump_json().encode("utf-8")
             client.sendall(struct.pack("!I", len(payload)) + payload)
             header = _recv_exact(client, _FRAME_HEADER_BYTES)
             length = struct.unpack("!I", header)[0]
             if length < 1 or length > _MAX_RESPONSE_BYTES:
-                return "systemd_broker_invalid_response"
+                return f"{backend}_broker_invalid_response"
             response = BrokerResponse.model_validate_json(_recv_exact(client, length), strict=True)
     except (AttributeError, OSError, ValueError):
-        return "systemd_broker_unavailable"
+        return f"{backend}_broker_unavailable"
     if response.ok:
         return None
-    return response.error or "systemd_transient_unit_unavailable"
+    return response.error or f"{backend}_broker_unavailable"
 
 
-class SystemdBroker:
+async def request_systemd_broker(
+    request: BrokerRequest,
+    *,
+    socket_path: Path = BROKER_SOCKET_PATH,
+) -> BrokerResponse:
+    return await request_skill_broker(request, socket_path=socket_path)
+
+
+def probe_systemd_broker(socket_path: Path = BROKER_SOCKET_PATH) -> str | None:
+    return probe_skill_broker("systemd", socket_path)
+
+
+class SkillBroker:
     def __init__(self, policy: BrokerPolicy) -> None:
         self._policy = policy
         self._processes: dict[str, asyncio.subprocess.Process] = {}
@@ -278,21 +313,33 @@ class SystemdBroker:
         try:
             validated = validate_broker_request(request, peer_uid=peer_uid, policy=self._policy)
             if validated.action == "probe":
-                return await self._probe()
+                return await self._probe(validated.backend)
             if validated.action == "terminate":
-                await self._terminate(validated.execution_id or "")
+                await self._terminate(validated.execution_id or "", validated.backend)
                 return BrokerResponse(ok=True)
             invocation = validated.invocation
             if invocation is None:
                 raise BrokerRequestError("run invocation is missing")
             async with self._execution_slots:
-                result = await self._run(invocation)
+                result = await self._run(invocation, validated.backend)
             return BrokerResponse(ok=True, result=result)
         except (BrokerRequestError, OSError, subprocess.SubprocessError, ValueError) as error:
             return BrokerResponse(ok=False, error=str(error))
 
-    async def _run(self, invocation: SkillInvocation) -> SkillResult:
-        command = build_broker_systemd_command(invocation, self._policy)
+    async def _run(
+        self,
+        invocation: SkillInvocation,
+        backend: BrokerBackend,
+    ) -> SkillResult:
+        if backend == "docker":
+            from agent_hub.skills.sandbox.docker import DockerSandboxSettings, build_docker_command
+
+            command = build_docker_command(
+                invocation,
+                DockerSandboxSettings(executable=self._policy.docker),
+            )
+        else:
+            command = build_broker_systemd_command(invocation, self._policy)
         try:
             return await run_subprocess_with_limits(
                 command,
@@ -300,16 +347,21 @@ class SystemdBroker:
                 process_started=lambda process: self._processes.__setitem__(
                     invocation.execution_id, process
                 ),
-                on_forced_terminate=lambda: self._terminate(invocation.execution_id),
+                on_forced_terminate=lambda: self._terminate(invocation.execution_id, backend),
             )
         finally:
             self._processes.pop(invocation.execution_id, None)
 
-    async def _terminate(self, execution_id: str) -> None:
+    async def _terminate(self, execution_id: str, backend: BrokerBackend) -> None:
         process = self._processes.get(execution_id)
         if process is not None and process.returncode is None:
             process.kill()
-        command = build_broker_terminate_command(execution_id, self._policy)
+        if backend == "docker":
+            from agent_hub.skills.sandbox.docker import build_docker_terminate_command
+
+            command = build_docker_terminate_command(execution_id, executable=self._policy.docker)
+        else:
+            command = build_broker_terminate_command(execution_id, self._policy)
         killer = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.DEVNULL,
@@ -317,7 +369,56 @@ class SystemdBroker:
         )
         await asyncio.wait_for(killer.wait(), timeout=5)
 
-    async def _probe(self) -> BrokerResponse:
+    async def _probe(self, backend: BrokerBackend) -> BrokerResponse:
+        if backend == "docker":
+            return await self._probe_docker()
+        return await self._probe_systemd()
+
+    async def _probe_docker(self) -> BrokerResponse:
+        try:
+            self._policy.runtime_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="docker-skill-probe-",
+                dir=self._policy.runtime_root,
+            ) as temporary:
+                root = Path(temporary)
+                package = root / "probe.zip"
+                workdir = root / "workspace"
+                workdir.mkdir(mode=0o770)
+                if hasattr(os, "chown"):
+                    os.chown(workdir, self._policy.allowed_uid, self._policy.allowed_gid)
+                _write_docker_probe_package(package)
+                invocation = SkillInvocation(
+                    execution_id=f"probe_{uuid.uuid4().hex[:12]}",
+                    package_path=package,
+                    package_sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+                    input={"docker_probe": "ok"},
+                    timeout_seconds=10,
+                    output_limit_bytes=4096,
+                    memory_limit_bytes=64 * 1024 * 1024,
+                    cpu_quota_percent=25,
+                    sandbox_profile="read_only",
+                    writable_tmp_path=workdir,
+                )
+                result = await self._run(invocation, "docker")
+        except (OSError, TimeoutError, ValueError):
+            _LOGGER.exception("Docker Skill broker probe could not start the runner")
+            return BrokerResponse(ok=False, error="docker_broker_unavailable")
+        if result.timed_out or result.exit_code != 0:
+            detail = result.stderr.casefold()
+            if "no such image" in detail or "not found" in detail:
+                return BrokerResponse(ok=False, error="docker_runner_image_not_found")
+            _LOGGER.warning("Docker Skill broker probe failed: %s", detail.strip() or "no stderr")
+            return BrokerResponse(ok=False, error="docker_runner_unavailable")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return BrokerResponse(ok=False, error="docker_runner_invalid_response")
+        if payload != {"docker_probe": "ok"}:
+            return BrokerResponse(ok=False, error="docker_runner_invalid_response")
+        return BrokerResponse(ok=True)
+
+    async def _probe_systemd(self) -> BrokerResponse:
         unit = f"agent-hub-skill-probe-{uuid.uuid4().hex[:12]}"
         command = (
             self._policy.systemd_run,
@@ -355,6 +456,9 @@ class SystemdBroker:
             _LOGGER.warning("systemd Skill broker probe failed: %s", detail or "no stderr")
             return BrokerResponse(ok=False, error="systemd_transient_unit_unavailable")
         return BrokerResponse(ok=True)
+
+
+SystemdBroker = SkillBroker
 
 
 async def _serve_client(
@@ -457,17 +561,61 @@ def _activated_socket() -> socket.socket:
     return activated
 
 
+def _write_docker_probe_package(path: Path) -> None:
+    dependency_hash = hashlib.sha256(b"").hexdigest()
+    manifest = textwrap.dedent(
+        f"""\
+        name: docker_probe
+        version: 1.0.0
+        entry_point: main.py
+        compatible_runtime: python3.12
+        declared_tools: []
+        network_policy:
+          mode: none
+          allow_hosts: []
+        writable_paths: []
+        env_secret_refs: []
+        dependency_lock_hash: "{dependency_hash}"
+        """
+    )
+    entrypoint = textwrap.dedent(
+        """\
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        payload = json.load(sys.stdin)
+        Path(os.environ["AGENT_HUB_WORKDIR"], "probe-write.txt").write_text(
+            "ok", encoding="utf-8"
+        )
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        """
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("skill.yaml", manifest)
+        archive.writestr("main.py", entrypoint)
+
+
 def load_broker_policy() -> BrokerPolicy:
     group_module = importlib.import_module("grp")
     password_module = importlib.import_module("pwd")
-    _module_attribute(group_module, "getgrnam")("agent-hub")
+    service_group = _module_attribute(group_module, "getgrnam")("agent-hub")
     service_user = _module_attribute(password_module, "getpwnam")("agent-hub")
-    return BrokerPolicy(allowed_uid=int(service_user.pw_uid))
+    docker = next(
+        (candidate for candidate in ("/usr/bin/docker", "/snap/bin/docker") if Path(candidate).is_file()),
+        "/usr/bin/docker",
+    )
+    return BrokerPolicy(
+        allowed_uid=int(service_user.pw_uid),
+        allowed_gid=int(getattr(service_group, "gr_gid", service_user.pw_uid)),
+        docker=docker,
+    )
 
 
 async def _main_async() -> None:
     policy = load_broker_policy()
-    broker = SystemdBroker(policy)
+    broker = SkillBroker(policy)
     start_unix_server = cast(Any, _module_attribute(asyncio, "start_unix_server"))
     server = await start_unix_server(
         lambda reader, writer: _serve_client(reader, writer, broker),
@@ -478,7 +626,7 @@ async def _main_async() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agent Hub privileged systemd Skill broker")
+    parser = argparse.ArgumentParser(description="Agent Hub privileged Skill broker")
     parser.parse_args()
     get_effective_uid = getattr(os, "geteuid", None)
     if get_effective_uid is None or get_effective_uid() != 0:

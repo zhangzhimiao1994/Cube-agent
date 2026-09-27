@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from subprocess import CompletedProcess
-from typing import Any
-
 import pytest
 
 from agent_hub.execution_backends import (
@@ -23,16 +20,7 @@ def teardown_function() -> None:
 def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executables = {"docker": "/usr/bin/docker"}
-    monkeypatch.setattr(
-        "agent_hub.execution_backends.shutil.which",
-        lambda name: executables.get(name),
-    )
-    monkeypatch.setattr(
-        "agent_hub.execution_backends.subprocess.run",
-        lambda *args, **kwargs: CompletedProcess(args=args[0], returncode=0, stdout="image-id\n", stderr=""),
-    )
-    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", lambda: None)
+    monkeypatch.setattr("agent_hub.execution_backends.probe_skill_broker", lambda backend: None)
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
@@ -42,33 +30,26 @@ def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
     assert statuses["docker"].adapter == "DockerSkillSandbox"
 
 
-def test_probe_explains_missing_docker_instead_of_advertising_placeholder(
+def test_probe_explains_missing_docker_broker_instead_of_advertising_placeholder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "agent_hub.execution_backends.shutil.which",
-        lambda name: None,
+        "agent_hub.execution_backends.probe_skill_broker",
+        lambda backend: "docker_broker_unavailable" if backend == "docker" else None,
     )
-    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", lambda: None)
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
     assert statuses["docker"].available is False
-    assert statuses["docker"].reason == "docker_cli_not_found"
+    assert statuses["docker"].reason == "docker_broker_unavailable"
 
 
 def test_probe_rejects_systemd_when_privileged_broker_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executables = {"docker": "/usr/bin/docker"}
     monkeypatch.setattr(
-        "agent_hub.execution_backends.shutil.which",
-        lambda name: executables.get(name),
-    )
-
-    monkeypatch.setattr(
-        "agent_hub.execution_backends.probe_systemd_broker",
-        lambda: "systemd_broker_unavailable",
+        "agent_hub.execution_backends.probe_skill_broker",
+        lambda backend: "systemd_broker_unavailable" if backend == "systemd" else None,
     )
 
     statuses = {item.id: item for item in probe_execution_backends()}
@@ -86,7 +67,10 @@ def test_systemd_probe_exercises_the_runtime_isolation_contract(
         nonlocal calls
         calls += 1
 
-    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", probe)
+    monkeypatch.setattr(
+        "agent_hub.execution_backends.probe_skill_broker",
+        lambda backend: probe() if backend == "systemd" else None,
+    )
 
     probe_execution_backends()
 
@@ -118,28 +102,17 @@ def test_selected_backend_probe_is_cached_without_probing_other_backends(
     assert calls == {"systemd": 1, "docker": 0}
 
 
-def test_docker_probe_starts_the_hardened_runner_image(
+def test_docker_probe_routes_through_privileged_skill_broker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "agent_hub.execution_backends.shutil.which",
-        lambda name: "/usr/bin/docker" if name == "docker" else None,
-    )
-    commands: list[tuple[str, ...]] = []
+    probes: list[str] = []
 
-    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
-        del kwargs
-        commands.append(tuple(args))
-        return CompletedProcess(args=args, returncode=0, stdout="image-id\n", stderr="")
+    def probe(backend: str) -> None:
+        probes.append(backend)
 
-    monkeypatch.setattr("agent_hub.execution_backends.subprocess.run", run)
+    monkeypatch.setattr("agent_hub.execution_backends.probe_skill_broker", probe)
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
     assert statuses["docker"].available is True
-    runner_command = commands[-1]
-    assert runner_command[:3] == ("/usr/bin/docker", "run", "--rm")
-    assert "--read-only" in runner_command
-    assert "no-new-privileges" in runner_command
-    assert "none" in runner_command
-    assert runner_command[-3:] == ("python", "-c", "import agent_hub.skills.runner")
+    assert probes == ["systemd", "docker"]

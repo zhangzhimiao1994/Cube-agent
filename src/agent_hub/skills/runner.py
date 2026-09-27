@@ -18,6 +18,7 @@ _DEFAULT_PACKAGE_PATH = Path("/package/skill.zip")
 _DEFAULT_WORKDIR = Path("/workspace")
 _DEPENDENCY_FILES = frozenset({"requirements.txt", "requirements.lock", "dependencies.lock"})
 _SANDBOX_PROFILES = frozenset({"none", "read_only", "restricted", "workspace_write"})
+_COMPATIBLE_RUNTIME = f"python{sys.version_info.major}.{sys.version_info.minor}"
 
 
 class SkillRunnerError(RuntimeError):
@@ -43,6 +44,14 @@ def run_skill_from_environment() -> int:
         inspection = SkillPackageInspector().inspect(archive_bytes)
         if inspection.content_sha256 != actual_sha256:
             raise SkillRunnerError("skill package inspection hash mismatch")
+        if inspection.manifest.compatible_runtime != _COMPATIBLE_RUNTIME:
+            raise SkillRunnerError(
+                f"compatible runtime {inspection.manifest.compatible_runtime} is unavailable"
+            )
+        if inspection.manifest.network_policy.mode != "none":
+            raise SkillRunnerError(
+                "network policy requires a configured controlled egress sandbox"
+            )
         _reject_runtime_dependency_install(archive_bytes)
         return _execute_archive(
             archive_bytes,

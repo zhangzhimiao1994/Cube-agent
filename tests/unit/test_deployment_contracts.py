@@ -1,4 +1,9 @@
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -76,6 +81,133 @@ def test_dockerfile_builds_virtualenv_at_runtime_path_without_editable_install()
     assert "AGENT_HUB_PYPI_MIRROR:" in compose
     assert "AGENT_HUB_NPM_MIRROR:" in compose
     assert "COPY --from=python-build --chown=10001:10001 /opt/agent-hub/.venv ./.venv" in dockerfile
+
+
+def test_dockerfile_defines_non_root_skill_runner_target() -> None:
+    dockerfile = read("Dockerfile")
+
+    assert "FROM ${PYTHON_IMAGE} AS skill-runner" in dockerfile
+    runner = dockerfile.split("FROM ${PYTHON_IMAGE} AS skill-runner", 1)[1].split(
+        "FROM ${PYTHON_IMAGE} AS runtime", 1
+    )[0]
+    assert "--uid 65532" in runner
+    assert "--gid 65532" in runner
+    assert "USER 65532:65532" in runner
+    assert "mkdir -p /package /workspace" in runner
+    assert 'CMD ["python", "-m", "agent_hub.skills.runner"]' in runner
+
+
+def test_skill_runner_builder_is_registered_and_uses_safe_docker_argv() -> None:
+    launcher = read("scripts/agent-hub")
+    command_path = ROOT / "scripts/commands/build-skill-runner.sh"
+
+    assert command_path.is_file(), "build-skill-runner command is missing"
+    command = command_path.read_text(encoding="utf-8")
+    assert "build-skill-runner  Build the isolated Docker Skill runner image." in launcher
+    assert "build-skill-runner" in launcher
+    assert 'image="agent-hub-skill-runner:latest"' in command
+    assert "--source" in command
+    assert "--image" in command
+    assert "build_args=(" in command
+    assert "build --target skill-runner --tag" in command
+    assert 'exec "$docker_bin" "${build_args[@]}"' in command
+    assert "eval" not in command
+
+
+def test_skill_runner_build_command_is_documented() -> None:
+    readme = read("README.md")
+    operations = read("docs/operations.md")
+
+    assert "scripts/agent-hub build-skill-runner" in readme
+    assert "scripts/agent-hub build-skill-runner" in operations
+    assert "--source" in operations
+    assert "--image" in operations
+
+
+def test_skill_runner_builder_preserves_source_and_image_as_single_arguments(
+    tmp_path: Path,
+) -> None:
+    shell = _posix_shell()
+    fake_bin = tmp_path / "fake bin"
+    fake_bin.mkdir()
+    if os.name == "nt":
+        shutil.copy2(shell, fake_bin / "bash.exe")
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        "printf '%s\\0' \"$@\" > \"$AGENT_HUB_TEST_DOCKER_ARGS\"\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    source = tmp_path / "source with spaces;not-a-command"
+    source.mkdir()
+    (source / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    marker = tmp_path / "must-not-exist"
+    source_arg = _shell_path(source)
+    image = f"registry.example/runner:test; touch {_shell_path(marker)}"
+    captured = tmp_path / "docker-args.bin"
+    env = os.environ.copy()
+    env["AGENT_HUB_TEST_FAKE_BIN"] = _shell_path(fake_bin)
+    env["AGENT_HUB_TEST_LAUNCHER"] = _shell_path(ROOT / "scripts/agent-hub")
+    env["AGENT_HUB_TEST_DOCKER_ARGS"] = _shell_path(captured)
+
+    result = subprocess.run(
+        (
+            str(shell),
+            "-lc",
+            (
+                'PATH="$AGENT_HUB_TEST_FAKE_BIN:/usr/bin:/bin"; '
+                'export PATH; exec "$AGENT_HUB_TEST_LAUNCHER" "$@"'
+            ),
+            "build-skill-runner-contract",
+            "build-skill-runner",
+            "--source",
+            source_arg,
+            "--image",
+            image,
+        ),
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert captured.read_bytes().split(b"\0")[:-1] == [
+        b"build",
+        b"--target",
+        b"skill-runner",
+        b"--tag",
+        image.encode(),
+        source_arg.encode(),
+    ]
+    assert not marker.exists()
+
+
+def _posix_shell() -> Path:
+    for name in ("bash", "sh"):
+        candidate = shutil.which(name)
+        if candidate and Path(candidate).name.casefold() != "bash.exe":
+            return Path(candidate)
+    git = shutil.which("git")
+    if git:
+        bundled = Path(git).resolve().parents[1] / "usr/bin/sh.exe"
+        if bundled.is_file():
+            return bundled
+    pytest.skip("a POSIX shell is required for the build command contract")
+
+
+def _shell_path(path: Path) -> str:
+    resolved = path.resolve()
+    if os.name != "nt":
+        return resolved.as_posix()
+    drive = resolved.drive.rstrip(":").lower()
+    relative = resolved.as_posix().split(":", 1)[1].lstrip("/")
+    return f"/{drive}/{relative}"
 
 
 def test_compose_runs_migrations_and_bootstrap_before_application_services() -> None:

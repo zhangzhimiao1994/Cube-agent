@@ -15,6 +15,7 @@ from agent_hub.skills.sandbox.base import (
 from agent_hub.skills.sandbox.broker import BrokerRequest, BrokerResponse
 from agent_hub.skills.sandbox.docker import (
     DockerSandboxSettings,
+    DockerSkillSandbox,
     build_docker_command,
     build_docker_terminate_command,
 )
@@ -68,7 +69,7 @@ def test_docker_command_enforces_default_hardening_and_no_network() -> None:
 
     assert command[:3] == ("docker", "run", "--rm")
     assert "--user" in command
-    assert "65532:65532" in command
+    assert "10001:10001" in command
     assert "--read-only" in command
     assert _value_after(command, "--cap-drop") == "ALL"
     assert _value_after(command, "--security-opt") == "no-new-privileges"
@@ -90,15 +91,9 @@ def test_docker_command_enforces_default_hardening_and_no_network() -> None:
     )
 
 
-def test_docker_command_uses_isolated_network_when_network_policy_allows() -> None:
-    command = build_docker_command(
-        invocation(network_allowlist=("api.example.com",)),
-        DockerSandboxSettings(isolated_network_name="agent-hub-isolated-egress"),
-    )
-
-    assert _value_after(command, "--network") == "agent-hub-isolated-egress"
-    assert "host" not in command
-    assert all("api.example.com" not in part for part in command)
+def test_docker_command_rejects_network_allowlist_until_egress_policy_exists() -> None:
+    with pytest.raises(ValueError, match="network allowlist"):
+        build_docker_command(invocation(network_allowlist=("api.example.com",)))
 
 
 def test_docker_command_rejects_host_network_and_mount_option_injection() -> None:
@@ -116,6 +111,32 @@ def test_docker_terminate_command_targets_named_container_without_shell() -> Non
     )
     with pytest.raises(ValueError):
         build_docker_terminate_command("../escape")
+
+
+async def test_docker_sandbox_routes_execution_through_privileged_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[BrokerRequest, dict[str, object]]] = []
+
+    async def request_broker(request: BrokerRequest, **kwargs: object) -> BrokerResponse:
+        requests.append((request, kwargs))
+        return BrokerResponse(
+            ok=True,
+            result=SkillResult(exit_code=0, stdout="docker-ok\n", stderr="", timed_out=False),
+        )
+
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.docker.request_skill_broker",
+        request_broker,
+    )
+    sandbox = DockerSkillSandbox()
+
+    result = await sandbox.run(invocation())
+
+    assert result.stdout == "docker-ok\n"
+    request, _ = requests[0]
+    assert request.action == "run"
+    assert request.backend == "docker"
 
 
 async def test_systemd_sandbox_routes_execution_through_privileged_broker(

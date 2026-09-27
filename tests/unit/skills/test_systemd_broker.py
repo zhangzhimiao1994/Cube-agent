@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agent_hub.skills.sandbox.base import SkillInvocation
+from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from agent_hub.skills.sandbox.broker import (
     BrokerPolicy,
     BrokerRequest,
@@ -176,6 +177,79 @@ async def test_broker_probe_returns_stable_reason_without_systemd_stderr(
 
     assert response.ok is False
     assert response.error == "systemd_transient_unit_unavailable"
+
+
+async def test_broker_routes_docker_run_through_fixed_hardened_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / "skills"
+    invocation = _invocation(skill_root)
+    commands: list[tuple[str, ...]] = []
+
+    async def run_limited(
+        command: tuple[str, ...],
+        received: SkillInvocation,
+        **kwargs: object,
+    ) -> SkillResult:
+        del kwargs
+        commands.append(command)
+        assert received == invocation
+        return SkillResult(exit_code=0, stdout="docker-ok\n", stderr="", timed_out=False)
+
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.broker.run_subprocess_with_limits",
+        run_limited,
+    )
+    broker = SystemdBroker(
+        BrokerPolicy(skill_root=skill_root, allowed_uid=10001, docker="/snap/bin/docker")
+    )
+
+    response = await broker.handle(
+        BrokerRequest.run(invocation, backend="docker"),
+        peer_uid=10001,
+    )
+
+    assert response.ok is True
+    assert response.result is not None
+    assert response.result.stdout == "docker-ok\n"
+    command = commands[0]
+    assert command[:3] == ("/snap/bin/docker", "run", "--rm")
+    assert "10001:10001" in command
+    assert command[command.index("--network") + 1] == "none"
+    assert all("docker.sock" not in item for item in command)
+
+
+async def test_docker_broker_probe_executes_real_mounted_skill_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    received: list[tuple[SkillInvocation, str]] = []
+    broker = SystemdBroker(
+        BrokerPolicy(
+            skill_root=tmp_path / "skills",
+            allowed_uid=10001,
+            docker="/snap/bin/docker",
+            runtime_root=tmp_path / "run",
+        )
+    )
+
+    async def run_probe(invocation: SkillInvocation, backend: str) -> SkillResult:
+        received.append((invocation, backend))
+        assert invocation.package_path.is_file()
+        assert invocation.writable_tmp_path.is_dir()
+        with zipfile.ZipFile(invocation.package_path) as archive:
+            assert {"skill.yaml", "main.py"}.issubset(archive.namelist())
+        return SkillResult(exit_code=0, stdout='{"docker_probe":"ok"}\n', stderr="", timed_out=False)
+
+    monkeypatch.setattr(broker, "_run", run_probe)
+
+    response = await broker.handle(BrokerRequest.probe(backend="docker"), peer_uid=10001)
+
+    assert response.ok is True
+    assert len(received) == 1
+    assert received[0][1] == "docker"
+    assert received[0][0].input == {"docker_probe": "ok"}
 
 
 def test_broker_policy_resolves_installed_agent_hub_uid(

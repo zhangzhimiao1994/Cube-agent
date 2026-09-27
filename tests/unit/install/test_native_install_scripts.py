@@ -736,7 +736,7 @@ def test_project_scale_acceptance_command_is_registered_as_safe_runner() -> None
     assert "project-scale-acceptance" in launcher
     assert "Run project-scale acceptance fixture planning and execution." in launcher
     assert (
-        "doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|package-release"
+        "doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|build-skill-runner|package-release"
         in launcher
     )
     assert "Usage: scripts/agent-hub project-scale-acceptance" in command

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -76,6 +77,40 @@ def test_skill_runner_rejects_unknown_sandbox_profile() -> None:
     assert "sandbox profile" in result.stderr
 
 
+def test_skill_runner_rejects_incompatible_runtime() -> None:
+    with _workspace_tmpdir() as tmp_path:
+        package = _skill_zip(tmp_path, compatible_runtime="node22")
+
+        result = _run_runner(
+            package,
+            tmp_path,
+            input_text="{}",
+            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+        )
+
+    assert result.returncode == 78
+    assert "compatible runtime" in result.stderr
+
+
+def test_skill_runner_rejects_network_policy_without_controlled_egress() -> None:
+    with _workspace_tmpdir() as tmp_path:
+        package = _skill_zip(
+            tmp_path,
+            network_mode="allowlist",
+            allow_hosts=("api.example.com",),
+        )
+
+        result = _run_runner(
+            package,
+            tmp_path,
+            input_text="{}",
+            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+        )
+
+    assert result.returncode == 78
+    assert "network policy" in result.stderr
+
+
 def _run_runner(
     package: Path,
     tmp_path: Path,
@@ -108,6 +143,9 @@ def _skill_zip(
     *,
     entry_body: str = "print('ok')\n",
     requirements: str = "",
+    compatible_runtime: str = "python3.12",
+    network_mode: str = "none",
+    allow_hosts: tuple[str, ...] = (),
 ) -> Path:
     package = tmp_path / "skill.zip"
     dependency_hash = hashlib.sha256(requirements.encode()).hexdigest()
@@ -119,13 +157,12 @@ def _skill_zip(
                 name: demo_skill
                 version: 1.0.0
                 entry_point: main.py
-                compatible_runtime: python3.12
+                compatible_runtime: {compatible_runtime}
                 declared_tools:
                   []
                 network_policy:
-                  mode: none
-                  allow_hosts:
-                    []
+                  mode: {network_mode}
+                  allow_hosts: {json.dumps(list(allow_hosts))}
                 writable_paths:
                   []
                 env_secret_refs:

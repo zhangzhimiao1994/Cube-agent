@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from agent_hub.skills.sandbox.broker import probe_systemd_broker
+from agent_hub.skills.sandbox.broker import probe_skill_broker
 
 ExecutionBackendId = Literal["systemd", "docker"]
 EXECUTION_BACKEND_IDS = frozenset({"systemd", "docker"})
@@ -108,61 +106,8 @@ def _cached_unavailable_reason(backend: ExecutionBackendId) -> str | None:
 
 
 def _systemd_unavailable_reason() -> str | None:
-    return probe_systemd_broker()
+    return probe_skill_broker("systemd")
 
 
 def _docker_unavailable_reason() -> str | None:
-    docker = shutil.which("docker")
-    if docker is None:
-        return "docker_cli_not_found"
-    try:
-        result = subprocess.run(
-            (docker, "image", "inspect", DOCKER_SKILL_RUNNER_IMAGE, "--format", "{{.Id}}"),
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "docker_daemon_unavailable"
-    if result.returncode != 0:
-        combined = f"{result.stdout}\n{result.stderr}".casefold()
-        if "no such image" in combined or "not found" in combined:
-            return "docker_runner_image_not_found"
-        return "docker_daemon_unavailable"
-    try:
-        runner = subprocess.run(
-            (
-                docker,
-                "run",
-                "--rm",
-                "--user",
-                "65532:65532",
-                "--read-only",
-                "--cap-drop",
-                "ALL",
-                "--security-opt",
-                "no-new-privileges",
-                "--pids-limit",
-                "16",
-                "--memory",
-                "33554432",
-                "--cpus",
-                "0.25",
-                "--network",
-                "none",
-                "--tmpfs",
-                "/tmp:rw,noexec,nosuid,nodev,size=16m",
-                DOCKER_SKILL_RUNNER_IMAGE,
-                "python",
-                "-c",
-                "import agent_hub.skills.runner",
-            ),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "docker_runner_unavailable"
-    return None if runner.returncode == 0 else "docker_runner_unavailable"
+    return probe_skill_broker("docker")

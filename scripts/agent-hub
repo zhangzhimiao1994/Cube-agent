@@ -21,6 +21,7 @@ Commands:
   project-scale-acceptance
                       Run project-scale acceptance fixture planning and execution.
   openclaw-adapter     Start a local OpenClaw Adapter.
+  build-skill-runner  Build the isolated Docker Skill runner image.
   package-release     Build a deployable source archive including web/dist.
   version             Print installed version.
 EOF
@@ -34,7 +35,7 @@ fi
 shift || true
 
 case "$command" in
-  doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|package-release)
+  doctor|status|logs|backup|restore|upgrade|prune-releases|verify-release|harness-acceptance|project-scale-acceptance|openclaw-adapter|build-skill-runner|package-release)
     exec "$COMMAND_DIR/$command.sh" "$@"
     ;;
   version)

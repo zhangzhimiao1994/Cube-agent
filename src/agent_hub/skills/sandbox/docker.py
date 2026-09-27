@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,19 +7,25 @@ from pathlib import Path
 from agent_hub.skills.sandbox.base import (
     SkillInvocation,
     SkillResult,
-    run_subprocess_with_limits,
     validate_execution_id,
+)
+from agent_hub.skills.sandbox.broker import (
+    BROKER_SOCKET_PATH,
+    BrokerRequest,
+    request_skill_broker,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class DockerSandboxSettings:
+    executable: str = "docker"
     image: str = "agent-hub-skill-runner:latest"
-    user: str = "65532:65532"
+    user: str = "10001:10001"
     pids_limit: int = 64
     isolated_network_name: str = "agent-hub-skill-net"
     container_package_path: str = "/package/skill.zip"
     container_workdir: str = "/workspace"
+    broker_socket_path: Path = BROKER_SOCKET_PATH
 
     def __post_init__(self) -> None:
         if self.isolated_network_name in {"host", "none"}:
@@ -33,36 +37,23 @@ class DockerSandboxSettings:
 class DockerSkillSandbox:
     def __init__(self, settings: DockerSandboxSettings | None = None) -> None:
         self._settings = settings or DockerSandboxSettings()
-        self._processes: dict[str, asyncio.subprocess.Process] = {}
 
     async def run(self, invocation: SkillInvocation) -> SkillResult:
-        argv = build_docker_command(invocation, self._settings)
-        try:
-            return await run_subprocess_with_limits(
-                argv,
-                invocation,
-                process_started=lambda process: self._processes.__setitem__(
-                    invocation.execution_id, process
-                ),
-                on_forced_terminate=lambda: self._terminate_backend(invocation.execution_id),
-            )
-        finally:
-            self._processes.pop(invocation.execution_id, None)
+        response = await request_skill_broker(
+            BrokerRequest.run(invocation, backend="docker"),
+            socket_path=self._settings.broker_socket_path,
+        )
+        if not response.ok or response.result is None:
+            raise OSError(response.error or "Docker Skill broker returned no result")
+        return response.result
 
     async def terminate(self, execution_id: str) -> None:
-        process = self._processes.get(execution_id)
-        if process is not None and process.returncode is None:
-            process.kill()
-        with contextlib.suppress(FileNotFoundError, TimeoutError):
-            await self._terminate_backend(execution_id)
-
-    async def _terminate_backend(self, execution_id: str) -> None:
-        killer = await asyncio.create_subprocess_exec(
-            *build_docker_terminate_command(execution_id),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        response = await request_skill_broker(
+            BrokerRequest.terminate(execution_id, backend="docker"),
+            socket_path=self._settings.broker_socket_path,
         )
-        await asyncio.wait_for(killer.wait(), timeout=5)
+        if not response.ok:
+            raise OSError(response.error or "Docker Skill broker termination failed")
 
 
 def build_docker_command(
@@ -70,9 +61,11 @@ def build_docker_command(
     settings: DockerSandboxSettings | None = None,
 ) -> tuple[str, ...]:
     settings = settings or DockerSandboxSettings()
+    if invocation.network_allowlist:
+        raise ValueError("network allowlist requires a configured Docker egress policy")
     cpus = f"{invocation.cpu_quota_percent / 100:.2f}".rstrip("0").rstrip(".")
     command: list[str] = [
-        "docker",
+        settings.executable,
         "run",
         "--rm",
         "--name",
@@ -91,7 +84,7 @@ def build_docker_command(
         "--cpus",
         cpus,
         "--network",
-        settings.isolated_network_name if invocation.network_allowlist else "none",
+        "none",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=64m",
         "--workdir",
@@ -124,9 +117,13 @@ def build_docker_command(
     return tuple(command)
 
 
-def build_docker_terminate_command(execution_id: str) -> tuple[str, ...]:
+def build_docker_terminate_command(
+    execution_id: str,
+    *,
+    executable: str = "docker",
+) -> tuple[str, ...]:
     validate_execution_id(execution_id)
-    return ("docker", "kill", f"agent-hub-skill-{execution_id}")
+    return (executable, "kill", f"agent-hub-skill-{execution_id}")
 
 
 def _bind_mount(source: object, target: str, *, readonly: bool) -> str:

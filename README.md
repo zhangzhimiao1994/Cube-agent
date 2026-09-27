@@ -153,6 +153,14 @@ Supported execution backends:
 - **systemd**: the default native Linux backend. A socket-activated privileged broker creates constrained transient units and enforces caller identity, package path/hash, resource limits, network policy, filesystem bindings, output limits, timeout, and termination.
 - **Docker**: an optional sandbox backend. It is unavailable unless both the Docker CLI and daemon pass runtime probes.
 
+Build the pinned Docker Skill runner target from the repository root before enabling that backend:
+
+```bash
+scripts/agent-hub build-skill-runner
+```
+
+The command produces `agent-hub-skill-runner:latest`; custom build contexts and image tags are documented in [Operations](docs/operations.md).
+
 If a run needs an absent runtime, Cube Agent can pause it in `waiting_approval`, show the concrete install/configure/enable action, and resume the same run after the blocker is resolved. Model-provider failures and unsafe recovery conditions remain terminal rather than being mislabeled as installable dependencies.
 
 ## Hermes Learning And Memory
