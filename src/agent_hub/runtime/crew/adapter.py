@@ -4095,15 +4095,22 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
-        use_review_packets = step.final_synthesizer or bool(step.depends_on)
         source_payload = [
             (
                 _artifact_review_packet_payload(
                     artifact,
                     max_preview_bytes=_COMPACT_RETRY_SOURCE_PREVIEW_BYTES,
                 )
-                if recovery_attempt > 0 or use_review_packets
-                else _artifact_prompt_payload(artifact)
+                if recovery_attempt > 0
+                else (
+                    _artifact_final_synthesis_payload(artifact)
+                    if step.final_synthesizer
+                    else (
+                        _artifact_review_packet_payload(artifact)
+                        if step.depends_on
+                        else _artifact_prompt_payload(artifact)
+                    )
+                )
             )
             for artifact in sources
         ]

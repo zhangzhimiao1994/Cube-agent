@@ -4634,9 +4634,8 @@ async def test_blocked_contract_self_repair_preserves_unrelated_completed_branch
     final_prompt = json.loads(restored_generation.prompts[-1][2])
     final_sources = final_prompt["untrusted_source_artifacts"]
     assert isinstance(final_sources, list)
-    assert {
-        source["artifact_review_packet"]["id"] for source in final_sources
-    } >= {preserved_side_note_id}
+    assert {source["id"] for source in final_sources} >= {preserved_side_note_id}
+    assert all(source["synthesis_input"]["mode"] == "summary" for source in final_sources)
     started_steps = [
         event.step_id
         for event in events
@@ -5163,7 +5162,7 @@ async def test_reviewer_timeout_fails_closed_after_retry_budget_is_exhausted() -
     assert len([item for item in generation.prompts if item[1] != "reviewer"]) == 1
 
 
-async def test_dependent_final_step_receives_bounded_review_packets() -> None:
+async def test_dependent_final_step_receives_bounded_synthesis_sources() -> None:
     generation = RecordingGeneration()
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
@@ -5174,9 +5173,9 @@ async def test_dependent_final_step_receives_bounded_review_packets() -> None:
     await _collect(runtime)
 
     final_prompt = next(prompt for step_id, _, prompt in generation.prompts if step_id == "final_response")
-    assert '"artifact_review_packet"' in final_prompt
-    assert '"content_keys"' in final_prompt
-    assert '"content":{"text"' not in final_prompt
+    assert '"synthesis_input":{"mode":"summary"' in final_prompt
+    assert '"content":{"text"' in final_prompt
+    assert '"artifact_review_packet"' not in final_prompt
 
 
 def test_artifact_review_packet_payload_exposes_bounded_preview_without_full_content() -> None:
