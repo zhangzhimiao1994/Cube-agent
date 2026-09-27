@@ -232,6 +232,7 @@ def default_capability_policy(
         for capability, operation, resource_prefix, effect in (
             ("calculator", "evaluate", "calculator", PolicyEffect.ALLOW),
             ("file", "read", "workspace", PolicyEffect.ALLOW),
+            ("file", "create", "workspace", generated_effect),
             ("file", "create", "generated", generated_effect),
             ("context", "read", "context", PolicyEffect.ALLOW),
             ("skill", "use", "skill", skill_effect),

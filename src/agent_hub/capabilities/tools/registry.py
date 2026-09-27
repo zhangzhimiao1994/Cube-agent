@@ -331,6 +331,33 @@ def create_builtin_tool_registry() -> ToolRegistry:
         replay_safe=True,
         aliases=("workspace_read",),
     )
+    registry.register(
+        "workspace.write_text",
+        object(),
+        kind="builtin",
+        adapter="runtime_builtin",
+        permission_class="file.create",
+        sandbox_profile="project_workspace_store",
+        replay_safe=True,
+    )
+    registry.register(
+        "workspace.list",
+        object(),
+        kind="builtin",
+        adapter="runtime_builtin",
+        permission_class="file.read",
+        sandbox_profile="project_workspace_store",
+        replay_safe=True,
+    )
+    registry.register(
+        "workspace.bundle",
+        object(),
+        kind="builtin",
+        adapter="runtime_builtin",
+        permission_class="file.create",
+        sandbox_profile="project_workspace_store",
+        replay_safe=True,
+    )
     return registry
 
 

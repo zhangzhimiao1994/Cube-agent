@@ -136,6 +136,120 @@ def test_real_project_scale_markdown_blocks_are_converted_to_zip_tool_call() -> 
     }
 
 
+def test_natural_workspace_project_text_bundle_is_converted_to_scoped_zip_tool_call() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="编写一个网盘网站",
+        routing_decision={
+            "project_id": "cloud-drive",
+            "workspace_session_id": "conv-cloud-drive",
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "website_preview_required": True,
+        },
+    )
+    task = (
+        "Role mission: implement.\n"
+        "User task: 编写一个网盘网站\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    text = json.dumps(
+        {
+            "workspace_bundle": {
+                "files": {
+                    "preview.html": "<!doctype html><html><body>网盘</body></html>\n",
+                    "README.md": "# 网盘\n",
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    completion = _completion(text)
+
+    updated = _project_scale_artifact_zip_completion(
+        context,
+        _project_scale_step(task),
+        completion,
+        completion.response,
+    )
+
+    assert updated is not completion
+    call = updated.response.tool_calls[0]
+    assert call.arguments["project_id"] == "cloud-drive"
+    assert call.arguments["workspace_session_id"] == "conv-cloud-drive"
+    assert call.arguments["files"] == {
+        "preview.html": "<!doctype html><html><body>网盘</body></html>\n",
+        "README.md": "# 网盘\n",
+    }
+
+
+def test_natural_workspace_project_unparseable_output_does_not_fabricate_bundle() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="编写一个网盘网站",
+        routing_decision={
+            "project_id": "cloud-drive",
+            "workspace_session_id": "conv-cloud-drive",
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+    task = (
+        "Role mission: implement.\n"
+        "User task: 编写一个网盘网站\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    completion = _completion("I will build the project later.")
+
+    updated = _project_scale_artifact_zip_completion(
+        context,
+        _project_scale_step(task),
+        completion,
+        completion.response,
+    )
+
+    assert updated is completion
+    assert updated.response.tool_calls == ()
+
+
+def test_natural_workspace_project_oversized_unparseable_output_does_not_fabricate_bundle() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="编写一个网盘网站",
+        routing_decision={
+            "project_id": "cloud-drive",
+            "workspace_session_id": "conv-cloud-drive",
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+    task = (
+        "Role mission: implement.\n"
+        "User task: 编写一个网盘网站\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    completion = _completion("Implementation notes:\n" + ("x" * 70_000))
+
+    updated = _project_scale_artifact_zip_completion(
+        context,
+        _project_scale_step(task),
+        completion,
+        completion.response,
+    )
+
+    assert updated is completion
+    assert updated.response.tool_calls == ()
+
+
 def test_project_zip_tool_uses_project_bundle_argument_limit() -> None:
     large_project_arguments = {
         "title": "Task API",

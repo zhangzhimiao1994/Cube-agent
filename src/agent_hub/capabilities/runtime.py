@@ -48,6 +48,9 @@ _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_PREFLIGHT_TOOL = "project.preflight_architecture"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
+_WORKSPACE_WRITE_TOOL = "workspace.write_text"
+_WORKSPACE_LIST_TOOL = "workspace.list"
+_WORKSPACE_BUNDLE_TOOL = "workspace.bundle"
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
@@ -59,6 +62,9 @@ _DOTTED_BUILT_INS = frozenset({
     _PPTX_TOOL,
     _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
+    _WORKSPACE_WRITE_TOOL,
+    _WORKSPACE_LIST_TOOL,
+    _WORKSPACE_BUNDLE_TOOL,
 })
 _REPLAY_SAFE = frozenset({
     "calculator",
@@ -71,6 +77,9 @@ _REPLAY_SAFE = frozenset({
     _PPTX_TOOL,
     _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
+    _WORKSPACE_WRITE_TOOL,
+    _WORKSPACE_LIST_TOOL,
+    _WORKSPACE_BUNDLE_TOOL,
 })
 _BUILTIN_ALIASES = {
     "calculator.evaluate": "calculator",
@@ -83,6 +92,9 @@ _MANIFEST_BUILTINS = (
     _PPTX_TOOL,
     _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
+    _WORKSPACE_WRITE_TOOL,
+    _WORKSPACE_LIST_TOOL,
+    _WORKSPACE_BUNDLE_TOOL,
     "read_context",
     "workspace.read",
 )
@@ -261,6 +273,12 @@ class RuntimeCapabilityGateway:
             return self._execute_project_preflight(tenant_id, arguments)
         if normalized_name == _PROJECT_ZIP_TOOL:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
+        if normalized_name == _WORKSPACE_WRITE_TOOL:
+            return await self._execute_workspace_write_text(tenant_id, run_id, arguments)
+        if normalized_name == _WORKSPACE_LIST_TOOL:
+            return await self._execute_workspace_list(tenant_id, run_id)
+        if normalized_name == _WORKSPACE_BUNDLE_TOOL:
+            return await self._execute_workspace_bundle(tenant_id, run_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -489,6 +507,133 @@ class RuntimeCapabilityGateway:
             result["workspace_files"] = workspace_files
         return result
 
+    async def _execute_workspace_write_text(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_project_workspace_store()
+        project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        path = _required_string(arguments, "path")
+        content = _required_string(arguments, "content")
+        try:
+            metadata = store.write_bytes(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                session_id=session_id,
+                relative_path=path,
+                data=content.encode("utf-8"),
+                mime_type=_workspace_mime_type(path),
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            raise RuntimeCapabilityError(str(error)) from None
+        public = cast(Mapping[str, JsonValue], metadata.to_public_dict())
+        return {
+            "summary": f"Wrote workspace file {metadata.path}.",
+            "file": public,
+            "workspace_files": (public,),
+        }
+
+    async def _execute_workspace_list(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_project_workspace_store()
+        project_id, session_id = await self._project_workspace_scope(
+            tenant_id, run_id, write_required=False
+        )
+        try:
+            files = store.list_files(tenant_id, project_id, session_id)
+        except (OSError, ValueError) as error:
+            raise RuntimeCapabilityError(str(error)) from None
+        public = tuple(cast(Mapping[str, JsonValue], item.to_public_dict()) for item in files)
+        return {
+            "summary": f"Workspace contains {len(public)} files.",
+            "workspace_files": public,
+            "bundle_download_url": store.bundle_download_url(project_id, session_id),
+        }
+
+    async def _execute_workspace_bundle(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_project_workspace_store()
+        generated_store = self._require_generated_file_store()
+        project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        title = _optional_string(arguments, "title") or "Project Workspace"
+        filename = _filename(arguments, title=title, extension=".zip")
+        try:
+            bundle = store.create_session_zip(tenant_id, project_id, session_id)
+            files = store.list_files(tenant_id, project_id, session_id)
+            artifact_id = uuid4()
+            metadata = generated_store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=ZIP_MIME_TYPE,
+                data=bundle.path.read_bytes(),
+            )
+        except (OSError, ValueError) as error:
+            raise RuntimeCapabilityError(str(error)) from None
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                public_metadata=metadata.to_public_dict(),
+                internal_metadata=metadata.to_content_file(),
+                presentation=_generated_file_presentation(
+                    arguments, default="final_attachment"
+                ),
+                summary=f"Generated workspace ZIP artifact {metadata.filename}.",
+            )
+        )
+        result["workspace_files"] = tuple(
+            cast(Mapping[str, JsonValue], item.to_public_dict()) for item in files
+        )
+        result["bundle_download_url"] = store.bundle_download_url(project_id, session_id)
+        return result
+
+    async def _project_workspace_scope(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        write_required: bool = True,
+    ) -> tuple[str, str]:
+        getter = getattr(self._run_repository, "get", None)
+        if not callable(getter):
+            raise RuntimeCapabilityError("workspace scope is not configured")
+        try:
+            record = getter(tenant_id, run_id)
+            if isawaitable(record):
+                record = await cast(Awaitable[object], record)
+        except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+            raise RuntimeCapabilityError("workspace scope could not be resolved") from error
+        routing = getattr(record, "routing_decision", None)
+        if not isinstance(routing, Mapping):
+            raise RuntimeCapabilityError("workspace scope could not be resolved")
+        permissions = routing.get("requested_permissions")
+        sandbox_profile = routing.get("sandbox_profile")
+        if not isinstance(permissions, tuple | list):
+            raise RuntimeCapabilityError("workspace access is not authorized")
+        if write_required:
+            if sandbox_profile != "workspace_write" or "workspace.write" not in permissions:
+                raise RuntimeCapabilityError("workspace write is not authorized")
+        elif (
+            sandbox_profile not in {"read_only", "restricted", "workspace_write"}
+            or "workspace.read" not in permissions
+        ):
+            raise RuntimeCapabilityError("workspace read is not authorized")
+        project_id = routing.get("project_id")
+        session_id = routing.get("workspace_session_id")
+        if not isinstance(project_id, str) or not isinstance(session_id, str):
+            raise RuntimeCapabilityError("workspace scope could not be resolved")
+        return project_id, session_id
+
     def _execute_project_preflight(
         self,
         tenant_id: UUID,
@@ -566,6 +711,11 @@ class RuntimeCapabilityGateway:
         if self._generated_file_store is None:
             raise RuntimeCapabilityError("generated artifact store is not configured")
         return self._generated_file_store
+
+    def _require_project_workspace_store(self) -> ProjectWorkspaceStore:
+        if self._project_workspace_store is None:
+            raise RuntimeCapabilityError("project workspace store is not configured")
+        return self._project_workspace_store
 
     async def _execute_skill(
         self,
@@ -679,7 +829,7 @@ class RuntimeCapabilityGateway:
 
     def _builtin_manifest_item(self, name: str) -> Mapping[str, JsonValue]:
         availability_reason = self._builtin_availability_reason(name)
-        return {
+        item: dict[str, JsonValue] = {
             "id": name,
             "kind": "builtin",
             "adapter": "runtime_builtin",
@@ -690,6 +840,10 @@ class RuntimeCapabilityGateway:
             "replay_safe": self.is_replay_safe(name),
             "aliases": _builtin_aliases(name),
         }
+        input_schema = _builtin_input_schema(name)
+        if input_schema is not None:
+            item["input_schema"] = input_schema
+        return item
 
     def _builtin_availability_reason(self, name: str) -> str | None:
         if name == "workspace.read":
@@ -697,9 +851,14 @@ class RuntimeCapabilityGateway:
                 return "workspace_root_not_configured"
             if not callable(getattr(self._run_repository, "get", None)):
                 return "workspace_scope_not_configured"
-        if name == _PROJECT_PREFLIGHT_TOOL and self._project_workspace_store is None:
+        if name in {
+            _PROJECT_PREFLIGHT_TOOL,
+            _WORKSPACE_WRITE_TOOL,
+            _WORKSPACE_LIST_TOOL,
+            _WORKSPACE_BUNDLE_TOOL,
+        } and self._project_workspace_store is None:
             return "project_workspace_store_not_configured"
-        if name in {_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL} and (
+        if name in {_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL, _WORKSPACE_BUNDLE_TOOL} and (
             self._generated_file_store is None
         ):
             return "generated_artifact_store_not_configured"
@@ -940,6 +1099,8 @@ def _builtin_permission_class(name: str) -> str:
         return "network.read"
     if name == "workspace.read":
         return "file.read"
+    if name == _WORKSPACE_LIST_TOOL:
+        return "file.read"
     return "file.create"
 
 
@@ -950,9 +1111,43 @@ def _builtin_sandbox_profile(name: str) -> str:
         return "http_read"
     if name == "workspace.read":
         return "workspace_read"
-    if name == _PROJECT_PREFLIGHT_TOOL:
+    if name in {
+        _PROJECT_PREFLIGHT_TOOL,
+        _WORKSPACE_WRITE_TOOL,
+        _WORKSPACE_LIST_TOOL,
+        _WORKSPACE_BUNDLE_TOOL,
+    }:
         return "project_workspace_store"
     return "generated_artifact_store"
+
+
+def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+    if name == _WORKSPACE_WRITE_TOOL:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("path", "content"),
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                "content": {"type": "string", "minLength": 1},
+            },
+        }
+    if name == _WORKSPACE_LIST_TOOL:
+        return {"type": "object", "additionalProperties": False, "properties": {}}
+    if name == _WORKSPACE_BUNDLE_TOOL:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "filename": {"type": "string", "minLength": 1, "maxLength": 200},
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                },
+            },
+        }
+    return None
 
 
 def _required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:

@@ -37,7 +37,10 @@ def test_registry_registers_builtin_tool_names() -> None:
         "presentation.generate_pptx",
         "project.generate_zip",
         "project.preflight_architecture",
+        "workspace.bundle",
+        "workspace.list",
         "workspace.read",
+        "workspace.write_text",
     )
 
 
@@ -111,6 +114,24 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "aliases": (),
             },
             {
+                "id": "workspace.bundle",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "project_workspace_store",
+                "replay_safe": True,
+                "aliases": (),
+            },
+            {
+                "id": "workspace.list",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.read",
+                "sandbox_profile": "project_workspace_store",
+                "replay_safe": True,
+                "aliases": (),
+            },
+            {
                 "id": "workspace.read",
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
@@ -118,6 +139,15 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "sandbox_profile": "workspace_read",
                 "replay_safe": True,
                 "aliases": ("workspace_read",),
+            },
+            {
+                "id": "workspace.write_text",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "project_workspace_store",
+                "replay_safe": True,
+                "aliases": (),
             },
         ),
     }

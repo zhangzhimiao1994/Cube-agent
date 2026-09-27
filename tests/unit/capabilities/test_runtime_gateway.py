@@ -21,6 +21,63 @@ TENANT_ID = UUID("66666666-6666-4666-8666-666666666666")
 RUN_ID = UUID("77777777-7777-4777-8777-777777777777")
 
 
+def _workspace_tool_manifest_items(
+    *, configured: bool,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    common: dict[str, JsonValue] = {
+        "kind": "builtin",
+        "adapter": "runtime_builtin",
+        "sandbox_profile": "project_workspace_store",
+        "available": configured,
+        "availability_reason": None if configured else "project_workspace_store_not_configured",
+        "replay_safe": True,
+        "aliases": (),
+    }
+    return (
+        {
+            **common,
+            "id": "workspace.write_text",
+            "permission_class": "file.create",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ("path", "content"),
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "content": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+        {
+            **common,
+            "id": "workspace.list",
+            "permission_class": "file.read",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+        },
+        {
+            **common,
+            "id": "workspace.bundle",
+            "permission_class": "file.create",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "filename": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "presentation": {
+                        "type": "string",
+                        "enum": ("step_detail", "final_attachment"),
+                    },
+                },
+            },
+        },
+    )
+
+
 class FakeSandbox:
     def __init__(self) -> None:
         self.invocations: list[SkillInvocation] = []
@@ -481,6 +538,163 @@ async def test_runtime_gateway_copies_project_zip_sources_to_project_workspace(
         / "session-01"
         / "main.py"
     ).read_text(encoding="utf-8") == "print('hello world')\n"
+
+
+async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    workspace_dir = tmp_path / "workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            session="session-large",
+            project_id="large-project",
+        )
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+        project_workspace_dir=workspace_dir,
+        run_repository=repository,
+    )
+
+    content = "x" * 250_000
+    for index in range(9):
+        result = await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="implementer",
+            name="workspace.write_text",
+            arguments={"path": f"src/chunk-{index}.txt", "content": content},
+            idempotency_key=f"workspace-write-{index}",
+        )
+        file_payload = cast(Mapping[str, JsonValue], result["file"])
+        assert file_payload["path"] == f"src/chunk-{index}.txt"
+
+    listing = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="implementer",
+        name="workspace.list",
+        arguments={},
+        idempotency_key="workspace-list",
+    )
+    listed_files = cast(tuple[JsonValue, ...], listing["workspace_files"])
+    assert len(listed_files) == 9
+
+    bundle = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="implementer",
+        name="workspace.bundle",
+        arguments={"title": "Large Project", "presentation": "final_attachment"},
+        idempotency_key="workspace-bundle",
+    )
+
+    assert bundle["presentation"] == "final_attachment"
+    bundle_file = cast(Mapping[str, JsonValue], bundle["file"])
+    assert bundle_file["filename"] == "large-project.zip"
+    bundled_files = cast(tuple[JsonValue, ...], bundle["workspace_files"])
+    assert len(bundled_files) == 9
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(bundle["artifact_id"])
+        / "large-project.zip"
+    )
+    with ZipFile(stored_path) as archive:
+        assert len(archive.namelist()) == 9
+        assert archive.read("src/chunk-8.txt") == content.encode("utf-8")
+
+
+async def test_workspace_write_scope_is_resolved_from_run_not_model_arguments(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            session="trusted-session",
+            project_id="trusted-project",
+        )
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        project_workspace_dir=workspace_dir,
+        run_repository=repository,
+    )
+
+    await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="implementer",
+        name="workspace.write_text",
+        arguments={
+            "path": "README.md",
+            "content": "trusted\n",
+            "project_id": "attacker-project",
+            "workspace_session_id": "attacker-session",
+        },
+        idempotency_key="workspace-trusted-scope",
+    )
+
+    trusted = (
+        workspace_dir
+        / str(TENANT_ID)
+        / "projects"
+        / "trusted-project"
+        / "sessions"
+        / "trusted-session"
+        / "README.md"
+    )
+    assert trusted.read_text(encoding="utf-8") == "trusted\n"
+    assert not (workspace_dir / str(TENANT_ID) / "projects" / "attacker-project").exists()
+
+
+async def test_workspace_list_allows_read_only_authorized_run(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspaces"
+    target = (
+        workspace_dir
+        / str(TENANT_ID)
+        / "projects"
+        / "read-project"
+        / "sessions"
+        / "read-session"
+        / "README.md"
+    )
+    target.parent.mkdir(parents=True)
+    target.write_text("readable\n", encoding="utf-8")
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            session="read-session",
+            project_id="read-project",
+            sandbox_profile="read_only",
+            requested_permissions=["workspace.read"],
+        )
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        project_workspace_dir=workspace_dir,
+        run_repository=repository,
+    )
+
+    listing = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="reviewer",
+        name="workspace.list",
+        arguments={},
+        idempotency_key="workspace-list-read-only",
+    )
+
+    listed_files = cast(tuple[Mapping[str, JsonValue], ...], listing["workspace_files"])
+    assert tuple(item["path"] for item in listed_files) == ("README.md",)
 
 
 async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
@@ -1005,6 +1219,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "replay_safe": True,
                 "aliases": (),
             },
+            *_workspace_tool_manifest_items(configured=False),
             {
                 "id": "read_context",
                 "kind": "builtin",
@@ -1125,6 +1340,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "replay_safe": True,
             "aliases": (),
         },
+        *_workspace_tool_manifest_items(configured=False),
         {
             "id": "read_context",
             "kind": "builtin",
@@ -1672,6 +1888,9 @@ def test_runtime_gateway_capability_manifest_skips_bad_registry_sources(
         "presentation.generate_pptx",
         "project.preflight_architecture",
         "project.generate_zip",
+        "workspace.write_text",
+        "workspace.list",
+        "workspace.bundle",
         "read_context",
         "workspace.read",
     }

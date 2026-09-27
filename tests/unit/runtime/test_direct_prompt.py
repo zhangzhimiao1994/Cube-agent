@@ -270,6 +270,77 @@ def test_direct_capability_repair_request_uses_project_sized_output_budget() -> 
     assert model_request.max_output_tokens > 8_192
 
 
+def test_direct_natural_website_request_receives_workspace_preview_contract() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="编写一个网盘网站",
+        timeout_seconds=1200,
+        token_budget=100_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "website_preview_required": True,
+        },
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    model_request = runtime._build_request(context).request
+
+    assert model_request is not None
+    assert model_request.max_output_tokens > 8_192
+    serialized = "\n".join(cast(str, message.content) for message in model_request.messages)
+    assert "workspace_bundle.files" in serialized
+    assert "preview.html" in serialized
+    assert "self-contained" in serialized
+
+
+@pytest.mark.asyncio
+async def test_direct_natural_website_wraps_single_html_block_as_preview_workspace_file() -> None:
+    response_text = """已完成可运行预览：
+```html
+<!doctype html><html><body><button id="upload">上传</button></body></html>
+```
+"""
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=response_text, usage=TokenUsage(20, 30, 50))),
+        logical_model="main",
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="编写一个网盘网站",
+                timeout_seconds=1200,
+                token_budget=100_000,
+                routing_decision={
+                    "project_scale": "large",
+                    "project_delivery": "workspace",
+                    "artifact_strategy": "workspace_bundle",
+                    "website_preview_required": True,
+                },
+            )
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    assert artifact_event.artifact.type == "tool_result"
+    assert artifact_event.artifact.content["workspace_bundle"] == {
+        "files": {
+            "preview.html": (
+                '<!doctype html><html><body><button id="upload">上传</button></body></html>\n'
+            )
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_direct_medium_capability_request_emits_controlled_artifact_without_model() -> None:
     request = (

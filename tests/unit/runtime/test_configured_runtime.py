@@ -72,6 +72,12 @@ def test_python_project_zip_request_is_profiled_as_software() -> None:
     assert TaskProfile.SOFTWARE in profiles
 
 
+def test_natural_chinese_website_request_is_profiled_as_software() -> None:
+    profiles = defaults_module._task_profiles("编写一个网盘网站")
+
+    assert TaskProfile.SOFTWARE in profiles
+
+
 def test_project_scale_medium_capability_task_is_bounded_for_role_planning() -> None:
     plan = build_project_scale_run_plan(
         benchmark_kind="capability",
@@ -5616,6 +5622,86 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
             "If read_context has no additional runtime context, continue with the requested files"
             in implementer_step.task
         )
+
+
+def test_natural_large_website_uses_workspace_bundle_budget_and_preview_contract() -> None:
+    roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the requested project.",
+            must_answer=("What should be built?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=(
+                "read_context",
+                "run_safe_command",
+                "workspace.write_text",
+                "workspace.list",
+                "workspace.bundle",
+                "project.generate_zip",
+            ),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="编写一个网盘网站",
+            timeout_seconds=1200,
+            routing_decision={
+                "project_scale": "large",
+                "project_delivery": "workspace",
+                "artifact_strategy": "workspace_bundle",
+                "website_preview_required": True,
+            },
+        ),
+        capability_gateway=FakeCapabilityAvailability(
+            {
+                "read_context",
+                "run_safe_command",
+                "workspace.write_text",
+                "workspace.list",
+                "workspace.bundle",
+                "project.generate_zip",
+            }
+        ),
+    )
+
+    architect_step = next(step for step in plan.steps if step.agent == "architect")
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    final_step = next(step for step in plan.steps if step.id == "final_response_step")
+    assert architect_step.tools == ()
+    assert implementer_step.tools == (
+        "run_safe_command",
+        "workspace.write_text",
+        "workspace.list",
+        "workspace.bundle",
+    )
+    assert implementer_step.tool_argument_budget_bytes == {"workspace.write_text": 512_000}
+    assert "Build the project incrementally" in implementer_step.task
+    assert "workspace.bundle succeeds" in implementer_step.task
+    assert "preview.html" in implementer_step.task
+    assert "self-contained" in implementer_step.task
+    assert "concise" in final_step.task
 
 
 def test_project_scale_zip_implementer_gets_extended_step_timeout() -> None:

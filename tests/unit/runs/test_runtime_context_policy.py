@@ -7,6 +7,8 @@ from agent_hub.runs.repository import ConversationContextItem
 from agent_hub.runs.service import (
     _conversation_history_artifact,
     _conversation_history_token_budget,
+    _local_main_agent_auto_mode,
+    _project_delivery_assessment,
     _runtime_timeout_seconds,
     _runtime_token_budget,
 )
@@ -26,6 +28,54 @@ def test_runtime_token_budget_policy_uses_configured_complex_budget() -> None:
 
 def test_runtime_token_budget_policy_clamps_to_runtime_contract_limit() -> None:
     assert _runtime_token_budget(TaskMode.DISPATCH, configured_tokens=99_000_000) == 10_000_000
+
+
+def test_project_delivery_assessment_routes_natural_chinese_cloud_drive_to_large_workspace() -> None:
+    assessment = _project_delivery_assessment("编写一个网盘网站")
+
+    assert assessment == {
+        "project_scale": "large",
+        "project_delivery": "workspace",
+        "artifact_strategy": "workspace_bundle",
+        "website_preview_required": True,
+        "runtime_timeout_seconds": 1200.0,
+    }
+    assert _local_main_agent_auto_mode("编写一个网盘网站", ()) is TaskMode.HYBRID
+
+
+def test_project_delivery_assessment_covers_all_four_scales() -> None:
+    cases = (
+        ("创建一个简单的 hello world 网站", "small", 300.0),
+        ("开发一个公司官网", "medium", 600.0),
+        ("开发一个包含登录、上传和分享功能的网盘网站", "large", 1200.0),
+        ("构建一个超大型企业项目组合管理平台", "ultra", 1800.0),
+    )
+
+    for message, expected_scale, expected_timeout in cases:
+        assessment = _project_delivery_assessment(message)
+        assert assessment is not None
+        assert assessment["project_scale"] == expected_scale
+        assert assessment["runtime_timeout_seconds"] == expected_timeout
+
+
+def test_project_delivery_assessment_ignores_non_execution_planning_questions() -> None:
+    assert _project_delivery_assessment("网盘网站应该怎么规划？不要开始实现") is None
+
+
+def test_project_delivery_assessment_ignores_document_about_software() -> None:
+    assert _project_delivery_assessment("生成一份网站需求文档") is None
+    assert _project_delivery_assessment("编写网站测试报告") is None
+    assert _project_delivery_assessment("分析如何实现网站") is None
+
+
+def test_project_delivery_assessment_upgrades_feature_rich_website_to_large() -> None:
+    assessment = _project_delivery_assessment(
+        "开发一个带登录、文件上传、分享链接、全文搜索和角色权限的文件管理网站"
+    )
+
+    assert assessment is not None
+    assert assessment["project_scale"] == "large"
+    assert assessment["runtime_timeout_seconds"] == 1200.0
 
 
 def test_conversation_history_budget_uses_main_agent_context_window() -> None:

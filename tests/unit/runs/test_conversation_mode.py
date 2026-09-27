@@ -261,6 +261,37 @@ async def test_auto_conversation_continuation_receives_persistent_memory() -> No
     assert isinstance(routing.get("memory"), dict)
 
 
+async def test_auto_natural_large_website_persists_workspace_first_delivery_contract() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="编写一个网盘网站",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-natural-large-project",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    routing = repository.created[-1]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing.items() >= {
+        "project_scale": "large",
+        "project_delivery": "workspace",
+        "artifact_strategy": "workspace_bundle",
+        "website_preview_required": True,
+        "runtime_timeout_seconds": 1200.0,
+        "main_agent_selected_mode": "hybrid",
+    }.items()
+
+
 async def test_auto_submission_reuses_previous_mode_for_same_conversation_without_reasking() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()
@@ -301,6 +332,37 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
             "workspace_session_id": "conv-1",
             "sandbox_profile": "workspace_write",
             "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
+    }.items()
+
+
+async def test_auto_large_project_upgrades_previous_direct_conversation_mode() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="编写一个带登录、上传、分享、搜索和权限管理的网盘网站",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-previous-direct",
+    )
+
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing.items() >= {
+        "reason": "project_scale_mode_upgrade",
+        "main_agent_selected_mode": "hybrid",
+        "mode_source": "project_scale_assessment",
+        "project_scale": "large",
+        "project_delivery": "workspace",
     }.items()
 
 

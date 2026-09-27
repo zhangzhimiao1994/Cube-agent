@@ -535,6 +535,9 @@ class RunService:
             **workspace.routing_payload(),
             "execution_backend": resolved_execution_backend,
         }
+        project_delivery = _project_delivery_assessment(message)
+        if project_delivery is not None:
+            operator_selection.update(project_delivery)
         recalled_memories = await self._safe_runtime_memory_recall(
             tenant_id=tenant_id,
             actor_id=actor_id,
@@ -669,11 +672,25 @@ class RunService:
                 conversation_id=effective_conversation_id,
                 message=message,
             )
+            continuation_reason = "conversation_mode_continuation"
+            continuation_source = "previous_conversation_run"
+            if continuation_mode is not None and project_delivery is not None:
+                project_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                if (
+                    project_mode is TaskMode.HYBRID
+                    and continuation_mode is not TaskMode.HYBRID
+                ) or (
+                    project_mode is TaskMode.DISPATCH
+                    and continuation_mode in {TaskMode.DIRECT, TaskMode.DISCUSS}
+                ):
+                    continuation_mode = project_mode
+                    continuation_reason = "project_scale_mode_upgrade"
+                    continuation_source = "project_scale_assessment"
             if continuation_mode is not None:
                 routing_payload = {
-                    "reason": "conversation_mode_continuation",
+                    "reason": continuation_reason,
                     "main_agent_selected_mode": continuation_mode.value,
-                    "mode_source": "previous_conversation_run",
+                    "mode_source": continuation_source,
                     **operator_selection,
                 }
                 record = await self._repository.create_run(
@@ -3308,6 +3325,187 @@ def _message_suggests_tool_use(message: str) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _project_delivery_assessment(message: str) -> dict[str, object] | None:
+    """Classify executable software requests before model routing."""
+
+    text = " ".join(message.casefold().split())
+    non_execution_markers = (
+        "不要开始",
+        "不要实现",
+        "不要构建",
+        "不要开发",
+        "暂不开始",
+        "暂不实现",
+        "暂不构建",
+        "暂不开发",
+        "只讨论",
+        "仅讨论",
+        "怎么规划",
+        "如何规划",
+        "do not build",
+        "do not implement",
+        "don't build",
+        "don't implement",
+        "planning only",
+    )
+    if any(marker in text for marker in non_execution_markers):
+        return None
+    documentation_markers = (
+        "需求文档",
+        "测试报告",
+        "架构说明",
+        "设计说明",
+        "实现方案",
+        "website requirements",
+        "test report",
+        "architecture document",
+    )
+    software_build_markers = (
+        "开发网站",
+        "构建网站",
+        "实现网站",
+        "搭建网站",
+        "编写代码",
+        "开发系统",
+        "构建系统",
+        "build the website",
+        "implement the website",
+    )
+    if any(marker in text for marker in documentation_markers) and not any(
+        marker in text for marker in software_build_markers
+    ):
+        return None
+    if any(marker in text for marker in ("分析如何实现", "如何实现网站", "怎么实现网站")):
+        return None
+    action_markers = (
+        "编写",
+        "开发",
+        "构建",
+        "创建",
+        "生成",
+        "实现",
+        "搭建",
+        "制作",
+        "build",
+        "create",
+        "implement",
+        "develop",
+        "generate",
+    )
+    software_markers = (
+        "网站",
+        "网页",
+        "官网",
+        "应用",
+        "软件",
+        "系统",
+        "平台",
+        "项目",
+        "源码",
+        "代码",
+        "api",
+        "frontend",
+        "backend",
+        "website",
+        "web app",
+        "application",
+        "software",
+        "project",
+    )
+    if not any(marker in text for marker in action_markers) or not any(
+        marker in text for marker in software_markers
+    ):
+        return None
+
+    ultra_markers = (
+        "超大型",
+        "特大型",
+        "超大规模",
+        "ultra-large",
+        "ultra large",
+        "mega project",
+    )
+    large_markers = (
+        "大型",
+        "大规模",
+        "网盘",
+        "电商",
+        "商城",
+        "crm",
+        "erp",
+        "saas",
+        "社交平台",
+        "管理系统",
+        "企业平台",
+        "large project",
+        "enterprise platform",
+    )
+    medium_markers = ("中型", "medium project")
+    small_markers = (
+        "小型",
+        "简单",
+        "最简单",
+        "单页",
+        "hello world",
+        "small project",
+        "simple",
+    )
+    if any(marker in text for marker in ultra_markers):
+        scale = "ultra"
+    elif any(marker in text for marker in large_markers):
+        scale = "large"
+    elif any(marker in text for marker in medium_markers):
+        scale = "medium"
+    elif any(marker in text for marker in small_markers):
+        scale = "small"
+    else:
+        scale = "medium"
+
+    feature_markers = (
+        "登录",
+        "注册",
+        "上传",
+        "下载",
+        "分享",
+        "搜索",
+        "权限",
+        "角色",
+        "审计",
+        "支付",
+        "消息",
+        "login",
+        "register",
+        "upload",
+        "download",
+        "share",
+        "search",
+        "permission",
+        "role-based",
+        "audit",
+        "payment",
+    )
+    if scale == "medium" and sum(marker in text for marker in feature_markers) >= 4:
+        scale = "large"
+
+    website_preview_required = any(
+        marker in text
+        for marker in ("网站", "网页", "官网", "前端", "website", "web app", "frontend")
+    )
+    timeout_by_scale = {
+        "small": 300.0,
+        "medium": 600.0,
+        "large": 1200.0,
+        "ultra": 1800.0,
+    }
+    return {
+        "project_scale": scale,
+        "project_delivery": "workspace",
+        "artifact_strategy": "workspace_bundle",
+        "website_preview_required": website_preview_required,
+        "runtime_timeout_seconds": timeout_by_scale[scale],
+    }
+
+
 def _message_suggests_long_running(message: str) -> bool:
     text = message.casefold()
     if _message_suggests_ultra_large_project(message):
@@ -4257,6 +4455,13 @@ def _main_agent_adjusted_ready_mode(
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
     text = message.lower()
+    project_delivery = _project_delivery_assessment(message)
+    if project_delivery is not None:
+        return (
+            TaskMode.HYBRID
+            if project_delivery["project_scale"] in {"large", "ultra"}
+            else TaskMode.DISPATCH
+        )
     if _message_suggests_ultra_large_project(message):
         return TaskMode.HYBRID
     execution_markers = (

@@ -429,6 +429,9 @@ _STATIC_BUILTIN_POLICY_PARTS: Mapping[str, CapabilityPolicyParts] = {
         "generated/project.preflight_architecture",
     ),
     "project.generate_zip": ("file", "create", "generated/project.generate_zip"),
+    "workspace.write_text": ("file", "create", "workspace/current"),
+    "workspace.list": ("file", "read", "workspace/current"),
+    "workspace.bundle": ("file", "create", "workspace/bundle"),
 }
 _DYNAMIC_BUILTIN_TOOLS = frozenset({"read_context", "workspace_read", "workspace.read"})
 _KNOWN_BUILTIN_TOOLS = frozenset(_STATIC_BUILTIN_POLICY_PARTS) | _DYNAMIC_BUILTIN_TOOLS
@@ -532,7 +535,7 @@ def _workspace_write_sandbox_failure(request: HarnessToolCallRequest) -> str | N
 
 
 def _has_project_workspace_write_side_effect(request: HarnessToolCallRequest) -> bool:
-    return (
+    return request.tool_name in {"workspace.write_text", "workspace.bundle"} or (
         request.tool_name == "project.generate_zip"
         and _nonblank_argument(request, "project_id")
         and _nonblank_argument(request, "workspace_session_id")

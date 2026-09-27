@@ -171,6 +171,15 @@ def _is_project_scale_capability_request(request: object) -> bool:
     )
 
 
+def _is_workspace_project_delivery(context: TaskContext) -> bool:
+    return (
+        context.routing_decision.get("project_delivery") == "workspace"
+        and context.routing_decision.get("artifact_strategy") == "workspace_bundle"
+        and context.routing_decision.get("project_scale")
+        in {"small", "medium", "large", "ultra"}
+    )
+
+
 def _can_recover_project_scale_capability_request(request: object) -> bool:
     text = str(request).casefold()
     return (
@@ -199,13 +208,17 @@ def _is_ultra_project_scale_request(request: object) -> bool:
 
 
 def _max_output_bytes_for_context(context: TaskContext) -> int:
-    if _is_project_scale_capability_request(context.request):
+    if _is_project_scale_capability_request(context.request) or _is_workspace_project_delivery(
+        context
+    ):
         return _MAX_PROJECT_SCALE_OUTPUT_BYTES
     return _MAX_OUTPUT_BYTES
 
 
 def _max_direct_output_tokens_for_context(context: TaskContext) -> int:
-    if _is_project_scale_capability_request(context.request):
+    if _is_project_scale_capability_request(context.request) or _is_workspace_project_delivery(
+        context
+    ):
         return _MAX_PROJECT_SCALE_DIRECT_OUTPUT_TOKENS
     return _MAX_DIRECT_OUTPUT_TOKENS
 
@@ -219,6 +232,23 @@ def _project_scale_workspace_bundle_from_model_text(
         if bundle is not None:
             return bundle
     return _workspace_bundle_from_markdown_file_blocks(text)
+
+
+def _website_preview_workspace_bundle_from_model_text(
+    text: str,
+    context: TaskContext,
+) -> dict[str, JsonValue] | None:
+    if context.routing_decision.get("website_preview_required") is not True:
+        return None
+    fenced = re.search(r"(?is)```html[ \t]*\r?\n(.*?)(?:\r?\n)?```", text)
+    if fenced is not None:
+        html = fenced.group(1).strip()
+    else:
+        stripped = text.strip()
+        html = stripped if re.match(r"(?is)^<!doctype\s+html|^<html\b", stripped) else ""
+    if not html:
+        return None
+    return _normalized_workspace_bundle({"files": {"preview.html": f"{html}\n"}})
 
 
 def _json_mapping_from_model_text(text: str) -> Mapping[str, object] | None:
@@ -691,6 +721,11 @@ class DirectRuntime:
                     del text, response, completion, request, included_source_ids, context
                     _raise_execution_error("model response text is empty")
             extracted_workspace_bundle = _project_scale_workspace_bundle_from_model_text(text)
+            if extracted_workspace_bundle is None:
+                extracted_workspace_bundle = _website_preview_workspace_bundle_from_model_text(
+                    text,
+                    context,
+                )
             output_byte_limit = (
                 _MAX_PROJECT_SCALE_OUTPUT_BYTES
                 if extracted_workspace_bundle is not None
@@ -1039,9 +1074,23 @@ class DirectRuntime:
             guidance_context = (
                 context.instruction_context.render() if context.instruction_context is not None else ""
             )
+            project_delivery_context = ""
+            if _is_workspace_project_delivery(context):
+                project_delivery_context = (
+                    "PROJECT_DELIVERY_CONTRACT: Return the complete deliverable as strict JSON "
+                    "with workspace_bundle.files mapping safe relative paths to full UTF-8 file "
+                    "contents, or Markdown file blocks headed with an exact relative file path. "
+                    "Keep the chat summary concise instead of pasting unrelated prose. "
+                )
+                if context.routing_decision.get("website_preview_required") is True:
+                    project_delivery_context += (
+                        "Include a self-contained preview.html (or index.html) that demonstrates "
+                        "the main user flow without external network dependencies. "
+                    )
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
                 + (f"{guidance_context}\n" if guidance_context else "")
+                + (f"{project_delivery_context}\n" if project_delivery_context else "")
                 +
                 f"{hermes_context}\n"
                 f"{repair_context}\n"

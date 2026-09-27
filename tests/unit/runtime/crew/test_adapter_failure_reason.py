@@ -46,6 +46,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _scope_project_workspace_tool_call,
     _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
     _tool_definitions,
@@ -2560,6 +2561,148 @@ async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_natural_large_project_writes_workspace_incrementally_before_bundle() -> None:
+    class IncrementalGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.calls += 1
+            responses = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="write-preview",
+                        name="workspace.write_text",
+                        arguments={
+                            "path": "preview.html",
+                            "content": "<!doctype html><title>网盘</title>",
+                        },
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="list-files", name="workspace.list", arguments={}
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="bundle",
+                        name="workspace.bundle",
+                        arguments={"title": "Cloud Drive"},
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                ModelResponse(text="Workspace bundle delivered.", usage=TokenUsage(1, 1, 2)),
+            )
+            return GatewayCompletion(
+                response=responses[min(self.calls - 1, len(responses) - 1)],
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+                cost_usd=Decimal(0),
+            )
+
+    class IncrementalCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name in {"workspace.write_text", "workspace.list", "workspace.bundle"}
+
+    class IncrementalHarness:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            payload: Mapping[str, JsonValue] = {
+                "summary": f"{request.tool_name} completed",
+            }
+            if request.tool_name == "workspace.bundle":
+                payload = {
+                    **payload,
+                    "artifact_id": str(uuid4()),
+                    "presentation": "final_attachment",
+                    "file": {"filename": "cloud-drive.zip"},
+                }
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload=payload,
+            )
+
+    task = (
+        "Role mission: implement.\n"
+        "User task: 编写一个网盘网站\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    tools = ("workspace.write_text", "workspace.list", "workspace.bundle")
+    plan = DispatchPlan(
+        agents=(AgentSpec(
+            id="implementer",
+            role="Implementer",
+            goal="Build the project incrementally.",
+            logical_model="general",
+            allowed_tools=tools,
+        ),),
+        steps=(DispatchStep(
+            id="implementer_step",
+            agent="implementer",
+            task=task,
+            tools=tools,
+            final_synthesizer=True,
+            token_budget=10_000,
+            tool_argument_budget_bytes={"workspace.write_text": 512_000},
+        ),),
+        allowed_tools=tools,
+        total_token_budget=10_000,
+    )
+    harness = IncrementalHarness()
+    runtime = CrewDispatchRuntime(
+        IncrementalGateway(),
+        plan,
+        capability_gateway=IncrementalCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(_context(
+            actor_id=uuid4(),
+            actor_role=Role.OPERATOR,
+            routing_decision={
+                "project_id": "cloud-drive",
+                "workspace_session_id": "cloud-drive-session",
+                "sandbox_profile": "workspace_write",
+                "project_scale": "large",
+                "project_delivery": "workspace",
+                "artifact_strategy": "workspace_bundle",
+            },
+            token_budget=10_000,
+        ))
+    ]
+
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text",
+        "workspace.list",
+        "workspace.bundle",
+    ]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
     capabilities = FakeCapabilities()
     harness = FailingHarnessToolGateway()
@@ -2819,6 +2962,31 @@ def test_project_zip_tool_definition_exposes_required_file_schema() -> None:
     assert files["type"] == "object"
     assert files["additionalProperties"] == {"type": "string"}
     assert definition.parameters["additionalProperties"] is False
+
+
+def test_project_zip_tool_call_gets_server_owned_workspace_scope() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="编写一个网盘网站",
+        routing_decision={
+            "project_id": "cloud-drive",
+            "workspace_session_id": "conv-cloud-drive",
+            "project_delivery": "workspace",
+        },
+    )
+    original = ToolCall(
+        id="zip-call",
+        name="project.generate_zip",
+        arguments={"title": "网盘", "files": {"preview.html": "<html></html>"}},
+    )
+
+    scoped = _scope_project_workspace_tool_call(context, original)
+
+    assert "project_id" not in original.arguments
+    assert scoped.arguments["project_id"] == "cloud-drive"
+    assert scoped.arguments["workspace_session_id"] == "conv-cloud-drive"
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:

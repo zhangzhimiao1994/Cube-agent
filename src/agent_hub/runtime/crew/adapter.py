@@ -109,6 +109,7 @@ _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
 _MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES = 2_048
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
+_MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS = 32
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_CONFIGURED_TOOL_ARGUMENT_BYTES = 10_000_000
@@ -361,6 +362,12 @@ def _tool_description(internal_name: str) -> str:
         return "Generate a downloadable PPTX presentation from title and slide content."
     if internal_name in {"read_context", "workspace.read", "workspace_read"}:
         return "Read approved workspace or conversation context."
+    if internal_name == "workspace.write_text":
+        return "Write one complete UTF-8 text file into the current run's authorized project workspace."
+    if internal_name == "workspace.list":
+        return "List files already written to the current run's authorized project workspace."
+    if internal_name == "workspace.bundle":
+        return "Package the current run's project workspace as the final downloadable ZIP."
     return f"Approved Agent Hub capability: {internal_name}"
 
 
@@ -426,6 +433,31 @@ def _tool_parameters(
                 },
             },
         }
+    if internal_name == "workspace.write_text":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("path", "content"),
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                "content": {"type": "string", "minLength": 1},
+            },
+        }
+    if internal_name == "workspace.list":
+        return {"type": "object", "additionalProperties": False, "properties": {}}
+    if internal_name == "workspace.bundle":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "filename": {"type": "string", "minLength": 1, "maxLength": 200},
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                },
+            },
+        }
     if internal_name in {"document.generate_docx", "presentation.generate_pptx"}:
         return {
             "type": "object",
@@ -450,6 +482,14 @@ def _tool_sandbox(
     *,
     sandbox_profile: str | None = None,
 ) -> str:
+    if name in {"workspace.write_text", "workspace.bundle"}:
+        return (
+            "workspace_write"
+            if _routing_sandbox_profile(routing_decision) == "workspace_write"
+            else "restricted"
+        )
+    if name == "workspace.list":
+        return "read_only"
     if (
         name == "project.generate_zip"
         and _has_project_workspace_write_side_effect(arguments)
@@ -1247,6 +1287,14 @@ def _is_project_scale_tool_contract_step(step: DispatchStep) -> bool:
     )
 
 
+def _is_incremental_workspace_contract_step(step: DispatchStep) -> bool:
+    return (
+        "workspace.bundle" in step.tools
+        and "workspace.write_text" in step.tools
+        and _is_real_project_scale_handoff(step.task)
+    )
+
+
 def _step_timeout_recovery_window_seconds(step: DispatchStep) -> float:
     if _is_project_scale_tool_contract_step(step):
         return _PROJECT_SCALE_STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
@@ -1261,6 +1309,20 @@ def _should_check_framework_raw(step: DispatchStep, completion: GatewayCompletio
 
 
 def _is_real_project_scale_handoff(task: object) -> bool:
+    text = str(task).casefold()
+    return "project workspace delivery contract:" in text or (
+        "build a real " in text
+        and "business project for flow=" in text
+        and "workspace_bundle.files" in text
+    ) or (
+        "repair this same business project" in text
+        and "original request:" in text
+        and "build a real " in text
+        and "workspace_bundle.files" in text
+    )
+
+
+def _is_project_scale_acceptance_handoff(task: object) -> bool:
     text = str(task).casefold()
     return (
         "build a real " in text
@@ -1289,6 +1351,11 @@ def _project_scale_artifact_zip_completion(
     if project_id is None or workspace_session_id is None:
         return completion
     generated_files = _project_scale_generated_files_from_text(response.text)
+    if generated_files is None and not (
+        is_project_scale_artifact_request(step.task)
+        or _is_project_scale_acceptance_handoff(step.task)
+    ):
+        return completion
     files = generated_files or project_scale_artifact_zip_files(step.task)
     return GatewayCompletion(
         response=ModelResponse(
@@ -1778,6 +1845,22 @@ def _routing_text(routing_decision: Mapping[str, JsonValue], key: str) -> str | 
     if type(value) is str and value.strip():
         return value
     return None
+
+
+def _scope_project_workspace_tool_call(
+    context: TaskContext,
+    tool_call: ToolCall,
+) -> ToolCall:
+    if tool_call.name != PROJECT_SCALE_ARTIFACT_TOOL_NAME:
+        return tool_call
+    project_id = _routing_text(context.routing_decision, "project_id")
+    workspace_session_id = _routing_text(context.routing_decision, "workspace_session_id")
+    if project_id is None or workspace_session_id is None:
+        return tool_call
+    arguments = dict(tool_call.arguments)
+    arguments["project_id"] = project_id
+    arguments["workspace_session_id"] = workspace_session_id
+    return ToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
 
 
 def _step_has_dependents(plan: DispatchPlan, step: DispatchStep) -> bool:
@@ -4593,6 +4676,7 @@ class CrewDispatchRuntime:
         response_schema = (
             None
             if _is_project_scale_tool_contract_step(step)
+            or _is_incremental_workspace_contract_step(step)
             else _agent_response_schema(agent)
         )
         required_capabilities = {ModelCapability.TEXT}
@@ -4601,7 +4685,12 @@ class CrewDispatchRuntime:
         if response_schema is not None:
             required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
         logical_model = _agent_logical_model_for_recovery(agent, recovery_attempt)
-        for _round in range(_MAX_TOOL_ROUNDS + 1):
+        tool_round_limit = (
+            _MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS
+            if _is_incremental_workspace_contract_step(step)
+            else _MAX_TOOL_ROUNDS
+        )
+        for _round in range(tool_round_limit + 1):
             await emit(
                 kind=EventKind.MODEL_STARTED,
                 actor=agent.id,
@@ -4636,12 +4725,19 @@ class CrewDispatchRuntime:
             response = self._valid_response(completion)
             assert response is not None
             if not response.tool_calls:
+                if _is_incremental_workspace_contract_step(step) and not any(
+                    state.get("step_id") == step.id
+                    and state.get("name") == "workspace.bundle"
+                    and state.get("status") == "succeeded"
+                    for state in tool_ledger.states.values()
+                ):
+                    _fail("project workspace bundle is missing")
                 if step.final_synthesizer:
                     completion = _reconcile_final_attachment_completion(completion, evidence)
                 return completion
             if self._capabilities is None or self._tool_gateway is None or not step.tools:
                 _fail("step requested an unavailable capability")
-            if _round == _MAX_TOOL_ROUNDS:
+            if _round == tool_round_limit:
                 reusable_results = tuple(
                     reusable_generated_file_result(tool_call.name, evidence)
                     for tool_call in response.tool_calls
@@ -4662,6 +4758,7 @@ class CrewDispatchRuntime:
             results: list[dict[str, object]] = []
             reused_generated_file_results = 0
             for tool_index, tool_call in enumerate(response.tool_calls):
+                tool_call = _scope_project_workspace_tool_call(context, tool_call)
                 if tool_call.name not in step.tools:
                     fallback_completion = _project_scale_forbidden_tool_structured_completion(
                         step,
@@ -6254,7 +6351,7 @@ class CrewDispatchRuntime:
                     + _STEP_TIMEOUT_RECOVERY_RETRIES
                 )
                 or type(round_index) is not int
-                or not 0 <= round_index <= _MAX_TOOL_ROUNDS
+                or not 0 <= round_index <= _MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS
                 or type(tool_index) is not int
                 or not 0 <= tool_index <= 64
                 or type(name) is not str

@@ -101,6 +101,10 @@ _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE = {
     "ultra": _MAX_PROJECT_ZIP_ARGUMENT_BUDGET_BYTES,
 }
 _PROJECT_ZIP_COMPLEXITY_BUDGET_STEP_BYTES = 500_000
+_WORKSPACE_WRITE_ARGUMENT_BUDGET_BYTES = 512_000
+_INCREMENTAL_WORKSPACE_TOOLS = frozenset(
+    {"workspace.write_text", "workspace.list", "workspace.bundle"}
+)
 _PROJECT_ZIP_COMPLEXITY_MARKERS = (
     "admin",
     "administrator",
@@ -233,6 +237,10 @@ _SOFTWARE_TASK_KEYWORDS = (
     "可下载",
     "download",
     "网页",
+    "网站",
+    "官网",
+    "软件",
+    "应用",
     "web",
     "前端",
     "后端",
@@ -1188,24 +1196,49 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
     ]
     if "run_safe_command" in tools:
         lines.append("Run an available safe command smoke test before final packaging.")
+    if _INCREMENTAL_WORKSPACE_TOOLS.issubset(tools):
+        lines.extend(
+            (
+                "Build the project incrementally: call workspace.write_text once per complete file instead of returning the entire project in one model response.",
+                "Call workspace.list to verify the final file set, then call workspace.bundle with presentation=final_attachment.",
+                "Do not claim delivery until workspace.bundle succeeds.",
+            )
+        )
+        if context.routing_decision.get("website_preview_required") is True:
+            lines.append(
+                "Write a self-contained preview.html with no external network dependencies so the UI can run the main flow in a sandboxed preview."
+            )
     if "project.generate_zip" in tools:
         lines.append(
             "Use project.generate_zip only after verification; set presentation to final_attachment for the user-downloadable ZIP."
         )
         if _is_project_scale_generated_project_request(context):
             lines.append(
+                "Project workspace delivery contract: produce complete workspace files and a downloadable bundle; do not paste the full generated source into the final chat response."
+            )
+            lines.append(
                 "If read_context has no additional runtime context, continue with the requested files and call project.generate_zip instead of rereading context."
             )
+            if context.routing_decision.get("website_preview_required") is True:
+                lines.append(
+                    "Include a self-contained preview.html (or index.html) that demonstrates the main user flow without external network dependencies so the UI can run it in a sandboxed preview."
+                )
     return "\n" + "\n".join(lines) + "\n"
 
 
 def _software_final_guidance(context: TaskContext) -> str:
     if TaskProfile.SOFTWARE not in _task_profiles(context.request):
         return ""
-    return (
+    guidance = (
         "Do not claim the project works without verification evidence. "
         "Summarize the verified file list, smoke-test result, and any remaining risk. "
     )
+    if _is_project_scale_generated_project_request(context):
+        guidance += (
+            "Keep the final chat response concise and link the workspace bundle, downloadable ZIP, "
+            "and runnable preview instead of pasting generated source into the conversation. "
+        )
+    return guidance
 
 
 def _project_preflight_implementation_guidance(preflight_context: str) -> str:
@@ -1511,7 +1544,9 @@ def _role_max_output_tokens(
 ) -> int:
     if not _is_project_scale_generated_project_request(context):
         return 4096
-    if role.id == "implementer" and "project.generate_zip" in tools:
+    if role.id == "implementer" and (
+        "project.generate_zip" in tools or "workspace.write_text" in tools
+    ):
         return 24_576
     if _is_post_product_role(role):
         return 8_192
@@ -1522,14 +1557,14 @@ def _tool_argument_budgets_for_step(
     context: TaskContext,
     tools: tuple[str, ...],
 ) -> dict[str, int]:
-    if (
-        PROJECT_SCALE_ARTIFACT_TOOL_NAME not in tools
-        or not _is_project_scale_generated_project_request(context)
-    ):
+    if not _is_project_scale_generated_project_request(context):
         return {}
-    return {
-        PROJECT_SCALE_ARTIFACT_TOOL_NAME: _project_zip_argument_budget_bytes(context),
-    }
+    budgets: dict[str, int] = {}
+    if "workspace.write_text" in tools:
+        budgets["workspace.write_text"] = _WORKSPACE_WRITE_ARGUMENT_BUDGET_BYTES
+    if PROJECT_SCALE_ARTIFACT_TOOL_NAME in tools:
+        budgets[PROJECT_SCALE_ARTIFACT_TOOL_NAME] = _project_zip_argument_budget_bytes(context)
+    return budgets
 
 
 def _project_zip_argument_budget_bytes(context: TaskContext) -> int:
@@ -1573,6 +1608,9 @@ def _project_zip_argument_budget_override(context: TaskContext) -> int | None:
 
 
 def _project_scale_budget_tier(context: TaskContext) -> str:
+    routed_scale = context.routing_decision.get("project_scale")
+    if routed_scale in _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE:
+        return str(routed_scale)
     text = str(context.request).casefold()
     if "ultra-large" in text or "ultra large" in text or "real ultra" in text:
         return "ultra"
@@ -1768,6 +1806,14 @@ def _role_allowed_tools(
     ):
         filtered = [name for name in filtered if name != "read_context"]
     if (
+        role.id == "implementer"
+        and _INCREMENTAL_WORKSPACE_TOOLS.issubset(filtered)
+        and _is_project_scale_generated_project_request(context)
+    ):
+        filtered = [
+            name for name in filtered if name not in {"read_context", "project.generate_zip"}
+        ]
+    if (
         role.purpose is RolePurpose.PLAN
         and _is_project_scale_generated_project_request(context)
     ):
@@ -1777,6 +1823,13 @@ def _role_allowed_tools(
 
 def _is_project_scale_generated_project_request(context: TaskContext) -> bool:
     if _is_project_scale_artifact_request(context):
+        return True
+    if (
+        context.routing_decision.get("project_delivery") == "workspace"
+        and context.routing_decision.get("artifact_strategy") == "workspace_bundle"
+        and context.routing_decision.get("project_scale")
+        in _PROJECT_ZIP_ARGUMENT_BASE_BUDGET_BYTES_BY_SCALE
+    ):
         return True
     text = str(context.request).casefold()
     return (
