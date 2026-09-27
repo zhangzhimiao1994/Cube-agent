@@ -945,6 +945,84 @@ async def test_get_preserves_actionable_mode_decision_for_public_recovery() -> N
     assert completed.clarification_reason is None
 
 
+async def test_get_exposes_only_current_waiting_capability_approval_id() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    repository = PreviewMutationRepository(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=run_id,
+    )
+    repository.record = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="run an approved capability",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.WAITING_APPROVAL,
+        version=3,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "capability_tool",
+            "approval_id": "capability_approval_public_1",
+            "approval_fingerprint": "fingerprint-1",
+            "reason": "capability requires approval",
+        },
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    waiting = await service.get(tenant_id, run_id)
+
+    assert waiting.approval_id == "capability_approval_public_1"
+
+    repository.record = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="run an approved capability",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "capability_tool",
+            "approval_id": "capability_approval_public_1",
+            "approval_fingerprint": "fingerprint-1",
+            "reason": "capability requires approval",
+        },
+    )
+
+    completed = await service.get(tenant_id, run_id)
+
+    assert completed.approval_id is None
+
+    repository.record = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="approve a project plan",
+        mode=TaskMode.HYBRID,
+        status=RunStatus.WAITING_APPROVAL,
+        version=5,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "project_preflight",
+            "approval_id": "non_capability_approval",
+            "reason": "project preflight requires approval",
+        },
+    )
+
+    non_capability = await service.get(tenant_id, run_id)
+
+    assert non_capability.approval_id is None
+
+
 async def test_auto_submission_uses_hermes_before_local_direct_router_fallback() -> None:
     repository = ConversationModeRepository(None)
     advisor = RecordingHermesAdvisor(

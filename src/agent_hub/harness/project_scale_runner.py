@@ -525,6 +525,7 @@ def execute_project_scale_plan(
     generated_project_commands: Sequence[Sequence[str]] | None = None,
     generated_project_timeout_seconds: float = 120,
     progress: Callable[[str], None] | None = None,
+    auto_approve_capability_requests: bool = False,
 ) -> ProjectScaleExecutionReport:
     validate_generated_project = validate_generated_project or plan.benchmark_kind == "capability"
     results: list[ProjectScaleCaseResult] = []
@@ -623,6 +624,7 @@ def execute_project_scale_plan(
                 case_id=run_request.case_id,
                 mode_decision_context=mode_decision_context,
                 defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
+                auto_approve_capability_requests=auto_approve_capability_requests,
             )
             status = observation.status
             observed_mode = observed_mode or _execution_mode(observation.details)
@@ -696,6 +698,7 @@ def execute_project_scale_plan(
                             case_id=run_request.case_id,
                             mode_decision_context=mode_decision_context,
                             defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
+                            auto_approve_capability_requests=auto_approve_capability_requests,
                         )
                         observation = self_repair_observation
                         status = self_repair_observation.status
@@ -879,6 +882,7 @@ def execute_project_scale_plan(
                     case_id=run_request.case_id,
                     mode_decision_context=mode_decision_context,
                     defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
+                    auto_approve_capability_requests=auto_approve_capability_requests,
                 )
                 status = repair_observation.status
                 final_observed_mode = (
@@ -1706,6 +1710,7 @@ def _collect_run_observation(
     case_id: str,
     mode_decision_context: Mapping[str, object],
     defer_artifacts_until_terminal: bool = False,
+    auto_approve_capability_requests: bool = False,
 ) -> _RunObservation:
     status = current_status
     details: dict[str, object] | None = None
@@ -1747,15 +1752,17 @@ def _collect_run_observation(
             evidence["final_artifacts"] = bool(
                 evidence.get("final_artifacts")
             ) or _has_final_artifacts(details)
-            approved_status = _approve_pending_capability(
-                client,
-                run_id=run_id,
-                details=details,
-                approved_capabilities=approved_capabilities,
-                errors=errors,
-            )
-            if approved_status is not None:
-                status = approved_status
+            if auto_approve_capability_requests:
+                approved_status = _approve_pending_capability(
+                    client,
+                    run_id=run_id,
+                    details=details,
+                    approved_capabilities=approved_capabilities,
+                    evidence=evidence,
+                    errors=errors,
+                )
+                if approved_status is not None:
+                    status = approved_status
         if _is_terminal_status(status):
             evidence["terminal_status"] = True
             break
@@ -2246,11 +2253,20 @@ def _approve_pending_capability(
     run_id: str,
     details: dict[str, object],
     approved_capabilities: set[str],
+    evidence: dict[str, bool],
     errors: list[str],
 ) -> str | None:
-    if details.get("status") != "waiting_approval":
+    if (
+        details.get("status") != "waiting_approval"
+        or details.get("clarification_reason") != "capability requires approval"
+    ):
         return None
-    approval = _capability_approval_request(client, run_id=run_id, details=details)
+    approval = _capability_approval_request(
+        client,
+        run_id=run_id,
+        details=details,
+        errors=errors,
+    )
     if approval is None:
         return None
     approval_id, version = approval
@@ -2269,6 +2285,14 @@ def _approve_pending_capability(
     if not isinstance(response, dict):
         errors.append("capability_approval: approve-capability returned non-object JSON")
         return None
+    response_run_id = response.get("id")
+    if response_run_id is not None and str(response_run_id) != run_id:
+        errors.append(
+            "capability_approval: approve-capability returned mismatched run id "
+            f"{response_run_id}"
+        )
+        return None
+    evidence["capability_approval"] = True
     return _string_value(response.get("status"))
 
 
@@ -2277,17 +2301,49 @@ def _capability_approval_request(
     *,
     run_id: str,
     details: dict[str, object],
+    errors: list[str],
 ) -> tuple[str, int] | None:
     approval = _capability_approval_from_mapping(details)
     if approval is not None:
         return approval
     try:
-        admin_response = client.request_json("GET", f"/api/v1/admin/runs/{quote(run_id)}")
+        events_response = client.request_json("GET", f"/api/v1/runs/{quote(run_id)}/events")
     except RuntimeError:
         return None
-    if not isinstance(admin_response, dict):
+    events = _run_events_items(events_response)
+    if not isinstance(events, list):
         return None
-    return _capability_approval_from_mapping(admin_response)
+    scope_errors = _validate_run_events_scope(events, run_id)
+    if scope_errors:
+        _extend_unique(
+            errors,
+            tuple(f"capability_approval: {error}" for error in scope_errors),
+        )
+        return None
+    return _capability_approval_from_events(events, version=details.get("version"))
+
+
+def _capability_approval_from_events(
+    events: Sequence[object],
+    *,
+    version: object,
+) -> tuple[str, int] | None:
+    if not isinstance(version, int) or version <= 0:
+        return None
+    resolved: set[str] = set()
+    for event in reversed(events):
+        if not isinstance(event, Mapping):
+            continue
+        approval_id = event.get("approval_id")
+        if not isinstance(approval_id, str) or not approval_id:
+            continue
+        kind = event.get("kind")
+        if kind == "approval.resolved":
+            resolved.add(approval_id)
+            continue
+        if kind == "approval.requested" and approval_id not in resolved:
+            return approval_id, version
+    return None
 
 
 def _capability_approval_from_mapping(payload: Mapping[str, object]) -> tuple[str, int] | None:

@@ -749,6 +749,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
 
     def execute(plan: Any, client: Any, **kwargs: object) -> ProjectScaleExecutionReport:
         del client
+        assert kwargs["auto_approve_capability_requests"] is True
         plans.append(plan)
         scale, route_intent = plan.requests[0].case_id.split(":", 1)
         scoped_workspace_paths.append(

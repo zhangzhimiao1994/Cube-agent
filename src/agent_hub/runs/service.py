@@ -138,6 +138,7 @@ class RunSummary:
     conversation_id: str | None = None
     decision_token: str | None = None
     clarification_reason: str | None = None
+    approval_id: str | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -2318,6 +2319,12 @@ class RunService:
             RunStatus.WAITING_USER_MODE,
             RunStatus.WAITING_APPROVAL,
         }
+        capability_approval_id = (
+            _string_or_none(routing_decision.get("approval_id"))
+            if record.status is RunStatus.WAITING_APPROVAL
+            and routing_decision.get("approval_kind") == "capability_tool"
+            else None
+        )
         return RunSummary(
             id=record.id,
             tenant_id=record.tenant_id,
@@ -2341,6 +2348,7 @@ class RunService:
                 if waiting_for_decision
                 else None
             ),
+            approval_id=capability_approval_id,
         )
 
     async def _safe_notify_terminal_hooks(

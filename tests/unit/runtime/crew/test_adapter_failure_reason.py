@@ -2115,6 +2115,18 @@ async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
 
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
+            if not request.tools:
+                return GatewayCompletion(
+                    response=ModelResponse(
+                        text="Reused results synthesized.",
+                        usage=TokenUsage(1, 1, 2),
+                    ),
+                    deployment_id="primary",
+                    logical_model=request.logical_model,
+                    provider_id="deepseek",
+                    provider_model="deepseek/deepseek-v4-flash",
+                    cost_usd=Decimal(0),
+                )
             return GatewayCompletion(
                 response=ModelResponse(
                     text=None,
@@ -2222,16 +2234,17 @@ async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
         crew_factory=FastFactory(),
     )
 
-    with pytest.raises(RuntimeExecutionError, match="step capability round limit exceeded"):
-        _ = [
-            event
-            async for event in runtime.run(
-                _context(routing_decision={"project_scale": "medium"})
-            )
-        ]
+    events = [
+        event
+        async for event in runtime.run(
+            _context(routing_decision={"project_scale": "medium"})
+        )
+    ]
 
     assert len(harness.calls) == 2
-    assert len(gateway.requests) == 9
+    assert len(gateway.requests) == 3
+    assert gateway.requests[-1].tools == ()
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.parametrize(
@@ -2258,6 +2271,123 @@ def test_tool_round_budget_scales_with_project_size(
     assert budget.initial_limit == 8
     assert budget.extension_size == 8
     assert budget.hard_limit == hard_limit
+
+
+@pytest.mark.parametrize(
+    ("project_scale", "tool_rounds"),
+    [("medium", 9), ("large", 17), ("ultra", 25)],
+)
+async def test_tool_round_budget_extends_only_while_new_results_arrive(
+    project_scale: str,
+    tool_rounds: int,
+) -> None:
+    class ProgressGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            request_index = len(self.requests)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id=f"progress-{request_index}",
+                            name="web_search",
+                            arguments={"q": f"unique-{request_index}"},
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if request_index <= tool_rounds
+                else ModelResponse(text="done", usage=TokenUsage(1, 1, 2))
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    gateway = ProgressGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(routing_decision={"project_scale": project_scale})
+        )
+    ]
+
+    assert len(harness.calls) == tool_rounds
+    assert len(gateway.requests) == tool_rounds + 1
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("project_scale", "hard_limit"),
+    [("small", 8), ("medium", 16), ("large", 24), ("ultra", 32)],
+)
+async def test_tool_round_budget_stops_at_scale_hard_limit(
+    project_scale: str,
+    hard_limit: int,
+) -> None:
+    class EndlessProgressGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            request_index = len(self.requests)
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id=f"progress-{request_index}",
+                            name="web_search",
+                            arguments={"q": f"unique-{request_index}"},
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    gateway = EndlessProgressGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="step capability round limit exceeded"):
+        _ = [
+            event
+            async for event in runtime.run(
+                _context(routing_decision={"project_scale": project_scale})
+            )
+        ]
+
+    assert len(harness.calls) == hard_limit
+    assert len(gateway.requests) == hard_limit + 1
 
 
 async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> None:

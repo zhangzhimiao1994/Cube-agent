@@ -1390,6 +1390,58 @@ def test_execute_project_scale_plan_uses_waiting_details_mode_decision() -> None
     assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
 
 
+def test_execute_project_scale_plan_publicly_approves_capability_once_after_mode_choice() -> None:
+    plan = _auto_scale_plan("medium")
+    client = WaitingModeThenCapabilityApprovalClient(
+        run_id="run-medium-auto-capability",
+        session_id="project-scale-medium-auto",
+    )
+
+    result = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=0.05,
+        poll_interval_seconds=0,
+        auto_approve_capability_requests=True,
+    ).results[0]
+
+    assert result.status == "completed"
+    assert result.observed_mode == "dispatch"
+    assert result.evidence["capability_approval"] is True
+    assert client.choose_mode_bodies == [
+        {
+            "mode": "dispatch",
+            "decision_token": client.decision_token,
+            "version": 1,
+        }
+    ]
+    assert client.capability_approval_bodies == [
+        {
+            "approval_id": client.capability_approval_id,
+            "version": client.capability_approval_version,
+        }
+    ]
+    assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
+
+
+def test_execute_project_scale_plan_does_not_auto_approve_capability_without_opt_in() -> None:
+    plan = _auto_scale_plan("medium")
+    client = WaitingModeThenCapabilityApprovalClient(
+        run_id="run-medium-auto-no-approval",
+        session_id="project-scale-medium-auto",
+    )
+
+    execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    assert client.capability_approval_bodies == []
+    assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
+
+
 @pytest.mark.parametrize("flow", ("direct", "dispatch", "hybrid", "multi_agent"))
 def test_execute_project_scale_plan_does_not_choose_mode_for_explicit_flow(flow: str) -> None:
     plan = build_project_scale_run_plan(
@@ -4203,7 +4255,13 @@ def test_execute_project_scale_plan_approves_waiting_capability_tool() -> None:
         capability_approval_version=3,
     )
 
-    report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=5,
+        poll_interval_seconds=0,
+        auto_approve_capability_requests=True,
+    )
 
     assert report.ok is True
     assert report.results[0].status == "completed"
@@ -4740,6 +4798,10 @@ class FakeAcceptanceClient:
                     details_response["version"] = self.self_repair_decision_version
                 if self.self_repair_decision_token is not None:
                     details_response["repair_proposal"] = _self_repair_proposal_fixture()
+            if status == "waiting_approval" and self.capability_approval_id is not None:
+                details_response["clarification_reason"] = "capability requires approval"
+                details_response["approval_id"] = self.capability_approval_id
+                details_response["version"] = self.capability_approval_version
             return details_response
         if path in {
             f"/api/v1/runs/{self.run_id}/events",
@@ -4984,6 +5046,53 @@ class WaitingUserModeAcceptanceClient(FakeAcceptanceClient):
             body=body,
             idempotency_key=idempotency_key,
         )
+
+
+class WaitingModeThenCapabilityApprovalClient(WaitingUserModeAcceptanceClient):
+    def __init__(self, *, run_id: str, session_id: str) -> None:
+        super().__init__(run_id=run_id, session_id=session_id, token_source="submission")
+        self.statuses = ["waiting_approval", "waiting_approval", "completed"]
+        self.capability_approval_id = "approval-project-generate-zip"
+        self.capability_approval_version = 3
+        self.events = [
+            {
+                "kind": "approval.requested",
+                "run_id": run_id,
+                "approval_id": self.capability_approval_id,
+            }
+        ]
+        self.capability_approval_bodies: list[dict[str, object]] = []
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object] | list[object]:
+        if method == "GET" and path == f"/api/v1/admin/runs/{self.run_id}":
+            raise AssertionError("real-user capability approval must not use admin run data")
+        if method == "POST" and path == f"/api/v1/runs/{self.run_id}/approve-capability":
+            assert body is not None
+            self.capability_approval_bodies.append(dict(body))
+        response = super().request_json(
+            method,
+            path,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
+        if (
+            method == "GET"
+            and path == f"/api/v1/runs/{self.run_id}/details"
+            and isinstance(response, dict)
+            and response.get("status") == "waiting_approval"
+        ):
+            response["clarification_reason"] = "capability requires approval"
+            response["decision_token"] = "capability-decision-token-public-details"
+            response["version"] = self.capability_approval_version
+            response.pop("approval_id", None)
+        return response
 
 
 def _project_bundle(files: dict[str, str]) -> bytes:

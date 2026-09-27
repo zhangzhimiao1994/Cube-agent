@@ -1633,6 +1633,39 @@ describe("api client transport", () => {
     expect(result.capability_install_proposal?.capabilities).toEqual(["office.search_documents"]);
   });
 
+  it("preserves a pending capability approval id on run detail responses", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_approval_1",
+          status: "waiting_approval",
+          mode: "dispatch",
+          version: 3,
+          approval_id: "capability_approval_public_1",
+          request: "Run an approved capability.",
+          created_at: "2026-09-28T00:00:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.run("run_approval_1");
+
+    expect(result.approval_id).toBe("capability_approval_public_1");
+  });
+
   it("updates plugin package approval state", async () => {
     const plugin: PluginResource = {
       id: "calendar",

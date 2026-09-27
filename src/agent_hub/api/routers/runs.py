@@ -475,6 +475,7 @@ class RunSummaryResponse(BaseModel):
     usage_cost_usd: Decimal
     decision_token: str | None = None
     clarification_reason: str | None = None
+    approval_id: str | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -490,6 +491,7 @@ class RunSummaryResponse(BaseModel):
             usage_cost_usd=run.usage_cost_usd,
             decision_token=run.decision_token,
             clarification_reason=run.clarification_reason,
+            approval_id=run.approval_id,
         )
 
 

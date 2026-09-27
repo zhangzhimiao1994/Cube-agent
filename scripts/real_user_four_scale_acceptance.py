@@ -705,6 +705,7 @@ def run_real_user_four_scale_acceptance(
                 validate_generated_project=True,
                 generated_project_timeout_seconds=artifact_build_timeout_seconds,
                 progress=case_progress,
+                auto_approve_capability_requests=True,
             )
             result = runner_report.results[0]
             public_artifacts = verify_public_workspace_artifacts(

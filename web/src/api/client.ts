@@ -911,6 +911,7 @@ const RunDetailSchema = RunListItemSchema.extend({
     SelfRepairRecoverySummarySchema.nullable(),
   ).optional(),
   decision_token: z.string().nullable().optional(),
+  approval_id: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),

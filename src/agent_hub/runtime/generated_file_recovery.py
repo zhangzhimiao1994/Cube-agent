@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from typing import cast
 
@@ -12,10 +14,37 @@ _ZIP_MIME_TYPE = "application/zip"
 def reusable_generated_file_result(
     tool_name: str,
     artifacts: Sequence[Artifact],
+    *,
+    arguments: Mapping[str, JsonValue],
 ) -> Mapping[str, JsonValue] | None:
     if tool_name != _PROJECT_ZIP_TOOL:
         return None
-    return final_attachment_result(artifacts, mime_type=_ZIP_MIME_TYPE, extension=".zip")
+    return final_attachment_result(
+        artifacts,
+        mime_type=_ZIP_MIME_TYPE,
+        extension=".zip",
+        tool_name=tool_name,
+        arguments_sha256=generated_file_arguments_sha256(arguments),
+    )
+
+
+def generated_file_arguments_sha256(arguments: Mapping[str, JsonValue]) -> str:
+    encoded = json.dumps(
+        _mutable_json(arguments),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _mutable_json(value: JsonValue) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(item) for item in value]
+    return value
 
 
 def final_attachment_result(
@@ -23,9 +52,18 @@ def final_attachment_result(
     *,
     mime_type: str | None = None,
     extension: str | None = None,
+    tool_name: str | None = None,
+    arguments_sha256: str | None = None,
 ) -> Mapping[str, JsonValue] | None:
     for artifact in reversed(artifacts):
         if artifact.type != "tool_result":
+            continue
+        if tool_name is not None and artifact.content.get("tool_name") != tool_name:
+            continue
+        if (
+            arguments_sha256 is not None
+            and artifact.content.get("arguments_sha256") != arguments_sha256
+        ):
             continue
         result = artifact.content.get("result")
         if _is_final_attachment_result(result, mime_type=mime_type, extension=extension):

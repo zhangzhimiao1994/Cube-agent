@@ -943,7 +943,11 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 id=uuid4(),
                 type="tool_result",
                 producer=self._actor,
-                content={"result": replayed},
+                content={
+                    "result": replayed,
+                    "tool_name": self.name,
+                    "arguments_sha256": arguments_hash,
+                },
             )
             self._records.append(
                 _ToolRecord(
@@ -1027,14 +1031,22 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
         if tool_result.status != "succeeded":
-            reusable_result = reusable_generated_file_result(self.name, self._durability.artifacts)
+            reusable_result = reusable_generated_file_result(
+                self.name,
+                self._durability.artifacts,
+                arguments=cast(Mapping[str, JsonValue], arguments),
+            )
             if reusable_result is not None:
                 reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
                 artifact = Artifact(
                     id=uuid4(),
                     type="tool_result",
                     producer=self._actor,
-                    content={"result": reusable_result},
+                    content={
+                        "result": reusable_result,
+                        "tool_name": self.name,
+                        "arguments_sha256": arguments_hash,
+                    },
                 )
                 self._records.append(
                     _ToolRecord(
@@ -1076,7 +1088,11 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             id=uuid4(),
             type="tool_result",
             producer=self._actor,
-            content={"result": tool_result.payload},
+            content={
+                "result": tool_result.payload,
+                "tool_name": self.name,
+                "arguments_sha256": arguments_hash,
+            },
         )
         self._records.append(
             _ToolRecord(

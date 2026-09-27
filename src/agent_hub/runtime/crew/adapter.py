@@ -111,6 +111,7 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS = 32
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
+_MAX_STEP_ARTIFACT_LINEAGE = 128
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_CONFIGURED_TOOL_ARGUMENT_BYTES = 10_000_000
 _MAX_AUDITED_TOKENS = 100_000_000
@@ -3233,7 +3234,12 @@ class CrewDispatchRuntime:
                         artifact is not None and isinstance(completion, GatewayCompletion)
                         and completion.response.tool_calls and model_state["purpose"] == "step"
                     ):
-                        if len(artifact.source_ids) + 1 + len(completion.response.tool_calls) > 63:
+                        if (
+                            len(artifact.source_ids)
+                            + 1
+                            + len(completion.response.tool_calls)
+                            >= _MAX_STEP_ARTIFACT_LINEAGE
+                        ):
                             _fail("artifact lineage exceeds limit")
                         provisional = _ToolLedger(
                             states=dict(tool_ledger.states),
@@ -4879,7 +4885,11 @@ class CrewDispatchRuntime:
                     )
                 else:
                     reusable_results = tuple(
-                        reusable_generated_file_result(tool_call.name, evidence)
+                        reusable_generated_file_result(
+                            tool_call.name,
+                            evidence,
+                            arguments=tool_call.arguments,
+                        )
                         for tool_call in response.tool_calls
                     )
                     if reusable_results and all(result is not None for result in reusable_results):
@@ -4894,7 +4904,11 @@ class CrewDispatchRuntime:
                     _fail("step capability round limit exceeded")
             if _round == round_budget.hard_limit:
                 reusable_results = tuple(
-                    reusable_generated_file_result(tool_call.name, evidence)
+                    reusable_generated_file_result(
+                        tool_call.name,
+                        evidence,
+                        arguments=tool_call.arguments,
+                    )
                     for tool_call in response.tool_calls
                 )
                 if reusable_results and all(result is not None for result in reusable_results):
@@ -4949,6 +4963,7 @@ class CrewDispatchRuntime:
                 generated_file_result = reusable_generated_file_result(
                     tool_call.name,
                     evidence,
+                    arguments=tool_call.arguments,
                 )
                 semantic_artifact = (
                     None
@@ -5013,6 +5028,7 @@ class CrewDispatchRuntime:
                         }
                     )
                     evidence.append(artifact)
+                    reused_semantic_results += 1
                     continue
                 reusable_result = generated_file_result
                 if reusable_result is not None:
@@ -5021,7 +5037,11 @@ class CrewDispatchRuntime:
                         id=uuid4(),
                         type="tool_result",
                         producer=step.agent,
-                        content={"result": reusable_result},
+                        content={
+                            "result": reusable_result,
+                            "tool_name": tool_call.name,
+                            "arguments_sha256": arguments_sha256,
+                        },
                         source_ids=(str(trigger_model_artifact.id),),
                     )
                     await emit(
@@ -5326,14 +5346,22 @@ class CrewDispatchRuntime:
                         evidence.append(artifact)
                         results.append({"name": tool_call.name, "result": result})
                         continue
-                    reusable_result = reusable_generated_file_result(tool_call.name, evidence)
+                    reusable_result = reusable_generated_file_result(
+                        tool_call.name,
+                        evidence,
+                        arguments=tool_call.arguments,
+                    )
                     if reusable_result is not None:
                         reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
                         artifact = Artifact(
                             id=uuid4(),
                             type="tool_result",
                             producer=step.agent,
-                            content={"result": reusable_result},
+                            content={
+                                "result": reusable_result,
+                                "tool_name": tool_call.name,
+                                "arguments_sha256": arguments_sha256,
+                            },
                             source_ids=(str(trigger_model_artifact.id),),
                         )
                         await emit(
@@ -5448,7 +5476,11 @@ class CrewDispatchRuntime:
                     id=uuid4(),
                     type="tool_result",
                     producer=step.agent,
-                    content={"result": result},
+                    content={
+                        "result": result,
+                        "tool_name": tool_call.name,
+                        "arguments_sha256": arguments_sha256,
+                    },
                     source_ids=(str(trigger_model_artifact.id),),
                 )
                 await emit(
@@ -5475,9 +5507,10 @@ class CrewDispatchRuntime:
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
                 round_progressed = True
+            reused_result_count = reused_generated_file_results + reused_semantic_results
             if reused_generated_file_results == len(response.tool_calls):
                 return _generated_file_ready_completion(completion, response)
-            force_result_synthesis = reused_semantic_results == len(response.tool_calls)
+            force_result_synthesis = reused_result_count == len(response.tool_calls)
             last_round_progressed = round_progressed
             messages.append(
                 ModelMessage(
@@ -5511,7 +5544,7 @@ class CrewDispatchRuntime:
             if artifact.id not in seen:
                 seen.add(artifact.id)
                 ordered.append(artifact)
-        if len(ordered) > 64:
+        if len(ordered) > _MAX_STEP_ARTIFACT_LINEAGE:
             _fail("artifact lineage exceeds limit")
         return tuple(ordered)
 
