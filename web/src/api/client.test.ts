@@ -1901,3 +1901,65 @@ describe("api client transport", () => {
     await expect(api.pluginAdapters()).rejects.toThrow();
   });
 });
+
+describe("web preview transport", () => {
+  it("supports starting, reading, renewing, and stopping a conversation preview", async () => {
+    const preview = {
+      id: "preview-1",
+      status: "ready",
+      preview_url: "/api/v1/web-previews/preview-1/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    const response = () =>
+      new Response(JSON.stringify(preview), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const fetchMock = vi.fn().mockImplementation(response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.startWebPreview({
+      conversation_id: "conv/preview",
+      project_id: "project-a",
+      workspace_session_id: "session-a",
+      root: "dist",
+    });
+    await api.webPreviewForConversation("conv/preview");
+    await api.renewWebPreview("preview/1");
+    await api.stopWebPreview("preview/1", { keepalive: true });
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/v1/web-previews/start",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: "conv/preview",
+          project_id: "project-a",
+          workspace_session_id: "session-a",
+          root: "dist",
+        }),
+      }),
+    ]);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(
+      /^\/api\/v1\/web-previews\/conversations\/conv%2Fpreview\?_=/,
+    );
+    expect(fetchMock.mock.calls[2]?.[0]).toBe("/api/v1/web-previews/preview%2F1/renew");
+    expect(fetchMock.mock.calls[3]?.[0]).toBe("/api/v1/web-previews/preview%2F1");
+    expect(fetchMock.mock.calls[3]?.[1]).toEqual(
+      expect.objectContaining({ method: "DELETE", keepalive: true }),
+    );
+  });
+
+  it("treats a missing conversation preview as an idle state", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { code: "not_found", message: "not found" } }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        })),
+    );
+
+    await expect(api.webPreviewForConversation("conv-empty")).resolves.toBeNull();
+  });
+});

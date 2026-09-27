@@ -2108,6 +2108,132 @@ async def test_identical_tool_call_is_reused_and_forces_result_synthesis() -> No
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
+    class MixedReuseGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id=f"zip-{len(self.requests)}",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Mixed reuse",
+                                "files": {"main.py": "print('ready')\n"},
+                                "presentation": "final_attachment",
+                            },
+                        ),
+                        ToolCall(
+                            id=f"search-{len(self.requests)}",
+                            name="web_search",
+                            arguments={"q": "same query"},
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class MixedReuseCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name in {"project.generate_zip", "web.search"}
+
+    class MixedReuseHarness:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+            self.artifact_id = str(uuid4())
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            payload: Mapping[str, JsonValue]
+            if request.tool_name == "project.generate_zip":
+                payload = {
+                    "artifact_id": self.artifact_id,
+                    "file": {
+                        "artifact_id": self.artifact_id,
+                        "filename": "mixed-reuse.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "download_url": (
+                            f"/api/v1/runs/{RUN_ID}/artifacts/{self.artifact_id}/download"
+                        ),
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated mixed-reuse.zip.",
+                }
+            else:
+                payload = {"items": ("same result",)}
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload=payload,
+            )
+
+    tools = ("project.generate_zip", "web.search")
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=tools,
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=tools,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=tools,
+        total_token_budget=100,
+    )
+    gateway = MixedReuseGateway()
+    harness = MixedReuseHarness()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=MixedReuseCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="step capability round limit exceeded"):
+        _ = [
+            event
+            async for event in runtime.run(
+                _context(routing_decision={"project_scale": "medium"})
+            )
+        ]
+
+    assert len(harness.calls) == 2
+    assert len(gateway.requests) == 9
+
+
 @pytest.mark.parametrize(
     ("project_scale", "hard_limit"),
     [

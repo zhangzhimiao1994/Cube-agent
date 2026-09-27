@@ -5,107 +5,100 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import textwrap
 import zipfile
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 
-def test_skill_runner_executes_valid_self_contained_package() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(
-            tmp_path,
-            entry_body=(
-                "import json, sys\n"
-                "payload = json.load(sys.stdin)\n"
-                "print('hello ' + payload['name'])\n"
-            ),
-        )
+def test_skill_runner_executes_valid_self_contained_package(tmp_path: Path) -> None:
+    package = _skill_zip(
+        tmp_path,
+        entry_body=(
+            "import json, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            "print('hello ' + payload['name'])\n"
+        ),
+    )
 
-        result = _run_runner(
-            package,
-            tmp_path,
-            input_text='{"name":"agent"}',
-            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
-        )
+    result = _run_runner(
+        package,
+        tmp_path,
+        input_text='{"name":"agent"}',
+        sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+    )
 
     assert result.returncode == 0
     assert result.stdout == "hello agent\n"
     assert result.stderr == ""
 
 
-def test_skill_runner_rejects_package_hash_mismatch() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(tmp_path)
+def test_skill_runner_rejects_package_hash_mismatch(tmp_path: Path) -> None:
+    package = _skill_zip(tmp_path)
 
-        result = _run_runner(package, tmp_path, input_text="{}", sha256="0" * 64)
+    result = _run_runner(package, tmp_path, input_text="{}", sha256="0" * 64)
 
     assert result.returncode == 78
     assert "sha256 does not match" in result.stderr
 
 
-def test_skill_runner_rejects_runtime_dependency_install() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(tmp_path, requirements="pydantic==2.10.0\n")
+def test_skill_runner_rejects_runtime_dependency_install(tmp_path: Path) -> None:
+    package = _skill_zip(tmp_path, requirements="pydantic==2.10.0\n")
 
-        result = _run_runner(
-            package,
-            tmp_path,
-            input_text="{}",
-            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
-        )
+    result = _run_runner(
+        package,
+        tmp_path,
+        input_text="{}",
+        sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+    )
 
     assert result.returncode == 78
     assert "dependencies are not installed" in result.stderr
 
 
-def test_skill_runner_rejects_unknown_sandbox_profile() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(tmp_path)
+def test_skill_runner_rejects_unknown_sandbox_profile(tmp_path: Path) -> None:
+    package = _skill_zip(tmp_path)
 
-        result = _run_runner(
-            package,
-            tmp_path,
-            input_text="{}",
-            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
-            sandbox_profile="unconfined",
-        )
+    result = _run_runner(
+        package,
+        tmp_path,
+        input_text="{}",
+        sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+        sandbox_profile="unconfined",
+    )
 
     assert result.returncode == 78
     assert "sandbox profile" in result.stderr
 
 
-def test_skill_runner_rejects_incompatible_runtime() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(tmp_path, compatible_runtime="node22")
+def test_skill_runner_rejects_incompatible_runtime(tmp_path: Path) -> None:
+    package = _skill_zip(tmp_path, compatible_runtime="node22")
 
-        result = _run_runner(
-            package,
-            tmp_path,
-            input_text="{}",
-            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
-        )
+    result = _run_runner(
+        package,
+        tmp_path,
+        input_text="{}",
+        sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+    )
 
     assert result.returncode == 78
     assert "compatible runtime" in result.stderr
 
 
-def test_skill_runner_rejects_network_policy_without_controlled_egress() -> None:
-    with _workspace_tmpdir() as tmp_path:
-        package = _skill_zip(
-            tmp_path,
-            network_mode="allowlist",
-            allow_hosts=("api.example.com",),
-        )
+def test_skill_runner_rejects_network_policy_without_controlled_egress(
+    tmp_path: Path,
+) -> None:
+    package = _skill_zip(
+        tmp_path,
+        network_mode="allowlist",
+        allow_hosts=("api.example.com",),
+    )
 
-        result = _run_runner(
-            package,
-            tmp_path,
-            input_text="{}",
-            sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
-        )
+    result = _run_runner(
+        package,
+        tmp_path,
+        input_text="{}",
+        sha256=hashlib.sha256(package.read_bytes()).hexdigest(),
+    )
 
     assert result.returncode == 78
     assert "network policy" in result.stderr
@@ -175,11 +168,3 @@ def _skill_zip(
         if requirements:
             archive.writestr("requirements.txt", requirements)
     return package
-
-
-@contextmanager
-def _workspace_tmpdir() -> Iterator[Path]:
-    root = Path.cwd() / ".pytest-tmp"
-    root.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root) as directory:
-        yield Path(directory)

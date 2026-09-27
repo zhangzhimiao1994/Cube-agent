@@ -176,6 +176,18 @@ class ConversationQueueRepository:
             ).all()
         return tuple(self._item(row) for row in rows)
 
+    async def get(self, tenant_id: UUID, item_id: UUID) -> ConversationQueueItem:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(ConversationQueueItemRow).where(
+                    ConversationQueueItemRow.tenant_id == tenant_id,
+                    ConversationQueueItemRow.id == item_id,
+                )
+            )
+        if row is None:
+            raise ConversationQueueNotFound("queue item was not found")
+        return self._item(row)
+
     async def edit(
         self,
         tenant_id: UUID,

@@ -5013,7 +5013,6 @@ class CrewDispatchRuntime:
                         }
                     )
                     evidence.append(artifact)
-                    round_progressed = True
                     continue
                 reusable_result = generated_file_result
                 if reusable_result is not None:
@@ -5056,7 +5055,6 @@ class CrewDispatchRuntime:
                     evidence.append(artifact)
                     results.append({"name": tool_call.name, "result": reusable_result})
                     reused_generated_file_results += 1
-                    round_progressed = True
                     continue
                 replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
                 replay_safe = bool(

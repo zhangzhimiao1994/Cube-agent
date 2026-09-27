@@ -189,6 +189,31 @@ _DASHSCOPE_AUTH_HINT = (
     "https://dashscope.aliyuncs.com/compatible-mode/v1；API Key 输入框只填写 sk-... 原文，"
     "不要带 Bearer 前缀。"
 )
+
+
+async def _stop_conversation_preview(
+    request: Request,
+    tenant_id: UUID,
+    conversation_id: str,
+) -> None:
+    manager = getattr(request.app.state, "preview_manager", None)
+    stop_conversation = getattr(manager, "stop_conversation", None)
+    if not callable(stop_conversation):
+        return
+    try:
+        await asyncio.to_thread(stop_conversation, tenant_id, conversation_id)
+    except Exception as error:
+        _LOGGER.exception(
+            "failed to stop conversation preview",
+            extra={"tenant_id": str(tenant_id), "conversation_id": conversation_id},
+        )
+        raise PublicAPIError(
+            503,
+            "preview_stop_failed",
+            "website preview could not be stopped safely",
+        ) from error
+
+
 _OPENAI_COMPATIBLE_AUTH_HINT = (
     "OpenAI 兼容中转站返回 401/403 通常表示鉴权失败：请确认 API Key 属于该中转站账号，"
     "API Base 是否需要带 /v1，并且 API Key 输入框只填写 token 原文，不要带 Bearer 前缀。"
@@ -17568,14 +17593,18 @@ async def get_conversation(
 async def update_conversation(
     conversation_id: str,
     body: ConversationUpdateRequest,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> ConversationResponse:
     _require(principal, "run:create")
+    if body.archived is True:
+        await _stop_conversation_preview(request, principal.tenant_id, conversation_id)
     try:
-        return await service.update_conversation(conversation_id, body)
+        response = await service.update_conversation(conversation_id, body)
     except (ConversationNotFound, KeyError) as error:
         raise PublicAPIError(404, "conversation_not_found", "conversation was not found") from error
+    return response
 
 
 @router.post(
@@ -17698,11 +17727,20 @@ async def pause_operational_run(
 )
 async def resume_operational_run(
     run_id: UUID,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> RunDetailResponse:
     _require(principal, "run:resume")
     try:
+        detail = await service.get_run(run_id)
+        conversation_id = detail.conversation_id or detail.explicit_details.get("conversation_id")
+        if conversation_id:
+            await _stop_conversation_preview(
+                request,
+                principal.tenant_id,
+                conversation_id,
+            )
         return await service.resume_run(run_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None

@@ -38,6 +38,7 @@ from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment
 from agent_hub.runs.conversation_queue import (
     ConversationQueueConflict,
     ConversationQueueItem,
+    ConversationQueueNotFound,
     ConversationQueueRepository,
     EnqueueConversationMessage,
 )
@@ -134,6 +135,7 @@ class RunSummary:
     completed_step_ids: tuple[str, ...]
     artifact_ids: tuple[UUID, ...]
     usage_cost_usd: Decimal
+    conversation_id: str | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -446,11 +448,13 @@ class RunService:
         instruction_context_loader: InstructionContextLoader | None = None,
         conversation_repository: ConversationRepositoryProtocol | None = None,
         conversation_queue_repository: ConversationQueueRepository | None = None,
+        conversation_preview_stopper: Callable[[UUID, str], Awaitable[None]] | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
         self._conversation_repository = conversation_repository
         self._conversation_queue_repository = conversation_queue_repository
+        self._conversation_preview_stopper = conversation_preview_stopper
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -510,6 +514,7 @@ class RunService:
             project_id = conversation.project_id
             project_label = conversation.project_label
             workspace_session_id = conversation.workspace_path
+        await self._stop_conversation_preview(tenant_id, effective_conversation_id)
         workspace = workspace_selection(
             project_id=project_id,
             project_label=project_label,
@@ -1166,6 +1171,7 @@ class RunService:
         version: int,
     ) -> SubmittedRun:
         del actor_id
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.approve_temporary_agent_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1188,6 +1194,7 @@ class RunService:
         cleaned_feedback = feedback.strip()
         if not cleaned_feedback:
             raise ValueError("temporary agent feedback must not be blank")
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.revise_temporary_agent_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1207,6 +1214,7 @@ class RunService:
         version: int,
     ) -> SubmittedRun:
         del actor_id
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.accept_self_repair_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1225,6 +1233,7 @@ class RunService:
         version: int,
     ) -> SubmittedRun:
         del actor_id
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.approve_project_preflight_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1243,6 +1252,7 @@ class RunService:
         version: int,
     ) -> SubmittedRun:
         del actor_id
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.approve_capability_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1282,6 +1292,7 @@ class RunService:
     ) -> SubmittedRun:
         del actor_id
         cleaned_operator_note = operator_note.strip() if operator_note else None
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.choose_mode_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1389,6 +1400,25 @@ class RunService:
         record = await self._repository.get(tenant_id, run_id)
         return await self._summary(record)
 
+    async def _stop_conversation_preview(
+        self,
+        tenant_id: UUID,
+        conversation_id: str | None,
+    ) -> None:
+        if self._conversation_preview_stopper is None or not conversation_id:
+            return
+        await self._conversation_preview_stopper(tenant_id, conversation_id)
+
+    async def _stop_run_preview(self, tenant_id: UUID, run_id: UUID) -> None:
+        if self._conversation_preview_stopper is None:
+            return
+        record = await self._repository.get(tenant_id, run_id)
+        routing_decision = record.routing_decision or {}
+        await self._stop_conversation_preview(
+            tenant_id,
+            _string_or_none(routing_decision.get("conversation_id")),
+        )
+
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
         return await self._repository.events(tenant_id, run_id)
 
@@ -1397,6 +1427,7 @@ class RunService:
         return await self._summary(record)
 
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
+        await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.enqueue_existing_run(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1488,6 +1519,15 @@ class RunService:
         return await self._conversation_queue_repository.list_for_conversation(
             tenant_id, conversation_id
         )
+
+    async def conversation_queue_item(
+        self,
+        tenant_id: UUID,
+        item_id: UUID,
+    ) -> ConversationQueueItem:
+        if self._conversation_queue_repository is None:
+            raise ConversationQueueNotFound("conversation queue is unavailable")
+        return await self._conversation_queue_repository.get(tenant_id, item_id)
 
     async def edit_queued_message(
         self,
@@ -2271,6 +2311,7 @@ class RunService:
         return _submitted(await self._repository.get(tenant_id, run_id))
 
     async def _summary(self, record: RunRecord) -> RunSummary:
+        routing_decision = record.routing_decision or {}
         return RunSummary(
             id=record.id,
             tenant_id=record.tenant_id,
@@ -2283,6 +2324,7 @@ class RunService:
             ),
             artifact_ids=await self._repository.artifact_ids(record.tenant_id, record.id),
             usage_cost_usd=await self._repository.usage_cost(record.tenant_id, record.id),
+            conversation_id=_string_or_none(routing_decision.get("conversation_id")),
         )
 
     async def _safe_notify_terminal_hooks(

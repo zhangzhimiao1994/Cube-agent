@@ -135,6 +135,74 @@ class ConversationMetadataRepository:
         return self.record
 
 
+class PreviewMutationRepository:
+    def __init__(self, *, tenant_id: UUID, actor_id: UUID, run_id: UUID) -> None:
+        self.sequence: list[str] = []
+        self.record = RunRecord(
+            id=run_id,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request="continue",
+            mode=TaskMode.DIRECT,
+            status=RunStatus.QUEUED,
+            version=1,
+            created_at=datetime.now(UTC),
+            routing_decision={"conversation_id": "conv-preview"},
+        )
+
+    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+        assert tenant_id == self.record.tenant_id
+        assert run_id == self.record.id
+        return self.record
+
+    async def approve_temporary_agent_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def revise_temporary_agent_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def accept_self_repair_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def approve_project_preflight_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def approve_capability_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def choose_mode_and_enqueue(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def enqueue_existing_run(self, **kwargs: object) -> RunRecord:
+        del kwargs
+        self.sequence.append("mutation")
+        return self.record
+
+    async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
+        del tenant_id, run_id
+        return ()
+
+    async def artifact_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
+        del tenant_id, run_id
+        return ()
+
+    async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> float:
+        del tenant_id, run_id
+        return 0.0
+
+
 class RecordingHermesAdvisor:
     def __init__(self, advice: HermesRunAdvice | None) -> None:
         self.advice = advice
@@ -188,6 +256,132 @@ class RecordingRuntimeMemoryRecall:
                 reason="当前项目记忆",
             ),
         )
+
+
+async def test_submit_stops_conversation_preview_before_creating_run() -> None:
+    repository = ConversationModeRepository(None)
+    stopped: list[tuple[UUID, str]] = []
+
+    async def stop_preview(tenant_id: UUID, conversation_id: str) -> None:
+        stopped.append((tenant_id, conversation_id))
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        conversation_preview_stopper=stop_preview,
+    )
+    tenant_id = uuid4()
+
+    await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="continue the project",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-preview",
+    )
+
+    assert stopped == [(tenant_id, "conv-preview")]
+    assert len(repository.created) == 1
+
+
+async def test_submit_preview_stop_failure_prevents_run_creation() -> None:
+    repository = ConversationModeRepository(None)
+
+    async def stop_preview(_tenant_id: UUID, _conversation_id: str) -> None:
+        raise RuntimeError("preview stop failed")
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        conversation_preview_stopper=stop_preview,
+    )
+
+    with pytest.raises(RuntimeError, match="preview stop failed"):
+        await service.submit(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            message="continue the project",
+            mode=TaskMode.DIRECT,
+            conversation_id="conv-preview",
+        )
+
+    assert repository.created == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "method_kwargs"),
+    [
+        (
+            "approve_temporary_agent",
+            {"actor_id": uuid4(), "decision_token": "decision", "version": 1},
+        ),
+        (
+            "revise_temporary_agent",
+            {
+                "actor_id": uuid4(),
+                "decision_token": "decision",
+                "version": 1,
+                "feedback": "revise this",
+            },
+        ),
+        (
+            "accept_self_repair",
+            {"actor_id": uuid4(), "decision_token": "decision", "version": 1},
+        ),
+        (
+            "approve_project_preflight",
+            {"actor_id": uuid4(), "decision_token": "decision", "version": 1},
+        ),
+        (
+            "approve_capability",
+            {"actor_id": uuid4(), "approval_id": "approval", "version": 1},
+        ),
+        (
+            "choose_mode",
+            {
+                "actor_id": uuid4(),
+                "mode": TaskMode.DIRECT,
+                "decision_token": "decision",
+                "version": 1,
+            },
+        ),
+        ("resume", {}),
+    ],
+)
+async def test_run_state_entry_stops_preview_before_mutation(
+    method_name: str,
+    method_kwargs: dict[str, object],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    repository = PreviewMutationRepository(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=run_id,
+    )
+
+    async def stop_preview(actual_tenant_id: UUID, conversation_id: str) -> None:
+        assert actual_tenant_id == tenant_id
+        assert conversation_id == "conv-preview"
+        repository.sequence.append("stop")
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        conversation_preview_stopper=stop_preview,
+    )
+    method = getattr(service, method_name)
+
+    await method(tenant_id=tenant_id, run_id=run_id, **method_kwargs)
+
+    assert repository.sequence == ["stop", "mutation"]
 
 
 @pytest.mark.parametrize(

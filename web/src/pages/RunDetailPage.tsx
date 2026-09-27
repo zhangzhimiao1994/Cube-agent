@@ -12,6 +12,7 @@ import {
   type DownloadableFile,
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
+import { WebsiteServicePreview, webPreviewRoot, type WebPreviewScope } from "./RunsPage";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MODEL_CAPABILITY_LABELS: Record<string, string> = {
@@ -3041,9 +3042,11 @@ function DetailWorkbenchActionRow({
 function DetailWorkbenchFilePreview({
   file,
   onOpenSource,
+  webPreviewScope,
 }: {
   file: DetailWorkbenchFileItem;
   onOpenSource: (card: DetailProcessCard) => void;
+  webPreviewScope?: WebPreviewScope | null;
 }) {
   const [previewText, setPreviewText] = useState<string | null>(file.text);
   const [previewMode, setPreviewMode] = useState<"source" | "live">("source");
@@ -3079,32 +3082,8 @@ function DetailWorkbenchFilePreview({
     };
   }, [canPreview, downloadUrl, file.id, file.text]);
 
-  return (
-    <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
-      <div className="agent-workbench-file-preview-header">
-        <div>
-          <small>{file.operation}</small>
-          <strong>{file.path || file.filename}</strong>
-        </div>
-        <ArtifactFileCard artifact={file.download} compact />
-      </div>
-      <dl>
-        <div>
-          <dt>类型</dt>
-          <dd>{[file.kind, file.mimeType, file.size].filter(Boolean).join(" · ") || "文件"}</dd>
-        </div>
-        {file.sha256 ? (
-          <div>
-            <dt>SHA-256</dt>
-            <dd>{file.sha256.slice(0, 16)}</dd>
-          </div>
-        ) : null}
-      </dl>
-      {file.source ? (
-        <button type="button" className="secondary-action" onClick={() => onOpenSource(file.source as DetailProcessCard)}>
-          查看来源动作
-        </button>
-      ) : null}
+  const previewContent = (
+    <>
       {canPreview && htmlPreview?.eligible ? (
         <div className="agent-workbench-preview-mode" role="group" aria-label="预览方式">
           <button type="button" className="secondary-action" aria-pressed={previewMode === "source"} onClick={() => setPreviewMode("source")}>
@@ -3137,6 +3116,44 @@ function DetailWorkbenchFilePreview({
       ) : (
         <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
       )}
+    </>
+  );
+
+  return (
+    <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
+      <div className="agent-workbench-file-preview-header">
+        <div>
+          <small>{file.operation}</small>
+          <strong>{file.path || file.filename}</strong>
+        </div>
+        <ArtifactFileCard artifact={file.download} compact />
+      </div>
+      <dl>
+        <div>
+          <dt>类型</dt>
+          <dd>{[file.kind, file.mimeType, file.size].filter(Boolean).join(" · ") || "文件"}</dd>
+        </div>
+        {file.sha256 ? (
+          <div>
+            <dt>SHA-256</dt>
+            <dd>{file.sha256.slice(0, 16)}</dd>
+          </div>
+        ) : null}
+      </dl>
+      {file.source ? (
+        <button type="button" className="secondary-action" onClick={() => onOpenSource(file.source as DetailProcessCard)}>
+          查看来源动作
+        </button>
+      ) : null}
+      {isDetailHtmlPreviewCandidate(file) ? (
+        <WebsiteServicePreview
+          root={webPreviewRoot(file.path)}
+          scope={webPreviewScope}
+          title={file.filename}
+        >
+          {previewContent}
+        </WebsiteServicePreview>
+      ) : previewContent}
       {error ? (
         <p role="alert" className="form-error">
           {error}
@@ -3152,12 +3169,14 @@ function DetailProcessDrawer({
   dialogId,
   onClose,
   onSelectCard,
+  webPreviewScope,
 }: {
   cards: DetailProcessCard[];
   selectedCard: DetailProcessCard | null;
   dialogId: string;
   onClose: () => void;
   onSelectCard: (card: DetailProcessCard | null) => void;
+  webPreviewScope?: WebPreviewScope | null;
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const [activeView, setActiveView] = useState<DetailWorkbenchView>("overview");
@@ -3350,7 +3369,12 @@ function DetailProcessDrawer({
                       <small>{selectedFile ? selectedFile.path || selectedFile.filename : `${fileItems.length} 个文件/产物`}</small>
                     </div>
                     {selectedFile ? (
-                      <DetailWorkbenchFilePreview key={selectedFile.id} file={selectedFile} onOpenSource={onSelectCard} />
+                      <DetailWorkbenchFilePreview
+                        key={selectedFile.id}
+                        file={selectedFile}
+                        onOpenSource={onSelectCard}
+                        webPreviewScope={webPreviewScope}
+                      />
                     ) : (
                       <p className="agent-workbench-compressed-note">点击动作里的文件，可在这里直接预览内容。</p>
                     )}
@@ -3366,7 +3390,7 @@ function DetailProcessDrawer({
   );
 }
 
-function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
+function DetailProcessSummary({ cards, webPreviewScope }: { cards: DetailProcessCard[]; webPreviewScope?: WebPreviewScope | null }) {
   const [selectedCard, setSelectedCard] = useState<DetailProcessCard | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const previouslyFocused = useRef<HTMLElement | null>(null);
@@ -3425,6 +3449,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
           dialogId={workbenchId}
           onClose={() => setDrawerOpen(false)}
           onSelectCard={setSelectedCard}
+          webPreviewScope={webPreviewScope}
         />
       ) : null}
     </section>
@@ -3580,6 +3605,16 @@ export function RunDetailPage() {
     ...detailProcessCards(timelineItems, orderedRunData.artifacts),
     ...detailToolLifecycleCards(orderedRunData, toolLifecycles, orderedRunData.artifacts),
   ];
+  const webPreviewScope: WebPreviewScope | null =
+    orderedRunData.conversation_id?.trim() &&
+    orderedRunData.explicit_details.project_id?.trim() &&
+    orderedRunData.explicit_details.workspace_session_id?.trim()
+      ? {
+          conversationId: orderedRunData.conversation_id.trim(),
+          projectId: orderedRunData.explicit_details.project_id.trim(),
+          workspaceSessionId: orderedRunData.explicit_details.workspace_session_id.trim(),
+        }
+      : null;
   const posture = detailPosture(orderedRunData);
   const explicitRows = explicitDetailRows(orderedRunData.explicit_details);
   const executionIntents = executionIntentsForDetail(orderedRunData);
@@ -3942,7 +3977,7 @@ export function RunDetailPage() {
         </article>
       ) : null}
 
-      <DetailProcessSummary cards={processCards} />
+      <DetailProcessSummary cards={processCards} webPreviewScope={webPreviewScope} />
 
       {failureDiagnostics.length > 0 ? (
         <section className="run-failure-diagnostics" aria-label="故障诊断">

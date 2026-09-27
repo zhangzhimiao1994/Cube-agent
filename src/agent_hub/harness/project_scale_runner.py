@@ -12,6 +12,7 @@ import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from http.cookies import SimpleCookie
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
@@ -216,6 +217,11 @@ class ProjectScaleCaseResult:
     run_id: str | None
     status: str | None
     evidence: dict[str, bool]
+    observed_mode: str | None = None
+    final_observed_mode: str | None = None
+    participant_agent_ids: tuple[str, ...] = ()
+    participant_event_kinds: tuple[str, ...] = ()
+    participant_event_count: int = 0
     validation_focus: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
 
@@ -236,6 +242,8 @@ class ProjectScaleCaseResult:
             required = tuple(key for key in required if key != "project_preflight_approval")
         if _case_requires_discussion_trace(self.case_id):
             required = (*required, "discussion_trace")
+        if _case_requires_multi_agent_participation(self.case_id):
+            required = (*required, "multi_agent_participation")
         if _case_requires_plugin_contract(self.case_id):
             required = (*required, "plugin_contract")
         if _case_requires_self_repair_trace(self.case_id):
@@ -274,6 +282,12 @@ class ProjectScaleCaseResult:
             "case_id": self.case_id,
             "run_id": self.run_id,
             "status": self.status,
+            "observed_mode": self.observed_mode,
+            "initial_observed_mode": self.observed_mode,
+            "final_observed_mode": self.final_observed_mode or self.observed_mode,
+            "participant_agent_ids": list(self.participant_agent_ids),
+            "participant_event_kinds": list(self.participant_event_kinds),
+            "participant_event_count": self.participant_event_count,
             "ok": self.ok,
             "repair_attempted": self.repair_attempted,
             "repair_outcome": self.repair_outcome,
@@ -348,6 +362,7 @@ class UrllibAcceptanceClient:
         self._username = username
         self._password = password
         self._tenant_id = tenant_id
+        self._cookies: dict[str, str] = {}
 
     def request_json(
         self,
@@ -393,9 +408,19 @@ class UrllibAcceptanceClient:
             headers = dict(headers)
             headers["Authorization"] = f"Bearer {self._bearer_token}"
         url = urljoin(self._base_url, path.lstrip("/"))
+        if self._cookies:
+            headers = dict(headers)
+            headers["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in sorted(self._cookies.items())
+            )
         request = Request(url, data=data, headers=headers, method=method)
         try:
             with urlopen(request, timeout=self._timeout) as response:
+                response_headers = getattr(response, "headers", None)
+                if response_headers is not None:
+                    self._capture_response_cookies(
+                        response_headers.get_all("Set-Cookie") or ()
+                    )
                 return cast(bytes, response.read())
         except HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
@@ -415,6 +440,16 @@ class UrllibAcceptanceClient:
 
     def _can_login(self) -> bool:
         return bool(self._username and self._password)
+
+    def _capture_response_cookies(self, values: Sequence[str]) -> None:
+        for value in values:
+            parsed = SimpleCookie()
+            parsed.load(value)
+            for name, morsel in parsed.items():
+                if not morsel.value or morsel["max-age"] == "0":
+                    self._cookies.pop(name, None)
+                else:
+                    self._cookies[name] = morsel.value
 
     def _refresh_bearer_token(self) -> None:
         if not self._can_login():
@@ -498,6 +533,7 @@ def execute_project_scale_plan(
             "deliverable_quality": False,
             "agent_standard_verification": False,
             "discussion_trace": False,
+            "multi_agent_participation": False,
             "plugin_contract": False,
             "deliverable_repair_trace": False,
             "self_repair_trace": False,
@@ -512,6 +548,10 @@ def execute_project_scale_plan(
         errors: list[str] = []
         run_id: str | None = None
         status: str | None = None
+        observed_mode: str | None = None
+        final_observed_mode: str | None = None
+        participant_agent_ids: set[str] = set()
+        participant_event_kinds: list[str] = []
         case_deadline = time.monotonic() + max(wait_seconds, 0)
         try:
             _report_progress(progress, f"{case_label}: submitting run")
@@ -532,6 +572,8 @@ def execute_project_scale_plan(
                 raise RuntimeError("run create response missing id")
             run_id = raw_run_id
             status = _string_value(response.get("status"))
+            observed_mode = _execution_mode(response) or observed_mode
+            final_observed_mode = _execution_mode(response) or final_observed_mode
             _validate_run_submission_scope(response, request_body)
             _extend_unique(
                 errors,
@@ -564,6 +606,16 @@ def execute_project_scale_plan(
                 defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
             )
             status = observation.status
+            observed_mode = observed_mode or _execution_mode(observation.details)
+            final_observed_mode = _execution_mode(observation.details) or final_observed_mode
+            observed_participants, observed_event_kinds = _multi_agent_participation(
+                observation.events
+            )
+            participant_agent_ids.update(observed_participants)
+            participant_event_kinds.extend(observed_event_kinds)
+            evidence["multi_agent_participation"] = (
+                len(participant_agent_ids) >= 2 and len(participant_event_kinds) >= 2
+            )
             initial_self_repair_trace = _has_self_repair_trace(observation.events)
             _extend_unique(
                 errors,
@@ -609,6 +661,9 @@ def execute_project_scale_plan(
                             raise RuntimeError("self repair acceptance response missing id")
                         run_id = repair_run_id
                         status = _string_value(repair_response.get("status")) or status
+                        final_observed_mode = (
+                            _execution_mode(repair_response) or final_observed_mode
+                        )
                         evidence["deliverable_repair_trace"] = True
                         self_repair_observation = _collect_run_observation(
                             client,
@@ -623,6 +678,10 @@ def execute_project_scale_plan(
                         )
                         observation = self_repair_observation
                         status = self_repair_observation.status
+                        final_observed_mode = (
+                            _execution_mode(self_repair_observation.details)
+                            or final_observed_mode
+                        )
                         _extend_unique(
                             errors,
                             _validate_mode_control(
@@ -734,6 +793,10 @@ def execute_project_scale_plan(
                             *agent_standard_verification.reasons,
                             *discussion_trace.reasons,
                             *plugin_contract.reasons,
+                            *_multi_agent_participation_reasons(
+                                evidence,
+                                case_id=run_request.case_id,
+                            ),
                             *generated_project_validation.reasons,
                             *_self_repair_trace_reasons(
                                 evidence,
@@ -765,6 +828,7 @@ def execute_project_scale_plan(
                 evidence["deliverable_repair_trace"] = True
                 run_id = repair_run_id
                 status = _string_value(repair_response.get("status")) or status
+                final_observed_mode = _execution_mode(repair_response) or final_observed_mode
                 approval_status = _approve_project_preflight_run(
                     client,
                     run_id=run_id,
@@ -790,6 +854,9 @@ def execute_project_scale_plan(
                     defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                 )
                 status = repair_observation.status
+                final_observed_mode = (
+                    _execution_mode(repair_observation.details) or final_observed_mode
+                )
                 _extend_unique(
                     errors,
                     _validate_mode_control(
@@ -879,6 +946,10 @@ def execute_project_scale_plan(
                         and not evidence["plugin_contract"]
                     )
                     or (
+                        _case_requires_multi_agent_participation(run_request.case_id)
+                        and not evidence["multi_agent_participation"]
+                    )
+                    or (
                         validate_generated_project
                         and not evidence["generated_project_validation"]
                     )
@@ -898,6 +969,16 @@ def execute_project_scale_plan(
                     and not evidence["plugin_contract"]
                 ):
                     errors.extend(plugin_contract.reasons)
+                if (
+                    _case_requires_multi_agent_participation(run_request.case_id)
+                    and not evidence["multi_agent_participation"]
+                ):
+                    errors.extend(
+                        _multi_agent_participation_reasons(
+                            evidence,
+                            case_id=run_request.case_id,
+                        )
+                    )
                 if validate_generated_project and not evidence["generated_project_validation"]:
                     errors.extend(generated_project_validation.reasons)
             if run_id is not None and not _is_terminal_status(status):
@@ -931,6 +1012,11 @@ def execute_project_scale_plan(
             run_id=run_id,
             status=status,
             evidence=evidence,
+            observed_mode=observed_mode,
+            final_observed_mode=final_observed_mode or observed_mode,
+            participant_agent_ids=tuple(sorted(participant_agent_ids)),
+            participant_event_kinds=tuple(participant_event_kinds),
+            participant_event_count=len(participant_event_kinds),
             validation_focus=run_request.validation_focus,
             errors=tuple(errors),
         )
@@ -1455,6 +1541,13 @@ def _run_generated_project_command(
 ) -> str | None:
     if not command or any(not isinstance(part, str) or not part for part in command):
         return "generated_project_validation: invalid validation command"
+    if command[0].casefold() in {"node", "npm", "npm.cmd", "npx", "npx.cmd"} and not (
+        _generated_project_validation_is_isolated()
+    ):
+        return (
+            "generated_project_validation: isolated systemd validator is required "
+            "for generated npm/node commands"
+        )
     safe_env = _generated_project_command_env()
     executable = shutil.which(command[0], path=safe_env.get("PATH")) or command[0]
     resolved_command = [executable, *command[1:]]
@@ -1490,6 +1583,18 @@ def _run_generated_project_command(
             f"exit={completed.returncode} command={_format_command(command)}{output_note}"
         )
     return None
+
+
+def _generated_project_validation_is_isolated() -> bool:
+    if os.name != "posix":
+        return False
+    if os.environ.get("AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX") != "systemd":
+        return False
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "agent-hub-acceptance-" in cgroup
 
 
 def _generated_project_output_tail(value: str) -> str:
@@ -1676,7 +1781,10 @@ def _refresh_run_terminal_status(
 
 
 def _validate_run_submission_scope(response: dict[str, object], body: dict[str, object]) -> None:
-    for field in ("project_id", "workspace_session_id"):
+    fields = ["project_id", "workspace_session_id"]
+    if isinstance(body.get("conversation_id"), str) and body["conversation_id"]:
+        fields.append("conversation_id")
+    for field in fields:
         expected = body.get(field)
         actual = response.get(field)
         if not isinstance(expected, str) or not expected:
@@ -1950,6 +2058,73 @@ def _validate_mode_control(
         got = actual if isinstance(actual, str) and actual else "missing"
         return [f"mode_control: requested {requested} got {got}"]
     return []
+
+
+def _execution_mode(response: Mapping[str, object] | None) -> str | None:
+    if response is None:
+        return None
+    mode = response.get("mode")
+    if mode in {"direct", "dispatch", "hybrid"}:
+        return mode
+    return None
+
+
+def _multi_agent_participation(
+    events: list[object] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return distinct participant identities and one kind entry per attributable event."""
+
+    participants: set[str] = set()
+    event_kinds: list[str] = []
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        event_participants: set[str] = set()
+        raw_event_kind = event.get("kind")
+        event_kind = (
+            raw_event_kind.strip()
+            if isinstance(raw_event_kind, str) and raw_event_kind.strip()
+            else "participant.event"
+        )
+        normalized_kind = event_kind.casefold()
+        actor = event.get("actor")
+        runtime_lifecycle_event = (
+            normalized_kind.startswith(("step.", "model.", "review."))
+            and isinstance(actor, str)
+            and bool(actor.strip())
+        )
+        agent_scoped_event = runtime_lifecycle_event or any(
+            marker in event_kind.casefold()
+            for marker in ("agent", "worker", "dispatch", "participant")
+        )
+        if not agent_scoped_event:
+            continue
+        mappings = [event]
+        payload = event.get("payload")
+        if isinstance(payload, Mapping):
+            mappings.append(payload)
+        for mapping in mappings:
+            for key in ("actor", "agent_id", "agent", "participant_id", "member"):
+                value = mapping.get(key)
+                if isinstance(value, str) and value.strip():
+                    event_participants.add(value.strip().casefold())
+            role = mapping.get("role")
+            if agent_scoped_event and isinstance(role, str) and role.strip():
+                event_participants.add(role.strip().casefold())
+            raw_participants = mapping.get("participants")
+            if isinstance(raw_participants, Sequence) and not isinstance(
+                raw_participants, str | bytes
+            ):
+                event_participants.update(
+                    item.strip().casefold()
+                    for item in raw_participants
+                    if isinstance(item, str) and item.strip()
+                )
+        if not event_participants:
+            continue
+        participants.update(event_participants)
+        event_kinds.append(event_kind)
+    return tuple(sorted(participants)), tuple(event_kinds)
 
 
 def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None:
@@ -2362,6 +2537,12 @@ def _safe_idempotency_token(value: str) -> str:
 def _safe_workspace_session_token(session_id: str, execution_id: str) -> str:
     token = re.sub(r"[^a-z0-9_-]+", "-", execution_id.casefold())
     token = re.sub(r"[-_]{2,}", "-", token).strip("-_")
+    normalized_session = re.sub(r"[^a-z0-9_-]+", "-", session_id.casefold())
+    normalized_session = re.sub(r"[-_]{2,}", "-", normalized_session).strip("-_")
+    if token and (
+        normalized_session == token or normalized_session.endswith(f"-{token}")
+    ):
+        return normalized_session[:64].rstrip("-_") or "project-scale-run"
     scoped = f"{session_id}-{token or 'run'}"
     scoped = re.sub(r"[^a-z0-9_-]+", "-", scoped.casefold())
     scoped = re.sub(r"[-_]{2,}", "-", scoped).strip("-_")
@@ -2376,6 +2557,11 @@ def _case_requires_project_preflight(case_id: str) -> bool:
 def _case_requires_discussion_trace(case_id: str) -> bool:
     _scale, _, flow = case_id.partition(":")
     return flow in _DISCUSSION_TRACE_FLOWS
+
+
+def _case_requires_multi_agent_participation(case_id: str) -> bool:
+    _scale, _, flow = case_id.partition(":")
+    return flow == "multi_agent"
 
 
 def _case_requires_plugin_contract(case_id: str) -> bool:
@@ -3415,6 +3601,10 @@ def _should_attempt_deliverable_repair(
                 _case_requires_plugin_contract(case_id)
                 and evidence.get("plugin_contract") is not True
             )
+            or (
+                _case_requires_multi_agent_participation(case_id)
+                and evidence.get("multi_agent_participation") is not True
+            )
             or evidence.get("generated_project_validation") is False
             or (
                 _case_requires_self_repair_trace(case_id)
@@ -3440,6 +3630,10 @@ def _has_followup_deliverable_repair_reason(
             _case_requires_plugin_contract(case_id)
             and evidence.get("plugin_contract") is not True
         )
+        or (
+            _case_requires_multi_agent_participation(case_id)
+            and evidence.get("multi_agent_participation") is not True
+        )
         or evidence.get("generated_project_validation") is False
         or (
             _case_requires_self_repair_trace(case_id)
@@ -3450,6 +3644,20 @@ def _has_followup_deliverable_repair_reason(
 
 def _case_requires_self_repair_trace(case_id: str) -> bool:
     return "self_repair" in case_id or "model_failure" in case_id
+
+
+def _multi_agent_participation_reasons(
+    evidence: Mapping[str, bool],
+    *,
+    case_id: str,
+) -> tuple[str, ...]:
+    if not _case_requires_multi_agent_participation(case_id):
+        return ()
+    if evidence.get("multi_agent_participation") is True:
+        return ()
+    return (
+        "multi_agent_participation: fewer than two distinct agents with attributable events",
+    )
 
 
 def _self_repair_trace_reasons(

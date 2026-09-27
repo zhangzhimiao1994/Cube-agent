@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RunDetail } from "../api/client";
+import { api, type RunDetail } from "../api/client";
 import { TestApp } from "../app/router";
 
 const runId = "55555555-5555-4555-8555-555555555555";
@@ -847,6 +847,7 @@ describe("RunDetailPage", () => {
       kind: "workspace_file",
       title: "index.html",
       filename: "index.html",
+      path: "dist/index.html",
       mime_type: "text/html",
       text: html,
       download_url: "/api/v1/artifacts/index-html/download",
@@ -922,6 +923,88 @@ describe("RunDetailPage", () => {
     await user.click(within(fileList).getByRole("button", { name: /preview\.html/ }));
     expect(within(workspace).queryByRole("button", { name: "运行预览" })).toBeNull();
     expect(within(workspace).queryByTitle("index.html 运行预览")).toBeNull();
+  });
+
+  it("starts the website preview with the run conversation workspace scope", async () => {
+    const user = userEvent.setup();
+    const htmlArtifact = {
+      ...runDetail.artifacts[0],
+      id: "artifact-site-index",
+      kind: "workspace_file",
+      title: "dist/index.html",
+      filename: "index.html",
+      mime_type: "text/html",
+      text: "<!doctype html><html><body>site</body></html>",
+      download_url: "/api/v1/artifacts/site-index/download",
+    };
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      conversation_id: "conv-detail-preview",
+      explicit_details: {
+        ...runDetail.explicit_details,
+        project_id: "project-detail-preview",
+        workspace_session_id: "session-detail-preview",
+      },
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "artifact.created",
+          summary: "创建文件 index.html",
+          payload: { operation_kind: "file_create", artifact_id: htmlArtifact.id },
+          artifact: htmlArtifact,
+        },
+      ],
+      artifacts: [htmlArtifact],
+    };
+    const preview = {
+      id: "preview-detail",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-detail/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
+    const start = vi.spyOn(api, "startWebPreview").mockResolvedValue(preview);
+    vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);
+    vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+    await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
+    const workspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
+    await user.click(within(workspace).getByRole("button", { name: "运行网站" }));
+
+    await waitFor(() =>
+      expect(start).toHaveBeenCalledWith({
+        conversation_id: "conv-detail-preview",
+        project_id: "project-detail-preview",
+        workspace_session_id: "session-detail-preview",
+        root: "dist",
+      }),
+    );
+    const serviceFrame = within(workspace).getByTitle("index.html 网站预览");
+    expect(serviceFrame.getAttribute("src")).toBe(preview.preview_url);
+    expect(serviceFrame.getAttribute("sandbox")).toBe("allow-scripts allow-forms allow-modals");
+    expect(serviceFrame.getAttribute("sandbox")).not.toContain("allow-same-origin");
   });
 
   it("shows safe command and workspace path summaries for detail action rows without downloadable files", async () => {

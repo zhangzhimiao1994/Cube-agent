@@ -35,6 +35,7 @@ from agent_hub.harness.project_scale_runner import (
     _has_agent_standard_verification,
     _has_deliverable_repair_trace,
     _has_self_repair_trace,
+    _multi_agent_participation,
     _plugin_contract_payload_passes,
     _safe_zip_member_path,
     _should_attempt_deliverable_repair,
@@ -87,6 +88,37 @@ def test_generated_project_command_env_allows_npm_registry_override(
     env = project_scale_runner_module._generated_project_command_env()
 
     assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org/"
+
+
+def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX",
+        raising=False,
+    )
+    invoked = False
+
+    def unexpected_run(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("untrusted npm command reached the host subprocess runner")
+
+    monkeypatch.setattr(project_scale_runner_module.subprocess, "run", unexpected_run)
+
+    reason = project_scale_runner_module._run_generated_project_command(
+        ("npm", "test"),
+        cwd=tmp_path,
+        timeout_seconds=30,
+    )
+
+    assert invoked is False
+    assert reason == (
+        "generated_project_validation: isolated systemd validator is required "
+        "for generated npm/node commands"
+    )
 
 
 def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,6 +412,8 @@ def test_capability_ultra_uses_independent_portfolio_requirements(
 def test_controlled_ultra_project_bundle_passes_independent_validation() -> None:
     if shutil.which("npm") is None:
         pytest.skip("npm is required for generated project validation")
+    if not project_scale_runner_module._generated_project_validation_is_isolated():
+        pytest.skip("generated npm projects require the isolated systemd validator")
     bundle = _project_bundle(
         dict(
             project_scale_artifact_zip_files(
@@ -1183,6 +1217,59 @@ def test_urllib_acceptance_client_retries_busy_acceptance_login(
     assert sleeps == [1.0]
 
 
+def test_urllib_acceptance_client_reuses_same_origin_response_cookies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cookies: list[str | None] = []
+
+    class UrlopenRequest(Protocol):
+        full_url: str
+
+        def get_header(self, header_name: str) -> str | None: ...
+
+    class Response:
+        def __init__(self, payload: bytes, *, set_cookie: str | None = None) -> None:
+            self.payload = payload
+            self.headers = Message()
+            if set_cookie is not None:
+                self.headers.add_header("Set-Cookie", set_cookie)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+    def fake_urlopen(request: object, *, timeout: float) -> Response:
+        del timeout
+        request = cast(UrlopenRequest, request)
+        cookies.append(request.get_header("Cookie"))
+        if request.full_url.endswith("/api/v1/web-previews/start"):
+            return Response(
+                b'{"id":"preview-1"}',
+                set_cookie=(
+                    "agent_preview_preview_1=secret; HttpOnly; SameSite=Strict; "
+                    "Path=/api/v1/web-previews/preview-1/content"
+                ),
+            )
+        return Response(b"<!doctype html><title>preview</title>")
+
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.urlopen", fake_urlopen)
+    client = UrllibAcceptanceClient(
+        base_url="http://agent-hub.local",
+        bearer_token="token",
+    )
+
+    client.request_json("POST", "/api/v1/web-previews/start", body={})
+    content = client.request_bytes("GET", "/api/v1/web-previews/preview-1/content/")
+
+    assert content.startswith(b"<!doctype html>")
+    assert cookies == [None, "agent_preview_preview_1=secret"]
+
+
 def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(status="completed", artifacts=[{"id": "artifact-1"}])
@@ -1194,6 +1281,7 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
     result = report.results[0]
     assert result.case_id == "small:direct"
     assert result.run_id == "run-small-direct"
+    assert result.observed_mode == "direct"
     assert result.evidence == {
         "run_details": True,
         "run_events": True,
@@ -1202,6 +1290,7 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         "deliverable_quality": True,
         "agent_standard_verification": True,
         "discussion_trace": False,
+        "multi_agent_participation": False,
         "plugin_contract": False,
         "deliverable_repair_trace": False,
         "self_repair_trace": False,
@@ -1219,6 +1308,165 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         ("GET", "/api/v1/runs/run-small-direct/events", None),
         ("GET", workspace_bundle_path, None),
     ]
+
+
+def test_execute_project_scale_plan_preserves_initial_mode_across_repair() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        actual_mode="direct",
+        repair_actual_mode="hybrid",
+        deliverable_quality_sequence=(False, True),
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert result.run_id == "run-small-direct-repair"
+    assert result.observed_mode == "direct"
+    assert result.final_observed_mode == "hybrid"
+    assert result.to_payload()["initial_observed_mode"] == "direct"
+
+
+def test_multi_agent_participation_requires_distinct_agents_with_events() -> None:
+    participants, event_kinds = _multi_agent_participation(
+        [
+            {"kind": "agent.started", "agent_id": "architect"},
+            {"kind": "agent.tool.completed", "agent_id": "architect"},
+            {"kind": "agent.completed", "payload": {"agent_id": "reviewer"}},
+        ]
+    )
+
+    assert participants == ("architect", "reviewer")
+    assert event_kinds == ("agent.started", "agent.tool.completed", "agent.completed")
+
+    duplicate_participants, _ = _multi_agent_participation(
+        [
+            {"kind": "agent.started", "agent_id": "Architect"},
+            {"kind": "agent.completed", "agent_id": "architect"},
+        ]
+    )
+    assert duplicate_participants == ("architect",)
+
+    chat_roles, chat_events = _multi_agent_participation(
+        [
+            {"kind": "message.created", "role": "user"},
+            {"kind": "message.created", "role": "assistant"},
+        ]
+    )
+    assert chat_roles == ()
+    assert chat_events == ()
+    unrelated_participants, unrelated_events = _multi_agent_participation(
+        [
+            {
+                "kind": "artifact.created",
+                "participants": ["architect", "reviewer"],
+                "payload": {"agent_id": "writer"},
+            }
+        ]
+    )
+    assert unrelated_participants == ()
+    assert unrelated_events == ()
+
+    crew_participants, crew_events = _multi_agent_participation(
+        [
+            {
+                "kind": "step.started",
+                "actor": "architect",
+                "payload": {"role": "Architect"},
+            },
+            {
+                "kind": "model.started",
+                "actor": "reviewer",
+                "payload": {"role": "Reviewer"},
+            },
+            {
+                "kind": "step.completed",
+                "actor": "architect",
+                "payload": {"role": "Architect"},
+            },
+        ]
+    )
+    assert crew_participants == ("architect", "reviewer")
+    assert crew_events == ("step.started", "model.started", "step.completed")
+
+
+def test_run_submission_scope_requires_matching_conversation() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "run scope mismatch: conversation_id expected conv-current "
+            "got conv-stale"
+        ),
+    ):
+        project_scale_runner_module._validate_run_submission_scope(
+            {
+                "project_id": "project-current",
+                "workspace_session_id": "workspace-current",
+                "conversation_id": "conv-stale",
+            },
+            {
+                "project_id": "project-current",
+                "workspace_session_id": "workspace-current",
+                "conversation_id": "conv-current",
+            },
+        )
+
+
+def test_multi_agent_participation_is_not_combined_across_repair_runs() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("multi_agent",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-multi-agent",
+        session_id="project-scale-small-multi_agent",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[{"kind": "agent.started", "agent_id": "architect"}],
+        repair_events=[{"kind": "agent.completed", "agent_id": "reviewer"}],
+        deliverable_quality_sequence=(False, True),
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert result.evidence["multi_agent_participation"] is False
+    assert result.participant_agent_ids == ("architect",), result.errors
+    assert result.participant_event_count == 1
+
+
+def test_execute_project_scale_plan_records_multi_agent_participation_evidence() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("multi_agent",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-multi-agent",
+        session_id="project-scale-small-multi_agent",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {"kind": "agent.started", "agent_id": "architect"},
+            {"kind": "agent.completed", "payload": {"agent_id": "reviewer"}},
+        ],
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert result.ok is True
+    assert result.evidence["multi_agent_participation"] is True
+    assert result.participant_agent_ids == ("architect", "reviewer")
+    assert result.participant_event_count == 2
+    assert "multi_agent_participation" in result.required_evidence
 
 
 def test_execute_project_scale_plan_accepts_production_events_envelope_and_artifact_ids() -> None:
@@ -4076,6 +4324,7 @@ class FakeAcceptanceClient:
         artifacts: list[dict[str, object]] | None = None,
         admin_artifacts: list[dict[str, object]] | None = None,
         events: list[dict[str, object]] | None = None,
+        repair_events: list[dict[str, object]] | None = None,
         events_envelope: bool = False,
         artifact_ids: list[str] | None = None,
         response_project_id: str | None = None,
@@ -4092,6 +4341,7 @@ class FakeAcceptanceClient:
         execution_evidence: bool = True,
         execution_evidence_sequence: tuple[bool, ...] | None = None,
         actual_mode: str | None = None,
+        repair_actual_mode: str | None = None,
         capability_approval_id: str | None = None,
         capability_approval_version: int | None = None,
         self_repair_decision_token: str | None = None,
@@ -4116,6 +4366,7 @@ class FakeAcceptanceClient:
         self.artifacts = artifacts or []
         self.admin_artifacts = admin_artifacts
         self.events = [{"kind": "run.created"}] if events is None else events
+        self.repair_events = repair_events
         self.events_envelope = events_envelope
         self.artifact_ids = artifact_ids or []
         self.response_project_id = response_project_id
@@ -4137,6 +4388,7 @@ class FakeAcceptanceClient:
         self.execution_evidence_sequence = list(execution_evidence_sequence or ())
         self.current_execution_evidence = execution_evidence
         self.actual_mode = actual_mode
+        self.repair_actual_mode = repair_actual_mode
         self.capability_approval_id = capability_approval_id
         self.capability_approval_version = capability_approval_version
         self.self_repair_decision_token = self_repair_decision_token
@@ -4175,8 +4427,14 @@ class FakeAcceptanceClient:
                 ),
                 "project_id": self.response_project_id or body["project_id"],
                 "workspace_session_id": self.response_session_id or body["workspace_session_id"],
-                "mode": self.actual_mode or body["mode"],
+                "mode": (
+                    self.repair_actual_mode
+                    if is_repair and self.repair_actual_mode is not None
+                    else self.actual_mode or body["mode"]
+                ),
             }
+            if "conversation_id" in body:
+                response["conversation_id"] = body["conversation_id"]
             decision_token = self.repair_decision_token if is_repair else self.decision_token
             decision_version = self.repair_decision_version if is_repair else self.decision_version
             if decision_token is not None:
@@ -4207,13 +4465,18 @@ class FakeAcceptanceClient:
                 "decision_token": self.self_repair_decision_token,
                 "version": self.self_repair_decision_version,
             }
-            return {
+            response = {
                 "id": self.repair_run_id,
                 "status": "queued",
                 "project_id": self.submitted_bodies[-1]["project_id"],
                 "workspace_session_id": self.submitted_bodies[-1]["workspace_session_id"],
-                "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
+                "mode": self.repair_actual_mode
+                or self.actual_mode
+                or self.submitted_bodies[-1]["mode"],
             }
+            if "conversation_id" in self.submitted_bodies[-1]:
+                response["conversation_id"] = self.submitted_bodies[-1]["conversation_id"]
+            return response
         if path == f"/api/v1/admin/runs/{self.run_id}":
             admin_response: dict[str, object] = {
                 "id": self.run_id,
@@ -4249,7 +4512,12 @@ class FakeAcceptanceClient:
                 "status": status,
                 "artifacts": self.artifacts,
                 "artifact_ids": self.artifact_ids,
-                "mode": self.actual_mode or self.submitted_bodies[-1]["mode"],
+                "mode": (
+                    self.repair_actual_mode
+                    if path == f"/api/v1/runs/{self.repair_run_id}/details"
+                    and self.repair_actual_mode is not None
+                    else self.actual_mode or self.submitted_bodies[-1]["mode"]
+                ),
             }
             if deliverable_quality:
                 details_response["deliverable_quality"] = {
@@ -4319,7 +4587,12 @@ class FakeAcceptanceClient:
             f"/api/v1/runs/{self.run_id}/events",
             f"/api/v1/runs/{self.repair_run_id}/events",
         }:
-            events = list(self.events)
+            events = list(
+                self.repair_events
+                if path == f"/api/v1/runs/{self.repair_run_id}/events"
+                and self.repair_events is not None
+                else self.events
+            )
             if path == f"/api/v1/runs/{self.repair_run_id}/events":
                 events = [
                     {

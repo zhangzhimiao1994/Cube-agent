@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,6 +33,17 @@ class StubAuthService:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return self.principal
+
+
+@dataclass(slots=True)
+class StubPreviewManager:
+    calls: list[tuple[UUID, str, int]] = field(default_factory=list)
+    fail: bool = False
+
+    def stop_conversation(self, tenant_id: UUID, conversation_id: str) -> None:
+        self.calls.append((tenant_id, conversation_id, threading.get_ident()))
+        if self.fail:
+            raise RuntimeError("preview stop failed")
 
 
 @dataclass(slots=True)
@@ -471,6 +483,7 @@ class StubRunService:
             completed_step_ids=("research",),
             artifact_ids=(uuid4(),),
             usage_cost_usd=Decimal("0.00"),
+            conversation_id="conv-preview",
         )
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
@@ -579,6 +592,15 @@ class StubRunService:
             if item.tenant_id == tenant_id and item.conversation_id == conversation_id
         )
 
+    async def conversation_queue_item(
+        self, tenant_id: UUID, item_id: UUID
+    ) -> ConversationQueueItem:
+        return next(
+            item
+            for item in self.queued_items
+            if item.tenant_id == tenant_id and item.id == item_id
+        )
+
     async def edit_queued_message(
         self, tenant_id: UUID, item_id: UUID, *, version: int, message: str
     ) -> ConversationQueueItem:
@@ -650,6 +672,7 @@ def _client(
     *,
     attachment_store_dir: Path | None = None,
     settings_service: StubSettingsService | None = None,
+    preview_manager: StubPreviewManager | None = None,
 ) -> tuple[TestClient, StubRunService, AuthenticatedPrincipal]:
     principal = AuthenticatedPrincipal(uuid4(), uuid4(), role)
     service = StubRunService([])
@@ -662,6 +685,8 @@ def _client(
     )
     if attachment_store_dir is not None:
         app.state.attachment_store_dir = attachment_store_dir
+    if preview_manager is not None:
+        app.state.preview_manager = preview_manager
     return TestClient(app), service, principal
 
 
@@ -716,6 +741,146 @@ def test_conversation_queue_supports_list_edit_redirect_and_cancel() -> None:
     )
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
+
+
+def test_conversation_queue_stops_preview_for_enqueue_and_redirect_only() -> None:
+    preview_manager = StubPreviewManager()
+    client, _, principal = _client(preview_manager=preview_manager)
+
+    queued = client.post(
+        "/api/v1/admin/conversations/conv-preview/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-preview-1"},
+        json={"message": "排队执行", "mode": "auto"},
+    )
+    item = queued.json()
+
+    assert queued.status_code == 202
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (principal.tenant_id, "conv-preview")
+    ]
+
+    edited = client.patch(
+        f"/api/v1/admin/conversation-queue/{item['id']}",
+        headers=bearer(),
+        json={"version": 1, "message": "编辑后排队执行"},
+    )
+    assert edited.status_code == 200
+    assert len(preview_manager.calls) == 1
+
+    redirected = client.post(
+        f"/api/v1/admin/conversation-queue/{item['id']}/redirect",
+        headers=bearer(),
+        json={"version": 2},
+    )
+    assert redirected.status_code == 200
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (principal.tenant_id, "conv-preview"),
+        (principal.tenant_id, "conv-preview"),
+    ]
+
+    replacement = client.post(
+        "/api/v1/admin/conversations/conv-preview/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-preview-2"},
+        json={"message": "稍后取消", "mode": "auto"},
+    ).json()
+    assert len(preview_manager.calls) == 3
+    cancelled = client.request(
+        "DELETE",
+        f"/api/v1/admin/conversation-queue/{replacement['id']}",
+        headers=bearer(),
+        json={"version": 1},
+    )
+    assert cancelled.status_code == 200
+    assert len(preview_manager.calls) == 3
+
+
+def test_conversation_queue_redirect_fails_closed_before_state_mutation() -> None:
+    preview_manager = StubPreviewManager()
+    client, service, _ = _client(preview_manager=preview_manager)
+    item = client.post(
+        "/api/v1/admin/conversations/conv-redirect/queue",
+        headers={**bearer(), "Idempotency-Key": "queue-preview-fail-1"},
+        json={"message": "排队执行", "mode": "auto"},
+    ).json()
+    preview_manager.fail = True
+
+    response = client.post(
+        f"/api/v1/admin/conversation-queue/{item['id']}/redirect",
+        headers=bearer(),
+        json={"version": 1},
+    )
+
+    assert response.status_code == 503
+    current = next(entry for entry in service.queued_items if str(entry.id) == item["id"])
+    assert current.status is ConversationQueueStatus.QUEUED
+    assert current.version == 1
+
+
+def test_run_submission_fails_closed_when_conversation_preview_cannot_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    preview_manager = StubPreviewManager(fail=True)
+    client, service, principal = _client(preview_manager=preview_manager)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "继续执行", "mode": "hybrid", "conversation_id": "conv-preview"},
+    )
+
+    assert response.status_code == 503
+    assert service.enqueue_count == 0
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (principal.tenant_id, "conv-preview")
+    ]
+    assert "failed to stop conversation preview" in caplog.text
+
+
+def test_run_submission_closes_preview_before_rejection_can_leave_it_exposed() -> None:
+    preview_manager = StubPreviewManager()
+    client, service, principal = _client(preview_manager=preview_manager)
+    service.archived_conversation_ids.add("conv-archived")
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "继续执行", "mode": "hybrid", "conversation_id": "conv-archived"},
+    )
+
+    assert response.status_code == 409
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (principal.tenant_id, "conv-archived")
+    ]
+
+
+def test_mode_selection_and_resume_stop_preview_before_execution_continues() -> None:
+    preview_manager = StubPreviewManager()
+    client, service, principal = _client(preview_manager=preview_manager)
+    created = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "继续执行", "mode": "auto", "conversation_id": "conv-preview"},
+    ).json()
+    preview_manager.calls.clear()
+
+    chosen = client.post(
+        f"/api/v1/runs/{created['id']}/choose-mode",
+        headers=bearer(),
+        json={
+            "mode": "hybrid",
+            "decision_token": created["decision_token"],
+            "version": created["version"],
+        },
+    )
+    resumed = client.post(f"/api/v1/runs/{created['id']}/resume", headers=bearer())
+
+    assert chosen.status_code == 202
+    assert resumed.status_code == 200
+    assert service.resumed == [(principal.tenant_id, UUID(created["id"]))]
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (principal.tenant_id, "conv-preview"),
+        (principal.tenant_id, "conv-preview"),
+    ]
 
 
 def test_conversation_queue_reports_when_active_run_finished_before_enqueue() -> None:

@@ -30,7 +30,7 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import admin, auth, config, runs, system, users, workspaces
+from agent_hub.api.routers import admin, auth, config, previews, runs, system, users, workspaces
 from agent_hub.auth.models import Role
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
@@ -104,6 +104,7 @@ from agent_hub.plugins.runtime import (
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
 )
+from agent_hub.previews import PreviewManager
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (
@@ -1068,6 +1069,7 @@ def create_app(
     runtime_registry: RuntimeRegistry | None = None,
     mode_router: ModeRouterProtocol | None = None,
     task_queue: TaskQueue | None = None,
+    preview_manager: PreviewManager | None = None,
     feishu_gateway: ChannelGatewayProtocol | None = None,
     feishu_websocket_client_factory: FeishuWebSocketClientFactoryForSettings | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
@@ -1096,6 +1098,10 @@ def create_app(
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
             application.state.attachment_store_dir = configured.attachment_store_dir
+            if getattr(application.state, "preview_manager", None) is None:
+                application.state.preview_manager = previews.WebPreviewService(
+                    preview_manager or PreviewManager(configured.project_workspace_dir)
+                )
             if getattr(application.state, "capability_installer_service", None) is None:
                 application.state.capability_installer_service = CapabilityInstallerService(
                     environment_manager=CapabilityEnvironmentManager(
@@ -1361,6 +1367,21 @@ def create_app(
                     ),
                     configured.bootstrap_tenant_id,
                 )
+
+                async def stop_conversation_preview(
+                    tenant_id: UUID,
+                    conversation_id: str,
+                ) -> None:
+                    preview_service = cast(
+                        previews.WebPreviewService,
+                        application.state.preview_manager,
+                    )
+                    await asyncio.to_thread(
+                        preview_service.stop_conversation,
+                        tenant_id,
+                        conversation_id,
+                    )
+
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
                     instruction_context_loader=InstructionContextLoader(
@@ -1386,6 +1407,7 @@ def create_app(
                     ),
                     conversation_repository=ConversationRepository(active_sessions),
                     conversation_queue_repository=ConversationQueueRepository(active_sessions),
+                    conversation_preview_stopper=stop_conversation_preview,
                 )
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router
@@ -1519,6 +1541,10 @@ def create_app(
             await _stop_scheduler_tick_loop(application)
             await _stop_feishu_websocket_connector(application)
             await _cancel_background_tasks(application.state.feishu_reply_tasks)
+            active_preview_service = getattr(application.state, "preview_manager", None)
+            application.state.preview_manager = None
+            if active_preview_service is not None:
+                await asyncio.to_thread(active_preview_service.close)
             await _cleanup_owned_resources(
                 cleanup_callbacks,
                 primary_error=sys.exception(),
@@ -1556,6 +1582,9 @@ def create_app(
     application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
     application.state.project_workspace_store = None
+    application.state.preview_manager = (
+        previews.WebPreviewService(preview_manager) if preview_manager is not None else None
+    )
 
     async def refresh_channel_runtime_config(runtime_config: Mapping[str, str]) -> None:
         application.state.channel_runtime_config = dict(runtime_config)
@@ -1589,6 +1618,7 @@ def create_app(
     application.router.routes.extend(runs.router.routes)
     application.router.routes.extend(runs.admin_queue_router.routes)
     application.router.routes.extend(workspaces.router.routes)
+    application.router.routes.extend(previews.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)
     application.router.routes.extend(

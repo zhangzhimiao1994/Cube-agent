@@ -9,7 +9,7 @@ import tempfile
 import threading
 import zipfile
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3951,13 +3951,26 @@ class AcceptingRuntimePluginService:
     preflight_plugin = staticmethod(accept_plugin_activation)
 
 
-def client() -> TestClient:
+@dataclass(slots=True)
+class StubPreviewManager:
+    calls: list[tuple[UUID, str, int]] = field(default_factory=list)
+    fail: bool = False
+
+    def stop_conversation(self, tenant_id: UUID, conversation_id: str) -> None:
+        self.calls.append((tenant_id, conversation_id, threading.get_ident()))
+        if self.fail:
+            raise RuntimeError("preview stop failed")
+
+
+def client(preview_manager: StubPreviewManager | None = None) -> TestClient:
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
     )
     app.state.admin_resource_service = InMemoryAdminResourceService()
     app.state.plugin_service = AcceptingRuntimePluginService()
+    if preview_manager is not None:
+        app.state.preview_manager = preview_manager
     app.state.settings = Settings.model_construct(
         plugin_package_store_dir=Path(tempfile.gettempdir())
         / f"agent-hub-test-plugin-packages-{uuid4()}"
@@ -13384,7 +13397,8 @@ def test_all_channel_statuses_are_configured_when_required_env_exists(
 
 
 def test_operational_run_listing_details_and_controls() -> None:
-    api = client()
+    preview_manager = StubPreviewManager()
+    api = client(preview_manager)
 
     runs = api.get("/api/v1/admin/runs", headers=headers())
     assert runs.status_code == 200
@@ -13408,6 +13422,9 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert pause.json()["status"] == "paused"
     assert resume.json()["status"] == "running"
     assert cancel.json()["status"] == "cancelled"
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (TENANT_ID, detail.json()["explicit_details"]["conversation_id"])
+    ]
 
 
 def test_operational_run_delete_removes_cancelled_conversation() -> None:
@@ -14105,7 +14122,8 @@ def test_conversation_requires_an_existing_project_workspace() -> None:
 
 
 def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
-    api = client()
+    preview_manager = StubPreviewManager()
+    api = client(preview_manager)
     create_project_workspace_for_test(
         api,
         project_id="Mofang Agent",
@@ -14156,6 +14174,9 @@ def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
         "runs": [],
     }.items()
     assert updated.json()["archived_at"] is not None
+    assert [(tenant_id, conversation_id) for tenant_id, conversation_id, _ in preview_manager.calls] == [
+        (TENANT_ID, "conv-metadata")
+    ]
     assert api.get("/api/v1/admin/conversations", headers=headers()).json() == []
     archived = api.get(
         "/api/v1/admin/conversations",
@@ -14171,6 +14192,7 @@ def test_conversation_metadata_create_list_update_archive_and_restore() -> None:
     )
     assert restored.status_code == 200
     assert restored.json()["archived_at"] is None
+    assert len(preview_manager.calls) == 1
     detail = api.get("/api/v1/admin/conversations/conv-metadata", headers=headers())
     assert detail.status_code == 200
     assert detail.json()["title"] == "重命名后的标题"

@@ -964,6 +964,260 @@ describe("WorkbenchFilePreview", () => {
       /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-html-preview\s*{[\s\S]*min-height:\s*min\(62dvh,\s*36rem\);/,
     );
   });
+
+  it("starts and stops a website service preview from a workspace HTML file", async () => {
+    const user = userEvent.setup();
+    const preview = {
+      id: "preview-1",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-1/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
+    const start = vi.spyOn(api, "startWebPreview").mockResolvedValue(preview);
+    const renew = vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);
+    const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+
+    const { unmount } = render(
+      <WorkbenchFilePreview
+        file={{
+          id: "dist-index",
+          title: "index.html",
+          filename: "index.html",
+          path: "dist/index.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "2 KB",
+          sha256: null,
+          text: "<!doctype html><html><body>fallback</body></html>",
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-preview",
+          projectId: "project-preview",
+          workspaceSessionId: "session-preview",
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(api.webPreviewForConversation).toHaveBeenCalledWith("conv-preview"));
+    await user.click(screen.getByRole("button", { name: "运行网站" }));
+    const serviceFrame = await screen.findByTitle("index.html 网站预览");
+    await waitFor(() => expect(serviceFrame.getAttribute("src")).toBe(preview.preview_url));
+    expect(serviceFrame.getAttribute("sandbox")).toBe("allow-scripts allow-forms allow-modals");
+    expect(serviceFrame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(serviceFrame.getAttribute("referrerpolicy")).toBe("no-referrer");
+    expect(start).toHaveBeenCalledWith({
+      conversation_id: "conv-preview",
+      project_id: "project-preview",
+      workspace_session_id: "session-preview",
+      root: "dist",
+    });
+
+    await user.click(screen.getByRole("button", { name: "在新窗口打开" }));
+    expect(renew).toHaveBeenCalledWith("preview-1");
+    expect(open).toHaveBeenCalledWith(preview.preview_url, "_blank", "noopener,noreferrer");
+
+    window.dispatchEvent(new PageTransitionEvent("pagehide"));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-1", { keepalive: true }));
+    unmount();
+  });
+
+  it("keeps an active website preview running when its drawer closes", async () => {
+    const preview = {
+      id: "preview-close",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-close/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(preview);
+    vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);
+    const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    const { unmount } = render(
+      <WorkbenchFilePreview
+        file={{
+          id: "index-close",
+          title: "index.html",
+          filename: "index.html",
+          path: "index.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "1 KB",
+          sha256: null,
+          text: "<!doctype html><html><body>preview</body></html>",
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-close",
+          projectId: "project-close",
+          workspaceSessionId: "session-close",
+        }}
+      />,
+    );
+    await screen.findByTitle("index.html 网站预览");
+
+    unmount();
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("stops the previous website preview when switching conversations", async () => {
+    const preview = {
+      id: "preview-old-conversation",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-old-conversation/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockImplementation(async (conversationId) => (
+      conversationId === "conv-old" ? preview : null
+    ));
+    const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    const file = {
+      id: "index-switch",
+      title: "index.html",
+      filename: "index.html",
+      path: "index.html",
+      kind: "workspace_file" as const,
+      operation: "创建文件" as const,
+      mimeType: "text/html",
+      size: "1 KB",
+      sha256: null,
+      text: "<!doctype html><html><body>preview</body></html>",
+      source: null,
+    };
+    const { rerender } = render(
+      <WorkbenchFilePreview
+        file={file}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-old",
+          projectId: "project-old",
+          workspaceSessionId: "session-old",
+        }}
+      />,
+    );
+    await screen.findByTitle("index.html 网站预览");
+
+    rerender(
+      <WorkbenchFilePreview
+        file={file}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-new",
+          projectId: "project-new",
+          workspaceSessionId: "session-new",
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-old-conversation", { keepalive: false }));
+    await waitFor(() => expect(api.webPreviewForConversation).toHaveBeenCalledWith("conv-new"));
+  });
+
+  it("stops a website preview that finishes starting after the drawer unmounts", async () => {
+    const user = userEvent.setup();
+    let resolveStart!: (preview: Awaited<ReturnType<typeof api.startWebPreview>>) => void;
+    const startPromise = new Promise<Awaited<ReturnType<typeof api.startWebPreview>>>((resolve) => {
+      resolveStart = resolve;
+    });
+    const preview = {
+      id: "preview-late",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-late/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
+    vi.spyOn(api, "startWebPreview").mockReturnValue(startPromise);
+    const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    const { unmount } = render(
+      <WorkbenchFilePreview
+        file={{
+          id: "index-late",
+          title: "index.html",
+          filename: "index.html",
+          path: "index.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "1 KB",
+          sha256: null,
+          text: "<!doctype html><html><body>preview</body></html>",
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-late",
+          projectId: "project-late",
+          workspaceSessionId: "session-late",
+        }}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "运行网站" }));
+    unmount();
+    resolveStart(preview);
+
+    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-late", { keepalive: false }));
+  });
+
+  it("keeps an active website preview alive when pagehide enters the back-forward cache", async () => {
+    const preview = {
+      id: "preview-bfcache",
+      status: "ready" as const,
+      preview_url: "/api/v1/web-previews/preview-bfcache/content/",
+      lease_expires_at: "2026-09-28T08:30:00Z",
+    };
+    vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(preview);
+    const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
+    const { unmount } = render(
+      <WorkbenchFilePreview
+        file={{
+          id: "index-bfcache",
+          title: "index.html",
+          filename: "index.html",
+          path: "index.html",
+          kind: "workspace_file",
+          operation: "创建文件",
+          mimeType: "text/html",
+          size: "1 KB",
+          sha256: null,
+          text: "<!doctype html><html><body>preview</body></html>",
+          source: null,
+        }}
+        onOpenSource={vi.fn()}
+        webPreviewScope={{
+          conversationId: "conv-bfcache",
+          projectId: "project-bfcache",
+          workspaceSessionId: "session-bfcache",
+        }}
+      />,
+    );
+    await screen.findByTitle("index.html 网站预览");
+
+    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+    expect(stop).not.toHaveBeenCalled();
+    unmount();
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("keeps website service preview controls and iframe usable at 390px", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(
+      /\.agent-workbench-web-preview-actions\s*{[\s\S]*display:\s*flex;[\s\S]*flex-wrap:\s*wrap;/,
+    );
+    expect(stylesCss).toMatch(
+      /\.agent-workbench-web-preview\s*{[\s\S]*inline-size:\s*100%;[\s\S]*min-height:\s*min\(68dvh,\s*44rem\);/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 640px\)[\s\S]*\.agent-workbench-web-preview\s*{[\s\S]*min-height:\s*min\(58dvh,\s*34rem\);/,
+    );
+  });
 });
 
 describe("slashCommandsForQuery", () => {

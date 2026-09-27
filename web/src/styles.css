@@ -3385,6 +3385,50 @@ article:hover {
   overflow: hidden;
 }
 
+.agent-workbench-web-preview-shell {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.agent-workbench-web-preview-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.agent-workbench-web-preview-actions span,
+.agent-workbench-web-preview-lease {
+  color: #475569;
+  font-size: 0.78rem;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.agent-workbench-web-preview {
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  border-radius: 8px;
+  display: block;
+  inline-size: 100%;
+  min-height: min(68dvh, 44rem);
+}
+
+.agent-workbench-web-preview-loading {
+  align-items: center;
+  background: #f8fafc;
+  border: 1px dashed rgba(8, 145, 178, 0.38);
+  border-radius: 8px;
+  color: #334155;
+  display: flex;
+  justify-content: center;
+  min-height: 12rem;
+  padding: 1rem;
+  text-align: center;
+}
+
 .agent-workbench-agent-card.status-异常 {
   border-color: rgba(255, 101, 118, 0.34);
 }
@@ -8354,6 +8398,14 @@ article:hover {
 @media (max-width: 640px) {
   .agent-workbench-html-preview {
     min-height: min(62dvh, 36rem);
+  }
+
+  .agent-workbench-web-preview {
+    min-height: min(58dvh, 34rem);
+  }
+
+  .agent-workbench-web-preview-actions .secondary-action {
+    flex: 1 1 8rem;
   }
 
   .artifact-file-card {

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import re
 import shutil
 import tarfile
@@ -48,6 +49,7 @@ admin_queue_router = APIRouter(
     tags=["conversation-queue"],
     responses=error_responses(401, 403, 404, 405, 409, 422, 500, 503),
 )
+_LOGGER = logging.getLogger(__name__)
 
 ARCHIVE_EXTENSIONS = (
     ".tar.gz",
@@ -210,6 +212,10 @@ class RunServiceProtocol(Protocol):
     async def conversation_queue(
         self, tenant_id: UUID, conversation_id: str
     ) -> tuple[ConversationQueueItem, ...]: ...
+
+    async def conversation_queue_item(
+        self, tenant_id: UUID, item_id: UUID
+    ) -> ConversationQueueItem: ...
 
     async def cancel_queued_message(
         self, tenant_id: UUID, item_id: UUID, *, version: int
@@ -1058,6 +1064,44 @@ def _queue_error(error: Exception) -> PublicAPIError:
     return PublicAPIError(409, code, reason, details={"reason": reason})
 
 
+async def _stop_conversation_preview(
+    request: Request,
+    tenant_id: UUID,
+    conversation_id: str | None,
+) -> None:
+    if not conversation_id:
+        return
+    manager = getattr(request.app.state, "preview_manager", None)
+    stop_conversation = getattr(manager, "stop_conversation", None)
+    if not callable(stop_conversation):
+        return
+    try:
+        await asyncio.to_thread(stop_conversation, tenant_id, conversation_id)
+    except Exception as error:
+        _LOGGER.exception(
+            "failed to stop conversation preview",
+            extra={"tenant_id": str(tenant_id), "conversation_id": conversation_id},
+        )
+        raise PublicAPIError(
+            503,
+            "preview_stop_failed",
+            "website preview could not be stopped safely",
+        ) from error
+
+
+async def _stop_run_preview(
+    request: Request,
+    service: RunServiceProtocol,
+    tenant_id: UUID,
+    run_id: UUID,
+) -> None:
+    try:
+        summary = await service.get(tenant_id, run_id)
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    await _stop_conversation_preview(request, tenant_id, summary.conversation_id)
+
+
 @router.post(
     "",
     response_model=SubmittedRunResponse,
@@ -1084,6 +1128,7 @@ async def create_run(
             "vibe_coding_disabled",
             "Vibe Coding is disabled in system settings",
         )
+    await _stop_conversation_preview(request, principal.tenant_id, body.conversation_id)
     try:
         execution_backend = body.execution_backend or await _default_execution_backend(request)
         if body.execution_backend is not None:
@@ -1178,6 +1223,7 @@ async def queue_conversation_message(
 ) -> ConversationQueueItemResponse:
     if body.conversation_id not in {None, conversation_id}:
         raise PublicAPIError(422, "request_validation", "conversation_id does not match path")
+    await _stop_conversation_preview(request, principal.tenant_id, conversation_id)
     try:
         execution_backend = body.execution_backend or await _default_execution_backend(request)
         item = await service.queue_message(
@@ -1266,6 +1312,12 @@ async def redirect_conversation_queue_item(
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:cancel"))],
 ) -> ConversationQueueItemResponse:
     try:
+        current = await service.conversation_queue_item(principal.tenant_id, queue_item_id)
+        await _stop_conversation_preview(
+            request,
+            principal.tenant_id,
+            current.conversation_id,
+        )
         item = await service.redirect_to_queued_message(
             principal.tenant_id,
             queue_item_id,
@@ -1308,11 +1360,13 @@ async def cancel_conversation_queue_item(
 async def choose_mode(
     run_id: UUID,
     body: ChooseModeRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
     if body.mode is TaskMode.AUTO:
         raise PublicAPIError(422, "request_validation", "request validation failed")
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.choose_mode(
             tenant_id=principal.tenant_id,
@@ -1345,9 +1399,11 @@ async def choose_mode(
 async def approve_temporary_agent(
     run_id: UUID,
     body: ApproveTemporaryAgentRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.approve_temporary_agent(
             tenant_id=principal.tenant_id,
@@ -1378,9 +1434,11 @@ async def approve_temporary_agent(
 async def revise_temporary_agent(
     run_id: UUID,
     body: ReviseTemporaryAgentRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.revise_temporary_agent(
             tenant_id=principal.tenant_id,
@@ -1412,9 +1470,11 @@ async def revise_temporary_agent(
 async def accept_self_repair(
     run_id: UUID,
     body: AcceptSelfRepairRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.accept_self_repair(
             tenant_id=principal.tenant_id,
@@ -1445,9 +1505,11 @@ async def accept_self_repair(
 async def approve_project_preflight(
     run_id: UUID,
     body: ProjectPreflightApprovalRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.approve_project_preflight(
             tenant_id=principal.tenant_id,
@@ -1478,9 +1540,11 @@ async def approve_project_preflight(
 async def approve_capability(
     run_id: UUID,
     body: CapabilityApprovalRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         submitted = await service.approve_capability(
             tenant_id=principal.tenant_id,
@@ -1619,9 +1683,11 @@ async def pause_run(
 @router.post("/{run_id}/resume", response_model=RunSummaryResponse)
 async def resume_run(
     run_id: UUID,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:resume"))],
 ) -> RunSummaryResponse:
+    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
         summary = await service.resume(principal.tenant_id, run_id)
     except RunNotFound as error:

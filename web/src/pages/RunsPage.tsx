@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef,
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import {
   ArtifactFileCard,
@@ -3581,12 +3581,247 @@ async function readWorkbenchPreviewText(payload: unknown): Promise<string> {
   return "";
 }
 
+export type WebPreviewScope = {
+  conversationId: string;
+  projectId: string;
+  workspaceSessionId: string;
+};
+
+export function webPreviewRoot(path: string | null | undefined): string | undefined {
+  const normalized = (path ?? "").trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const separator = normalized.lastIndexOf("/");
+  return separator > 0 ? normalized.slice(0, separator) : undefined;
+}
+
+function isActiveWebPreview(preview: WebPreview | null): preview is WebPreview {
+  return preview?.status === "starting" || preview?.status === "ready" || preview?.status === "stopping";
+}
+
+function webPreviewStatusText(status: WebPreview["status"]): string {
+  const labels: Record<WebPreview["status"], string> = {
+    starting: "网站服务正在启动",
+    ready: "网站服务已就绪",
+    stopping: "网站服务正在停止",
+    stopped: "网站服务已停止",
+    failed: "网站服务启动失败",
+    expired: "网站服务租约已过期",
+  };
+  return labels[status];
+}
+
+export function WebsiteServicePreview({
+  children,
+  root,
+  scope,
+  title,
+}: {
+  children: ReactNode;
+  root?: string;
+  scope?: WebPreviewScope | null;
+  title: string;
+}) {
+  const [preview, setPreview] = useState<WebPreview | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const previewRef = useRef<WebPreview | null>(null);
+  const stopRequestedRef = useRef(new Set<string>());
+  const mountedRef = useRef(true);
+  const conversationRef = useRef("");
+
+  const stopPreview = (current: WebPreview, keepalive = false) => {
+    if (stopRequestedRef.current.has(current.id)) return Promise.resolve(current);
+    stopRequestedRef.current.add(current.id);
+    return api.stopWebPreview(current.id, { keepalive }).catch((caught) => {
+      if (!keepalive) stopRequestedRef.current.delete(current.id);
+      throw caught;
+    });
+  };
+
+  useEffect(() => {
+    previewRef.current = preview;
+  }, [preview]);
+
+  useEffect(() => {
+    let active = true;
+    const conversationId = scope?.conversationId.trim() ?? "";
+    const previousConversationId = conversationRef.current;
+    conversationRef.current = conversationId;
+    const previousPreview = previewRef.current;
+    if (
+      previousConversationId
+      && previousConversationId !== conversationId
+      && isActiveWebPreview(previousPreview)
+    ) {
+      void stopPreview(previousPreview).catch(() => undefined);
+    }
+    setPreview(null);
+    setError(null);
+    if (!conversationId) return () => {
+      active = false;
+    };
+    setLoading(true);
+    void api
+      .webPreviewForConversation(conversationId)
+      .then((current) => {
+        if (active) setPreview(current);
+      })
+      .catch((caught) => {
+        if (active) setError(formatApiError(caught, "网站预览状态读取失败"));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [scope?.conversationId]);
+
+  useEffect(() => {
+    if (preview?.status !== "starting" || !scope?.conversationId.trim()) return undefined;
+    const timer = window.setTimeout(() => {
+      void api
+        .webPreviewForConversation(scope.conversationId)
+        .then((current) => setPreview(current))
+        .catch((caught) => setError(formatApiError(caught, "网站预览状态刷新失败")));
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [preview?.status, scope?.conversationId]);
+
+  useEffect(() => {
+    if (preview?.status !== "ready") return undefined;
+    const timer = window.setInterval(() => {
+      void api
+        .renewWebPreview(preview.id)
+        .then((renewed) => setPreview(renewed))
+        .catch((caught) => {
+          setPreview(null);
+          setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
+        });
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [preview?.id, preview?.status]);
+
+  useEffect(() => {
+    const onPageHide = (event: PageTransitionEvent) => {
+      if (event.persisted) return;
+      const current = previewRef.current;
+      if (isActiveWebPreview(current)) void stopPreview(current, true).catch(() => undefined);
+    };
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const start = async () => {
+    if (!scope) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const started = await api.startWebPreview({
+        conversation_id: scope.conversationId,
+        project_id: scope.projectId,
+        workspace_session_id: scope.workspaceSessionId,
+        ...(root ? { root } : {}),
+      });
+      if (!mountedRef.current) {
+        await stopPreview(started).catch(() => undefined);
+        return;
+      }
+      stopRequestedRef.current.delete(started.id);
+      setPreview(started);
+    } catch (caught) {
+      if (mountedRef.current) {
+        setError(formatApiError(caught, "网站服务启动失败，已保留静态预览"));
+      }
+    } finally {
+      if (mountedRef.current) setLoading(false);
+    }
+  };
+
+  const stop = async () => {
+    if (!preview || !isActiveWebPreview(preview)) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setPreview(await stopPreview(preview));
+    } catch (caught) {
+      setPreview(null);
+      setError(formatApiError(caught, "网站预览停止失败"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openInNewWindow = () => {
+    if (!preview?.preview_url) return;
+    void api.renewWebPreview(preview.id).then(setPreview).catch((caught) => {
+      setPreview(null);
+      setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
+    });
+    window.open(preview.preview_url, "_blank", "noopener,noreferrer");
+  };
+
+  const serviceVisible = preview?.status === "starting" || (preview?.status === "ready" && Boolean(preview.preview_url));
+  return (
+    <div className="agent-workbench-web-preview-shell">
+      {scope ? (
+        <div className="agent-workbench-web-preview-actions" role="group" aria-label="网站服务预览">
+          {!isActiveWebPreview(preview) ? (
+            <button type="button" className="secondary-action" disabled={loading} onClick={() => void start()}>
+              {loading ? "正在启动..." : "运行网站"}
+            </button>
+          ) : (
+            <button type="button" className="secondary-action" disabled={loading || preview.status === "stopping"} onClick={() => void stop()}>
+              {preview.status === "stopping" ? "正在停止..." : "停止预览"}
+            </button>
+          )}
+          {preview?.status === "ready" && preview.preview_url ? (
+            <button type="button" className="secondary-action" onClick={openInNewWindow}>
+              在新窗口打开
+            </button>
+          ) : null}
+          {preview ? <span role="status">{webPreviewStatusText(preview.status)}</span> : null}
+        </div>
+      ) : null}
+      {preview?.status === "ready" && preview.preview_url ? (
+        <iframe
+          className="agent-workbench-web-preview"
+          title={`${title} 网站预览`}
+          src={preview.preview_url}
+          sandbox="allow-scripts allow-forms allow-modals"
+          referrerPolicy="no-referrer"
+          onLoad={() => void api.renewWebPreview(preview.id).then(setPreview).catch((caught) => {
+            setPreview(null);
+            setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
+          })}
+        />
+      ) : preview?.status === "starting" ? (
+        <div className="agent-workbench-web-preview-loading" role="status">网站服务启动后会在这里显示。</div>
+      ) : (
+        children
+      )}
+      {serviceVisible && preview?.lease_expires_at ? (
+        <small className="agent-workbench-web-preview-lease">预览租约至 {new Date(preview.lease_expires_at).toLocaleString()}</small>
+      ) : null}
+      {error ? <p role="alert" className="form-error">{error}</p> : null}
+    </div>
+  );
+}
+
 export function WorkbenchFilePreview({
   file,
   onOpenSource,
+  webPreviewScope,
 }: {
   file: WorkbenchFileItem;
   onOpenSource: (target: ProcessDetailTarget) => void;
+  webPreviewScope?: WebPreviewScope | null;
 }) {
   const [previewText, setPreviewText] = useState<string | null>(file.text);
   const [previewMode, setPreviewMode] = useState<"source" | "live">("source");
@@ -3622,32 +3857,8 @@ export function WorkbenchFilePreview({
     };
   }, [canPreview, downloadUrl, file.id, file.text]);
 
-  return (
-    <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
-      <div className="agent-workbench-file-preview-header">
-        <div>
-          <small>{file.operation}</small>
-          <strong>{file.path || file.filename}</strong>
-        </div>
-        {file.download ? <ArtifactFileCard artifact={file.download} compact /> : null}
-      </div>
-      <dl>
-        <div>
-          <dt>类型</dt>
-          <dd>{[file.kind, file.mimeType, file.size].filter(Boolean).join(" · ") || "文件"}</dd>
-        </div>
-        {file.sha256 ? (
-          <div>
-            <dt>SHA-256</dt>
-            <dd>{file.sha256.slice(0, 16)}</dd>
-          </div>
-        ) : null}
-      </dl>
-      {file.source ? (
-        <button type="button" className="secondary-action" onClick={() => onOpenSource(file.source as ProcessDetailTarget)}>
-          查看来源动作
-        </button>
-      ) : null}
+  const previewContent = (
+    <>
       {canPreview && htmlPreview?.eligible ? (
         <div className="agent-workbench-preview-mode" role="group" aria-label="预览方式">
           <button type="button" className="secondary-action" aria-pressed={previewMode === "source"} onClick={() => setPreviewMode("source")}>
@@ -3680,6 +3891,44 @@ export function WorkbenchFilePreview({
       ) : (
         <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
       )}
+    </>
+  );
+
+  return (
+    <article className="agent-workbench-file-preview" aria-label={`${file.filename}预览`}>
+      <div className="agent-workbench-file-preview-header">
+        <div>
+          <small>{file.operation}</small>
+          <strong>{file.path || file.filename}</strong>
+        </div>
+        {file.download ? <ArtifactFileCard artifact={file.download} compact /> : null}
+      </div>
+      <dl>
+        <div>
+          <dt>类型</dt>
+          <dd>{[file.kind, file.mimeType, file.size].filter(Boolean).join(" · ") || "文件"}</dd>
+        </div>
+        {file.sha256 ? (
+          <div>
+            <dt>SHA-256</dt>
+            <dd>{file.sha256.slice(0, 16)}</dd>
+          </div>
+        ) : null}
+      </dl>
+      {file.source ? (
+        <button type="button" className="secondary-action" onClick={() => onOpenSource(file.source as ProcessDetailTarget)}>
+          查看来源动作
+        </button>
+      ) : null}
+      {isHtmlPreviewCandidate(file) ? (
+        <WebsiteServicePreview
+          root={webPreviewRoot(file.path)}
+          scope={webPreviewScope}
+          title={file.filename}
+        >
+          {previewContent}
+        </WebsiteServicePreview>
+      ) : previewContent}
       {error ? <p role="alert" className="form-error">{error}</p> : null}
     </article>
   );
@@ -3689,10 +3938,12 @@ function ConversationFilePreviewDrawer({
   file,
   onClose,
   onOpenSource,
+  webPreviewScope,
 }: {
   file: WorkbenchFileItem;
   onClose: () => void;
   onOpenSource: (target: ProcessDetailTarget) => void;
+  webPreviewScope?: WebPreviewScope | null;
 }) {
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
@@ -3715,6 +3966,7 @@ function ConversationFilePreviewDrawer({
         </div>
         <WorkbenchFilePreview
           file={file}
+          webPreviewScope={webPreviewScope}
           onOpenSource={(target) => {
             onClose();
             onOpenSource(target);
@@ -4795,6 +5047,7 @@ function AgentWorkbenchDrawer({
   taskChain,
   onClose,
   onOpen,
+  webPreviewScope,
 }: {
   dispatchCards: AgentDispatchCard[];
   executionIntents: RunExecutionIntent[];
@@ -4805,6 +5058,7 @@ function AgentWorkbenchDrawer({
   taskChain: TaskChainStep[];
   onClose: () => void;
   onOpen: (target: ProcessDetailTarget) => void;
+  webPreviewScope?: WebPreviewScope | null;
 }) {
   const [showAllActions, setShowAllActions] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(initialAgentId ?? null);
@@ -5068,6 +5322,7 @@ function AgentWorkbenchDrawer({
                       <WorkbenchFilePreview
                         key={selectedFile.id}
                         file={selectedFile}
+                        webPreviewScope={webPreviewScope}
                         onOpenSource={(target) => {
                           onOpen(target);
                         }}
@@ -5149,6 +5404,13 @@ function RunProcessSummary({
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
   const fileItems = workbenchFileItems([detail], workspaceFiles, items);
+  const conversationId = runConversationId(detail)?.trim() ?? "";
+  const projectId = detail.explicit_details.project_id?.trim() ?? "";
+  const workspaceSessionId = detail.explicit_details.workspace_session_id?.trim() ?? "";
+  const webPreviewScope: WebPreviewScope | null =
+    conversationId && projectId && workspaceSessionId
+      ? { conversationId, projectId, workspaceSessionId }
+      : null;
   const coordinationItems = items.filter(isWorkbenchCoordinationItem);
   const shouldShowSummary =
     items.length > 0 ||
@@ -5229,6 +5491,7 @@ function RunProcessSummary({
               initialAgentId={initialWorkbenchAgentId}
               items={items}
               taskChain={taskChain}
+              webPreviewScope={webPreviewScope}
               onClose={() => setIsWorkbenchOpen(false)}
               onOpen={(item) => {
                 onOpen(item);
@@ -8604,6 +8867,15 @@ export function RunsPage() {
           {conversationPreviewFile ? (
             <ConversationFilePreviewDrawer
               file={conversationPreviewFile}
+              webPreviewScope={
+                activeConversationId && activeWorkspaceProjectId && visibleWorkspaceSessionId
+                  ? {
+                      conversationId: activeConversationId,
+                      projectId: activeWorkspaceProjectId,
+                      workspaceSessionId: visibleWorkspaceSessionId,
+                    }
+                  : null
+              }
               onClose={() => setConversationPreviewFile(null)}
               onOpenSource={setProcessDetailTarget}
             />

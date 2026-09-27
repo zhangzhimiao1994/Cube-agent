@@ -1020,6 +1020,21 @@ export type WorkspaceDirectoryList = z.infer<typeof WorkspaceDirectoryListSchema
 export type WorkspaceFile = z.infer<typeof WorkspaceFileSchema>;
 export type WorkspaceFileList = z.infer<typeof WorkspaceFileListSchema>;
 
+const WebPreviewSchema = z.object({
+  id: z.string(),
+  status: z.enum(["starting", "ready", "stopping", "stopped", "failed", "expired"]),
+  preview_url: z.string().nullable(),
+  lease_expires_at: z.string().nullable(),
+});
+
+export type WebPreview = z.infer<typeof WebPreviewSchema>;
+export type WebPreviewStartRequest = {
+  conversation_id: string;
+  project_id: string;
+  workspace_session_id: string;
+  root?: string;
+};
+
 const SkillSourceProvenanceSchema = z.object({
   source_id: z.string(),
   sync_id: z.string(),
@@ -2787,6 +2802,39 @@ export const api = {
   },
   downloadGeneratedArtifact(path: string): Promise<Blob> {
     return requestDownload(path);
+  },
+  startWebPreview(payload: WebPreviewStartRequest): Promise<WebPreview> {
+    return request(
+      "/api/v1/web-previews/start",
+      { method: "POST", body: JSON.stringify(payload) },
+      WebPreviewSchema,
+    );
+  },
+  async webPreviewForConversation(conversationId: string): Promise<WebPreview | null> {
+    try {
+      return await request(
+        `/api/v1/web-previews/conversations/${encodeURIComponent(conversationId)}`,
+        { method: "GET" },
+        WebPreviewSchema,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return null;
+      throw error;
+    }
+  },
+  renewWebPreview(id: string): Promise<WebPreview> {
+    return request(
+      `/api/v1/web-previews/${encodeURIComponent(id)}/renew`,
+      { method: "POST" },
+      WebPreviewSchema,
+    );
+  },
+  stopWebPreview(id: string, options: { keepalive?: boolean } = {}): Promise<WebPreview> {
+    return request(
+      `/api/v1/web-previews/${encodeURIComponent(id)}`,
+      { method: "DELETE", keepalive: options.keepalive },
+      WebPreviewSchema,
+    );
   },
   approveSkill(id: string): Promise<Skill> {
     return request(`/api/v1/admin/skills/${id}/approve`, { method: "POST" }, SkillSchema);
