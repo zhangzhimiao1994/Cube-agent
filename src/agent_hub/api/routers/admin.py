@@ -136,7 +136,12 @@ from agent_hub.runs.projects import (
     ProjectWorkspaceRepository,
     normalize_project_workspace,
 )
-from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
+from agent_hub.runs.repository import (
+    RunConflict,
+    RunNotFound,
+    RunRecord,
+    RunRepository,
+)
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import (
@@ -363,6 +368,24 @@ class RunListItem(BaseModel):
     queue_wait_ms: int = Field(ge=0)
     capacity_wait_ms: int = Field(ge=0)
     cost_usd: str
+
+
+class ConversationQuestionSearchItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    conversation_id: str
+    project_id: str
+    question: str
+    created_at: datetime
+    conversation_title: str
+
+
+class ConversationQuestionSearchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ConversationQuestionSearchItemResponse]
+    next_cursor: str | None = None
 
 
 class RunArtifactResponse(BaseModel):
@@ -3155,6 +3178,16 @@ class AdminResourceService(Protocol):
     ) -> MainAgentConfigResponse: ...
 
     async def list_runs(self) -> tuple[RunListItem, ...]: ...
+
+    async def search_conversation_questions(
+        self,
+        *,
+        q: str,
+        project_id: str | None = None,
+        archived: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> ConversationQuestionSearchResponse: ...
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse: ...
 
@@ -6147,6 +6180,18 @@ class InMemoryAdminResourceService:
             for run in self.runs.values()
         )
 
+    async def search_conversation_questions(
+        self,
+        *,
+        q: str,
+        project_id: str | None = None,
+        archived: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> ConversationQuestionSearchResponse:
+        del q, project_id, archived, limit, cursor
+        return ConversationQuestionSearchResponse(items=[])
+
     async def get_run(self, run_id: UUID) -> RunDetailResponse:
         return self.runs[run_id]
 
@@ -8028,6 +8073,46 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         for record in records:
             items.append(await self._run_list_item(record))
         return tuple(items)
+
+    async def search_conversation_questions(
+        self,
+        *,
+        q: str,
+        project_id: str | None = None,
+        archived: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> ConversationQuestionSearchResponse:
+        if self._run_repository is None:
+            return await super().search_conversation_questions(
+                q=q,
+                project_id=project_id,
+                archived=archived,
+                limit=limit,
+                cursor=cursor,
+            )
+        page = await self._run_repository.search_conversation_questions(
+            self._tenant_id,
+            q=q,
+            project_id=project_id,
+            archived=archived,
+            limit=limit,
+            cursor=cursor,
+        )
+        return ConversationQuestionSearchResponse(
+            items=[
+                ConversationQuestionSearchItemResponse(
+                    run_id=item.run_id,
+                    conversation_id=item.conversation_id,
+                    project_id=item.project_id,
+                    question=item.question,
+                    created_at=item.created_at,
+                    conversation_title=item.conversation_title,
+                )
+                for item in page.items
+            ],
+            next_cursor=page.next_cursor,
+        )
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse:
         if self._run_repository is None:
@@ -17350,6 +17435,33 @@ async def update_main_agent_config(
 ) -> MainAgentConfigResponse:
     _require(principal, "config:write")
     return await service.update_main_agent_config(body)
+
+
+@router.get(
+    "/conversation-questions/search",
+    response_model=ConversationQuestionSearchResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def search_conversation_questions(
+    q: Annotated[str, Query(min_length=1, max_length=100_000)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    project_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+    archived: bool = False,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=1024)] = None,
+) -> ConversationQuestionSearchResponse:
+    _require(principal, "run:read")
+    try:
+        return await service.search_conversation_questions(
+            q=q,
+            project_id=project_id,
+            archived=archived,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as error:
+        raise PublicAPIError(422, "invalid_search_cursor", str(error)) from error
 
 
 @router.get("/runs", response_model=list[RunListItem], responses=error_responses(401, 403, 422))

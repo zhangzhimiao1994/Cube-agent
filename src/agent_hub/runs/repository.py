@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -10,13 +13,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, and_, delete, func, select
+from sqlalchemy import Select, and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import Role
 from agent_hub.db.models import (
     ConversationQueueItemRow,
+    ConversationRow,
     RunApprovalRow,
     RunArtifactRow,
     RunCheckpointRow,
@@ -83,6 +87,22 @@ class ConversationContextItem:
     run_id: UUID
     request: str
     artifacts: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationQuestionSearchItem:
+    run_id: UUID
+    conversation_id: str
+    project_id: str
+    question: str
+    created_at: datetime
+    conversation_title: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationQuestionSearchPage:
+    items: tuple[ConversationQuestionSearchItem, ...]
+    next_cursor: str | None
 
 
 class RunNotFound(RuntimeError):
@@ -340,6 +360,90 @@ class RunRepository:
                 )
             ).all()
             return tuple(self._record(row) for row in rows)
+
+    async def search_conversation_questions(
+        self,
+        tenant_id: UUID,
+        *,
+        q: str,
+        project_id: str | None = None,
+        archived: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> ConversationQuestionSearchPage:
+        normalized_query = q.strip()
+        if not normalized_query:
+            raise ValueError("question search query must not be empty")
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("question search limit must be between 1 and 50")
+        normalized_project_id = None if project_id is None else project_id.strip()
+        if project_id is not None and not normalized_project_id:
+            raise ValueError("project_id must not be empty")
+
+        escaped_query = (
+            normalized_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        statement = (
+            select(
+                RunRow.id.label("run_id"),
+                ConversationRow.conversation_id,
+                ConversationRow.project_id,
+                RunRow.request.label("question"),
+                RunRow.created_at,
+                ConversationRow.title.label("conversation_title"),
+            )
+            .join(
+                ConversationRow,
+                and_(
+                    ConversationRow.tenant_id == RunRow.tenant_id,
+                    ConversationRow.conversation_id
+                    == RunRow.routing_decision["conversation_id"].astext,
+                ),
+            )
+            .where(RunRow.tenant_id == tenant_id)
+            .where(RunRow.request.ilike(f"%{escaped_query}%", escape="\\"))
+            .where(
+                ConversationRow.archived_at.is_not(None)
+                if archived
+                else ConversationRow.archived_at.is_(None)
+            )
+        )
+        if normalized_project_id is not None:
+            statement = statement.where(ConversationRow.project_id == normalized_project_id)
+        if cursor is not None:
+            cursor_created_at, cursor_run_id = _decode_question_search_cursor(cursor)
+            statement = statement.where(
+                or_(
+                    RunRow.created_at < cursor_created_at,
+                    and_(
+                        RunRow.created_at == cursor_created_at,
+                        RunRow.id < cursor_run_id,
+                    ),
+                )
+            )
+        statement = statement.order_by(RunRow.created_at.desc(), RunRow.id.desc()).limit(limit + 1)
+
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).mappings().all()
+
+        has_more = len(rows) > limit
+        visible_rows = rows[:limit]
+        items = tuple(
+            ConversationQuestionSearchItem(
+                run_id=row["run_id"],
+                conversation_id=row["conversation_id"],
+                project_id=row["project_id"],
+                question=row["question"],
+                created_at=row["created_at"],
+                conversation_title=row["conversation_title"],
+            )
+            for row in visible_rows
+        )
+        next_cursor = None
+        if has_more and items:
+            last_item = items[-1]
+            next_cursor = _encode_question_search_cursor(last_item.created_at, last_item.run_id)
+        return ConversationQuestionSearchPage(items=items, next_cursor=next_cursor)
 
     async def list_conversation(
         self,
@@ -1861,7 +1965,35 @@ class RunRepository:
                 payload=event.to_payload(),
             )
             .on_conflict_do_nothing(index_elements=[RunUsageRow.run_id, RunUsageRow.sequence])
-        )
+            )
+
+
+def _encode_question_search_cursor(created_at: datetime, run_id: UUID) -> str:
+    payload = json.dumps(
+        {"created_at": created_at.isoformat(), "run_id": str(run_id)},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_question_search_cursor(cursor: str) -> tuple[datetime, UUID]:
+    try:
+        payload = json.loads(base64.b64decode(cursor.encode("ascii"), altchars=b"-_", validate=True))
+        created_at = datetime.fromisoformat(payload["created_at"])
+        run_id = UUID(payload["run_id"])
+    except (
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ValueError("invalid question search cursor") from error
+    if created_at.tzinfo is None:
+        raise ValueError("invalid question search cursor")
+    return created_at, run_id
 
 
 def _is_recovery_replayable_event_kind(kind: str) -> bool:
