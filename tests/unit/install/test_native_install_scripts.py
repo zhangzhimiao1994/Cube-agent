@@ -844,7 +844,7 @@ def test_auto_mode_prefers_native_on_supported_systemd_hosts() -> None:
     assert 'elif [[ "$HAS_DOCKER" -eq 1 || "$HOST_MANAGER" == "unknown" ]]; then' in detect
     assert "chooses native on supported systemd apt/dnf hosts" in install
     assert "prefers native mode" in readme
-    assert "Native mode when systemd plus apt/dnf support are detected" in installation
+    assert "Native mode when systemd and a recognized apt/dnf family are detected" in installation
 
 
 def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:

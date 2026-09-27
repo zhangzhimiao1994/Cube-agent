@@ -62,7 +62,20 @@ cd Cube-agent
 sudo bash install.sh --mode auto --yes
 ```
 
-`auto` selects native mode when systemd and a recognized apt/dnf family are detected; otherwise it selects Docker. Distribution-version validation happens after that selection, so use `--mode docker` explicitly on an unsupported native distribution. For a network-constrained server in China:
+Without Git, download into an isolated source directory:
+
+```bash
+tmp="$(mktemp -d /tmp/agent-hub-install.XXXXXX)"
+curl -fL https://github.com/zhangzhimiao1994/Cube-agent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
+mkdir -p "$tmp/source"
+tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"
+cd "$tmp/source"
+sudo bash install.sh --mode auto --yes
+```
+
+Do not extract the archive directly into `/root`; keeping a dedicated source directory prevents repository files from being flattened into an unrelated working directory.
+
+`auto` prefers native mode when systemd and a recognized apt/dnf family are detected; otherwise it selects Docker. Distribution-version validation happens after that selection, so use `--mode docker` explicitly on an unsupported native distribution. For a network-constrained server in China:
 
 ```bash
 sudo env AGENT_HUB_MIRROR_MODE=auto bash install.sh --mode auto --yes

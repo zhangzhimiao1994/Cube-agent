@@ -195,5 +195,5 @@ def test_readme_uses_repository_checkout_instead_of_placeholder_install_url() ->
     readme = read("README.md")
 
     assert "example.invalid" not in readme
-    assert "git clone https://github.com/zhangzhimiao1994/mutilagent.git" in readme
-    assert "cd mutilagent" in readme
+    assert "git clone https://github.com/zhangzhimiao1994/Cube-agent.git" in readme
+    assert "cd Cube-agent" in readme
