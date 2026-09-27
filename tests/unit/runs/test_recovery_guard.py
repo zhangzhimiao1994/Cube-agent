@@ -361,7 +361,7 @@ async def test_record_non_model_repair_proposal_pauses_run_for_resolution() -> N
     async def persist_event(*args: object, **kwargs: object) -> None:
         del args, kwargs
 
-    repository.persist_event = cast(Any, persist_event)
+    cast(Any, repository).persist_event = persist_event
     await repository.record_self_repair_decision(
         cast(Any, session),
         tenant_id=row.tenant_id,
