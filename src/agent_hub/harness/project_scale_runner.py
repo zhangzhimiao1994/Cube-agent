@@ -139,6 +139,12 @@ _DISCUSSION_TRACE_FLOWS = frozenset(
     }
 )
 _AUTHENTICATION_BUSY_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+_AUTO_MODE_BY_PROJECT_SCALE = {
+    "small": "dispatch",
+    "medium": "dispatch",
+    "large": "hybrid",
+    "ultra": "hybrid",
+}
 _PLACEHOLDER_MARKERS = (
     "lorem ipsum",
     "placeholder project",
@@ -571,6 +577,17 @@ def execute_project_scale_plan(
             if not isinstance(raw_run_id, str) or not raw_run_id:
                 raise RuntimeError("run create response missing id")
             run_id = raw_run_id
+            mode_decision_context = dict(response)
+            mode_choice_response = _choose_auto_mode_if_waiting(
+                client,
+                run_id=run_id,
+                case_id=run_request.case_id,
+                requested_body=request_body,
+                current=response,
+                fallback=mode_decision_context,
+            )
+            if mode_choice_response is not None:
+                response = mode_choice_response
             status = _string_value(response.get("status"))
             observed_mode = _execution_mode(response) or observed_mode
             final_observed_mode = _execution_mode(response) or final_observed_mode
@@ -589,7 +606,7 @@ def execute_project_scale_plan(
                 response=response,
                 case_id=run_request.case_id,
                 evidence=evidence,
-                required=True,
+                required=request_body.get("mode") != "auto",
             )
             status = approval_status or status
 
@@ -603,6 +620,8 @@ def execute_project_scale_plan(
                 current_status=status,
                 evidence=evidence,
                 errors=errors,
+                case_id=run_request.case_id,
+                mode_decision_context=mode_decision_context,
                 defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
             )
             status = observation.status
@@ -674,6 +693,8 @@ def execute_project_scale_plan(
                             current_status=status,
                             evidence=evidence,
                             errors=errors,
+                            case_id=run_request.case_id,
+                            mode_decision_context=mode_decision_context,
                             defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                         )
                         observation = self_repair_observation
@@ -851,6 +872,8 @@ def execute_project_scale_plan(
                     current_status=status,
                     evidence=evidence,
                     errors=errors,
+                    case_id=run_request.case_id,
+                    mode_decision_context=mode_decision_context,
                     defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                 )
                 status = repair_observation.status
@@ -1661,6 +1684,8 @@ def _collect_run_observation(
     current_status: str | None,
     evidence: dict[str, bool],
     errors: list[str],
+    case_id: str,
+    mode_decision_context: Mapping[str, object],
     defer_artifacts_until_terminal: bool = False,
 ) -> _RunObservation:
     status = current_status
@@ -1677,6 +1702,29 @@ def _collect_run_observation(
             details = details_response
             _validate_run_details_scope(details, run_id)
             status = _string_value(details.get("status")) or status
+            mode_choice_response = _choose_auto_mode_if_waiting(
+                client,
+                run_id=run_id,
+                case_id=case_id,
+                requested_body=body,
+                current=details,
+                fallback=mode_decision_context,
+            )
+            if mode_choice_response is not None:
+                _validate_run_submission_scope(mode_choice_response, body)
+                details = {**details, **mode_choice_response}
+                status = _string_value(mode_choice_response.get("status")) or status
+                approval_status = _approve_project_preflight_run(
+                    client,
+                    run_id=run_id,
+                    response=mode_choice_response,
+                    case_id=case_id,
+                    evidence=evidence,
+                    required=False,
+                )
+                status = approval_status or status
+                if approval_status is not None:
+                    details["status"] = approval_status
             evidence["final_artifacts"] = bool(
                 evidence.get("final_artifacts")
             ) or _has_final_artifacts(details)
@@ -1758,6 +1806,45 @@ def _collect_run_observation(
         events=events,
         workspace_bundle=workspace_bundle,
     )
+
+
+def _choose_auto_mode_if_waiting(
+    client: AcceptanceClient,
+    *,
+    run_id: str,
+    case_id: str,
+    requested_body: Mapping[str, object],
+    current: Mapping[str, object],
+    fallback: Mapping[str, object],
+) -> dict[str, object] | None:
+    if requested_body.get("mode") != "auto" or current.get("status") != "waiting_user_mode":
+        return None
+    scale, _, _flow = case_id.partition(":")
+    selected_mode = _AUTO_MODE_BY_PROJECT_SCALE.get(scale)
+    if selected_mode is None:
+        return None
+    decision_token = current.get("decision_token")
+    if not isinstance(decision_token, str) or not decision_token:
+        decision_token = fallback.get("decision_token")
+    version = current.get("version")
+    if not isinstance(version, int) or version <= 0:
+        version = fallback.get("version")
+    if not isinstance(decision_token, str) or not decision_token:
+        return None
+    if not isinstance(version, int) or version <= 0:
+        return None
+    response = client.request_json(
+        "POST",
+        f"/api/v1/runs/{quote(run_id)}/choose-mode",
+        body={
+            "mode": selected_mode,
+            "decision_token": decision_token,
+            "version": version,
+        },
+    )
+    if not isinstance(response, dict):
+        raise TypeError("mode choice returned non-object JSON")
+    return response
 
 
 def _refresh_run_terminal_status(

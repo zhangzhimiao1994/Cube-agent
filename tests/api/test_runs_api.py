@@ -135,6 +135,9 @@ class StubRunService:
     archived_conversation_ids: set[str] = field(default_factory=set)
     queued_items: list[ConversationQueueItem] = field(default_factory=list)
     conversation_active: bool = True
+    summary_status: RunStatus = RunStatus.RUNNING
+    summary_decision_token: str | None = None
+    summary_clarification_reason: str | None = None
 
     async def submit(
         self,
@@ -476,7 +479,7 @@ class StubRunService:
         return RunSummary(
             id=run_id,
             tenant_id=tenant_id,
-            status=RunStatus.RUNNING,
+            status=self.summary_status,
             mode=TaskMode.DISPATCH,
             version=7,
             request="safe request",
@@ -484,6 +487,8 @@ class StubRunService:
             artifact_ids=(uuid4(),),
             usage_cost_usd=Decimal("0.00"),
             conversation_id="conv-preview",
+            decision_token=self.summary_decision_token,
+            clarification_reason=self.summary_clarification_reason,
         )
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
@@ -2052,6 +2057,20 @@ def test_run_details_include_version_for_capability_approval() -> None:
     assert details.status_code == 200
     assert summary.json()["version"] == 7
     assert details.json()["version"] == 7
+
+
+def test_run_details_expose_actionable_mode_decision_after_reconnect() -> None:
+    client, service, _ = _client()
+    run_id = uuid4()
+    service.summary_status = RunStatus.WAITING_USER_MODE
+    service.summary_decision_token = "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"
+    service.summary_clarification_reason = "routing_requires_user_choice"
+
+    details = client.get(f"/api/v1/runs/{run_id}/details", headers=bearer())
+
+    assert details.status_code == 200
+    assert details.json()["decision_token"] == service.summary_decision_token
+    assert details.json()["clarification_reason"] == "routing_requires_user_choice"
 
 
 def test_run_events_and_details_never_expose_credentials_or_hidden_reasoning() -> None:

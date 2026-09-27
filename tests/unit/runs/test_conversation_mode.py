@@ -888,6 +888,63 @@ async def test_auto_submission_waits_when_router_requires_user_choice() -> None:
     assert "main_agent_selected_mode" not in routing
 
 
+async def test_get_preserves_actionable_mode_decision_for_public_recovery() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    repository = PreviewMutationRepository(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=run_id,
+    )
+    repository.record = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="ambiguous workflow",
+        mode=None,
+        status=RunStatus.WAITING_USER_MODE,
+        version=3,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "reason": "routing_requires_user_choice",
+            "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            "conversation_id": "conv-recovery",
+        },
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    summary = await service.get(tenant_id, run_id)
+
+    assert summary.decision_token == "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"
+    assert summary.clarification_reason == "routing_requires_user_choice"
+
+    repository.record = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="ambiguous workflow",
+        mode=TaskMode.HYBRID,
+        status=RunStatus.COMPLETED,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "reason": "routing_requires_user_choice",
+            "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+        },
+    )
+
+    completed = await service.get(tenant_id, run_id)
+
+    assert completed.decision_token is None
+    assert completed.clarification_reason is None
+
+
 async def test_auto_submission_uses_hermes_before_local_direct_router_fallback() -> None:
     repository = ConversationModeRepository(None)
     advisor = RecordingHermesAdvisor(

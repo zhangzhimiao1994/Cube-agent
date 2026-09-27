@@ -473,6 +473,8 @@ class RunSummaryResponse(BaseModel):
     completed_step_ids: tuple[str, ...]
     artifact_ids: tuple[UUID, ...]
     usage_cost_usd: Decimal
+    decision_token: str | None = None
+    clarification_reason: str | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -486,6 +488,8 @@ class RunSummaryResponse(BaseModel):
             completed_step_ids=run.completed_step_ids,
             artifact_ids=run.artifact_ids,
             usage_cost_usd=run.usage_cost_usd,
+            decision_token=run.decision_token,
+            clarification_reason=run.clarification_reason,
         )
 
 

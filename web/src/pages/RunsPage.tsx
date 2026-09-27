@@ -8753,15 +8753,21 @@ export function RunsPage() {
                 <h3>主 Agent 需要你确认运行方式</h3>
                 <p>
                   自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
-                  请在当前输入框回复编号或关键词；后面可以继续补充你的想法。
+                  请选择本次运行方式；也可以在输入框回复编号或关键词。
                 </p>
-                <ol className="choice-list">
-                  {MANUAL_RUN_MODES.map((item, index) => (
-                    <li key={item.value}>
-                      {index + 1}. {item.label}：{item.description}
-                    </li>
+                <div className="mode-choice-grid">
+                  {MANUAL_RUN_MODES.map((item) => (
+                    <button
+                      type="button"
+                      key={item.value}
+                      disabled={chooseMode.isPending}
+                      onClick={() => chooseMode.mutate({ chosenMode: item.value })}
+                    >
+                      <strong>{item.label}</strong>
+                      <small>{item.description}</small>
+                    </button>
                   ))}
-                </ol>
+                </div>
               </article>
             ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
@@ -9353,15 +9359,23 @@ export function RunsPage() {
                     message.trim().length === 0 ||
                     currentConversationArchived
                   }
-                  title={canStopLatestRun ? "当前任务完成后执行这条消息" : "发送消息"}
+                  title={
+                    modeSelection
+                      ? "确认运行模式"
+                      : canStopLatestRun
+                        ? "当前任务完成后执行这条消息"
+                        : "发送消息"
+                  }
                 >
                   {queueMessage.isPending
                     ? "排队中..."
                     : createRun.isPending
                       ? "发送中..."
-                      : canStopLatestRun
-                        ? "排队"
-                        : "发送"}
+                      : modeSelection
+                        ? "确认"
+                        : canStopLatestRun
+                          ? "排队"
+                          : "发送"}
                 </button>
               </div>
             </div>

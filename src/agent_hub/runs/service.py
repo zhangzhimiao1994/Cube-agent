@@ -136,6 +136,8 @@ class RunSummary:
     artifact_ids: tuple[UUID, ...]
     usage_cost_usd: Decimal
     conversation_id: str | None = None
+    decision_token: str | None = None
+    clarification_reason: str | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -2312,6 +2314,10 @@ class RunService:
 
     async def _summary(self, record: RunRecord) -> RunSummary:
         routing_decision = record.routing_decision or {}
+        waiting_for_decision = record.status in {
+            RunStatus.WAITING_USER_MODE,
+            RunStatus.WAITING_APPROVAL,
+        }
         return RunSummary(
             id=record.id,
             tenant_id=record.tenant_id,
@@ -2325,6 +2331,16 @@ class RunService:
             artifact_ids=await self._repository.artifact_ids(record.tenant_id, record.id),
             usage_cost_usd=await self._repository.usage_cost(record.tenant_id, record.id),
             conversation_id=_string_or_none(routing_decision.get("conversation_id")),
+            decision_token=(
+                str(routing_decision["decision_token"])
+                if waiting_for_decision and routing_decision.get("decision_token") is not None
+                else None
+            ),
+            clarification_reason=(
+                str(routing_decision.get("reason", "routing_requires_user_choice"))
+                if waiting_for_decision
+                else None
+            ),
         )
 
     async def _safe_notify_terminal_hooks(

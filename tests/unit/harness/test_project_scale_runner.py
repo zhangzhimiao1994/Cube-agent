@@ -19,6 +19,7 @@ from agent_hub.harness.project_scale import (
     PROJECT_SCALE_TIERS,
     ProjectScaleBenchmarkKind,
     ProjectScaleRunPlan,
+    ProjectScaleRunRequest,
     build_project_scale_run_plan,
 )
 from agent_hub.harness.project_scale_runner import (
@@ -1308,6 +1309,91 @@ def test_execute_project_scale_plan_submits_run_and_collects_evidence() -> None:
         ("GET", "/api/v1/runs/run-small-direct/events", None),
         ("GET", workspace_bundle_path, None),
     ]
+
+
+@pytest.mark.parametrize(
+    ("scale", "expected_mode"),
+    (
+        ("small", "dispatch"),
+        ("medium", "dispatch"),
+        ("large", "hybrid"),
+        ("ultra", "hybrid"),
+    ),
+)
+def test_execute_project_scale_plan_recovers_auto_run_waiting_for_user_mode(
+    scale: str,
+    expected_mode: str,
+) -> None:
+    plan = _auto_scale_plan(scale)
+    client = WaitingUserModeAcceptanceClient(
+        run_id=f"run-{scale}-auto",
+        session_id=f"project-scale-{scale}-auto",
+        token_source="submission",
+    )
+
+    result = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=0.05,
+        poll_interval_seconds=0,
+    ).results[0]
+
+    assert result.status == "completed"
+    assert result.observed_mode == expected_mode
+    assert client.choose_mode_bodies == [
+        {
+            "mode": expected_mode,
+            "decision_token": client.decision_token,
+            "version": 1,
+        }
+    ]
+    assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
+
+
+def test_execute_project_scale_plan_uses_waiting_details_mode_decision() -> None:
+    plan = _auto_scale_plan("large")
+    client = WaitingUserModeAcceptanceClient(
+        run_id="run-large-auto-details-token",
+        session_id="project-scale-large-auto",
+        token_source="details",
+    )
+
+    result = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=0.05,
+        poll_interval_seconds=0,
+    ).results[0]
+
+    assert result.status == "completed"
+    assert client.choose_mode_bodies == [
+        {
+            "mode": "hybrid",
+            "decision_token": client.decision_token,
+            "version": 2,
+        }
+    ]
+    assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
+
+
+@pytest.mark.parametrize("flow", ("direct", "dispatch", "hybrid", "multi_agent"))
+def test_execute_project_scale_plan_does_not_choose_mode_for_explicit_flow(flow: str) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=(flow,),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id=f"run-small-{flow}",
+        session_id=f"project-scale-small-{flow}",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    execute_project_scale_plan(plan, client)
+
+    assert not any(path.endswith("/choose-mode") for _, path, _ in client.calls)
 
 
 def test_execute_project_scale_plan_preserves_initial_mode_across_repair() -> None:
@@ -4708,6 +4794,124 @@ class FakeAcceptanceClient:
         else:
             self.current_execution_evidence = self.execution_evidence
         return self.current_execution_evidence
+
+
+def _auto_scale_plan(scale: str) -> ProjectScaleRunPlan:
+    base = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=(scale,),
+        flows=("artifact_production",),
+        execute=True,
+    )
+    request = base.requests[0]
+    body = dict(request.body)
+    body.update(
+        {
+            "mode": "auto",
+            "workspace_session_id": f"project-scale-{scale}-auto",
+        }
+    )
+    return ProjectScaleRunPlan(
+        requests=(
+            ProjectScaleRunRequest(
+                case_id=f"{scale}:auto",
+                body=body,
+                validation_focus=request.validation_focus,
+            ),
+        ),
+        required_evidence=base.required_evidence,
+        cleanup_actions=base.cleanup_actions,
+        dry_run=False,
+        execute=True,
+        requires_bearer_token=base.requires_bearer_token,
+        benchmark_kind=base.benchmark_kind,
+    )
+
+
+class WaitingUserModeAcceptanceClient(FakeAcceptanceClient):
+    def __init__(self, *, run_id: str, session_id: str, token_source: str) -> None:
+        super().__init__(
+            run_id=run_id,
+            session_id=session_id,
+            status="completed",
+            artifacts=[{"id": "artifact-1"}],
+        )
+        self.token_source = token_source
+        self.decision_token = "mode-decision-token-abcdefghijklmnopqrstuvwxyz"
+        self.preflight_token = "preflight-token-abcdefghijklmnopqrstuvwxyz123"
+        self.mode_chosen = False
+        self.choose_mode_bodies: list[dict[str, object]] = []
+        self.selected_mode: str | None = None
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object] | list[object]:
+        if method == "POST" and path == "/api/v1/runs":
+            submission_response = super().request_json(
+                method,
+                path,
+                body=body,
+                idempotency_key=idempotency_key,
+            )
+            assert isinstance(submission_response, dict)
+            submission_response["status"] = (
+                "waiting_user_mode" if self.token_source == "submission" else "queued"
+            )
+            submission_response["mode"] = None
+            submission_response["version"] = 1
+            if self.token_source == "submission":
+                submission_response["decision_token"] = self.decision_token
+            return submission_response
+        if method == "POST" and path == f"/api/v1/runs/{self.run_id}/choose-mode":
+            self.calls.append((method, path, idempotency_key))
+            assert body is not None
+            self.choose_mode_bodies.append(dict(body))
+            self.mode_chosen = True
+            self.selected_mode = cast(str, body["mode"])
+            self.actual_mode = self.selected_mode
+            scale = self.run_id.split("-", 2)[1]
+            waiting_preflight = scale in {"large", "ultra"}
+            choice_response: dict[str, object] = {
+                "id": self.run_id,
+                "status": "waiting_approval" if waiting_preflight else "queued",
+                "mode": self.selected_mode,
+                "version": 2,
+                "project_id": self.submitted_bodies[-1]["project_id"],
+                "workspace_session_id": self.submitted_bodies[-1]["workspace_session_id"],
+            }
+            if waiting_preflight:
+                choice_response["decision_token"] = self.preflight_token
+            return choice_response
+        if method == "POST" and path == f"/api/v1/runs/{self.run_id}/approve-project-preflight":
+            self.calls.append((method, path, idempotency_key))
+            assert body == {"decision_token": self.preflight_token, "version": 2}
+            return {"id": self.run_id, "status": "queued", "mode": self.selected_mode}
+        if (
+            method == "GET"
+            and path == f"/api/v1/runs/{self.run_id}/details"
+            and not self.mode_chosen
+        ):
+            self.calls.append((method, path, idempotency_key))
+            details_response: dict[str, object] = {
+                "id": self.run_id,
+                "status": "waiting_user_mode",
+                "mode": None,
+                "version": 2,
+            }
+            if self.token_source == "details":
+                details_response["decision_token"] = self.decision_token
+            return details_response
+        return super().request_json(
+            method,
+            path,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
 
 
 def _project_bundle(files: dict[str, str]) -> bytes:

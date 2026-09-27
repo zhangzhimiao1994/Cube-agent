@@ -7441,6 +7441,36 @@ describe("operational management pages", () => {
     expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
   });
 
+  it("offers explicit mode buttons when auto routing needs confirmation", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "这个请求需要二次确认");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    const prompt = await screen.findByRole("article", { name: "运行模式确认" });
+    expect(within(prompt).getByRole("button", { name: /^直连/ })).not.toBeNull();
+    expect(within(prompt).getByRole("button", { name: /^派单/ })).not.toBeNull();
+    expect(within(prompt).getByRole("button", { name: /^讨论/ })).not.toBeNull();
+    expect(within(prompt).getByRole("button", { name: /^混合/ })).not.toBeNull();
+    expect(within(composer).getByRole("button", { name: "确认" })).not.toBeNull();
+
+    await user.click(within(prompt).getByRole("button", { name: /^混合/ }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
+        method: "POST",
+        body: {
+          mode: "hybrid",
+          decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+          version: 1,
+        },
+      }),
+    );
+  });
+
   it("does not expose manual mode controls for ordinary conversations", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
