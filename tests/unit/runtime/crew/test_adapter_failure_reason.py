@@ -51,6 +51,7 @@ from agent_hub.runtime.crew.adapter import (
     _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
     _tool_definitions,
+    _tool_round_budget,
     _tool_sandbox,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -86,6 +87,72 @@ class ToolGateway:
                 usage=TokenUsage(1, 1, 2),
             )
             if len(self.requests) == 1
+            else ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class ToolResultAwareGateway:
+    """Models a provider that needs a trusted continuation contract after a tool call."""
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        has_trusted_continuation = any(
+            message.role == "system"
+            and isinstance(message.content, str)
+            and "CAPABILITY_RESULT_CONTINUATION" in message.content
+            for message in request.messages
+        )
+        response = (
+            ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
+            if has_trusted_continuation
+            else ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="provider-call", name="web_search", arguments={"q": "safe"}),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class DuplicateUntilToolsDisabledGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id=f"provider-call-{len(self.requests)}",
+                        name="web_search",
+                        arguments={"q": "safe"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if request.tools
             else ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
         )
         return GatewayCompletion(
@@ -1994,6 +2061,77 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     result = tool_artifact.content["result"]
     assert isinstance(result, Mapping)
     assert result["items"] == ("harness result",)
+
+
+async def test_successful_tool_result_adds_trusted_continuation_contract() -> None:
+    gateway = ToolResultAwareGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(harness.calls) == 1
+    assert len(gateway.requests) == 2
+    continuation = gateway.requests[1]
+    assert any(
+        message.role == "system"
+        and isinstance(message.content, str)
+        and "CAPABILITY_RESULT_CONTINUATION" in message.content
+        for message in continuation.messages
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_identical_tool_call_is_reused_and_forces_result_synthesis() -> None:
+    gateway = DuplicateUntilToolsDisabledGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(harness.calls) == 1
+    assert len(gateway.requests) == 3
+    assert gateway.requests[2].tools == ()
+    assert ModelCapability.TOOL_CALLING not in gateway.requests[2].required_capabilities
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("project_scale", "hard_limit"),
+    [
+        (None, 8),
+        ("small", 8),
+        ("medium", 16),
+        ("large", 24),
+        ("ultra", 32),
+    ],
+)
+def test_tool_round_budget_scales_with_project_size(
+    project_scale: str | None,
+    hard_limit: int,
+) -> None:
+    routing_decision = {} if project_scale is None else {"project_scale": project_scale}
+
+    budget = _tool_round_budget(
+        _context(routing_decision=routing_decision),
+        _tool_plan().steps[0],
+    )
+
+    assert budget.initial_limit == 8
+    assert budget.extension_size == 8
+    assert budget.hard_limit == hard_limit
 
 
 async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> None:
