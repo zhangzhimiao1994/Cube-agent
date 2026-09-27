@@ -778,6 +778,7 @@ def test_native_install_deploys_minimal_privilege_skill_broker_units() -> None:
     assert "SocketGroup=agent-hub" in socket_unit
     assert "SocketMode=0660" in socket_unit
     assert "User=root" in service_unit
+    assert "SupplementaryGroups=agent-hub" in service_unit
     assert "NoNewPrivileges=yes" in service_unit
     assert "CapabilityBoundingSet=" in service_unit
     assert "RestrictAddressFamilies=AF_UNIX" in service_unit

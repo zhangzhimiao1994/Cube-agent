@@ -19,6 +19,11 @@
   grep -q '^ReadWritePaths=/var/lib/agent-hub /run/agent-hub' deploy/native/systemd/agent-hub-api.service
 }
 
+@test "skill broker reads service-owned packages without ambient capabilities" {
+  grep -q '^SupplementaryGroups=agent-hub' deploy/native/systemd/agent-hub-skill-broker.service
+  grep -q '^CapabilityBoundingSet=$' deploy/native/systemd/agent-hub-skill-broker.service
+}
+
 @test "python systemd services load the active release source tree" {
   for unit in \
     deploy/native/systemd/agent-hub-api.service \

@@ -7,6 +7,7 @@ After=agent-hub-skill-broker.socket
 Type=exec
 User=root
 Group=root
+SupplementaryGroups=agent-hub
 Environment=PYTHONPATH=/opt/agent-hub/current/src
 WorkingDirectory=/opt/agent-hub/current
 ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.skills.sandbox.broker
