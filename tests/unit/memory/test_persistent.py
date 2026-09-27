@@ -58,7 +58,7 @@ def test_runtime_memory_selection_is_actor_and_scope_isolated() -> None:
 
 
 def test_runtime_memory_selection_can_reach_past_two_hundred_unrelated_rows() -> None:
-    unrelated = tuple(
+    unrelated: tuple[tuple[str, dict[str, object]], ...] = tuple(
         (
             f"other-{index:03d}",
             {
