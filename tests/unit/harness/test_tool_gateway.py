@@ -1,6 +1,8 @@
 from collections.abc import Mapping
 from uuid import UUID
 
+import pytest
+
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
@@ -430,6 +432,23 @@ def project_zip_workspace_write_request(*, sandbox: str = "workspace_write") -> 
         approval_required=False,
         sandbox=sandbox,
         idempotency_key="project_zip_workspace_1",
+    )
+
+
+def builtin_request(
+    tool_name: str,
+    *,
+    arguments: Mapping[str, JsonValue] | None = None,
+    sandbox: str = "restricted",
+) -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="main_agent",
+        tool_name=tool_name,
+        arguments={} if arguments is None else arguments,
+        approval_required=False,
+        sandbox=sandbox,
+        idempotency_key=f"builtin_{tool_name}",
     )
 
 
@@ -980,6 +999,136 @@ async def test_harness_tool_gateway_maps_project_zip_to_file_create_policy() -> 
     assert capability_request.capability == "file"
     assert capability_request.operation == "create"
     assert capability_request.resource == "generated/project.generate_zip"
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected"),
+    (
+        ("calculator", {}, ("calculator", "evaluate", "calculator")),
+        ("calculator_evaluate", {}, ("calculator", "evaluate", "calculator")),
+        ("calculator.evaluate", {}, ("calculator", "evaluate", "calculator")),
+        ("read_context", {}, ("context", "read", "context")),
+        (
+            "read_context",
+            {"path": "workspace/docs/spec.md"},
+            ("file", "read", "workspace/docs/spec.md"),
+        ),
+        ("workspace_read", {"path": "README.md"}, ("file", "read", "workspace/README.md")),
+        ("workspace.read", {"path": "README.md"}, ("file", "read", "workspace/README.md")),
+        ("http.read", {"url": "https://example.com/a"}, ("network", "read", "network/http")),
+        (
+            "document.generate_docx",
+            {},
+            ("file", "create", "generated/document.generate_docx"),
+        ),
+        (
+            "presentation.generate_pptx",
+            {},
+            ("file", "create", "generated/presentation.generate_pptx"),
+        ),
+        (
+            "project.preflight_architecture",
+            {"project_id": "project-main", "workspace_session_id": "session-main"},
+            ("file", "create", "generated/project.preflight_architecture"),
+        ),
+        ("project.generate_zip", {}, ("file", "create", "generated/project.generate_zip")),
+    ),
+)
+async def test_harness_tool_gateway_maps_every_builtin_to_explicit_policy_identity(
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+    expected: tuple[str, str, str],
+) -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        builtin_request(tool_name, arguments=arguments),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert (
+        capability_request.capability,
+        capability_request.operation,
+        capability_request.resource,
+    ) == expected
+    assert (capability_request.capability, capability_request.operation) != ("skill", "use")
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_routes_http_builtin_with_manifest_sandbox_through_network_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        builtin_request(
+            "http.read",
+            arguments={"url": "https://example.com/a"},
+            sandbox="http_read",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    capability_request = policy.requests[0][0]
+    assert (
+        capability_request.capability,
+        capability_request.operation,
+        capability_request.resource,
+    ) == ("network", "read", "network/http")
+    assert [call[0] for call in runtime.calls] == ["available", "execute"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "sandbox"),
+    (
+        ("project.delete_workspace", "restricted"),
+        ("workspace.write", "restricted"),
+        ("unmapped_writer", "workspace_write"),
+    ),
+)
+async def test_harness_tool_gateway_fails_closed_for_unmapped_dangerous_builtin(
+    tool_name: str,
+    sandbox: str,
+) -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    gateway = HarnessToolGateway(runtime)
+
+    result = await gateway.invoke(TENANT_ID, builtin_request(tool_name, sandbox=sandbox))
+
+    assert result.status == "failed"
+    assert result.failure_reason == "tool permission mapping unavailable"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_keeps_unknown_restricted_skill_on_skill_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        builtin_request("team_custom_skill"),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert (
+        capability_request.capability,
+        capability_request.operation,
+        capability_request.resource,
+    ) == ("skill", "use", "skill/team_custom_skill")
     assert runtime.calls == []
 
 

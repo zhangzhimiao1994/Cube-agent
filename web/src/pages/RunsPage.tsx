@@ -89,6 +89,16 @@ type RunSubmissionOverride = {
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const EXECUTION_BACKEND_REASON_TEXT: Record<string, string> = {
+  systemd_tools_not_found: "服务器未安装 systemd 运行工具",
+  systemd_broker_unavailable: "systemd 安全执行代理未启动或当前服务无权连接",
+  systemd_broker_invalid_response: "systemd 安全执行代理返回了无效响应",
+  systemd_transient_unit_unavailable: "服务账号无权创建 systemd 隔离单元",
+  docker_cli_not_found: "服务器未安装 Docker 命令行",
+  docker_daemon_unavailable: "Docker 服务未运行",
+  docker_runner_image_not_found: "缺少 Skill 运行镜像",
+  docker_runner_unavailable: "Skill 运行镜像无法按隔离策略启动",
+};
 const TOOL_STATUS_LABELS: Record<string, string> = {
   requested: "已请求",
   running: "进行中",
@@ -5400,6 +5410,65 @@ type ConversationProjectOption = {
   legacyWorkspaceCount: number;
 };
 
+type ConversationManagerView = "current" | "archived";
+
+export function conversationManagerMetadata(
+  current: ConversationMetadata[],
+  archived: ConversationMetadata[],
+  view: ConversationManagerView,
+) {
+  return view === "archived"
+    ? archived.filter((conversation) => Boolean(conversation.archived_at))
+    : current.filter((conversation) => !conversation.archived_at);
+}
+
+export function currentConversationRuns<T extends { conversation_id?: string | null }>(
+  runs: T[],
+  archived: ConversationMetadata[],
+) {
+  const archivedConversationIds = new Set(
+    archived.map((conversation) => conversation.conversation_id),
+  );
+  return runs.filter(
+    (run) => !archivedConversationIds.has(run.conversation_id ?? ""),
+  );
+}
+
+export function ConversationManagerTabs({
+  value,
+  currentCount,
+  archivedCount,
+  onChange,
+}: {
+  value: ConversationManagerView;
+  currentCount: number;
+  archivedCount: number;
+  onChange: (value: ConversationManagerView) => void;
+}) {
+  return (
+    <div className="conversation-manager-tabs" role="tablist" aria-label="会话分类">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={value === "current"}
+        className={value === "current" ? "selected" : ""}
+        onClick={() => onChange("current")}
+      >
+        当前会话 <span>{currentCount}</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={value === "archived"}
+        className={value === "archived" ? "selected" : ""}
+        onClick={() => onChange("archived")}
+      >
+        已归档 <span>{archivedCount}</span>
+      </button>
+    </div>
+  );
+}
+
 type NewProjectDraft = {
   projectId: string;
   label: string;
@@ -6071,6 +6140,8 @@ export function RunsPage() {
   const [renameConversationOpen, setRenameConversationOpen] = useState(false);
   const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [conversationSearch, setConversationSearch] = useState("");
+  const [conversationManagerView, setConversationManagerView] =
+    useState<ConversationManagerView>("current");
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
@@ -6217,14 +6288,6 @@ export function RunsPage() {
     setConversationId(linkedConversationId);
     setSelectedRunId(null);
   }, [conversationId, linkedConversationId]);
-  useEffect(() => {
-    if (linkedConversationId || selectedRunId || activeConversationKnown || message.trim()) return;
-    const latest = conversations.data?.[0];
-    if (!latest) return;
-    setConversationId(latest.conversation_id);
-    if (latest.project_id?.trim()) setProjectId(latest.project_id);
-    setProjectLabel(latest.project_label?.trim() ?? "");
-  }, [activeConversationKnown, conversations.data, linkedConversationId, message, selectedRunId]);
   useEffect(() => {
     if (!settings.data) return;
     setMode("auto");
@@ -6421,8 +6484,7 @@ export function RunsPage() {
       !projectWorkspaces.isSuccess ||
       !conversations.isSuccess ||
       !archivedConversations.isSuccess ||
-      conversations.data.length > 0 ||
-      archivedConversations.data.length > 0
+      conversations.data.length > 0
     ) return;
     initialProjectSetupPromptedRef.current = true;
     const firstProject = conversationProjects[0];
@@ -6843,6 +6905,7 @@ export function RunsPage() {
       }));
       setRenameConversationOpen(false);
       setConversationMenuOpen(false);
+      if (variables.archived === false) setConversationManagerView("current");
       setSubmitNotice(
         variables.title !== undefined
           ? "会话名称已更新。"
@@ -7471,11 +7534,9 @@ export function RunsPage() {
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runListItems;
-  const archivedConversationIds = new Set(
-    (archivedConversations.data ?? []).map((item) => item.conversation_id),
-  );
-  const conversationListItems = items.filter(
-    (item) => !archivedConversationIds.has(item.conversation_id ?? ""),
+  const conversationListItems = currentConversationRuns(
+    items,
+    archivedConversations.data ?? [],
   );
   const managerProjectId = managedProjectId.trim() || projectId.trim() || conversationProjects[0]?.id || "";
   const conversationProjectById = new Map(
@@ -7488,16 +7549,28 @@ export function RunsPage() {
     const itemProjectId = item.conversation_id ? conversationProjectById.get(item.conversation_id) : null;
     return itemProjectId ? itemProjectId === managerProjectId : managerProjectId === activeWorkspaceProjectId;
   });
-  const visibleConversationItems = projectConversationListItems.filter(
+  const visibleConversationItems = (conversationManagerView === "current" ? projectConversationListItems : []).filter(
     (item) => conversationMatchesSearch(item, conversationSearch, items),
   );
   const runConversationIds = new Set(
-    items.map((item) => item.conversation_id).filter((value): value is string => Boolean(value)),
+    conversationListItems
+      .map((item) => item.conversation_id)
+      .filter((value): value is string => Boolean(value)),
   );
-  const metadataConversationItems = [
-    ...(conversations.data ?? []).filter((item) => !runConversationIds.has(item.conversation_id)),
-    ...(archivedConversations.data ?? []),
-  ];
+  const currentMetadataConversationItems = conversationManagerMetadata(
+    conversations.data ?? [],
+    archivedConversations.data ?? [],
+    "current",
+  ).filter((item) => !runConversationIds.has(item.conversation_id));
+  const archivedMetadataConversationItems = conversationManagerMetadata(
+    conversations.data ?? [],
+    archivedConversations.data ?? [],
+    "archived",
+  );
+  const metadataConversationItems =
+    conversationManagerView === "archived"
+      ? archivedMetadataConversationItems
+      : currentMetadataConversationItems;
   const normalizedConversationSearch = conversationSearch.trim().toLocaleLowerCase();
   const visibleMetadataConversationItems = metadataConversationItems.filter((item) =>
     (!managerProjectId || item.project_id === managerProjectId) &&
@@ -7507,7 +7580,18 @@ export function RunsPage() {
           .filter(Boolean)
           .some((value) => value?.toLocaleLowerCase().includes(normalizedConversationSearch))),
   );
-  const totalConversationCount = conversationListItems.length + metadataConversationItems.length;
+  const currentConversationCount =
+    projectConversationListItems.length +
+    currentMetadataConversationItems.filter(
+      (item) => !managerProjectId || item.project_id === managerProjectId,
+    ).length;
+  const archivedConversationCount = archivedMetadataConversationItems.filter(
+    (item) => !managerProjectId || item.project_id === managerProjectId,
+  ).length;
+  const totalConversationCount =
+    conversationManagerView === "archived"
+      ? archivedConversationCount
+      : currentConversationCount;
   const visibleConversationCount = visibleConversationItems.length + visibleMetadataConversationItems.length;
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const availableExecutionBackends = executionBackends.data?.filter((backend) => backend.available) ?? [];
@@ -7525,9 +7609,13 @@ export function RunsPage() {
   const executionBackendNotice = executionBackends.isLoading
     ? "正在探测执行环境，请稍候。"
     : executionBackends.isError
-      ? "执行环境探测失败，普通对话仍可发送；本次不会指定 Skill 执行环境。"
+      ? "执行环境状态读取失败。本次仍可普通对话，但不会执行 Skill。"
       : availableExecutionBackends.length === 0
-        ? "当前没有可用的 Skill 执行环境，普通对话仍可发送。"
+        ? `服务器暂时无法安全运行 Skill：${Array.from(new Set(
+            (executionBackends.data ?? [])
+              .filter((backend) => !backend.available)
+              .map((backend) => backend.reason ? EXECUTION_BACKEND_REASON_TEXT[backend.reason] ?? backend.reason : "原因未知"),
+          )).join("；") || "未接入隔离执行器"}。本次仍可普通对话，但不会执行 Skill。`
         : null;
   const executionBackendLabel = selectedExecutionBackend
     ? `${selectedExecutionBackend.name}${selectedExecutionBackend.available ? "" : "（不可用）"}`
@@ -7619,7 +7707,7 @@ export function RunsPage() {
   const currentConversationListItem = items.find((item) => item.conversation_id === activeConversationId);
   const currentConversationTitle =
     activeConversation.data?.title?.trim() ||
-    (currentConversationListItem ? conversationTitle(currentConversationListItem, items) : conversationId);
+    (currentConversationListItem ? conversationTitle(currentConversationListItem, items) : activeConversationKnown ? conversationId : "新会话");
   const currentConversationArchived = Boolean(activeConversation.data?.archived_at);
   const currentConversationPersisted = Boolean(
     activeConversation.data?.created_at || listedConversationMetadata?.created_at,
@@ -7734,15 +7822,24 @@ export function RunsPage() {
               </article>
             ))}
           </div>
+          <ConversationManagerTabs
+            value={conversationManagerView}
+            currentCount={currentConversationCount}
+            archivedCount={archivedConversationCount}
+            onChange={(nextView) => {
+              setConversationManagerView(nextView);
+              setSelectedConversationIds([]);
+            }}
+          />
           <input
             type="search"
             className="conversation-history-search"
-            aria-label="搜索历史会话"
-            placeholder="搜索最近会话、问题或 ID"
+            aria-label={conversationManagerView === "archived" ? "搜索已归档会话" : "搜索当前会话"}
+            placeholder={conversationManagerView === "archived" ? "搜索已归档会话或 ID" : "搜索当前会话、问题或 ID"}
             value={conversationSearch}
             onChange={(event) => setConversationSearch(event.target.value)}
           />
-          {items.length > 0 ? (
+          {conversationManagerView === "current" && conversationListItems.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
                 <input
@@ -7767,14 +7864,22 @@ export function RunsPage() {
             </div>
           ) : null}
           {totalConversationCount === 0 ? (
-            <p className="field-help">还没有会话。直接发送消息即可开始。</p>
+            <p className="field-help">
+              {conversationManagerView === "archived"
+                ? "还没有已归档会话。"
+                : "还没有会话。直接发送消息即可开始。"}
+            </p>
           ) : visibleConversationCount === 0 ? (
-            <p className="field-help">没有匹配的历史会话。</p>
+            <p className="field-help">
+              {conversationManagerView === "archived"
+                ? "没有匹配的已归档会话。"
+                : "没有匹配的当前会话。"}
+            </p>
           ) : (
             <>
               {visibleMetadataConversationItems.map((conversation: ConversationMetadata) => {
                 const title = conversation.title?.trim() || conversation.conversation_id;
-                const archived = Boolean(conversation.archived_at);
+                const archived = conversationManagerView === "archived";
                 return (
                   <div
                     key={`metadata-${conversation.conversation_id}`}
@@ -7799,15 +7904,32 @@ export function RunsPage() {
                         {conversation.project_label?.trim() || conversation.project_id || "默认项目"}
                       </small>
                     </button>
-                    <button
-                      type="button"
-                      className="conversation-branch-button"
-                      aria-label={`按原思路新建分支 ${title}`}
-                      title="引用这段会话新建分支"
-                      onClick={() => startBranchConversation(conversation.conversation_id)}
-                    >
-                      分支
-                    </button>
+                    {archived ? (
+                      <button
+                        type="button"
+                        className="conversation-restore-button"
+                        aria-label={`恢复会话 ${title}`}
+                        disabled={updateConversation.isPending}
+                        onClick={() =>
+                          updateConversation.mutate({
+                            conversationId: conversation.conversation_id,
+                            archived: false,
+                          })
+                        }
+                      >
+                        恢复
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="conversation-branch-button"
+                        aria-label={`按原思路新建分支 ${title}`}
+                        title="引用这段会话新建分支"
+                        onClick={() => startBranchConversation(conversation.conversation_id)}
+                      >
+                        分支
+                      </button>
+                    )}
                     <span className="conversation-metadata-status">{archived ? "已归档" : "未开始"}</span>
                   </div>
                 );
@@ -7908,6 +8030,26 @@ export function RunsPage() {
               <span>{workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : "无参考方案"}</span>
             </div>
           </div>
+          <div className="conversation-workspace-summary">
+            <span className="field-label">本次工作目录</span>
+            <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
+            <code>{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)}</code>
+            <small>{runWorkspacePath ? "仅覆盖本次运行，不修改项目默认目录。" : "当前使用项目默认工作目录。"}</small>
+            <div className="conversation-workspace-actions">
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => setWorkspaceDirectoryTarget({ kind: "run", projectId: activeWorkspaceProjectId })}
+              >
+                选择本次工作目录
+              </button>
+              {runWorkspacePath ? (
+                <button type="button" className="secondary-action" onClick={() => setRunWorkspacePath("")}>
+                  恢复项目默认
+                </button>
+              ) : null}
+            </div>
+          </div>
           <details className="run-settings-panel" aria-label="本次运行设置">
             <summary aria-label="展开或收起本次运行设置">详细设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
@@ -7975,26 +8117,6 @@ export function RunsPage() {
                 {executionBackendStatus}
               </span>
             </label>
-            <div className="conversation-workspace-summary">
-              <span className="field-label">本次工作目录</span>
-              <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
-              <code>{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)}</code>
-              <small>{runWorkspacePath ? "仅覆盖本次运行，不修改项目默认目录。" : "当前使用项目默认工作目录。"}</small>
-              <div className="conversation-workspace-actions">
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => setWorkspaceDirectoryTarget({ kind: "run", projectId: activeWorkspaceProjectId })}
-                >
-                  选择本次工作目录
-                </button>
-                {runWorkspacePath ? (
-                  <button type="button" className="secondary-action" onClick={() => setRunWorkspacePath("")}>
-                    恢复项目默认
-                  </button>
-                ) : null}
-              </div>
-            </div>
             <label htmlFor="reference-conversation-id">
               参考会话
               <input
@@ -8716,7 +8838,12 @@ export function RunsPage() {
             </div>
             {executionBackendFallbackNotice ? <p className="field-help" role="status">{executionBackendFallbackNotice}</p> : null}
             {executionBackendNotice && !executionBackends.isLoading ? (
-              <p className="field-help" role="status">{executionBackendNotice}</p>
+              <div className="execution-backend-notice" role="status">
+                <p className="field-help">{executionBackendNotice}</p>
+                <button type="button" className="secondary-action" onClick={() => navigate("/execution-environments")}>
+                  查看执行环境
+                </button>
+              </div>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
             {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}

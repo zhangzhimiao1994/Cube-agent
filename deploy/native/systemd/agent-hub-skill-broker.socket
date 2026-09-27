@@ -1,0 +1,13 @@
+[Unit]
+Description=Agent Hub privileged Skill broker socket
+Before=agent-hub-api.service agent-hub-worker.service
+
+[Socket]
+ListenStream=/run/agent-hub/skill-broker.sock
+SocketUser=root
+SocketGroup=agent-hub
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

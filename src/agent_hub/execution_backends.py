@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
-import tempfile
 import threading
 import time
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal, cast
+
+from agent_hub.skills.sandbox.broker import probe_systemd_broker
 
 ExecutionBackendId = Literal["systemd", "docker"]
 EXECUTION_BACKEND_IDS = frozenset({"systemd", "docker"})
@@ -50,7 +48,7 @@ def probe_execution_backends() -> tuple[ExecutionBackendStatus, ...]:
             id="systemd",
             name="本机 systemd 隔离",
             adapter="SystemdSkillSandbox",
-            description="在当前 Linux 服务器上通过 systemd transient unit 运行技能。",
+            description="通过最小权限 broker 在当前 Linux 服务器上运行 systemd 隔离技能。",
             isolation="固定严格隔离：DynamicUser + 只读系统 + 私有网络",
             cost="本机资源",
             available=systemd_reason is None,
@@ -110,69 +108,7 @@ def _cached_unavailable_reason(backend: ExecutionBackendId) -> str | None:
 
 
 def _systemd_unavailable_reason() -> str | None:
-    systemd_run = shutil.which("systemd-run")
-    if systemd_run is None or shutil.which("systemctl") is None:
-        return "systemd_tools_not_found"
-    unit = f"agent-hub-execution-probe-{uuid.uuid4().hex[:12]}"
-    try:
-        with tempfile.TemporaryDirectory(prefix="agent-hub-execution-probe-") as temp_dir:
-            probe_workdir = Path(temp_dir)
-            probe_workdir.chmod(0o777)
-            workdir = probe_workdir.as_posix()
-            source_root = Path(__file__).resolve().parents[1].as_posix()
-            python = Path(sys.executable).resolve().as_posix()
-            result = subprocess.run(
-                (
-                    systemd_run,
-                    "--wait",
-                    "--collect",
-                    "--quiet",
-                    "--unit",
-                    unit,
-                    "-p",
-                    "DynamicUser=yes",
-                    "-p",
-                    "NoNewPrivileges=yes",
-                    "-p",
-                    "ProtectSystem=strict",
-                    "-p",
-                    "PrivateTmp=yes",
-                    "-p",
-                    "PrivateDevices=yes",
-                    "-p",
-                    "RestrictSUIDSGID=yes",
-                    "-p",
-                    "PrivateNetwork=yes",
-                    "-p",
-                    "IPAddressDeny=any",
-                    "-p",
-                    "MemoryMax=33554432",
-                    "-p",
-                    "CPUQuota=100%",
-                    "-p",
-                    "RuntimeMaxSec=5s",
-                    "-p",
-                    f"ReadOnlyPaths={source_root}",
-                    "-p",
-                    f"ReadOnlyPaths={python}",
-                    "-p",
-                    f"ReadWritePaths={workdir}",
-                    "-p",
-                    f"WorkingDirectory={workdir}",
-                    "-E",
-                    f"PYTHONPATH={source_root}",
-                    python,
-                    "-c",
-                    "import agent_hub.skills.runner",
-                ),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-    except (OSError, subprocess.TimeoutExpired):
-        return "systemd_transient_unit_unavailable"
-    return None if result.returncode == 0 else "systemd_transient_unit_unavailable"
+    return probe_systemd_broker()
 
 
 def _docker_unavailable_reason() -> str | None:

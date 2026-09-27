@@ -430,8 +430,14 @@ normalize_native_systemd_units() {
 }
 
 install_native_systemd_units() {
+  remove_legacy_native_skill_unit
   install -m 0644 "$AGENT_HUB_SOURCE_DIR"/deploy/native/systemd/* /etc/systemd/system/
   normalize_native_systemd_units
+}
+
+remove_legacy_native_skill_unit() {
+  systemctl stop 'agent-hub-skill@*.service' >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/agent-hub-skill@.service
 }
 
 native_public_url() {
@@ -494,31 +500,23 @@ deploy_native_release() {
     npm --prefix web run build
   )
 
+  fix_native_release_permissions "$release"
   ln -sfn "$release" "$INSTALL_ROOT/current"
-  fix_native_web_permissions "$release"
+  chown -h root:root "$INSTALL_ROOT/current" 2>/dev/null || true
   prune_native_releases
 }
 
-fix_native_web_permissions() {
+fix_native_release_permissions() {
   local release="${1:-}"
   [[ -n "$release" ]] || release="$(readlink -f "$INSTALL_ROOT/current" 2>/dev/null || true)"
   [[ -n "$release" && -d "$release" ]] || return 0
 
-  chown -R agent-hub:agent-hub "$release" 2>/dev/null || true
+  chown -R root:agent-hub "$release"
   chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
   chmod 0755 "$release"
-  if [[ -d "$release/.venv" ]]; then
-    chmod -R u+rwX,g+rX,o-rwx "$release/.venv"
-    if [[ -d "$release/.venv/bin" ]]; then
-      find "$release/.venv/bin" -type f -exec chmod u+rx,g+rx,o-rwx {} +
-    fi
-  fi
-  if [[ -d "$release/.litellm-venv" ]]; then
-    chmod -R u+rwX,g+rX,o-rwx "$release/.litellm-venv"
-    if [[ -d "$release/.litellm-venv/bin" ]]; then
-      find "$release/.litellm-venv/bin" -type f -exec chmod u+rx,g+rx,o-rwx {} +
-    fi
-  fi
+  chmod -R u+rwX,g+rX,o-rwx "$release"
+  chmod -R g-w,o-rwx "$release"
+  find "$release" -type f -exec chmod u-s,g-s {} +
   if [[ -d "$release/web" ]]; then
     chmod 0755 "$release/web"
   fi
@@ -744,7 +742,9 @@ install_native_mode() {
   systemctl daemon-reload
   systemctl enable caddy
   systemctl reload-or-restart caddy || systemctl restart caddy
+  systemctl enable --now agent-hub-skill-broker.socket
   systemctl enable --now agent-hub.target
+  require_native_service_active agent-hub-skill-broker.socket
   require_native_service_active caddy.service
   require_native_service_active agent-hub-api.service
   require_native_service_active agent-hub-worker.service

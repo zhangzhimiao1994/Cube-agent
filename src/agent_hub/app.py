@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from redis.asyncio import Redis
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -39,6 +39,8 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
+from agent_hub.capability_installer.environment import CapabilityEnvironmentManager
+from agent_hub.capability_installer.service import CapabilityInstallerService
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
@@ -70,7 +72,7 @@ from agent_hub.channels.submitter import (
 )
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService
-from agent_hub.db.models import TenantRow
+from agent_hub.db.models import AdminResourceRow, TenantRow
 from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.config import harness_scheduler_from_config
@@ -127,8 +129,15 @@ from agent_hub.runtime.invalidation import (
     RuntimeConfigInvalidationTarget,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
-from agent_hub.scheduler.service import SchedulerService
-from agent_hub.scheduler.types import TaskRequest
+from agent_hub.scheduler.service import (
+    SCHEDULER_ADVISORY_LOCK_KEY,
+    SCHEDULER_CLAIM_RECORD_TYPE,
+    SchedulerService,
+    scheduler_claim_from_payload,
+    scheduler_claim_payload,
+    scheduler_claim_resource_id,
+)
+from agent_hub.scheduler.types import ScheduleDefinition, TaskRequest
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
@@ -852,6 +861,194 @@ async def ensure_bootstrap_tenant(
         await session.execute(statement)
 
 
+async def _tick_persisted_schedules_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    service: SchedulerService,
+    *,
+    now: datetime,
+    tenant_id: UUID | None = None,
+) -> tuple[UUID, ...]:
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    async with session_factory() as session:
+        await session.begin()
+        lock_result = await session.execute(
+            text(
+                "SELECT pg_try_advisory_xact_lock("
+                "hashtextextended(:lock_key, 0))"
+            ),
+            {"lock_key": SCHEDULER_ADVISORY_LOCK_KEY},
+        )
+        if not bool(lock_result.scalar_one()):
+            await session.rollback()
+            return ()
+
+        rows_result = await session.execute(
+            select(AdminResourceRow)
+            .where(AdminResourceRow.kind == "schedule")
+            .order_by(AdminResourceRow.tenant_id, AdminResourceRow.resource_id)
+        )
+        rows = tuple(rows_result.scalars().all())
+        schedules: list[ScheduleDefinition] = []
+        schedule_rows: dict[tuple[UUID, UUID], AdminResourceRow] = {}
+        pending_claims: dict[str, TaskRequest] = {}
+        for row in rows:
+            if row.payload.get("record_type") == SCHEDULER_CLAIM_RECORD_TYPE:
+                try:
+                    claim = scheduler_claim_from_payload(row.payload)
+                    if row.tenant_id != claim.tenant_id:
+                        raise ValueError("persisted scheduler claim identity mismatch")
+                    if row.resource_id != scheduler_claim_resource_id(claim):
+                        raise ValueError("persisted scheduler claim resource mismatch")
+                except (KeyError, TypeError, ValueError):
+                    _LOGGER.warning(
+                        "scheduler_persisted_claim_invalid resource_id=%s",
+                        row.resource_id,
+                    )
+                    continue
+                if tenant_id is None or claim.tenant_id == tenant_id:
+                    pending_claims[row.resource_id] = claim
+                continue
+            try:
+                schedule = admin._schedule_from_payload(row.payload)
+                key = (schedule.tenant_id, schedule.id)
+                if row.tenant_id != schedule.tenant_id or row.resource_id != str(schedule.id):
+                    raise ValueError("persisted schedule identity mismatch")
+                if key in schedule_rows:
+                    raise ValueError("duplicate persisted schedule")
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning(
+                    "scheduler_persisted_schedule_invalid resource_id=%s",
+                    row.resource_id,
+                )
+                continue
+            schedules.append(schedule)
+            schedule_rows[key] = row
+
+        await service.replace_schedules(tuple(schedules))
+        claims = await service.claim_due(tenant_id=tenant_id, now=now)
+        for claim in claims:
+            resource_id = scheduler_claim_resource_id(claim)
+            if resource_id in pending_claims:
+                continue
+            session.add(
+                AdminResourceRow(
+                    tenant_id=claim.tenant_id,
+                    kind="schedule",
+                    resource_id=resource_id,
+                    payload=scheduler_claim_payload(claim),
+                )
+            )
+            pending_claims[resource_id] = claim
+        tenant_ids = {schedule.tenant_id for schedule in schedules}
+        current = {
+            (schedule.tenant_id, schedule.id): schedule
+            for tenant_id in tenant_ids
+            for schedule in await service.list_schedules(tenant_id=tenant_id)
+        }
+        for key, row in schedule_rows.items():
+            current_schedule = current.get(key)
+            if current_schedule is not None:
+                row.payload = admin._schedule_to_payload(current_schedule)
+        await session.commit()
+    return await _drain_scheduler_claims(
+        session_factory,
+        service,
+        pending_claims,
+    )
+
+
+async def _drain_scheduler_claims(
+    session_factory: async_sessionmaker[AsyncSession],
+    service: SchedulerService,
+    claims: Mapping[str, TaskRequest],
+) -> tuple[UUID, ...]:
+    fired: list[UUID] = []
+    for resource_id, claim in claims.items():
+        try:
+            submitted = await service.submit_claimed((claim,))
+        except Exception as error:  # noqa: BLE001 -- the durable claim is retried next tick.
+            _LOGGER.warning(
+                "scheduler_claim_submission_failed resource_id=%s error_type=%s",
+                resource_id,
+                type(error).__name__,
+            )
+            continue
+        fired.extend(submitted)
+        try:
+            await _ack_scheduler_claim(
+                session_factory,
+                tenant_id=claim.tenant_id,
+                resource_id=resource_id,
+            )
+        except Exception as error:  # noqa: BLE001 -- idempotent submission makes retry safe.
+            _LOGGER.warning(
+                "scheduler_claim_ack_failed resource_id=%s error_type=%s",
+                resource_id,
+                type(error).__name__,
+            )
+    return tuple(fired)
+
+
+async def _ack_scheduler_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: UUID,
+    resource_id: str,
+) -> None:
+    async with session_factory() as session:
+        await session.begin()
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": SCHEDULER_ADVISORY_LOCK_KEY},
+        )
+        await session.execute(
+            text(
+                "DELETE FROM agent_hub_admin_resources "
+                "WHERE tenant_id = :tenant_id AND kind = 'schedule' "
+                "AND resource_id = :resource_id"
+            ),
+            {"tenant_id": tenant_id, "resource_id": resource_id},
+        )
+        await session.commit()
+
+
+async def _run_scheduler_tick_loop(
+    tick_once: Callable[[], Awaitable[object]],
+    *,
+    interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    while True:
+        try:
+            await tick_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 -- a later tick must still run.
+            _LOGGER.error(
+                "scheduler_tick_failed error_type=%s",
+                type(error).__name__,
+            )
+        await sleep(interval_seconds)
+
+
+async def _stop_scheduler_tick_loop(application: FastAPI) -> None:
+    task = getattr(application.state, "scheduler_task", None)
+    application.state.scheduler_task = None
+    if not isinstance(task, asyncio.Task):
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception as error:  # noqa: BLE001 -- shutdown should continue.
+        _LOGGER.error(
+            "scheduler_shutdown_failed error_type=%s",
+            type(error).__name__,
+        )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -898,6 +1095,13 @@ def create_app(
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
             application.state.attachment_store_dir = configured.attachment_store_dir
+            if getattr(application.state, "capability_installer_service", None) is None:
+                application.state.capability_installer_service = CapabilityInstallerService(
+                    environment_manager=CapabilityEnvironmentManager(
+                        configured.capability_environment_root_dir,
+                        quota_bytes=configured.capability_environment_disk_quota_bytes,
+                    )
+                )
             if getattr(application.state, "project_workspace_store", None) is None:
                 from agent_hub.files.workspace import ProjectWorkspaceStore
 
@@ -1191,6 +1395,37 @@ def create_app(
                     lambda task: _submit_scheduled_task(application, task)
                 )
             if (
+                active_sessions is not None
+                and isinstance(application.state.schedule_service, SchedulerService)
+            ):
+                schedule_service = application.state.schedule_service
+
+                async def tick_persisted_schedules(
+                    *,
+                    now: datetime,
+                    tenant_id: UUID | None = None,
+                ) -> tuple[UUID, ...]:
+                    return await _tick_persisted_schedules_once(
+                        active_sessions,
+                        schedule_service,
+                        now=now,
+                        tenant_id=tenant_id,
+                    )
+
+                application.state.persisted_schedule_tick = tick_persisted_schedules
+                if configured.scheduler_enabled:
+
+                    async def tick_schedules() -> None:
+                        await tick_persisted_schedules(now=datetime.now(UTC))
+
+                    application.state.scheduler_task = asyncio.create_task(
+                        _run_scheduler_tick_loop(
+                            tick_schedules,
+                            interval_seconds=configured.scheduler_tick_interval_seconds,
+                        ),
+                        name="scheduler-tick-loop",
+                    )
+            if (
                 feishu_gateway is None
                 and active_sessions is not None
                 and getattr(application.state, "run_service", None) is not None
@@ -1279,6 +1514,7 @@ def create_app(
                 application.state.extra_readiness_checks = extra_checks
             yield
         finally:
+            await _stop_scheduler_tick_loop(application)
             await _stop_feishu_websocket_connector(application)
             await _cancel_background_tasks(application.state.feishu_reply_tasks)
             await _cleanup_owned_resources(
@@ -1308,6 +1544,9 @@ def create_app(
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.schedule_service = None
+    application.state.capability_installer_service = None
+    application.state.scheduler_task = None
+    application.state.persisted_schedule_tick = None
     application.state.feishu_gateway = feishu_gateway
     application.state.feishu_reply_dispatcher = None
     application.state.feishu_reply_tasks = set()

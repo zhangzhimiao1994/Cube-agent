@@ -7143,6 +7143,25 @@ describe("operational management pages", () => {
     expect(chatConsole?.className).not.toContain("history-drawer-open");
   });
 
+  it("starts on a neutral new conversation instead of restoring the latest conversation", async () => {
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(screen.getByText("会话：新会话")).not.toBeNull();
+    expect(screen.queryByText("会话：短视频脚本方案")).toBeNull();
+  });
+
+  it("prompts for a new conversation when only archived history remains", async () => {
+    visibleConversationMetadata = {
+      ...visibleConversationMetadata,
+      archived_at: "2026-09-26T08:00:00Z",
+    };
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("dialog", { name: "新建会话" })).not.toBeNull();
+    expect(screen.getByText("会话：新会话")).not.toBeNull();
+  });
+
   it("chooses a project workspace from a platform-aware server directory dialog", async () => {
     const user = userEvent.setup();
     visibleWorkspaceDirectories = {
@@ -7302,6 +7321,9 @@ describe("operational management pages", () => {
     await openRunConfig(user);
     const settingsDialog = screen.getByRole("dialog", { name: "本次运行设置" });
     expect(document.body.style.overflow).toBe("hidden");
+    const workspaceButton = within(settingsDialog).getByRole("button", { name: "选择本次工作目录" });
+    expect(workspaceButton).not.toBeNull();
+    expect(workspaceButton.closest("details")).toBeNull();
     await user.click(within(settingsDialog).getByText("详细设置"));
     await user.click(within(settingsDialog).getByRole("button", { name: "选择本次工作目录" }));
     expect(await screen.findByRole("dialog", { name: "选择本次工作目录" })).not.toBeNull();
@@ -7395,7 +7417,9 @@ describe("operational management pages", () => {
         body: { archived: false },
       }),
     );
-    await waitFor(() => expect(screen.queryByText("已归档")).toBeNull());
+    await waitFor(() =>
+      expect(document.querySelector(".conversation-archived-badge")).toBeNull(),
+    );
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -7742,7 +7766,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(await screen.findByText("执行环境探测失败，普通对话仍可发送；本次不会指定 Skill 执行环境。")).not.toBeNull();
+    expect(await screen.findByText("执行环境状态读取失败。本次仍可普通对话，但不会执行 Skill。")).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
 
@@ -7764,9 +7788,9 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(
-      await screen.findByText("当前没有可用的 Skill 执行环境，普通对话仍可发送。"),
-    ).not.toBeNull();
+    expect(await screen.findByText(/服务器暂时无法安全运行 Skill/)).not.toBeNull();
+    expect(screen.getByText(/本次仍可普通对话，但不会执行 Skill/)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "查看执行环境" })).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
 

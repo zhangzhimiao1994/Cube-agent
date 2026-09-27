@@ -133,6 +133,35 @@ def test_log_level_accepts_known_levels_and_rejects_invalid_values() -> None:
         Settings.model_validate({"log_level": "VERBOSE"})
 
 
+def test_scheduler_background_loop_has_safe_defaults_and_bounded_interval() -> None:
+    settings = Settings.model_validate({})
+
+    assert settings.scheduler_enabled is True
+    assert settings.scheduler_tick_interval_seconds == 5.0
+
+    for invalid_interval in (0, 0.09, 301):
+        with pytest.raises(ValidationError):
+            Settings.model_validate(
+                {"scheduler_tick_interval_seconds": invalid_interval}
+            )
+
+
+def test_capability_environment_store_has_configurable_root_and_bounded_quota() -> None:
+    settings = Settings.model_validate(
+        {
+            "capability_environment_root_dir": "C:/agent-hub/capability-envs",
+            "capability_environment_disk_quota_bytes": 8_589_934_592,
+        }
+    )
+
+    assert settings.capability_environment_root_dir == Path("C:/agent-hub/capability-envs")
+    assert settings.capability_environment_disk_quota_bytes == 8_589_934_592
+
+    for quota in (0, 1_048_575, 1_099_511_627_777):
+        with pytest.raises(ValidationError):
+            Settings.model_validate({"capability_environment_disk_quota_bytes": quota})
+
+
 @pytest.mark.parametrize(
     "name", [" ", "\tName", "Name\n", "x" * 201]
 )

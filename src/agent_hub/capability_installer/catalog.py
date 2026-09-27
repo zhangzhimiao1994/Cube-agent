@@ -4,7 +4,8 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
-from typing import Literal
+from pathlib import Path
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -21,6 +22,39 @@ CapabilityInstallRisk = Literal[
 ]
 
 
+class CliArtifactEnvironmentRecipe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["cli_artifact"] = "cli_artifact"
+    version: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    artifact_path: Path
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    executable_name: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    )
+
+
+class PythonLockEnvironmentRecipe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["python_lock"] = "python_lock"
+    version: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    lock_file: Path
+    wheel_cache: Path
+    smoke_module: str = Field(
+        min_length=1, max_length=256, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*$"
+    )
+    executable_name: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    )
+
+
+CapabilityEnvironmentRecipe = Annotated[
+    CliArtifactEnvironmentRecipe | PythonLockEnvironmentRecipe,
+    Field(discriminator="kind"),
+]
+
+
 class CapabilityCatalogEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -30,6 +64,7 @@ class CapabilityCatalogEntry(BaseModel):
     aliases: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
     risks: tuple[CapabilityInstallRisk, ...] = Field(min_length=1, max_length=16)
     permission_summary: tuple[str, ...] = Field(min_length=1, max_length=16)
+    environment_recipe: CapabilityEnvironmentRecipe | None = None
     plugin: PluginResourceRequest
 
     @field_validator("aliases")
@@ -56,6 +91,7 @@ class CapabilityInstallPlan(BaseModel):
     permission_summary: tuple[str, ...]
     rollback_strategy: Literal["restore_previous_plugin_or_delete_installed_plugin"]
     requires_confirmation: bool
+    environment_recipe: dict[str, object] | None
     plugin_request: dict[str, object]
 
 
@@ -88,11 +124,17 @@ class TrustedCapabilityCatalog:
     def plan(self, entry_id: str, *, query: str) -> CapabilityInstallPlan:
         entry = self.get(entry_id)
         payload = entry.plugin.model_dump(mode="json", exclude_none=True)
+        recipe_payload = (
+            entry.environment_recipe.model_dump(mode="json")
+            if entry.environment_recipe is not None
+            else None
+        )
         plan_seed = json.dumps(
             {
                 "entry_id": entry.id,
                 "query": query.strip(),
                 "plugin": payload,
+                "environment_recipe": recipe_payload,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -111,6 +153,7 @@ class TrustedCapabilityCatalog:
             permission_summary=entry.permission_summary,
             rollback_strategy="restore_previous_plugin_or_delete_installed_plugin",
             requires_confirmation=True,
+            environment_recipe=recipe_payload,
             plugin_request=payload,
         )
 
@@ -262,8 +305,11 @@ def _match_score(entry: CapabilityCatalogEntry, query_tokens: Iterable[str]) -> 
 
 __all__ = [
     "CapabilityCatalogEntry",
+    "CapabilityEnvironmentRecipe",
     "CapabilityInstallPlan",
     "CapabilityInstallRisk",
+    "CliArtifactEnvironmentRecipe",
+    "PythonLockEnvironmentRecipe",
     "TrustedCapabilityCatalog",
     "default_trusted_capability_entries",
 ]

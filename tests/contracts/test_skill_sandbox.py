@@ -12,14 +12,15 @@ from agent_hub.skills.sandbox.base import (
     decode_bounded,
     run_subprocess_with_limits,
 )
+from agent_hub.skills.sandbox.broker import BrokerRequest, BrokerResponse
 from agent_hub.skills.sandbox.docker import (
     DockerSandboxSettings,
     build_docker_command,
     build_docker_terminate_command,
 )
 from agent_hub.skills.sandbox.systemd import (
-    build_systemd_run_command,
-    build_systemd_terminate_command,
+    SystemdSandboxSettings,
+    SystemdSkillSandbox,
 )
 
 
@@ -117,33 +118,33 @@ def test_docker_terminate_command_targets_named_container_without_shell() -> Non
         build_docker_terminate_command("../escape")
 
 
-def test_systemd_command_enforces_process_filesystem_and_network_restrictions() -> None:
-    command = build_systemd_run_command(invocation())
-    properties = _properties(command)
+async def test_systemd_sandbox_routes_execution_through_privileged_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[BrokerRequest, dict[str, object]]] = []
 
-    assert command[:5] == ("systemd-run", "--wait", "--collect", "--pipe", "--quiet")
-    assert properties["DynamicUser"] == "yes"
-    assert properties["NoNewPrivileges"] == "yes"
-    assert properties["ProtectSystem"] == "strict"
-    assert properties["PrivateTmp"] == "yes"
-    assert properties["PrivateDevices"] == "yes"
-    assert properties["RestrictSUIDSGID"] == "yes"
-    assert properties["PrivateNetwork"] == "yes"
-    assert properties["IPAddressDeny"] == "any"
-    assert properties["MemoryMax"] == str(128 * 1024 * 1024)
-    assert properties["CPUQuota"] == "50%"
-    assert properties["RuntimeMaxSec"] == "3s"
-    assert properties["ReadWritePaths"] == "/srv/agent-hub/tmp/exec_1"
-    assert properties["WorkingDirectory"] == "/srv/agent-hub/tmp/exec_1"
-    assert "PYTHONPATH=/opt/agent-hub/current/src" in _environment_values(command)
-    assert "AGENT_HUB_SANDBOX_PROFILE=read_only" in _environment_values(command)
-    assert any(item == "ReadOnlyPaths=/srv/agent-hub/packages/pkg.zip" for item in _property_values(command))
-    assert any(item == "ReadOnlyPaths=/srv/agent-hub/input.txt" for item in _property_values(command))
-    assert command[-3:] == (
-        "/opt/agent-hub/current/.venv/bin/python",
-        "-m",
-        "agent_hub.skills.runner",
+    async def request_broker(request: BrokerRequest, **kwargs: object) -> BrokerResponse:
+        requests.append((request, kwargs))
+        return BrokerResponse(
+            ok=True,
+            result=SkillResult(exit_code=0, stdout="ok\n", stderr="", timed_out=False),
+        )
+
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.systemd.request_systemd_broker",
+        request_broker,
     )
+    sandbox = SystemdSkillSandbox(
+        SystemdSandboxSettings(socket_path=Path("/run/agent-hub/skill-broker.sock"))
+    )
+
+    result = await sandbox.run(invocation())
+
+    assert result.stdout == "ok\n"
+    request, kwargs = requests[0]
+    assert request.action == "run"
+    assert request.invocation == invocation()
+    assert kwargs["socket_path"] == Path("/run/agent-hub/skill-broker.sock")
 
 
 async def test_subprocess_runner_enforces_timeout_and_bounded_output() -> None:
@@ -169,15 +170,26 @@ async def test_subprocess_runner_enforces_timeout_and_bounded_output() -> None:
     assert cleanup_calls == 1
 
 
-def test_systemd_terminate_command_targets_unit_without_shell() -> None:
-    assert build_systemd_terminate_command("exec_1") == (
-        "systemctl",
-        "kill",
-        "--kill-who=all",
-        "agent-hub-skill-exec_1.service",
+async def test_systemd_sandbox_routes_termination_through_privileged_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[BrokerRequest, dict[str, object]]] = []
+
+    async def request_broker(request: BrokerRequest, **kwargs: object) -> BrokerResponse:
+        requests.append((request, kwargs))
+        return BrokerResponse(ok=True)
+
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.systemd.request_systemd_broker",
+        request_broker,
     )
-    with pytest.raises(ValueError):
-        build_systemd_terminate_command("../escape")
+    sandbox = SystemdSkillSandbox()
+
+    await sandbox.terminate("exec_1")
+
+    request, _ = requests[0]
+    assert request.action == "terminate"
+    assert request.execution_id == "exec_1"
 
 
 def _environment_values(command: tuple[str, ...], *, flag: str = "-E") -> list[str]:

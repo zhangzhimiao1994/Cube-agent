@@ -1,0 +1,29 @@
+[Unit]
+Description=Agent Hub privileged systemd Skill broker
+Requires=agent-hub-skill-broker.socket
+After=agent-hub-skill-broker.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+Environment=PYTHONPATH=/opt/agent-hub/current/src
+WorkingDirectory=/opt/agent-hub/current
+ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.skills.sandbox.broker
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+ReadOnlyPaths=/opt/agent-hub/current
+ReadWritePaths=/run/agent-hub
+
+[Install]
+WantedBy=agent-hub.target

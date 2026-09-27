@@ -154,11 +154,114 @@ class BlockingFeishuClient:
 
 def valid_settings(attachment_store_dir: Path | None = None, **overrides: object) -> Settings:
     key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
-    values: dict[str, object] = {"jwt_signing_key": "base64url:" + key}
+    values: dict[str, object] = {
+        "jwt_signing_key": "base64url:" + key,
+        "scheduler_enabled": False,
+    }
     if attachment_store_dir is not None:
         values["attachment_store_dir"] = attachment_store_dir
     values.update(overrides)
     return Settings.model_validate(values)
+
+
+def test_create_app_starts_and_cleanly_stops_scheduler_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    stopped = threading.Event()
+    observed_interval: list[float] = []
+
+    async def scheduler_loop(
+        tick_once: object,
+        *,
+        interval_seconds: float,
+        sleep: object = asyncio.sleep,
+    ) -> None:
+        del sleep
+        assert callable(tick_once)
+        observed_interval.append(interval_seconds)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(app_module, "_run_scheduler_tick_loop", scheduler_loop)
+    application = create_app(
+        settings=valid_settings(
+            scheduler_enabled=True,
+            scheduler_tick_interval_seconds=1.25,
+        ),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=object(),
+        rate_limiter=object(),
+        config_service=object(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        assert started.wait(timeout=1)
+        assert application.state.scheduler_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert application.state.scheduler_task is None
+    assert observed_interval == [1.25]
+
+
+def test_create_app_does_not_start_scheduler_loop_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+
+    async def scheduler_loop(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        started.set()
+
+    monkeypatch.setattr(app_module, "_run_scheduler_tick_loop", scheduler_loop)
+    application = create_app(
+        settings=valid_settings(scheduler_enabled=False),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=object(),
+        rate_limiter=object(),
+        config_service=object(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        assert application.state.scheduler_task is None
+
+    assert not started.is_set()
+
+
+def test_create_app_initializes_trusted_capability_environment_manager(
+    tmp_path: Path,
+) -> None:
+    environment_root = tmp_path / "capability-environments"
+    application = create_app(
+        settings=valid_settings(
+            capability_environment_root_dir=environment_root,
+            capability_environment_disk_quota_bytes=8 * 1024 * 1024,
+        ),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=object(),
+        rate_limiter=object(),
+        config_service=object(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        assert application.state.capability_installer_service is not None
+        assert (environment_root / ".staging").is_dir()
+        assert (environment_root / ".locks").is_dir()
 
 
 def test_web_ui_rejects_sibling_path_with_shared_prefix(tmp_path: Path) -> None:

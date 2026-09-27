@@ -374,8 +374,121 @@ async def test_local_command_plugin_adapter_rejects_missing_required_environment
                 idempotency_key="strix-2",
             ),
         )
-
     assert calls == 0
+
+
+async def test_local_command_plugin_adapter_preflight_checks_command_environment_and_docker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in (
+        "AGENT_HUB_TEST_STRIX_KEY_A",
+        "AGENT_HUB_TEST_STRIX_KEY_B",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    probes: list[tuple[str, float, Mapping[str, str]]] = []
+
+    async def probe_runtime(
+        executable: str,
+        timeout_seconds: float,
+        environment: Mapping[str, str],
+    ) -> bool:
+        probes.append((executable, timeout_seconds, environment))
+        return False
+
+    adapter = LocalCommandPluginAdapter(
+        command_resolver=lambda command: f"C:/tools/{command}.exe",
+        runtime_probe=probe_runtime,
+    )
+    target_plugin = plugin(
+        "security-testing",
+        adapter="local_command",
+        resource_config={
+            "command": "strix",
+            "required_commands": ("docker",),
+            "required_env_any": (
+                "AGENT_HUB_TEST_STRIX_KEY_A",
+                "AGENT_HUB_TEST_STRIX_KEY_B",
+            ),
+            "env_passthrough": (
+                "AGENT_HUB_TEST_STRIX_KEY_A",
+                "AGENT_HUB_TEST_STRIX_KEY_B",
+            ),
+        },
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="required environment"):
+        await adapter.preflight(plugin=target_plugin)
+    assert probes == []
+
+    monkeypatch.setenv("AGENT_HUB_TEST_STRIX_KEY_B", "configured")
+    with pytest.raises(RuntimeCapabilityError, match="Docker runtime unavailable"):
+        await adapter.preflight(plugin=target_plugin)
+    assert probes and probes[0][0] == "C:/tools/docker.exe"
+
+
+async def test_http_json_plugin_adapter_preflight_probes_endpoint_and_credentials() -> None:
+    probes: list[tuple[str, float, Mapping[str, str]]] = []
+    resolved_refs: list[str] = []
+
+    async def probe(
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str],
+    ) -> int:
+        probes.append((url, timeout_seconds, headers))
+        return 204
+
+    async def resolve_secret(ref: str) -> str:
+        resolved_refs.append(ref)
+        return "secret-value"
+
+    adapter = HttpJsonPluginAdapter(probe=probe, secret_resolver=resolve_secret)
+    target_plugin = plugin(
+        "calendar",
+        adapter="http_json",
+        endpoint_url="https://plugins.example/invoke",
+        domain_allowlist=("plugins.example",),
+        credential_ref="secret://calendar",
+        credential_header="X-Plugin-Key",
+        credential_scheme="",
+        timeout_seconds=3,
+    )
+
+    await adapter.preflight(plugin=target_plugin)
+
+    assert resolved_refs == ["secret://calendar"]
+    assert probes == [
+        (
+            "https://plugins.example/invoke",
+            3,
+            {},
+        )
+    ]
+
+
+async def test_http_json_plugin_adapter_preflight_rejects_unresolvable_credential() -> None:
+    async def probe(
+        url: str,
+        timeout_seconds: float,
+        headers: Mapping[str, str],
+    ) -> int:
+        del url, timeout_seconds, headers
+        return 204
+
+    async def resolve_secret(_ref: str) -> str:
+        return ""
+
+    adapter = HttpJsonPluginAdapter(probe=probe, secret_resolver=resolve_secret)
+    target_plugin = plugin(
+        "calendar",
+        adapter="http_json",
+        endpoint_url="https://plugins.example/invoke",
+        domain_allowlist=("plugins.example",),
+        credential_ref="secret://calendar",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="credential unavailable"):
+        await adapter.preflight(plugin=target_plugin)
 
 
 def _argv_contains_ordered_pair(

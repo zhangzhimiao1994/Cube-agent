@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -19,6 +21,9 @@ from agent_hub.scheduler.types import (
 )
 
 _DEFAULT_CREATION_TIME = datetime(2026, 8, 6, tzinfo=UTC)
+SCHEDULER_ADVISORY_LOCK_KEY = "agent-hub:scheduler-tick:v1"
+SCHEDULER_CLAIM_RECORD_TYPE = "claim"
+_SCHEDULER_CLAIM_RESOURCE_PREFIX = "claim:"
 
 
 class SubmittedRunLike:
@@ -123,6 +128,20 @@ class SchedulerService:
                 if key[0] == tenant_id
             )
 
+    async def replace_schedules(
+        self,
+        schedules: tuple[ScheduleDefinition, ...],
+    ) -> None:
+        replacement: dict[tuple[UUID, UUID], ScheduleDefinition] = {}
+        for schedule in schedules:
+            key = (schedule.tenant_id, schedule.id)
+            if key in replacement:
+                raise ValueError("duplicate schedule")
+            replacement[key] = schedule
+        async with self._lock:
+            self._schedules = replacement
+            self._submitted_fires.clear()
+
     async def delete_schedule(self, *, tenant_id: UUID, schedule_id: UUID) -> None:
         async with self._lock:
             try:
@@ -220,6 +239,32 @@ class SchedulerService:
             await self._complete_fire(request)
             schedule_id = UUID(str(request.metadata["schedule_id"]))
             fired.append(schedule_id)
+
+    async def claim_due(
+        self,
+        tenant_id: UUID | None = None,
+        *,
+        now: datetime,
+    ) -> tuple[TaskRequest, ...]:
+        """Advance due schedules and return claims without invoking external submission."""
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        claims: list[TaskRequest] = []
+        normalized_now = now.astimezone(UTC)
+        while True:
+            request = await self._next_due_request(tenant_id=tenant_id, now=normalized_now)
+            if request is None:
+                return tuple(claims)
+            await self._complete_fire(request)
+            claims.append(request)
+
+    async def submit_claimed(self, claims: tuple[TaskRequest, ...]) -> tuple[UUID, ...]:
+        """Submit requests whose schedule advancement has already been made durable."""
+        fired: list[UUID] = []
+        for request in claims:
+            await self._submit(request)
+            fired.append(UUID(str(request.metadata["schedule_id"])))
+        return tuple(fired)
 
     async def _next_due_request(self, *, tenant_id: UUID | None, now: datetime) -> TaskRequest | None:
         async with self._lock:
@@ -327,7 +372,56 @@ class SchedulerService:
         self._schedules[key] = replace(schedule, next_fire_at=next_fire_at.astimezone(UTC))
 
 
-__all__ = ["SchedulerService", "TaskSubmissionCallable"]
+def scheduler_claim_resource_id(request: TaskRequest) -> str:
+    digest = hashlib.sha256(
+        f"{request.tenant_id}:{request.idempotency_key}".encode()
+    ).hexdigest()
+    return f"{_SCHEDULER_CLAIM_RESOURCE_PREFIX}{digest}"
+
+
+def scheduler_claim_payload(request: TaskRequest) -> dict[str, object]:
+    return {
+        "record_type": SCHEDULER_CLAIM_RECORD_TYPE,
+        "tenant_id": str(request.tenant_id),
+        "actor_id": str(request.actor_id),
+        "message": request.message,
+        "mode": request.mode.value,
+        "workflow": request.workflow,
+        "budget": request.budget,
+        "idempotency_key": request.idempotency_key,
+        "metadata": dict(request.metadata),
+    }
+
+
+def scheduler_claim_from_payload(payload: Mapping[str, object]) -> TaskRequest:
+    if payload.get("record_type") != SCHEDULER_CLAIM_RECORD_TYPE:
+        raise ValueError("scheduler claim record type is invalid")
+    raw_metadata = payload.get("metadata")
+    metadata = cast(Mapping[str, object], raw_metadata) if isinstance(raw_metadata, dict) else {}
+    raw_budget = payload.get("budget")
+    if type(raw_budget) is not int:
+        raise ValueError("scheduler claim budget is invalid")
+    return TaskRequest(
+        tenant_id=UUID(str(payload["tenant_id"])),
+        actor_id=UUID(str(payload["actor_id"])),
+        message=str(payload["message"]),
+        mode=TaskMode(str(payload["mode"])),
+        workflow=str(payload["workflow"]),
+        budget=raw_budget,
+        idempotency_key=str(payload["idempotency_key"]),
+        metadata=metadata,
+    )
+
+
+__all__ = [
+    "SCHEDULER_ADVISORY_LOCK_KEY",
+    "SCHEDULER_CLAIM_RECORD_TYPE",
+    "SchedulerService",
+    "TaskSubmissionCallable",
+    "scheduler_claim_from_payload",
+    "scheduler_claim_payload",
+    "scheduler_claim_resource_id",
+]
 
 
 def _fire_identity(request: TaskRequest) -> tuple[UUID, UUID, datetime]:

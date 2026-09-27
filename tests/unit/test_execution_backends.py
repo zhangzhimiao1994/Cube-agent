@@ -23,11 +23,7 @@ def teardown_function() -> None:
 def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executables = {
-        "systemd-run": "/usr/bin/systemd-run",
-        "systemctl": "/usr/bin/systemctl",
-        "docker": "/usr/bin/docker",
-    }
+    executables = {"docker": "/usr/bin/docker"}
     monkeypatch.setattr(
         "agent_hub.execution_backends.shutil.which",
         lambda name: executables.get(name),
@@ -36,6 +32,7 @@ def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
         "agent_hub.execution_backends.subprocess.run",
         lambda *args, **kwargs: CompletedProcess(args=args[0], returncode=0, stdout="image-id\n", stderr=""),
     )
+    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", lambda: None)
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
@@ -50,8 +47,9 @@ def test_probe_explains_missing_docker_instead_of_advertising_placeholder(
 ) -> None:
     monkeypatch.setattr(
         "agent_hub.execution_backends.shutil.which",
-        lambda name: "/usr/bin/systemd-run" if name in {"systemd-run", "systemctl"} else None,
+        lambda name: None,
     )
+    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", lambda: None)
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
@@ -59,76 +57,40 @@ def test_probe_explains_missing_docker_instead_of_advertising_placeholder(
     assert statuses["docker"].reason == "docker_cli_not_found"
 
 
-def test_probe_rejects_systemd_when_transient_units_cannot_start(
+def test_probe_rejects_systemd_when_privileged_broker_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executables = {
-        "systemd-run": "/usr/bin/systemd-run",
-        "systemctl": "/usr/bin/systemctl",
-        "docker": "/usr/bin/docker",
-    }
+    executables = {"docker": "/usr/bin/docker"}
     monkeypatch.setattr(
         "agent_hub.execution_backends.shutil.which",
         lambda name: executables.get(name),
     )
 
-    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
-        del kwargs
-        if args[0] == "/usr/bin/systemd-run":
-            return CompletedProcess(args=args, returncode=1, stdout="", stderr="Failed to connect to bus")
-        return CompletedProcess(args=args, returncode=0, stdout="image-id\n", stderr="")
-
-    monkeypatch.setattr("agent_hub.execution_backends.subprocess.run", run)
+    monkeypatch.setattr(
+        "agent_hub.execution_backends.probe_systemd_broker",
+        lambda: "systemd_broker_unavailable",
+    )
 
     statuses = {item.id: item for item in probe_execution_backends()}
 
     assert statuses["systemd"].available is False
-    assert statuses["systemd"].reason == "systemd_transient_unit_unavailable"
+    assert statuses["systemd"].reason == "systemd_broker_unavailable"
 
 
 def test_systemd_probe_exercises_the_runtime_isolation_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executables = {
-        "systemd-run": "/usr/bin/systemd-run",
-        "systemctl": "/usr/bin/systemctl",
-    }
-    monkeypatch.setattr(
-        "agent_hub.execution_backends.shutil.which",
-        lambda name: executables.get(name),
-    )
-    commands: list[tuple[str, ...]] = []
+    calls = 0
 
-    def run(args: list[str], **kwargs: Any) -> CompletedProcess[str]:
-        del kwargs
-        commands.append(tuple(args))
-        return CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+    def probe() -> None:
+        nonlocal calls
+        calls += 1
 
-    monkeypatch.setattr("agent_hub.execution_backends.subprocess.run", run)
+    monkeypatch.setattr("agent_hub.execution_backends.probe_systemd_broker", probe)
 
     probe_execution_backends()
 
-    command = commands[0]
-    properties = {
-        command[index + 1].split("=", 1)[0]: command[index + 1].split("=", 1)[1]
-        for index, value in enumerate(command)
-        if value == "-p" and "=" in command[index + 1]
-    }
-    assert properties["DynamicUser"] == "yes"
-    assert properties["NoNewPrivileges"] == "yes"
-    assert properties["ProtectSystem"] == "strict"
-    assert properties["PrivateTmp"] == "yes"
-    assert properties["PrivateDevices"] == "yes"
-    assert properties["RestrictSUIDSGID"] == "yes"
-    assert properties["PrivateNetwork"] == "yes"
-    assert properties["IPAddressDeny"] == "any"
-    assert properties["MemoryMax"]
-    assert properties["CPUQuota"]
-    assert properties["RuntimeMaxSec"]
-    assert properties["ReadOnlyPaths"]
-    assert properties["ReadWritePaths"]
-    assert properties["WorkingDirectory"]
-    assert "import agent_hub.skills.runner" in command
+    assert calls == 1
 
 
 def test_selected_backend_probe_is_cached_without_probing_other_backends(

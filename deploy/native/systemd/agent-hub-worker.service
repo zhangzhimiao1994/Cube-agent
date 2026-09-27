@@ -1,6 +1,7 @@
 [Unit]
 Description=Agent Hub Worker
-After=agent-hub-api.service
+Wants=agent-hub-skill-broker.socket
+After=agent-hub-api.service agent-hub-skill-broker.socket
 
 [Service]
 Type=simple

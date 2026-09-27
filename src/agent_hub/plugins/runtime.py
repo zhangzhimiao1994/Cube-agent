@@ -107,7 +107,9 @@ type HttpJsonPost = Callable[
     [str, Mapping[str, JsonValue], float, Mapping[str, str]],
     Awaitable[Mapping[str, JsonValue]],
 ]
+type HttpJsonProbe = Callable[[str, float, Mapping[str, str]], Awaitable[int]]
 type PluginSecretResolver = Callable[[str], Awaitable[str]]
+type LocalRuntimeProbe = Callable[[str, float, Mapping[str, str]], Awaitable[bool]]
 
 
 class LocalCommandRunner(Protocol):
@@ -147,10 +149,33 @@ class HttpJsonPluginAdapter:
         self,
         *,
         post_json: HttpJsonPost | None = None,
+        probe: HttpJsonProbe | None = None,
         secret_resolver: PluginSecretResolver | None = None,
     ) -> None:
         self._post_json = _httpx_post_json if post_json is None else post_json
+        self._probe = _httpx_head_probe if probe is None else probe
         self._secret_resolver = secret_resolver
+
+    async def preflight(self, *, plugin: PluginResourceResponse) -> None:
+        url = _plugin_endpoint_url(plugin)
+        if not _endpoint_domain_allowed(url, plugin.domain_allowlist):
+            raise RuntimeCapabilityError("Plugin endpoint not allowed")
+        await self._headers_for_plugin(plugin)
+        try:
+            status_code = await self._probe(url, plugin.timeout_seconds, {})
+        except (TimeoutError, httpx.TimeoutException) as error:
+            raise RuntimeCapabilityError("Plugin endpoint timed out") from error
+        except RuntimeCapabilityError:
+            raise
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin endpoint unavailable") from error
+        if 200 <= status_code < 400 or status_code in {405, 501}:
+            return
+        if status_code in {401, 403} and plugin.credential_ref is not None:
+            return
+        if status_code >= 500:
+            raise RuntimeCapabilityError("Plugin endpoint unhealthy")
+        raise RuntimeCapabilityError("Plugin endpoint unavailable")
 
     async def invoke(
         self,
@@ -219,10 +244,46 @@ class LocalCommandPluginAdapter:
         *,
         command_runner: LocalCommandRunner | None = None,
         command_resolver: Callable[[str], str | None] | None = None,
+        runtime_probe: LocalRuntimeProbe | None = None,
     ) -> None:
         self._command_runner = _run_local_command if command_runner is None else command_runner
         self._command_resolver = shutil.which if command_resolver is None else command_resolver
+        self._runtime_probe = _probe_local_runtime if runtime_probe is None else runtime_probe
         self._check_command_available = command_runner is None
+
+    async def preflight(self, *, plugin: PluginResourceResponse) -> None:
+        command = _local_command_string(plugin.resource_config.get("command"))
+        if _resolve_local_command(command, self._command_resolver) is None:
+            raise RuntimeCapabilityError("Plugin command unavailable")
+        environment = _local_command_environment(plugin.resource_config.get("env_passthrough"))
+        _ensure_local_command_prerequisites(
+            plugin=plugin,
+            environment=environment,
+            command_resolver=self._command_resolver,
+        )
+        required_commands = _local_command_string_list(
+            plugin.resource_config.get("required_commands"),
+            "required_commands",
+        )
+        docker_command = next(
+            (
+                item
+                for item in (command, *required_commands)
+                if Path(item).name.lower() in {"docker", "docker.exe"}
+            ),
+            None,
+        )
+        if docker_command is None:
+            return
+        docker_executable = _resolve_local_command(docker_command, self._command_resolver)
+        if docker_executable is None:
+            raise RuntimeCapabilityError("Plugin command unavailable")
+        if not await self._runtime_probe(
+            docker_executable,
+            min(plugin.timeout_seconds, 5.0),
+            environment,
+        ):
+            raise RuntimeCapabilityError("Plugin Docker runtime unavailable")
 
     async def invoke(
         self,
@@ -657,6 +718,19 @@ class RuntimePluginService:
             _adapter_descriptor(adapter_id, adapter)
             for adapter_id, adapter in sorted(self._adapters.items())
         )
+
+    async def preflight_plugin(self, plugin: PluginResourceResponse) -> None:
+        checked_adapters: set[str] = set()
+        for capability in plugin.capabilities:
+            if capability.adapter in checked_adapters:
+                continue
+            checked_adapters.add(capability.adapter)
+            adapter = self._adapters.get(capability.adapter)
+            if adapter is None:
+                raise RuntimeCapabilityError("Plugin adapter unavailable")
+            preflight = getattr(adapter, "preflight", None)
+            if callable(preflight):
+                await preflight(plugin=plugin)
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         return self._available_plugin_capability(tenant_id, name) is not None
@@ -1409,6 +1483,34 @@ async def _run_local_command(
     )
 
 
+async def _probe_local_runtime(
+    executable: str,
+    timeout_seconds: float,
+    environment: Mapping[str, str],
+) -> bool:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            "info",
+            "--format",
+            "{{.ServerVersion}}",
+            env=dict(environment),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    try:
+        return await asyncio.wait_for(process.wait(), timeout=timeout_seconds) == 0
+    except TimeoutError:
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
+        return False
+
+
 def _local_command_argv(
     command: str,
     *,
@@ -1824,6 +1926,19 @@ async def _httpx_post_json(
     return cast(Mapping[str, JsonValue], data)
 
 
+async def _httpx_head_probe(
+    url: str,
+    timeout_seconds: float,
+    headers: Mapping[str, str],
+) -> int:
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+    ) as client:
+        response = await client.head(url, headers=headers)
+    return response.status_code
+
+
 def _secret_resolver(admin_service: object) -> PluginSecretResolver | None:
     resolver = getattr(admin_service, "resolve_secret_value", None)
     if not callable(resolver):
@@ -1834,8 +1949,10 @@ def _secret_resolver(admin_service: object) -> PluginSecretResolver | None:
 __all__ = [
     "HttpJsonPluginAdapter",
     "HttpJsonPost",
+    "HttpJsonProbe",
     "LocalCommandPluginAdapter",
     "LocalCommandRunner",
+    "LocalRuntimeProbe",
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",

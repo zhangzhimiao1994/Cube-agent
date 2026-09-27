@@ -19,6 +19,7 @@ from agent_hub.capabilities.manifest import (
 )
 from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
 from agent_hub.capabilities.tools.calculator import Calculator
+from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadError
 from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
@@ -32,6 +33,7 @@ from agent_hub.files.generated import (
 from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.project_preflight import build_project_preflight_files
 from agent_hub.runtime.contracts import JsonValue
+from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
     SANDBOX_PROFILES,
     SandboxProfile,
@@ -51,6 +53,7 @@ _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
 _DOTTED_BUILT_INS = frozenset({
     "calculator.evaluate",
+    "http.read",
     "workspace.read",
     _DOCX_TOOL,
     _PPTX_TOOL,
@@ -75,6 +78,7 @@ _BUILTIN_ALIASES = {
 }
 _MANIFEST_BUILTINS = (
     "calculator.evaluate",
+    "http.read",
     _DOCX_TOOL,
     _PPTX_TOOL,
     _PROJECT_PREFLIGHT_TOOL,
@@ -114,6 +118,7 @@ class RuntimeCapabilityGateway:
         skill_sandbox: SkillSandbox | None = None,
         skill_sandboxes: Mapping[str, SkillSandbox] | None = None,
         calculator: Calculator | None = None,
+        http_reader: HttpReader | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
@@ -140,6 +145,7 @@ class RuntimeCapabilityGateway:
                 "docker": DockerSkillSandbox(),
             }
         self._calculator = calculator or Calculator()
+        self._http_reader = http_reader or HttpReader.production()
         self._tool_registry = tool_registry
         self._tenant_id = tenant_id
 
@@ -170,7 +176,9 @@ class RuntimeCapabilityGateway:
             return True
         if _SAFE_CAPABILITY_NAME.fullmatch(normalized_name) is None:
             return False
-        return self._skill_package_path(tenant_id, normalized_name).is_file()
+        return self._skill_package_availability_reason(
+            self._skill_package_path(tenant_id, normalized_name)
+        ) is None
 
     async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
         if self._tool_registry is None:
@@ -239,6 +247,8 @@ class RuntimeCapabilityGateway:
         _require_safe("idempotency key", idempotency_key, max_length=160)
         if normalized_name in {"calculator", "calculator_evaluate"}:
             return self._execute_calculator(arguments)
+        if normalized_name == "http.read":
+            return await self._execute_http_read(arguments)
         if normalized_name == "read_context":
             return await self._execute_read_context(tenant_id, run_id, arguments)
         if normalized_name == "workspace_read":
@@ -266,6 +276,24 @@ class RuntimeCapabilityGateway:
             raise RuntimeCapabilityError("calculator requires expression")
         result = self._calculator.evaluate(expression)
         return {"value": str(result.value)}
+
+    async def _execute_http_read(
+        self,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        url = arguments.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise RuntimeCapabilityError("http.read requires url")
+        try:
+            result = await self._http_reader.fetch(url.strip())
+        except HttpReadError as error:
+            raise RuntimeCapabilityError(str(error)) from None
+        return {
+            "url": result.url,
+            "status_code": result.status_code,
+            "body": result.body,
+            "truncated": result.truncated,
+        }
 
     async def _execute_read_context(
         self, tenant_id: UUID, run_id: UUID, arguments: Mapping[str, JsonValue],
@@ -556,7 +584,8 @@ class RuntimeCapabilityGateway:
         package_sha256 = hashlib.sha256(archive_bytes).hexdigest()
         execution_id = _execution_id(actor, skill_id, idempotency_key)
         writable_tmp_path = self._skill_store_dir / str(tenant_id) / "tmp" / execution_id
-        writable_tmp_path.mkdir(parents=True, exist_ok=True)
+        writable_tmp_path.mkdir(mode=0o770, parents=True, exist_ok=True)
+        writable_tmp_path.chmod(0o770)
         try:
             execution_backend, sandbox_profile, sandbox = await self._skill_sandbox_for_run(
                 tenant_id=tenant_id,
@@ -685,6 +714,7 @@ class RuntimeCapabilityGateway:
             skill_id = package_path.stem
             if _SAFE_CAPABILITY_NAME.fullmatch(skill_id) is None:
                 continue
+            availability_reason = self._skill_package_availability_reason(package_path)
             items.append(
                 {
                     "id": skill_id,
@@ -692,13 +722,21 @@ class RuntimeCapabilityGateway:
                     "adapter": "skill_sandbox",
                     "permission_class": "skill.use",
                     "sandbox_profile": "systemd_skill_sandbox",
-                    "available": True,
-                    "availability_reason": None,
+                    "available": availability_reason is None,
+                    "availability_reason": availability_reason,
                     "replay_safe": False,
                     "aliases": (),
                 }
             )
         return tuple(items)
+
+    @staticmethod
+    def _skill_package_availability_reason(package_path: Path) -> str | None:
+        try:
+            SkillPackageInspector().inspect(package_path.read_bytes())
+        except (InvalidSkillPackage, OSError, ValueError):
+            return "skill_package_not_executable"
+        return None
 
     def _registry_manifest_items(
         self,
@@ -898,6 +936,8 @@ def _builtin_permission_class(name: str) -> str:
         return "calculator.evaluate"
     if name == "read_context":
         return "context.read"
+    if name == "http.read":
+        return "network.read"
     if name == "workspace.read":
         return "file.read"
     return "file.create"
@@ -906,6 +946,8 @@ def _builtin_permission_class(name: str) -> str:
 def _builtin_sandbox_profile(name: str) -> str:
     if name in {"calculator.evaluate", "read_context"}:
         return "in_process"
+    if name == "http.read":
+        return "http_read"
     if name == "workspace.read":
         return "workspace_read"
     if name == _PROJECT_PREFLIGHT_TOOL:

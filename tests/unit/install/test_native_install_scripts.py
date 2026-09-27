@@ -764,6 +764,51 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_native_install_deploys_minimal_privilege_skill_broker_units() -> None:
+    installer = read("scripts/lib/install_native.sh")
+    target = read("deploy/native/systemd/agent-hub.target")
+    socket_unit = read("deploy/native/systemd/agent-hub-skill-broker.socket")
+    service_unit = read("deploy/native/systemd/agent-hub-skill-broker.service")
+    api_unit = read("deploy/native/systemd/agent-hub-api.service")
+    worker_unit = read("deploy/native/systemd/agent-hub-worker.service")
+
+    assert "agent-hub-skill-broker.socket" in target
+    assert "ListenStream=/run/agent-hub/skill-broker.sock" in socket_unit
+    assert "SocketUser=root" in socket_unit
+    assert "SocketGroup=agent-hub" in socket_unit
+    assert "SocketMode=0660" in socket_unit
+    assert "User=root" in service_unit
+    assert "NoNewPrivileges=yes" in service_unit
+    assert "CapabilityBoundingSet=" in service_unit
+    assert "RestrictAddressFamilies=AF_UNIX" in service_unit
+    assert "-m agent_hub.skills.sandbox.broker" in service_unit
+    assert "sudoers" not in installer.casefold()
+    assert "polkit" not in installer.casefold()
+    assert "agent-hub-skill-broker.socket" in api_unit
+    assert "agent-hub-skill-broker.socket" in worker_unit
+    assert "remove_legacy_native_skill_unit" in installer
+    assert 'rm -f /etc/systemd/system/agent-hub-skill@.service' in installer
+    assert "systemctl enable --now agent-hub-skill-broker.socket" in installer
+    assert "require_native_service_active agent-hub-skill-broker.socket" in installer
+
+
+def test_native_install_keeps_root_broker_runtime_unwritable_by_service_user() -> None:
+    installer = read("scripts/lib/install_native.sh")
+    service_unit = read("deploy/native/systemd/agent-hub-skill-broker.service")
+
+    assert 'chown -R root:agent-hub "$release"' in installer
+    assert 'chmod -R u+rwX,g+rX,o-rwx "$release"' in installer
+    assert 'chmod -R g-w,o-rwx "$release"' in installer
+    assert 'chown -R agent-hub:agent-hub "$release"' not in installer
+    assert 'chown -h root:root "$INSTALL_ROOT/current"' in installer
+    assert installer.index('fix_native_release_permissions "$release"') < installer.index(
+        'ln -sfn "$release" "$INSTALL_ROOT/current"'
+    )
+    assert "Environment=PYTHONPATH=/opt/agent-hub/current/src" in service_unit
+    assert "ExecStart=/opt/agent-hub/current/.venv/bin/python" in service_unit
+    assert "ReadOnlyPaths=/opt/agent-hub/current" in service_unit
+
+
 def test_auto_mode_prefers_native_on_supported_systemd_hosts() -> None:
     detect = read("scripts/lib/detect.sh")
     install = read("install.sh")
@@ -989,17 +1034,16 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "handle /health {" in installer
     assert "handle /openapi.json" in caddyfile
     assert "handle /openapi.json" in installer
-    assert "fix_native_web_permissions" in installer
+    assert "fix_native_release_permissions" in installer
     assert 'chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"' in installer
     assert 'chmod 0755 "$release"' in installer
     assert 'chmod 0755 "$release/web"' in installer
     assert 'chmod 0755 "$release/web/dist"' in installer
     assert 'chmod -R a+rX "$release/web/dist"' in installer
-    assert 'chmod -R u+rwX,g+rX,o-rwx "$release/.venv"' in installer
-    assert 'chmod -R u+rwX,g+rX,o-rwx "$release/.litellm-venv"' in installer
+    assert 'chmod -R u+rwX,g+rX,o-rwx "$release"' in installer
     assert "fix_native_uv_permissions" in installer
     assert 'chmod -R a+rX "$python_dir"' in installer
-    assert "chown -R agent-hub:agent-hub" in installer
+    assert 'chown -R root:agent-hub "$release"' in installer
     assert "systemctl reload-or-restart caddy" in installer
 
 

@@ -1,4 +1,9 @@
+from pathlib import Path
+
+from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceRequest
 from agent_hub.capability_installer.catalog import (
+    CapabilityCatalogEntry,
+    CliArtifactEnvironmentRecipe,
     TrustedCapabilityCatalog,
     default_trusted_capability_entries,
 )
@@ -73,3 +78,53 @@ def test_default_capability_catalog_does_not_ship_placeholder_plugin_endpoints()
         payload = entry.plugin.model_dump(mode="json", exclude_none=True)
 
         assert "plugins.example" not in str(payload)
+
+
+def test_install_plan_id_binds_the_trusted_environment_recipe() -> None:
+    artifact_hash = "a" * 64
+
+    def entry(version: str) -> CapabilityCatalogEntry:
+        return CapabilityCatalogEntry(
+            id="offline_cli",
+            name_cn="离线 CLI",
+            summary_cn="从可信离线制品构建。",
+            risks=("code_execution",),
+            permission_summary=("执行离线 CLI",),
+            environment_recipe=CliArtifactEnvironmentRecipe(
+                version=version,
+                artifact_path=Path("/trusted/cache/tool"),
+                sha256=artifact_hash,
+                executable_name="tool",
+            ),
+            plugin=PluginResourceRequest(
+                id="offline-cli",
+                name="Offline CLI",
+                resource_config={"command": "managed-by-environment"},
+                capabilities=[
+                    PluginCapabilityRequest(
+                        id="offline.run",
+                        adapter="local_command",
+                        permission_class="plugin.use",
+                        sandbox_profile="local_process",
+                    )
+                ],
+            ),
+        )
+
+    first = TrustedCapabilityCatalog((entry("1.0.0"),)).plan("offline_cli", query="安装")
+    second = TrustedCapabilityCatalog((entry("2.0.0"),)).plan("offline_cli", query="安装")
+
+    assert first.id != second.id
+    assert first.environment_recipe == {
+        "kind": "cli_artifact",
+        "version": "1.0.0",
+        "artifact_path": str(Path("/trusted/cache/tool")),
+        "sha256": artifact_hash,
+        "executable_name": "tool",
+    }
+
+
+def test_default_strix_catalog_never_claims_an_online_environment_recipe() -> None:
+    entry = TrustedCapabilityCatalog(default_trusted_capability_entries()).get("security_testing")
+
+    assert entry.environment_recipe is None

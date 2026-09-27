@@ -1535,6 +1535,42 @@ article:hover {
   width: 100%;
 }
 
+.conversation-manager-tabs {
+  background: rgba(8, 17, 31, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.25rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0.25rem;
+}
+
+.conversation-manager-tabs button {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 0.8rem;
+  font-weight: 850;
+  gap: 0.35rem;
+  justify-content: center;
+  min-height: 2rem;
+  padding: 0.35rem 0.45rem;
+}
+
+.conversation-manager-tabs button.selected {
+  background: rgba(85, 215, 255, 0.12);
+  border-color: rgba(85, 215, 255, 0.38);
+  color: var(--text);
+}
+
+.conversation-manager-tabs button span {
+  color: inherit;
+  font-size: 0.72rem;
+}
+
 .conversation-projects {
   display: grid;
   gap: 0.4rem;
@@ -1674,6 +1710,7 @@ article:hover {
 }
 
 .conversation-branch-button,
+.conversation-restore-button,
 .conversation-delete-button {
   align-self: center;
   border-radius: 0.55rem;
@@ -1693,6 +1730,18 @@ article:hover {
   color: #baf2ff;
 }
 
+.conversation-restore-button {
+  background: rgba(125, 255, 189, 0.12);
+  border: 1px solid rgba(125, 255, 189, 0.38);
+  color: #bfffdc;
+}
+
+.conversation-restore-button:hover:not(:disabled),
+.conversation-restore-button:focus-visible {
+  border-color: rgba(125, 255, 189, 0.72);
+  box-shadow: 0 0 0 1px rgba(125, 255, 189, 0.16);
+}
+
 .conversation-branch-button:hover:not(:disabled),
 .conversation-branch-button:focus-visible {
   border-color: rgba(85, 215, 255, 0.78);
@@ -1706,6 +1755,7 @@ article:hover {
 }
 
 .conversation-branch-button:disabled,
+.conversation-restore-button:disabled,
 .conversation-delete-button:disabled {
   background: rgba(148, 163, 184, 0.08);
   border-color: rgba(148, 163, 184, 0.2);
@@ -4546,6 +4596,34 @@ article:hover {
   display: flex;
   flex-wrap: wrap;
   gap: 0.45rem;
+}
+
+.execution-backend-notice {
+  align-items: center;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 0.75rem;
+  display: flex;
+  gap: 0.65rem;
+  justify-content: space-between;
+  padding: 0.65rem 0.75rem;
+}
+
+.execution-backend-notice p {
+  line-height: 1.45;
+  margin: 0;
+}
+
+.execution-backend-notice .secondary-action {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .execution-backend-notice {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .conversation-dialog-backdrop {
@@ -7674,6 +7752,7 @@ article:hover {
   }
 
   .conversation-branch-button,
+  .conversation-restore-button,
   .conversation-delete-button {
     font-size: 0.72rem;
     min-height: 1.7rem;
@@ -8394,7 +8473,8 @@ article:hover {
     grid-row: 1 / 3;
   }
 
-  .conversation-branch-button {
+  .conversation-branch-button,
+  .conversation-restore-button {
     grid-column: 3;
     grid-row: 1;
   }

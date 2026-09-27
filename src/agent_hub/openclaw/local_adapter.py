@@ -147,13 +147,13 @@ def main() -> None:
 def _adapter_capabilities(config: OpenClawLocalAdapterConfig) -> list[str]:
     capabilities: list[str] = []
     if config.allowed_commands:
-        capabilities.extend(["server_command", "desktop_action", "screen_read", "file_read"])
-    if config.desktop_action_command is not None and "desktop_action" not in capabilities:
+        capabilities.append("server_command")
+    if config.desktop_action_command is not None:
         capabilities.append("desktop_action")
-    if config.allowed_file_roots and "file_read" not in capabilities:
-        capabilities.append("file_read")
-    if config.screen_read_command is not None and "screen_read" not in capabilities:
+    if config.screen_read_command is not None:
         capabilities.append("screen_read")
+    if config.allowed_file_roots:
+        capabilities.append("file_read")
     return capabilities
 
 

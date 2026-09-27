@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any, NoReturn, Self, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -100,6 +101,7 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationResult,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
+from agent_hub.openclaw.remote_adapter import OpenClawRemoteAdapterError
 from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_cache_signature_payload_sha256,
     plugin_package_dependency_lock,
@@ -495,21 +497,115 @@ def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
 
     assert response.status_code == 200
     adapters = {(adapter["platform"], adapter["kind"]): adapter for adapter in response.json()}
-    assert adapters[("linux", "server_command")] == {
-        "platform": "linux",
-        "kind": "server_command",
-        "target_type": "server",
-        "status": "available",
-        "execution_host": "agent-hub-server",
-        "requires_user_approval": True,
-        "supports_read_only": False,
-        "description": "Runs exact allowlisted argv commands on the 魔方 agent Linux server after approval.",
-    }
+    assert adapters[("linux", "server_command")]["status"] == "adapter_unavailable"
+    assert adapters[("linux", "server_command")]["reason"] == "openclaw_disabled"
     assert adapters[("windows", "server_command")]["status"] == "adapter_unavailable"
     assert adapters[("windows", "server_command")]["execution_host"] == "remote-windows-host"
+    assert adapters[("windows", "server_command")]["reason"] == "openclaw_disabled"
     assert adapters[("macos", "desktop_action")]["status"] == "adapter_unavailable"
     assert adapters[("linux", "screen_read")]["supports_read_only"] is True
     assert adapters[("windows", "file_read")]["requires_user_approval"] is True
+
+
+def test_openclaw_adapters_require_nonempty_command_allowlist() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_allowed_commands"] = []
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    adapters = api.get("/api/v1/admin/openclaw/adapters", headers=headers()).json()
+
+    assert {adapter["status"] for adapter in adapters} == {"adapter_unavailable"}
+    assert {adapter["reason"] for adapter in adapters} == {
+        "openclaw_command_allowlist_empty"
+    }
+
+
+def test_openclaw_remote_adapter_requires_successful_health_and_capability_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def probe_without_requested_capability(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return SimpleNamespace(
+            status="available",
+            platform="windows",
+            capabilities=("screen_read",),
+        )
+
+    monkeypatch.setattr(
+        admin_router,
+        "probe_remote_openclaw_adapter",
+        probe_without_requested_capability,
+    )
+    api = client()
+    secret = api.post(
+        "/api/v1/admin/secrets",
+        headers=headers(),
+        json={"label": "openclaw-windows-adapter", "value": "sk-live"},
+    )
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_allowed_commands"] = [["whoami"]]
+    payload["openclaw_remote_adapters"] = [
+        {
+            "platform": "windows",
+            "target_type": "server",
+            "target": "desktop",
+            "base_url": "https://openclaw.invalid",
+            "credential_ref": secret.json()["ref"],
+        }
+    ]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    adapters = api.get("/api/v1/admin/openclaw/adapters", headers=headers()).json()
+    windows_command = next(
+        adapter
+        for adapter in adapters
+        if adapter["platform"] == "windows" and adapter["kind"] == "server_command"
+    )
+
+    assert windows_command["status"] == "adapter_unavailable"
+    assert windows_command["reason"] == "remote_adapter_capability_unavailable"
+
+
+def test_openclaw_remote_adapter_health_probe_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_probe(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OpenClawRemoteAdapterError("health unavailable")
+
+    monkeypatch.setattr(admin_router, "probe_remote_openclaw_adapter", reject_probe)
+    api = client()
+    secret = api.post(
+        "/api/v1/admin/secrets",
+        headers=headers(),
+        json={"label": "openclaw-windows-adapter", "value": "sk-live"},
+    )
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_allowed_commands"] = [["whoami"]]
+    payload["openclaw_remote_adapters"] = [
+        {
+            "platform": "windows",
+            "target_type": "server",
+            "target": "desktop",
+            "base_url": "https://openclaw.invalid",
+            "credential_ref": secret.json()["ref"],
+        }
+    ]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    adapters = api.get("/api/v1/admin/openclaw/adapters", headers=headers()).json()
+    windows_command = next(
+        adapter
+        for adapter in adapters
+        if adapter["platform"] == "windows" and adapter["kind"] == "server_command"
+    )
+
+    assert windows_command["status"] == "adapter_unavailable"
+    assert windows_command["reason"] == "remote_adapter_probe_failed"
 
 
 def test_openclaw_operation_can_be_created_from_chat_proposal() -> None:
@@ -3836,12 +3932,21 @@ class OtherTenantAuthService:
         return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
 
 
+async def accept_plugin_activation(plugin: PluginResourceResponse) -> None:
+    assert plugin.id
+
+
+class AcceptingRuntimePluginService:
+    preflight_plugin = staticmethod(accept_plugin_activation)
+
+
 def client() -> TestClient:
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
     )
     app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.plugin_service = AcceptingRuntimePluginService()
     app.state.settings = Settings.model_construct(
         plugin_package_store_dir=Path(tempfile.gettempdir())
         / f"agent-hub-test-plugin-packages-{uuid4()}"
@@ -3856,6 +3961,7 @@ def client_with_settings(settings: Settings) -> TestClient:
         rate_limiter=object(),
     )
     app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.plugin_service = AcceptingRuntimePluginService()
     app.state.settings = settings
     return TestClient(app)
 
@@ -4601,6 +4707,8 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
         command_resolver=lambda command: (
             f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
         ),
+        environment={"STRIX_LLM": "configured"},
+        runtime_probe=lambda _executable: True,
     )
 
     plan_response = api.post(
@@ -4626,7 +4734,7 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
     assert install_body["plan"]["status"] == "installed"
     assert install_body["plugin"]["id"] == "security-testing"
     assert install_body["plugin"]["status"] == "running"
-    assert install_body["plugin"]["resource_config"]["command"] == "strix"
+    assert install_body["plugin"]["resource_config"]["command"] == "C:/tools/strix.exe"
     assert install_body["plugin"]["resource_config"]["required_commands"] == ["docker"]
     assert "OPENAI_API_KEY" in install_body["plugin"]["resource_config"]["required_env_any"]
     assert reloaded == [TENANT_ID]
@@ -4654,7 +4762,10 @@ def test_capability_installer_installs_plugin_and_rolls_back_manifest_visibility
         json=roundtrip_payload,
     )
     assert roundtrip_response.status_code == 200
-    assert roundtrip_response.json()["resource_config"]["command"] == "strix"
+    assert (
+        roundtrip_response.json()["resource_config"]["command"]
+        == "C:/tools/strix.exe"
+    )
     assert reloaded == [TENANT_ID, TENANT_ID]
     capabilities = {
         item["id"]: item
@@ -4683,6 +4794,8 @@ def test_capability_installer_rollback_restores_existing_plugin() -> None:
         command_resolver=lambda command: (
             f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
         ),
+        environment={"STRIX_LLM": "configured"},
+        runtime_probe=lambda _executable: True,
     )
 
     existing = api.post(
@@ -4732,7 +4845,10 @@ def test_capability_installer_rollback_restores_existing_plugin() -> None:
     assert existing.status_code == 200
     assert plan_response.status_code == 200
     assert install_response.status_code == 200
-    assert install_response.json()["plugin"]["resource_config"]["command"] == "strix"
+    assert (
+        install_response.json()["plugin"]["resource_config"]["command"]
+        == "C:/tools/strix.exe"
+    )
     assert rollback_response.status_code == 200
     assert restored["name"] == "Existing Security Connector"
     assert restored["resource_config"] == {"command": "custom-strix", "base_args": ["--old"]}
@@ -4771,6 +4887,8 @@ def test_capability_installer_requires_confirmed_plan_id() -> None:
         command_resolver=lambda command: (
             f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
         ),
+        environment={"STRIX_LLM": "configured"},
+        runtime_probe=lambda _executable: True,
     )
     plan_response = api.post(
         "/api/v1/admin/capability-installer/plan",
@@ -5006,9 +5124,17 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             *,
             tenant_id: UUID | None = None,
             actor_id: UUID | None = None,
+            activation_preflight: (
+                Callable[[PluginResourceResponse], Awaitable[None]] | None
+            ) = None,
         ) -> PluginResourceResponse:
             self.calls.append(("start", plugin_id, tenant_id, actor_id))
-            return await super().start_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+            return await super().start_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                activation_preflight=activation_preflight,
+            )
 
         async def stop_plugin(
             self,
@@ -5026,9 +5152,17 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             *,
             tenant_id: UUID | None = None,
             actor_id: UUID | None = None,
+            activation_preflight: (
+                Callable[[PluginResourceResponse], Awaitable[None]] | None
+            ) = None,
         ) -> PluginResourceResponse:
             self.calls.append(("reload", plugin_id, tenant_id, actor_id))
-            return await super().reload_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+            return await super().reload_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                activation_preflight=activation_preflight,
+            )
 
         async def delete_plugin(
             self,
@@ -5043,6 +5177,7 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
     api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
     service = RecordingPluginWriteService()
     cast(Any, api).state.admin_resource_service = service
+    cast(Any, api).state.plugin_service = AcceptingRuntimePluginService()
     test_client = TestClient(api)
 
     created = test_client.post(
@@ -5270,6 +5405,144 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
         TENANT_ID,
         TENANT_ID,
     ]
+
+
+def test_plugin_start_preflight_failure_persists_nonhealthy_state() -> None:
+    class RejectingRuntimePluginService:
+        async def preflight_plugin(self, plugin: PluginResourceResponse) -> None:
+            assert plugin.id == "missing-runtime"
+            raise RuntimeCapabilityError("Plugin command unavailable")
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = RejectingRuntimePluginService()
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "missing-runtime",
+            "name": "Missing Runtime",
+            "resource_config": {"command": "missing-runtime"},
+            "capabilities": [
+                {
+                    "id": "missing.run",
+                    "adapter": "local_command",
+                    "permission_class": "plugin.use",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+        },
+    )
+
+    started = api.post(
+        "/api/v1/admin/plugins/missing-runtime/start",
+        headers=headers(),
+    )
+    plugins = api.get("/api/v1/admin/plugins", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_preflight_failed"
+    assert started.json()["error"]["details"]["reason"] == "Plugin command unavailable"
+    stored = next(item for item in plugins.json() if item["id"] == "missing-runtime")
+    assert stored["status"] == "failed"
+    assert stored["health"] == "unhealthy"
+    assert stored["last_error_type"] == "plugin_preflight_failed"
+
+
+def test_plugin_start_rejects_config_changed_during_preflight() -> None:
+    api = client()
+    service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+
+    class MutatingRuntimePluginService:
+        async def preflight_plugin(self, plugin: PluginResourceResponse) -> None:
+            assert plugin.resource_config == {"command": "original"}
+            await service.upsert_plugin(
+                PluginResourceRequest(
+                    id=plugin.id,
+                    name=plugin.name,
+                    resource_config={"command": "replacement"},
+                    capabilities=list(plugin.capabilities),
+                ),
+                tenant_id=TENANT_ID,
+                actor_id=USER_ID,
+            )
+
+    cast(Any, api.app).state.plugin_service = MutatingRuntimePluginService()
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "changing-runtime",
+            "name": "Changing Runtime",
+            "resource_config": {"command": "original"},
+            "capabilities": [
+                {
+                    "id": "changing.run",
+                    "adapter": "local_command",
+                    "permission_class": "plugin.use",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+        },
+    )
+
+    started = api.post(
+        "/api/v1/admin/plugins/changing-runtime/start",
+        headers=headers(),
+    )
+    plugins = api.get("/api/v1/admin/plugins", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_activation_snapshot_changed"
+    stored = next(item for item in plugins.json() if item["id"] == "changing-runtime")
+    assert stored["resource_config"] == {"command": "replacement"}
+    assert stored["status"] == "stopped"
+    assert stored["health"] == "stopped"
+
+
+def test_capability_installer_uses_plugin_activation_preflight_and_rolls_back() -> None:
+    class RejectingRuntimePluginService:
+        async def preflight_plugin(self, plugin: PluginResourceResponse) -> None:
+            assert plugin.id == "security-testing"
+            raise RuntimeCapabilityError("Plugin Docker runtime unavailable")
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = RejectingRuntimePluginService()
+    cast(Any, api.app).state.capability_installer_service = CapabilityInstallerService(
+        command_resolver=lambda command: (
+            f"C:/tools/{command}.exe" if command in {"strix", "docker"} else None
+        ),
+        environment={"STRIX_LLM": "configured"},
+        runtime_probe=lambda _executable: True,
+    )
+    plan_response = api.post(
+        "/api/v1/admin/capability-installer/plan",
+        headers=headers(),
+        json={"entry_id": "security_testing", "query": "需要 strix 自动化渗透能力"},
+    )
+
+    installed = api.post(
+        "/api/v1/admin/capability-installer/install",
+        headers=headers(),
+        json={
+            "entry_id": "security_testing",
+            "query": "需要 strix 自动化渗透能力",
+            "plan_id": plan_response.json()["plan"]["id"],
+            "confirm": True,
+        },
+    )
+    plugins = api.get("/api/v1/admin/plugins", headers=headers())
+
+    assert installed.status_code == 409
+    assert installed.json()["error"]["code"] == "plugin_preflight_failed"
+    assert installed.json()["error"]["details"]["reason"] == (
+        "Plugin Docker runtime unavailable"
+    )
+    assert all(plugin["id"] != "security-testing" for plugin in plugins.json())
 
 
 def plugin_archive(
@@ -7561,7 +7834,7 @@ def test_runtime_registered_adapter_package_requires_known_adapter() -> None:
 
 
 def test_runtime_registered_adapter_package_requires_capabilities_to_use_package_adapter() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -7686,7 +7959,7 @@ def test_runtime_registered_adapter_package_rejects_unsupported_activation_contr
     capabilities: list[Mapping[str, object]],
     expected_reason: str,
 ) -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -7738,7 +8011,7 @@ def test_runtime_registered_adapter_package_rejects_unsupported_activation_contr
 
 
 def test_runtime_registered_adapter_package_can_be_approved_and_started() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -7810,7 +8083,7 @@ def test_runtime_registered_adapter_package_can_be_approved_and_started() -> Non
 
 
 def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -7877,7 +8150,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter
 
 
 def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -7946,7 +8219,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() 
 
 
 def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8015,7 +8288,7 @@ def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() 
 
 
 def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8090,7 +8363,7 @@ def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> 
 def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapter(
     endpoint: str,
 ) -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8162,7 +8435,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapte
 def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
     endpoint: str,
 ) -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8239,7 +8512,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
 def test_runtime_registered_adapter_package_lifecycle_rechecks_dependencies(
     endpoint: str,
 ) -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8407,7 +8680,7 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
         encoding="utf-8",
     )
 
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8498,7 +8771,7 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
 
 
 def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8572,7 +8845,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
 def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() -> None:
     dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
 
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8674,7 +8947,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
 
 
 def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -8744,7 +9017,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
 
 
 def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies() -> None:
-    class CalendarPluginService:
+    class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
                 {
@@ -9813,10 +10086,16 @@ async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
         )
     )
     disabled = await service.disable_plugin("search")
-    enabled = await service.enable_plugin("search")
-    started = await service.start_plugin("search")
+    enabled = await service.enable_plugin(
+        "search", activation_preflight=accept_plugin_activation
+    )
+    started = await service.start_plugin(
+        "search", activation_preflight=accept_plugin_activation
+    )
     stopped = await service.stop_plugin("search")
-    reloaded = await service.reload_plugin("search")
+    reloaded = await service.reload_plugin(
+        "search", activation_preflight=accept_plugin_activation
+    )
 
     assert created.status == "stopped"
     assert created.health == "stopped"
@@ -9851,8 +10130,12 @@ async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
         )
     )
     disabled = await service.disable_plugin("search")
-    enabled = await service.enable_plugin("search")
-    started = await service.start_plugin("search")
+    enabled = await service.enable_plugin(
+        "search", activation_preflight=accept_plugin_activation
+    )
+    started = await service.start_plugin(
+        "search", activation_preflight=accept_plugin_activation
+    )
     listed = await service.list_plugins()
 
     assert disabled.enabled is False
@@ -9960,8 +10243,18 @@ async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant()
         actor_id=USER_ID,
     )
     disabled = await service.disable_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
-    enabled = await service.enable_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
-    started = await service.start_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
+    enabled = await service.enable_plugin(
+        "search",
+        tenant_id=OTHER_TENANT_ID,
+        actor_id=USER_ID,
+        activation_preflight=accept_plugin_activation,
+    )
+    started = await service.start_plugin(
+        "search",
+        tenant_id=OTHER_TENANT_ID,
+        actor_id=USER_ID,
+        activation_preflight=accept_plugin_activation,
+    )
     bootstrap_plugins = await service.list_plugins(tenant_id=TENANT_ID)
     tenant_plugins = await service.list_plugins(tenant_id=OTHER_TENANT_ID)
     await service.delete_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
@@ -11608,6 +11901,7 @@ def scheduler_client(
     *,
     resource_service: InMemoryAdminResourceService | None = None,
     auth_service: object | None = None,
+    persisted_tick: object | None = None,
 ) -> TestClient:
     app = create_app(
         auth_service=auth_service or StubAuthService(),
@@ -11615,6 +11909,7 @@ def scheduler_client(
     )
     app.state.admin_resource_service = resource_service or InMemoryAdminResourceService()
     app.state.schedule_service = SchedulerService(submitter.submit)
+    app.state.persisted_schedule_tick = persisted_tick
     return TestClient(app)
 
 
@@ -11747,6 +12042,28 @@ def test_schedule_api_creates_lists_and_ticks_user_visible_tasks() -> None:
     assert request.budget == 4096
     assert request.metadata["schedule_id"] == schedule["id"]
     assert request.metadata["openclaw"] == "windows_desktop_report"
+
+
+def test_schedule_api_manual_tick_uses_persisted_claim_path_when_available() -> None:
+    calls: list[tuple[datetime, UUID]] = []
+
+    async def persisted_tick(*, now: datetime, tenant_id: UUID) -> tuple[UUID, ...]:
+        calls.append((now, tenant_id))
+        return (UUID("00000000-0000-4000-8000-000000000077"),)
+
+    submitter = RecordingScheduleSubmitter()
+    api = scheduler_client(submitter, persisted_tick=persisted_tick)
+
+    response = api.post(
+        "/api/v1/admin/schedules/tick",
+        headers=headers(),
+        json={"now": "2026-08-13T09:00:00+08:00"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"fired": ["00000000-0000-4000-8000-000000000077"]}
+    assert calls == [(datetime(2026, 8, 13, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")), TENANT_ID)]
+    assert submitter.calls == []
 
 
 def test_schedule_api_persists_restores_and_deletes_tasks() -> None:

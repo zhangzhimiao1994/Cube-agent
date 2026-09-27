@@ -101,6 +101,9 @@ class HarnessToolGateway:
     ) -> HarnessToolCallResult:
         if not isinstance(request, HarnessToolCallRequest):
             raise TypeError("request must be HarnessToolCallRequest")
+        policy_mapping_failure = _builtin_policy_mapping_failure(request)
+        if policy_mapping_failure is not None:
+            return self._failure(request, policy_mapping_failure)
         sandbox_failure = _workspace_write_sandbox_failure(request)
         if sandbox_failure is not None:
             return self._failure(request, sandbox_failure)
@@ -409,6 +412,31 @@ def _plugin_declared_capability_parts(
 _SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
 _SAFE_AVAILABILITY_REASON = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
+_STATIC_BUILTIN_POLICY_PARTS: Mapping[str, CapabilityPolicyParts] = {
+    "calculator": ("calculator", "evaluate", "calculator"),
+    "calculator_evaluate": ("calculator", "evaluate", "calculator"),
+    "calculator.evaluate": ("calculator", "evaluate", "calculator"),
+    "document.generate_docx": ("file", "create", "generated/document.generate_docx"),
+    "http.read": ("network", "read", "network/http"),
+    "presentation.generate_pptx": (
+        "file",
+        "create",
+        "generated/presentation.generate_pptx",
+    ),
+    "project.preflight_architecture": (
+        "file",
+        "create",
+        "generated/project.preflight_architecture",
+    ),
+    "project.generate_zip": ("file", "create", "generated/project.generate_zip"),
+}
+_DYNAMIC_BUILTIN_TOOLS = frozenset({"read_context", "workspace_read", "workspace.read"})
+_KNOWN_BUILTIN_TOOLS = frozenset(_STATIC_BUILTIN_POLICY_PARTS) | _DYNAMIC_BUILTIN_TOOLS
+_RESERVED_BUILTIN_PREFIXES = ("calculator.", "document.", "http.", "presentation.", "project.", "workspace.")
+_PRIVILEGED_BUILTIN_SANDBOXES = frozenset(
+    {"generated_artifact_store", "project_workspace_store", "workspace_write"}
+)
+
 _EXTERNAL_SANDBOX_PROFILES = frozenset(
     {
         "http_read",
@@ -424,11 +452,14 @@ _MCP_SANDBOX_PROFILES = frozenset({"mcp_remote", "mcp_stdio"})
 
 
 def _uses_external_envelope(request: HarnessToolCallRequest) -> bool:
-    return request.sandbox in _EXTERNAL_SANDBOX_PROFILES
+    return (
+        request.tool_name not in _KNOWN_BUILTIN_TOOLS
+        and request.sandbox in _EXTERNAL_SANDBOX_PROFILES
+    )
 
 
 def _requires_external_backend(request: HarnessToolCallRequest) -> bool:
-    return request.sandbox in _EXTERNAL_SANDBOX_PROFILES
+    return _uses_external_envelope(request)
 
 
 def _may_route_to_mcp_backend(request: HarnessToolCallRequest) -> bool:
@@ -513,11 +544,20 @@ def _nonblank_argument(request: HarnessToolCallRequest, name: str) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _builtin_policy_mapping_failure(request: HarnessToolCallRequest) -> str | None:
+    if request.tool_name in _KNOWN_BUILTIN_TOOLS or _uses_external_envelope(request):
+        return None
+    if request.sandbox in _PRIVILEGED_BUILTIN_SANDBOXES:
+        return "tool permission mapping unavailable"
+    if request.tool_name.startswith(_RESERVED_BUILTIN_PREFIXES):
+        return "tool permission mapping unavailable"
+    return None
+
+
 def _capability_parts(request: HarnessToolCallRequest) -> CapabilityPolicyParts:
-    if request.tool_name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
-        return "calculator", "evaluate", "calculator"
-    if request.tool_name in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}:
-        return "file", "create", f"generated/{request.tool_name}"
+    static_parts = _STATIC_BUILTIN_POLICY_PARTS.get(request.tool_name)
+    if static_parts is not None:
+        return static_parts
     if request.tool_name in {"workspace_read", "workspace.read"}:
         path = request.arguments.get("path")
         return "file", "read", _workspace_policy_resource(path)

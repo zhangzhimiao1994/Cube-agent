@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -9,6 +10,7 @@ from zipfile import ZipFile
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
+from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadResult
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource, ToolRegistry
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
@@ -22,9 +24,11 @@ RUN_ID = UUID("77777777-7777-4777-8777-777777777777")
 class FakeSandbox:
     def __init__(self) -> None:
         self.invocations: list[SkillInvocation] = []
+        self.workdir_modes: list[int] = []
 
     async def run(self, invocation: SkillInvocation) -> SkillResult:
         self.invocations.append(invocation)
+        self.workdir_modes.append(invocation.writable_tmp_path.stat().st_mode & 0o777)
         return SkillResult(
             exit_code=0,
             stdout='{"ok":true}',
@@ -34,6 +38,20 @@ class FakeSandbox:
 
     async def terminate(self, execution_id: str) -> None:
         del execution_id
+
+
+class FakeHttpReader(HttpReader):
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def fetch(self, url: str) -> HttpReadResult:
+        self.urls.append(url)
+        return HttpReadResult(
+            url=url,
+            status_code=200,
+            body="live response",
+            truncated=False,
+        )
 
 
 class UnavailableSandbox(FakeSandbox):
@@ -157,6 +175,37 @@ async def test_runtime_gateway_executes_calculator_without_external_side_effects
 
     assert result == {"value": "14"}
     assert gateway.is_replay_safe("calculator") is True
+
+
+async def test_runtime_gateway_executes_http_read_without_skill_fallback(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "http.read.zip").write_bytes(b"must not run")
+    reader = FakeHttpReader()
+    sandbox = FakeSandbox()
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        skill_sandbox=sandbox,
+        http_reader=reader,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="researcher",
+        name="http.read",
+        arguments={"url": "https://example.com/docs"},
+        idempotency_key="http_read_1",
+    )
+
+    assert result == {
+        "url": "https://example.com/docs",
+        "status_code": 200,
+        "body": "live response",
+        "truncated": False,
+    }
+    assert reader.urls == ["https://example.com/docs"]
+    assert sandbox.invocations == []
 
 
 async def test_runtime_gateway_prepares_manifest_sources_for_tenant(tmp_path: Path) -> None:
@@ -714,6 +763,8 @@ async def test_runtime_gateway_invokes_installed_skill_through_sandbox(tmp_path:
     assert len(sandbox.invocations) == 1
     assert sandbox.invocations[0].package_path == skill_dir / "docx.zip"
     assert sandbox.invocations[0].input["arguments"] == {"task": "draft"}
+    if os.name == "posix":
+        assert sandbox.workdir_modes == [0o770]
 
 
 async def test_runtime_gateway_uses_execution_backend_persisted_on_run(tmp_path: Path) -> None:
@@ -858,6 +909,7 @@ def test_runtime_gateway_is_available_matches_builtin_manifest_availability(
 
     assert gateway.is_available(TENANT_ID, "calculator.evaluate") is True
     assert gateway.is_available(TENANT_ID, "calculator") is True
+    assert gateway.is_available(TENANT_ID, "http.read") is True
     assert gateway.is_available(TENANT_ID, "read_context") is True
     assert gateway.is_available(TENANT_ID, "document.generate_docx") is False
     assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is False
@@ -897,6 +949,17 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "availability_reason": None,
                 "replay_safe": True,
                 "aliases": ("calculator",),
+            },
+            {
+                "id": "http.read",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "network.read",
+                "sandbox_profile": "http_read",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": False,
+                "aliases": (),
             },
             {
                 "id": "document.generate_docx",
@@ -1008,6 +1071,17 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "aliases": ("calculator",),
         },
         {
+            "id": "http.read",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "network.read",
+            "sandbox_profile": "http_read",
+            "available": True,
+            "availability_reason": None,
+            "replay_safe": False,
+            "aliases": (),
+        },
+        {
             "id": "document.generate_docx",
             "kind": "builtin",
             "adapter": "runtime_builtin",
@@ -1089,6 +1163,25 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
     assert "workspace/output.txt" not in repr(manifest)
     assert "tool:filesystem.read" not in repr(manifest)
     assert str(tmp_path) not in repr(manifest)
+
+
+def test_runtime_gateway_does_not_mark_instruction_only_skill_as_executable(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    package_path = skill_dir / "instructions_only.zip"
+    with ZipFile(package_path, "w") as archive:
+        archive.writestr("SKILL.md", "# Instructions only\n")
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    item = next(value for value in items if value["id"] == "instructions_only")
+
+    assert item["available"] is False
+    assert item["availability_reason"] == "skill_package_not_executable"
+    assert gateway.is_available(TENANT_ID, "instructions_only") is False
 
 
 def test_runtime_gateway_capability_manifest_includes_registry_capabilities(
@@ -1574,6 +1667,7 @@ def test_runtime_gateway_capability_manifest_skips_bad_registry_sources(
 
     assert {item["id"] for item in manifest_items} == {
         "calculator.evaluate",
+        "http.read",
         "document.generate_docx",
         "presentation.generate_pptx",
         "project.preflight_architecture",

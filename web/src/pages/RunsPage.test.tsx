@@ -8,6 +8,9 @@ import type { RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
+  ConversationManagerTabs,
+  conversationManagerMetadata,
+  currentConversationRuns,
   conversationIdFromSearch,
   conversationMatchesSearch,
   conversationSelectionIds,
@@ -69,6 +72,75 @@ describe("runConversationId", () => {
         explicit_details: { conversation_id: "conv-explicit" },
       }),
     ).toBe("conv-explicit");
+  });
+});
+
+describe("conversation manager views", () => {
+  const currentConversation = {
+    conversation_id: "conv-current",
+    title: "当前会话",
+    project_id: "default",
+    project_label: "默认项目",
+    workspace_path: "conv-current",
+    archived_at: null,
+    created_at: "2026-09-27T00:00:00Z",
+    updated_at: "2026-09-27T00:00:00Z",
+  };
+  const archivedConversation = {
+    ...currentConversation,
+    conversation_id: "conv-archived",
+    title: "归档会话",
+    workspace_path: "conv-archived",
+    archived_at: "2026-09-27T01:00:00Z",
+  };
+
+  it("keeps archived conversations out of the current view", () => {
+    expect(
+      conversationManagerMetadata([currentConversation], [archivedConversation], "current"),
+    ).toEqual([currentConversation]);
+    expect(
+      conversationManagerMetadata([currentConversation], [archivedConversation], "archived"),
+    ).toEqual([archivedConversation]);
+  });
+
+  it("keeps runs from archived conversations out of the current view", () => {
+    const currentRun = { ...baseRun, id: "run-current", conversation_id: "conv-current" };
+    const archivedRun = { ...baseRun, id: "run-archived", conversation_id: "conv-archived" };
+
+    expect(currentConversationRuns([currentRun, archivedRun], [archivedConversation])).toEqual([
+      currentRun,
+    ]);
+  });
+
+  it("switches between current and archived conversations with accessible tabs", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <ConversationManagerTabs
+        value="current"
+        currentCount={3}
+        archivedCount={2}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "当前会话 3" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    await user.click(screen.getByRole("tab", { name: "已归档 2" }));
+    expect(onChange).toHaveBeenCalledWith("archived");
+
+    rerender(
+      <ConversationManagerTabs
+        value="archived"
+        currentCount={3}
+        archivedCount={2}
+        onChange={onChange}
+      />,
+    );
+    expect(screen.getByRole("tab", { name: "已归档 2" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
   });
 });
 

@@ -4,6 +4,8 @@ import { api, formatApiError, type ExecutionBackend } from "../api/client";
 
 const REASON_TEXT: Record<string, string> = {
   systemd_tools_not_found: "服务器未安装 systemd-run 或 systemctl。",
+  systemd_broker_unavailable: "systemd 安全执行代理未启动，或 Agent Hub 服务无权连接。",
+  systemd_broker_invalid_response: "systemd 安全执行代理返回了无效响应。",
   systemd_transient_unit_unavailable: "服务账号无法创建 systemd 临时隔离单元。",
   docker_cli_not_found: "服务器未安装 Docker CLI。",
   docker_daemon_unavailable: "Docker 服务不可访问。",

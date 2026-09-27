@@ -274,7 +274,32 @@ def test_local_adapter_health_reports_platform_and_capabilities() -> None:
     body = response.json()
     assert body["status"] == "ok"
     assert body["platform"] == "windows"
-    assert body["capabilities"] == ["server_command", "desktop_action", "screen_read", "file_read"]
+    assert body["capabilities"] == ["server_command"]
+
+
+def test_local_adapter_health_reports_only_independently_configured_capabilities(
+    tmp_path: Path,
+) -> None:
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="linux",
+            allowed_commands=[[sys.executable, "-c", "print('ok')"]],
+            desktop_action_command=[sys.executable, "-c", "print('desktop')"],
+            screen_read_command=[sys.executable, "-c", "print('screen')"],
+            allowed_file_roots=[tmp_path],
+        )
+    )
+
+    response = TestClient(app).get("/v1/openclaw/health", headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == [
+        "server_command",
+        "desktop_action",
+        "screen_read",
+        "file_read",
+    ]
 
 def test_local_adapter_health_requires_bearer_token() -> None:
     response = _client().get("/v1/openclaw/health")

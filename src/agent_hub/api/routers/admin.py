@@ -101,6 +101,7 @@ from agent_hub.openclaw.executor import (
 from agent_hub.openclaw.remote_adapter import (
     OpenClawRemoteAdapter,
     OpenClawRemoteAdapterError,
+    probe_remote_openclaw_adapter,
     run_remote_openclaw_operation,
 )
 from agent_hub.plugins.contracts import (
@@ -141,6 +142,10 @@ from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import (
     is_legacy_generic_failure_reason,
     runtime_failure_diagnostic_from_reason,
+)
+from agent_hub.scheduler.service import (
+    SCHEDULER_ADVISORY_LOCK_KEY,
+    SCHEDULER_CLAIM_RECORD_TYPE,
 )
 from agent_hub.scheduler.types import (
     CronScheduleSpec,
@@ -1389,6 +1394,9 @@ class PluginResourceResponse(PluginResourceRequest):
     last_error_type: str | None = Field(default=None, max_length=128)
 
 
+type PluginActivationPreflight = Callable[[PluginResourceResponse], Awaitable[None]]
+
+
 class PluginArchiveInstallResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2117,6 +2125,7 @@ class OpenClawAdapterResponse(BaseModel):
     kind: str = Field(pattern=r"^(server_command|desktop_action|screen_read|file_read)$")
     target_type: str = Field(pattern=r"^(server|computer|desktop|filesystem|screen)$")
     status: str = Field(pattern=r"^(available|adapter_unavailable)$")
+    reason: str | None = None
     execution_host: str
     requires_user_approval: bool
     supports_read_only: bool
@@ -2546,8 +2555,10 @@ def _configured_openclaw_adapter_for_session(
     )
 
 
-def _openclaw_adapter_responses(
+async def _openclaw_adapter_responses(
     settings: SystemSettingsResponse | None = None,
+    *,
+    adapter_token_resolver: Callable[[str], Awaitable[str]] | None = None,
 ) -> tuple[OpenClawAdapterResponse, ...]:
     descriptions = {
         ("linux", "server_command"): (
@@ -2599,6 +2610,10 @@ def _openclaw_adapter_responses(
         ): "Requires a connected macOS filesystem OpenClaw adapter before execution.",
     }
     adapters: list[OpenClawAdapterResponse] = []
+    remote_probes: dict[
+        tuple[str, str, str, str, str],
+        tuple[frozenset[str], str | None],
+    ] = {}
     for platform in ("linux", "windows", "macos"):
         for kind in ("server_command", "desktop_action", "screen_read", "file_read"):
             configured = (
@@ -2607,7 +2622,61 @@ def _openclaw_adapter_responses(
                 else _configured_openclaw_adapter_for_kind(settings, platform=platform, kind=kind)
             )
             local_linux = platform == "linux" and kind == "server_command"
-            available = local_linux or configured is not None
+            available = False
+            reason: str | None
+            if settings is None or not settings.openclaw_enabled:
+                reason = "openclaw_disabled"
+            elif not settings.openclaw_allowed_commands:
+                reason = "openclaw_command_allowlist_empty"
+            elif local_linux:
+                available = True
+                reason = None
+            elif configured is None:
+                reason = "openclaw_adapter_not_configured"
+            else:
+                probe_key = (
+                    configured.platform,
+                    configured.target_type,
+                    configured.target,
+                    configured.base_url,
+                    configured.credential_ref,
+                )
+                if probe_key not in remote_probes:
+                    if adapter_token_resolver is None:
+                        remote_probes[probe_key] = (
+                            frozenset(),
+                            "remote_adapter_credentials_unavailable",
+                        )
+                    else:
+                        try:
+                            token = await adapter_token_resolver(configured.credential_ref)
+                            probe = await probe_remote_openclaw_adapter(
+                                OpenClawRemoteAdapter(
+                                    platform=configured.platform,
+                                    target_type=configured.target_type,
+                                    target=configured.target,
+                                    base_url=configured.base_url,
+                                ),
+                                bearer_token=token,
+                            )
+                        except Exception:  # noqa: BLE001 - list projection must fail closed.
+                            remote_probes[probe_key] = (
+                                frozenset(),
+                                "remote_adapter_probe_failed",
+                            )
+                        else:
+                            remote_probes[probe_key] = (
+                                frozenset(probe.capabilities),
+                                None,
+                            )
+                capabilities, probe_reason = remote_probes[probe_key]
+                if probe_reason is not None:
+                    reason = probe_reason
+                elif kind not in capabilities:
+                    reason = "remote_adapter_capability_unavailable"
+                else:
+                    available = True
+                    reason = None
             if configured is not None:
                 host = _remote_adapter_host(configured)
                 description = (
@@ -2623,6 +2692,7 @@ def _openclaw_adapter_responses(
                     kind=kind,
                     target_type=_openclaw_default_target_type(kind),
                     status="available" if available else "adapter_unavailable",
+                    reason=reason,
                     execution_host=host,
                     requires_user_approval=True,
                     supports_read_only=kind in {"screen_read", "file_read"},
@@ -3037,6 +3107,8 @@ class AdminResourceService(Protocol):
 
     async def get_secret(self, ref: str) -> SecretReferenceResponse: ...
 
+    async def resolve_secret_value(self, ref: str) -> str: ...
+
     async def probe_concurrency(self, request: ProbeRequest) -> ProbeResponse: ...
 
     async def save_draft(self, request: DraftRequest) -> PublishResponse: ...
@@ -3294,6 +3366,15 @@ class AdminResourceService(Protocol):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
+    ) -> PluginResourceResponse: ...
+
+    async def mark_plugin_preflight_failed(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
     ) -> PluginResourceResponse: ...
 
     async def enable_plugin(
@@ -3302,6 +3383,7 @@ class AdminResourceService(Protocol):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse: ...
 
     async def disable_plugin(
@@ -3326,6 +3408,7 @@ class AdminResourceService(Protocol):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse: ...
 
     async def approve_plugin_package(
@@ -4581,6 +4664,67 @@ async def _current_plugin_for_activation_check(
     raise KeyError(plugin_id)
 
 
+def _plugin_activation_preflight(request: Request) -> PluginActivationPreflight:
+    runtime = getattr(request.app.state, "plugin_service", None)
+    preflight = getattr(runtime, "preflight_plugin", None)
+
+    async def run(plugin: PluginResourceResponse) -> None:
+        if not callable(preflight):
+            from agent_hub.capabilities.runtime import RuntimeCapabilityError
+
+            raise RuntimeCapabilityError("Plugin runtime preflight unavailable")
+        result = preflight(plugin)
+        if inspect.isawaitable(result):
+            await result
+
+    return run
+
+
+def _plugin_activation_snapshot_sha256(plugin: PluginResourceResponse) -> str:
+    payload = json.dumps(
+        plugin.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _run_plugin_activation_preflight(
+    plugin: PluginResourceResponse,
+    activation_preflight: PluginActivationPreflight | None,
+) -> None:
+    from agent_hub.capabilities.runtime import RuntimeCapabilityError
+
+    if activation_preflight is None:
+        error = RuntimeCapabilityError("Plugin runtime preflight unavailable")
+    else:
+        try:
+            await activation_preflight(plugin)
+            return
+        except RuntimeCapabilityError as caught:
+            error = caught
+    reason = _safe_model_check_detail(str(error)) or "Plugin runtime unavailable"
+    raise PublicAPIError(
+        409,
+        "plugin_preflight_failed",
+        "plugin runtime preflight failed",
+        details={"reason": reason},
+    ) from None
+
+
+def _ensure_plugin_activation_snapshot_unchanged(
+    expected_sha256: str,
+    current: PluginResourceResponse,
+) -> None:
+    if _plugin_activation_snapshot_sha256(current) != expected_sha256:
+        raise PublicAPIError(
+            409,
+            "plugin_activation_snapshot_changed",
+            "plugin configuration changed during activation preflight",
+        )
+
+
 def _ensure_runtime_registered_package_can_activate(
     request: Request,
     plugin: PluginResourceResponse,
@@ -5376,6 +5520,18 @@ def _plugin_started_response(plugin: PluginResourceResponse) -> PluginResourceRe
     _ensure_plugin_package_activation_allowed(plugin)
     return plugin.model_copy(
         update={"status": "running", "health": "healthy", "last_error_type": None}
+    )
+
+
+def _plugin_preflight_failed_response(
+    plugin: PluginResourceResponse,
+) -> PluginResourceResponse:
+    return plugin.model_copy(
+        update={
+            "status": "failed",
+            "health": "unhealthy",
+            "last_error_type": "plugin_preflight_failed",
+        }
     )
 
 
@@ -7144,10 +7300,33 @@ class InMemoryAdminResourceService:
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         del tenant_id, actor_id
         current = self.plugins[plugin_id]
+        expected_sha256 = _plugin_activation_snapshot_sha256(current)
+        try:
+            await _run_plugin_activation_preflight(current, activation_preflight)
+        except PublicAPIError:
+            latest = self.plugins[plugin_id]
+            _ensure_plugin_activation_snapshot_unchanged(expected_sha256, latest)
+            self.plugins[plugin_id] = _plugin_preflight_failed_response(latest)
+            raise
+        current = self.plugins[plugin_id]
+        _ensure_plugin_activation_snapshot_unchanged(expected_sha256, current)
         updated = _plugin_started_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def mark_plugin_preflight_failed(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
+        updated = _plugin_preflight_failed_response(self.plugins[plugin_id])
         self.plugins[plugin_id] = updated
         return updated
 
@@ -7157,9 +7336,20 @@ class InMemoryAdminResourceService:
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         del tenant_id, actor_id
         current = self.plugins[plugin_id]
+        expected_sha256 = _plugin_activation_snapshot_sha256(current)
+        try:
+            await _run_plugin_activation_preflight(current, activation_preflight)
+        except PublicAPIError:
+            latest = self.plugins[plugin_id]
+            _ensure_plugin_activation_snapshot_unchanged(expected_sha256, latest)
+            self.plugins[plugin_id] = _plugin_preflight_failed_response(latest)
+            raise
+        current = self.plugins[plugin_id]
+        _ensure_plugin_activation_snapshot_unchanged(expected_sha256, current)
         updated = _plugin_enabled_response(current)
         self.plugins[plugin_id] = updated
         return updated
@@ -7196,9 +7386,20 @@ class InMemoryAdminResourceService:
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         del tenant_id, actor_id
         current = self.plugins[plugin_id]
+        expected_sha256 = _plugin_activation_snapshot_sha256(current)
+        try:
+            await _run_plugin_activation_preflight(current, activation_preflight)
+        except PublicAPIError:
+            latest = self.plugins[plugin_id]
+            _ensure_plugin_activation_snapshot_unchanged(expected_sha256, latest)
+            self.plugins[plugin_id] = _plugin_preflight_failed_response(latest)
+            raise
+        current = self.plugins[plugin_id]
+        _ensure_plugin_activation_snapshot_unchanged(expected_sha256, current)
         updated = _plugin_started_response(current)
         self.plugins[plugin_id] = updated
         return updated
@@ -10968,13 +11169,51 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         return await self._set_plugin_lifecycle(
             plugin_id,
             "start",
             tenant_id=tenant_id,
             actor_id=actor_id,
+            activation_preflight=activation_preflight,
         )
+
+    async def mark_plugin_preflight_failed(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
+        if payload is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(plugin_id)
+            return await super().mark_plugin_preflight_failed(
+                plugin_id,
+                actor_id=actor_id,
+            )
+        if not payload:
+            raise KeyError(plugin_id)
+        updated = _plugin_preflight_failed_response(
+            PluginResourceResponse.model_validate(payload)
+        )
+        if not await self._upsert_admin_payload(
+            "plugin",
+            updated.id,
+            updated.model_dump(mode="json"),
+            tenant_id=tenant_id,
+        ):
+            raise KeyError(plugin_id)
+        await self._record_audit(
+            "plugin.preflight.failed",
+            f"plugin:{updated.id}",
+            {"id": updated.id, "error_type": "plugin_preflight_failed"},
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+        return updated
 
     async def enable_plugin(
         self,
@@ -10982,12 +11221,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         return await self._set_plugin_lifecycle(
             plugin_id,
             "enable",
             tenant_id=tenant_id,
             actor_id=actor_id,
+            activation_preflight=activation_preflight,
         )
 
     async def disable_plugin(
@@ -11024,12 +11265,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         return await self._set_plugin_lifecycle(
             plugin_id,
             "reload",
             tenant_id=tenant_id,
             actor_id=actor_id,
+            activation_preflight=activation_preflight,
         )
 
     async def approve_plugin_package(
@@ -11141,23 +11384,72 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        activation_preflight: PluginActivationPreflight | None = None,
     ) -> PluginResourceResponse:
         payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
         if payload is None:
             if tenant_id is not None and tenant_id != self._tenant_id:
                 raise KeyError(plugin_id)
             if action == "start":
-                return await super().start_plugin(plugin_id)
+                return await super().start_plugin(
+                    plugin_id,
+                    activation_preflight=activation_preflight,
+                )
             if action == "enable":
-                return await super().enable_plugin(plugin_id)
+                return await super().enable_plugin(
+                    plugin_id,
+                    activation_preflight=activation_preflight,
+                )
             if action == "disable":
                 return await super().disable_plugin(plugin_id)
             if action == "stop":
                 return await super().stop_plugin(plugin_id)
-            return await super().reload_plugin(plugin_id)
+            return await super().reload_plugin(
+                plugin_id,
+                activation_preflight=activation_preflight,
+            )
         if not payload:
             raise KeyError(plugin_id)
         current = PluginResourceResponse.model_validate(payload)
+        if action in {"start", "enable", "reload"}:
+            expected_sha256 = _plugin_activation_snapshot_sha256(current)
+            try:
+                await _run_plugin_activation_preflight(current, activation_preflight)
+            except PublicAPIError:
+                latest_payload = await self._get_admin_payload(
+                    "plugin",
+                    plugin_id,
+                    tenant_id=tenant_id,
+                )
+                if not latest_payload:
+                    raise KeyError(plugin_id) from None
+                latest = PluginResourceResponse.model_validate(latest_payload)
+                _ensure_plugin_activation_snapshot_unchanged(expected_sha256, latest)
+                failed = _plugin_preflight_failed_response(latest)
+                if not await self._upsert_admin_payload(
+                    "plugin",
+                    failed.id,
+                    failed.model_dump(mode="json"),
+                    tenant_id=tenant_id,
+                ):
+                    raise KeyError(plugin_id) from None
+                await self._record_audit(
+                    "plugin.preflight.failed",
+                    f"plugin:{failed.id}",
+                    {"id": failed.id, "error_type": "plugin_preflight_failed"},
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                )
+                raise
+            latest_payload = await self._get_admin_payload(
+                "plugin",
+                plugin_id,
+                tenant_id=tenant_id,
+            )
+            if not latest_payload:
+                raise KeyError(plugin_id)
+            current = PluginResourceResponse.model_validate(latest_payload)
+            _ensure_plugin_activation_snapshot_unchanged(expected_sha256, current)
         if action == "enable":
             updated = _plugin_enabled_response(current)
         elif action == "disable":
@@ -12155,6 +12447,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         )
         async with self._session_factory() as session, session.begin():
+            if kind == "schedule":
+                await _acquire_scheduler_advisory_xact_lock(session)
             await session.execute(statement)
         return True
 
@@ -12167,6 +12461,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if self._session_factory is None:
             return False
         async with self._session_factory() as session, session.begin():
+            if any(kind == "schedule" for kind, _resource_id, _payload in upserts) or any(
+                kind == "schedule" for kind, _resource_id in deletes
+            ):
+                await _acquire_scheduler_advisory_xact_lock(session)
             for kind, resource_id, payload in upserts:
                 statement = (
                     insert(AdminResourceRow)
@@ -12206,6 +12504,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if self._session_factory is None:
             return None
         target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
+        if kind == "schedule":
+            async with self._session_factory() as session, session.begin():
+                await _acquire_scheduler_advisory_xact_lock(session)
+                result = await session.execute(
+                    delete(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == target_tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .where(AdminResourceRow.resource_id == resource_id)
+                )
+                return bool(getattr(result, "rowcount", 0))
         existing = await self._get_admin_payload(kind, resource_id, tenant_id=target_tenant_id)
         if not existing:
             return False
@@ -12619,6 +12927,13 @@ def _schedule_from_payload(payload: Mapping[str, object]) -> ScheduleDefinition:
     )
 
 
+async def _acquire_scheduler_advisory_xact_lock(session: AsyncSession) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": SCHEDULER_ADVISORY_LOCK_KEY},
+    )
+
+
 async def _restore_persisted_schedules(
     service: SchedulerServiceProtocol,
     resources: AdminResourceService,
@@ -12632,6 +12947,8 @@ async def _restore_persisted_schedules(
         return
     existing_ids = {schedule.id for schedule in await service.list_schedules(tenant_id=tenant_id)}
     for payload in payloads:
+        if payload.get("record_type") == SCHEDULER_CLAIM_RECORD_TYPE:
+            continue
         try:
             schedule = _schedule_from_payload(payload)
         except (KeyError, TypeError, ValueError):
@@ -16485,6 +16802,18 @@ async def tick_schedules(
 ) -> ScheduleTickResponse:
     _require(principal, "run:create")
     service = _scheduler_service(request)
+    persisted_tick = getattr(request.app.state, "persisted_schedule_tick", None)
+    if callable(persisted_tick):
+        try:
+            fired = await persisted_tick(now=body.now, tenant_id=principal.tenant_id)
+        except ValueError as error:
+            raise PublicAPIError(
+                422,
+                "request_validation",
+                "request validation failed",
+                details={"reason": str(error)},
+            ) from error
+        return ScheduleTickResponse(fired=list(fired))
     await _restore_persisted_schedules(service, resources, tenant_id=principal.tenant_id)
     try:
         fired = await service.tick(tenant_id=principal.tenant_id, now=body.now)
@@ -16789,7 +17118,10 @@ async def list_openclaw_adapters(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> tuple[OpenClawAdapterResponse, ...]:
     _require(principal, "config:read")
-    return _openclaw_adapter_responses(await service.get_settings())
+    return await _openclaw_adapter_responses(
+        await service.get_settings(),
+        adapter_token_resolver=service.resolve_secret_value,
+    )
 
 
 @router.post(
@@ -17794,6 +18126,7 @@ async def capability_installer_install(
             confirm=body.confirm,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
+            activation_preflight=_plugin_activation_preflight(request),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -18199,6 +18532,7 @@ async def start_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
+            activation_preflight=_plugin_activation_preflight(request),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -18233,6 +18567,7 @@ async def enable_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
+            activation_preflight=_plugin_activation_preflight(request),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -18315,6 +18650,7 @@ async def reload_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
+            activation_preflight=_plugin_activation_preflight(request),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None

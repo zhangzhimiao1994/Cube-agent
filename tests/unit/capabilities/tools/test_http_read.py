@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -8,6 +10,7 @@ from agent_hub.capabilities.tools.http_read import (
     HttpReader,
     HttpReadError,
     HttpResponse,
+    PinnedHttpTransport,
     ResponseTooLarge,
     UnsafeTarget,
 )
@@ -219,3 +222,75 @@ async def test_http_reader_rejects_oversized_content_length_before_body() -> Non
 
     with pytest.raises(ResponseTooLarge):
         await reader.fetch("https://example.test/large")
+
+
+class FakeStreamWriter:
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.written.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_pinned_transport_connects_to_validated_ip_and_preserves_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    reader.feed_eof()
+    writer = FakeStreamWriter()
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def open_connection(*args: Any, **kwargs: Any) -> tuple[asyncio.StreamReader, Any]:
+        calls.append((args, kwargs))
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    transport = PinnedHttpTransport(max_response_bytes=10)
+
+    response = await transport.get(
+        "http://public.example:8080/read?q=1",
+        resolved_addresses=("93.184.216.34",),
+    )
+
+    assert response.body == b"ok"
+    assert calls == [
+        (
+            ("93.184.216.34", 8080),
+            {"ssl": None, "server_hostname": None},
+        )
+    ]
+    assert b"GET /read?q=1 HTTP/1.1\r\n" in writer.written
+    assert b"Host: public.example:8080\r\n" in writer.written
+    assert writer.closed is True
+
+
+async def test_pinned_transport_stream_limit_applies_without_content_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"HTTP/1.1 200 OK\r\n\r\n123456")
+    reader.feed_eof()
+    writer = FakeStreamWriter()
+
+    async def open_connection(*args: Any, **kwargs: Any) -> tuple[asyncio.StreamReader, Any]:
+        del args, kwargs
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+
+    with pytest.raises(ResponseTooLarge):
+        await PinnedHttpTransport(max_response_bytes=5).get(
+            "http://public.example/read",
+            resolved_addresses=("93.184.216.34",),
+        )

@@ -2,7 +2,9 @@
 
 import base64
 import binascii
+import os
 import re
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar, Literal
@@ -16,6 +18,12 @@ from agent_hub.plugins.dependency_policy import (
     normalize_plugin_package_dependency_allowlist_entry,
 )
 from agent_hub.security.network import canonical_ip
+
+
+def _default_capability_environment_root_dir() -> Path:
+    if os.name == "nt":
+        return Path(tempfile.gettempdir()) / "agent-hub" / "capability-environments"
+    return Path("/var/lib/agent-hub/capability-environments")
 
 
 class Settings(BaseSettings):
@@ -53,9 +61,19 @@ class Settings(BaseSettings):
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     runtime_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     runtime_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
+    scheduler_enabled: bool = True
+    scheduler_tick_interval_seconds: float = Field(default=5.0, ge=0.1, le=300.0)
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     plugin_package_store_dir: Path = Path("/var/lib/agent-hub/plugin-packages")
+    capability_environment_root_dir: Path = Field(
+        default_factory=_default_capability_environment_root_dir
+    )
+    capability_environment_disk_quota_bytes: int = Field(
+        default=5_368_709_120,
+        ge=1_048_576,
+        le=1_099_511_627_776,
+    )
     plugin_package_subprocess_runner_enabled: bool = False
     plugin_package_subprocess_adapter_ids: frozenset[str] = Field(
         default=frozenset(),

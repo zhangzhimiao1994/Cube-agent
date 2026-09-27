@@ -1,6 +1,7 @@
 [Unit]
 Description=Agent Hub API
-After=network-online.target postgresql.service redis.service
+Wants=agent-hub-skill-broker.socket
+After=network-online.target postgresql.service redis.service agent-hub-skill-broker.socket
 
 [Service]
 Type=simple
