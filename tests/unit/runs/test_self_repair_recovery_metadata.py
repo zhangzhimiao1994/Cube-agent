@@ -662,6 +662,36 @@ def test_runtime_blocker_proposal_requests_install_instead_of_reporting_terminal
     assert "已暂停" in str(proposal["summary"])
     assert "失败" not in str(proposal["summary"])
 
+    projected = repair_proposal_projection(proposal)
+    assert projected is not None
+    assert projected["resolution_kind"] == "install_runtime"
+    assert projected["resolution_label"] == "安装并继续"
+    assert projected["pauses_run"] is True
+
+
+def test_generic_runtime_failure_remains_terminal_instead_of_claiming_installable_blocker() -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"source": "manual"},
+        events=(
+            RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=run_id,
+                reason="unexpected runtime crash",
+            ),
+        ),
+        policy=SelfRepairPolicy(),
+    )
+
+    assert decision is not None
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["resolution_kind"] == "retry_recoverable"
+    assert proposal["pauses_run"] is False
+
 
 def test_model_failure_proposal_does_not_pause_for_local_resolution() -> None:
     run_id = uuid4()

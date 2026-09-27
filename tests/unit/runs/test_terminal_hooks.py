@@ -2110,7 +2110,7 @@ async def test_execute_classifies_runtime_exception_failure() -> None:
 
     submitted = await service.execute(repository.run_id)
 
-    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.status is RunStatus.FAILED
     assert [event.kind for event in repository.event_log] == [
         EventKind.RUNTIME_FAILED,
         "repair.classified",
@@ -2460,7 +2460,7 @@ async def test_recover_persists_repair_classification_for_failed_running_recover
 
     submitted = await service.recover(repository.run_id)
 
-    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.status is RunStatus.FAILED
     repair_events = [event for event in repository.event_log if event.kind == "repair.classified"]
     assert len(repair_events) == 1
     assert repair_events[0].payload["source_kind"] == "step.failed"

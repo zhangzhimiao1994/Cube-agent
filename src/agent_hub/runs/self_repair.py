@@ -223,6 +223,20 @@ _MODEL_FAILURE_CATEGORIES = frozenset(
         "capacity_pressure",
     }
 )
+_PAUSABLE_FAILURE_CATEGORIES = frozenset(
+    {
+        "plugin_runtime_unavailable",
+        "plugin_adapter_unavailable",
+        "plugin_credential_unavailable",
+        "plugin_invalid_arguments",
+        "plugin_invalid_result",
+        "plugin_sandbox_unsupported",
+        "plugin_disabled",
+        "mcp_runtime_unavailable",
+        "mcp_tool_unavailable",
+        "mcp_server_not_discovered",
+    }
+)
 _REPAIR_PROPOSAL_FIELDS = frozenset(
     {
         "kind",
@@ -291,7 +305,10 @@ class SelfRepairDecision:
 
     @property
     def pauses_run(self) -> bool:
-        return self.kind == "repair.classified" and self.failure_category not in _MODEL_FAILURE_CATEGORIES
+        return (
+            self.kind == "repair.classified"
+            and self.failure_category in _PAUSABLE_FAILURE_CATEGORIES
+        )
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
         return SelfRepairDecision(
@@ -759,7 +776,7 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
             value,
             allowed=SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
         )
-    if key == "automatic_execution":
+    if key in {"automatic_execution", "pauses_run"}:
         return value if type(value) is bool else None
     if key in {"requires_approval", "replay_safe"}:
         return value if type(value) is bool else None
@@ -767,9 +784,9 @@ def _repair_proposal_projection_value(key: str, value: object) -> JsonValue | No
         return _safe_int(value, default=1, minimum=1, maximum=3)
     if key == "source_event_sequence":
         return _safe_int(value, default=0, minimum=0, maximum=2**63 - 1)
-    if key in {"kind", "repair_action"}:
+    if key in {"kind", "repair_action", "resolution_kind"}:
         return _safe_text(value, default="", max_chars=96)
-    if key == "title":
+    if key in {"title", "resolution_label"}:
         return _safe_text(value, default="", max_chars=96)
     if key == "summary":
         return _safe_text(value, default="", max_chars=160)
