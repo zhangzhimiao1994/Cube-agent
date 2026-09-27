@@ -3551,9 +3551,7 @@ class CrewDispatchRuntime:
                             if not isinstance(error, _ModelContractFailed) and _can_compact_retry_subagent(
                                 review_diagnostic,
                                 recovery_attempt=review_recovery_attempt,
-                                remaining_seconds=self._remaining_timeout(
-                                    run_state, step_deadline
-                                ),
+                                remaining_seconds=self._remaining_timeout(run_state),
                                 max_recovery_attempts=_subagent_recovery_attempt_limit(reviewer),
                             ):
                                 review_recovery_attempt += 1
@@ -3732,7 +3730,7 @@ class CrewDispatchRuntime:
                 if not isinstance(error, (_ReviewFailed, _ModelContractFailed)) and _can_compact_retry_subagent(
                     diagnostic,
                     recovery_attempt=recovery_attempt,
-                    remaining_seconds=self._remaining_timeout(run_state, step_deadline),
+                    remaining_seconds=self._remaining_timeout(run_state),
                     max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
                 ):
                     recovery_attempt += 1

@@ -609,6 +609,36 @@ class RecordingGeneration:
         return await bridge.complete([{"role": "system", "content": prompt}])
 
 
+class DeadlineThenSuccessGeneration(RecordingGeneration):
+    def __init__(self, *, first_delay_seconds: float, target_agent_id: str) -> None:
+        super().__init__()
+        self.first_delay_seconds = first_delay_seconds
+        self.target_agent_id = target_agent_id
+        self.target_attempts = 0
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        if agent_id == self.target_agent_id:
+            self.target_attempts += 1
+        if agent_id == self.target_agent_id and self.target_attempts == 1:
+            self.prompts.append((step_id, agent_id, prompt))
+            await asyncio.sleep(self.first_delay_seconds)
+        return await super().execute(
+            step_id,
+            prompt,
+            bridge,
+            agent_id=agent_id,
+            storage_scope=storage_scope,
+        )
+
+
 class RecordingFactory(CrewObjectFactory):
     def __init__(self, generation: RecordingGeneration) -> None:
         self.generation = generation
@@ -2906,6 +2936,63 @@ async def test_agent_timeout_compact_retries_before_failing_step() -> None:
         crew_factory=RecordingFactory(RecordingGeneration()),
     )
     await restored.restore_checkpoint(checkpoint)
+
+
+async def test_expired_step_deadline_uses_remaining_run_budget_for_compact_retry() -> None:
+    generation = DeadlineThenSuccessGeneration(
+        first_delay_seconds=0.1,
+        target_agent_id="writer",
+    )
+    plan = _one_step_plan()
+    plan = plan.model_copy(update={
+        "steps": (
+            plan.steps[0].model_copy(update={"timeout_seconds": 0.05}),
+        ),
+    })
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = [event async for event in runtime.run(_context(timeout_seconds=2.0))]
+
+    assert generation.target_attempts == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.reason == "CrewAI step timed out: step=final actor=writer"
+    assert retrying.payload["error_code"] == "crew.step_timeout"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_expired_review_deadline_uses_remaining_run_budget_for_compact_retry() -> None:
+    generation = DeadlineThenSuccessGeneration(
+        first_delay_seconds=0.1,
+        target_agent_id="reviewer",
+    )
+    plan = _reviewed_step_plan()
+    plan = plan.model_copy(update={
+        "steps": (
+            plan.steps[0].model_copy(update={"timeout_seconds": 0.05}),
+            plan.steps[1],
+        ),
+    })
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = [event async for event in runtime.run(_context(timeout_seconds=2.0))]
+
+    assert generation.target_attempts == 2
+    retrying = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_RETRYING and event.actor == "reviewer"
+    )
+    assert retrying.reason == "CrewAI step timed out: step=draft.review actor=reviewer"
+    assert retrying.payload["error_code"] == "crew.step_timeout"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_agent_timeout_reports_recovery_closure_after_retry_exhausted() -> None:
