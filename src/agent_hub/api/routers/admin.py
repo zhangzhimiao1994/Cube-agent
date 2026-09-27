@@ -17443,7 +17443,7 @@ async def update_main_agent_config(
     responses=error_responses(401, 403, 422),
 )
 async def search_conversation_questions(
-    q: Annotated[str, Query(min_length=1, max_length=100_000)],
+    q: Annotated[str, Query(min_length=1, max_length=500)],
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
     project_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,

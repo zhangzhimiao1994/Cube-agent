@@ -242,6 +242,22 @@ def test_conversation_index_migration_uses_non_blocking_postgres_ddl() -> None:
     assert "routing_decision ->> 'conversation_id'" in source
 
 
+def test_conversation_question_search_migration_adds_trigram_index() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0031_conversation_question_search.py"
+    )
+    source = migration_path.read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "0030_skill_source_revisions"' in source
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in source
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in source
+    assert "gin_trgm_ops" in source
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in source
+
+
 def test_conversation_metadata_model_is_unique_per_tenant_and_conversation() -> None:
     table = cast(Table, ConversationRow.__table__)
 

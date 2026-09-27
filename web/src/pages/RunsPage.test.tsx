@@ -10,8 +10,10 @@ import {
   ConversationCheckpointNav,
   ConversationManagerTabs,
   conversationManagerMetadata,
+  conversationManagerSearchState,
   currentConversationRuns,
   conversationIdFromSearch,
+  conversationQuestionSearchHref,
   conversationMatchesSearch,
   conversationSelectionIds,
   conversationCheckpoints,
@@ -101,6 +103,36 @@ describe("conversation manager views", () => {
     expect(
       conversationManagerMetadata([currentConversation], [archivedConversation], "archived"),
     ).toEqual([archivedConversation]);
+  });
+
+  it("counts full-history question hits and does not show a contradictory empty state", () => {
+    expect(
+      conversationManagerSearchState({
+        localConversationCount: 0,
+        questionResultCount: 2,
+        questionResultsCurrent: true,
+        questionSearchPending: false,
+      }),
+    ).toEqual({
+      effectiveQuestionResultCount: 2,
+      hasVisibleResults: true,
+      summary: "0 个会话 · 已加载 2 个问题",
+    });
+  });
+
+  it("hides stale debounced question hits while the next search is pending", () => {
+    expect(
+      conversationManagerSearchState({
+        localConversationCount: 0,
+        questionResultCount: 3,
+        questionResultsCurrent: false,
+        questionSearchPending: true,
+      }),
+    ).toEqual({
+      effectiveQuestionResultCount: 0,
+      hasVisibleResults: true,
+      summary: "0 个会话",
+    });
   });
 
   it("keeps runs from archived conversations out of the current view", () => {
@@ -201,6 +233,17 @@ describe("conversation ordering", () => {
     expect(conversationIdFromSearch("?conversation=%20%20")).toBeNull();
     expect(shouldShowModeEntry("?conversation=conv-office-search")).toBe(false);
     expect(shouldShowModeEntry("")).toBe(true);
+  });
+
+  it("builds a stable deep link for a full-history question result", () => {
+    expect(
+      conversationQuestionSearchHref({
+        conversationId: "conv/history",
+        runId: "11111111-1111-4111-8111-111111111111",
+      }),
+    ).toBe(
+      "?conversation=conv%2Fhistory#chat-message-11111111-1111-4111-8111-111111111111-request",
+    );
   });
 
   it("renders conversation turns by run creation time even when incoming data is out of order", () => {
@@ -387,6 +430,7 @@ describe("conversation ordering", () => {
         artifacts: [],
         href: "#chat-message-11111111-1111-4111-8111-111111111111-request",
         label: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并...",
+        searchText: "需要编写一个浏览器插件，不触发切屏读取 office 文档，并可以进行搜索查询",
         index: 1,
       },
       {
@@ -396,6 +440,7 @@ describe("conversation ordering", () => {
         artifacts: [],
         href: "#chat-message-33333333-3333-4333-8333-333333333333-request",
         label: "继续优化 UI 交互，重点检查文件预览和配置页面",
+        searchText: "继续优化 UI 交互，重点检查文件预览和配置页面",
         index: 2,
       },
     ]);
@@ -471,6 +516,29 @@ describe("conversation ordering", () => {
     await userEvent.type(screen.getByRole("searchbox", { name: "搜索对话检查点" }), "第二轮");
     expect(screen.queryByText("第一轮做计划")).toBeNull();
     expect(screen.getByText("第二轮检查 UI")).not.toBeNull();
+  });
+
+  it("finds a checkpoint by question text beyond the compact label", async () => {
+    const runs: RunDetail[] = [
+      {
+        ...baseRun,
+        id: "11111111-1111-4111-8111-111111111111",
+        request: "这是一个足够长的问题，用来验证紧凑标题截断以后仍然能够搜索问题末尾的唯一关键词海王星",
+        created_at: "2026-09-02T00:01:00Z",
+      },
+      {
+        ...baseRun,
+        id: "33333333-3333-4333-8333-333333333333",
+        request: "另一个问题",
+        created_at: "2026-09-02T00:02:00Z",
+      },
+    ];
+    render(<ConversationCheckpointNav checkpoints={conversationCheckpoints(conversationMessages(runs))} />);
+
+    await userEvent.type(screen.getByRole("searchbox", { name: "搜索对话检查点" }), "海王星");
+
+    expect(screen.getByText(/这是一个足够长的问题/)).not.toBeNull();
+    expect(screen.queryByText("另一个问题")).toBeNull();
   });
 
   it("restores a conversation checkpoint from the current URL hash", () => {

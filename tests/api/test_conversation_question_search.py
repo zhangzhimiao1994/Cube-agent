@@ -143,6 +143,16 @@ def test_search_endpoint_rejects_limit_outside_1_to_50(limit: int) -> None:
     assert response.status_code == 422
 
 
+def test_search_endpoint_rejects_oversized_queries() -> None:
+    response = _client(SearchService()).get(
+        "/api/v1/admin/conversation-questions/search",
+        headers=_headers(),
+        params={"q": "问" * 501},
+    )
+
+    assert response.status_code == 422
+
+
 def test_search_endpoint_requires_authentication() -> None:
     response = _client(SearchService()).get(
         "/api/v1/admin/conversation-questions/search",

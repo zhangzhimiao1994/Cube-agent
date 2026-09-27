@@ -433,7 +433,7 @@ class RunRepository:
                 run_id=row["run_id"],
                 conversation_id=row["conversation_id"],
                 project_id=row["project_id"],
-                question=row["question"],
+                question=_question_search_excerpt(row["question"], normalized_query),
                 created_at=row["created_at"],
                 conversation_title=row["conversation_title"],
             )
@@ -1974,6 +1974,17 @@ def _encode_question_search_cursor(created_at: datetime, run_id: UUID) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _question_search_excerpt(question: str, query: str, *, max_chars: int = 600) -> str:
+    if len(question) <= max_chars:
+        return question
+    match_index = max(question.lower().find(query.lower()), 0)
+    start = max(0, match_index - max_chars // 3)
+    end = min(len(question), start + max_chars)
+    start = max(0, end - max_chars)
+    excerpt = question[start:end]
+    return f"{'...' if start else ''}{excerpt}{'...' if end < len(question) else ''}"
 
 
 def _decode_question_search_cursor(cursor: str) -> tuple[datetime, UUID]:

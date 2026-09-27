@@ -1535,6 +1535,59 @@ article:hover {
   width: 100%;
 }
 
+.conversation-question-results {
+  background: rgba(8, 17, 31, 0.76);
+  border: 1px solid rgba(85, 215, 255, 0.24);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.5rem;
+}
+
+.conversation-question-results-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.conversation-question-results-header small,
+.conversation-question-result small {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.conversation-question-result {
+  background: rgba(3, 10, 20, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  color: var(--text);
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.5rem;
+  text-decoration: none;
+}
+
+.conversation-question-result:hover,
+.conversation-question-result:focus-visible {
+  border-color: rgba(85, 215, 255, 0.5);
+}
+
+.conversation-question-result span {
+  color: #baf2ff;
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.conversation-question-result strong {
+  display: -webkit-box;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
 .conversation-manager-tabs {
   background: rgba(8, 17, 31, 0.72);
   border: 1px solid rgba(148, 163, 184, 0.18);

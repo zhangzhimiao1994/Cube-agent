@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -424,6 +424,7 @@ type ConversationCheckpoint = {
   href: string;
   id: string;
   label: string;
+  searchText: string;
   index: number;
 };
 export type SlashCommand = {
@@ -2799,8 +2800,42 @@ export function conversationSelectionIds(items: RunListItem[], query: string) {
     .map((item) => item.id);
 }
 
+export function conversationManagerSearchState({
+  localConversationCount,
+  questionResultCount,
+  questionResultsCurrent,
+  questionSearchPending,
+}: {
+  localConversationCount: number;
+  questionResultCount: number;
+  questionResultsCurrent: boolean;
+  questionSearchPending: boolean;
+}) {
+  const effectiveQuestionResultCount = questionResultsCurrent ? questionResultCount : 0;
+  return {
+    effectiveQuestionResultCount,
+    hasVisibleResults:
+      questionSearchPending || localConversationCount > 0 || effectiveQuestionResultCount > 0,
+    summary:
+      effectiveQuestionResultCount > 0
+        ? `${localConversationCount} 个会话 · 已加载 ${effectiveQuestionResultCount} 个问题`
+        : `${localConversationCount} 个会话`,
+  };
+}
+
 export function conversationIdFromSearch(search: string) {
   return new URLSearchParams(search).get("conversation")?.trim() || null;
+}
+
+export function conversationQuestionSearchHref({
+  conversationId,
+  runId,
+}: {
+  conversationId: string;
+  runId: string;
+}) {
+  const params = new URLSearchParams({ conversation: conversationId });
+  return `?${params.toString()}#${chatMessageAnchorId(`${runId}-request`)}`;
 }
 
 export function shouldShowModeEntry(search: string) {
@@ -2844,6 +2879,7 @@ export function conversationCheckpoints(messages: ChatMessage[]): ConversationCh
         href: `#${chatMessageAnchorId(message.id)}`,
         id: message.id,
         label: normalizeConversationQuestion(message.body, `第 ${index + 1} 轮`),
+        searchText: message.body,
         index: index + 1,
       };
     });
@@ -2921,7 +2957,7 @@ export function ConversationCheckpointNav({
   }, [checkpointHashKey]);
   if (checkpoints.length < 2) return null;
   const visibleCheckpoints = checkpoints.filter((checkpoint) =>
-    `${checkpoint.index} ${checkpoint.label}`.toLowerCase().includes(query.trim().toLowerCase()),
+    `${checkpoint.index} ${checkpoint.searchText}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
   );
   const expandedCheckpoint = checkpoints.find((checkpoint) => checkpoint.id === expandedId) ?? null;
   return (
@@ -6149,6 +6185,35 @@ export function RunsPage() {
   const [conversationSearch, setConversationSearch] = useState("");
   const [conversationManagerView, setConversationManagerView] =
     useState<ConversationManagerView>("current");
+  const [debouncedConversationSearch, setDebouncedConversationSearch] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setDebouncedConversationSearch(conversationSearch.trim()),
+      250,
+    );
+    return () => window.clearTimeout(timer);
+  }, [conversationSearch]);
+  const questionSearchProjectId =
+    managedProjectId.trim() || projectId.trim() || conversationProjects[0]?.id || "";
+  const conversationQuestionSearch = useInfiniteQuery({
+    queryKey: [
+      "conversation-question-search",
+      debouncedConversationSearch,
+      questionSearchProjectId,
+      conversationManagerView,
+    ],
+    queryFn: ({ pageParam }) =>
+      api.searchConversationQuestions({
+        query: debouncedConversationSearch,
+        projectId: questionSearchProjectId || undefined,
+        archived: conversationManagerView === "archived",
+        cursor: pageParam,
+        limit: 20,
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    enabled: historyOpen && debouncedConversationSearch.length > 0,
+  });
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
@@ -7609,6 +7674,20 @@ export function RunsPage() {
       ? archivedConversationCount
       : currentConversationCount;
   const visibleConversationCount = visibleConversationItems.length + visibleMetadataConversationItems.length;
+  const conversationSearchQuery = conversationSearch.trim();
+  const questionResultsCurrent =
+    Boolean(conversationSearchQuery) && debouncedConversationSearch === conversationSearchQuery;
+  const conversationQuestionResults = questionResultsCurrent
+    ? (conversationQuestionSearch.data?.pages.flatMap((page) => page.items) ?? [])
+    : [];
+  const conversationSearchState = conversationManagerSearchState({
+    localConversationCount: visibleConversationCount,
+    questionResultCount: conversationQuestionResults.length,
+    questionResultsCurrent,
+    questionSearchPending:
+      Boolean(conversationSearchQuery) &&
+      (!questionResultsCurrent || conversationQuestionSearch.isFetching),
+  });
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const availableExecutionBackends = executionBackends.data?.filter((backend) => backend.available) ?? [];
   const selectedExecutionBackend = executionBackends.data?.find((item) => item.id === executionBackend);
@@ -7801,7 +7880,9 @@ export function RunsPage() {
             <div>
               <h3>项目与会话</h3>
               <span>
-                {conversationSearch.trim() ? `${visibleConversationCount}/${totalConversationCount}` : totalConversationCount} 条
+                {conversationSearchQuery
+                  ? conversationSearchState.summary
+                  : `${totalConversationCount} 个会话`}
               </span>
             </div>
             <div className="conversation-list-actions">
@@ -7855,6 +7936,58 @@ export function RunsPage() {
             value={conversationSearch}
             onChange={(event) => setConversationSearch(event.target.value)}
           />
+          {questionResultsCurrent ? (
+            <section className="conversation-question-results" aria-label="历史问题搜索结果">
+              <div className="conversation-question-results-header">
+                <strong>问题命中</strong>
+                {conversationQuestionSearch.isFetching && !conversationQuestionSearch.isFetchingNextPage ? (
+                  <small role="status">搜索中...</small>
+                ) : null}
+              </div>
+              {conversationQuestionSearch.isError ? (
+                <small role="alert">
+                  {formatApiError(conversationQuestionSearch.error, "历史问题搜索失败")}
+                </small>
+              ) : null}
+              {conversationQuestionResults.map((result) => {
+                const href = conversationQuestionSearchHref({
+                  conversationId: result.conversation_id,
+                  runId: result.run_id,
+                });
+                return (
+                  <Link
+                    key={result.run_id}
+                    className="conversation-question-result"
+                    to={href}
+                    onClick={() => {
+                      setConversationId(result.conversation_id);
+                      setSelectedRunId(result.run_id);
+                      if (result.project_id?.trim()) setProjectId(result.project_id);
+                      setHistoryOpen(false);
+                    }}
+                  >
+                    <span>{result.conversation_title?.trim() || result.conversation_id}</span>
+                    <strong>{result.question}</strong>
+                    <small>{conversationTimestamp(result.created_at)}</small>
+                  </Link>
+                );
+              })}
+              {conversationQuestionSearch.data &&
+              conversationQuestionSearch.data.pages.every((page) => page.items.length === 0) ? (
+                <small>没有匹配的历史问题。</small>
+              ) : null}
+              {conversationQuestionSearch.hasNextPage ? (
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={conversationQuestionSearch.isFetchingNextPage}
+                  onClick={() => void conversationQuestionSearch.fetchNextPage()}
+                >
+                  {conversationQuestionSearch.isFetchingNextPage ? "加载中..." : "加载更多问题"}
+                </button>
+              ) : null}
+            </section>
+          ) : null}
           {conversationManagerView === "current" && conversationListItems.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
@@ -7879,13 +8012,13 @@ export function RunsPage() {
               <small>已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
-          {totalConversationCount === 0 ? (
+          {!conversationSearchQuery && totalConversationCount === 0 ? (
             <p className="field-help">
               {conversationManagerView === "archived"
                 ? "还没有已归档会话。"
                 : "还没有会话。直接发送消息即可开始。"}
             </p>
-          ) : visibleConversationCount === 0 ? (
+          ) : conversationSearchQuery && !conversationSearchState.hasVisibleResults ? (
             <p className="field-help">
               {conversationManagerView === "archived"
                 ? "没有匹配的已归档会话。"

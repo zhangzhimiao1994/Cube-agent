@@ -552,6 +552,23 @@ const RunListItemSchema = z.object({
 
 export type RunListItem = z.infer<typeof RunListItemSchema>;
 
+const ConversationQuestionSearchItemSchema = z.object({
+  run_id: z.string(),
+  conversation_id: z.string(),
+  project_id: z.string().nullable(),
+  conversation_title: z.string().nullable(),
+  question: z.string(),
+  created_at: z.string(),
+});
+
+const ConversationQuestionSearchResultSchema = z.object({
+  items: z.array(ConversationQuestionSearchItemSchema),
+  next_cursor: z.string().nullable(),
+});
+
+export type ConversationQuestionSearchItem = z.infer<typeof ConversationQuestionSearchItemSchema>;
+export type ConversationQuestionSearchResult = z.infer<typeof ConversationQuestionSearchResultSchema>;
+
 const TemporaryAgentProposalSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -2551,6 +2568,26 @@ export const api = {
   },
   runs(): Promise<RunListItem[]> {
     return request("/api/v1/admin/runs", { method: "GET" }, z.array(RunListItemSchema));
+  },
+  searchConversationQuestions(options: {
+    query: string;
+    projectId?: string;
+    archived: boolean;
+    cursor?: string;
+    limit?: number;
+  }): Promise<ConversationQuestionSearchResult> {
+    const params = new URLSearchParams({
+      q: options.query,
+      archived: String(options.archived),
+      limit: String(options.limit ?? 20),
+    });
+    if (options.projectId?.trim()) params.set("project_id", options.projectId.trim());
+    if (options.cursor?.trim()) params.set("cursor", options.cursor.trim());
+    return request(
+      `/api/v1/admin/conversation-questions/search?${params.toString()}`,
+      { method: "GET" },
+      ConversationQuestionSearchResultSchema,
+    );
   },
   run(id: string): Promise<RunDetail> {
     return request(`/api/v1/admin/runs/${id}`, { method: "GET" }, RunDetailSchema);

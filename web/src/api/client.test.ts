@@ -315,6 +315,47 @@ describe("api client transport", () => {
     expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ cache: "no-store" }));
   });
 
+  it("searches the complete conversation question history with encoded filters", async () => {
+    const response = {
+      items: [
+        {
+          run_id: "11111111-1111-4111-8111-111111111111",
+          conversation_id: "conv-history",
+          project_id: "project-office",
+          conversation_title: "Office 文档能力",
+          question: "继续检查很早以前的 Office 文档搜索问题",
+          created_at: "2026-09-01T00:00:00Z",
+        },
+      ],
+      next_cursor: "next/page",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      api.searchConversationQuestions({
+        query: "Office 文档 %_\\",
+        projectId: "project-office",
+        archived: false,
+        cursor: "cursor/page",
+        limit: 20,
+      }),
+    ).resolves.toEqual(response);
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), "https://agent.test");
+    expect(url.pathname).toBe("/api/v1/admin/conversation-questions/search");
+    expect(url.searchParams.get("q")).toBe("Office 文档 %_\\");
+    expect(url.searchParams.get("project_id")).toBe("project-office");
+    expect(url.searchParams.get("archived")).toBe("false");
+    expect(url.searchParams.get("cursor")).toBe("cursor/page");
+    expect(url.searchParams.get("limit")).toBe("20");
+  });
+
   it("keeps legacy settings responses on manual tool approval by default", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
