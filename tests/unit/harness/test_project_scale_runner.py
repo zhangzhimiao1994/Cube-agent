@@ -106,7 +106,7 @@ def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
         invoked = True
         raise AssertionError("untrusted npm command reached the host subprocess runner")
 
-    monkeypatch.setattr(project_scale_runner_module.subprocess, "run", unexpected_run)
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
 
     reason = project_scale_runner_module._run_generated_project_command(
         ("npm", "test"),

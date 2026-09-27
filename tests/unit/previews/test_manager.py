@@ -5,6 +5,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
 import pytest
@@ -510,18 +511,22 @@ def test_capacity_is_rejected_before_snapshot_or_port_allocation(
         _start(manager)
         snapshot_calls = 0
         server_calls = 0
-        original_snapshot = preview_manager_module._snapshot_preview_root
-        original_server = preview_manager_module._LoopbackPreviewServer
-
-        def counting_snapshot(*args: object, **kwargs: object):
+        def counting_snapshot(
+            preview_root: Path,
+            *,
+            max_bytes: int,
+            max_files: int,
+        ) -> object:
+            del preview_root, max_bytes, max_files
             nonlocal snapshot_calls
             snapshot_calls += 1
-            return original_snapshot(*args, **kwargs)
+            raise AssertionError("capacity rejection copied a preview snapshot")
 
-        def counting_server(*args: object, **kwargs: object):
+        def counting_server(*args: object, **kwargs: object) -> object:
+            del args, kwargs
             nonlocal server_calls
             server_calls += 1
-            return original_server(*args, **kwargs)
+            raise AssertionError("capacity rejection allocated a preview port")
 
         monkeypatch.setattr(preview_manager_module, "_snapshot_preview_root", counting_snapshot)
         monkeypatch.setattr(preview_manager_module, "_LoopbackPreviewServer", counting_server)
@@ -554,7 +559,13 @@ def test_concurrent_start_reserves_capacity_and_releases_it_after_failure(
     release_snapshot = threading.Event()
     first_errors: list[OSError] = []
 
-    def failing_snapshot(*args: object, **kwargs: object):
+    def failing_snapshot(
+        preview_root: Path,
+        *,
+        max_bytes: int,
+        max_files: int,
+    ) -> tuple[TemporaryDirectory[str], Path]:
+        del preview_root, max_bytes, max_files
         snapshot_entered.set()
         assert release_snapshot.wait(timeout=2)
         raise OSError("snapshot failed")
@@ -638,13 +649,22 @@ def test_concurrent_start_for_same_conversation_does_not_duplicate_work(
     snapshot_calls = 0
     first_launches: list[PreviewLaunch] = []
 
-    def blocking_snapshot(*args: object, **kwargs: object):
+    def blocking_snapshot(
+        preview_root: Path,
+        *,
+        max_bytes: int,
+        max_files: int,
+    ) -> tuple[TemporaryDirectory[str], Path]:
         nonlocal snapshot_calls
         snapshot_calls += 1
         if snapshot_calls == 1:
             snapshot_entered.set()
             assert release_snapshot.wait(timeout=2)
-        return original_snapshot(*args, **kwargs)
+        return original_snapshot(
+            preview_root,
+            max_bytes=max_bytes,
+            max_files=max_files,
+        )
 
     monkeypatch.setattr(preview_manager_module, "_snapshot_preview_root", blocking_snapshot)
 
