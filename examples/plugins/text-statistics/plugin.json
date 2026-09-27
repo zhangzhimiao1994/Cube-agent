@@ -1,0 +1,88 @@
+{
+  "id": "text-statistics",
+  "name": "文本统计",
+  "description": "统计文本的字符、非空白字符、行、词语、中文字符和 UTF-8 字节数。",
+  "version": "1.0.0",
+  "package": {
+    "schema_version": 1,
+    "kind": "adapter_package",
+    "package_version": "1.0.0",
+    "adapter_id": "python_subprocess_v1",
+    "sdk_api_version": "1.0",
+    "signature": {
+      "algorithm": "ed25519",
+      "key_id": "cubeagent-first-party",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "runtime": "python",
+    "entrypoint": "adapter/main.py",
+    "isolation": "local_process",
+    "install_mode": "runtime_registered"
+  },
+  "capabilities": [
+    {
+      "id": "text.statistics",
+      "adapter": "python_subprocess_v1",
+      "permission_class": "plugin.use",
+      "sandbox_profile": "local_process",
+      "policy_effect": "allow",
+      "replay_safe": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 200000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "character_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "non_whitespace_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "line_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "word_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "chinese_character_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "utf8_byte_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "ok",
+          "character_count",
+          "non_whitespace_count",
+          "line_count",
+          "word_count",
+          "chinese_character_count",
+          "utf8_byte_count"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

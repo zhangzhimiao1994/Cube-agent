@@ -605,9 +605,11 @@ def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -
 
 def _plugin_package_python_args(target: PluginPackageExecutionTarget) -> tuple[str, ...]:
     if target.dependency_root is None:
-        return ("-I", str(target.entrypoint))
+        return ("-I", "-X", "utf8", str(target.entrypoint))
     return (
         "-I",
+        "-X",
+        "utf8",
         "-c",
         _PLUGIN_PACKAGE_DEPENDENCY_BOOTSTRAP,
         str(target.dependency_root),

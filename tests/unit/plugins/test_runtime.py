@@ -2366,8 +2366,8 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
         argv,
         ("--ro-bind", str(package_root), str(package_root)),
     )
-    assert argv[-6] == str(runtime_root / "bin" / "python")
-    assert argv[-5] == "-I"
+    assert argv[-8] == str(runtime_root / "bin" / "python")
+    assert argv[-7:-4] == ("-I", "-X", "utf8")
     assert argv[-4] == "-c"
     assert argv[-2:] == (str(dependency_root), str(entrypoint))
 
