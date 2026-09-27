@@ -7722,6 +7722,52 @@ export function RunsPage() {
       executeSlashCommand(slashCommand.id);
       return;
     }
+    const selectedProject = conversationProjects.find((item) => item.id === projectId.trim());
+    if (!selectedProject) {
+      if (projectWorkspaces.isLoading || conversations.isLoading || archivedConversations.isLoading) {
+        setSubmitNotice("正在读取项目工作区，请稍候再发送。");
+        return;
+      }
+      if (projectWorkspaces.isError) {
+        setSubmitNotice("项目工作区读取失败，请重试后再发送。");
+        void projectWorkspaces.refetch();
+        return;
+      }
+      setNewProjectDraft({ projectId: "", label: "", workspacePath: "main" });
+      createProjectWorkspace.reset();
+      setNewConversationOpen(false);
+      setNewProjectOpen(true);
+      setSubmitNotice("请先创建项目工作区，再创建第一条会话。");
+      return;
+    }
+    const selectedProjectHasConversation =
+      activeConversationKnown ||
+      (conversations.data ?? []).some((item) => item.project_id?.trim() === selectedProject.id);
+    if (!selectedProjectHasConversation) {
+      if (conversations.isLoading) {
+        setSubmitNotice("正在读取会话，请稍候再发送。");
+        return;
+      }
+      if (conversations.isError) {
+        setSubmitNotice("会话读取失败，请重试后再发送。");
+        void conversations.refetch();
+        return;
+      }
+      const nextConversationId = newConversationId();
+      setNewConversationDraft({
+        conversationId: nextConversationId,
+        title: "",
+        projectId: selectedProject.id,
+        projectLabel: selectedProject.label,
+        workspacePath: selectedProject.workspacePath,
+        referenceConversationId: null,
+      });
+      createConversation.reset();
+      setNewProjectOpen(false);
+      setNewConversationOpen(true);
+      setSubmitNotice("请先创建会话，再发送消息。");
+      return;
+    }
     if (temporaryApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "同意临时加入", aliases: ["同意", "接受", "加入", "approve", "yes"] },

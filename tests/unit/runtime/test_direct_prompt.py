@@ -40,6 +40,35 @@ def test_project_scale_fixture_files_include_agent_standard_reading_evidence() -
     assert _workspace_bundle_agent_standard_reasons(buffer.getvalue()) == ()
 
 
+@pytest.mark.parametrize(
+    ("scale", "api_resource", "domain_text"),
+    (
+        ("small", "/tasks", "Open tasks"),
+        ("medium", "/tenants/:tenant/accounts", "Open deals"),
+        ("large", "/orders", "Orders at risk"),
+        ("ultra", "/portfolio/read-model", "Active programs"),
+    ),
+)
+def test_project_scale_fixture_files_include_interactive_web_preview(
+    scale: str,
+    api_resource: str,
+    domain_text: str,
+) -> None:
+    files = project_scale_artifact_zip_files(
+        f"Build a real {scale} business project for flow=artifact_production. "
+        "Also include a complete interactive website with a preview.html entrypoint."
+    )
+
+    preview = files["preview.html"]
+
+    assert "<!doctype html>" in preview.casefold()
+    assert "data-preview-action" in preview
+    assert "addEventListener" in preview
+    assert "@media" in preview
+    assert api_resource in preview
+    assert domain_text in preview
+
+
 def test_project_scale_small_fixture_files_include_start_script() -> None:
     files = project_scale_artifact_zip_files(
         "Project-scale acceptance fixture: build a small project for scale=small "

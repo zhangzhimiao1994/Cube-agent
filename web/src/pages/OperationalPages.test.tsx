@@ -7338,23 +7338,51 @@ describe("operational management pages", () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "打开本次运行配置" })));
   });
 
-  it("persists a default conversation before the first message in an empty tenant", async () => {
+  it("reopens project setup instead of submitting when no project workspace exists", async () => {
+    visibleProjectWorkspaces = [];
     hideVisibleConversationMetadata = true;
     visibleRunListItems = [];
+    visibleConversationRuns = [];
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const initialDialog = await screen.findByRole("dialog", { name: "新建项目工作区" });
+    await user.click(within(initialDialog).getByRole("button", { name: "关闭新建项目工作区" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "第一次消息");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await waitFor(() => expect(requests.some((item) => item.path === "/api/v1/runs")).toBe(true));
-    const conversationRequestIndex = requests.findIndex(
-      (item) => item.path === "/api/v1/admin/conversations" && item.method === "POST",
-    );
-    const runRequestIndex = requests.findIndex((item) => item.path === "/api/v1/runs");
-    expect(conversationRequestIndex).toBeGreaterThanOrEqual(0);
-    expect(runRequestIndex).toBeGreaterThan(conversationRequestIndex);
+    expect(await screen.findByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
+    expect(screen.getByText("请先创建项目工作区，再创建第一条会话。")).not.toBeNull();
+    expect(requests.some((item) => item.path === "/api/v1/admin/conversations" && item.method === "POST")).toBe(false);
+    expect(requests.some((item) => item.path === "/api/v1/runs")).toBe(false);
+  });
+
+  it("reopens conversation setup instead of submitting when a project has no conversation", async () => {
+    visibleProjectWorkspaces = [
+      {
+        project_id: "browser-tools",
+        label: "浏览器工具",
+        workspace_path: "shared-main",
+        created_at: "2026-09-27T00:00:00Z",
+        updated_at: "2026-09-27T00:00:00Z",
+      },
+    ];
+    hideVisibleConversationMetadata = true;
+    visibleRunListItems = [];
+    visibleConversationRuns = [];
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    const initialDialog = await screen.findByRole("dialog", { name: "新建会话" });
+    await user.click(within(initialDialog).getByRole("button", { name: "关闭新建会话" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "第一次消息");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const reopenedDialog = await screen.findByRole("dialog", { name: "新建会话" });
+    expect((within(reopenedDialog).getByLabelText("所属项目") as HTMLSelectElement).value).toBe("browser-tools");
+    expect(screen.getByText("请先创建会话，再发送消息。")).not.toBeNull();
+    expect(requests.some((item) => item.path === "/api/v1/admin/conversations" && item.method === "POST")).toBe(false);
+    expect(requests.some((item) => item.path === "/api/v1/runs")).toBe(false);
   });
 
   it("rejects absolute or traversing workspace paths in the new-project form", async () => {

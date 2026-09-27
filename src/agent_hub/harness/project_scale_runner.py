@@ -766,6 +766,10 @@ def execute_project_scale_plan(
                 if plan.benchmark_kind == "capability"
                 else _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
             )
+            if not _generated_project_validation_is_repairable(
+                generated_project_validation
+            ):
+                max_deliverable_repair_attempts = 0
             while (
                 deliverable_repair_attempts < max_deliverable_repair_attempts
                 and _should_attempt_deliverable_repair(
@@ -952,6 +956,10 @@ def execute_project_scale_plan(
                             repair_workspace_bundle, generated_project_validation
                         )
                         evidence["deliverable_quality"] = deliverable_quality.passed
+                    if not _generated_project_validation_is_repairable(
+                        generated_project_validation
+                    ):
+                        break
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
             if (
@@ -1618,6 +1626,17 @@ def _generated_project_validation_is_isolated() -> bool:
     except OSError:
         return False
     return "agent-hub-acceptance-" in cgroup
+
+
+def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
+    if result.passed:
+        return True
+    return not any(
+        reason.startswith(
+            "generated_project_validation: isolated systemd validator is required"
+        )
+        for reason in result.reasons
+    )
 
 
 def _generated_project_output_tail(value: str) -> str:

@@ -122,6 +122,20 @@ def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     )
 
 
+def test_validator_infrastructure_failure_is_not_treated_as_project_repair() -> None:
+    result = project_scale_runner_module._EvidenceCheck(
+        passed=False,
+        reasons=(
+            (
+                "generated_project_validation: isolated systemd validator is required "
+                "for generated npm/node commands"
+            ),
+        ),
+    )
+
+    assert not project_scale_runner_module._generated_project_validation_is_repairable(result)
+
+
 def test_remaining_wait_seconds_uses_case_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 120.0)
 
@@ -3509,6 +3523,64 @@ def test_capability_repair_retries_when_repair_run_fails_without_artifacts(
     assert len(client.submitted_bodies) == 3
     assert "generated_project_validation: missing workspace bundle" in str(
         client.submitted_bodies[2]["message"]
+    )
+
+
+def test_capability_repair_stops_when_validator_isolation_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: command failed exit=2",),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: isolated systemd validator is required "
+                    "for generated npm/node commands"
+                ),
+            ),
+        ),
+    ]
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: validation_results.pop(0),
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-direct-isolation",
+        session_id="project-scale-small-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            dict(
+                project_scale_artifact_zip_files(
+                    "Build a real small business project for flow=direct."
+                )
+            )
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        validate_generated_project=True,
+    )
+
+    assert report.ok is False
+    assert len(client.submitted_bodies) == 2
+    assert any(
+        "isolated systemd validator is required" in error
+        for error in report.results[0].errors
     )
 
 

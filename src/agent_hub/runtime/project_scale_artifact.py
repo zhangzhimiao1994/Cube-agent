@@ -241,6 +241,19 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
     if _project_scale_request_scale(request) == "large":
         return _large_order_ops_project_files(task)
     return {
+        "preview.html": _project_scale_preview_html(
+            title="Team Task Desk",
+            subtitle="Plan, assign, and finish the team's daily work.",
+            api_resource="/tasks",
+            navigation=("Overview", "My tasks", "Team"),
+            metrics=("Open tasks", "Completed", "Team health"),
+            work_items=(
+                "Review the priority queue",
+                "Validate the latest changes",
+                "Publish the daily summary",
+            ),
+            item_label="task",
+        ),
         "README.md": (
             "# Project Scale Artifact Production\n\n"
             "This workspace contains a small runnable TypeScript project produced for "
@@ -427,6 +440,158 @@ def project_scale_artifact_zip_files(request: object) -> Mapping[str, str]:
     }
 
 
+def _project_scale_preview_html(
+    *,
+    title: str,
+    subtitle: str,
+    api_resource: str,
+    navigation: tuple[str, str, str],
+    metrics: tuple[str, str, str],
+    work_items: tuple[str, str, str],
+    item_label: str,
+) -> str:
+    template = (
+        """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__TITLE__</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #18212b; background: #f3f6f8; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0, 1fr); }
+    aside { padding: 24px 18px; color: #f7fbfc; background: #15343c; }
+    .brand { margin: 0 0 28px; font-size: 18px; font-weight: 800; }
+    .nav { display: grid; gap: 8px; }
+    .nav button { padding: 11px 12px; border: 0; border-radius: 6px; color: #c9dadd; background: transparent; text-align: left; }
+    .nav button[aria-pressed="true"] { color: #10242a; background: #c9f0e8; font-weight: 700; }
+    main { min-width: 0; padding: 28px clamp(18px, 4vw, 48px); }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: clamp(26px, 4vw, 42px); letter-spacing: 0; }
+    header p { margin: 8px 0 0; color: #52616d; }
+    .status { padding: 8px 11px; border: 1px solid #8fb6ad; border-radius: 999px; color: #21594d; background: #edf8f5; white-space: nowrap; }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .metric, .panel { border: 1px solid #d4dde2; border-radius: 8px; background: #fff; box-shadow: 0 8px 24px rgb(24 33 43 / 7%); }
+    .metric { padding: 16px; }
+    .metric span { display: block; color: #697983; font-size: 13px; }
+    .metric strong { display: block; margin-top: 8px; font-size: 25px; }
+    .panel { overflow: hidden; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid #e2e8eb; }
+    .panel-head h2 { margin: 0; font-size: 18px; }
+    form { display: flex; gap: 8px; }
+    input { min-width: 0; padding: 9px 10px; border: 1px solid #b8c5cb; border-radius: 6px; }
+    .primary { padding: 9px 13px; border: 0; border-radius: 6px; color: white; background: #006d77; font-weight: 700; }
+    ul { margin: 0; padding: 0; list-style: none; }
+    li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 15px 16px; border-bottom: 1px solid #edf1f3; }
+    li:last-child { border-bottom: 0; }
+    li span { overflow-wrap: anywhere; }
+    li button { border: 0; color: #a3382b; background: transparent; font-weight: 700; }
+    .empty { color: #697983; }
+    #toast { position: fixed; right: 20px; bottom: 20px; padding: 11px 14px; border-radius: 6px; color: white; background: #29343a; opacity: 0; transform: translateY(8px); transition: 160ms ease; }
+    #toast.visible { opacity: 1; transform: translateY(0); }
+    @media (max-width: 720px) {
+      .shell { grid-template-columns: 1fr; }
+      aside { padding: 14px 16px; }
+      .brand { margin-bottom: 12px; }
+      .nav { grid-template-columns: repeat(3, 1fr); }
+      .nav button { text-align: center; }
+      main { padding: 20px 14px; }
+      header { align-items: flex-start; }
+      .metrics { grid-template-columns: 1fr; }
+      .panel-head { align-items: stretch; flex-direction: column; }
+      form { width: 100%; }
+      input { flex: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <p class="brand">__TITLE__</p>
+      <nav class="nav" aria-label="Workspace views">
+        <button type="button" aria-pressed="true" data-view="__NAV_1__">__NAV_1__</button>
+        <button type="button" aria-pressed="false" data-view="__NAV_2__">__NAV_2__</button>
+        <button type="button" aria-pressed="false" data-view="__NAV_3__">__NAV_3__</button>
+      </nav>
+    </aside>
+    <main>
+      <header>
+        <div><h1 id="view-title">__NAV_1__</h1><p>__SUBTITLE__</p><p><code>API __API_RESOURCE__</code></p></div>
+        <span class="status">Live preview</span>
+      </header>
+      <section class="metrics" aria-label="Summary">
+        <div class="metric"><span>__METRIC_1__</span><strong id="open-count">3</strong></div>
+        <div class="metric"><span>__METRIC_2__</span><strong>18</strong></div>
+        <div class="metric"><span>__METRIC_3__</span><strong>96%</strong></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Current __ITEM_LABEL__s</h2>
+          <form id="add-form"><input id="new-item" aria-label="New __ITEM_LABEL__" placeholder="Add a __ITEM_LABEL__" required><button class="primary" data-preview-action="add" type="submit">Add</button></form>
+        </div>
+        <ul id="work-list">
+          <li><span>__WORK_1__</span><button type="button" data-preview-action="complete">Complete</button></li>
+          <li><span>__WORK_2__</span><button type="button" data-preview-action="complete">Complete</button></li>
+          <li><span>__WORK_3__</span><button type="button" data-preview-action="complete">Complete</button></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script>
+    const list = document.querySelector('#work-list');
+    const count = document.querySelector('#open-count');
+    const toast = document.querySelector('#toast');
+    const notify = (message) => { toast.textContent = message; toast.classList.add('visible'); setTimeout(() => toast.classList.remove('visible'), 1200); };
+    document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => {
+      document.querySelectorAll('[data-view]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+      document.querySelector('#view-title').textContent = button.dataset.view;
+      notify(`${button.dataset.view} selected`);
+    }));
+    document.querySelector('#add-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      const input = document.querySelector('#new-item');
+      const item = document.createElement('li');
+      item.innerHTML = `<span></span><button type="button" data-preview-action="complete">Complete</button>`;
+      item.querySelector('span').textContent = input.value.trim();
+      item.querySelector('button').addEventListener('click', completeItem);
+      list.append(item);
+      input.value = '';
+      updateCount();
+      notify('Work item added');
+    });
+    function completeItem(event) { event.currentTarget.closest('li').remove(); updateCount(); notify('Work item completed'); }
+    function updateCount() { count.textContent = String(list.children.length); }
+    document.querySelectorAll('[data-preview-action="complete"]').forEach((button) => button.addEventListener('click', completeItem));
+  </script>
+</body>
+</html>
+"""
+    )
+    replacements = {
+        "__TITLE__": title,
+        "__SUBTITLE__": subtitle,
+        "__API_RESOURCE__": api_resource,
+        "__ITEM_LABEL__": item_label,
+        "__NAV_1__": navigation[0],
+        "__NAV_2__": navigation[1],
+        "__NAV_3__": navigation[2],
+        "__METRIC_1__": metrics[0],
+        "__METRIC_2__": metrics[1],
+        "__METRIC_3__": metrics[2],
+        "__WORK_1__": work_items[0],
+        "__WORK_2__": work_items[1],
+        "__WORK_3__": work_items[2],
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template
+
+
 def _project_scale_request_scale(request: object) -> str | None:
     text = str(request).casefold()
     if "ultra-large" in text or "ultra large" in text:
@@ -439,6 +604,19 @@ def _project_scale_request_scale(request: object) -> str | None:
 
 def _medium_crm_project_files(task: str) -> Mapping[str, str]:
     return {
+        "preview.html": _project_scale_preview_html(
+            title="Tenant CRM",
+            subtitle="A clear view of accounts, opportunities, and follow-ups.",
+            api_resource="/tenants/:tenant/accounts",
+            navigation=("Pipeline", "Accounts", "Reminders"),
+            metrics=("Open deals", "Active accounts", "Follow-ups"),
+            work_items=(
+                "Qualify the Acme expansion opportunity",
+                "Confirm the Northwind decision makers",
+                "Schedule the renewal reminder",
+            ),
+            item_label="follow-up",
+        ),
         "README.md": (
             "# Tenant CRM Lite\n\n"
             "Runnable Node HTTP service for tenant-isolated accounts, contacts, "
@@ -534,6 +712,19 @@ def _medium_crm_project_files(task: str) -> Mapping[str, str]:
 
 def _large_order_ops_project_files(task: str) -> Mapping[str, str]:
     return {
+        "preview.html": _project_scale_preview_html(
+            title="Order Operations",
+            subtitle="Coordinate inventory, orders, payments, and fulfillment.",
+            api_resource="/orders",
+            navigation=("Control tower", "Orders", "Fulfillment"),
+            metrics=("Orders at risk", "Reservations", "Shipments"),
+            work_items=(
+                "Resolve the SKU-104 stock conflict",
+                "Review payment for order ORD-2048",
+                "Release the afternoon fulfillment wave",
+            ),
+            item_label="operation",
+        ),
         "README.md": (
             "# Order Operations Platform\n\n"
             "Runnable Node HTTP service for catalog, inventory reservations, order workflow, "
@@ -632,6 +823,19 @@ def _large_order_ops_project_files(task: str) -> Mapping[str, str]:
 
 def _ultra_portfolio_os_project_files(task: str) -> Mapping[str, str]:
     return {
+        "preview.html": _project_scale_preview_html(
+            title="Portfolio Command",
+            subtitle="Govern programs, dependencies, approvals, and delivery health.",
+            api_resource="/portfolio/read-model",
+            navigation=("Portfolio", "Dependencies", "Approvals"),
+            metrics=("Active programs", "At-risk projects", "Approvals due"),
+            work_items=(
+                "Review the migration dependency chain",
+                "Approve the customer platform budget",
+                "Mitigate the staffing capacity risk",
+            ),
+            item_label="portfolio action",
+        ),
         "README.md": (
             "# Enterprise Portfolio OS\n\n"
             "Runnable Node HTTP service for program and project portfolio operations, "
