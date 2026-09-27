@@ -491,7 +491,8 @@ class PythonSubprocessPluginPackageRunner:
         max_stdout_bytes: int = 262_144,
         environment: Mapping[str, str] | None = None,
     ) -> None:
-        self._python_executable = sys.executable if python_executable is None else python_executable
+        selected_python = sys.executable if python_executable is None else python_executable
+        self._python_executable = os.path.realpath(selected_python)
         self._process_launcher = process_launcher
         self._timeout_seconds = max(0.001, timeout_seconds)
         self._max_stdin_bytes = max(1, max_stdin_bytes)

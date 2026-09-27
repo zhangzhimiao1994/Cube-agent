@@ -2111,6 +2111,15 @@ async def test_python_subprocess_plugin_package_runner_times_out(
         )
 
 
+def test_python_subprocess_plugin_package_runner_resolves_python_path() -> None:
+    executable = Path(sys.executable)
+    python_alias = executable.parent / ".." / executable.parent.name / executable.name
+
+    runner = PythonSubprocessPluginPackageRunner(python_executable=str(python_alias))
+
+    assert cast(Any, runner)._python_executable == str(Path(sys.executable).resolve())
+
+
 async def test_python_subprocess_plugin_package_runner_kills_child_when_stdout_exceeds_limit(
     tmp_path: Path,
 ) -> None:
