@@ -55,6 +55,15 @@ _PLUGIN_PACKAGE_DEPENDENCY_BOOTSTRAP = (
     "sys.path.insert(0, sys.argv[1]); "
     "runpy.run_path(sys.argv[2], run_name='__main__')"
 )
+_PLUGIN_PACKAGE_PREFLIGHT_PROBE = (
+    "import pathlib, sys; "
+    "root = pathlib.Path(sys.argv[1]).resolve(); "
+    "entrypoint = pathlib.Path(sys.argv[2]).resolve(); "
+    "entrypoint.relative_to(root); "
+    "compile(entrypoint.read_bytes(), str(entrypoint), 'exec'); "
+    "dependency_root = sys.argv[3]; "
+    "assert not dependency_root or pathlib.Path(dependency_root).resolve().is_dir()"
+)
 
 
 class PluginConfigService(Protocol):
@@ -125,6 +134,8 @@ class LocalCommandRunner(Protocol):
 
 
 class PluginPackageRunner(Protocol):
+    async def preflight(self, *, target: PluginPackageExecutionTarget) -> None: ...
+
     async def invoke(
         self,
         *,
@@ -138,6 +149,13 @@ class PluginPackageRunner(Protocol):
 
 class PluginPackageProcessLauncher(Protocol):
     def argv(
+        self,
+        *,
+        python_executable: str,
+        target: PluginPackageExecutionTarget,
+    ) -> tuple[str, ...]: ...
+
+    def probe_argv(
         self,
         *,
         python_executable: str,
@@ -352,6 +370,23 @@ class PluginPackageAdapter:
         self._runner = runner
         self._dependency_policy = dependency_policy
 
+    async def preflight(self, *, plugin: PluginResourceResponse) -> None:
+        package = plugin.package_metadata
+        if package is None or package.adapter_id != self._adapter_id:
+            raise RuntimeCapabilityError("Plugin package adapter mismatch")
+        target = _plugin_package_execution_target(
+            plugin,
+            tenant_id=_plugin_package_artifact_tenant_id(plugin),
+            package_store_dir=self._package_store_dir,
+            dependency_policy=self._dependency_policy,
+        )
+        try:
+            await self._runner.preflight(target=target)
+        except RuntimeCapabilityError:
+            raise
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin package preflight failed") from error
+
     async def invoke(
         self,
         *,
@@ -409,6 +444,31 @@ class BubblewrapPluginPackageProcessLauncher:
         python_executable: str,
         target: PluginPackageExecutionTarget,
     ) -> tuple[str, ...]:
+        return self._sandbox_argv(
+            python_executable=python_executable,
+            target=target,
+            python_args=_plugin_package_python_args(target),
+        )
+
+    def probe_argv(
+        self,
+        *,
+        python_executable: str,
+        target: PluginPackageExecutionTarget,
+    ) -> tuple[str, ...]:
+        return self._sandbox_argv(
+            python_executable=python_executable,
+            target=target,
+            python_args=_plugin_package_preflight_python_args(target),
+        )
+
+    def _sandbox_argv(
+        self,
+        *,
+        python_executable: str,
+        target: PluginPackageExecutionTarget,
+        python_args: tuple[str, ...],
+    ) -> tuple[str, ...]:
         root = target.root
         dependency_bind_args: tuple[str, ...] = ()
         if target.dependency_root is not None:
@@ -450,7 +510,7 @@ class BubblewrapPluginPackageProcessLauncher:
             str(root),
             "--",
             python_executable,
-            *_plugin_package_python_args(target),
+            *python_args,
         )
 
 
@@ -498,6 +558,38 @@ class PythonSubprocessPluginPackageRunner:
         self._max_stdin_bytes = max(1, max_stdin_bytes)
         self._max_stdout_bytes = max(1, max_stdout_bytes)
         self._environment = _minimal_python_subprocess_environment(environment)
+
+    async def preflight(self, *, target: PluginPackageExecutionTarget) -> None:
+        _ensure_plugin_package_runner_target(target)
+        argv = (
+            self._process_launcher.probe_argv(
+                python_executable=self._python_executable,
+                target=target,
+            )
+            if self._process_launcher is not None
+            else (self._python_executable, *_plugin_package_preflight_python_args(target))
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=target.root,
+                env=self._environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin package preflight failed") from error
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._timeout_seconds)
+        except TimeoutError as error:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await process.wait()
+            raise RuntimeCapabilityError("Plugin package preflight timed out") from error
+        if process.returncode != 0:
+            raise RuntimeCapabilityError("Plugin package preflight failed")
 
     async def invoke(
         self,
@@ -625,6 +717,21 @@ def _plugin_package_python_args(target: PluginPackageExecutionTarget) -> tuple[s
         _PLUGIN_PACKAGE_DEPENDENCY_BOOTSTRAP,
         str(target.dependency_root),
         str(target.entrypoint),
+    )
+
+
+def _plugin_package_preflight_python_args(
+    target: PluginPackageExecutionTarget,
+) -> tuple[str, ...]:
+    return (
+        "-I",
+        "-X",
+        "utf8",
+        "-c",
+        _PLUGIN_PACKAGE_PREFLIGHT_PROBE,
+        str(target.root),
+        str(target.entrypoint),
+        "" if target.dependency_root is None else str(target.dependency_root),
     )
 
 
@@ -1238,6 +1345,20 @@ def _plugin_package_execution_target(
         entrypoint=entrypoint,
         dependency_root=dependency_root,
     )
+
+
+def _plugin_package_artifact_tenant_id(plugin: PluginResourceResponse) -> UUID:
+    package = plugin.package_metadata
+    artifact = None if package is None else package.artifact
+    if artifact is None:
+        raise RuntimeCapabilityError("Plugin package artifact is unavailable")
+    storage_parts = artifact.storage_key.split("/")
+    if len(storage_parts) != 3:
+        raise RuntimeCapabilityError("Plugin package artifact storage key is invalid")
+    try:
+        return UUID(storage_parts[0])
+    except ValueError:
+        raise RuntimeCapabilityError("Plugin package artifact storage key is invalid") from None
 
 
 def _plugin_package_dependency_root(

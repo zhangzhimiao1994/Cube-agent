@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -240,6 +240,12 @@ class RecordingPluginPackageRunner:
     ]
     result: object | None = None
     failure: Exception | None = None
+    preflight_calls: list[PluginPackageExecutionTarget] = field(default_factory=list)
+
+    async def preflight(self, *, target: PluginPackageExecutionTarget) -> None:
+        if self.failure is not None:
+            raise self.failure
+        self.preflight_calls.append(target)
 
     async def invoke(
         self,
@@ -1256,6 +1262,42 @@ async def test_plugin_package_adapter_invokes_runner_with_execution_target(
     )
 
 
+async def test_plugin_package_adapter_preflight_probes_resolved_execution_target(
+    tmp_path: Path,
+) -> None:
+    content_sha256 = "a" * 64
+    package_store_dir = tmp_path / "packages"
+    artifact_root = package_store_dir / str(TENANT_ID) / "calendar" / content_sha256
+    entrypoint = artifact_root / "adapter" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("raise RuntimeError('must not execute during preflight')\n")
+    package_metadata = verified_package_with_artifact(
+        content_sha256=content_sha256,
+        storage_key=f"{TENANT_ID}/calendar/{content_sha256}",
+    )
+    runner = RecordingPluginPackageRunner(calls=[])
+    adapter = PluginPackageAdapter(
+        adapter_id="calendar_python",
+        package_store_dir=package_store_dir,
+        runner=runner,
+    )
+
+    await adapter.preflight(
+        plugin=plugin(
+            "calendar",
+            adapter="calendar_python",
+            sandbox_profile="local_process",
+            package_metadata=package_metadata,
+            content_sha256=content_sha256,
+        )
+    )
+
+    assert runner.preflight_calls == [
+        PluginPackageExecutionTarget(root=artifact_root, entrypoint=entrypoint)
+    ]
+    assert runner.calls == []
+
+
 async def test_plugin_package_adapter_passes_ready_dependency_cache_to_runner(
     tmp_path: Path,
 ) -> None:
@@ -1880,6 +1922,27 @@ async def test_python_subprocess_plugin_package_runner_sends_stable_json_request
     }
 
 
+async def test_python_subprocess_plugin_package_runner_preflight_compiles_without_executing(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "entrypoint-executed.txt"
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "from pathlib import Path\n"
+        f"Path({marker.name!r}).write_text('executed')\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    await runner.preflight(
+        target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint)
+    )
+
+    assert not marker.exists()
+
+
 async def test_python_subprocess_plugin_package_runner_imports_dependency_cache(
     tmp_path: Path,
 ) -> None:
@@ -2380,6 +2443,40 @@ def test_bubblewrap_plugin_package_launcher_binds_runtime_without_network(
     assert argv[-7:-4] == ("-I", "-X", "utf8")
     assert argv[-4] == "-c"
     assert argv[-2:] == (str(dependency_root), str(entrypoint))
+
+
+def test_bubblewrap_plugin_package_launcher_preflight_reuses_package_mounts_and_python(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    dependency_root = tmp_path / "dependency-cache"
+    runtime_root = tmp_path / "python-runtime"
+    entrypoint = package_root / "adapter" / "main.py"
+    python_executable = str(runtime_root / "bin" / "python")
+    launcher = BubblewrapPluginPackageProcessLauncher(
+        bubblewrap_executable=tmp_path / "bwrap",
+        readonly_bind_paths=(runtime_root,),
+    )
+
+    argv = launcher.probe_argv(
+        python_executable=python_executable,
+        target=PluginPackageExecutionTarget(
+            root=package_root,
+            entrypoint=entrypoint,
+            dependency_root=dependency_root,
+        ),
+    )
+
+    assert argv[0] == str(tmp_path / "bwrap")
+    assert "--unshare-net" in argv
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", package_root, package_root)
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", dependency_root, dependency_root)
+    assert _argv_contains_ordered_pair(argv, "--ro-bind", runtime_root, runtime_root)
+    assert python_executable in argv
+    assert "/bin/true" not in argv
+    assert str(package_root) in argv
+    assert str(entrypoint) in argv
+    assert str(dependency_root) in argv
 
 
 def test_readonly_bind_mount_preserves_symlink_destination(tmp_path: Path) -> None:
