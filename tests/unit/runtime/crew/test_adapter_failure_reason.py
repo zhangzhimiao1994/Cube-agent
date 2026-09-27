@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from decimal import Decimal
@@ -5117,6 +5118,54 @@ def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact(
     assert len(text.encode("utf-8")) <= 256
     assert "[truncated:" in text
     assert artifact.content["text"] == original_text
+
+
+def test_workspace_write_model_evidence_replaces_content_with_metadata_summary() -> None:
+    content = "大型项目源码" * 20_000
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text=None,
+            tool_calls=(
+                ToolCall(
+                    id="write-large-file",
+                    name="workspace.write_text",
+                    arguments={"path": "src/large.ts", "content": content},
+                ),
+            ),
+            usage=TokenUsage(100, 100, 200),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/chat",
+        cost_usd=Decimal(0),
+    )
+    artifact = CrewDispatchRuntime._model_artifact(
+        actor="implementer",
+        completion=completion,
+        sources=(),
+    )
+
+    payload = _artifact_prompt_payload(artifact)
+
+    payload_content = payload["content"]
+    assert isinstance(payload_content, Mapping)
+    tool_calls = payload_content["tool_calls"]
+    assert isinstance(tool_calls, list)
+    tool_arguments = tool_calls[0]["arguments"]
+    assert tool_arguments == {
+        "path": "src/large.ts",
+        "content_bytes": len(content.encode("utf-8")),
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+    assert content not in json.dumps(payload, ensure_ascii=False)
+    artifact_tool_calls = artifact.content["tool_calls"]
+    assert isinstance(artifact_tool_calls, tuple)
+    artifact_tool_call = artifact_tool_calls[0]
+    assert isinstance(artifact_tool_call, Mapping)
+    artifact_arguments = artifact_tool_call["arguments"]
+    assert isinstance(artifact_arguments, Mapping)
+    assert artifact_arguments["content"] == content
 
 
 def test_final_synthesis_payload_uses_smaller_summary_without_mutating_artifact() -> None:

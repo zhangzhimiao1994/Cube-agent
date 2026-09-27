@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -27,10 +28,11 @@ from agent_hub.files.generated import (
     DOCX_MIME_TYPE,
     PPTX_MIME_TYPE,
     ZIP_MIME_TYPE,
+    GeneratedFileMetadata,
     GeneratedFileStore,
     safe_generated_filename,
 )
-from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.files.workspace import ProjectWorkspaceFile, ProjectWorkspaceStore
 from agent_hub.project_preflight import build_project_preflight_files
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
@@ -567,16 +569,17 @@ class RuntimeCapabilityGateway:
         title = _optional_string(arguments, "title") or "Project Workspace"
         filename = _filename(arguments, title=title, extension=".zip")
         try:
-            bundle = store.create_session_zip(tenant_id, project_id, session_id)
-            files = store.list_files(tenant_id, project_id, session_id)
             artifact_id = uuid4()
-            metadata = generated_store.store_bytes(
+            metadata, files = await asyncio.to_thread(
+                self._bundle_workspace,
+                store=store,
+                generated_store=generated_store,
                 tenant_id=tenant_id,
                 run_id=run_id,
+                project_id=project_id,
+                session_id=session_id,
                 artifact_id=artifact_id,
                 filename=filename,
-                mime_type=ZIP_MIME_TYPE,
-                data=bundle.path.read_bytes(),
             )
         except (OSError, ValueError) as error:
             raise RuntimeCapabilityError(str(error)) from None
@@ -596,6 +599,37 @@ class RuntimeCapabilityGateway:
         )
         result["bundle_download_url"] = store.bundle_download_url(project_id, session_id)
         return result
+
+    @staticmethod
+    def _bundle_workspace(
+        *,
+        store: ProjectWorkspaceStore,
+        generated_store: GeneratedFileStore,
+        tenant_id: UUID,
+        run_id: UUID,
+        project_id: str,
+        session_id: str,
+        artifact_id: UUID,
+        filename: str,
+    ) -> tuple[GeneratedFileMetadata, tuple[ProjectWorkspaceFile, ...]]:
+        bundle = store.create_session_zip(tenant_id, project_id, session_id)
+        try:
+            metadata = generated_store.store_path(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=ZIP_MIME_TYPE,
+                source=bundle.path,
+                move=True,
+            )
+        finally:
+            bundle.path.unlink(missing_ok=True)
+            try:
+                bundle.path.parent.rmdir()
+            except OSError:
+                pass
+        return metadata, bundle.files
 
     async def _project_workspace_scope(
         self,
@@ -1101,6 +1135,8 @@ def _builtin_permission_class(name: str) -> str:
         return "file.read"
     if name == _WORKSPACE_LIST_TOOL:
         return "file.read"
+    if name == _WORKSPACE_WRITE_TOOL:
+        return "file.write"
     return "file.create"
 
 

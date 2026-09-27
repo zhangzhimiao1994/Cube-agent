@@ -862,14 +862,53 @@ def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
     return value
 
 
+def _workspace_write_evidence_arguments(arguments: JsonValue) -> JsonValue:
+    if not isinstance(arguments, Mapping):
+        return arguments
+    path = arguments.get("path")
+    content = arguments.get("content")
+    if type(path) is not str or type(content) is not str:
+        return arguments
+    encoded = content.encode("utf-8")
+    return {
+        "path": path,
+        "content_bytes": len(encoded),
+        "content_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _model_evidence_content(content: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    raw_calls = content.get("tool_calls")
+    if not isinstance(raw_calls, tuple | list):
+        return content
+    calls: list[JsonValue] = []
+    changed = False
+    for raw_call in raw_calls:
+        if not isinstance(raw_call, Mapping) or raw_call.get("name") != "workspace.write_text":
+            calls.append(raw_call)
+            continue
+        call = dict(raw_call)
+        call["arguments"] = _workspace_write_evidence_arguments(call.get("arguments"))
+        calls.append(cast(JsonValue, call))
+        changed = True
+    if not changed:
+        return content
+    return {**content, "tool_calls": tuple(calls)}
+
+
 def _artifact_prompt_payload(
     artifact: Artifact,
     *,
     max_text_bytes: int = _MAX_SOURCE_ARTIFACT_TEXT_BYTES,
 ) -> dict[str, object]:
     payload = artifact.to_payload()
+    content = (
+        _model_evidence_content(artifact.content)
+        if artifact.type == "model_response"
+        else artifact.content
+    )
     payload["content"] = _bounded_prompt_json(
-        artifact.content, max_text_bytes=max_text_bytes
+        content, max_text_bytes=max_text_bytes
     )
     return payload
 
@@ -1336,6 +1375,28 @@ def _is_project_scale_acceptance_handoff(task: object) -> bool:
     )
 
 
+def _website_preview_entry_present(files: object) -> bool:
+    if isinstance(files, Mapping):
+        return any(path in files for path in ("preview.html", "index.html"))
+    if not isinstance(files, tuple | list):
+        return False
+    for item in files:
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get("path")
+        if path in {"preview.html", "index.html"}:
+            return True
+    return False
+
+
+def _require_website_preview_entry(context: TaskContext, files: object) -> None:
+    if (
+        context.routing_decision.get("website_preview_required") is True
+        and not _website_preview_entry_present(files)
+    ):
+        _fail("website preview entry is missing")
+
+
 def _project_scale_artifact_zip_completion(
     context: TaskContext,
     step: DispatchStep,
@@ -1357,6 +1418,7 @@ def _project_scale_artifact_zip_completion(
     ):
         return completion
     files = generated_files or project_scale_artifact_zip_files(step.task)
+    _require_website_preview_entry(context, files)
     return GatewayCompletion(
         response=ModelResponse(
             text=None,
@@ -4768,6 +4830,11 @@ class CrewDispatchRuntime:
                     if fallback_completion is not None:
                         return fallback_completion
                     _fail("step requested a forbidden capability")
+                if tool_call.name == PROJECT_SCALE_ARTIFACT_TOOL_NAME:
+                    _require_website_preview_entry(
+                        context,
+                        tool_call.arguments.get("files"),
+                    )
                 try:
                     canonical_arguments = json.dumps(
                         _mutable_json(tool_call.arguments),
@@ -5236,6 +5303,11 @@ class CrewDispatchRuntime:
                     raise CapabilityOutcomeUncertain(
                         "capability outcome requires confirmation"
                     ) from None
+                if tool_call.name == "workspace.bundle":
+                    _require_website_preview_entry(
+                        context,
+                        result.get("workspace_files"),
+                    )
                 if tool_request.approval_required:
                     await emit(
                         kind=EventKind.TOOL_STARTED,
@@ -5405,7 +5477,15 @@ class CrewDispatchRuntime:
             "provider_metadata": dict(response.provider_metadata),
         }
         encoded = json.dumps(_mutable_json(content), ensure_ascii=False, allow_nan=False)
-        if len(encoded.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        evidence_limit = (
+            _MAX_CONFIGURED_TOOL_ARGUMENT_BYTES
+            if any(
+                tool_call.name == "workspace.write_text"
+                for tool_call in response.tool_calls
+            )
+            else _MAX_PROMPT_BYTES
+        )
+        if len(encoded.encode("utf-8")) > evidence_limit:
             _fail("model response evidence exceeds limit")
         return Artifact(
             id=uuid4(),

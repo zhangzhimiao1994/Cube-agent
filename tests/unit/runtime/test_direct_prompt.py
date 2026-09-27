@@ -17,6 +17,7 @@ from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import (
     DirectRuntime,
+    RuntimeExecutionError,
     _project_scale_workspace_bundle_from_model_text,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -339,6 +340,43 @@ async def test_direct_natural_website_wraps_single_html_block_as_preview_workspa
             )
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_direct_website_bundle_without_preview_entry_is_rejected() -> None:
+    response_text = json.dumps(
+        {
+            "workspace_bundle": {
+                "files": {
+                    "README.md": "# Website\n",
+                    "src/main.js": "console.log('ready');\n",
+                }
+            }
+        }
+    )
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=response_text, usage=TokenUsage(20, 30, 50))),
+        logical_model="main",
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="website preview entry is missing"):
+        async for _event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="创建一个简单网站",
+                timeout_seconds=300,
+                token_budget=100_000,
+                routing_decision={
+                    "project_scale": "small",
+                    "project_delivery": "workspace",
+                    "artifact_strategy": "workspace_bundle",
+                    "website_preview_required": True,
+                },
+            )
+        ):
+            pass
 
 
 @pytest.mark.asyncio

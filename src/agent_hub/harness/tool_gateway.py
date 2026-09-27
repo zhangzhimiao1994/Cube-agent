@@ -429,7 +429,7 @@ _STATIC_BUILTIN_POLICY_PARTS: Mapping[str, CapabilityPolicyParts] = {
         "generated/project.preflight_architecture",
     ),
     "project.generate_zip": ("file", "create", "generated/project.generate_zip"),
-    "workspace.write_text": ("file", "create", "workspace/current"),
+    "workspace.write_text": ("file", "write", "workspace/current"),
     "workspace.list": ("file", "read", "workspace/current"),
     "workspace.bundle": ("file", "create", "workspace/bundle"),
 }

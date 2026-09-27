@@ -775,7 +775,7 @@ describe("WorkbenchFilePreview", () => {
   it("switches a complete HTML artifact from source to a restricted live preview", async () => {
     const user = userEvent.setup();
     const trailingMarker = "HTML_AFTER_SOURCE_PREVIEW_LIMIT";
-    const html = `<!doctype html><html><head><title>Preview</title></head><body><button id="counter">0</button><script>document.querySelector('#counter').onclick = () => document.querySelector('#counter').textContent = '1';</script>${"x".repeat(8_100)}${trailingMarker}</body></html>`;
+    const html = `<!-- fake <head> must not capture the security policy -->\n<!doctype html><html><head><title>Preview</title></head><body><button id="counter">0</button><script>document.querySelector('#counter').onclick = () => document.querySelector('#counter').textContent = '1';</script>${"x".repeat(8_100)}${trailingMarker}</body></html>`;
     const downloadSpy = vi
       .spyOn(api, "downloadGeneratedArtifact")
       .mockResolvedValue(new Response(html, { headers: { "Content-Type": "text/html" } }) as unknown as Blob);
@@ -841,22 +841,24 @@ describe("WorkbenchFilePreview", () => {
     expect(iframe.getAttribute("srcdoc")).toContain(trailingMarker);
     expect(iframe.getAttribute("srcdoc")).toContain("default-src 'none'");
     expect(iframe.getAttribute("srcdoc")).toContain("form-action 'none'");
+    const previewDocument = new DOMParser().parseFromString(iframe.getAttribute("srcdoc") ?? "", "text/html");
+    expect(previewDocument.head.querySelector('meta[http-equiv="Content-Security-Policy"]')).not.toBeNull();
   });
 
-  it("does not offer a live preview for HTML that depends on external files", () => {
+  it("does not let preview.html bypass checks for external scripts, styles, images, or fetches", () => {
     render(
       <WorkbenchFilePreview
         file={{
           id: "external-index",
-          title: "index.html",
-          filename: "index.html",
-          path: "index.html",
+          title: "preview.html",
+          filename: "preview.html",
+          path: "preview.html",
           kind: "workspace_file",
           operation: "创建文件",
           mimeType: "text/html",
           size: "2 KB",
           sha256: null,
-          text: '<!doctype html><html><head><link rel="stylesheet" href="styles.css"></head><body><script src="app.js"></script></body></html>',
+          text: '<!doctype html><html><head><link rel="stylesheet" href="styles.css"></head><body><img src="hero.png"><script src="app.js"></script><script>fetch("/api/data")</script></body></html>',
           source: null,
         }}
         onOpenSource={vi.fn()}

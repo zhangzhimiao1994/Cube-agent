@@ -225,6 +225,11 @@ async def test_docker_broker_probe_executes_real_mounted_skill_contract(
     tmp_path: Path,
 ) -> None:
     received: list[tuple[SkillInvocation, str]] = []
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.broker.os.chown",
+        lambda *_args: None,
+        raising=False,
+    )
     broker = SystemdBroker(
         BrokerPolicy(
             skill_root=tmp_path / "skills",

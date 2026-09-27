@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -37,7 +37,7 @@ def _workspace_tool_manifest_items(
         {
             **common,
             "id": "workspace.write_text",
-            "permission_class": "file.create",
+            "permission_class": "file.write",
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
@@ -542,6 +542,7 @@ async def test_runtime_gateway_copies_project_zip_sources_to_project_workspace(
 
 async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generated_dir = tmp_path / "generated"
     workspace_dir = tmp_path / "workspaces"
@@ -559,6 +560,15 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
         project_workspace_dir=workspace_dir,
         run_repository=repository,
     )
+    offloaded: list[str] = []
+
+    async def to_thread(
+        function: Callable[..., object], /, *args: object, **kwargs: object
+    ) -> object:
+        offloaded.append(getattr(function, "__name__", type(function).__name__))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("agent_hub.capabilities.runtime.asyncio.to_thread", to_thread)
 
     content = "x" * 250_000
     for index in range(9):
@@ -608,6 +618,17 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
     with ZipFile(stored_path) as archive:
         assert len(archive.namelist()) == 9
         assert archive.read("src/chunk-8.txt") == content.encode("utf-8")
+    assert offloaded == ["_bundle_workspace"]
+    workspace_bundle_dir = (
+        workspace_dir
+        / str(TENANT_ID)
+        / "projects"
+        / "large-project"
+        / "sessions"
+        / "session-large"
+        / ".bundles"
+    )
+    assert not workspace_bundle_dir.exists() or not tuple(workspace_bundle_dir.iterdir())
 
 
 async def test_workspace_write_scope_is_resolved_from_run_not_model_arguments(

@@ -251,6 +251,13 @@ def _website_preview_workspace_bundle_from_model_text(
     return _normalized_workspace_bundle({"files": {"preview.html": f"{html}\n"}})
 
 
+def _workspace_bundle_has_website_preview(bundle: Mapping[str, object]) -> bool:
+    files = bundle.get("files")
+    return isinstance(files, Mapping) and any(
+        path in files for path in ("preview.html", "index.html")
+    )
+
+
 def _json_mapping_from_model_text(text: str) -> Mapping[str, object] | None:
     candidate = text.strip()
     if candidate.startswith("```"):
@@ -726,6 +733,16 @@ class DirectRuntime:
                     text,
                     context,
                 )
+            if (
+                context.routing_decision.get("website_preview_required") is True
+                and extracted_workspace_bundle is not None
+                and not _workspace_bundle_has_website_preview(extracted_workspace_bundle)
+            ):
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del text, response, completion, request, included_source_ids, context
+                _raise_execution_error("website preview entry is missing")
             output_byte_limit = (
                 _MAX_PROJECT_SCALE_OUTPUT_BYTES
                 if extracted_workspace_bundle is not None

@@ -1655,22 +1655,30 @@ function detailHtmlPreviewByteLength(text: string) {
 }
 
 function isClearlySelfContainedDetailHtml(html: string) {
-  if (!/<(?:!doctype\s+html|html(?:\s|>))/i.test(html)) return false;
-  const resourceAttributes = html.matchAll(/\b(?:src|href|poster|action|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi);
-  for (const match of resourceAttributes) {
-    const value = (match[1] ?? match[2] ?? match[3] ?? "").trim().toLowerCase();
-    if (value && !/^(?:#|data:|blob:|about:blank|javascript:)/.test(value)) return false;
+  const sourceWithoutComments = html.replace(/<!--[\s\S]*?-->/g, "");
+  if (!/<(?:!doctype\s+html|html(?:\s|>))/i.test(sourceWithoutComments)) return false;
+  const previewDocument = new DOMParser().parseFromString(html, "text/html");
+  if (previewDocument.querySelector('meta[http-equiv="refresh" i]')) return false;
+  for (const element of previewDocument.querySelectorAll("*")) {
+    for (const attribute of ["src", "href", "poster", "action", "formaction", "data", "background", "cite", "manifest", "xlink:href"]) {
+      const value = element.getAttribute(attribute)?.trim().toLowerCase() ?? "";
+      if (value && !/^(?:#|data:|blob:|about:blank|javascript:)/.test(value)) return false;
+    }
+    const srcset = element.getAttribute("srcset")?.trim() ?? "";
+    if (srcset.split(",").some((candidate) => {
+      const value = candidate.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+      return value.length > 0 && !/^(?:data:|blob:)/.test(value);
+    })) return false;
   }
-  for (const match of html.matchAll(/url\(\s*(['"]?)([^)'"\s]+)\1\s*\)/gi)) {
+  for (const match of sourceWithoutComments.matchAll(/url\(\s*(['"]?)([^)'"\s]+)\1\s*\)/gi)) {
     const value = (match[2] ?? "").trim().toLowerCase();
     if (value && !/^(?:#|data:|blob:)/.test(value)) return false;
   }
-  return !/(?:@import\b|\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\s*\(|\bEventSource\s*\()/i.test(html);
+  return !/(?:@import\b|\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\s*\(|\bEventSource\s*\(|\bsendBeacon\s*\()/i.test(sourceWithoutComments);
 }
 
-function detailHtmlLivePreviewState(file: DetailWorkbenchFileItem, text: string | null) {
-  const isPreviewFile = /^preview\.html?$/i.test(file.filename.trim());
-  const eligible = Boolean(text) && (isPreviewFile || isClearlySelfContainedDetailHtml(text as string));
+function detailHtmlLivePreviewState(_file: DetailWorkbenchFileItem, text: string | null) {
+  const eligible = Boolean(text) && isClearlySelfContainedDetailHtml(text as string);
   const oversized = eligible && detailHtmlPreviewByteLength(text as string) > DETAIL_HTML_LIVE_PREVIEW_MAX_BYTES;
   return { eligible, oversized, available: eligible && !oversized };
 }
@@ -1681,12 +1689,19 @@ function detailSourcePreviewText(text: string | null) {
 }
 
 function detailSandboxedHtmlDocument(html: string) {
-  const securityHead = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:; connect-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'">
-<meta name="referrer" content="no-referrer">
-<script>document.addEventListener('click',function(event){var anchor=event.target.closest&&event.target.closest('a[href]');if(anchor){var href=anchor.getAttribute('href')||'';if(href&&!href.startsWith('#'))event.preventDefault();}},true);document.addEventListener('submit',function(event){event.preventDefault();},true);</script>`;
-  if (/<head(?:\s[^>]*)?>/i.test(html)) return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${securityHead}`);
-  if (/<html(?:\s[^>]*)?>/i.test(html)) return html.replace(/<html(?:\s[^>]*)?>/i, (root) => `${root}<head>${securityHead}</head>`);
-  return `<!doctype html><html><head>${securityHead}</head><body>${html}</body></html>`;
+  const previewDocument = new DOMParser().parseFromString(html, "text/html");
+  const policy = previewDocument.createElement("meta");
+  policy.httpEquiv = "Content-Security-Policy";
+  policy.content = "default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:; connect-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'";
+  const referrer = previewDocument.createElement("meta");
+  referrer.name = "referrer";
+  referrer.content = "no-referrer";
+  const interactionGuard = previewDocument.createElement("script");
+  interactionGuard.textContent = "document.addEventListener('click',function(event){var anchor=event.target.closest&&event.target.closest('a[href]');if(anchor){var href=anchor.getAttribute('href')||'';if(href&&!href.startsWith('#'))event.preventDefault();}},true);document.addEventListener('submit',function(event){event.preventDefault();},true);";
+  previewDocument.head.prepend(interactionGuard);
+  previewDocument.head.prepend(referrer);
+  previewDocument.head.prepend(policy);
+  return `<!doctype html>\n${previewDocument.documentElement.outerHTML}`;
 }
 
 async function readDetailWorkbenchPreviewText(payload: unknown): Promise<string> {

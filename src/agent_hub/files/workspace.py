@@ -205,6 +205,7 @@ class ProjectWorkspaceFile:
 class ProjectWorkspaceBundle:
     path: Path
     filename: str
+    files: tuple[ProjectWorkspaceFile, ...]
     mime_type: str = WORKSPACE_ZIP_MIME_TYPE
 
 
@@ -334,6 +335,7 @@ class ProjectWorkspaceStore:
         return ProjectWorkspaceBundle(
             path=bundle_path,
             filename=f"{project}-{session}-workspace.zip",
+            files=files,
         )
 
     def bundle_download_url(self, project_id: str, session_id: str) -> str:

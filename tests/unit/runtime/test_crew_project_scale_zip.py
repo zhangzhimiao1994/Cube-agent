@@ -3,6 +3,8 @@ from collections.abc import Mapping
 from decimal import Decimal
 from uuid import UUID
 
+import pytest
+
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
 from agent_hub.models.types import (
@@ -18,6 +20,7 @@ from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import (
     _MAX_TOOL_ARGUMENT_BYTES,
     CrewDispatchRuntime,
+    RuntimeExecutionError,
     _project_scale_artifact_zip_completion,
     _project_scale_gateway_failure_structured_completion,
     _project_scale_rejected_structured_completion,
@@ -184,6 +187,48 @@ def test_natural_workspace_project_text_bundle_is_converted_to_scoped_zip_tool_c
         "preview.html": "<!doctype html><html><body>网盘</body></html>\n",
         "README.md": "# 网盘\n",
     }
+
+
+def test_natural_website_zip_bundle_without_preview_entry_is_rejected() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="创建一个简单网站",
+        routing_decision={
+            "project_id": "website",
+            "workspace_session_id": "conv-website",
+            "project_scale": "small",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "website_preview_required": True,
+        },
+    )
+    task = (
+        "Role mission: implement.\n"
+        "User task: 创建一个简单网站\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    completion = _completion(
+        json.dumps(
+            {
+                "workspace_bundle": {
+                    "files": {
+                        "README.md": "# Website\n",
+                        "src/main.js": "console.log('ready');\n",
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="website preview entry is missing"):
+        _project_scale_artifact_zip_completion(
+            context,
+            _project_scale_step(task),
+            completion,
+            completion.response,
+        )
 
 
 def test_natural_workspace_project_unparseable_output_does_not_fabricate_bundle() -> None:

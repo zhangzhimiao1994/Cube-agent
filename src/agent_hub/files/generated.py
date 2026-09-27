@@ -129,6 +129,43 @@ class GeneratedFileStore:
             download_url=f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
         )
 
+    def store_path(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        artifact_id: UUID,
+        filename: str,
+        mime_type: str,
+        source: Path,
+        *,
+        move: bool = False,
+    ) -> GeneratedFileMetadata:
+        """Persist an existing file without loading the complete payload into memory."""
+
+        safe_filename = validate_generated_filename(filename, mime_type)
+        source_path = source.resolve(strict=True)
+        if not source_path.is_file():
+            raise ValueError("generated file source is not a file")
+
+        storage_key = f"{tenant_id}/{run_id}/{artifact_id}/{safe_filename}"
+        output_path = self._path_for_storage_key(storage_key)
+        if source_path == output_path:
+            raise ValueError("generated file source already uses destination path")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if move:
+            shutil.move(str(source_path), str(output_path))
+        else:
+            shutil.copyfile(source_path, output_path)
+
+        return GeneratedFileMetadata(
+            filename=safe_filename,
+            mime_type=mime_type,
+            size_bytes=output_path.stat().st_size,
+            sha256=_sha256_file(output_path),
+            storage_key=storage_key,
+            download_url=f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
+        )
+
     def resolve(self, storage_key: str) -> Path:
         """Resolve a storage key to an existing file under the generated artifact root."""
 
@@ -191,6 +228,14 @@ class GeneratedFileStore:
 
         safe_filename = _safe_filename(filename)
         return parsed_tenant_id, parsed_run_id, parsed_artifact_id, safe_filename
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def safe_generated_filename(filename: str) -> str:

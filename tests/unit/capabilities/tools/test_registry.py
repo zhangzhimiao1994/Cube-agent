@@ -144,7 +144,7 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "id": "workspace.write_text",
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
-                "permission_class": "file.create",
+                "permission_class": "file.write",
                 "sandbox_profile": "project_workspace_store",
                 "replay_safe": True,
                 "aliases": (),

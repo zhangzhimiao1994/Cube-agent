@@ -1002,6 +1002,32 @@ async def test_harness_tool_gateway_maps_project_zip_to_file_create_policy() -> 
     assert runtime.calls == []
 
 
+async def test_harness_tool_gateway_maps_workspace_write_to_file_write_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        builtin_request(
+            "workspace.write_text",
+            arguments={"path": "README.md", "content": "updated"},
+            sandbox="workspace_write",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert (
+        capability_request.capability,
+        capability_request.operation,
+        capability_request.resource,
+    ) == ("file", "write", "workspace/current")
+    assert runtime.calls == []
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "expected"),
     (

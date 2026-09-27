@@ -998,7 +998,7 @@ async def test_project_preflight_approval_enqueues_the_planned_run() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_large_project_requires_preflight_and_preserves_direct_mode() -> None:
+async def test_direct_large_project_requires_preflight_and_preserves_hybrid_upgrade() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
     repository = FakeRepository()
@@ -1019,9 +1019,14 @@ async def test_direct_large_project_requires_preflight_and_preserves_direct_mode
     )
 
     assert submitted.status is RunStatus.WAITING_APPROVAL
-    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.mode is TaskMode.HYBRID
     assert submitted.project_preflight_proposal is not None
-    assert submitted.project_preflight_proposal["mode"] == "direct"
+    assert submitted.project_preflight_proposal["mode"] == "hybrid"
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["requested_mode"] == "direct"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["mode_source"] == "project_scale_assessment"
 
     assert submitted.decision_token is not None
     approved = await service.approve_project_preflight(
@@ -1033,7 +1038,7 @@ async def test_direct_large_project_requires_preflight_and_preserves_direct_mode
     )
 
     assert approved.status is RunStatus.QUEUED
-    assert approved.mode is TaskMode.DIRECT
+    assert approved.mode is TaskMode.HYBRID
 
 
 @pytest.mark.asyncio

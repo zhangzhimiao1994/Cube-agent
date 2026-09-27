@@ -840,7 +840,7 @@ describe("RunDetailPage", () => {
   it("runs an index.html artifact in a restricted iframe while keeping source as the default", async () => {
     const user = userEvent.setup();
     const trailingMarker = "DETAIL_HTML_AFTER_SOURCE_PREVIEW_LIMIT";
-    const html = `<!doctype html><html><body><button>可交互页面</button>${"y".repeat(8_100)}${trailingMarker}</body></html>`;
+    const html = `<!-- fake <head> must not capture the security policy -->\n<!doctype html><html><head><title>Detail preview</title></head><body><button>可交互页面</button>${"y".repeat(8_100)}${trailingMarker}</body></html>`;
     const htmlArtifact = {
       ...runDetail.artifacts[0],
       id: "artifact-index-html",
@@ -854,9 +854,9 @@ describe("RunDetailPage", () => {
     const externalHtmlArtifact = {
       ...htmlArtifact,
       id: "artifact-external-html",
-      title: "app.html",
-      filename: "app.html",
-      text: '<!doctype html><html><head><link rel="stylesheet" href="app.css"></head><body></body></html>',
+      title: "preview.html",
+      filename: "preview.html",
+      text: '<!doctype html><html><head><link rel="stylesheet" href="app.css"></head><body><img src="hero.png"><script src="app.js"></script><script>fetch("/api/data")</script></body></html>',
       download_url: "/api/v1/artifacts/external-html/download",
     };
     const detailedRun: RunDetail = {
@@ -916,8 +916,10 @@ describe("RunDetailPage", () => {
     const iframe = within(workspace).getByTitle("index.html 运行预览");
     expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
     expect(iframe.getAttribute("srcdoc")).toContain(trailingMarker);
+    const previewDocument = new DOMParser().parseFromString(iframe.getAttribute("srcdoc") ?? "", "text/html");
+    expect(previewDocument.head.querySelector('meta[http-equiv="Content-Security-Policy"]')).not.toBeNull();
 
-    await user.click(within(fileList).getByRole("button", { name: /app\.html/ }));
+    await user.click(within(fileList).getByRole("button", { name: /preview\.html/ }));
     expect(within(workspace).queryByRole("button", { name: "运行预览" })).toBeNull();
     expect(within(workspace).queryByTitle("index.html 运行预览")).toBeNull();
   });

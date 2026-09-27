@@ -538,6 +538,19 @@ class RunService:
         project_delivery = _project_delivery_assessment(message)
         if project_delivery is not None:
             operator_selection.update(project_delivery)
+            if (
+                mode is TaskMode.DIRECT
+                and project_delivery.get("project_scale") in {"large", "ultra"}
+            ):
+                mode = TaskMode.HYBRID
+                operator_selection.update(
+                    {
+                        "reason": "project_scale_mode_upgrade",
+                        "requested_mode": TaskMode.DIRECT.value,
+                        "main_agent_selected_mode": TaskMode.HYBRID.value,
+                        "mode_source": "project_scale_assessment",
+                    }
+                )
         recalled_memories = await self._safe_runtime_memory_recall(
             tenant_id=tenant_id,
             actor_id=actor_id,

@@ -35,6 +35,32 @@ def test_store_bytes_writes_file_under_tenant_run_artifact_scope(tmp_path: Path)
     assert store.resolve(metadata.storage_key) == expected_path
 
 
+def test_store_path_moves_file_without_loading_or_retaining_source(tmp_path: Path) -> None:
+    tenant_id = uuid4()
+    run_id = uuid4()
+    artifact_id = uuid4()
+    source = tmp_path / "source" / "bundle.zip"
+    source.parent.mkdir()
+    source.write_bytes(b"PK\x03\x04workspace-bundle")
+    store = GeneratedFileStore(tmp_path / "generated")
+
+    metadata = store.store_path(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="workspace.zip",
+        mime_type=ZIP_MIME,
+        source=source,
+        move=True,
+    )
+
+    assert source.exists() is False
+    stored = store.resolve(metadata.storage_key)
+    assert stored.read_bytes() == b"PK\x03\x04workspace-bundle"
+    assert metadata.size_bytes == stored.stat().st_size
+    assert metadata.sha256 == sha256(stored.read_bytes()).hexdigest()
+
+
 @pytest.mark.parametrize(
     "filename",
     [

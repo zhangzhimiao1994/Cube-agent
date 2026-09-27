@@ -336,7 +336,7 @@ def create_builtin_tool_registry() -> ToolRegistry:
         object(),
         kind="builtin",
         adapter="runtime_builtin",
-        permission_class="file.create",
+        permission_class="file.write",
         sandbox_profile="project_workspace_store",
         replay_safe=True,
     )

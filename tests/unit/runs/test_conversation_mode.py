@@ -366,6 +366,47 @@ async def test_auto_large_project_upgrades_previous_direct_conversation_mode() -
     }.items()
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_scale"),
+    (
+        ("开发一个带登录、上传、分享、搜索和权限管理的大型网盘网站", "large"),
+        ("构建一个超大型企业项目管理平台", "ultra"),
+    ),
+)
+async def test_explicit_direct_large_project_is_upgraded_before_runtime(
+    message: str,
+    expected_scale: str,
+) -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=message,
+        mode=TaskMode.DIRECT,
+        conversation_id=f"conv-explicit-direct-{expected_scale}",
+    )
+
+    assert submitted.mode is TaskMode.HYBRID
+    routing = repository.created[-1]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing.items() >= {
+        "reason": "project_scale_mode_upgrade",
+        "requested_mode": "direct",
+        "main_agent_selected_mode": "hybrid",
+        "mode_source": "project_scale_assessment",
+        "project_scale": expected_scale,
+        "project_delivery": "workspace",
+        "artifact_strategy": "workspace_bundle",
+    }.items()
+
+
 async def test_reference_workflow_is_advisory_and_persisted_without_selecting_workflow() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     service = RunService(
