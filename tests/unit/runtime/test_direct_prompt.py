@@ -28,6 +28,7 @@ from agent_hub.runtime.direct import (
     _normalized_workspace_bundle,
     _project_scale_workspace_bundle_from_model_text,
     _workspace_batch_from_model_text,
+    _workspace_bundle_has_website_preview,
     _workspace_delivery_token_limit,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -36,6 +37,12 @@ from tests.contracts.test_runtime_contract import FakeGateway
 
 class UnusedGateway:
     pass
+
+
+def test_website_preview_accepts_common_public_entrypoint() -> None:
+    assert _workspace_bundle_has_website_preview(
+        {"files": {"public/preview.html": "<!doctype html><main>ready</main>"}}
+    )
 
 
 class RecordingCapabilityGateway:

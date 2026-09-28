@@ -100,6 +100,7 @@ def test_preview_serves_immutable_snapshot_when_workspace_changes(tmp_path: Path
     ("files", "expected_root", "expected_body"),
     [
         ({"build/index.html": "build"}, "build", b"build"),
+        ({"public/preview.html": "public"}, "public", b"public"),
         ({"preview.html": "preview"}, ".", b"preview"),
         ({"index.html": "index"}, ".", b"index"),
     ],

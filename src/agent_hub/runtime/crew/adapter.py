@@ -1595,16 +1595,33 @@ def _is_project_scale_acceptance_handoff(task: object) -> bool:
     )
 
 
+_WEBSITE_PREVIEW_ENTRY_PATHS = frozenset(
+    {
+        "preview.html",
+        "index.html",
+        "public/preview.html",
+        "public/index.html",
+    }
+)
+
+
+def _website_preview_entry_path(path: object) -> bool:
+    return (
+        isinstance(path, str)
+        and path.replace("\\", "/").casefold() in _WEBSITE_PREVIEW_ENTRY_PATHS
+    )
+
+
 def _website_preview_entry_present(files: object) -> bool:
     if isinstance(files, Mapping):
-        return any(path in files for path in ("preview.html", "index.html"))
+        return any(_website_preview_entry_path(path) for path in files)
     if not isinstance(files, tuple | list):
         return False
     for item in files:
         if not isinstance(item, Mapping):
             continue
         path = item.get("path")
-        if path in {"preview.html", "index.html"}:
+        if _website_preview_entry_path(path):
             return True
     return False
 

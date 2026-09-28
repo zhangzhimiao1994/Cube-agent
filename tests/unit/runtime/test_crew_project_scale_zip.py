@@ -26,11 +26,18 @@ from agent_hub.runtime.crew.adapter import (
     _project_scale_rejected_zip_completion,
     _project_scale_structured_role_completion,
     _tool_argument_byte_limit,
+    _website_preview_entry_present,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchStep
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000021")
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000022")
+
+
+def test_crew_website_preview_accepts_common_public_entrypoint() -> None:
+    assert _website_preview_entry_present(
+        {"public/index.html": "<!doctype html><main>ready</main>"}
+    )
 
 
 def _project_scale_context() -> TaskContext:

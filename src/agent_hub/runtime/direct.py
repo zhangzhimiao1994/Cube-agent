@@ -600,10 +600,27 @@ def _website_preview_workspace_bundle_from_model_text(
     return _normalized_workspace_bundle({"files": {"preview.html": f"{html}\n"}})
 
 
+_WEBSITE_PREVIEW_ENTRY_PATHS = frozenset(
+    {
+        "preview.html",
+        "index.html",
+        "public/preview.html",
+        "public/index.html",
+    }
+)
+
+
+def _is_website_preview_entry_path(path: object) -> bool:
+    return (
+        isinstance(path, str)
+        and path.replace("\\", "/").casefold() in _WEBSITE_PREVIEW_ENTRY_PATHS
+    )
+
+
 def _workspace_bundle_has_website_preview(bundle: Mapping[str, object]) -> bool:
     files = bundle.get("files")
     return isinstance(files, Mapping) and any(
-        path in files for path in ("preview.html", "index.html")
+        _is_website_preview_entry_path(path) for path in files
     )
 
 
@@ -1590,7 +1607,7 @@ class DirectRuntime:
                 if (
                     context.routing_decision.get("website_preview_required") is True
                     and not any(
-                        path.casefold() in {"preview.html", "index.html"}
+                        _is_website_preview_entry_path(path)
                         for path in batched.written_paths
                     )
                 ):

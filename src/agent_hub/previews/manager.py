@@ -606,6 +606,8 @@ def _find_preview_root(session_root: Path) -> tuple[Path, str]:
     candidates = (
         (session_root / "dist", "index.html"),
         (session_root / "build", "index.html"),
+        (session_root / "public", "preview.html"),
+        (session_root / "public", "index.html"),
         (session_root, "preview.html"),
         (session_root, "index.html"),
     )
