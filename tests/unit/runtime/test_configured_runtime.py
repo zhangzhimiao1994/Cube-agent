@@ -159,6 +159,14 @@ class FakeCapabilityAvailability:
         return {}
 
 
+class ProjectPreflightCapabilityGateway(FakeCapabilityAvailability):
+    def __init__(self) -> None:
+        super().__init__({"project.preflight_architecture"})
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "project.preflight_architecture"
+
+
 class ManifestCapabilityGateway(FakeCapabilityAvailability):
     def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
         assert tenant_id == TENANT_ID
@@ -4737,6 +4745,99 @@ async def test_config_backed_hybrid_runtime_injects_harness_tool_gateway_into_ch
     hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[-1])
     assert hybrid.dispatch is ProbeDispatchRuntime.instances[-1]
     assert hybrid.discussion is ProbeDiscussionRuntime.instances[-1]
+
+
+@pytest.mark.asyncio
+async def test_project_preflight_agent_uses_model_with_effective_tool_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "sonnet5": {
+                        "deployments": [
+                            {
+                                "provider": "claude-code-relay",
+                                "model": "claude-sonnet-5",
+                                "api_base": "https://relay.example/v1/messages",
+                                "credential_ref": "secret://sonnet",
+                                "quota_scope_id": "sonnet_account",
+                                "max_concurrency": 8,
+                                "capabilities": [
+                                    "text",
+                                    "tool_calling",
+                                    "structured_output",
+                                ],
+                            }
+                        ]
+                    },
+                    "qwen": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen3-max",
+                                "api_base": "https://dashscope.example/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 8,
+                                "capabilities": [
+                                    "text",
+                                    "tool_calling",
+                                    "structured_output",
+                                ],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "builder",
+                        "role": "Builder",
+                        "prompt": "Execute the approved plan.",
+                        "model": "sonnet5",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        capability_gateway=ProjectPreflightCapabilityGateway(),
+    )
+
+    _ = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Execute the approved plan.",
+                routing_decision={
+                    "selected_agent_ids": ("builder",),
+                    "project_preflight_approved": True,
+                    "project_preflight_proposal": {
+                        "kind": "project_architecture_preflight",
+                        "capability": "project.preflight_architecture",
+                        "plan_path": "PROJECT_ARCHITECTURE_PLAN.md",
+                        "graph_path": "architecture-map.html",
+                        "requires_constraints_and_skills_reading": True,
+                    },
+                },
+            )
+        )
+    ]
+
+    plan = cast(DispatchPlan, ProbeDispatchRuntime.instances[-1].plan)
+    agents = {agent.id: agent for agent in plan.agents}
+    assert agents["builder"].logical_model == "sonnet5"
+    assert agents["project_preflight_architect"].logical_model == "qwen"
 
 
 @pytest.mark.asyncio

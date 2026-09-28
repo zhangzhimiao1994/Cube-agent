@@ -1029,6 +1029,8 @@ class ConfigBackedDispatchRuntime:
             ),
             capability_gateway=self._capability_gateway,
             role_fallbacks_by_id=role_fallbacks_by_id,
+            config=config,
+            deployment_constraint=deployment_constraint,
         )
         role_payload = _dispatch_role_payload(plan)
         dispatch_runtime: ExecutionRuntime = CrewDispatchRuntime(
@@ -1433,6 +1435,8 @@ class ConfigBackedHybridRuntime:
             ),
             capability_gateway=self._capability_gateway,
             role_fallbacks_by_id=dispatch_fallbacks_by_id,
+            config=config,
+            deployment_constraint=deployment_constraint,
         )
         discussion_plan = _discussion_plan(
             discussion_roles,
@@ -1695,6 +1699,8 @@ def _dispatch_plan(
     max_parallelism: int = 1,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     role_fallbacks_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    config: PlatformConfig | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> DispatchPlan:
     selected_roles = tuple(roles)
     if not selected_roles:
@@ -1739,6 +1745,13 @@ def _dispatch_plan(
         for role in selected_roles
     }
     role_fallbacks_by_id = role_fallbacks_by_id or {}
+    preflight_model, preflight_fallbacks = _project_preflight_model_route(
+        selected_roles,
+        config,
+        task=context.request,
+        preflight_tools=preflight_tools,
+        deployment_constraint=deployment_constraint,
+    )
     agents = [
         AgentSpec(
             id=role.id,
@@ -1775,8 +1788,9 @@ def _dispatch_plan(
                     "the approved architecture plan and graph, and hand the staged execution "
                     "basis to the implementation roles."
                 ),
-                logical_model=selected_roles[0].model,
+                logical_model=preflight_model,
                 allowed_tools=preflight_tools,
+                fallback_models=preflight_fallbacks,
                 output_schema={
                     "summary": "string",
                     "plan_path": "string",
@@ -1923,6 +1937,48 @@ def _dispatch_plan(
         total_timeout_seconds=sum(step.timeout_seconds for step in steps),
         total_cost_usd=sum((step.cost_budget_usd for step in steps), Decimal(0)),
     )
+
+
+def _project_preflight_model_route(
+    roles: tuple[RoleAssignment, ...],
+    config: PlatformConfig | None,
+    *,
+    task: object,
+    preflight_tools: tuple[str, ...],
+    deployment_constraint: DeploymentRoutingConstraint | None,
+) -> tuple[str, tuple[str, ...]]:
+    default_model = roles[0].model
+    if config is None or not preflight_tools:
+        return default_model, ()
+    role = RoleAssignment(
+        id=_PROJECT_PREFLIGHT_AGENT_ID,
+        role="Project Preflight Architect",
+        purpose=RolePurpose.EXECUTE,
+        mission="Create the approved architecture plan and graph before implementation.",
+        must_answer=("What staged architecture should implementation follow?",),
+        allowed_tools=preflight_tools,
+        forbidden_actions=("Do not implement before architecture preflight completes.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model=default_model,
+    )
+    ranked = _rank_logical_models_for_role(
+        role,
+        config,
+        default_model=default_model,
+        task=task,
+        allowed_tools=preflight_tools,
+        deployment_constraint=deployment_constraint,
+    )
+    if not ranked:
+        return default_model, ()
+    selected = ranked[0][2]
+    fallbacks = tuple(
+        logical_model
+        for _, _, logical_model in ranked[1:]
+        if logical_model != selected
+    )[:3]
+    return selected, fallbacks
 
 
 def _is_default_multi_agent_chain_request(
