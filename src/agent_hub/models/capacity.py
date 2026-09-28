@@ -30,7 +30,7 @@ def _deployment_token_estimates(
             raise ValueError("estimated_tokens must be a strict positive integer")
         return {candidate.id: estimated_tokens for candidate in candidates}
     if not isinstance(estimated_tokens, Mapping):
-        raise TypeError(
+        raise ValueError(  # noqa: TRY004 - public validation contract uses ValueError
             "estimated_tokens must be a strict positive integer or deployment mapping"
         )
     expected_ids = {candidate.id for candidate in candidates}

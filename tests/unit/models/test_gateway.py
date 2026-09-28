@@ -1905,6 +1905,18 @@ def test_default_estimator_counts_chinese_as_tokens_not_raw_utf8_bytes() -> None
     assert estimated_text_tokens < len(chinese_text.encode("utf-8"))
 
 
+def test_default_estimator_conservatively_reserves_tpm_for_cjk_payload() -> None:
+    model_request = ModelRequest(
+        logical_model="chat",
+        messages=(ModelMessage(role="user", content="界" * 300),),
+        max_output_tokens=1,
+    )
+
+    estimate = ConservativeTokenEstimator().estimate(model_request)
+
+    assert 500 < estimate < len("界".encode()) * 300
+
+
 def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() -> None:
     huge_integer = 10**999
     schema_value: Mapping[str, JsonValue] = {

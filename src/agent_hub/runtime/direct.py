@@ -1179,6 +1179,11 @@ class DirectRuntime:
             failure_fingerprints: dict[str, int] = {}
             while True:
                 attempt_count += 1
+                gateway_failed = False
+                failure_reason = "model gateway failed"
+                fingerprint = "unknown:None:model gateway failed"
+                fingerprint_count = 0
+                retryable = False
                 try:
                     completion = await gateway_task
                 except asyncio.CancelledError:
@@ -1193,6 +1198,8 @@ class DirectRuntime:
                     error.__context__ = None
                     error.__cause__ = None
                     del error
+                    gateway_failed = True
+                if gateway_failed:
                     await self._consume_task_terminal(gateway_task)
                     self._active_task = None
                     gateway_task = None

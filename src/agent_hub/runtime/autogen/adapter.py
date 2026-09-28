@@ -879,7 +879,7 @@ def _discussion_hard_turn_limit(
     token_capacity = max(1, remaining_tokens // _MIN_MODEL_TOKENS_PER_TURN)
     remaining_seconds = min(plan.wall_time_seconds, context.timeout_seconds)
     time_capacity = max(1, int(remaining_seconds // _MIN_SECONDS_PER_TURN))
-    return min(token_capacity, time_capacity)
+    return max(plan.max_turns, min(token_capacity, time_capacity))
 
 
 def _checkpoint_wall_time_seconds(

@@ -122,6 +122,25 @@ def test_hard_limit_uses_token_and_time_capacity_without_fixed_turn_cap() -> Non
     assert large_project_limit == 500
 
 
+def test_hard_limit_does_not_preempt_configured_soft_turn_window() -> None:
+    limit = getattr(adapter, "_discussion_hard_turn_limit", None)
+    assert limit is not None, "dynamic hard limit is not implemented"
+
+    token_constrained = limit(
+        _plan(soft_turns=4, token_budget=2),
+        _context(token_budget=2),
+        0,
+    )
+    time_constrained = limit(
+        _plan(soft_turns=4, wall_time_seconds=0.2),
+        _context(timeout_seconds=0.2),
+        0,
+    )
+
+    assert token_constrained == 4
+    assert time_constrained == 4
+
+
 def test_soft_limit_can_expand_past_legacy_sixty_four_turn_boundary() -> None:
     control_type = getattr(adapter, "_DiscussionControl", None)
     assert control_type is not None

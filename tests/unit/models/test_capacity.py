@@ -183,6 +183,21 @@ async def test_scoped_views_use_each_deployments_token_estimate() -> None:
     assert redis.acquire_token_estimates == [11, 22]
 
 
+@pytest.mark.parametrize("estimated", [None, True, 1.0])
+async def test_capacity_rejects_non_integer_token_estimates_with_value_error(
+    estimated: object,
+) -> None:
+    selected = deployment("selected", "selected-scope")
+    capacity = CapacityPool(object())
+
+    with pytest.raises(ValueError, match="estimated_tokens"):
+        await capacity.acquire(
+            [selected],
+            wait_timeout=0,
+            estimated_tokens=estimated,  # type: ignore[arg-type]
+        )
+
+
 async def test_scoped_view_registers_global_most_restrictive_shared_scope_policy() -> None:
     redis = InMemoryCapacityRedis()
     permissive = deployment(

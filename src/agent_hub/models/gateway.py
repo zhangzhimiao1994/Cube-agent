@@ -339,7 +339,7 @@ class ConservativeTokenEstimator:
             if character.isascii():
                 tokens += 1
             else:
-                tokens += max(1, math.ceil(len(character.encode("utf-8")) / 3))
+                tokens += max(1, math.ceil(len(character.encode("utf-8")) / 2))
         flush_ascii_run()
         return tokens
 
