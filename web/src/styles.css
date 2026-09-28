@@ -1673,6 +1673,39 @@ article:hover {
   padding: 0;
 }
 
+.conversation-project-detail {
+  display: grid;
+  gap: 0.48rem;
+  min-width: 0;
+}
+
+.conversation-project-detail-header {
+  background: rgba(8, 17, 31, 0.76);
+  border: 1px solid rgba(85, 215, 255, 0.28);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 0.55rem;
+}
+
+.conversation-project-detail-header > div {
+  display: grid;
+  gap: 0.14rem;
+  min-width: 0;
+}
+
+.conversation-project-detail-header code,
+.conversation-project-detail-header small {
+  color: var(--muted);
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.conversation-project-back {
+  align-self: start;
+}
+
 .conversation-list-header {
   align-items: center;
   display: flex;
@@ -8589,6 +8622,15 @@ article:hover {
     font-size: 0.76rem;
     min-height: 2rem;
     padding: 0.35rem 0.5rem;
+  }
+
+  .conversation-project-detail-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .conversation-project-back {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 
   .conversation-row {

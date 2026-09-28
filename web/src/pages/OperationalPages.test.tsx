@@ -7129,18 +7129,71 @@ describe("operational management pages", () => {
     expect(screen.getByRole("heading", { name: "项目与会话" })).not.toBeNull();
     expect(screen.getByRole("button", { name: "创建项目" })).not.toBeNull();
     expect(screen.getByRole("button", { name: "在默认项目中新建会话" })).not.toBeNull();
-    const conversationOpenButton = screen.getByRole("button", { name: conversationOpenButtonName });
-    expect(conversationOpenButton).not.toBeNull();
-    expect(conversationOpenButton.querySelector(".conversation-title-text")?.textContent).toBe(conversationHistoryTitle);
-    expect(screen.getByText("全选当前结果")).not.toBeNull();
-    expect(screen.getByRole("button", { name: /批量删除已选会话 0 条/ })).not.toBeNull();
-    expect(screen.getByText("删除已选（0）")).not.toBeNull();
-    expect(screen.getByText(conversationHistoryTitle)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "进入项目 默认项目" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: conversationOpenButtonName })).toBeNull();
+    expect(screen.queryByText("全选当前结果")).toBeNull();
     expect(screen.queryByText("22222222")).toBeNull();
     expect(screen.getAllByRole("button", { name: "关闭项目与会话" }).length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(chatConsole?.className).not.toContain("history-drawer-open");
+  });
+
+  it("opens a project detail level before showing that project's conversations", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    const manager = screen.getByRole("navigation", { name: "项目与会话管理" });
+
+    expect(within(manager).queryByRole("button", { name: conversationOpenButtonName })).toBeNull();
+    await user.click(within(manager).getByRole("button", { name: "进入项目 默认项目" }));
+
+    const projectDetail = within(manager).getByRole("region", { name: "项目详情 默认项目" });
+    expect(within(projectDetail).getByText("default")).not.toBeNull();
+    expect(within(projectDetail).getByRole("button", { name: "返回项目列表" })).not.toBeNull();
+    expect(within(manager).getByRole("button", { name: conversationOpenButtonName })).not.toBeNull();
+    expect(within(manager).queryByRole("button", { name: "进入项目 默认项目" })).toBeNull();
+
+    await user.click(within(projectDetail).getByRole("button", { name: "返回项目列表" }));
+    expect(within(manager).getByRole("button", { name: "进入项目 默认项目" })).not.toBeNull();
+    expect(within(manager).queryByRole("button", { name: conversationOpenButtonName })).toBeNull();
+  });
+
+  it("opens a project's conversation content from the project detail level", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    const manager = screen.getByRole("navigation", { name: "项目与会话管理" });
+    await user.click(within(manager).getByRole("button", { name: "进入项目 默认项目" }));
+    await user.click(within(manager).getByRole("button", { name: conversationOpenButtonName }));
+
+    expect(screen.getByRole("button", { name: "打开项目与会话" })).not.toBeNull();
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(
+      await within(stream).findByText("给我做一个短视频脚本方案。", {
+        selector: ".chat-message.user p",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("keeps the project plus button scoped to new conversation creation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    const manager = screen.getByRole("navigation", { name: "项目与会话管理" });
+    await user.click(within(manager).getByRole("button", { name: "在默认项目中新建会话" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "新建会话" });
+    await user.click(within(dialog).getByRole("button", { name: "关闭新建会话" }));
+    await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    expect(within(manager).getByRole("button", { name: "进入项目 默认项目" })).not.toBeNull();
+    expect(within(manager).queryByRole("region", { name: "项目详情 默认项目" })).toBeNull();
   });
 
   it("starts on a neutral new conversation instead of restoring the latest conversation", async () => {
@@ -7260,6 +7313,7 @@ describe("operational management pages", () => {
     expect(screen.queryByRole("dialog", { name: "新建会话" })).toBeNull();
     expect(screen.getByText("会话：浏览器插件开发")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "打开项目与会话" }));
+    await user.click(screen.getByRole("button", { name: "进入项目 浏览器工具" }));
     expect(screen.getByRole("button", { name: "进入会话 浏览器插件开发" })).not.toBeNull();
   });
 

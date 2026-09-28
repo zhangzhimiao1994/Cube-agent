@@ -806,6 +806,14 @@ test("project conversation and run settings dialogs stay separate and usable on 
     expect(managerBounds.container.left).toBeGreaterThanOrEqual(0);
     expect(managerBounds.container.right).toBeLessThanOrEqual(managerBounds.viewportWidth + 1);
     expect(managerBounds.escapedChildren).toEqual([]);
+    await expect(manager.getByRole("button", { name: "进入项目 默认项目" })).toBeVisible();
+    await expect(manager.getByRole("tab", { name: /当前会话/ })).toHaveCount(0);
+    await manager.getByRole("button", { name: "进入项目 默认项目" }).click();
+    const projectDetail = manager.getByRole("region", { name: "项目详情 默认项目" });
+    await expect(projectDetail).toBeVisible();
+    await expect(projectDetail.getByRole("tab", { name: /当前会话/ })).toBeVisible();
+    await projectDetail.getByRole("button", { name: "返回项目列表" }).click();
+    await expect(manager.getByRole("button", { name: "进入项目 默认项目" })).toBeVisible();
     await manager.getByRole("button", { name: "创建项目" }).click();
     const projectDialog = page.getByRole("dialog", { name: "新建项目工作区" });
     await expect(projectDialog).toBeVisible();

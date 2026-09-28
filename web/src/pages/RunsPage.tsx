@@ -8026,7 +8026,15 @@ export function RunsPage() {
     items,
     archivedConversations.data ?? [],
   );
-  const managerProjectId = managedProjectId.trim() || projectId.trim() || conversationProjects[0]?.id || "";
+  const selectedManagedProject =
+    conversationProjects.find((item) => item.id === managedProjectId.trim()) ?? null;
+  const activeManagedProject =
+    selectedManagedProject ??
+    conversationProjects.find((item) => item.id === projectId.trim()) ??
+    conversationProjects[0] ??
+    null;
+  const managerProjectId = activeManagedProject?.id ?? "";
+  const showProjectOverview = historyOpen && !selectedManagedProject;
   const conversationProjectById = new Map(
     [...(conversations.data ?? []), ...(archivedConversations.data ?? [])]
       .filter((item) => item.project_id?.trim())
@@ -8264,7 +8272,10 @@ export function RunsPage() {
         aria-expanded={historyOpen}
         onClick={() => {
           const next = !historyOpen;
-          if (next) window.dispatchEvent(new Event("agent-hub:close-mobile-nav"));
+          if (next) {
+            setManagedProjectId("");
+            window.dispatchEvent(new Event("agent-hub:close-mobile-nav"));
+          }
           setHistoryOpen(next);
         }}
       >
@@ -8287,9 +8298,11 @@ export function RunsPage() {
             <div>
               <h3>项目与会话</h3>
               <span>
-                {conversationSearchQuery
-                  ? conversationSearchState.summary
-                  : `${totalConversationCount} 个会话`}
+                {!showProjectOverview
+                  ? conversationSearchQuery
+                    ? conversationSearchState.summary
+                    : `${totalConversationCount} 个会话`
+                  : `${conversationProjects.length} 个项目`}
               </span>
             </div>
             <div className="conversation-list-actions">
@@ -8301,9 +8314,10 @@ export function RunsPage() {
               </button>
             </div>
           </div>
-          <div className="conversation-projects" aria-label="项目列表">
-            {conversationProjects.map((project) => (
-              <article key={project.id} className={`conversation-project${project.id === managerProjectId ? " selected" : ""}`}>
+          {showProjectOverview ? (
+            <div className="conversation-projects" aria-label="项目列表">
+              {conversationProjects.map((project) => (
+                <article key={project.id} className="conversation-project">
                 <button
                   type="button"
                   className="conversation-project-select"
@@ -8323,9 +8337,40 @@ export function RunsPage() {
                 >
                   +
                 </button>
-              </article>
-            ))}
-          </div>
+                </article>
+              ))}
+            </div>
+          ) : activeManagedProject ? (
+            <section
+              className="conversation-project-detail"
+              role="region"
+              aria-label={`项目详情 ${activeManagedProject.label}`}
+            >
+              <header className="conversation-project-detail-header">
+                <button
+                  type="button"
+                  className="secondary-action conversation-project-back"
+                  onClick={() => {
+                    setManagedProjectId("");
+                    setConversationSearch("");
+                    setSelectedConversationIds([]);
+                  }}
+                >
+                  返回项目列表
+                </button>
+                <div>
+                  <strong>{activeManagedProject.label}</strong>
+                  <code>{activeManagedProject.id}</code>
+                  <small>工作区：{activeManagedProject.workspacePath}</small>
+                </div>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => startNewConversationForProject(activeManagedProject)}
+                >
+                  新建会话
+                </button>
+              </header>
           <ConversationManagerTabs
             value={conversationManagerView}
             currentCount={currentConversationCount}
@@ -8549,6 +8594,8 @@ export function RunsPage() {
             <p className="form-error" role="alert">
               {formatApiError(deleteRun.error, "对话删除失败")}
             </p>
+          ) : null}
+            </section>
           ) : null}
         </nav>
 
