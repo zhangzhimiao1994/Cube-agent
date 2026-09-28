@@ -4459,17 +4459,16 @@ def _should_attempt_deliverable_repair(
     case_id: str,
     benchmark_kind: ProjectScaleBenchmarkKind,
 ) -> bool:
-    has_observable_deliverable = (
-        evidence.get("final_artifacts") is True
-        and evidence.get("workspace_bundle") is True
-    )
+    has_final_artifact = evidence.get("final_artifacts") is True
+    has_workspace_bundle = evidence.get("workspace_bundle") is True
+    has_observable_deliverable = has_final_artifact and has_workspace_bundle
     has_capability_validation_failure = (
         benchmark_kind == "capability"
         and evidence.get("generated_project_validation") is False
     )
     return (
         (status in {"completed", "failed"} or has_observable_deliverable)
-        and (evidence.get("final_artifacts") is True or has_capability_validation_failure)
+        and (has_final_artifact or has_workspace_bundle or has_capability_validation_failure)
         and bool(_deliverable_repair_evidence_deficits(evidence, case_id=case_id))
     )
 

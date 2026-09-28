@@ -942,6 +942,24 @@ def test_running_run_with_final_bundle_and_failed_validation_triggers_repair() -
     ) is True
 
 
+def test_completed_capability_bundle_without_final_attachment_triggers_repair() -> None:
+    evidence = {
+        "final_artifacts": False,
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "generated_project_validation": True,
+        "requirements_validation": True,
+        "agent_standard_verification": False,
+    }
+
+    assert _should_attempt_deliverable_repair(
+        status="completed",
+        evidence=evidence,
+        case_id="small:auto",
+        benchmark_kind="capability",
+    ) is True
+
+
 @pytest.mark.parametrize("benchmark_kind", ("fixture", "capability"))
 @pytest.mark.parametrize(
     "source", ("details", "model_text", "event_flags", "zip_flags", "zip_reading", "zip_plan")
