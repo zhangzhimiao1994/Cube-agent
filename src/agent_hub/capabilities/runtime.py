@@ -57,6 +57,7 @@ _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_PREFLIGHT_TOOL = "project.preflight_architecture"
 _PROJECT_ZIP_TOOL = PROJECT_ZIP_TOOL_NAME
 _WORKSPACE_WRITE_TOOL = "workspace.write_text"
+_WORKSPACE_PRUNE_TOOL = "workspace.prune"
 _WORKSPACE_LIST_TOOL = "workspace.list"
 _WORKSPACE_BUNDLE_TOOL = "workspace.bundle"
 _MAX_PROJECT_FILES = PROJECT_ZIP_MAX_FILES
@@ -71,6 +72,7 @@ _DOTTED_BUILT_INS = frozenset({
     _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
     _WORKSPACE_WRITE_TOOL,
+    _WORKSPACE_PRUNE_TOOL,
     _WORKSPACE_LIST_TOOL,
     _WORKSPACE_BUNDLE_TOOL,
 })
@@ -86,6 +88,7 @@ _REPLAY_SAFE = frozenset({
     _PROJECT_PREFLIGHT_TOOL,
     _PROJECT_ZIP_TOOL,
     _WORKSPACE_WRITE_TOOL,
+    _WORKSPACE_PRUNE_TOOL,
     _WORKSPACE_LIST_TOOL,
     _WORKSPACE_BUNDLE_TOOL,
 })
@@ -283,6 +286,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if normalized_name == _WORKSPACE_WRITE_TOOL:
             return await self._execute_workspace_write_text(tenant_id, run_id, arguments)
+        if normalized_name == _WORKSPACE_PRUNE_TOOL:
+            return await self._execute_workspace_prune(tenant_id, run_id, arguments)
         if normalized_name == _WORKSPACE_LIST_TOOL:
             return await self._execute_workspace_list(tenant_id, run_id)
         if normalized_name == _WORKSPACE_BUNDLE_TOOL:
@@ -561,6 +566,33 @@ class RuntimeCapabilityGateway:
             "summary": f"Workspace contains {len(public)} files.",
             "workspace_files": public,
             "bundle_download_url": store.bundle_download_url(project_id, session_id),
+        }
+
+    async def _execute_workspace_prune(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_project_workspace_store()
+        project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        raw_paths = arguments.get("keep_paths")
+        if not isinstance(raw_paths, tuple | list) or not raw_paths:
+            raise RuntimeCapabilityError("workspace prune requires keep_paths")
+        if any(not isinstance(path, str) for path in raw_paths):
+            raise RuntimeCapabilityError("workspace prune keep_paths must be strings")
+        try:
+            removed = store.prune_files(
+                tenant_id,
+                project_id,
+                session_id,
+                keep_paths=tuple(cast(str, path) for path in raw_paths),
+            )
+        except (OSError, ValueError) as error:
+            raise RuntimeCapabilityError(str(error)) from None
+        return {
+            "summary": f"Pruned {len(removed)} obsolete workspace files.",
+            "removed_paths": removed,
         }
 
     async def _execute_workspace_bundle(

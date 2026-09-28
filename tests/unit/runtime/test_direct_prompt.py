@@ -68,10 +68,12 @@ class RecordingCapabilityGateway:
                 "artifact_id": str(uuid4()),
                 "bundle_download_url": "/api/workspaces/project/session/bundle",
             }
+        if name == "workspace.prune":
+            return {"summary": "Pruned workspace.", "removed_paths": ()}
         return {"summary": f"Wrote {arguments['path']}."}
 
     def is_replay_safe(self, name: str) -> bool:
-        return name in {"workspace.write_text", "workspace.bundle"}
+        return name in {"workspace.write_text", "workspace.prune", "workspace.bundle"}
 
 
 class SequencedDirectGateway:
@@ -730,6 +732,76 @@ async def test_direct_project_delivery_writes_fenced_model_batch() -> None:
     assert capabilities.calls[0][1] == {
         "path": "package.json",
         "content": '{"scripts":{"test":"node --test"}}',
+    }
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_direct_authoritative_workspace_delivery_prunes_after_all_project_files() -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "workspace_bundle": {
+                            "files": {
+                                "package.json": '{"scripts":{"test":"node --test"}}',
+                                "README.md": "# Project\n",
+                                "IMPLEMENTATION_PLAN.md": "# Plan\n",
+                                "VERIFICATION.md": "# Verification\n",
+                                "src/main.js": "export const ready = true;\n",
+                                "tests/main.test.js": "// test\n",
+                            }
+                        }
+                    }
+                ),
+                usage=TokenUsage(100, 80, 180),
+            ),
+        )
+    )
+    capabilities = RecordingCapabilityGateway()
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=capabilities,
+    )
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Repair the complete project workspace.",
+        timeout_seconds=600,
+        token_budget=50_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "replace_workspace_files": True,
+        },
+    )
+
+    events = [event async for event in runtime.run(task)]
+
+    assert [call[0] for call in capabilities.calls] == [
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.prune",
+        "workspace.write_text",
+        "workspace.bundle",
+    ]
+    assert capabilities.calls[6][1] == {
+        "keep_paths": (
+            "IMPLEMENTATION_PLAN.md",
+            "README.md",
+            "VERIFICATION.md",
+            "package.json",
+            "src/main.js",
+            "tests/main.test.js",
+        )
     }
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 

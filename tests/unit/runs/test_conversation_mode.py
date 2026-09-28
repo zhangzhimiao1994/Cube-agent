@@ -652,6 +652,7 @@ async def test_explicit_direct_large_project_can_lock_recovery_mode() -> None:
         mode=TaskMode.DIRECT,
         conversation_id="conv-large-direct-recovery",
         allow_scale_mode_upgrade=False,
+        replace_workspace_files=True,
     )
 
     assert submitted.mode is TaskMode.DIRECT
@@ -660,6 +661,7 @@ async def test_explicit_direct_large_project_can_lock_recovery_mode() -> None:
     routing = repository.created[-1]["routing_decision"]
     assert isinstance(routing, dict)
     assert routing["allow_scale_mode_upgrade"] is False
+    assert routing["replace_workspace_files"] is True
 
 
 async def test_reference_workflow_is_advisory_and_persisted_without_selecting_workflow() -> None:

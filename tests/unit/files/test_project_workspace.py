@@ -33,6 +33,42 @@ def test_project_workspace_store_writes_and_lists_session_files(tmp_path: Path) 
     assert store.list_files(tenant_id, "Mofang Agent", "Conv Main 01") == (metadata,)
 
 
+def test_project_workspace_store_prunes_files_not_in_authoritative_manifest(
+    tmp_path: Path,
+) -> None:
+    tenant_id = uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+    store.write_bytes(
+        tenant_id, "project", "session", "src/current.ts", b"current\n", "text/typescript"
+    )
+    store.write_bytes(
+        tenant_id, "project", "session", "src/obsolete.ts", b"obsolete\n", "text/typescript"
+    )
+    store.write_bytes(
+        tenant_id, "project", "session", "tests/obsolete.test.ts", b"old\n", "text/typescript"
+    )
+
+    removed = store.prune_files(
+        tenant_id,
+        "project",
+        "session",
+        keep_paths=("src/current.ts",),
+    )
+
+    assert removed == ("src/obsolete.ts", "tests/obsolete.test.ts")
+    assert [item.path for item in store.list_files(tenant_id, "project", "session")] == [
+        "src/current.ts"
+    ]
+    assert not (store.session_root(tenant_id, "project", "session") / "tests").exists()
+
+
+def test_project_workspace_store_prune_rejects_unsafe_manifest_path(tmp_path: Path) -> None:
+    store = ProjectWorkspaceStore(tmp_path)
+
+    with pytest.raises(ValueError, match="workspace path"):
+        store.prune_files(uuid4(), "project", "session", keep_paths=("../escape",))
+
+
 def test_project_workspace_store_uses_run_workspace_segment_rules(tmp_path: Path) -> None:
     tenant_id = uuid4()
     store = ProjectWorkspaceStore(tmp_path)

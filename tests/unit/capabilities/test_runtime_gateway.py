@@ -718,6 +718,55 @@ async def test_workspace_list_allows_read_only_authorized_run(tmp_path: Path) ->
     assert tuple(item["path"] for item in listed_files) == ("README.md",)
 
 
+async def test_workspace_prune_uses_run_scope_and_removes_only_obsolete_files(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            session="repair-session",
+            project_id="repair-project",
+        )
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        project_workspace_dir=workspace_dir,
+        run_repository=repository,
+    )
+    for path in ("src/current.ts", "src/obsolete.ts"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="main_agent",
+            name="workspace.write_text",
+            arguments={"path": path, "content": path},
+            idempotency_key=f"write-{path.replace('/', '-').replace('.', '-')}",
+        )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="main_agent",
+        name="workspace.prune",
+        arguments={"keep_paths": ("src/current.ts",)},
+        idempotency_key="prune-repair-workspace",
+    )
+
+    assert result["removed_paths"] == ("src/obsolete.ts",)
+    listing = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="main_agent",
+        name="workspace.list",
+        arguments={},
+        idempotency_key="list-repair-workspace",
+    )
+    listed_files = cast(tuple[Mapping[str, JsonValue], ...], listing["workspace_files"])
+    assert tuple(item["path"] for item in listed_files) == ("src/current.ts",)
+
+
 async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
     tmp_path: Path,
 ) -> None:

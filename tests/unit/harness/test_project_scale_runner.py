@@ -774,6 +774,7 @@ def test_auto_hybrid_partial_discussion_completion_falls_back_to_direct() -> Non
         effective_mode=mode,
     )
     assert repair["allow_scale_mode_upgrade"] is False
+    assert repair["replace_workspace_files"] is True
 
 
 def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(

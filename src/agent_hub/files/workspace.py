@@ -286,6 +286,49 @@ class ProjectWorkspaceStore:
             )
         return tuple(files)
 
+    def prune_files(
+        self,
+        tenant_id: UUID,
+        project_id: str,
+        session_id: str,
+        *,
+        keep_paths: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Remove files outside an authoritative delivery manifest.
+
+        Callers write the complete replacement first, then prune. This keeps an interrupted
+        delivery from deleting the previous workspace before its replacement is durable.
+        """
+        keep = {_safe_workspace_path(path) for path in keep_paths}
+        session_root = self.session_root(tenant_id, project_id, session_id)
+        if not session_root.exists():
+            return ()
+        removed: list[str] = []
+        for item in self.list_files(tenant_id, project_id, session_id):
+            if item.path in keep:
+                continue
+            target = self._resolve_candidate(
+                tenant_id,
+                project_id,
+                session_id,
+                item.path,
+                must_exist=True,
+            )
+            target.unlink()
+            removed.append(item.path)
+        for directory in sorted(
+            (path for path in session_root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            if directory.name == ".bundles":
+                continue
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        return tuple(removed)
+
     def resolve_file(
         self,
         tenant_id: UUID,

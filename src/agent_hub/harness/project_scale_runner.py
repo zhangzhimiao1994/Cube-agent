@@ -969,32 +969,33 @@ def execute_project_scale_plan(
                     progress,
                     f"{case_label}: submitting deliverable repair {deliverable_repair_attempts}",
                 )
+                repair_body = _deliverable_repair_body(
+                    request_body,
+                    run_request.case_id,
+                    benchmark_kind=plan.benchmark_kind,
+                    effective_mode=repair_mode,
+                    source_workspace_bundle=current_workspace_bundle,
+                    failed_reasons=(
+                        *deliverable_quality.reasons,
+                        *agent_standard_verification.reasons,
+                        *discussion_trace.reasons,
+                        *plugin_contract.reasons,
+                        *_multi_agent_participation_reasons(
+                            evidence,
+                            case_id=run_request.case_id,
+                            contract_reasons=multi_agent_contract_reasons,
+                        ),
+                        *generated_project_validation.reasons,
+                        *_self_repair_trace_reasons(
+                            evidence,
+                            case_id=run_request.case_id,
+                        ),
+                    ),
+                )
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
-                    body=_deliverable_repair_body(
-                        request_body,
-                        run_request.case_id,
-                        benchmark_kind=plan.benchmark_kind,
-                        effective_mode=repair_mode,
-                        source_workspace_bundle=current_workspace_bundle,
-                        failed_reasons=(
-                            *deliverable_quality.reasons,
-                            *agent_standard_verification.reasons,
-                            *discussion_trace.reasons,
-                            *plugin_contract.reasons,
-                            *_multi_agent_participation_reasons(
-                                evidence,
-                                case_id=run_request.case_id,
-                                contract_reasons=multi_agent_contract_reasons,
-                            ),
-                            *generated_project_validation.reasons,
-                            *_self_repair_trace_reasons(
-                                evidence,
-                                case_id=run_request.case_id,
-                            ),
-                        ),
-                    ),
+                    body=repair_body,
                     idempotency_key=_deliverable_repair_idempotency_key(
                         run_request.case_id,
                         index,
@@ -1095,9 +1096,14 @@ def execute_project_scale_plan(
                         and evidence["deliverable_repair_trace"]
                     )
                 )
-                repair_workspace_bundle = _merged_workspace_bundle(
-                    current_workspace_bundle,
-                    repair_observation.workspace_bundle,
+                repair_workspace_bundle = (
+                    repair_observation.workspace_bundle
+                    if repair_body.get("replace_workspace_files") is True
+                    and _workspace_bundle_is_authoritative(repair_observation.workspace_bundle)
+                    else _merged_workspace_bundle(
+                        current_workspace_bundle,
+                        repair_observation.workspace_bundle,
+                    )
                 )
                 current_workspace_bundle = repair_workspace_bundle
                 deliverable_quality = _evaluate_deliverable_quality(
@@ -1766,6 +1772,26 @@ def _workspace_bundle_from_file_bytes(files: Mapping[str, bytes]) -> bytes:
         for path in sorted(files):
             archive.writestr(path, files[path])
     return buffer.getvalue()
+
+
+def _workspace_bundle_is_authoritative(workspace_bundle: bytes | None) -> bool:
+    if workspace_bundle is None:
+        return False
+    files = _workspace_bundle_file_bytes(workspace_bundle)
+    if not files:
+        return False
+    required = {
+        "package.json",
+        "README.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+    }
+    paths = set(files)
+    return (
+        required.issubset(paths)
+        and any(path.startswith("src/") for path in paths)
+        and any(path.startswith("tests/") for path in paths)
+    )
 
 
 def _merge_evidence_checks(*checks: _EvidenceCheck) -> _EvidenceCheck:
@@ -3310,6 +3336,7 @@ def _deliverable_repair_body(
         repair_body["allow_scale_mode_upgrade"] = False
     original_message = body.get("message")
     if benchmark_kind == "capability":
+        repair_body["replace_workspace_files"] = True
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
         guidance = (

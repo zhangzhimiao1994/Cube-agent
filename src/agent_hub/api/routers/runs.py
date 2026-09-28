@@ -92,6 +92,7 @@ class RunServiceProtocol(Protocol):
         reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
         allow_scale_mode_upgrade: bool = True,
+        replace_workspace_files: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
@@ -260,6 +261,7 @@ class CreateRunRequest(BaseModel):
     )
     allow_workflow_adjustment: bool = False
     allow_scale_mode_upgrade: bool = True
+    replace_workspace_files: bool = False
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
@@ -1186,6 +1188,7 @@ async def create_run(
             reference_workflow_id=body.reference_workflow_id,
             allow_workflow_adjustment=body.allow_workflow_adjustment,
             allow_scale_mode_upgrade=body.allow_scale_mode_upgrade,
+            replace_workspace_files=body.replace_workspace_files,
             conversation_id=body.conversation_id,
             reference_conversation_id=body.reference_conversation_id,
             attachment_ids=body.attachment_ids,
@@ -1270,6 +1273,7 @@ async def queue_conversation_message(
             reference_workflow_id=body.reference_workflow_id,
             allow_workflow_adjustment=body.allow_workflow_adjustment,
             allow_scale_mode_upgrade=body.allow_scale_mode_upgrade,
+            replace_workspace_files=body.replace_workspace_files,
             direct_model=body.direct_model,
             vibe_coding=body.vibe_coding,
             skip_evolution_proposal=body.skip_evolution_proposal,

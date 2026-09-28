@@ -621,6 +621,21 @@ def _markdown_workspace_batch_is_complete(files: Mapping[str, str]) -> bool:
     )
 
 
+def _workspace_file_set_is_authoritative(paths: Mapping[str, object] | set[str]) -> bool:
+    names = set(paths)
+    required = {
+        "package.json",
+        "README.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+    }
+    return (
+        required.issubset(names)
+        and any(path.startswith("src/") for path in names)
+        and any(path.startswith("tests/") for path in names)
+    )
+
+
 def _website_preview_workspace_bundle_from_model_text(
     text: str,
     context: TaskContext,
@@ -1076,6 +1091,17 @@ class DirectRuntime:
         known_files: Mapping[str, str],
         deadline: float,
     ) -> Mapping[str, JsonValue]:
+        if (
+            context.routing_decision.get("replace_workspace_files") is True
+            and _workspace_file_set_is_authoritative(known_files)
+        ):
+            await self._execute_workspace_capability(
+                context,
+                name="workspace.prune",
+                arguments={"keep_paths": tuple(sorted(known_files))},
+                idempotency_key=f"direct-prune-{context.run_id.hex}",
+                deadline=deadline,
+            )
         manifest = json.dumps(
             {
                 "schema_version": 1,

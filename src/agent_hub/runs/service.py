@@ -510,6 +510,7 @@ class RunService:
         reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
         allow_scale_mode_upgrade: bool = True,
+        replace_workspace_files: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
@@ -556,6 +557,7 @@ class RunService:
             "workflow_id": workflow_id,
             "allow_workflow_adjustment": allow_workflow_adjustment,
             "allow_scale_mode_upgrade": allow_scale_mode_upgrade,
+            "replace_workspace_files": replace_workspace_files,
             "workflow_adjustment_policy": "ask_before_apply"
             if allow_workflow_adjustment
             else "strict_preset",
