@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -74,6 +75,7 @@ _AGENT_STANDARD_EVIDENCE_FILENAMES = frozenset(
         "constraints_reading_evidence.json",
     }
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 def _model_output_has_agent_standard_evidence(value: object) -> bool:
@@ -285,6 +287,7 @@ def _workspace_delivery_initial_seconds(
     *,
     initial_remaining_seconds: float,
     absolute_remaining_seconds: float,
+    initial_progress_units: int = 1,
 ) -> float:
     initial_remaining = max(0.001, float(initial_remaining_seconds))
     absolute_remaining = max(0.001, float(absolute_remaining_seconds))
@@ -304,8 +307,15 @@ def _workspace_delivery_initial_seconds(
         if type(complexity_value) is int and complexity_value > 0
         else 1
     )
-    first_progress_slice = float(soft_value) / complexity
-    return min(absolute_remaining, max(initial_remaining, first_progress_slice))
+    progress_units = (
+        initial_progress_units
+        if type(initial_progress_units) is int and initial_progress_units > 0
+        else 1
+    )
+    bootstrap_budget = (
+        float(soft_value) * min(progress_units, complexity) / complexity
+    )
+    return min(absolute_remaining, max(initial_remaining, bootstrap_budget))
 
 
 def _prompt_token_budget(context: TaskContext) -> int:
@@ -1019,6 +1029,12 @@ class DirectRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - redact capability boundary
+            _LOGGER.warning(
+                "direct_workspace_capability_failed run_id=%s capability=%s error_type=%s",
+                context.run_id,
+                name,
+                type(error).__name__,
+            )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1128,6 +1144,7 @@ class DirectRuntime:
             context,
             initial_remaining_seconds=initial_remaining,
             absolute_remaining_seconds=remaining_absolute_seconds,
+            initial_progress_units=len(initial_batch.files) + 2,
         )
         delivery_deadline = deadline_from_routing(
             context.routing_decision,

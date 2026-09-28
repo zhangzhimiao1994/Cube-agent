@@ -913,6 +913,30 @@ def test_workspace_delivery_bootstrap_respects_remaining_absolute_budget() -> No
     ) == 12.0
 
 
+def test_workspace_delivery_bootstrap_scales_with_initial_batch_work() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a multi-file project after a long model response.",
+        timeout_seconds=600,
+        token_budget=5_000,
+        routing_decision={
+            "runtime_timeout_source": "project_scale_soft_budget",
+            "runtime_timeout_soft_seconds": 300.0,
+            "runtime_timeout_absolute_seconds": 3_600.0,
+            "critical_path_complexity_units": 6,
+        },
+    )
+
+    assert _workspace_delivery_initial_seconds(
+        context,
+        initial_remaining_seconds=0.001,
+        absolute_remaining_seconds=3_000.0,
+        initial_progress_units=8,
+    ) == 300.0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("project_scale", ("large", "ultra"))
 async def test_direct_workspace_batches_extend_soft_token_budget_from_progress(
