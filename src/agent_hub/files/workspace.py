@@ -509,7 +509,19 @@ def _safe_workspace_path(value: str) -> str:
     parts = posix.parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("workspace path must not escape the session")
-    if any(part.startswith(".") for part in parts):
+    allowed_metadata_dotfiles = {
+        ".dockerignore",
+        ".editorconfig",
+        ".eslintignore",
+        ".gitattributes",
+        ".gitignore",
+        ".nvmrc",
+        ".prettierignore",
+    }
+    hidden_parts = tuple(part for part in parts if part.startswith("."))
+    if hidden_parts and not (
+        len(parts) == 1 and parts[0] in allowed_metadata_dotfiles
+    ):
         raise ValueError("workspace path must not contain hidden files")
     return posix.as_posix()
 

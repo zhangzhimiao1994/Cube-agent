@@ -81,6 +81,31 @@ def test_project_workspace_store_rejects_unsafe_relative_paths(
         )
 
 
+def test_project_workspace_store_allows_known_project_metadata_dotfiles(
+    tmp_path: Path,
+) -> None:
+    tenant_id = uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+
+    metadata = store.write_bytes(
+        tenant_id=tenant_id,
+        project_id="project",
+        session_id="session",
+        relative_path=".gitignore",
+        data=b"node_modules/\n",
+        mime_type="text/plain",
+    )
+
+    assert metadata.path == ".gitignore"
+    assert [item.path for item in store.list_files(tenant_id, "project", "session")] == [
+        ".gitignore"
+    ]
+    bundle = store.create_session_zip(tenant_id, "project", "session")
+    with zipfile.ZipFile(bundle.path) as archive:
+        assert archive.namelist() == [".gitignore"]
+        assert archive.read(".gitignore") == b"node_modules/\n"
+
+
 def test_project_workspace_store_rejects_symlink_escape_on_download(tmp_path: Path) -> None:
     tenant_id = uuid4()
     store = ProjectWorkspaceStore(tmp_path)
