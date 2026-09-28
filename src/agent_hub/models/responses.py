@@ -21,7 +21,18 @@ from agent_hub.models.types import (
     ToolCall,
 )
 
-_MAX_BYTES = 262_144
+_LEGACY_INPUT_BYTES = 262_144
+_ABSOLUTE_INPUT_BYTES = 2_097_152
+_ABSOLUTE_OUTPUT_BYTES = 262_144
+_LEGACY_OUTPUT_BYTES = 65_536
+_BYTES_PER_OUTPUT_TOKEN = 8
+_LEGACY_MESSAGE_COUNT = 64
+_ABSOLUTE_MESSAGE_COUNT = 512
+_MESSAGE_BUDGET_BYTES = 4_096
+_LEGACY_TOOL_ARGUMENT_BYTES = 32_768
+_ABSOLUTE_TOOL_ARGUMENT_BYTES = 524_288
+_PROJECT_ZIP_INLINE_ARGUMENT_BYTES = 128_000
+_PROJECT_ZIP_TOOL_NAMES = frozenset({"project.generate_zip", "project_generate_zip"})
 _MAX_DEPTH = 64
 _MAX_NODES = 16_384
 
@@ -47,7 +58,74 @@ def _get(value: object, key: str) -> Any:
     return getattr(value, key, None)
 
 
-def _plain_json(value: object) -> Any:
+def _estimated_input_tokens(request: ModelRequest) -> int:
+    encoded_bytes = 0
+    for message in request.messages:
+        if isinstance(message.content, str):
+            encoded_bytes += len(message.content.encode("utf-8"))
+        else:
+            encoded_bytes += len(
+                json.dumps(
+                    message.content,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+    return max(1, (encoded_bytes + 3) // 4 + len(request.messages) * 8)
+
+
+def _effective_output_tokens(deployment: Deployment, request: ModelRequest) -> int:
+    limit = request.max_output_tokens
+    if deployment.max_output_tokens is not None:
+        limit = min(limit, deployment.max_output_tokens)
+    if deployment.context_window_tokens is not None:
+        available = deployment.context_window_tokens - _estimated_input_tokens(request)
+        if available <= 0:
+            raise ResponsesContractError("Responses input exceeds deployment context window")
+        limit = min(limit, available)
+    if limit <= 0:  # pragma: no cover - guarded by request and deployment contracts
+        raise ResponsesContractError("Responses output capacity is unavailable")
+    return limit
+
+
+def _output_byte_limit(max_output_tokens: int) -> int:
+    return min(
+        _ABSOLUTE_OUTPUT_BYTES,
+        max(_LEGACY_OUTPUT_BYTES, max_output_tokens * _BYTES_PER_OUTPUT_TOKEN),
+    )
+
+
+def _input_byte_limit(deployment: Deployment) -> int:
+    if deployment.context_window_tokens is None:
+        return _LEGACY_INPUT_BYTES
+    return min(
+        _ABSOLUTE_INPUT_BYTES,
+        max(_LEGACY_INPUT_BYTES, deployment.context_window_tokens * 4),
+    )
+
+
+def _input_message_limit(deployment: Deployment) -> int:
+    return min(
+        _ABSOLUTE_MESSAGE_COUNT,
+        max(_LEGACY_MESSAGE_COUNT, _input_byte_limit(deployment) // _MESSAGE_BUDGET_BYTES),
+    )
+
+
+def _tool_argument_byte_limit(request: ModelRequest, tool_name: str) -> int:
+    dynamic_limit = min(
+        _ABSOLUTE_TOOL_ARGUMENT_BYTES,
+        max(
+            _LEGACY_TOOL_ARGUMENT_BYTES,
+            request.max_output_tokens * _BYTES_PER_OUTPUT_TOKEN,
+        ),
+    )
+    if tool_name in _PROJECT_ZIP_TOOL_NAMES:
+        return min(dynamic_limit, _PROJECT_ZIP_INLINE_ARGUMENT_BYTES)
+    return dynamic_limit
+
+
+def _plain_json(value: object, *, max_bytes: int = _LEGACY_INPUT_BYTES) -> Any:
     remaining = _MAX_NODES
 
     def walk(item: object, depth: int) -> Any:
@@ -68,15 +146,19 @@ def _plain_json(value: object) -> Any:
         raise ResponsesContractError("Responses JSON has invalid values")
 
     result = walk(value, 0)
-    if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode()) > _MAX_BYTES:
+    if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode()) > min(
+        max_bytes, _ABSOLUTE_INPUT_BYTES
+    ):
         raise ResponsesContractError("Responses JSON exceeds byte limit")
     return result
 
 
-def _schema(request: ModelRequest) -> dict[str, Any]:
+def _schema(
+    request: ModelRequest, *, max_bytes: int = _LEGACY_INPUT_BYTES
+) -> dict[str, Any]:
     if request.response_schema is None:
         raise ResponsesContractError("Responses request requires a schema")
-    schema = _plain_json(request.response_schema.schema)
+    schema = _plain_json(request.response_schema.schema, max_bytes=max_bytes)
 
     def check(item: object) -> None:
         if isinstance(item, dict):
@@ -130,22 +212,23 @@ def _schema(request: ModelRequest) -> dict[str, Any]:
 
 
 def response_create_kwargs(deployment: Deployment, request: ModelRequest) -> dict[str, object]:
-    schema = _schema(request)
+    input_byte_limit = _input_byte_limit(deployment)
+    schema = _schema(request, max_bytes=input_byte_limit)
     assert request.response_schema is not None
-    if not 1 <= len(request.messages) <= 64:
+    if not 1 <= len(request.messages) <= _input_message_limit(deployment):
         raise ResponsesContractError("Responses input message count is invalid")
     messages: list[dict[str, object]] = []
     for message in request.messages:
         if type(message.content) is not str or message.role not in {"system", "user", "assistant"}:
             raise ResponsesContractError("Responses input combination is unsupported")
         messages.append({"role": message.role, "content": message.content})
-    _plain_json(messages)
+    _plain_json(messages, max_bytes=input_byte_limit)
     if len(request.tools) > 128 or len({tool.name for tool in request.tools}) != len(request.tools):
         raise ResponsesContractError("Responses input tools are invalid")
     payload: dict[str, object] = {
         "model": deployment.request_model or deployment.provider_model,
         "input": messages,
-        "max_output_tokens": request.max_output_tokens,
+        "max_output_tokens": _effective_output_tokens(deployment, request),
         "timeout": request.timeout_seconds,
         "stream": False,
         "store": False,
@@ -164,16 +247,17 @@ def response_create_kwargs(deployment: Deployment, request: ModelRequest) -> dic
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": _plain_json(tool.parameters),
+                "parameters": _plain_json(tool.parameters, max_bytes=input_byte_limit),
             }
             for tool in request.tools
         ]
         payload["tool_choice"] = "auto"
+    _plain_json(payload, max_bytes=input_byte_limit)
     return payload
 
 
-def _loads(text: str) -> object:
-    if len(text.encode()) > 65_536:
+def _loads(text: str, *, max_bytes: int) -> object:
+    if len(text.encode()) > min(max_bytes, _ABSOLUTE_OUTPUT_BYTES):
         raise ResponsesContractError("Responses output exceeds byte limit")
 
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
@@ -189,7 +273,7 @@ def _loads(text: str) -> object:
 
     try:
         value = json.loads(text, object_pairs_hook=pairs, parse_constant=reject_constant)
-        return _plain_json(value)
+        return _plain_json(value, max_bytes=max_bytes)
     except (ValueError, RecursionError, OverflowError):
         raise ResponsesContractError("Responses output is not bounded strict JSON") from None
 
@@ -236,6 +320,7 @@ def _parse_output(
     response: object, request: ModelRequest, usage: TokenUsage | None,
     schema: dict[str, Any], rejected: _RejectOutput,
 ) -> ModelResponse:
+    output_byte_limit = _output_byte_limit(request.max_output_tokens)
     if (
         _get(response, "status") != "completed"
         or _get(response, "error") is not None
@@ -280,6 +365,9 @@ def _parse_output(
                 texts.append(text)
         elif kind == "function_call":
             call_id, name, arguments = (_get(item, key) for key in ("call_id", "name", "arguments"))
+            argument_limit = (
+                _tool_argument_byte_limit(request, name) if type(name) is str else 0
+            )
             if (
                 type(call_id) is not str
                 or not call_id
@@ -288,13 +376,13 @@ def _parse_output(
                 or type(name) is not str
                 or name not in permitted_names
                 or type(arguments) is not str
-                or len(arguments.encode()) > 32_768
+                or len(arguments.encode()) > argument_limit
                 or _get(item, "status") not in {None, "completed"}
                 or len(calls) >= 16
             ):
                 raise rejected("invalid_tool")
             try:
-                parsed = _loads(arguments)
+                parsed = _loads(arguments, max_bytes=argument_limit)
                 if not isinstance(parsed, dict):
                     raise rejected("invalid_tool")
                 calls.append(ToolCall(id=call_id, name=name, arguments=parsed))
@@ -303,7 +391,7 @@ def _parse_output(
             call_ids.add(call_id)
         else:
             raise ResponsesContractError("Responses output item type is unsupported")
-    if sum(len(text.encode()) for text in texts) > 65_536:
+    if sum(len(text.encode()) for text in texts) > output_byte_limit:
         raise rejected("output_limit", status="completed")
     text = "".join(texts) if texts else None
     if calls and texts:
@@ -312,7 +400,7 @@ def _parse_output(
         if text is None:
             raise ResponsesContractError("Responses output has no final result")
         try:
-            instance = _loads(text)
+            instance = _loads(text, max_bytes=output_byte_limit)
         except ResponsesContractError:
             raise rejected("invalid_json", status="completed", final_text=text) from None
         if not Draft202012Validator(schema).is_valid(instance):

@@ -152,6 +152,7 @@ async def test_schema_message_size_rejected_before_gateway_and_running_ledger(
         plan.agents[0].model_copy(update={'output_schema': {'summary': 'x' * 512}}),
     )})
     monkeypatch.setattr(adapter, '_MAX_PROMPT_BYTES', 768)
+    monkeypatch.setattr(adapter, '_ABSOLUTE_PROMPT_BYTES', 768)
     gateway = FakeGateway()
     runtime = CrewDispatchRuntime(gateway, plan, crew_factory=FastFactory())
     events: list[RunEvent] = []
@@ -178,6 +179,7 @@ async def test_reviewer_contract_counts_toward_size_before_its_ledger_entry(
     assert_contract(review)
     limit = sum(len(str(message.content).encode()) for message in review.messages) + 1024
     monkeypatch.setattr(adapter, '_MAX_PROMPT_BYTES', limit)
+    monkeypatch.setattr(adapter, '_ABSOLUTE_PROMPT_BYTES', limit)
     monkeypatch.setattr(adapter, '_REVIEW_RESPONSE_SCHEMA', replace(
         adapter._REVIEW_RESPONSE_SCHEMA,
         schema={**adapter._REVIEW_RESPONSE_SCHEMA.schema, 'description': 'x' * limit},

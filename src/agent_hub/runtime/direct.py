@@ -13,7 +13,12 @@ from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityUnavailable
-from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput, ModelGatewayError
+from agent_hub.models.gateway import (
+    ConservativeTokenEstimator,
+    GatewayCompletion,
+    GatewayRejectedOutput,
+    ModelGatewayError,
+)
 from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
@@ -53,8 +58,10 @@ _MAX_WORKSPACE_BUNDLE_BYTES = 100 * 1024 * 1024
 _MAX_WORKSPACE_FILE_BYTES = 50 * 1024 * 1024
 _MAX_WORKSPACE_BUNDLE_FILES = 512
 _MAX_MODEL_RESPONSE_BYTES = _MAX_WORKSPACE_BUNDLE_BYTES + 4 * 1024 * 1024
-_MAX_CONTEXT_BYTES = 196_608
-_MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
+_MAX_CONTEXT_BYTES = 2_000_000
+_MIN_CONTEXT_BYTES = 65_536
+_CONTEXT_BYTES_PER_TOKEN = 6
+_HISTORY_TOKEN_SHARE = 0.5
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
 _MAX_MODEL_OUTPUT_TOKENS = 1_000_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -182,6 +189,64 @@ def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
         return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
     prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
     return f"{prefix}{suffix}"
+
+
+def _estimate_text_tokens(value: str) -> int:
+    return ConservativeTokenEstimator._estimate_text_tokens(value)
+
+
+def _effective_context_token_budget(context: TaskContext) -> int:
+    budget = context.token_budget
+    for key in ("main_agent_context_window_tokens", "context_window_tokens"):
+        value = context.routing_decision.get(key)
+        if type(value) is int and value > 0:
+            budget = min(budget, value)
+            break
+    return max(1, budget)
+
+
+def _prompt_token_budget(context: TaskContext) -> int:
+    effective = _effective_context_token_budget(context)
+    output_reserve = min(
+        _max_direct_output_tokens_for_context(context),
+        max(256, effective // 4),
+    )
+    return max(1, effective - output_reserve)
+
+
+def _context_byte_budget(context: TaskContext) -> int:
+    return min(
+        _MAX_CONTEXT_BYTES,
+        max(_MIN_CONTEXT_BYTES, _prompt_token_budget(context) * _CONTEXT_BYTES_PER_TOKEN),
+    )
+
+
+def _truncate_prompt_text_to_budget(
+    value: str,
+    *,
+    max_tokens: int,
+    max_bytes: int,
+) -> str:
+    bounded = _truncate_prompt_text(value, max_bytes=max_bytes)
+    if _estimate_text_tokens(bounded) <= max_tokens:
+        return bounded
+    suffix = (
+        f"\n\n[truncated: original_bytes={len(value.encode('utf-8'))}; "
+        f"estimated_tokens={_estimate_text_tokens(value)}]"
+    )
+    low = 0
+    high = len(value)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = f"{value[:midpoint]}{suffix}"
+        if (
+            len(candidate.encode("utf-8")) <= max_bytes
+            and _estimate_text_tokens(candidate) <= max_tokens
+        ):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return _truncate_prompt_text(f"{value[:low]}{suffix}", max_bytes=max_bytes)
 
 
 def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
@@ -532,6 +597,9 @@ def _safe_workspace_bundle_path(value: str) -> str | None:
 
 def _serialized_prior_artifacts(
     artifacts: tuple[Artifact, ...],
+    *,
+    token_budget: int,
+    byte_budget: int,
 ) -> tuple[str, tuple[str, ...]]:
     entries: list[dict[str, object]] = []
     source_ids: list[str] = []
@@ -553,14 +621,18 @@ def _serialized_prior_artifacts(
         source_texts.append(text)
 
     included_text = 0
-    budget = _MAX_CONTEXT_BYTES // 2
+    bounded_token_budget = max(1, token_budget)
+    bounded_byte_budget = max(1, min(byte_budget, _MAX_CONTEXT_BYTES))
+    per_artifact_tokens = max(1, bounded_token_budget // max(1, len(entries)))
+    per_artifact_bytes = max(1, bounded_byte_budget // max(1, len(entries)))
     for index in range(len(entries) - 1, -1, -1):
         text = source_texts[index]
         if text is None:
             continue
-        entries[index]["text"] = _truncate_prompt_text(
+        entries[index]["text"] = _truncate_prompt_text_to_budget(
             text,
-            max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+            max_tokens=per_artifact_tokens,
+            max_bytes=per_artifact_bytes,
         )
         candidate = json.dumps(
             {
@@ -572,7 +644,10 @@ def _serialized_prior_artifacts(
             sort_keys=True,
             separators=(",", ":"),
         )
-        if len(candidate.encode("utf-8")) > budget:
+        if (
+            len(candidate.encode("utf-8")) > bounded_byte_budget
+            or _estimate_text_tokens(candidate) > bounded_token_budget
+        ):
             entries[index].pop("text", None)
             continue
         included_text += 1
@@ -855,7 +930,7 @@ class DirectRuntime:
                 prompt_estimate=prompt_estimate,
                 response_text=response.text or "",
                 request_max_output_tokens=request.max_output_tokens,
-                context_token_budget=context.token_budget,
+                context_token_budget=_effective_context_token_budget(context),
             )
             if budget_outcome.usage is None:
                 _raise_execution_error(
@@ -900,7 +975,7 @@ class DirectRuntime:
                     written_paths=tuple(sorted(known_files)),
                 )
 
-            remaining_tokens = context.token_budget - (
+            remaining_run_tokens = context.token_budget - (
                 total_prompt_tokens + total_completion_tokens
             )
             remaining_seconds = deadline - asyncio.get_running_loop().time()
@@ -922,7 +997,7 @@ class DirectRuntime:
                 ),
             )
             next_messages = (*base_messages, progress_message)
-            next_prompt_estimate = len(
+            next_prompt_estimate = _estimate_text_tokens(
                 json.dumps(
                     [
                         {"role": item.role, "content": item.content}
@@ -932,11 +1007,12 @@ class DirectRuntime:
                     allow_nan=False,
                     sort_keys=True,
                     separators=(",", ":"),
-                ).encode("utf-8")
+                )
             )
             next_output_tokens = min(
                 initial_request.max_output_tokens,
-                remaining_tokens - next_prompt_estimate,
+                _effective_context_token_budget(context) - next_prompt_estimate,
+                remaining_run_tokens - next_prompt_estimate,
             )
             if remaining_seconds <= 0 or next_output_tokens <= 0:
                 _raise_execution_error("workspace delivery budget is exhausted")
@@ -982,10 +1058,10 @@ class DirectRuntime:
         deadline: float,
     ) -> ModelRequest | None:
         remaining_seconds = deadline - asyncio.get_running_loop().time()
-        remaining_tokens = context.token_budget - consumed_tokens
         max_output_tokens = min(
             request.max_output_tokens,
-            remaining_tokens - prompt_estimate,
+            _effective_context_token_budget(context) - prompt_estimate,
+            context.token_budget - consumed_tokens - prompt_estimate,
         )
         if remaining_seconds <= 0 or max_output_tokens <= 0:
             return None
@@ -1369,7 +1445,7 @@ class DirectRuntime:
                     prompt_estimate=prompt_estimate,
                     response_text=text,
                     request_max_output_tokens=request.max_output_tokens,
-                    context_token_budget=context.token_budget,
+                    context_token_budget=_effective_context_token_budget(context),
                 )
                 if budget_outcome.usage is None:
                     budget_error_code = (
@@ -1621,7 +1697,7 @@ class DirectRuntime:
             del prompt, context, messages
             return outcome
         max_output_tokens = min(
-            context.token_budget - prompt.prompt_estimate,
+            _effective_context_token_budget(context) - prompt.prompt_estimate,
             _max_direct_output_tokens_for_context(context),
         )
         if max_output_tokens <= 0:
@@ -1669,7 +1745,13 @@ class DirectRuntime:
         messages: tuple[ModelMessage, ...] | None = None
         error_code: str | None = None
         try:
-            prior_payload, included_source_ids = _serialized_prior_artifacts(context.artifacts)
+            prompt_token_budget = _prompt_token_budget(context)
+            context_byte_budget = _context_byte_budget(context)
+            prior_payload, included_source_ids = _serialized_prior_artifacts(
+                context.artifacts,
+                token_budget=max(1, int(prompt_token_budget * _HISTORY_TOKEN_SHARE)),
+                byte_budget=max(1, context_byte_budget // 2),
+            )
             task_payload = json.dumps(
                 {"request": context.request},
                 ensure_ascii=False,
@@ -1718,7 +1800,7 @@ class DirectRuntime:
                 f"{preflight_context}\n"
                 f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
             )
-            if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:
+            if len(payload.encode("utf-8")) > context_byte_budget:
                 error_code = "runtime context exceeds size limit"
             else:
                 messages = (
@@ -1754,7 +1836,7 @@ class DirectRuntime:
             outcome = _PromptOutcome(
                 messages=messages,
                 included_source_ids=included_source_ids,
-                prompt_estimate=len(serialized_messages.encode("utf-8")),
+                prompt_estimate=_estimate_text_tokens(serialized_messages),
             )
         else:
             outcome = _PromptOutcome(error_code=error_code or "runtime prompt is invalid")
@@ -1864,7 +1946,7 @@ class DirectRuntime:
                 completion_exceeded_request=usage.completion_tokens
                 > request_max_output_tokens,
             )
-        completion_estimate = len(response_text.encode("utf-8"))
+        completion_estimate = _estimate_text_tokens(response_text)
         try:
             estimated = TokenUsage(
                 prompt_tokens=prompt_estimate,

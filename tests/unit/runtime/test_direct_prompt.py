@@ -342,7 +342,7 @@ module.exports = { add };
     }
 
 
-def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -> None:
+def test_direct_prompt_compacts_artifact_text_to_small_runtime_window() -> None:
     original_text = "长文本" * 1_000
     artifact = Artifact(
         id=uuid4(),
@@ -356,7 +356,8 @@ def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -
         mode=TaskMode.DIRECT,
         request="Synthesize the artifacts.",
         artifacts=(artifact,),
-        token_budget=1_000_000,
+        token_budget=4_096,
+        routing_decision={"main_agent_context_window_tokens": 4_096},
     )
     runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
 
@@ -365,7 +366,8 @@ def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -
     assert request is not None
     user_content = request.messages[-1].content
     assert isinstance(user_content, str)
-    assert "[truncated:" in user_content
+    assert original_text not in user_content
+    assert '"compacted_artifact_count":1' in user_content
     assert request.max_output_tokens <= 8192
     assert len(user_content.encode("utf-8")) < len(original_text.encode("utf-8"))
     assert artifact.content["text"] == original_text
@@ -396,9 +398,69 @@ def test_direct_prompt_compacts_many_artifacts_at_soft_waterline() -> None:
     assert outcome.messages is not None
     assert outcome.error_code is None
     assert outcome.included_source_ids == tuple(str(artifact.id) for artifact in artifacts)
-    assert outcome.prompt_estimate <= 196_608
+    assert outcome.prompt_estimate > 196_608
+    assert outcome.prompt_estimate < task.token_budget
     rendered = "\n".join(cast(str, item.content) for item in outcome.messages)
     assert "compacted_artifact_count" in rendered
+
+
+def test_direct_prompt_uses_larger_runtime_window_for_artifact_history() -> None:
+    marker = "EARLY_DECISION_MUST_SURVIVE"
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="context_loader",
+        content={"text": "x" * 55_000 + marker},
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    small = runtime._build_prompt(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=uuid4(),
+            mode=TaskMode.DIRECT,
+            request="Recall the earlier decision.",
+            artifacts=(artifact,),
+            token_budget=8_192,
+            routing_decision={"main_agent_context_window_tokens": 8_192},
+        )
+    )
+    large = runtime._build_prompt(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=uuid4(),
+            mode=TaskMode.DIRECT,
+            request="Recall the earlier decision.",
+            artifacts=(artifact,),
+            token_budget=128_000,
+            routing_decision={"main_agent_context_window_tokens": 128_000},
+        )
+    )
+
+    assert small.messages is not None
+    assert large.messages is not None
+    small_text = "\n".join(cast(str, message.content) for message in small.messages)
+    large_text = "\n".join(cast(str, message.content) for message in large.messages)
+    assert marker not in small_text
+    assert marker in large_text
+    assert large.prompt_estimate > small.prompt_estimate
+
+
+def test_direct_request_respects_deployment_context_window() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Summarize the project.",
+        token_budget=128_000,
+        routing_decision={"main_agent_context_window_tokens": 8_192},
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    outcome = runtime._build_request(context)
+
+    assert outcome.request is not None
+    assert outcome.prompt_estimate + outcome.request.max_output_tokens <= 8_192
 
 
 @pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
@@ -561,6 +623,51 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
     assert "package.json" not in rendered
     completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
     assert completed.payload["workspace_delivery"]
+
+
+@pytest.mark.asyncio
+async def test_direct_project_delivery_keeps_request_window_separate_from_run_budget() -> None:
+    responses = tuple(
+        ModelResponse(
+            text=json.dumps(
+                {
+                    "workspace_batch": {
+                        "files": {f"src/part-{index}.txt": f"part {index}\n"},
+                        "complete": index == 2,
+                        "continuation": "continue" if index < 2 else "",
+                    },
+                    "summary": f"Part {index} written.",
+                }
+            ),
+            usage=TokenUsage(200, 300, 500),
+        )
+        for index in range(3)
+    )
+    gateway = SequencedDirectGateway(responses)
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=RecordingCapabilityGateway(),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a large project in several workspace batches.",
+        timeout_seconds=600,
+        token_budget=5_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "main_agent_context_window_tokens": 1_000,
+        },
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert len(gateway.requests) == 3
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio

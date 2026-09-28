@@ -437,10 +437,14 @@ class ModelGateway:
         capacity: CapacityController | CapacityPool,
         lease: CapacityLease,
         *,
+        deadline: float,
         status_code: int | None,
         latency_seconds: float,
         succeeded: bool,
     ) -> None:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise TimeoutError
         await asyncio.wait_for(
             capacity.record_outcome(
                 lease.quota_scope_id,
@@ -448,10 +452,11 @@ class ModelGateway:
                 latency_seconds=latency_seconds,
                 succeeded=succeeded,
             ),
-            timeout=self._capacity_wait_timeout,
+            timeout=min(self._capacity_wait_timeout, remaining_seconds),
         )
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         (
             candidate_groups,
             attempted_logical_models,
@@ -468,6 +473,9 @@ class ModelGateway:
         input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         last_retryable_error: BaseException | None = None
         for logical_model, candidates in candidate_groups:
+            remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                break
             attempted_logical_models.append(logical_model)
             compatible_candidates = self._context_compatible_candidates(
                 candidates, input_tokens
@@ -481,13 +489,27 @@ class ModelGateway:
                 request, compatible_candidates, input_tokens
             )
             try:
-                await capacity.initialize()
-                lease = await capacity.acquire(
-                    compatible_candidates,
-                    self._capacity_wait_timeout,
-                    estimated_tokens=estimated_tokens,
+                await asyncio.wait_for(
+                    capacity.initialize(),
+                    timeout=min(self._capacity_wait_timeout, remaining_seconds),
                 )
-            except (CapacityWaitTimeout, CapacityQueueFull):
+                remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    raise TimeoutError
+                acquire_timeout = min(
+                    self._capacity_wait_timeout,
+                    request.timeout_seconds,
+                    remaining_seconds,
+                )
+                lease = await asyncio.wait_for(
+                    capacity.acquire(
+                        compatible_candidates,
+                        acquire_timeout,
+                        estimated_tokens=estimated_tokens,
+                    ),
+                    timeout=acquire_timeout,
+                )
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
                 if fallback_from_logical_model is None:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
@@ -501,16 +523,26 @@ class ModelGateway:
                 None,
             )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
-                cleanup_error = await self._release_cleanup(capacity, lease)
+                cleanup_error = await self._release_cleanup(
+                    capacity, lease, deadline=request_deadline
+                )
                 if isinstance(cleanup_error, asyncio.CancelledError):
                     raise cleanup_error
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
+            remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                cleanup_error = await self._release_cleanup(
+                    capacity, lease, deadline=request_deadline
+                )
+                if cleanup_error is not None:
+                    raise CapacityBackendError("model capacity release failed") from None
+                break
             selected_request = self._request_for_deployment(request, selected, input_tokens)
             try:
                 response = await self._complete_leased(
-                    capacity, selected, lease, selected_request
+                    capacity, selected, lease, selected_request, deadline=request_deadline
                 )
             except ModelResponseCancelled as error:
                 cancelled = self._cancelled_output(
@@ -557,6 +589,7 @@ class ModelGateway:
     async def stream_openai_compatible_events(
         self, request: ModelRequest
     ) -> AsyncIterator[NormalizedProviderEvent]:
+        request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         streaming_transport = self._streaming_transport()
         last_retryable_error: BaseException | None = None
         (
@@ -574,6 +607,9 @@ class ModelGateway:
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         for logical_model, candidates in candidate_groups:
+            remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                break
             attempted_logical_models.append(logical_model)
             compatible_candidates = self._context_compatible_candidates(
                 candidates, input_tokens
@@ -597,14 +633,31 @@ class ModelGateway:
                     reason=fallback_reason,
                     attempted_logical_models=attempted_logical_models,
                 )
+            remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                break
             try:
-                await capacity.initialize()
-                lease = await capacity.acquire(
-                    compatible_candidates,
-                    self._capacity_wait_timeout,
-                    estimated_tokens=estimated_tokens,
+                await asyncio.wait_for(
+                    capacity.initialize(),
+                    timeout=min(self._capacity_wait_timeout, remaining_seconds),
                 )
-            except (CapacityWaitTimeout, CapacityQueueFull):
+                remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    raise TimeoutError
+                acquire_timeout = min(
+                    self._capacity_wait_timeout,
+                    request.timeout_seconds,
+                    remaining_seconds,
+                )
+                lease = await asyncio.wait_for(
+                    capacity.acquire(
+                        compatible_candidates,
+                        acquire_timeout,
+                        estimated_tokens=estimated_tokens,
+                    ),
+                    timeout=acquire_timeout,
+                )
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
                 fallback_from_logical_model = logical_model
                 fallback_reason = "capacity_unavailable"
                 continue
@@ -617,12 +670,22 @@ class ModelGateway:
                 None,
             )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
-                cleanup_error = await self._release_cleanup(capacity, lease)
+                cleanup_error = await self._release_cleanup(
+                    capacity, lease, deadline=request_deadline
+                )
                 if isinstance(cleanup_error, asyncio.CancelledError):
                     raise cleanup_error
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
+            remaining_seconds = request_deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                cleanup_error = await self._release_cleanup(
+                    capacity, lease, deadline=request_deadline
+                )
+                if cleanup_error is not None:
+                    raise CapacityBackendError("model capacity release failed") from None
+                break
             selected_request = self._request_for_deployment(request, selected, input_tokens)
             yielded = False
             events = self._stream_openai_compatible_leased(
@@ -631,6 +694,7 @@ class ModelGateway:
                 lease,
                 selected_request,
                 streaming_transport,
+                deadline=request_deadline,
             )
             try:
                 while True:
@@ -658,7 +722,7 @@ class ModelGateway:
                 fallback_reason = _fallback_reason(error)
                 continue
             finally:
-                await cast(Any, events).aclose()
+                await self._stream_close_cleanup(events, deadline=request_deadline)
             return
         if last_retryable_error is not None:
             raise last_retryable_error from None
@@ -899,6 +963,8 @@ class ModelGateway:
         lease: CapacityLease,
         request: ModelRequest,
         transport: OpenAICompatibleChunkTransport,
+        *,
+        deadline: float,
     ) -> AsyncIterator[NormalizedProviderEvent]:
         primary_error: BaseException | None = None
         transport_started: float | None = None
@@ -907,7 +973,17 @@ class ModelGateway:
         succeeded = False
         try:
             try:
-                api_key = await self._secret_resolver.resolve(deployment.secret_ref)
+                remaining_seconds = deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    raise TimeoutError
+                api_key = await asyncio.wait_for(
+                    self._secret_resolver.resolve(deployment.secret_ref),
+                    timeout=remaining_seconds,
+                )
+            except TimeoutError:
+                primary_error = ModelTransportError(
+                    "model request deadline exhausted", status_code=408
+                )
             except asyncio.CancelledError as error:
                 primary_error = error
             except Exception:  # noqa: BLE001 - redact resolver details at the boundary
@@ -923,12 +999,15 @@ class ModelGateway:
                     request,
                     transport,
                     api_key,
+                    deadline=deadline,
                 )
                 try:
                     yielded = False
                     while True:
                         try:
-                            event = await anext(events)
+                            event = await self._next_stream_event_before_deadline(
+                                events, deadline=deadline
+                            )
                         except StopAsyncIteration:
                             break
                         yielded = True
@@ -938,6 +1017,11 @@ class ModelGateway:
                         succeeded = True
                     else:
                         primary_error = ModelGatewayError("model response is empty")
+                except TimeoutError:
+                    stream_primary_error = ModelTransportError(
+                        "model request deadline exhausted", status_code=408
+                    )
+                    primary_error = stream_primary_error
                 except GeneratorExit as error:
                     stream_primary_error = error
                     primary_error = error
@@ -980,7 +1064,9 @@ class ModelGateway:
                     del error
                     primary_error = ModelGatewayError("model transport failed")
                 finally:
-                    close_error = await self._stream_close_cleanup(events)
+                    close_error = await self._stream_close_cleanup(
+                        events, deadline=deadline
+                    )
                     if close_error is not None and stream_primary_error is None:
                         primary_error = ModelGatewayError("model stream cleanup failed")
                     del api_key
@@ -993,6 +1079,7 @@ class ModelGateway:
                     await self._record_capacity_outcome(
                         capacity,
                         lease,
+                        deadline=deadline,
                         status_code=status_code,
                         latency_seconds=latency,
                         succeeded=succeeded,
@@ -1003,7 +1090,9 @@ class ModelGateway:
                 except Exception:  # noqa: BLE001 - preserve any primary model failure
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
-            release_error = await self._release_cleanup(capacity, lease)
+            release_error = await self._release_cleanup(
+                capacity, lease, deadline=deadline
+            )
             if isinstance(release_error, asyncio.CancelledError) and isinstance(
                 primary_error, ModelResponseError
             ):
@@ -1025,6 +1114,8 @@ class ModelGateway:
         request: ModelRequest,
         transport: OpenAICompatibleChunkTransport,
         api_key: str,
+        *,
+        deadline: float,
     ) -> AsyncIterator[NormalizedProviderEvent]:
         from agent_hub.harness.streaming import transport_openai_compatible_stream_events
 
@@ -1068,7 +1159,7 @@ class ModelGateway:
             if not heartbeat_task.done():
                 heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
-            close_error = await self._stream_close_cleanup(events)
+            close_error = await self._stream_close_cleanup(events, deadline=deadline)
             if close_error is not None and primary_error is None:
                 raise ModelGatewayError("model stream cleanup failed") from None
 
@@ -1077,12 +1168,62 @@ class ModelGateway:
     ) -> NormalizedProviderEvent:
         return await anext(events)
 
-    async def _stream_close_cleanup(self, events: object) -> BaseException | None:
+    async def _next_stream_event_before_deadline(
+        self,
+        events: AsyncIterator[NormalizedProviderEvent],
+        *,
+        deadline: float,
+    ) -> NormalizedProviderEvent:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            raise TimeoutError
+        event_task: asyncio.Task[NormalizedProviderEvent] = asyncio.create_task(
+            self._next_stream_event(events)
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {event_task}, timeout=remaining_seconds
+            )
+        except asyncio.CancelledError:
+            event_task.cancel()
+            await asyncio.gather(event_task, return_exceptions=True)
+            raise
+        if event_task not in done:
+            event_task.cancel()
+
+            def _consume_event_result(task: asyncio.Task[NormalizedProviderEvent]) -> None:
+                if not task.cancelled():
+                    task.exception()
+
+            event_task.add_done_callback(_consume_event_result)
+            raise TimeoutError
+        return event_task.result()
+
+    async def _stream_close_cleanup(
+        self, events: object, *, deadline: float
+    ) -> BaseException | None:
         aclose = getattr(events, "aclose", None)
         if not callable(aclose):
             return None
+        close_task = asyncio.create_task(cast(Any, aclose)())
+        remaining_seconds = max(0.0, deadline - asyncio.get_running_loop().time())
         try:
-            await cast(Any, events).aclose()
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=remaining_seconds)
+        except TimeoutError:
+            close_task.cancel()
+
+            def _consume_close_result(task: asyncio.Task[Any]) -> None:
+                if not task.cancelled():
+                    task.exception()
+
+            close_task.add_done_callback(_consume_close_result)
+            return ModelGatewayError("model stream cleanup failed")
+        except asyncio.CancelledError as error:
+            close_task.cancel()
+            cleanup_error = await _settle_cleanup(close_task)
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                return error
+            return cleanup_error or error
         except BaseException as error:  # noqa: BLE001 - caller preserves primary failures
             return error
         return None
@@ -1093,6 +1234,8 @@ class ModelGateway:
         deployment: Deployment,
         lease: CapacityLease,
         request: ModelRequest,
+        *,
+        deadline: float,
     ) -> ModelResponse:
         primary_error: BaseException | None = None
         response: ModelResponse | None = None
@@ -1102,7 +1245,17 @@ class ModelGateway:
         status_code: int | None = None
         try:
             try:
-                api_key = await self._secret_resolver.resolve(deployment.secret_ref)
+                remaining_seconds = deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    raise TimeoutError
+                api_key = await asyncio.wait_for(
+                    self._secret_resolver.resolve(deployment.secret_ref),
+                    timeout=remaining_seconds,
+                )
+            except TimeoutError:
+                primary_error = ModelTransportError(
+                    "model request deadline exhausted", status_code=408
+                )
             except asyncio.CancelledError as error:
                 primary_error = error
             except Exception:  # noqa: BLE001 - redact resolver details at the boundary
@@ -1114,7 +1267,10 @@ class ModelGateway:
                 )
                 del api_key
                 try:
-                    outcome = await invocation
+                    remaining_seconds = deadline - asyncio.get_running_loop().time()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError
+                    outcome = await asyncio.wait_for(invocation, timeout=remaining_seconds)
                     receipt = _received_result(outcome)
                     if isinstance(outcome, _SafeTransportFailure):
                         primary_error = outcome.error
@@ -1134,6 +1290,11 @@ class ModelGateway:
                             response = outcome
                         status_code = 200
                         should_record = True
+                except TimeoutError:
+                    primary_error = ModelTransportError(
+                        "model request deadline exhausted", status_code=408
+                    )
+                    should_record = True
                 except asyncio.CancelledError as error:
                     if isinstance(error, ModelResponseCancelled):
                         receipt = error.receipt
@@ -1162,6 +1323,7 @@ class ModelGateway:
                     await self._record_capacity_outcome(
                         capacity,
                         lease,
+                        deadline=deadline,
                         status_code=status_code,
                         latency_seconds=latency,
                         succeeded=response is not None,
@@ -1175,7 +1337,9 @@ class ModelGateway:
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
         finally:
-            release_error = await self._release_cleanup(capacity, lease)
+            release_error = await self._release_cleanup(
+                capacity, lease, deadline=deadline
+            )
             if isinstance(release_error, asyncio.CancelledError) and isinstance(
                 primary_error, ModelResponseError | asyncio.CancelledError
             ):
@@ -1321,13 +1485,20 @@ class ModelGateway:
             current = renewed
 
     async def _release_cleanup(
-        self, capacity: CapacityController | CapacityPool, lease: CapacityLease
+        self,
+        capacity: CapacityController | CapacityPool,
+        lease: CapacityLease,
+        *,
+        deadline: float | None = None,
     ) -> BaseException | None:
         release_task = asyncio.create_task(capacity.release(lease))
+        timeout = self._capacity_wait_timeout
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - asyncio.get_running_loop().time()))
         try:
             await asyncio.wait_for(
                 asyncio.shield(release_task),
-                timeout=self._capacity_wait_timeout,
+                timeout=timeout,
             )
         except TimeoutError:
             release_task.cancel()

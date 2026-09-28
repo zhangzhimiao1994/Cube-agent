@@ -169,6 +169,192 @@ async def test_native_wire_preserves_original_schema_messages_model_budget_and_u
     close.assert_awaited_once()
 
 
+async def test_native_large_structured_output_uses_deployment_capacity() -> None:
+    text = json.dumps({"payload": "x" * 110_000}, separators=(",", ":"))
+    client, _, native, chat, close = setup_client(
+        response(
+            output=[message(text)],
+            usage=SimpleNamespace(
+                input_tokens=1_000,
+                output_tokens=28_000,
+                total_tokens=29_000,
+            ),
+        )
+    )
+    req = request(
+        max_output_tokens=32_768,
+        response_schema=StructuredResponseSchema(
+            name="LargePayload",
+            schema={
+                "type": "object",
+                "properties": {"payload": {"type": "string"}},
+                "required": ("payload",),
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    result = await client.complete(
+        deployment(context_window_tokens=131_072, max_output_tokens=32_768),
+        req,
+        API_KEY,
+    )
+
+    assert result.text == text
+    assert len(result.text.encode("utf-8")) > 100_000
+    assert native.await_args is not None
+    assert native.await_args.kwargs["max_output_tokens"] == 32_768
+    chat.assert_not_called()
+    close.assert_awaited_once()
+
+
+def test_native_wire_caps_output_to_deployment_and_context_capacity() -> None:
+    from agent_hub.models.responses import response_create_kwargs
+
+    req = request(
+        max_output_tokens=3_000,
+        messages=(ModelMessage(role="user", content="x" * 512),),
+    )
+    kwargs = response_create_kwargs(
+        deployment(context_window_tokens=4_096, max_output_tokens=2_048),
+        req,
+    )
+
+    effective_output_tokens = kwargs["max_output_tokens"]
+    assert type(effective_output_tokens) is int
+    assert 0 < effective_output_tokens <= 2_048
+    assert effective_output_tokens < 4_096
+
+
+def test_native_input_limit_scales_with_large_deployment_context() -> None:
+    from agent_hub.models.responses import response_create_kwargs
+
+    content = "x" * 300_000
+    kwargs = response_create_kwargs(
+        deployment(context_window_tokens=400_000, max_output_tokens=8_192),
+        request(
+            messages=(ModelMessage(role="user", content=content),),
+            max_output_tokens=8_192,
+        ),
+    )
+
+    assert kwargs["input"] == [{"role": "user", "content": content}]
+
+
+def test_native_input_limit_has_absolute_fuse() -> None:
+    from agent_hub.models.responses import ResponsesContractError, response_create_kwargs
+
+    with pytest.raises(ResponsesContractError, match="byte limit"):
+        response_create_kwargs(
+            deployment(context_window_tokens=2_000_000, max_output_tokens=8_192),
+            request(
+                messages=(ModelMessage(role="user", content="x" * 2_100_000),),
+                max_output_tokens=8_192,
+            ),
+        )
+
+
+def test_native_message_limit_scales_with_deployment_context() -> None:
+    from agent_hub.models.responses import response_create_kwargs
+
+    messages = tuple(
+        ModelMessage(role="user", content=f"message-{index}") for index in range(96)
+    )
+    kwargs = response_create_kwargs(
+        deployment(context_window_tokens=128_000, max_output_tokens=8_192),
+        request(messages=messages, max_output_tokens=8_192),
+    )
+
+    assert len(kwargs["input"]) == 96  # type: ignore[arg-type]
+
+
+def test_native_message_limit_keeps_absolute_fuse() -> None:
+    from agent_hub.models.responses import ResponsesContractError, response_create_kwargs
+
+    messages = tuple(ModelMessage(role="user", content="x") for _ in range(513))
+    with pytest.raises(ResponsesContractError, match="message count"):
+        response_create_kwargs(
+            deployment(context_window_tokens=1_000_000, max_output_tokens=8_192),
+            request(messages=messages, max_output_tokens=8_192),
+        )
+
+
+async def test_native_tool_argument_limit_scales_with_output_budget() -> None:
+    arguments = json.dumps({"payload": "x" * 100_000}, separators=(",", ":"))
+    client, _, _, _, _ = setup_client(
+        response(
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_1",
+                    name="write_manifest",
+                    arguments=arguments,
+                )
+            ]
+        )
+    )
+    req = request(
+        max_output_tokens=32_768,
+        tools=(
+            ToolDefinition(
+                name="write_manifest",
+                description="Write a bounded manifest",
+                parameters={"type": "object"},
+            ),
+        ),
+        required_capabilities=frozenset(
+            {ModelCapability.STRUCTURED_OUTPUT, ModelCapability.TOOL_CALLING}
+        ),
+    )
+
+    result = await client.complete(
+        deployment(context_window_tokens=400_000, max_output_tokens=32_768),
+        req,
+        API_KEY,
+    )
+
+    assert result.tool_calls[0].arguments["payload"] == "x" * 100_000
+
+
+async def test_native_project_zip_rejects_large_inline_file_payload() -> None:
+    arguments = json.dumps(
+        {"title": "large", "files": {"app.txt": "x" * 150_000}},
+        separators=(",", ":"),
+    )
+    client, _, _, _, _ = setup_client(
+        response(
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_1",
+                    name="project_generate_zip",
+                    arguments=arguments,
+                )
+            ]
+        )
+    )
+    req = request(
+        max_output_tokens=64_000,
+        tools=(
+            ToolDefinition(
+                name="project_generate_zip",
+                description="Generate a project ZIP",
+                parameters={"type": "object"},
+            ),
+        ),
+        required_capabilities=frozenset(
+            {ModelCapability.STRUCTURED_OUTPUT, ModelCapability.TOOL_CALLING}
+        ),
+    )
+
+    with pytest.raises(ModelResponseError):
+        await client.complete(
+            deployment(context_window_tokens=400_000, max_output_tokens=64_000),
+            req,
+            API_KEY,
+        )
+
+
 async def test_native_tools_use_call_id_and_preserve_current_runtime_continuation() -> None:
     client, _, native, chat, close = setup_client()
     native.side_effect = [

@@ -9,16 +9,25 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from yaml.nodes import MappingNode
 from yaml.tokens import AliasToken, AnchorToken, TagToken
 
+from agent_hub.capabilities.tools.project_zip import (
+    PROJECT_ZIP_INCREMENTAL_TOOLS,
+    PROJECT_ZIP_SOFT_TOTAL_SOURCE_BYTES,
+    PROJECT_ZIP_TOOL_NAME,
+)
+
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _MAX_TEXT_BYTES = 65_536
 _MAX_PLAN_BYTES = 262_144
+_ABSOLUTE_MAX_PLAN_STEPS = 256
+_MAX_HANDOFF_PAGE_SIZE = 100
+_PROJECT_SCALES = ("small", "medium", "large", "ultra")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,6})?")
 _INTRINSICALLY_DANGEROUS = frozenset(
     {"shell.exec", "docker.socket", "host.write", "privilege.escalate"}
@@ -217,7 +226,7 @@ class DispatchStep(_PlanModel):
     @field_validator("depends_on", mode="before")
     @classmethod
     def dependencies(cls, value: object) -> tuple[str, ...]:
-        return _id_tuple(value, "dependencies")
+        return _id_tuple(value, "dependencies", maximum=_ABSOLUTE_MAX_PLAN_STEPS)
 
     @field_validator("tools", mode="before")
     @classmethod
@@ -287,11 +296,12 @@ class DispatchPlan(_PlanModel):
     steps: tuple[DispatchStep, ...]
     allowed_tools: tuple[str, ...] = ()
     denied_tools: tuple[str, ...] = tuple(sorted(_INTRINSICALLY_DANGEROUS))
-    max_steps: int = Field(default=64, ge=1, le=64)
+    max_steps: int = Field(default=64, ge=1, le=_ABSOLUTE_MAX_PLAN_STEPS)
     max_parallelism: int = Field(default=4, ge=1, le=64)
     total_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
     total_timeout_seconds: float = Field(default=3600.0, gt=0, le=86400, allow_inf_nan=False)
     total_cost_usd: Decimal = Field(default=Decimal(0), ge=0, le=Decimal(1000000))
+    project_scale: Literal["small", "medium", "large", "ultra"] | None = None
 
     @field_validator("agents", mode="before")
     @classmethod
@@ -309,7 +319,7 @@ class DispatchPlan(_PlanModel):
         if not isinstance(value, list | tuple):
             raise TypeError("steps must be a list or tuple")
         result = tuple(value)
-        if not result or len(result) > 64:
+        if not result or len(result) > _ABSOLUTE_MAX_PLAN_STEPS:
             raise ValueError("step count is invalid")
         return result
 
@@ -371,9 +381,13 @@ class DispatchPlan(_PlanModel):
                 raise InvalidDispatchPlan("step references an unknown agent")
             if any(dependency not in known_steps for dependency in step.depends_on):
                 raise InvalidDispatchPlan("step references an unknown dependency")
+            dependency_limit = min(_ABSOLUTE_MAX_PLAN_STEPS, max(64, self.max_steps))
+            if len(step.depends_on) > dependency_limit:
+                raise InvalidDispatchPlan("step dependencies exceed plan capacity")
             agent_tools = set(agents[step.agent].allowed_tools)
             if set(step.tools) - (agent_tools & allowed) or set(step.tools) & denied:
                 raise InvalidDispatchPlan("step tool policy is not permitted")
+        self.validate_for_project_scale(self.effective_project_scale)
         layers = self._topological_layers()
         if sum(len(layer) for layer in layers) != len(self.steps):
             raise InvalidDispatchPlan("dispatch plan contains a cycle")
@@ -424,6 +438,35 @@ class DispatchPlan(_PlanModel):
         if step_cost > self.total_cost_usd:
             raise InvalidDispatchPlan("total cost budget is insufficient")
 
+    def validate_for_project_scale(self, project_scale: object) -> None:
+        if type(project_scale) is not str or project_scale not in _PROJECT_SCALES:
+            raise InvalidDispatchPlan("project scale is invalid")
+        if project_scale not in {"large", "ultra"}:
+            return
+        required = set(PROJECT_ZIP_INCREMENTAL_TOOLS)
+        for step in self.steps:
+            zip_budget = step.tool_argument_budget_bytes.get(PROJECT_ZIP_TOOL_NAME, 0)
+            if (
+                PROJECT_ZIP_TOOL_NAME in step.tools
+                and zip_budget > PROJECT_ZIP_SOFT_TOTAL_SOURCE_BYTES
+                and not required.issubset(step.tools)
+            ):
+                raise InvalidDispatchPlan(
+                    "project ZIP exceeds soft capacity; incremental workspace tools are required"
+                )
+
+    @property
+    def effective_project_scale(self) -> Literal["small", "medium", "large", "ultra"]:
+        if self.project_scale is not None:
+            return self.project_scale
+        if self.max_steps >= 256:
+            return "ultra"
+        if self.max_steps >= 160:
+            return "large"
+        if self.max_steps >= 96:
+            return "medium"
+        return "small"
+
     def _topological_layers(self) -> tuple[tuple[str, ...], ...]:
         remaining = {step.id: set(step.depends_on) for step in self.steps}
         layers: list[tuple[str, ...]] = []
@@ -459,6 +502,34 @@ class DispatchPlan(_PlanModel):
     @property
     def final_step(self) -> DispatchStep:
         return next(step for step in self.steps if step.final_synthesizer)
+
+    def handoff_dependency_page(
+        self,
+        step_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        if type(page) is not int or page < 1:
+            raise ValueError("page must be a positive integer")
+        if type(page_size) is not int or not 1 <= page_size <= _MAX_HANDOFF_PAGE_SIZE:
+            raise ValueError("page_size must be between 1 and 100")
+        step = next((candidate for candidate in self.steps if candidate.id == step_id), None)
+        if step is None:
+            raise ValueError("step_id is unknown")
+        total = len(step.depends_on)
+        page_count = max(1, math.ceil(total / page_size))
+        start = (page - 1) * page_size
+        items = step.depends_on[start : start + page_size]
+        return {
+            "step_id": step.id,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "page_count": page_count,
+            "items": items,
+            "has_more": start + len(items) < total,
+        }
 
     @property
     def digest(self) -> str:

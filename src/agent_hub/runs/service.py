@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -85,6 +85,13 @@ _MAX_REQUIRED_CAPABILITIES = 8
 _CONVERSATION_HISTORY_SHARE = 0.25
 _CONVERSATION_OUTPUT_RESERVE_SHARE = 0.20
 _RUNTIME_TIMEOUT_ABSOLUTE_SECONDS = 3600.0
+_RUNTIME_TOKEN_ABSOLUTE_LIMIT = 10_000_000
+_PROJECT_SCALE_TOKEN_MULTIPLIERS = {
+    "small": 1.0,
+    "medium": 1.5,
+    "large": 2.5,
+    "ultra": 4.0,
+}
 _TERMINAL_HOOK_NOTIFIED_KIND = "terminal.notified"
 
 
@@ -1686,7 +1693,19 @@ class RunService:
                     error.__cause__ = None
                     del error
                     checkpoint = None
-            token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
+            main_agent_context_window_tokens = await self._main_agent_context_window_tokens(
+                routing_decision
+            )
+            routing_decision = _with_main_agent_context_window(
+                routing_decision,
+                main_agent_context_window_tokens,
+            )
+            token_budget = _runtime_token_budget(
+                mode,
+                configured_tokens=self._runtime_token_budget,
+                routing_decision=routing_decision,
+                progress_units=_checkpoint_progress_units(checkpoint),
+            )
             instructions = None
             if mode in (TaskMode.DIRECT, TaskMode.DISPATCH) and self._instruction_context_loader is not None:
                 instructions = await self._instruction_context_loader.load(
@@ -1771,7 +1790,13 @@ class RunService:
                 )
             )
             try:
-                async for event in runtime.run(context):
+                async for event in _adaptive_runtime_events(
+                    runtime,
+                    context,
+                    configured_tokens=self._runtime_token_budget,
+                    routing_decision=routing_decision,
+                    initial_progress_units=_checkpoint_progress_units(checkpoint),
+                ):
                     cancel_runtime = False
                     stop_runtime_loop = False
                     async with await self._repository.run_transaction() as session, session.begin():
@@ -4442,11 +4467,96 @@ def _checkpoint_progress_units(checkpoint: RuntimeCheckpoint | None) -> int:
     return completed_units + artifact_units
 
 
-def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
+def _runtime_token_budget(
+    mode: TaskMode,
+    *,
+    configured_tokens: int,
+    routing_decision: Mapping[str, object] | None = None,
+    progress_units: int = 0,
+) -> int:
     del mode
-    if type(configured_tokens) is not int or configured_tokens <= 0:
-        return 1_000_000
-    return max(1, min(configured_tokens, 10_000_000))
+    base_budget = (
+        configured_tokens
+        if type(configured_tokens) is int and configured_tokens > 0
+        else 1_000_000
+    )
+    base_budget = max(1, min(base_budget, _RUNTIME_TOKEN_ABSOLUTE_LIMIT))
+    if routing_decision is None:
+        return base_budget
+    scale = routing_decision.get("project_scale")
+    recognized_scale = type(scale) is str and scale in _PROJECT_SCALE_TOKEN_MULTIPLIERS
+    multiplier = _PROJECT_SCALE_TOKEN_MULTIPLIERS.get(
+        scale if type(scale) is str else "",
+        1.0,
+    )
+    budget = base_budget * multiplier
+    if recognized_scale:
+        complexity = routing_decision.get("critical_path_complexity_units")
+        normalized_complexity = (
+            complexity if type(complexity) is int and complexity > 0 else 1
+        )
+        normalized_progress = (
+            progress_units if type(progress_units) is int and progress_units > 0 else 0
+        )
+        budget += base_budget * min(1.0, normalized_progress / normalized_complexity)
+    return max(1, min(math.ceil(budget), _RUNTIME_TOKEN_ABSOLUTE_LIMIT))
+
+
+def _with_main_agent_context_window(
+    routing_decision: Mapping[str, object],
+    context_window_tokens: int | None,
+) -> dict[str, object]:
+    decision = dict(routing_decision)
+    if any(
+        type(decision.get(key)) is int and cast(int, decision[key]) > 0
+        for key in ("main_agent_context_window_tokens", "context_window_tokens")
+    ):
+        return decision
+    if type(context_window_tokens) is int and context_window_tokens > 0:
+        decision["main_agent_context_window_tokens"] = min(
+            context_window_tokens,
+            _RUNTIME_TOKEN_ABSOLUTE_LIMIT,
+        )
+    return decision
+
+
+async def _adaptive_runtime_events(
+    runtime: ExecutionRuntime,
+    context: TaskContext,
+    *,
+    configured_tokens: int,
+    routing_decision: Mapping[str, object],
+    initial_progress_units: int,
+) -> AsyncIterator[RunEvent]:
+    progress_units = max(0, initial_progress_units)
+    seen_tool_calls: set[str] = set()
+    seen_artifacts: set[UUID] = set()
+    async for event in runtime.run(context):
+        if event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id is not None:
+            if event.tool_call_id not in seen_tool_calls:
+                seen_tool_calls.add(event.tool_call_id)
+                progress_units += 1
+            if event.artifact is not None:
+                seen_artifacts.add(event.artifact.id)
+        elif event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None:
+            if event.artifact.id not in seen_artifacts:
+                seen_artifacts.add(event.artifact.id)
+                progress_units += 1
+        elif event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None:
+            progress_units = max(
+                progress_units,
+                _checkpoint_progress_units(event.checkpoint),
+            )
+        extended_budget = _runtime_token_budget(
+            context.mode,
+            configured_tokens=configured_tokens,
+            routing_decision=routing_decision,
+            progress_units=progress_units,
+        )
+        if extended_budget > context.token_budget:
+            # The runtime is suspended at this event boundary and retains this exact context.
+            object.__setattr__(context, "token_budget", extended_budget)
+        yield event
 
 
 def _safe_worker_id(worker_id: str | None) -> str:

@@ -192,6 +192,7 @@ async def test_guidance_contributes_to_final_request_size_limit(tmp_path: Path, 
 
     context = await task(tmp_path, marker='x' * 8192)
     monkeypatch.setattr(adapter, '_MAX_PROMPT_BYTES', 4096)
+    monkeypatch.setattr(adapter, '_ABSOLUTE_PROMPT_BYTES', 4096)
     gateway = FakeGateway()
     runtime = CrewDispatchRuntime(gateway, one_step_plan(), crew_factory=FastFactory())
     events: list[RunEvent] = []

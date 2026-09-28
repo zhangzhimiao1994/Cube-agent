@@ -10,6 +10,8 @@ from decimal import Decimal
 from autogen_agentchat.base import TerminationCondition
 from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, StopMessage
 
+from agent_hub.runtime.adaptive_budget import AdaptiveDeadline
+
 
 @dataclass(slots=True)
 class DiscussionUsage:
@@ -28,6 +30,7 @@ class CompositeDiscussionTermination(TerminationCondition):
     wall_time_seconds: float
     consensus_votes: int
     cancelled: Callable[[], bool]
+    adaptive_deadline: AdaptiveDeadline | None = None
     monotonic: Callable[[], float] = time.monotonic
     completion_marker: str = "[COMPLETE]"
     consensus_marker: str = "[CONSENSUS]"
@@ -57,7 +60,11 @@ class CompositeDiscussionTermination(TerminationCondition):
                 self._votes.add(message.source)
         if self.cancelled():
             self.reason = "cancelled"
-        elif self.monotonic() - self._started_at >= self.wall_time_seconds:
+        elif (
+            self.adaptive_deadline.remaining(now=self.monotonic()) <= 0
+            if self.adaptive_deadline is not None
+            else self.monotonic() - self._started_at >= self.wall_time_seconds
+        ):
             self.reason = "wall_time"
         elif self.usage.tokens >= self.token_budget or self.usage.cost_usd >= self.cost_budget_usd:
             self.reason = "budget_exhausted"

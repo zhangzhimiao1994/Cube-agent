@@ -21,6 +21,12 @@ from agent_hub.capabilities.manifest import (
 from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
 from agent_hub.capabilities.tools.calculator import Calculator
 from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadError
+from agent_hub.capabilities.tools.project_zip import (
+    PROJECT_ZIP_ABSOLUTE_TOTAL_SOURCE_BYTES,
+    PROJECT_ZIP_MAX_FILE_BYTES,
+    PROJECT_ZIP_MAX_FILES,
+    PROJECT_ZIP_TOOL_NAME,
+)
 from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
@@ -49,13 +55,13 @@ _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_PREFLIGHT_TOOL = "project.preflight_architecture"
-_PROJECT_ZIP_TOOL = "project.generate_zip"
+_PROJECT_ZIP_TOOL = PROJECT_ZIP_TOOL_NAME
 _WORKSPACE_WRITE_TOOL = "workspace.write_text"
 _WORKSPACE_LIST_TOOL = "workspace.list"
 _WORKSPACE_BUNDLE_TOOL = "workspace.bundle"
-_MAX_PROJECT_FILES = 64
-_MAX_PROJECT_FILE_BYTES = 256_000
-_MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
+_MAX_PROJECT_FILES = PROJECT_ZIP_MAX_FILES
+_MAX_PROJECT_FILE_BYTES = PROJECT_ZIP_MAX_FILE_BYTES
+_MAX_PROJECT_ZIP_SOURCE_BYTES = PROJECT_ZIP_ABSOLUTE_TOTAL_SOURCE_BYTES
 _DOTTED_BUILT_INS = frozenset({
     "calculator.evaluate",
     "http.read",
@@ -1254,7 +1260,9 @@ def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
     raw_files = arguments.get("files")
     raw_entries = _project_file_entries(raw_files)
     if not raw_entries or len(raw_entries) > _MAX_PROJECT_FILES:
-        raise RuntimeCapabilityError("files must contain 1 to 64 entries")
+        raise RuntimeCapabilityError(
+            f"files must contain 1 to {_MAX_PROJECT_FILES} entries"
+        )
     files: dict[str, bytes] = {}
     total_bytes = 0
     for raw_path, raw_content in raw_entries:

@@ -38,7 +38,7 @@ _MAX_JSON_DEPTH = 20
 _MAX_JSON_NODES = 4_096
 _MAX_JSON_STRING = 512_000
 _MAX_JSON_BYTES = 2_000_000
-_MAX_TEXT_BYTES = 65_536
+_MAX_TEXT_BYTES = _MAX_JSON_STRING
 _SENSITIVE_KEYS = frozenset(
     {
         "api_key",
@@ -380,7 +380,7 @@ class Artifact(_RuntimeContractModel):
     type: str
     producer: str
     content: Mapping[str, JsonValue] = Field(repr=False)
-    source_ids: tuple[str, ...] = Field(default=(), max_length=64)
+    source_ids: tuple[str, ...] = Field(default=(), max_length=256)
     content_sha256: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
     provenance: GatewayProvenance | None = None
 

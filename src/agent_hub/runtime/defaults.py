@@ -5,9 +5,12 @@ from __future__ import annotations
 import keyword
 import logging
 import re
+import secrets
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from threading import RLock
 from typing import Literal, Protocol, cast
 from uuid import UUID
 
@@ -173,6 +176,54 @@ class HarnessToolInvoker(Protocol):
     ) -> HarnessToolCallResult: ...
 
 
+@dataclass(frozen=True)
+class _OrchestrationHandoffSnapshot:
+    tenant_id: UUID
+    run_id: UUID
+    items: tuple[Mapping[str, JsonValue], ...]
+    total_count: int
+    absolute_fuse_reached: bool
+    max_page_size: int
+    default_page_size: int
+
+
+@dataclass(frozen=True)
+class _OrchestrationHandoffStoredPage:
+    snapshot: _OrchestrationHandoffSnapshot
+    items: tuple[Mapping[str, JsonValue], ...]
+    pagination: Mapping[str, JsonValue]
+    next_cursor: str | None
+
+
+class _OrchestrationHandoffPageStore:
+    def __init__(self, *, max_snapshots: int) -> None:
+        self._max_snapshots = max_snapshots
+        self._snapshots: OrderedDict[str, _OrchestrationHandoffSnapshot] = OrderedDict()
+        self._lock = RLock()
+
+    def register(self, snapshot: _OrchestrationHandoffSnapshot) -> str:
+        with self._lock:
+            while True:
+                token = secrets.token_urlsafe(24)
+                if token not in self._snapshots:
+                    break
+            self._snapshots[token] = snapshot
+            self._snapshots.move_to_end(token)
+            while len(self._snapshots) > self._max_snapshots:
+                self._snapshots.popitem(last=False)
+            return token
+
+    def resolve(self, context: TaskContext, token: str) -> _OrchestrationHandoffSnapshot:
+        with self._lock:
+            snapshot = self._snapshots.get(token)
+            if snapshot is None:
+                raise ValueError("orchestration handoff cursor is unavailable or expired")
+            if snapshot.tenant_id != context.tenant_id or snapshot.run_id != context.run_id:
+                raise ValueError("orchestration handoff cursor does not belong to this run")
+            self._snapshots.move_to_end(token)
+            return snapshot
+
+
 CapacityFactory = Callable[
     [UUID, tuple[Deployment, ...]],
     Awaitable[CapacityController | CapacityPool],
@@ -189,11 +240,31 @@ _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
 _MAX_CAPABILITY_INVENTORY_FAILURE_CODES = 32
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
-_MAX_ORCHESTRATION_HANDOFFS = 12
+_ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS = 4096
+_ABSOLUTE_MAX_ORCHESTRATION_HANDOFF_PAGE_SIZE = 256
+_ORCHESTRATION_HANDOFF_PAGE_SIZE_BY_SCALE = {
+    "small": 12,
+    "medium": 24,
+    "large": 48,
+    "ultra": 96,
+}
+_DISPATCH_MAX_STEPS_BY_SCALE = {
+    "small": 64,
+    "medium": 96,
+    "large": 160,
+    "ultra": 256,
+}
 _ORCHESTRATION_CONTRACT_READY_STATUS = "done"
 _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES = ("blocked", "needs_user")
 _ORCHESTRATION_PROTOCOL_ID = "role_handoff_contract_v1"
+_ORCHESTRATION_HANDOFF_PAGE_READER = "runtime.read_orchestration_handoff_page"
+_ORCHESTRATION_HANDOFF_CURSOR_PREFIX = "handoff-page-v1"
+_ORCHESTRATION_HANDOFF_STORED_CURSOR_PREFIX = "handoff-page-v2"
+_MAX_ORCHESTRATION_HANDOFF_SNAPSHOTS = 512
 _DISPATCH_OUTPUT_SCHEMA_ID = "dispatch_output_v1"
+_ORCHESTRATION_HANDOFF_PAGE_STORE = _OrchestrationHandoffPageStore(
+    max_snapshots=_MAX_ORCHESTRATION_HANDOFF_SNAPSHOTS
+)
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
@@ -1531,6 +1602,7 @@ def _dispatch_plan(
         agents=tuple(agents),
         steps=steps,
         allowed_tools=plan_allowed_tools,
+        max_steps=_dispatch_max_steps(context),
         max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
         total_token_budget=context.token_budget,
         total_timeout_seconds=sum(step.timeout_seconds for step in steps),
@@ -1631,6 +1703,10 @@ def _project_scale_budget_tier(context: TaskContext) -> str:
     if "real medium" in text or "medium project" in text:
         return "medium"
     return "small"
+
+
+def _dispatch_max_steps(context: TaskContext) -> int:
+    return _DISPATCH_MAX_STEPS_BY_SCALE[_project_scale_budget_tier(context)]
 
 
 def _producer_step_timeout(
@@ -2436,6 +2512,11 @@ def _model_execution_plan_payload(
     if main_agent_constraint is not None:
         selected_provider = main_agent_constraint.provider
         selected_model = main_agent_constraint.model
+    orchestration_page = _register_orchestration_handoff_page(
+        context,
+        roles=roles,
+        steps=steps,
+    )
     payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "main_agent": {
@@ -2463,18 +2544,15 @@ def _model_execution_plan_payload(
             for role in roles
             if "id" in role and "purpose" in role and "logical_model" in role
         ),
-        "orchestration_handoffs": _orchestration_handoffs_payload(
-            roles=roles,
-            steps=steps,
+        "orchestration_handoffs": _stored_orchestration_handoffs_payload(
+            orchestration_page
         ),
-        "orchestration_contracts": _orchestration_contracts_payload(
-            roles=roles,
-            steps=steps,
+        "orchestration_contracts": _stored_orchestration_contracts_payload(
+            orchestration_page
         ),
-        "orchestration_protocol": _orchestration_protocol_payload(
+        "orchestration_protocol": _stored_orchestration_protocol_payload(
             context,
-            roles=roles,
-            steps=steps,
+            orchestration_page,
         ),
         "model_capability_negotiation": _model_capability_negotiation_payload(
             roles=roles,
@@ -2558,25 +2636,205 @@ def _dispatch_discussion_trace_payload(
     }
 
 
+def _register_orchestration_handoff_page(
+    context: TaskContext,
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> _OrchestrationHandoffStoredPage:
+    page, page_size = _orchestration_handoff_page_request(context)
+    items, total_count, absolute_fuse_reached = _orchestration_handoff_items(
+        roles=roles,
+        steps=steps,
+        page=1,
+        page_size=_ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS,
+    )
+    snapshot = _OrchestrationHandoffSnapshot(
+        tenant_id=context.tenant_id,
+        run_id=context.run_id,
+        items=tuple(items),
+        total_count=total_count,
+        absolute_fuse_reached=absolute_fuse_reached,
+        max_page_size=page_size,
+        default_page_size=page_size,
+    )
+    token = _ORCHESTRATION_HANDOFF_PAGE_STORE.register(snapshot)
+    return _stored_orchestration_handoff_page(
+        snapshot,
+        token=token,
+        offset=(page - 1) * page_size,
+        page=page,
+        requested_page_size=page_size,
+    )
+
+
+def _stored_orchestration_handoff_page(
+    snapshot: _OrchestrationHandoffSnapshot,
+    *,
+    token: str,
+    offset: int,
+    page: int,
+    requested_page_size: int,
+) -> _OrchestrationHandoffStoredPage:
+    page_size = min(max(1, requested_page_size), snapshot.max_page_size)
+    items = snapshot.items[offset : offset + page_size]
+    next_offset = offset + len(items)
+    has_more = next_offset < len(snapshot.items)
+    remaining_page_count = (
+        (len(snapshot.items) - offset + page_size - 1) // page_size
+        if offset < len(snapshot.items)
+        else 0
+    )
+    page_count = page - 1 + remaining_page_count
+    next_cursor = (
+        _stored_orchestration_handoff_cursor(
+            token=token,
+            offset=next_offset,
+            page=page + 1,
+        )
+        if has_more
+        else None
+    )
+    pagination: Mapping[str, JsonValue] = {
+        "page": page,
+        "page_size": page_size,
+        "page_count": page_count,
+        "has_more": has_more,
+        "next_page": page + 1 if has_more else None,
+        "absolute_limit": _ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS,
+        "absolute_fuse_reached": snapshot.absolute_fuse_reached,
+    }
+    return _OrchestrationHandoffStoredPage(
+        snapshot=snapshot,
+        items=items,
+        pagination=pagination,
+        next_cursor=next_cursor,
+    )
+
+
+def _stored_orchestration_handoffs_payload(
+    page: _OrchestrationHandoffStoredPage,
+) -> Mapping[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "items": page.items,
+        "total_count": page.snapshot.total_count,
+        "returned_count": len(page.items),
+        "pagination": page.pagination,
+        "truncated": (
+            len(page.items) < page.snapshot.total_count
+            or page.snapshot.absolute_fuse_reached
+        ),
+    }
+
+
+def _stored_orchestration_contracts_payload(
+    page: _OrchestrationHandoffStoredPage,
+) -> Mapping[str, JsonValue]:
+    items = tuple(_orchestration_contract_payload(item) for item in page.items)
+    return {
+        "schema_version": 1,
+        "items": items,
+        "total_count": page.snapshot.total_count,
+        "returned_count": len(items),
+        "pagination": page.pagination,
+        "truncated": (
+            len(items) < page.snapshot.total_count
+            or page.snapshot.absolute_fuse_reached
+        ),
+    }
+
+
+def _stored_orchestration_protocol_payload(
+    context: TaskContext,
+    page: _OrchestrationHandoffStoredPage,
+) -> Mapping[str, JsonValue]:
+    role_ids = {
+        role_id
+        for handoff in page.items
+        for role_id in (
+            handoff["source_role_id"],
+            handoff["target_role_id"],
+        )
+    }
+    return {
+        "schema_version": 1,
+        "protocol": _ORCHESTRATION_PROTOCOL_ID,
+        "mode": context.mode.value,
+        "role_count": len(role_ids),
+        "handoff_count": page.snapshot.total_count,
+        "contract_count": page.snapshot.total_count,
+        "returned_handoff_count": len(page.items),
+        "pagination": page.pagination,
+        "page_reader": {
+            "operation": _ORCHESTRATION_HANDOFF_PAGE_READER,
+            "page_size": page.pagination["page_size"],
+            "next_cursor": page.next_cursor,
+        },
+        "structured_output_schema": _DISPATCH_OUTPUT_SCHEMA_ID,
+        "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
+        "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
+        "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
+        "recovery_hints": (
+            (ORCHESTRATION_CONTRACT_RECOVERY_HINT,) if page.items else ()
+        ),
+        "truncated": (
+            len(page.items) < page.snapshot.total_count
+            or page.snapshot.absolute_fuse_reached
+        ),
+    }
+
+
+def _orchestration_contract_payload(
+    handoff: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    return {
+        "contract_id": f"{handoff['source_step_id']}-to-{handoff['target_step_id']}",
+        "source_step_id": handoff["source_step_id"],
+        "target_step_id": handoff["target_step_id"],
+        "source_role_id": handoff["source_role_id"],
+        "target_role_id": handoff["target_role_id"],
+        "handoff_kind": handoff["handoff_kind"],
+        "status": "planned",
+        "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
+        "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
+        "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
+        "recovery_hint": ORCHESTRATION_CONTRACT_RECOVERY_HINT,
+    }
+
+
 def _orchestration_handoffs_payload(
+    context: TaskContext,
     *,
     roles: tuple[Mapping[str, JsonValue], ...],
     steps: tuple[Mapping[str, JsonValue], ...],
 ) -> Mapping[str, JsonValue]:
-    items, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    items, total_count, absolute_fuse_reached, pagination = _orchestration_handoff_page(
+        context,
+        roles=roles,
+        steps=steps,
+    )
     return {
         "schema_version": 1,
         "items": tuple(items),
-        "truncated": truncated,
+        "total_count": total_count,
+        "returned_count": len(items),
+        "pagination": pagination,
+        "truncated": len(items) < total_count or absolute_fuse_reached,
     }
 
 
 def _orchestration_contracts_payload(
+    context: TaskContext,
     *,
     roles: tuple[Mapping[str, JsonValue], ...],
     steps: tuple[Mapping[str, JsonValue], ...],
 ) -> Mapping[str, JsonValue]:
-    handoffs, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    handoffs, total_count, absolute_fuse_reached, pagination = _orchestration_handoff_page(
+        context,
+        roles=roles,
+        steps=steps,
+    )
     items: list[Mapping[str, JsonValue]] = [
         {
             "contract_id": f"{handoff['source_step_id']}-to-{handoff['target_step_id']}",
@@ -2596,7 +2854,10 @@ def _orchestration_contracts_payload(
     return {
         "schema_version": 1,
         "items": tuple(items),
-        "truncated": truncated,
+        "total_count": total_count,
+        "returned_count": len(items),
+        "pagination": pagination,
+        "truncated": len(items) < total_count or absolute_fuse_reached,
     }
 
 
@@ -2606,7 +2867,11 @@ def _orchestration_protocol_payload(
     roles: tuple[Mapping[str, JsonValue], ...],
     steps: tuple[Mapping[str, JsonValue], ...],
 ) -> Mapping[str, JsonValue]:
-    handoffs, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    handoffs, total_count, absolute_fuse_reached, pagination = _orchestration_handoff_page(
+        context,
+        roles=roles,
+        steps=steps,
+    )
     role_ids = {
         role_id
         for handoff in handoffs
@@ -2625,14 +2890,78 @@ def _orchestration_protocol_payload(
         "protocol": _ORCHESTRATION_PROTOCOL_ID,
         "mode": context.mode.value,
         "role_count": len(role_ids),
-        "handoff_count": len(handoffs),
-        "contract_count": len(handoffs),
+        "handoff_count": total_count,
+        "contract_count": total_count,
+        "returned_handoff_count": len(handoffs),
+        "pagination": pagination,
+        "page_reader": _orchestration_handoff_page_reader_payload(pagination),
         "structured_output_schema": _DISPATCH_OUTPUT_SCHEMA_ID,
         "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
         "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
         "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
         "recovery_hints": recovery_hints,
-        "truncated": truncated,
+        "truncated": len(handoffs) < total_count or absolute_fuse_reached,
+    }
+
+
+def read_orchestration_handoff_page(
+    context: TaskContext,
+    *,
+    cursor: str,
+    page_size: int | None = None,
+    roles: tuple[Mapping[str, JsonValue], ...] | None = None,
+    steps: tuple[Mapping[str, JsonValue], ...] | None = None,
+) -> Mapping[str, JsonValue]:
+    """Read one continuation page from a run-bound snapshot.
+
+    ``roles`` and ``steps`` remain optional for legacy v1 cursors only.
+    """
+
+    if cursor.startswith(f"{_ORCHESTRATION_HANDOFF_STORED_CURSOR_PREFIX}:"):
+        token, offset, page = _parse_stored_orchestration_handoff_cursor(cursor)
+        snapshot = _ORCHESTRATION_HANDOFF_PAGE_STORE.resolve(context, token)
+        stored_page = _stored_orchestration_handoff_page(
+            snapshot,
+            token=token,
+            offset=offset,
+            page=page,
+            requested_page_size=(
+                page_size if type(page_size) is int else snapshot.default_page_size
+            ),
+        )
+        return {
+            "orchestration_handoffs": _stored_orchestration_handoffs_payload(stored_page),
+            "orchestration_contracts": _stored_orchestration_contracts_payload(stored_page),
+            "orchestration_protocol": _stored_orchestration_protocol_payload(
+                context,
+                stored_page,
+            ),
+        }
+
+    if roles is None or steps is None:
+        raise ValueError("legacy orchestration handoff cursor requires roles and steps")
+
+    page, legacy_page_size = _parse_orchestration_handoff_cursor(cursor)
+    routing_decision = dict(context.routing_decision)
+    routing_decision["orchestration_handoff_page"] = page
+    routing_decision["orchestration_handoff_page_size"] = legacy_page_size
+    page_context = context.model_copy(update={"routing_decision": routing_decision})
+    return {
+        "orchestration_handoffs": _orchestration_handoffs_payload(
+            page_context,
+            roles=roles,
+            steps=steps,
+        ),
+        "orchestration_contracts": _orchestration_contracts_payload(
+            page_context,
+            roles=roles,
+            steps=steps,
+        ),
+        "orchestration_protocol": _orchestration_protocol_payload(
+            page_context,
+            roles=roles,
+            steps=steps,
+        ),
     }
 
 
@@ -2839,7 +3168,9 @@ def _orchestration_handoff_items(
     *,
     roles: tuple[Mapping[str, JsonValue], ...],
     steps: tuple[Mapping[str, JsonValue], ...],
-) -> tuple[list[Mapping[str, JsonValue]], bool]:
+    page: int,
+    page_size: int,
+) -> tuple[list[Mapping[str, JsonValue]], int, bool]:
     safe_roles = {
         role_id: role
         for role in roles
@@ -2859,7 +3190,10 @@ def _orchestration_handoff_items(
         in safe_roles
     }
     items: list[Mapping[str, JsonValue]] = []
-    truncated = False
+    total_count = 0
+    absolute_fuse_reached = False
+    page_start = (page - 1) * page_size
+    page_end = page_start + page_size
     for target_step_id, target_step in safe_steps.items():
         target_role_id = _optional_orchestration_handoff_token(
             target_step.get("agent"),
@@ -2909,23 +3243,137 @@ def _orchestration_handoff_items(
                 or target_logical_model is None
             ):
                 continue
-            if len(items) >= _MAX_ORCHESTRATION_HANDOFFS:
-                truncated = True
-                return items, truncated
-            items.append(
-                {
-                    "source_step_id": source_step_id,
-                    "target_step_id": target_step_id,
-                    "source_role_id": source_role_id,
-                    "target_role_id": target_role_id,
-                    "source_purpose": source_purpose,
-                    "target_purpose": target_purpose,
-                    "source_logical_model": source_logical_model,
-                    "target_logical_model": target_logical_model,
-                    "handoff_kind": "step_dependency",
-                }
-            )
-    return items, truncated
+            item_index = total_count
+            total_count += 1
+            if item_index >= _ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS:
+                absolute_fuse_reached = True
+                continue
+            if page_start <= item_index < page_end:
+                items.append(
+                    {
+                        "source_step_id": source_step_id,
+                        "target_step_id": target_step_id,
+                        "source_role_id": source_role_id,
+                        "target_role_id": target_role_id,
+                        "source_purpose": source_purpose,
+                        "target_purpose": target_purpose,
+                        "source_logical_model": source_logical_model,
+                        "target_logical_model": target_logical_model,
+                        "handoff_kind": "step_dependency",
+                    }
+                )
+    return items, total_count, absolute_fuse_reached
+
+
+def _orchestration_handoff_page(
+    context: TaskContext,
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[
+    list[Mapping[str, JsonValue]],
+    int,
+    bool,
+    Mapping[str, JsonValue],
+]:
+    page, page_size = _orchestration_handoff_page_request(context)
+    items, total_count, absolute_fuse_reached = _orchestration_handoff_items(
+        roles=roles,
+        steps=steps,
+        page=page,
+        page_size=page_size,
+    )
+    accessible_count = min(total_count, _ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS)
+    page_count = (
+        (accessible_count + page_size - 1) // page_size
+        if accessible_count
+        else 0
+    )
+    has_more = page < page_count
+    pagination: Mapping[str, JsonValue] = {
+        "page": page,
+        "page_size": page_size,
+        "page_count": page_count,
+        "has_more": has_more,
+        "next_page": page + 1 if has_more else None,
+        "absolute_limit": _ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS,
+        "absolute_fuse_reached": absolute_fuse_reached,
+    }
+    return items, total_count, absolute_fuse_reached, pagination
+
+
+def _orchestration_handoff_page_request(context: TaskContext) -> tuple[int, int]:
+    scale = _project_scale_budget_tier(context)
+    scale_floor = _ORCHESTRATION_HANDOFF_PAGE_SIZE_BY_SCALE[scale]
+    token_sized = max(1, context.token_budget // 4096)
+    dynamic_page_size = min(
+        _ABSOLUTE_MAX_ORCHESTRATION_HANDOFF_PAGE_SIZE,
+        max(scale_floor, token_sized),
+    )
+    raw_page = context.routing_decision.get("orchestration_handoff_page")
+    page = raw_page if type(raw_page) is int and raw_page > 0 else 1
+    raw_page_size = context.routing_decision.get("orchestration_handoff_page_size")
+    page_size = (
+        min(raw_page_size, dynamic_page_size)
+        if type(raw_page_size) is int and raw_page_size > 0
+        else dynamic_page_size
+    )
+    return page, page_size
+
+
+def _orchestration_handoff_page_reader_payload(
+    pagination: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    page_size = pagination.get("page_size")
+    next_page = pagination.get("next_page")
+    next_cursor = (
+        f"{_ORCHESTRATION_HANDOFF_CURSOR_PREFIX}:{next_page}:{page_size}"
+        if type(next_page) is int and type(page_size) is int
+        else None
+    )
+    return {
+        "operation": _ORCHESTRATION_HANDOFF_PAGE_READER,
+        "page_size": page_size if type(page_size) is int else 0,
+        "next_cursor": next_cursor,
+    }
+
+
+def _parse_orchestration_handoff_cursor(cursor: str) -> tuple[int, int]:
+    parts = cursor.split(":")
+    if len(parts) != 3 or parts[0] != _ORCHESTRATION_HANDOFF_CURSOR_PREFIX:
+        raise ValueError("invalid orchestration handoff cursor")
+    try:
+        page = int(parts[1])
+        page_size = int(parts[2])
+    except ValueError as exc:
+        raise ValueError("invalid orchestration handoff cursor") from exc
+    if page < 2 or not 0 < page_size <= _ABSOLUTE_MAX_ORCHESTRATION_HANDOFF_PAGE_SIZE:
+        raise ValueError("invalid orchestration handoff cursor")
+    return page, page_size
+
+
+def _stored_orchestration_handoff_cursor(
+    *,
+    token: str,
+    offset: int,
+    page: int,
+) -> str:
+    return f"{_ORCHESTRATION_HANDOFF_STORED_CURSOR_PREFIX}:{token}:{offset}:{page}"
+
+
+def _parse_stored_orchestration_handoff_cursor(cursor: str) -> tuple[str, int, int]:
+    parts = cursor.split(":")
+    if len(parts) != 4 or parts[0] != _ORCHESTRATION_HANDOFF_STORED_CURSOR_PREFIX:
+        raise ValueError("invalid orchestration handoff cursor")
+    token = parts[1]
+    try:
+        offset = int(parts[2])
+        page = int(parts[3])
+    except ValueError as exc:
+        raise ValueError("invalid orchestration handoff cursor") from exc
+    if not token or offset <= 0 or page < 2:
+        raise ValueError("invalid orchestration handoff cursor")
+    return token, offset, page
 
 
 def _optional_orchestration_handoff_token(value: object, *, max_length: int) -> str | None:

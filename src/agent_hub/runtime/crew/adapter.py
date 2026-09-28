@@ -34,6 +34,10 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.tools.project_zip import (
+    PROJECT_ZIP_TOOL_NAME,
+    project_zip_evidence_arguments,
+)
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
@@ -43,6 +47,7 @@ from agent_hub.models.gateway import (
     GatewayRejectedOutput,
     GatewayResponseCancelled,
 )
+from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
     JsonScalar,
     ModelCapability,
@@ -76,7 +81,12 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.contracts import (
     _freeze_json as _freeze_bounded_json,
 )
-from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+from agent_hub.runtime.crew.plan import (
+    AgentSpec,
+    DispatchPlan,
+    DispatchStep,
+    InvalidDispatchPlan,
+)
 from agent_hub.runtime.failure_reason import (
     ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
@@ -107,10 +117,15 @@ _RUNTIME_TYPE = "crew"
 _RUNTIME_VERSION = "10"
 _LEGACY_RUNTIME_VERSION = "9"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
+# Legacy floors preserve existing small-task behavior. Dynamic limits may grow
+# beyond them, but never beyond the explicit absolute safety fuses.
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
 _MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES = 2_048
 _MAX_OUTPUT_BYTES = 65_536
+_ABSOLUTE_PROMPT_BYTES = 2_097_152
+_ABSOLUTE_OUTPUT_BYTES = 2_097_152
+_ABSOLUTE_INTERACTION_MESSAGES = 512
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_CHECKPOINT_TOOL_LEDGER_ENTRIES = 4_096
@@ -172,6 +187,122 @@ class _ToolRoundBudget:
     initial_limit: int
     extension_size: int
     hard_limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CrewContentLimits:
+    prompt_bytes: int
+    output_bytes: int
+    source_artifact_text_bytes: int
+    final_source_artifact_text_bytes: int
+    interaction_message_limit: int
+    interaction_prompt_bytes: int
+
+
+def _crew_content_limits(
+    context: TaskContext,
+    *,
+    max_output_tokens: int,
+    source_count: int,
+    deployment_context_window_tokens: int | None = None,
+) -> _CrewContentLimits:
+    scale = context.routing_decision.get("project_scale")
+    numerator, denominator = {
+        "medium": (5, 4),
+        "large": (3, 2),
+        "ultra": (2, 1),
+    }.get(scale if type(scale) is str else "small", (1, 1))
+    token_derived_prompt = max(_MAX_PROMPT_BYTES, context.token_budget * 8)
+    context_window_tokens = (
+        deployment_context_window_tokens
+        if type(deployment_context_window_tokens) is int
+        and deployment_context_window_tokens > 0
+        else None
+    )
+    for key in (
+        "main_agent_context_window_tokens",
+        "deployment_context_window_tokens",
+        "context_window_tokens",
+    ):
+        value = context.routing_decision.get(key)
+        if type(value) is int and value > 0:
+            context_window_tokens = (
+                value
+                if context_window_tokens is None
+                else min(context_window_tokens, value)
+            )
+    input_window_bytes = (
+        _ABSOLUTE_PROMPT_BYTES
+        if context_window_tokens is None
+        else max(1, context_window_tokens - max_output_tokens) * 4
+    )
+    prompt_bytes = min(
+        _ABSOLUTE_PROMPT_BYTES,
+        token_derived_prompt * numerator // denominator,
+        input_window_bytes,
+    )
+    output_bytes = min(
+        _ABSOLUTE_OUTPUT_BYTES,
+        max(_MAX_OUTPUT_BYTES, max_output_tokens * 8),
+    )
+    count = max(1, source_count)
+    source_artifact_text_bytes = min(
+        _ABSOLUTE_PROMPT_BYTES,
+        max(_MAX_SOURCE_ARTIFACT_TEXT_BYTES, prompt_bytes // (count * 4)),
+    )
+    final_source_artifact_text_bytes = min(
+        _ABSOLUTE_PROMPT_BYTES,
+        max(_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES, prompt_bytes // (count * 2)),
+    )
+    interaction_message_limit = min(
+        _ABSOLUTE_INTERACTION_MESSAGES,
+        max(_SOFT_INTERACTION_MESSAGE_LIMIT, prompt_bytes // 4_096),
+    )
+    return _CrewContentLimits(
+        prompt_bytes=prompt_bytes,
+        output_bytes=output_bytes,
+        source_artifact_text_bytes=source_artifact_text_bytes,
+        final_source_artifact_text_bytes=final_source_artifact_text_bytes,
+        interaction_message_limit=interaction_message_limit,
+        interaction_prompt_bytes=prompt_bytes * 3 // 4,
+    )
+
+
+def _gateway_context_window_tokens(
+    gateway: object,
+    logical_model: str,
+) -> int | None:
+    registry = getattr(gateway, "_registry", None)
+    if not isinstance(registry, ModelRegistry):
+        return None
+    fallbacks = getattr(gateway, "_fallbacks", {})
+    fallback_map = fallbacks if isinstance(fallbacks, Mapping) else {}
+    windows: list[int] = []
+    seen: set[str] = set()
+    current = logical_model
+    while current not in seen:
+        seen.add(current)
+        try:
+            candidates = registry.candidates(current)
+        except NoCapableDeployment:
+            break
+        windows.extend(
+            candidate.context_window_tokens
+            for candidate in candidates
+            if candidate.context_window_tokens is not None
+        )
+        fallback = fallback_map.get(current)
+        if type(fallback) is not str:
+            break
+        current = fallback
+    return min(windows) if windows else None
+
+
+def _model_output_byte_budget(max_output_tokens: int) -> int:
+    return min(
+        _ABSOLUTE_OUTPUT_BYTES,
+        max(_MAX_OUTPUT_BYTES, max_output_tokens * 8),
+    )
 
 
 def _tool_round_budget(context: TaskContext, step: DispatchStep) -> _ToolRoundBudget:
@@ -971,7 +1102,11 @@ def _artifact_prompt_payload(
     return payload
 
 
-def _artifact_final_synthesis_payload(artifact: Artifact) -> dict[str, object]:
+def _artifact_final_synthesis_payload(
+    artifact: Artifact,
+    *,
+    max_text_bytes: int = _MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES,
+) -> dict[str, object]:
     payload = artifact.to_payload()
     content = artifact.content
     text = content.get("text")
@@ -979,13 +1114,13 @@ def _artifact_final_synthesis_payload(artifact: Artifact) -> dict[str, object]:
         payload["content"] = {
             "text": _truncate_prompt_text(
                 text,
-                max_bytes=_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES,
+                max_bytes=max_text_bytes,
             )
         }
     else:
         payload["content"] = _bounded_prompt_json(
             content,
-            max_text_bytes=_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES,
+            max_text_bytes=max_text_bytes,
         )
     payload["synthesis_input"] = {
         "mode": "summary",
@@ -1359,7 +1494,7 @@ def _parse_structured_role_output(agent: AgentSpec, text: object) -> Mapping[str
         schema,
         text,
         prefix="structured role output",
-        max_bytes=_MAX_OUTPUT_BYTES,
+        max_bytes=_model_output_byte_budget(agent.max_output_tokens),
     )
 
 
@@ -1371,10 +1506,20 @@ def _same_json_value(left: JsonValue, right: JsonValue) -> bool:
     return type(left) is type(right) and left == right
 
 
-def _check_framework_raw(schema: StructuredResponseSchema, actual: object, raw: object) -> None:
+def _check_framework_raw(
+    schema: StructuredResponseSchema,
+    actual: object,
+    raw: object,
+    *,
+    max_bytes: int = _MAX_OUTPUT_BYTES,
+) -> None:
     try:
-        expected = _parse_structured_output(schema, actual, prefix="model", max_bytes=_MAX_OUTPUT_BYTES)
-        observed = _parse_structured_output(schema, raw, prefix="framework", max_bytes=_MAX_OUTPUT_BYTES)
+        expected = _parse_structured_output(
+            schema, actual, prefix="model", max_bytes=max_bytes
+        )
+        observed = _parse_structured_output(
+            schema, raw, prefix="framework", max_bytes=max_bytes
+        )
     except RuntimeExecutionError:
         raise _ModelContractFailed("framework output mismatch") from None
     if not _same_json_value(expected, observed):
@@ -1657,7 +1802,7 @@ def _project_scale_structured_role_completion(
             schema,
             completion.response.text,
             prefix="structured role output",
-            max_bytes=_MAX_OUTPUT_BYTES,
+            max_bytes=_model_output_byte_budget(agent.max_output_tokens),
         )
         return completion
     except RuntimeExecutionError:
@@ -2375,7 +2520,11 @@ class _CrewAIGeneration:
             )
             output = await crew.akickoff(inputs={})
         raw = getattr(output, "raw", None)
-        if type(raw) is not str or not raw.strip() or len(raw.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+        if (
+            type(raw) is not str
+            or not raw.strip()
+            or len(raw.encode("utf-8")) > _ABSOLUTE_OUTPUT_BYTES
+        ):
             raise RuntimeExecutionError("CrewAI output is invalid")
         return raw
 
@@ -2812,6 +2961,24 @@ class CrewDispatchRuntime:
         self._current_token: _RunToken | None = None
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
 
+    def _content_limits(
+        self,
+        context: TaskContext,
+        *,
+        logical_model: str,
+        max_output_tokens: int,
+        source_count: int,
+    ) -> _CrewContentLimits:
+        return _crew_content_limits(
+            context,
+            max_output_tokens=max_output_tokens,
+            source_count=source_count,
+            deployment_context_window_tokens=_gateway_context_window_tokens(
+                self._gateway,
+                logical_model,
+            ),
+        )
+
     @staticmethod
     def _default_crewai_storage_dir() -> Path:
         return _default_crewai_storage_dir()
@@ -2820,6 +2987,14 @@ class CrewDispatchRuntime:
         context = self._strict_context(context)
         if context.mode is not self.mode:
             raise RuntimeExecutionError("runtime mode mismatch")
+        routed_scale = context.routing_decision.get(
+            "project_scale",
+            self._plan.effective_project_scale,
+        )
+        try:
+            self._plan.validate_for_project_scale(routed_scale)
+        except InvalidDispatchPlan as error:
+            raise RuntimeExecutionError(str(error)) from None
         if self._active_stream is not None:
             raise RuntimeBusy("runtime is busy")
         self._generation += 1
@@ -4195,6 +4370,12 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
+        content_limits = self._content_limits(
+            context,
+            logical_model=_agent_logical_model_for_recovery(agent, recovery_attempt),
+            max_output_tokens=min(agent.max_output_tokens, step.token_budget),
+            source_count=len(sources),
+        )
         source_payload = [
             (
                 _artifact_review_packet_payload(
@@ -4203,12 +4384,18 @@ class CrewDispatchRuntime:
                 )
                 if recovery_attempt > 0
                 else (
-                    _artifact_final_synthesis_payload(artifact)
+                    _artifact_final_synthesis_payload(
+                        artifact,
+                        max_text_bytes=content_limits.final_source_artifact_text_bytes,
+                    )
                     if step.final_synthesizer
                     else (
                         _artifact_review_packet_payload(artifact)
                         if step.depends_on
-                        else _artifact_prompt_payload(artifact)
+                        else _artifact_prompt_payload(
+                            artifact,
+                            max_text_bytes=content_limits.source_artifact_text_bytes,
+                        )
                     )
                 )
             )
@@ -4244,7 +4431,7 @@ class CrewDispatchRuntime:
         if feedback is not None:
             user["untrusted_reviewer_feedback"] = feedback
         user_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if len(user_text.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        if len(user_text.encode("utf-8")) > content_limits.prompt_bytes:
             _fail("dispatch prompt exceeds limit")
         generation = run_state.crew_generation
         if generation is None:
@@ -4335,7 +4522,12 @@ class CrewDispatchRuntime:
         schema = _agent_response_schema(agent)
         if schema is not None:
             if _should_check_framework_raw(step, completion):
-                _check_framework_raw(schema, completion.response.text, raw)
+                _check_framework_raw(
+                    schema,
+                    completion.response.text,
+                    raw,
+                    max_bytes=content_limits.output_bytes,
+                )
         elif raw != completion.response.text:
             response = completion.response
             completion = GatewayCompletion(
@@ -4358,8 +4550,23 @@ class CrewDispatchRuntime:
         return completion, tuple(evidence)
 
     @classmethod
-    def _guidance_messages(cls, context: TaskContext, crew_messages: object) -> tuple[ModelMessage, ...]:
-        messages = cls._normalize_crewai_messages(crew_messages)
+    def _guidance_messages(
+        cls,
+        context: TaskContext,
+        crew_messages: object,
+        *,
+        limits: _CrewContentLimits | None = None,
+    ) -> tuple[ModelMessage, ...]:
+        active_limits = limits or _crew_content_limits(
+            context,
+            max_output_tokens=min(context.token_budget, 8_192),
+            source_count=max(1, len(context.artifacts)),
+        )
+        messages = cls._normalize_crewai_messages(
+            crew_messages,
+            max_prompt_bytes=active_limits.prompt_bytes,
+            message_limit=active_limits.interaction_message_limit,
+        )
         instructions = context.instruction_context
         if instructions is None or not instructions.render():
             return messages
@@ -4373,15 +4580,33 @@ class CrewDispatchRuntime:
             + "\n" + instructions.render()
         )))
         # Recheck after adding guidance, before constructing any request or ledger entry.
-        return cls._normalize_crewai_messages([
-            {"role": message.role, "content": message.content} for message in messages
-        ])
+        return cls._normalize_crewai_messages(
+            [{"role": message.role, "content": message.content} for message in messages],
+            max_prompt_bytes=active_limits.prompt_bytes,
+            message_limit=active_limits.interaction_message_limit,
+        )
 
     @classmethod
     def _response_contract_messages(
-        cls, messages: Sequence[ModelMessage], schema: StructuredResponseSchema | None,
+        cls,
+        messages: Sequence[ModelMessage],
+        schema: StructuredResponseSchema | None,
+        *,
+        limits: _CrewContentLimits | None = None,
     ) -> tuple[ModelMessage, ...]:
-        messages = cls._compact_interaction_messages(messages)
+        max_prompt_bytes = (
+            limits.interaction_prompt_bytes if limits is not None
+            else _SOFT_INTERACTION_PROMPT_BYTES
+        )
+        message_limit = (
+            limits.interaction_message_limit if limits is not None
+            else _SOFT_INTERACTION_MESSAGE_LIMIT
+        )
+        messages = cls._compact_interaction_messages(
+            messages,
+            max_prompt_bytes=max_prompt_bytes,
+            message_limit=message_limit,
+        )
         if schema is None:
             return tuple(messages)
         _structured_validator(schema)
@@ -4399,10 +4624,20 @@ class CrewDispatchRuntime:
             )
         ))
         # Assemble afresh per call, before size checks, request hashes, and ledger writes.
-        return cls._normalize_crewai_messages([
-            {"role": message.role, "content": message.content}
-            for message in (*messages, contract)
-        ])
+        return cls._normalize_crewai_messages(
+            [
+                {"role": message.role, "content": message.content}
+                for message in (*messages, contract)
+            ],
+            max_prompt_bytes=(
+                limits.prompt_bytes if limits is not None else _MAX_PROMPT_BYTES
+            ),
+            message_limit=(
+                limits.interaction_message_limit
+                if limits is not None
+                else _SOFT_INTERACTION_MESSAGE_LIMIT
+            ),
+        )
 
     async def _complete_with_guidance(
         self, context: TaskContext, request: ModelRequest, emit: EventEmitter,
@@ -4561,10 +4796,11 @@ class CrewDispatchRuntime:
     ) -> GatewayRejectedOutput | None:
         if request.response_schema is None or completion.response.tool_calls:
             return None
+        output_limit = _model_output_byte_budget(request.max_output_tokens)
         try:
             _parse_structured_output(
                 request.response_schema, completion.response.text,
-                prefix="structured role output", max_bytes=_MAX_OUTPUT_BYTES,
+                prefix="structured role output", max_bytes=output_limit,
             )
         except RuntimeExecutionError as error:
             text = completion.response.text
@@ -4572,8 +4808,9 @@ class CrewDispatchRuntime:
             oversized = False
             if type(text) is str:
                 try:
-                    oversized = len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
-                    if not oversized:
+                    text_bytes = len(text.encode("utf-8"))
+                    oversized = text_bytes > output_limit
+                    if not oversized and text_bytes <= 65_536:
                         bounded = text
                 except UnicodeError:
                     bounded = None
@@ -4607,6 +4844,7 @@ class CrewDispatchRuntime:
     ) -> tuple[GatewayCompletion, Artifact]:
         if request.response_schema is not None:
             _structured_validator(request.response_schema)
+        output_limit = _model_output_byte_budget(request.max_output_tokens)
         index = cursor.value
         cursor.value += 1
         key = self._model_call_key(context.run_id, step.id, attempt, purpose, actor, index)
@@ -4675,7 +4913,7 @@ class CrewDispatchRuntime:
                         completion = recovered_completion
                         rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
-                    self._valid_response(completion)
+                    self._valid_response(completion, max_output_bytes=output_limit)
                 if repair is not None and completion.response.tool_calls:
                     rejected = GatewayRejectedOutput(
                         evidence=RejectedOutputEvidence(
@@ -4726,7 +4964,7 @@ class CrewDispatchRuntime:
                     completion = _completion_with_estimated_usage(completion, request)
                     rejected = self._reject_invalid_structured(request, completion)
                     if rejected is None:
-                        self._valid_response(completion)
+                        self._valid_response(completion, max_output_bytes=output_limit)
             except GatewayResponseCancelled as error:
                 receipt = error.receipt
                 cancelled_private = dict(self._rejected_private_payload(receipt, sources))
@@ -4766,10 +5004,15 @@ class CrewDispatchRuntime:
                 completion = _completion_with_estimated_usage(completion, request)
                 rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
-                    self._valid_response(completion)
+                    self._valid_response(completion, max_output_bytes=output_limit)
             if rejected is None:
                 assert completion is not None
-                artifact = self._model_artifact(completion, actor, sources)
+                artifact = self._model_artifact(
+                    completion,
+                    actor,
+                    sources,
+                    max_output_bytes=output_limit,
+                )
                 succeeded = dict(running)
                 succeeded.update(
                     status="succeeded", artifact_id=str(artifact.id), sha256=artifact.content_sha256,
@@ -4820,18 +5063,43 @@ class CrewDispatchRuntime:
             cast(int, previous_repair["max_output_tokens"]) if previous_repair is not None
             else min(request.max_output_tokens or remaining_tokens, remaining_tokens)
         )
-        correction_messages = self._normalize_crewai_messages([
-            *({"role": message.role, "content": message.content} for message in request.messages),
-            {"role": "user", "content": "UNTRUSTED_REJECTED_OUTPUT_JSON=" + json.dumps({
-                "text": evidence.final_text, "reason": evidence.reason,
-                "text_sha256": evidence.text_sha256,
-            }, ensure_ascii=False)},
-            {"role": "system", "content": (
-                "Correct only the JSON format to satisfy the existing internal response schema. "
-                "Keep the assigned role, original task and facts. Do not invent unknown facts, "
-                "evidence or approval. Do not use tools. Return the JSON object only."
-            )},
-        ])
+        correction_limits = self._content_limits(
+            context,
+            logical_model=request.logical_model,
+            max_output_tokens=output_limit,
+            source_count=len(sources),
+        )
+        correction_messages = self._normalize_crewai_messages(
+            [
+                *(
+                    {"role": message.role, "content": message.content}
+                    for message in request.messages
+                ),
+                {
+                    "role": "user",
+                    "content": "UNTRUSTED_REJECTED_OUTPUT_JSON="
+                    + json.dumps(
+                        {
+                            "text": evidence.final_text,
+                            "reason": evidence.reason,
+                            "text_sha256": evidence.text_sha256,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "role": "system",
+                    "content": (
+                        "Correct only the JSON format to satisfy the existing internal response "
+                        "schema. Keep the assigned role, original task and facts. Do not invent "
+                        "unknown facts, evidence or approval. Do not use tools. Return the JSON "
+                        "object only."
+                    ),
+                },
+            ],
+            max_prompt_bytes=correction_limits.prompt_bytes,
+            message_limit=correction_limits.interaction_message_limit,
+        )
         correction = replace(
             request, messages=correction_messages, tools=(),
             required_capabilities=request.required_capabilities - {ModelCapability.TOOL_CALLING},
@@ -4886,7 +5154,16 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
     ) -> GatewayCompletion:
-        messages = list(self._guidance_messages(context, crew_messages))
+        max_output_tokens = min(agent.max_output_tokens, step.token_budget)
+        content_limits = self._content_limits(
+            context,
+            logical_model=_agent_logical_model_for_recovery(agent, recovery_attempt),
+            max_output_tokens=max_output_tokens,
+            source_count=len(input_sources),
+        )
+        messages = list(
+            self._guidance_messages(context, crew_messages, limits=content_limits)
+        )
         tool_metadata_by_name = _capability_manifest_tool_metadata_map(
             self._capabilities,
             tenant_id=context.tenant_id,
@@ -4948,10 +5225,14 @@ class CrewDispatchRuntime:
             )
             request = ModelRequest(
                 logical_model=logical_model,
-                messages=self._response_contract_messages(messages, response_schema),
+                messages=self._response_contract_messages(
+                    messages,
+                    response_schema,
+                    limits=content_limits,
+                ),
                 required_capabilities=frozenset(round_required_capabilities),
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),
-                max_output_tokens=min(agent.max_output_tokens, step.token_budget),
+                max_output_tokens=max_output_tokens,
                 response_schema=response_schema,
                 tools=round_tools,
             )
@@ -4971,7 +5252,10 @@ class CrewDispatchRuntime:
                 run_state=run_state, step_deadline=step_deadline,
             )
             evidence.append(model_artifact)
-            response = self._valid_response(completion)
+            response = self._valid_response(
+                completion,
+                max_output_bytes=content_limits.output_bytes,
+            )
             assert response is not None
             if not response.tool_calls:
                 if _is_incremental_workspace_contract_step(step) and not any(
@@ -5078,6 +5362,11 @@ class CrewDispatchRuntime:
                 ):
                     _fail("capability arguments exceed limit")
                 arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                event_arguments = (
+                    project_zip_evidence_arguments(tool_call.arguments)
+                    if tool_call.name == PROJECT_ZIP_TOOL_NAME
+                    else tool_call.arguments
+                )
                 generated_file_result = reusable_generated_file_result(
                     tool_call.name,
                     evidence,
@@ -5231,10 +5520,10 @@ class CrewDispatchRuntime:
                     actor=step.agent,
                     tool_call_id=call_id,
                     tool_name=tool_call.name,
-                    payload=safe_tool_event_payload(
-                        name=tool_call.name,
-                        status="requested",
-                        arguments=tool_call.arguments,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="requested",
+                            arguments=event_arguments,
                         sandbox=tool_sandbox,
                         replay_safe=replay_safe,
                     ),
@@ -5264,7 +5553,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="failed",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="invalid_request",
@@ -5284,7 +5573,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="running",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                         ),
@@ -5349,7 +5638,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="failed",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed",
@@ -5382,7 +5671,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="failed",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed"
@@ -5414,7 +5703,7 @@ class CrewDispatchRuntime:
                                 **safe_tool_event_payload(
                                     name=tool_call.name,
                                     status="waiting_approval",
-                                    arguments=tool_call.arguments,
+                                    arguments=event_arguments,
                                     sandbox=tool_sandbox,
                                     replay_safe=replay_safe,
                                     failure_kind="waiting_approval",
@@ -5514,7 +5803,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="failed",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed",
@@ -5533,7 +5822,7 @@ class CrewDispatchRuntime:
                     ):
                         result = augment_project_scale_artifact_result(result)
                     encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
-                    if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                    if len(encoded.encode("utf-8")) > content_limits.prompt_bytes:
                         _fail("capability result exceeds limit")
                 except Exception as error:  # noqa: BLE001
                     error.__traceback__ = None
@@ -5551,7 +5840,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="failed",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                             failure_kind="capability_failed"
@@ -5584,7 +5873,7 @@ class CrewDispatchRuntime:
                         payload=safe_tool_event_payload(
                             name=tool_call.name,
                             status="running",
-                            arguments=tool_call.arguments,
+                            arguments=event_arguments,
                             sandbox=tool_sandbox,
                             replay_safe=replay_safe,
                         ),
@@ -5738,7 +6027,7 @@ class CrewDispatchRuntime:
             ).encode("utf-8")
         except (TypeError, ValueError):
             _fail("model request is invalid")
-        if len(encoded) > _MAX_PROMPT_BYTES + 16_384:
+        if len(encoded) > _ABSOLUTE_PROMPT_BYTES + 16_384:
             _fail("model request exceeds ledger limit")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -5747,6 +6036,8 @@ class CrewDispatchRuntime:
         completion: GatewayCompletion,
         actor: str,
         sources: tuple[Artifact, ...],
+        *,
+        max_output_bytes: int = _MAX_OUTPUT_BYTES,
     ) -> Artifact:
         response = completion.response
         usage: Mapping[str, JsonValue] | None = None
@@ -5762,7 +6053,12 @@ class CrewDispatchRuntime:
                 {
                     "id": tool_call.id,
                     "name": tool_call.name,
-                    "arguments": cast(JsonValue, tool_call.arguments),
+                    "arguments": cast(
+                        JsonValue,
+                        project_zip_evidence_arguments(tool_call.arguments)
+                        if tool_call.name == PROJECT_ZIP_TOOL_NAME
+                        else tool_call.arguments,
+                    ),
                 }
                 for tool_call in response.tool_calls
             ),
@@ -5781,7 +6077,7 @@ class CrewDispatchRuntime:
                 tool_call.name == "workspace.write_text"
                 for tool_call in response.tool_calls
             )
-            else _MAX_PROMPT_BYTES
+            else min(_ABSOLUTE_OUTPUT_BYTES, max_output_bytes + 16_384)
         )
         if len(encoded.encode("utf-8")) > evidence_limit:
             _fail("model response evidence exceeds limit")
@@ -5929,6 +6225,9 @@ class CrewDispatchRuntime:
     @staticmethod
     def _compact_interaction_messages(
         messages: Sequence[ModelMessage],
+        *,
+        max_prompt_bytes: int = _SOFT_INTERACTION_PROMPT_BYTES,
+        message_limit: int = _SOFT_INTERACTION_MESSAGE_LIMIT,
     ) -> tuple[ModelMessage, ...]:
         def encoded_content(message: ModelMessage) -> bytes:
             return json.dumps(
@@ -5942,19 +6241,19 @@ class CrewDispatchRuntime:
         current = tuple(messages)
         current_bytes = sum(len(encoded_content(message)) for message in current)
         if (
-            len(current) <= _SOFT_INTERACTION_MESSAGE_LIMIT
-            and current_bytes <= _SOFT_INTERACTION_PROMPT_BYTES
+            len(current) <= message_limit
+            and current_bytes <= max_prompt_bytes
         ):
             return current
 
         anchor_count = min(2, len(current))
         anchors = current[:anchor_count]
-        remaining_bytes = _SOFT_INTERACTION_PROMPT_BYTES - sum(
+        remaining_bytes = max_prompt_bytes - sum(
             len(encoded_content(message)) for message in anchors
         )
         recent: list[ModelMessage] = []
         recent_bytes = 0
-        recent_capacity = max(1, _SOFT_INTERACTION_MESSAGE_LIMIT - anchor_count - 1)
+        recent_capacity = max(1, message_limit - anchor_count - 1)
         for message in reversed(current[anchor_count:]):
             message_bytes = len(encoded_content(message))
             if recent and (
@@ -5986,14 +6285,22 @@ class CrewDispatchRuntime:
         return (*anchors, summary, *recent)
 
     @staticmethod
-    def _normalize_crewai_messages(messages: object) -> tuple[ModelMessage, ...]:
+    def _normalize_crewai_messages(
+        messages: object,
+        *,
+        max_prompt_bytes: int = _MAX_PROMPT_BYTES,
+        message_limit: int = 64,
+    ) -> tuple[ModelMessage, ...]:
         if type(messages) is str:
             raw_messages: tuple[object, ...] = ({"role": "user", "content": messages},)
         elif type(messages) is list:
             raw_messages = tuple(cast(list[object], messages))
         else:
             _fail("CrewAI message boundary is invalid")
-        if not 1 <= len(raw_messages) <= 64:
+        if not 1 <= len(raw_messages) <= min(
+            message_limit,
+            _ABSOLUTE_INTERACTION_MESSAGES,
+        ):
             _fail("CrewAI message boundary is invalid")
         normalized: list[ModelMessage] = []
         total_bytes = 0
@@ -6010,7 +6317,7 @@ class CrewDispatchRuntime:
             safe_role = role if role in {"system", "user", "assistant"} else "user"
             safe_content = content if safe_role == role else f"UNTRUSTED_{role.upper()}={content}"
             total_bytes += len(safe_content.encode("utf-8"))
-            if total_bytes > _MAX_PROMPT_BYTES:
+            if total_bytes > min(max_prompt_bytes, _ABSOLUTE_PROMPT_BYTES):
                 _fail("CrewAI message boundary exceeds limit")
             normalized.append(ModelMessage(role=safe_role, content=safe_content))
         return tuple(normalized)
@@ -6031,6 +6338,13 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[str, str | None, tuple[Artifact, ...]]:
+        max_output_tokens = min(reviewer.max_output_tokens, step.token_budget)
+        content_limits = self._content_limits(
+            context,
+            logical_model=_agent_logical_model_for_recovery(reviewer, recovery_attempt),
+            max_output_tokens=max_output_tokens,
+            source_count=1,
+        )
         review_payload = _artifact_review_packet_payload(
             artifact,
             max_preview_bytes=(
@@ -6055,7 +6369,7 @@ class CrewDispatchRuntime:
             sort_keys=True,
             separators=(",", ":"),
         )
-        if len(payload.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        if len(payload.encode("utf-8")) > content_limits.prompt_bytes:
             _fail("review input exceeds limit")
         generation = run_state.crew_generation
         if generation is None:
@@ -6082,13 +6396,19 @@ class CrewDispatchRuntime:
                 request = ModelRequest(
                     logical_model=reviewer.logical_model,
                     messages=runtime._response_contract_messages(
-                        runtime._guidance_messages(context, crew_messages), _REVIEW_RESPONSE_SCHEMA,
+                        runtime._guidance_messages(
+                            context,
+                            crew_messages,
+                            limits=content_limits,
+                        ),
+                        _REVIEW_RESPONSE_SCHEMA,
+                        limits=content_limits,
                     ),
                     required_capabilities=frozenset(
                         {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
                     ),
                     timeout_seconds=runtime._remaining_timeout(run_state, step_deadline),
-                    max_output_tokens=min(reviewer.max_output_tokens, step.token_budget),
+                    max_output_tokens=max_output_tokens,
                     response_schema=_REVIEW_RESPONSE_SCHEMA,
                 )
                 completion, model_artifact = await runtime._execute_model_request(
@@ -6107,7 +6427,10 @@ class CrewDispatchRuntime:
                     run_state=run_state, step_deadline=step_deadline,
                 )
                 evidence.append(model_artifact)
-                response = runtime._valid_response(completion)
+                response = runtime._valid_response(
+                    completion,
+                    max_output_bytes=content_limits.output_bytes,
+                )
                 if response.text is None and response.tool_calls:
                     _fail("reviewer returned tool calls instead of JSON")
                 if response.text is None:
@@ -6151,7 +6474,12 @@ class CrewDispatchRuntime:
             _fail("CrewAI bypassed the ModelGateway bridge")
         if text is None:
             _fail("reviewer returned empty response")
-        _check_framework_raw(_REVIEW_RESPONSE_SCHEMA, completion.response.text, text)
+        _check_framework_raw(
+            _REVIEW_RESPONSE_SCHEMA,
+            completion.response.text,
+            text,
+            max_bytes=content_limits.output_bytes,
+        )
         value = _parse_structured_output(
             _REVIEW_RESPONSE_SCHEMA, completion.response.text, prefix="review response", max_bytes=16_384,
         )
@@ -6168,7 +6496,11 @@ class CrewDispatchRuntime:
         return cast(str, verdict), feedback, tuple(evidence)
 
     @staticmethod
-    def _valid_response(completion: GatewayCompletion) -> ModelResponse:
+    def _valid_response(
+        completion: GatewayCompletion,
+        *,
+        max_output_bytes: int = _MAX_OUTPUT_BYTES,
+    ) -> ModelResponse:
         if not isinstance(completion, GatewayCompletion):
             _fail("model gateway returned invalid completion")
         response = completion.response
@@ -6178,7 +6510,10 @@ class CrewDispatchRuntime:
             _fail("model response exceeds tool call limit")
         if response.text is not None and not response.text.strip() and not response.tool_calls:
             _fail("model response text is empty")
-        if response.text is not None and len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+        if response.text is not None and len(response.text.encode("utf-8")) > min(
+            max_output_bytes,
+            _ABSOLUTE_OUTPUT_BYTES,
+        ):
             _fail("model response exceeds output limit")
         if response.text is None and not response.tool_calls:
             _fail("model response is empty")

@@ -47,6 +47,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _crew_content_limits,
     _scope_project_workspace_tool_call,
     _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
@@ -2421,17 +2422,23 @@ async def test_tool_round_budget_stops_at_audited_resource_fuse(
         crew_factory=FastFactory(),
     )
 
+    context = _context(routing_decision={"project_scale": project_scale})
     with pytest.raises(RuntimeExecutionError, match="dispatch budget exhausted"):
         _ = [
             event
-            async for event in runtime.run(
-                _context(routing_decision={"project_scale": project_scale})
-            )
+            async for event in runtime.run(context)
         ]
 
     assert len(harness.calls) == hard_limit
     assert len(gateway.requests) == hard_limit + 1
-    assert max(len(request.messages) for request in gateway.requests) <= 48
+    limits = _crew_content_limits(
+        context,
+        max_output_tokens=max(request.max_output_tokens for request in gateway.requests),
+        source_count=1,
+    )
+    assert max(len(request.messages) for request in gateway.requests) <= (
+        limits.interaction_message_limit
+    )
     assert any(
         "EARLIER_INTERACTION_WINDOW_COMPRESSED" in message.content
         for request in gateway.requests

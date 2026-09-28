@@ -84,6 +84,21 @@ class BlockingAsyncChunkStream(AsyncChunkStream):
         return await super().__anext__()
 
 
+class BlockingCloseAsyncChunkStream(AsyncChunkStream):
+    def __init__(self, chunks: Sequence[object]) -> None:
+        super().__init__(chunks)
+        self.close_started = asyncio.Event()
+        self.close_cancelled = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.close_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.close_cancelled.set()
+            raise
+
+
 def test_gateway_completion_is_exported_from_models_package() -> None:
     import agent_hub.models as public_models
     from agent_hub.models import GatewayCompletion as PublicGatewayCompletion
@@ -131,6 +146,7 @@ class CapacityStub:
         self.records: list[tuple[str, int | None, float, bool]] = []
         self.configured: tuple[Deployment, ...] = ()
         self.record_error: Exception | None = None
+        self.record_block: asyncio.Event | None = None
         self.release_error: Exception | None = None
         self.release_block: asyncio.Event | None = None
         self.release_started = asyncio.Event()
@@ -194,6 +210,8 @@ class CapacityStub:
         succeeded: bool,
     ) -> None:
         self.records.append((quota_scope_id, status_code, latency_seconds, succeeded))
+        if self.record_block is not None:
+            await self.record_block.wait()
         if self.record_error is not None:
             raise self.record_error
 
@@ -231,14 +249,28 @@ class FingerprintSensitiveCapacity(CapacityStub):
 
 
 class SecretStub:
-    def __init__(self, events: list[object], failure: Exception | None = None) -> None:
+    def __init__(
+        self,
+        events: list[object],
+        failure: Exception | None = None,
+        *,
+        block: asyncio.Event | None = None,
+    ) -> None:
         self.events = events
         self.failure = failure
+        self.block = block
         self.references: list[str] = []
+        self.cancelled = asyncio.Event()
 
     async def resolve(self, secret_ref: str) -> str:
         self.events.append(("resolve", secret_ref))
         self.references.append(secret_ref)
+        if self.block is not None:
+            try:
+                await self.block.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
         if self.failure is not None:
             raise self.failure
         return f"key-for-{secret_ref}"
@@ -1518,6 +1550,193 @@ async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
         ("acquire", ("backup-key",), 0.02, estimated),
     ]
     assert capacity.initialize_calls == 2
+
+
+async def test_capacity_wait_is_bounded_by_request_remaining_time() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([CapacityWaitTimeout("busy"), lease("backup-key")])
+    transport = TransportStub(capacity.events)
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.05,
+    )
+
+    completion = await gateway.complete_with_context(short_request)
+
+    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    assert len(acquire_events) == 2
+    assert 0 < acquire_events[0][2] <= 0.05  # type: ignore[index]
+    assert 0 < acquire_events[1][2] <= acquire_events[0][2]  # type: ignore[index]
+    assert completion.logical_model == "backup"
+    assert transport.calls[0][1] is short_request
+    assert transport.calls[0][1].timeout_seconds == 0.05
+
+
+async def test_capacity_initialize_is_bounded_by_request_deadline() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+
+    async def block_initialize() -> None:
+        await asyncio.Future()
+
+    capacity.initialize = block_initialize  # type: ignore[method-assign]
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.02,
+    )
+
+    async with asyncio.timeout(0.2):
+        with pytest.raises(CapacityUnavailable):
+            await gateway.complete(short_request)
+
+
+async def test_capacity_record_and_release_waits_share_request_deadline() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    capacity.record_block = asyncio.Event()
+    capacity.release_block = asyncio.Event()
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.03,
+    )
+
+    async with asyncio.timeout(0.5):
+        with pytest.raises(ModelGatewayError, match="outcome recording failed"):
+            await gateway.complete(short_request)
+    assert capacity.release_started.is_set()
+
+
+async def test_secret_resolution_is_bounded_by_request_deadline() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    secret = SecretStub(capacity.events, block=asyncio.Event())
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        secret,
+        TransportStub(capacity.events),
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.02,
+    )
+
+    async with asyncio.timeout(0.2):
+        with pytest.raises(ModelTransportError) as captured:
+            await gateway.complete(short_request)
+    assert captured.value.status_code == 408
+    assert secret.cancelled.is_set()
+    assert capacity.release_started.is_set()
+
+
+async def test_stream_secret_resolution_is_bounded_by_request_deadline() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    capacity = CapacityStub([lease("selected")])
+    secret = SecretStub(capacity.events, block=asyncio.Event())
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        secret,
+        StreamingTransportStub(capacity.events, []),
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.02,
+    )
+
+    async with asyncio.timeout(0.2):
+        with pytest.raises(ModelTransportError) as captured:
+            await anext(gateway.stream_openai_compatible_events(short_request))
+    assert captured.value.status_code == 408
+    assert secret.cancelled.is_set()
+    assert capacity.release_started.is_set()
+
+
+async def test_stream_close_is_bounded_by_request_deadline() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    capacity = CapacityStub([lease("selected")])
+    blocking_close = BlockingCloseAsyncChunkStream(
+        [{"choices": [{"delta": {"content": "later"}}]}]
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        StreamingTransportStub(capacity.events, []),
+        capacity_wait_timeout=60,
+    )
+
+    async with asyncio.timeout(0.2):
+        close_error = await gateway._stream_close_cleanup(
+            blocking_close,
+            deadline=asyncio.get_running_loop().time() + 0.02,
+        )
+    assert isinstance(close_error, ModelGatewayError)
+    assert blocking_close.close_started.is_set()
+    await asyncio.sleep(0)
+    assert blocking_close.close_cancelled.is_set()
+
+
+async def test_streaming_fallback_recomputes_deadline_after_consumer_pause() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([CapacityWaitTimeout("busy"), lease("backup-key")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [{"choices": [{"delta": {"content": "done"}}]}],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        capacity_wait_timeout=60,
+    )
+    short_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        timeout_seconds=0.03,
+    )
+    events = gateway.stream_openai_compatible_events(short_request)
+
+    fallback = await anext(events)
+    assert fallback.kind == "model.fallback"
+    await asyncio.sleep(0.04)
+    with pytest.raises(CapacityUnavailable):
+        await anext(events)
+    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    assert len(acquire_events) == 1
 
 
 async def test_completion_context_reports_actual_fallback_provenance() -> None:

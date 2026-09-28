@@ -279,7 +279,7 @@ def test_artifact_accepts_large_structured_workspace_bundle_without_raising_text
             id=uuid4(),
             type="text",
             producer="main",
-            content={"text": "x" * 70_000},
+            content={"text": "x" * 512_001},
         )
 
 
@@ -366,9 +366,34 @@ def test_artifact_rejects_self_source_and_inconsistent_provenance() -> None:
 
 
 def test_text_artifact_rejects_empty_oversize_and_hidden_reasoning() -> None:
-    for content in ({"text": ""}, {"text": "x" * 65_537}, {"chain_of_thought": "secret"}):
+    for content in (
+        {"text": ""},
+        {"text": "x" * 512_001},
+        {"chain_of_thought": "secret"},
+    ):
         with pytest.raises(ValidationError):
             Artifact(id=uuid4(), type="text", producer="main", content=content)
+
+
+def test_artifact_lineage_supports_large_plan_fan_in_with_absolute_fuse() -> None:
+    sources = tuple(str(uuid4()) for _ in range(80))
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="finalizer",
+        content={"text": "summary"},
+        source_ids=sources,
+    )
+
+    assert artifact.source_ids == sources
+    with pytest.raises(ValidationError, match="source_ids"):
+        Artifact(
+            id=uuid4(),
+            type="text",
+            producer="finalizer",
+            content={"text": "summary"},
+            source_ids=tuple(str(uuid4()) for _ in range(257)),
+        )
 
 
 def test_checkpoint_freezes_and_hashes_bounded_safe_state() -> None:
@@ -940,7 +965,7 @@ async def test_direct_claims_only_sources_actually_included_in_prompt() -> None:
     assert str(image.id) not in prompt
 
 
-async def test_combined_prompt_limit_is_redacted_across_all_runtime_frames() -> None:
+async def test_combined_prompt_is_compacted_to_runtime_window() -> None:
     sentinel = "combined-prompt-model-sentinel"
     artifacts = tuple(
         Artifact(
@@ -953,12 +978,12 @@ async def test_combined_prompt_limit_is_redacted_across_all_runtime_frames() -> 
     )
     gateway = FakeGateway()
     runtime = DirectRuntime(gateway, logical_model="general")
-    with pytest.raises(RuntimeExecutionError) as caught:
-        await collect(runtime, context(artifacts=artifacts))
-    assert sentinel not in exception_graph_text(caught.value)
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    assert not gateway.requests
+    events = await collect(runtime, context(artifacts=artifacts))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 1
+    request = gateway.requests[0]
+    assert request.max_output_tokens > 0
 
 
 async def test_direct_escapes_untrusted_delimiter_text() -> None:
@@ -1200,8 +1225,43 @@ async def test_direct_uses_conservative_budget_when_provider_omits_usage() -> No
     assert events[-1].payload["usage_completion_exceeded_request"] is False
 
 
+def test_direct_estimates_equivalent_chinese_and_english_completions_consistently() -> None:
+    english = DirectRuntime._verified_budget_usage(
+        None,
+        prompt_estimate=10,
+        response_text="implementation " * 800,
+        request_max_output_tokens=20_000,
+        context_token_budget=30_000,
+    )
+    chinese = DirectRuntime._verified_budget_usage(
+        None,
+        prompt_estimate=10,
+        response_text="实现方案" * 500,
+        request_max_output_tokens=20_000,
+        context_token_budget=30_000,
+    )
+
+    assert english.usage is not None
+    assert chinese.usage is not None
+    ratio = english.usage.completion_tokens / chinese.usage.completion_tokens
+    assert 0.75 <= ratio <= 1.25
+
+
+def test_text_artifact_accepts_large_history_below_absolute_safety_fuse() -> None:
+    text = "历史决策" * 20_000
+
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="context_loader",
+        content={"text": text},
+    )
+
+    assert artifact.content["text"] == text
+
+
 async def test_direct_rejects_missing_usage_when_estimate_exceeds_budget() -> None:
-    gateway = FakeGateway(ModelResponse(text="x" * 900, usage=None))
+    gateway = FakeGateway(ModelResponse(text="x" * 4_000, usage=None))
     runtime = DirectRuntime(gateway, logical_model="general")
     with pytest.raises(RuntimeExecutionError) as caught:
         await collect(runtime, context(token_budget=1000))

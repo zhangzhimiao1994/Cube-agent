@@ -12,6 +12,12 @@ from agent_hub.plugins.dependency_policy import (
 )
 from agent_hub.runtime.contracts import JsonValue
 
+from .project_zip import (
+    PROJECT_ZIP_TOOL_NAME,
+    project_zip_input_schema,
+    project_zip_operational_limits,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 _PLUGIN_PACKAGE_ACTIVATION_REASON_CODES = {
@@ -85,9 +91,11 @@ class ToolManifest:
     sandbox_profile: str
     replay_safe: bool
     aliases: tuple[str, ...] = ()
+    input_schema: Mapping[str, JsonValue] | None = None
+    operational_limits: Mapping[str, JsonValue] | None = None
 
     def to_public_dict(self) -> Mapping[str, JsonValue]:
-        return {
+        payload: dict[str, JsonValue] = {
             "id": self.id,
             "kind": self.kind,
             "adapter": self.adapter,
@@ -96,6 +104,11 @@ class ToolManifest:
             "replay_safe": self.replay_safe,
             "aliases": self.aliases,
         }
+        if self.input_schema is not None:
+            payload["input_schema"] = dict(self.input_schema)
+        if self.operational_limits is not None:
+            payload["operational_limits"] = dict(self.operational_limits)
+        return payload
 
 
 class ToolRegistry:
@@ -114,6 +127,8 @@ class ToolRegistry:
         sandbox_profile: str = "unspecified",
         replay_safe: bool = False,
         aliases: tuple[str, ...] = (),
+        input_schema: Mapping[str, JsonValue] | None = None,
+        operational_limits: Mapping[str, JsonValue] | None = None,
     ) -> None:
         if not name or name in self._tools:
             raise ValueError("tool name is invalid")
@@ -125,6 +140,8 @@ class ToolRegistry:
             sandbox_profile=_nonblank(sandbox_profile, "sandbox_profile"),
             replay_safe=replay_safe is True,
             aliases=_aliases(aliases),
+            input_schema=input_schema,
+            operational_limits=operational_limits,
         )
         self._tools[name] = tool
         self._manifests[name] = manifest
@@ -313,13 +330,15 @@ def create_builtin_tool_registry() -> ToolRegistry:
         replay_safe=True,
     )
     registry.register(
-        "project.generate_zip",
+        PROJECT_ZIP_TOOL_NAME,
         object(),
         kind="builtin",
         adapter="runtime_builtin",
         permission_class="file.create",
         sandbox_profile="generated_artifact_store",
         replay_safe=True,
+        input_schema=project_zip_input_schema(),
+        operational_limits=project_zip_operational_limits(),
     )
     registry.register(
         "workspace.read",

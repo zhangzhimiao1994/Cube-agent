@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pytest
+from pydantic import ValidationError
 
 import agent_hub.runtime.defaults as defaults_module
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
@@ -1664,6 +1665,17 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
                 "handoff_kind": "step_dependency",
             },
         ),
+        "total_count": 1,
+        "returned_count": 1,
+        "pagination": {
+            "page": 1,
+            "page_size": 12,
+            "page_count": 1,
+            "has_more": False,
+            "next_page": None,
+            "absolute_limit": 4096,
+            "absolute_fuse_reached": False,
+        },
         "truncated": False,
     }
     assert plan["orchestration_contracts"] == {
@@ -1690,6 +1702,17 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
                 "recovery_hint": "retry_blocked_contract_chain",
             },
         ),
+        "total_count": 1,
+        "returned_count": 1,
+        "pagination": {
+            "page": 1,
+            "page_size": 12,
+            "page_count": 1,
+            "has_more": False,
+            "next_page": None,
+            "absolute_limit": 4096,
+            "absolute_fuse_reached": False,
+        },
         "truncated": False,
     }
     assert plan["orchestration_protocol"] == {
@@ -1699,6 +1722,21 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
         "role_count": 2,
         "handoff_count": 1,
         "contract_count": 1,
+        "returned_handoff_count": 1,
+        "pagination": {
+            "page": 1,
+            "page_size": 12,
+            "page_count": 1,
+            "has_more": False,
+            "next_page": None,
+            "absolute_limit": 4096,
+            "absolute_fuse_reached": False,
+        },
+        "page_reader": {
+            "operation": "runtime.read_orchestration_handoff_page",
+            "page_size": 12,
+            "next_cursor": None,
+        },
         "structured_output_schema": "dispatch_output_v1",
         "required_output_fields": (
             "status",
@@ -2226,6 +2264,32 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
             overflow_target_step,
         ),
     )
+    overflow_second_page = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+            routing_decision={
+                "orchestration_handoff_page": 2,
+                "orchestration_handoff_page_size": 12,
+            },
+        ),
+        main_agent_model="main",
+        roles=(*source_roles, target_role),
+        steps=(*source_steps, overflow_target_step),
+    )
+    legacy_second_page = defaults_module.read_orchestration_handoff_page(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+        ),
+        cursor="handoff-page-v1:2:12",
+        roles=(*source_roles, target_role),
+        steps=(*source_steps, overflow_target_step),
+    )
 
     exact_handoffs = exact_plan["orchestration_handoffs"]
     assert isinstance(exact_handoffs, Mapping)
@@ -2233,6 +2297,17 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
     assert isinstance(exact_items, tuple)
     assert len(exact_items) == 12
     assert exact_handoffs["truncated"] is False
+    assert exact_handoffs["total_count"] == 12
+    assert exact_handoffs["returned_count"] == 12
+    assert exact_handoffs["pagination"] == {
+        "page": 1,
+        "page_size": 12,
+        "page_count": 1,
+        "has_more": False,
+        "next_page": None,
+        "absolute_limit": 4096,
+        "absolute_fuse_reached": False,
+    }
     exact_contracts = exact_plan["orchestration_contracts"]
     assert isinstance(exact_contracts, Mapping)
     exact_contract_items = exact_contracts["items"]
@@ -2250,6 +2325,17 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
     assert isinstance(overflow_items, tuple)
     assert len(overflow_items) == 12
     assert overflow_handoffs["truncated"] is True
+    assert overflow_handoffs["total_count"] == 13
+    assert overflow_handoffs["returned_count"] == 12
+    assert overflow_handoffs["pagination"] == {
+        "page": 1,
+        "page_size": 12,
+        "page_count": 2,
+        "has_more": True,
+        "next_page": 2,
+        "absolute_limit": 4096,
+        "absolute_fuse_reached": False,
+    }
     overflow_contracts = overflow_plan["orchestration_contracts"]
     assert isinstance(overflow_contracts, Mapping)
     overflow_contract_items = overflow_contracts["items"]
@@ -2258,9 +2344,329 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
     assert overflow_contracts["truncated"] is True
     overflow_protocol = overflow_plan["orchestration_protocol"]
     assert isinstance(overflow_protocol, Mapping)
-    assert overflow_protocol["handoff_count"] == 12
-    assert overflow_protocol["contract_count"] == 12
+    assert overflow_protocol["handoff_count"] == 13
+    assert overflow_protocol["contract_count"] == 13
+    assert overflow_protocol["returned_handoff_count"] == 12
     assert overflow_protocol["truncated"] is True
+    second_handoffs = overflow_second_page["orchestration_handoffs"]
+    assert isinstance(second_handoffs, Mapping)
+    second_items = second_handoffs["items"]
+    assert isinstance(second_items, tuple)
+    assert len(second_items) == 1
+    assert second_handoffs["total_count"] == 13
+    assert second_handoffs["returned_count"] == 1
+    second_pagination = second_handoffs["pagination"]
+    assert isinstance(second_pagination, Mapping)
+    assert second_pagination["page"] == 2
+    assert second_pagination["has_more"] is False
+    legacy_handoffs = legacy_second_page["orchestration_handoffs"]
+    assert isinstance(legacy_handoffs, Mapping)
+    assert legacy_handoffs["items"] == second_items
+
+
+def test_model_execution_plan_handoff_page_size_grows_with_scale_and_token_budget() -> None:
+    source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}",
+            "role": "Worker",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        }
+        for index in range(40)
+    )
+    target_role: Mapping[str, JsonValue] = {
+        "id": "final_synthesizer",
+        "role": "Final Synthesizer",
+        "purpose": "synthesize",
+        "logical_model": "main",
+        "tools": (),
+    }
+    source_steps: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}_step",
+            "agent": f"worker_{index}",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        }
+        for index in range(40)
+    )
+    target_step: Mapping[str, JsonValue] = {
+        "id": "final_response_step",
+        "agent": "final_synthesizer",
+        "depends_on": tuple(f"worker_{index}_step" for index in range(40)),
+        "final_synthesizer": True,
+        "tools": (),
+    }
+
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Build a real large project.",
+            token_budget=262_144,
+            routing_decision={"project_scale": "large"},
+        ),
+        main_agent_model="main",
+        roles=(*source_roles, target_role),
+        steps=(*source_steps, target_step),
+    )
+
+    handoffs = plan["orchestration_handoffs"]
+    assert isinstance(handoffs, Mapping)
+    items = handoffs["items"]
+    assert isinstance(items, tuple)
+    assert len(items) == 40
+    assert handoffs["total_count"] == 40
+    pagination = handoffs["pagination"]
+    assert isinstance(pagination, Mapping)
+    assert pagination["page_size"] == 64
+    assert pagination["page_count"] == 1
+
+
+def test_model_execution_plan_handoff_pages_are_consumable_through_runtime_reader() -> None:
+    source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}",
+            "role": "Worker",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        }
+        for index in range(30)
+    )
+    target_role: Mapping[str, JsonValue] = {
+        "id": "final_synthesizer",
+        "role": "Final Synthesizer",
+        "purpose": "synthesize",
+        "logical_model": "main",
+        "tools": (),
+    }
+    source_steps: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}_step",
+            "agent": f"worker_{index}",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        }
+        for index in range(30)
+    )
+    target_step: Mapping[str, JsonValue] = {
+        "id": "final_response_step",
+        "agent": "final_synthesizer",
+        "depends_on": tuple(f"worker_{index}_step" for index in range(30)),
+        "final_synthesizer": True,
+        "tools": (),
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="Draft a launch campaign.",
+    )
+    roles = (*source_roles, target_role)
+    steps = (*source_steps, target_step)
+
+    plan = defaults_module._model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=roles,
+        steps=steps,
+    )
+
+    protocol = plan["orchestration_protocol"]
+    assert isinstance(protocol, Mapping)
+    reader = protocol["page_reader"]
+    assert isinstance(reader, Mapping)
+    assert reader["operation"] == "runtime.read_orchestration_handoff_page"
+    assert reader["page_size"] == 12
+    cursor = reader["next_cursor"]
+    assert isinstance(cursor, str)
+
+    initial_handoffs = plan["orchestration_handoffs"]
+    initial_contracts = plan["orchestration_contracts"]
+    assert isinstance(initial_handoffs, Mapping)
+    assert isinstance(initial_contracts, Mapping)
+    initial_handoff_items = initial_handoffs["items"]
+    initial_contract_items = initial_contracts["items"]
+    assert isinstance(initial_handoff_items, tuple)
+    assert isinstance(initial_contract_items, tuple)
+    handoff_ids = {
+        (str(item["source_step_id"]), str(item["target_step_id"]))
+        for item in initial_handoff_items
+        if isinstance(item, Mapping)
+    }
+    contract_ids = {
+        str(item["contract_id"])
+        for item in initial_contract_items
+        if isinstance(item, Mapping)
+    }
+    while cursor is not None:
+        page = defaults_module.read_orchestration_handoff_page(
+            context,
+            cursor=cursor,
+            page_size=7,
+        )
+        page_handoffs = page["orchestration_handoffs"]
+        page_contracts = page["orchestration_contracts"]
+        page_protocol = page["orchestration_protocol"]
+        assert isinstance(page_handoffs, Mapping)
+        assert isinstance(page_contracts, Mapping)
+        assert isinstance(page_protocol, Mapping)
+        assert len(cast(tuple[object, ...], page_handoffs["items"])) <= 7
+        handoff_ids.update(
+            (str(item["source_step_id"]), str(item["target_step_id"]))
+            for item in cast(tuple[Mapping[str, JsonValue], ...], page_handoffs["items"])
+        )
+        contract_ids.update(
+            str(item["contract_id"])
+            for item in cast(tuple[Mapping[str, JsonValue], ...], page_contracts["items"])
+        )
+        page_reader = page_protocol["page_reader"]
+        assert isinstance(page_reader, Mapping)
+        next_cursor = page_reader["next_cursor"]
+        assert next_cursor is None or isinstance(next_cursor, str)
+        cursor = next_cursor
+
+    assert handoff_ids == {
+        (f"worker_{index}_step", "final_response_step") for index in range(30)
+    }
+    assert contract_ids == {
+        f"worker_{index}_step-to-final_response_step" for index in range(30)
+    }
+
+    with pytest.raises(ValueError, match="does not belong to this run"):
+        defaults_module.read_orchestration_handoff_page(
+            context.model_copy(update={"run_id": uuid4()}),
+            cursor=cast(str, reader["next_cursor"]),
+            page_size=7,
+        )
+
+
+def test_orchestration_handoff_page_reader_preserves_absolute_fuse() -> None:
+    source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}",
+            "role": "Worker",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        }
+        for index in range(4097)
+    )
+    target_role: Mapping[str, JsonValue] = {
+        "id": "final_synthesizer",
+        "role": "Final Synthesizer",
+        "purpose": "synthesize",
+        "logical_model": "main",
+        "tools": (),
+    }
+    source_steps: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}_step",
+            "agent": f"worker_{index}",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        }
+        for index in range(4097)
+    )
+    target_step: Mapping[str, JsonValue] = {
+        "id": "final_response_step",
+        "agent": "final_synthesizer",
+        "depends_on": tuple(f"worker_{index}_step" for index in range(4097)),
+        "final_synthesizer": True,
+        "tools": (),
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="Build an ultra project.",
+        token_budget=1_048_576,
+        routing_decision={"project_scale": "ultra"},
+    )
+    plan = defaults_module._model_execution_plan_payload(
+        context,
+        main_agent_model="main",
+        roles=(*source_roles, target_role),
+        steps=(*source_steps, target_step),
+    )
+
+    handoffs = plan["orchestration_handoffs"]
+    protocol = plan["orchestration_protocol"]
+    assert isinstance(handoffs, Mapping)
+    assert isinstance(protocol, Mapping)
+    assert handoffs["total_count"] == 4097
+    page_reader = protocol["page_reader"]
+    assert isinstance(page_reader, Mapping)
+    cursor = page_reader["next_cursor"]
+    assert isinstance(cursor, str)
+    returned_count = int(cast(int, handoffs["returned_count"]))
+    last_handoffs = handoffs
+    while cursor is not None:
+        page = defaults_module.read_orchestration_handoff_page(
+            context,
+            cursor=cursor,
+            page_size=256,
+        )
+        page_handoffs = page["orchestration_handoffs"]
+        page_protocol = page["orchestration_protocol"]
+        assert isinstance(page_handoffs, Mapping)
+        assert isinstance(page_protocol, Mapping)
+        last_handoffs = page_handoffs
+        returned_count += int(cast(int, last_handoffs["returned_count"]))
+        next_reader = page_protocol["page_reader"]
+        assert isinstance(next_reader, Mapping)
+        next_cursor = next_reader["next_cursor"]
+        assert next_cursor is None or isinstance(next_cursor, str)
+        cursor = next_cursor
+
+    assert returned_count == 4096
+    pagination = last_handoffs["pagination"]
+    assert isinstance(pagination, Mapping)
+    assert pagination["absolute_limit"] == 4096
+    assert pagination["absolute_fuse_reached"] is True
+
+
+@pytest.mark.parametrize(
+    ("project_scale", "expected_max_steps"),
+    (("small", 64), ("medium", 96), ("large", 160), ("ultra", 256)),
+)
+def test_default_dispatch_plan_max_steps_grows_with_project_scale(
+    project_scale: str,
+    expected_max_steps: int,
+) -> None:
+    roles = (
+        RoleAssignment(
+            id="planner",
+            role="Planner",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the requested project.",
+            must_answer=("What should be done?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Plan the project.",
+            routing_decision={"project_scale": project_scale},
+        ),
+    )
+
+    assert plan.max_steps == expected_max_steps
 
 
 @pytest.mark.asyncio
@@ -2924,6 +3330,17 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
                 "handoff_kind": "step_dependency",
             },
         ),
+        "total_count": 1,
+        "returned_count": 1,
+        "pagination": {
+            "page": 1,
+            "page_size": 12,
+            "page_count": 1,
+            "has_more": False,
+            "next_page": None,
+            "absolute_limit": 4096,
+            "absolute_fuse_reached": False,
+        },
         "truncated": False,
     }
     assert model_execution_plan["model_capability_negotiation"] == {
@@ -5798,20 +6215,6 @@ def test_project_scale_zip_implementer_gets_extended_step_timeout() -> None:
             ),
             6_000_000,
         ),
-        (
-            (
-                "Build a real large business project for flow=dispatch. "
-                "Return strict JSON workspace_bundle.files (relative paths to full content)."
-            ),
-            9_000_000,
-        ),
-        (
-            (
-                "Build a real ultra-large business project for flow=dispatch. "
-                "Return strict JSON workspace_bundle.files (relative paths to full content)."
-            ),
-            10_000_000,
-        ),
     ),
 )
 def test_project_scale_zip_argument_budget_scales_with_project_size(
@@ -5848,6 +6251,39 @@ def test_project_scale_zip_argument_budget_scales_with_project_size(
     assert implementer_step.tool_argument_budget_bytes == {
         "project.generate_zip": expected_budget
     }
+
+
+@pytest.mark.parametrize("scale", ("large", "ultra-large"))
+def test_large_project_zip_only_plan_requires_incremental_workspace(scale: str) -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("project.generate_zip",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="incremental workspace"):
+        _dispatch_plan(
+            roles,
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request=(
+                    f"Build a real {scale} business project for flow=dispatch. "
+                    "Return strict JSON workspace_bundle.files."
+                ),
+            ),
+            capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+        )
 
 
 def test_project_scale_zip_argument_budget_uses_planner_complexity_signals() -> None:
@@ -5906,28 +6342,24 @@ def test_project_scale_zip_argument_budget_caps_complex_large_projects() -> None
         ),
     )
 
-    plan = _dispatch_plan(
-        roles,
-        TaskContext(
-            run_id=uuid4(),
-            tenant_id=TENANT_ID,
-            mode=TaskMode.DISPATCH,
-            request=(
-                "Build a real large business project for flow=dispatch. "
-                "Return strict JSON workspace_bundle.files (relative paths to full content). "
-                "Include auth, admin, database, upload, download, worker, queue, websocket, "
-                "payment, billing, build/test, generated_project_validation, and self-repair."
+    with pytest.raises(ValidationError, match="incremental workspace"):
+        _dispatch_plan(
+            roles,
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request=(
+                    "Build a real large business project for flow=dispatch. "
+                    "Return strict JSON workspace_bundle.files (relative paths to full content). "
+                    "Include auth, admin, database, upload, download, worker, queue, websocket, "
+                    "payment, billing, build/test, generated_project_validation, and self-repair."
+                ),
+                timeout_seconds=1800,
+                token_budget=2_000_000,
             ),
-            timeout_seconds=1800,
-            token_budget=2_000_000,
-        ),
-        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
-    )
-
-    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
-    assert implementer_step.tool_argument_budget_bytes == {
-        "project.generate_zip": 10_000_000
-    }
+            capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+        )
 
 
 @pytest.mark.parametrize(

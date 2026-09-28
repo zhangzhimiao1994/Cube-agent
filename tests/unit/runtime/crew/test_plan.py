@@ -414,6 +414,205 @@ def test_plan_allows_shared_total_token_budget_across_sequential_steps() -> None
     assert plan.total_token_budget == 100
 
 
+def test_large_plan_can_raise_soft_step_limit_but_keeps_absolute_fuse() -> None:
+    steps = tuple(
+        DispatchStep(
+            id=f"step-{index}",
+            agent="x",
+            task=f"Stage {index}",
+            depends_on=(() if index == 0 else (f"step-{index - 1}",)),
+            final_synthesizer=index == 79,
+            token_budget=1,
+            timeout_seconds=1,
+        )
+        for index in range(80)
+    )
+
+    plan = DispatchPlan(
+        agents=(agent("x", output_schema={"summary": "string"}),),
+        steps=steps,
+        max_steps=96,
+        total_token_budget=80,
+        total_timeout_seconds=80,
+    )
+
+    assert len(plan.steps) == 80
+    assert plan.max_steps == 96
+    assert DispatchPlan.from_payload(plan.to_payload()) == plan
+
+    with pytest.raises(ValidationError, match="step count"):
+        DispatchPlan(
+            agents=(agent("x", output_schema={"summary": "string"}),),
+            steps=tuple(
+                DispatchStep(
+                    id=f"absolute-{index}",
+                    agent="x",
+                    task=f"Stage {index}",
+                    final_synthesizer=index == 256,
+                    token_budget=1,
+                    timeout_seconds=1,
+                )
+                for index in range(257)
+            ),
+            max_steps=256,
+            total_token_budget=257,
+            total_timeout_seconds=257,
+        )
+
+
+def test_zip_plan_over_soft_capacity_requires_incremental_workspace_tools() -> None:
+    zip_tool = "project.generate_zip"
+
+    with pytest.raises(
+        (InvalidDispatchPlan, ValidationError), match="incremental workspace"
+    ):
+        DispatchPlan(
+            agents=(agent("builder", tools=(zip_tool,)),),
+            steps=(
+                DispatchStep(
+                    id="deliver",
+                    agent="builder",
+                    task="Build and deliver a large project",
+                    tools=(zip_tool,),
+                    tool_argument_budget_bytes={zip_tool: 3_000_000},
+                    final_synthesizer=True,
+                ),
+            ),
+            allowed_tools=(zip_tool,),
+            project_scale="large",
+        )
+
+    incremental_tools = (
+        "workspace.write_text",
+        "workspace.list",
+        "workspace.bundle",
+    )
+    plan = DispatchPlan(
+        agents=(agent("builder", tools=(zip_tool, *incremental_tools)),),
+        steps=(
+            DispatchStep(
+                id="deliver",
+                agent="builder",
+                task="Build and deliver a large project incrementally",
+                tools=(zip_tool, *incremental_tools),
+                tool_argument_budget_bytes={zip_tool: 3_000_000},
+                final_synthesizer=True,
+            ),
+        ),
+        allowed_tools=(zip_tool, *incremental_tools),
+        project_scale="large",
+    )
+
+    assert plan.final_step.tools == (zip_tool, *incremental_tools)
+
+
+def test_large_routing_scale_requires_incremental_zip_without_task_markers() -> None:
+    zip_tool = "project.generate_zip"
+    plan = DispatchPlan(
+        agents=(agent("builder", tools=(zip_tool,)),),
+        steps=(
+            DispatchStep(
+                id="deliver",
+                agent="builder",
+                task="Assemble the requested files",
+                tools=(zip_tool,),
+                tool_argument_budget_bytes={zip_tool: 3_000_000},
+                final_synthesizer=True,
+            ),
+        ),
+        allowed_tools=(zip_tool,),
+    )
+
+    with pytest.raises(InvalidDispatchPlan, match="incremental workspace"):
+        plan.validate_for_project_scale("large")
+
+
+def test_dependency_soft_limit_grows_with_plan_size_and_keeps_absolute_fuse() -> None:
+    dependencies = tuple(f"source-{index}" for index in range(80))
+    plan = DispatchPlan(
+        agents=(agent("x", output_schema={"summary": "string"}),),
+        steps=(
+            *(
+                DispatchStep(
+                    id=dependency,
+                    agent="x",
+                    task=f"Produce {dependency}",
+                    token_budget=1,
+                    timeout_seconds=1,
+                )
+                for dependency in dependencies
+            ),
+            DispatchStep(
+                id="final",
+                agent="x",
+                task="Synthesize all sources",
+                depends_on=dependencies,
+                final_synthesizer=True,
+                token_budget=1,
+                timeout_seconds=1,
+            ),
+        ),
+        max_steps=96,
+        total_token_budget=81,
+        total_timeout_seconds=81,
+    )
+    assert len(plan.final_step.depends_on) == 80
+
+    with pytest.raises(ValidationError, match="dependencies"):
+        DispatchStep(
+            id="absolute",
+            agent="x",
+            task="Fuse",
+            depends_on=tuple(f"dep-{index}" for index in range(257)),
+        )
+
+
+def test_handoff_dependencies_are_pageable_with_complete_count() -> None:
+    dependencies = tuple(f"source-{index}" for index in range(25))
+    plan = DispatchPlan(
+        agents=(agent("x", output_schema={"summary": "string"}),),
+        steps=(
+            *(
+                DispatchStep(
+                    id=dependency,
+                    agent="x",
+                    task=f"Produce {dependency}",
+                    token_budget=1,
+                    timeout_seconds=1,
+                )
+                for dependency in dependencies
+            ),
+            DispatchStep(
+                id="final",
+                agent="x",
+                task="Synthesize every handoff",
+                depends_on=dependencies,
+                final_synthesizer=True,
+                token_budget=1,
+                timeout_seconds=1,
+            ),
+        ),
+        total_token_budget=26,
+        total_timeout_seconds=26,
+    )
+
+    first = plan.handoff_dependency_page("final", page=1, page_size=12)
+    last = plan.handoff_dependency_page("final", page=3, page_size=12)
+
+    assert first == {
+        "step_id": "final",
+        "total": 25,
+        "page": 1,
+        "page_size": 12,
+        "page_count": 3,
+        "items": dependencies[:12],
+        "has_more": True,
+    }
+    assert last["items"] == dependencies[24:]
+    assert last["total"] == 25
+    assert last["has_more"] is False
+
+
 def test_plan_rejects_aggregate_oversized_text() -> None:
     with pytest.raises(ValidationError, match="size"):
         DispatchPlan(

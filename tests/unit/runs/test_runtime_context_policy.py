@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import cast
 from uuid import uuid4
+
+import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.repository import ConversationContextItem
 from agent_hub.runs.service import (
+    _adaptive_runtime_events,
     _checkpoint_progress_units,
     _conversation_history_artifact,
     _conversation_history_line_budget,
@@ -15,8 +19,16 @@ from agent_hub.runs.service import (
     _routing_runtime_timeout_seconds,
     _runtime_timeout_seconds,
     _runtime_token_budget,
+    _with_main_agent_context_window,
 )
-from agent_hub.runtime.contracts import RuntimeCheckpoint
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 
 
 def test_runtime_timeout_policy_uses_configured_production_window_for_dispatch() -> None:
@@ -33,6 +45,247 @@ def test_runtime_token_budget_policy_uses_configured_complex_budget() -> None:
 
 def test_runtime_token_budget_policy_clamps_to_runtime_contract_limit() -> None:
     assert _runtime_token_budget(TaskMode.DISPATCH, configured_tokens=99_000_000) == 10_000_000
+
+
+def test_runtime_token_budget_grows_with_declared_project_scale() -> None:
+    budgets = [
+        _runtime_token_budget(
+            TaskMode.HYBRID,
+            configured_tokens=1_000_000,
+            routing_decision={"project_scale": scale},
+        )
+        for scale in ("small", "medium", "large", "ultra")
+    ]
+
+    assert budgets == [1_000_000, 1_500_000, 2_500_000, 4_000_000]
+
+
+def test_runtime_token_budget_extends_only_from_durable_checkpoint_progress() -> None:
+    decision: dict[str, JsonValue] = {
+        "project_scale": "large",
+        "runtime_timeout_source": "project_scale_soft_budget",
+        "critical_path_complexity_units": 8,
+    }
+
+    assert _runtime_token_budget(
+        TaskMode.HYBRID,
+        configured_tokens=1_000_000,
+        routing_decision=decision,
+        progress_units=0,
+    ) == 2_500_000
+    assert _runtime_token_budget(
+        TaskMode.HYBRID,
+        configured_tokens=1_000_000,
+        routing_decision=decision,
+        progress_units=2,
+    ) == 2_750_000
+    assert _runtime_token_budget(
+        TaskMode.HYBRID,
+        configured_tokens=9_000_000,
+        routing_decision=decision,
+        progress_units=99,
+    ) == 10_000_000
+
+
+def test_runtime_token_budget_extends_from_current_run_progress_with_absolute_fuse() -> None:
+    decision: dict[str, JsonValue] = {
+        "project_scale": "medium",
+        "critical_path_complexity_units": 4,
+    }
+
+    assert _runtime_token_budget(
+        TaskMode.DIRECT,
+        configured_tokens=1_000_000,
+        routing_decision=decision,
+        progress_units=2,
+    ) == 2_000_000
+    assert _runtime_token_budget(
+        TaskMode.DIRECT,
+        configured_tokens=9_000_000,
+        routing_decision=decision,
+        progress_units=4,
+    ) == 10_000_000
+
+
+@pytest.mark.asyncio
+async def test_active_runtime_context_budget_grows_between_progress_events() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="worker",
+        content={"text": "durable file"},
+    )
+
+    class ProgressRuntime:
+        mode = TaskMode.DIRECT
+
+        def __init__(self) -> None:
+            self.observed_budgets: list[int] = []
+
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            self.observed_budgets.append(context.token_budget)
+            yield RunEvent(
+                kind=EventKind.TOOL_COMPLETED,
+                sequence=1,
+                run_id=run_id,
+                actor="worker",
+                tool_call_id="write-1",
+                tool_name="workspace.write_text",
+                payload={"result_bytes": 12},
+            )
+            self.observed_budgets.append(context.token_budget)
+            yield RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=2,
+                run_id=run_id,
+                artifact=artifact,
+            )
+            self.observed_budgets.append(context.token_budget)
+            yield RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=3,
+                run_id=run_id,
+                checkpoint=RuntimeCheckpoint(
+                    id=uuid4(),
+                    runtime_type="direct",
+                    runtime_version="2",
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    mode=TaskMode.DIRECT,
+                    state={
+                        "completed": ("write-1", "verify-1"),
+                        "artifact_registry": {str(artifact.id): artifact.content_sha256},
+                    },
+                ),
+            )
+            self.observed_budgets.append(context.token_budget)
+
+        async def save_checkpoint(self) -> RuntimeCheckpoint:
+            raise AssertionError("not used")
+
+        async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+            del checkpoint
+
+        async def cancel(self) -> None:
+            return None
+
+    runtime = ProgressRuntime()
+    decision: dict[str, JsonValue] = {
+        "project_scale": "medium",
+        "critical_path_complexity_units": 4,
+    }
+    context = TaskContext(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DIRECT,
+        request="Build a project",
+        token_budget=1_500_000,
+        routing_decision=decision,
+    )
+
+    events = [
+        event
+        async for event in _adaptive_runtime_events(
+            runtime,
+            context,
+            configured_tokens=1_000_000,
+            routing_decision=decision,
+            initial_progress_units=0,
+        )
+    ]
+
+    assert [event.kind for event in events] == [
+        EventKind.TOOL_COMPLETED,
+        EventKind.ARTIFACT_CREATED,
+        EventKind.CHECKPOINT_SAVED,
+    ]
+    assert runtime.observed_budgets == [1_500_000, 1_750_000, 2_000_000, 2_250_000]
+    assert context.token_budget == 2_250_000
+
+
+@pytest.mark.asyncio
+async def test_active_runtime_context_budget_never_exceeds_absolute_fuse() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+
+    class ProgressRuntime:
+        mode = TaskMode.DIRECT
+
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            yield RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=1,
+                run_id=run_id,
+                checkpoint=RuntimeCheckpoint(
+                    id=uuid4(),
+                    runtime_type="direct",
+                    runtime_version="2",
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    mode=TaskMode.DIRECT,
+                    state={"completed": tuple(str(index) for index in range(100))},
+                ),
+            )
+            assert context.token_budget == 10_000_000
+
+        async def save_checkpoint(self) -> RuntimeCheckpoint:
+            raise AssertionError("not used")
+
+        async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+            del checkpoint
+
+        async def cancel(self) -> None:
+            return None
+
+    decision: dict[str, JsonValue] = {
+        "project_scale": "small",
+        "critical_path_complexity_units": 1,
+    }
+    context = TaskContext(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DIRECT,
+        request="Build a project",
+        token_budget=9_000_000,
+        routing_decision=decision,
+    )
+
+    _ = [
+        event
+        async for event in _adaptive_runtime_events(
+            ProgressRuntime(),
+            context,
+            configured_tokens=9_000_000,
+            routing_decision=decision,
+            initial_progress_units=0,
+        )
+    ]
+
+    assert context.token_budget == 10_000_000
+
+
+def test_deployment_context_window_is_added_to_runtime_routing() -> None:
+    assert _with_main_agent_context_window(
+        {"project_scale": "large"},
+        131_072,
+    ) == {
+        "project_scale": "large",
+        "main_agent_context_window_tokens": 131_072,
+    }
+    assert _with_main_agent_context_window(
+        {"context_window_tokens": 65_536},
+        131_072,
+    ) == {"context_window_tokens": 65_536}
+
+
+def test_runtime_token_budget_ignores_malformed_project_scale() -> None:
+    assert _runtime_token_budget(
+        TaskMode.DIRECT,
+        configured_tokens=1_000_000,
+        routing_decision={"project_scale": []},
+    ) == 1_000_000
 
 
 def test_project_delivery_assessment_routes_natural_chinese_cloud_drive_to_large_workspace() -> None:

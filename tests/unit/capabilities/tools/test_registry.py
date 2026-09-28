@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 from agent_hub.capabilities.tools.registry import (
     CompositeCapabilityManifestSource,
@@ -16,6 +18,7 @@ from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_cache_signature_payload_sha256,
     plugin_package_dependency_lock,
 )
+from agent_hub.runtime.contracts import JsonValue
 
 
 def _artifact_origin(name: str, version: str, sha256: str) -> dict[str, str]:
@@ -51,6 +54,42 @@ def test_registry_exposes_schemas_without_executor_callables() -> None:
     projected = registry.schemas()
 
     assert projected == ({"name": "sample.tool"},)
+
+
+def test_project_zip_manifest_exposes_matching_soft_and_absolute_limits() -> None:
+    registry = create_builtin_tool_registry()
+
+    capabilities = cast(
+        tuple[Mapping[str, JsonValue], ...],
+        registry.manifests()["capabilities"],
+    )
+    project_zip = next(
+        item for item in capabilities if item["id"] == "project.generate_zip"
+    )
+
+    operational_limits = cast(
+        Mapping[str, JsonValue], project_zip["operational_limits"]
+    )
+    assert operational_limits == {
+        "max_files": 64,
+        "max_file_bytes": 256_000,
+        "soft_total_source_bytes": 2_000_000,
+        "absolute_total_source_bytes": 10_000_000,
+        "overflow_strategy": {
+            "required_tools": (
+                "workspace.write_text",
+                "workspace.list",
+                "workspace.bundle",
+            ),
+            "reason": "incremental_workspace_required",
+        },
+    }
+    input_schema = cast(Mapping[str, JsonValue], project_zip["input_schema"])
+    properties = cast(Mapping[str, JsonValue], input_schema["properties"])
+    files = cast(Mapping[str, JsonValue], properties["files"])
+    assert files["maxProperties"] == 64
+    assert files["x-max-file-utf8-bytes"] == 256_000
+    assert files["x-max-total-utf8-bytes"] == 10_000_000
 
 
 def test_registry_exposes_builtin_capability_manifests() -> None:
@@ -103,6 +142,78 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "sandbox_profile": "generated_artifact_store",
                 "replay_safe": True,
                 "aliases": (),
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ("title", "files"),
+                    "properties": {
+                        "title": {"type": "string", "minLength": 1, "maxLength": 240},
+                        "files": {
+                            "maxProperties": 64,
+                            "x-max-file-utf8-bytes": 256_000,
+                            "x-max-total-utf8-bytes": 10_000_000,
+                            "anyOf": (
+                                {
+                                    "type": "object",
+                                    "minProperties": 1,
+                                    "maxProperties": 64,
+                                    "additionalProperties": {
+                                        "type": "string",
+                                        "x-max-utf8-bytes": 256_000,
+                                    },
+                                },
+                                {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 64,
+                                    "items": {
+                                        "type": "object",
+                                        "minProperties": 1,
+                                        "maxProperties": 1,
+                                        "additionalProperties": {
+                                            "type": "string",
+                                            "x-max-utf8-bytes": 256_000,
+                                        },
+                                    },
+                                },
+                            ),
+                        },
+                        "filename": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 240,
+                        },
+                        "summary": {"type": "string", "maxLength": 2_000},
+                        "presentation": {
+                            "type": "string",
+                            "enum": ("step_detail", "final_attachment"),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128,
+                        },
+                        "workspace_session_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128,
+                        },
+                    },
+                },
+                "operational_limits": {
+                    "max_files": 64,
+                    "max_file_bytes": 256_000,
+                    "soft_total_source_bytes": 2_000_000,
+                    "absolute_total_source_bytes": 10_000_000,
+                    "overflow_strategy": {
+                        "required_tools": (
+                            "workspace.write_text",
+                            "workspace.list",
+                            "workspace.bundle",
+                        ),
+                        "reason": "incremental_workspace_required",
+                    },
+                },
             },
             {
                 "id": "project.preflight_architecture",

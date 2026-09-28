@@ -844,7 +844,10 @@ async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) 
         ({}, "files must contain 1 to 64 entries"),
         ({f"file-{index}.txt": "x" for index in range(65)}, "files must contain 1 to 64 entries"),
         ({"large.txt": "x" * 256_001}, "file content is too large"),
-        ({f"chunk-{index}.txt": "x" * 250_000 for index in range(9)}, "project content is too large"),
+        (
+            {f"chunk-{index}.txt": "x" * 250_000 for index in range(41)},
+            "project content is too large",
+        ),
     ],
 )
 async def test_runtime_gateway_rejects_oversized_project_zip_payloads(
@@ -864,6 +867,34 @@ async def test_runtime_gateway_rejects_oversized_project_zip_payloads(
             arguments={"title": "Oversized", "files": files},
             idempotency_key="project_zip_limits",
         )
+
+
+async def test_runtime_gateway_accepts_zip_above_soft_limit_below_absolute_fuse(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Bounded Archive",
+            "files": {
+                f"chunk-{index}.txt": chr(65 + index) * 250_000
+                for index in range(9)
+            },
+        },
+        idempotency_key="project_zip_above_soft_limit",
+    )
+
+    assert isinstance(result["artifact_id"], str)
+    file_payload = cast(Mapping[str, JsonValue], result["file"])
+    assert file_payload["mime_type"] == "application/zip"
 
 
 async def test_runtime_gateway_rejects_invalid_project_zip_presentation(tmp_path: Path) -> None:

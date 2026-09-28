@@ -93,9 +93,9 @@ _RUNTIME_TYPE = "autogen"
 _RUNTIME_VERSION = "2"
 _LEGACY_RUNTIME_VERSION = "1"
 _AUTOGEN_VERSION = "0.7.5"
-_MAX_MESSAGES = 128
-_MESSAGE_COMPACTION_WATERMARK = 112
-_MESSAGE_COMPACTION_TARGET = 96
+_DEFAULT_MESSAGE_SOFT_LIMIT = 128
+_ABSOLUTE_MESSAGE_SAFETY_LIMIT = 1_024
+_SEEN_OUTPUT_FINGERPRINT_LIMIT = 96
 _MIN_MODEL_TOKENS_PER_TURN = 2
 _MIN_SECONDS_PER_TURN = 1.0
 _CHECKPOINT_ARTIFACT_WINDOW = 64
@@ -105,6 +105,52 @@ _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
 _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class _MessageCompactionWindow:
+    watermark: int
+    target: int
+    allowed_messages: int
+    absolute_safety_limit: int
+
+
+_DEFAULT_MESSAGE_COMPACTION_WINDOW = _MessageCompactionWindow(
+    watermark=_DEFAULT_MESSAGE_SOFT_LIMIT - 16,
+    target=_DEFAULT_MESSAGE_SOFT_LIMIT - 32,
+    allowed_messages=_DEFAULT_MESSAGE_SOFT_LIMIT,
+    absolute_safety_limit=_ABSOLUTE_MESSAGE_SAFETY_LIMIT,
+)
+
+
+def _message_compaction_window(context: TaskContext) -> _MessageCompactionWindow:
+    complexity_value = context.routing_decision.get("critical_path_complexity_units", 1)
+    complexity = (
+        complexity_value
+        if type(complexity_value) is int and complexity_value > 0
+        else 1
+    )
+    context_window_tokens = context.token_budget
+    for key in ("main_agent_context_window_tokens", "context_window_tokens"):
+        value = context.routing_decision.get(key)
+        if type(value) is int and value > 0:
+            context_window_tokens = min(context_window_tokens, value)
+            break
+    token_capacity = context_window_tokens // 256
+    complexity_capacity = min(256, complexity * 16)
+    allowed_messages = min(
+        _ABSOLUTE_MESSAGE_SAFETY_LIMIT,
+        max(_DEFAULT_MESSAGE_SOFT_LIMIT, token_capacity + complexity_capacity),
+    )
+    compaction_reserve = max(16, allowed_messages // 8)
+    watermark = allowed_messages - compaction_reserve
+    compaction_margin = max(8, watermark // 6)
+    return _MessageCompactionWindow(
+        watermark=watermark,
+        target=max(16, watermark - compaction_margin),
+        allowed_messages=allowed_messages,
+        absolute_safety_limit=_ABSOLUTE_MESSAGE_SAFETY_LIMIT,
+    )
 
 
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
@@ -158,9 +204,13 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
-def _compact_llm_messages(messages: Sequence[LLMMessage]) -> tuple[LLMMessage, ...]:
+def _compact_llm_messages(
+    messages: Sequence[LLMMessage],
+    *,
+    window: _MessageCompactionWindow = _DEFAULT_MESSAGE_COMPACTION_WINDOW,
+) -> tuple[LLMMessage, ...]:
     history = tuple(messages)
-    if len(history) <= _MESSAGE_COMPACTION_WATERMARK:
+    if len(history) <= window.watermark:
         return history
     head_indexes: list[int] = []
     for index, message in enumerate(history[:8]):
@@ -175,7 +225,7 @@ def _compact_llm_messages(messages: Sequence[LLMMessage]) -> tuple[LLMMessage, .
         head_indexes.append(first_user_index)
     head_indexes.sort()
     head_index_set = set(head_indexes)
-    tail_count = max(1, _MESSAGE_COMPACTION_TARGET - len(head_indexes) - 1)
+    tail_count = max(1, window.target - len(head_indexes) - 1)
     tail_indexes = [
         index
         for index in range(len(history) - 1, -1, -1)
@@ -893,7 +943,7 @@ def _checkpoint_wall_time_seconds(
     remaining = checkpoint.state["remaining_timeout_seconds"]
     if isinstance(remaining, bool) or not isinstance(remaining, int | float):
         raise RuntimeExecutionError("runtime checkpoint is incompatible")
-    return min(wall_seconds, float(remaining))
+    return min(context.timeout_seconds, float(remaining))
 
 
 def _bounded_checkpoint_artifacts(
@@ -989,7 +1039,7 @@ class _DiscussionControl:
             or not isinstance(seen_participants, tuple)
             or not isinstance(seen_outputs, tuple)
             or len(seen_participants) > len(plan.participants)
-            or len(seen_outputs) > _MESSAGE_COMPACTION_TARGET
+            or len(seen_outputs) > _SEEN_OUTPUT_FINGERPRINT_LIMIT
             or any(type(item) is not str for item in seen_participants)
             or any(type(item) is not str for item in seen_outputs)
             or type(progress_since_extension) is not bool
@@ -1049,10 +1099,10 @@ class _DiscussionControl:
         )
         self.seen_participants.add(participant)
         self.seen_outputs.add(fingerprint)
-        if len(self.seen_outputs) > _MESSAGE_COMPACTION_TARGET:
+        if len(self.seen_outputs) > _SEEN_OUTPUT_FINGERPRINT_LIMIT:
             self.seen_outputs = {
                 fingerprint,
-                *sorted(self.seen_outputs)[-(_MESSAGE_COMPACTION_TARGET - 1) :],
+                *sorted(self.seen_outputs)[-(_SEEN_OUTPUT_FINGERPRINT_LIMIT - 1) :],
             }
         if progressed:
             self.progress_since_extension = True
@@ -1103,6 +1153,8 @@ class _AdaptiveDiscussionTermination(TerminationCondition):
     base: CompositeDiscussionTermination
     control: _DiscussionControl
     participants: frozenset[str]
+    context: TaskContext | None = None
+    plan_token_budget: int | None = None
     reason: str | None = field(default=None, init=False)
 
     @property
@@ -1113,6 +1165,11 @@ class _AdaptiveDiscussionTermination(TerminationCondition):
         self,
         messages: Sequence[BaseAgentEvent | BaseChatMessage],
     ) -> StopMessage | None:
+        if self.context is not None and self.plan_token_budget is not None:
+            self.base.token_budget = min(
+                self.plan_token_budget,
+                self.context.token_budget,
+            )
         base_stop = await self.base(messages)
         if base_stop is not None:
             self.reason = (
@@ -1468,6 +1525,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         max_output_tokens: int = 4096,
         supports_tool_calls: bool = False,
         durability: _DiscussionDurability | None = None,
+        compaction_window: _MessageCompactionWindow = _DEFAULT_MESSAGE_COMPACTION_WINDOW,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -1475,6 +1533,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._max_output_tokens = max_output_tokens
         self._supports_tool_calls = supports_tool_calls
         self._durability = durability
+        self._compaction_window = compaction_window
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -1491,9 +1550,19 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         del tool_choice, extra_create_args
         if json_output not in {None, False}:
             raise RuntimeExecutionError("unsupported AutoGen model request")
-        compacted_messages = _compact_llm_messages(messages)
+        if len(messages) > self._compaction_window.absolute_safety_limit:
+            raise RuntimeExecutionError(
+                "AutoGen message history exceeds the absolute message limit"
+            )
+        compacted_messages = _compact_llm_messages(
+            messages,
+            window=self._compaction_window,
+        )
         normalized = tuple(self._message(message) for message in compacted_messages)
-        if not normalized or len(normalized) > _MAX_MESSAGES:
+        if (
+            not normalized
+            or len(normalized) > self._compaction_window.allowed_messages
+        ):
             raise RuntimeExecutionError("AutoGen message history is invalid")
         request = ModelRequest(
             logical_model=self._logical_model,
@@ -1889,10 +1958,15 @@ class AutoGenDiscussionRuntime:
                     wall_time_seconds=wall_seconds,
                     consensus_votes=self._plan.consensus_votes,
                     cancelled=cancelled,
+                    adaptive_deadline=self._wall_budget,
+                    monotonic=asyncio.get_running_loop().time,
                 ),
                 control=discussion_control,
                 participants=frozenset(self.participant_ids),
+                context=context,
+                plan_token_budget=self._plan.token_budget,
             )
+            compaction_window = _message_compaction_window(context)
             clients = {
                 participant.id: GatewayChatCompletionClient(
                     self._gateway,
@@ -1901,6 +1975,7 @@ class AutoGenDiscussionRuntime:
                     max_output_tokens=participant.max_output_tokens,
                     supports_tool_calls=bool(participant.allowed_tools),
                     durability=durability,
+                    compaction_window=compaction_window,
                 )
                 for participant in self._plan.participants
             }
@@ -1914,6 +1989,7 @@ class AutoGenDiscussionRuntime:
                 usage,
                 max_output_tokens=self._plan.selector_max_output_tokens,
                 durability=durability,
+                compaction_window=compaction_window,
             )
             tool_records: list[_ToolRecord] = []
 
