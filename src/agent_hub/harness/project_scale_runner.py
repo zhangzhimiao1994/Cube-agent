@@ -3430,16 +3430,7 @@ def _deliverable_repair_mode(
         return effective_mode
     if body.get("mode") != "auto" or effective_mode != "dispatch" or status != "failed":
         return effective_mode
-    for event in events or ():
-        if not isinstance(event, Mapping):
-            continue
-        payload = event.get("payload")
-        error_code = payload.get("error_code") if isinstance(payload, Mapping) else None
-        if error_code == "model.structured_output_invalid":
-            return "direct"
-        if event.get("reason") == "structured output invalid":
-            return "direct"
-    return effective_mode
+    return "direct"
 
 
 def _workspace_repair_context(

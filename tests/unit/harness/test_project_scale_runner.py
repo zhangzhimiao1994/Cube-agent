@@ -720,10 +720,10 @@ def test_capability_repair_pins_the_observed_mode_for_auto_requests() -> None:
         ("auto", "failed", "structured output invalid", "direct"),
         ("dispatch", "failed", "structured output invalid", "dispatch"),
         ("auto", "completed", "structured output invalid", "dispatch"),
-        ("auto", "failed", "capability execution failed", "dispatch"),
+        ("auto", "failed", "capability execution failed", "direct"),
     ),
 )
-def test_capability_repair_mode_falls_back_only_for_auto_dispatch_contract_failure(
+def test_capability_repair_mode_falls_back_for_failed_auto_dispatch(
     requested_mode: str,
     status: str,
     reason: str,
@@ -751,7 +751,7 @@ def test_capability_repair_mode_falls_back_only_for_auto_dispatch_contract_failu
     assert mode == expected
 
 
-def test_auto_dispatch_repair_uses_latest_failure_to_cross_soft_limit_as_direct(
+def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -802,7 +802,7 @@ def test_auto_dispatch_repair_uses_latest_failure_to_cross_soft_limit_as_direct(
 
     assert [body["mode"] for body in client.submitted_bodies[:3]] == [
         "auto",
-        "dispatch",
+        "direct",
         "direct",
     ]
 
