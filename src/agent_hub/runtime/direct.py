@@ -280,6 +280,34 @@ def _workspace_delivery_token_limit(
     return min(progress_cap, max(soft_limit, projected_usage))
 
 
+def _workspace_delivery_initial_seconds(
+    context: TaskContext,
+    *,
+    initial_remaining_seconds: float,
+    absolute_remaining_seconds: float,
+) -> float:
+    initial_remaining = max(0.001, float(initial_remaining_seconds))
+    absolute_remaining = max(0.001, float(absolute_remaining_seconds))
+    if context.routing_decision.get("runtime_timeout_source") != "project_scale_soft_budget":
+        return min(initial_remaining, absolute_remaining)
+
+    soft_value = context.routing_decision.get("runtime_timeout_soft_seconds")
+    complexity_value = context.routing_decision.get("critical_path_complexity_units")
+    if (
+        isinstance(soft_value, bool)
+        or not isinstance(soft_value, int | float)
+        or soft_value <= 0
+    ):
+        return min(initial_remaining, absolute_remaining)
+    complexity = (
+        complexity_value
+        if type(complexity_value) is int and complexity_value > 0
+        else 1
+    )
+    first_progress_slice = float(soft_value) / complexity
+    return min(absolute_remaining, max(initial_remaining, first_progress_slice))
+
+
 def _prompt_token_budget(context: TaskContext) -> int:
     effective = _effective_context_token_budget(context)
     output_reserve = min(
@@ -1092,14 +1120,20 @@ class DirectRuntime:
             else context.timeout_seconds
         )
         elapsed_seconds = max(0.0, context.timeout_seconds - initial_remaining)
+        remaining_absolute_seconds = max(
+            0.001,
+            absolute_seconds - elapsed_seconds,
+        )
+        delivery_initial_seconds = _workspace_delivery_initial_seconds(
+            context,
+            initial_remaining_seconds=initial_remaining,
+            absolute_remaining_seconds=remaining_absolute_seconds,
+        )
         delivery_deadline = deadline_from_routing(
             context.routing_decision,
             now=loop_time,
-            initial_seconds=initial_remaining,
-            restored_absolute_seconds=max(
-                0.001,
-                absolute_seconds - elapsed_seconds,
-            ),
+            initial_seconds=delivery_initial_seconds,
+            restored_absolute_seconds=remaining_absolute_seconds,
         )
         deadline = delivery_deadline.deadline
         batch = initial_batch

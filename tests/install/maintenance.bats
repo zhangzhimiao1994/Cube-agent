@@ -51,6 +51,19 @@
   [ -d "$root/releases/202601030000-new" ]
 }
 
+@test "prune-releases keep zero removes every unreferenced rollback release" {
+  root="$BATS_TEST_TMPDIR/agent-hub"
+  mkdir -p "$root/releases/202601010000-old" "$root/releases/202601020000-current" "$root/releases/202601030000-new"
+  ln -s "$root/releases/202601020000-current" "$root/current"
+
+  run env AGENT_HUB_INSTALL_ROOT="$root" scripts/agent-hub prune-releases --keep 0 --execute
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$root/releases/202601010000-old" ]
+  [ -d "$root/releases/202601020000-current" ]
+  [ ! -e "$root/releases/202601030000-new" ]
+}
+
 @test "prune-releases preserves runtime releases referenced by current venv links" {
   root="$BATS_TEST_TMPDIR/agent-hub"
   runtime="$root/releases/202601010000-runtime"

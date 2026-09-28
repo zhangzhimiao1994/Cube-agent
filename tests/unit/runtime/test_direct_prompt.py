@@ -29,6 +29,7 @@ from agent_hub.runtime.direct import (
     _project_scale_workspace_bundle_from_model_text,
     _workspace_batch_from_model_text,
     _workspace_bundle_has_website_preview,
+    _workspace_delivery_initial_seconds,
     _workspace_delivery_token_limit,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -862,6 +863,54 @@ async def test_direct_project_delivery_keeps_request_window_separate_from_run_bu
 
     assert len(gateway.requests) == 3
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_workspace_delivery_bootstrap_earns_one_dynamic_progress_slice() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a project after a long model response.",
+        timeout_seconds=600,
+        token_budget=5_000,
+        routing_decision={
+            "project_scale": "small",
+            "project_delivery": "workspace",
+            "runtime_timeout_source": "project_scale_soft_budget",
+            "runtime_timeout_soft_seconds": 300.0,
+            "runtime_timeout_absolute_seconds": 3_600.0,
+            "critical_path_complexity_units": 6,
+        },
+    )
+
+    assert _workspace_delivery_initial_seconds(
+        context,
+        initial_remaining_seconds=0.001,
+        absolute_remaining_seconds=3_000.0,
+    ) == 50.0
+
+
+def test_workspace_delivery_bootstrap_respects_remaining_absolute_budget() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a project at its absolute deadline.",
+        timeout_seconds=600,
+        token_budget=5_000,
+        routing_decision={
+            "runtime_timeout_source": "project_scale_soft_budget",
+            "runtime_timeout_soft_seconds": 1_200.0,
+            "runtime_timeout_absolute_seconds": 3_600.0,
+            "critical_path_complexity_units": 4,
+        },
+    )
+
+    assert _workspace_delivery_initial_seconds(
+        context,
+        initial_remaining_seconds=0.001,
+        absolute_remaining_seconds=12.0,
+    ) == 12.0
 
 
 @pytest.mark.asyncio

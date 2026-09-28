@@ -15,8 +15,9 @@ usage() {
 Usage: scripts/agent-hub prune-releases [--install-root dir] [--keep count] [--execute]
 
 Previews old native release directories by default. Pass --execute to remove
-releases older than the newest count while always protecting the active current
-release target.
+releases older than the requested number of non-current releases while always
+protecting the active current release target and its runtime dependencies.
+Use --keep 0 when the host must not retain rollback releases.
 EOF
 }
 
@@ -54,8 +55,8 @@ while (($#)); do
   esac
 done
 
-if ! [[ "$keep" =~ ^[0-9]+$ ]] || [[ "$keep" -lt 1 ]]; then
-  die "--keep must be a positive integer"
+if ! [[ "$keep" =~ ^[0-9]+$ ]]; then
+  die "--keep must be a non-negative integer"
 fi
 
 release_dir="$install_root/releases"

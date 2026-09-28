@@ -55,6 +55,7 @@ def test_release_pruner_is_registered_and_protects_current_release() -> None:
     assert "--install-root" in command
     assert "--execute" in command
     assert "--yes" in command
+    assert 'die "--keep must be a non-negative integer"' in command
     assert '"$release_dir_real"/*)' in command
     assert 'die "current must point inside release directory' in command
     assert 'protected["$(basename -- "$current_real")"]="current"' in command
