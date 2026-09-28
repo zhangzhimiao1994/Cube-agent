@@ -1685,14 +1685,24 @@ article:hover {
   border-radius: 8px;
   display: grid;
   gap: 0.5rem;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   padding: 0.55rem;
 }
 
 .conversation-project-detail-header > div {
   display: grid;
   gap: 0.14rem;
+  grid-column: 1 / -1;
+  grid-row: 2;
   min-width: 0;
+}
+
+.conversation-project-detail-header > .secondary-action:last-child {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  white-space: nowrap;
+  width: auto;
 }
 
 .conversation-project-detail-header code,
@@ -1704,6 +1714,9 @@ article:hover {
 
 .conversation-project-back {
   align-self: start;
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
 }
 
 .conversation-list-header {
@@ -8622,15 +8635,6 @@ article:hover {
     font-size: 0.76rem;
     min-height: 2rem;
     padding: 0.35rem 0.5rem;
-  }
-
-  .conversation-project-detail-header {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .conversation-project-back {
-    grid-column: 1 / -1;
-    justify-self: start;
   }
 
   .conversation-row {
