@@ -751,6 +751,62 @@ def test_capability_repair_mode_falls_back_only_for_auto_dispatch_contract_failu
     assert mode == expected
 
 
+def test_auto_dispatch_repair_uses_latest_failure_to_cross_soft_limit_as_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("dispatch",),
+        execute=True,
+    )
+    plan.requests[0].body["mode"] = "auto"
+    failed_validation = project_scale_runner_module._EvidenceCheck(
+        passed=False,
+        reasons=("generated_project_validation: missing workspace bundle",),
+    )
+    validation_results = [
+        failed_validation,
+        failed_validation,
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_CAPABILITY_DELIVERABLE_REPAIR_SOFT_ATTEMPTS",
+        1,
+    )
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: validation_results.pop(0),
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-auto-dispatch-recovery",
+        session_id="project-scale-medium-dispatch",
+        statuses=("failed", "failed", "completed"),
+        actual_mode="dispatch",
+        repair_events=[
+            {
+                "kind": "runtime.failed",
+                "reason": "structured output invalid",
+                "payload": {"error_code": "model.structured_output_invalid"},
+            }
+        ],
+        artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(
+            dict(project_scale_artifact_zip_files("Build a medium CRM service."))
+        ),
+    )
+
+    execute_project_scale_plan(plan, client)
+
+    assert [body["mode"] for body in client.submitted_bodies[:3]] == [
+        "auto",
+        "dispatch",
+        "direct",
+    ]
+
+
 def test_capability_repair_bounds_long_medium_request_without_blocking_repair() -> None:
     plan = build_project_scale_run_plan(
         scales=("medium",), flows=("direct",), benchmark_kind="capability"

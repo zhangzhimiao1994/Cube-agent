@@ -868,6 +868,7 @@ def execute_project_scale_plan(
                 _drop_recovered_workspace_bundle_errors(errors)
             deliverable_repair_attempts = 0
             current_workspace_bundle = observation.workspace_bundle
+            current_observation_events = observation.events
             max_deliverable_repair_attempts = _deliverable_repair_attempt_limit(
                 run_request.case_id,
                 benchmark_kind=plan.benchmark_kind,
@@ -913,9 +914,16 @@ def execute_project_scale_plan(
                     benchmark_kind=plan.benchmark_kind,
                 )
             ):
+                repair_mode = _deliverable_repair_mode(
+                    request_body,
+                    effective_mode=final_observed_mode,
+                    status=status,
+                    events=current_observation_events,
+                )
                 if (
                     deliverable_repair_attempts >= soft_deliverable_repair_attempts
                     and not repair_progress_observed
+                    and repair_mode == final_observed_mode
                 ):
                     break
                 if deliverable_repair_attempts > 0 and not _has_followup_deliverable_repair_reason(
@@ -961,12 +969,7 @@ def execute_project_scale_plan(
                         request_body,
                         run_request.case_id,
                         benchmark_kind=plan.benchmark_kind,
-                        effective_mode=_deliverable_repair_mode(
-                            request_body,
-                            effective_mode=final_observed_mode,
-                            status=status,
-                            events=observation.events,
-                        ),
+                        effective_mode=repair_mode,
                         source_workspace_bundle=current_workspace_bundle,
                         failed_reasons=(
                             *deliverable_quality.reasons,
@@ -1038,6 +1041,7 @@ def execute_project_scale_plan(
                     auto_approve_capability_requests=auto_approve_capability_requests,
                 )
                 status = repair_observation.status
+                current_observation_events = repair_observation.events
                 final_observed_mode = (
                     _execution_mode(repair_observation.details) or final_observed_mode
                 )
