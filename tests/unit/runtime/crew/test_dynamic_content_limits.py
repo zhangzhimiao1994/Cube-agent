@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
+from typing import cast
 from uuid import uuid4
 
 from agent_hub.domain.runs import TaskMode
@@ -9,7 +11,7 @@ from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.gateway import ModelGateway as ConfiguredModelGateway
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import Deployment, ModelMessage, ModelResponse, ToolCall
-from agent_hub.runtime.contracts import Artifact, TaskContext
+from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
 from agent_hub.runtime.crew import adapter
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 
@@ -214,7 +216,7 @@ def test_large_project_zip_model_evidence_keeps_only_auditable_summary() -> None
         f"src/file-{index}.txt": f"FILE-{index}-" + "x" * 149_000
         for index in range(60)
     }
-    arguments = {"title": "large-project", "files": files}
+    arguments: dict[str, JsonValue] = {"title": "large-project", "files": files}
     canonical = json.dumps(
         arguments,
         ensure_ascii=False,
@@ -249,7 +251,9 @@ def test_large_project_zip_model_evidence_keeps_only_auditable_summary() -> None
 
     payload = artifact.to_payload()
     assert len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) < 2_000_000
-    recorded = artifact.content["tool_calls"][0]
+    content = artifact.content
+    tool_calls = cast(tuple[JsonValue, ...], content["tool_calls"])
+    recorded = cast(Mapping[str, JsonValue], tool_calls[0])
     assert recorded["arguments"] == {
         "audit": {
             "arguments_sha256": hashlib.sha256(canonical).hexdigest(),
