@@ -3428,9 +3428,20 @@ def _deliverable_repair_mode(
 ) -> str | None:
     if effective_mode not in {"direct", "dispatch", "hybrid"}:
         return effective_mode
-    if body.get("mode") != "auto" or effective_mode != "dispatch" or status != "failed":
+    if body.get("mode") != "auto":
         return effective_mode
-    return "direct"
+    if effective_mode == "dispatch" and status == "failed":
+        return "direct"
+    if effective_mode == "hybrid":
+        for event in events or ():
+            if not isinstance(event, Mapping):
+                continue
+            if (
+                event.get("kind") == "runtime.completed"
+                and event.get("reason") == "partial_hybrid_after_discussion_failure"
+            ):
+                return "direct"
+    return effective_mode
 
 
 def _workspace_repair_context(

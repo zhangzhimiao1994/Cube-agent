@@ -751,6 +751,23 @@ def test_capability_repair_mode_falls_back_for_failed_auto_dispatch(
     assert mode == expected
 
 
+def test_auto_hybrid_partial_discussion_completion_falls_back_to_direct() -> None:
+    mode = project_scale_runner_module._deliverable_repair_mode(
+        {"mode": "auto"},
+        effective_mode="hybrid",
+        status="completed",
+        events=(
+            {
+                "kind": "runtime.completed",
+                "reason": "partial_hybrid_after_discussion_failure",
+                "payload": {},
+            },
+        ),
+    )
+
+    assert mode == "direct"
+
+
 def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
