@@ -588,6 +588,14 @@ async def test_direct_large_bundle_switches_to_incremental_workspace_delivery() 
             True,
         ),
         (
+            (
+                '{"workspace_batch":{"files":{"README.md":"ready\\n"},'
+                '"complete":true,"continuation":null},"summary":"done"}'
+            ),
+            {"README.md": "ready\n"},
+            True,
+        ),
+        (
             """Project files follow.\n\n### `package.json`\n```json\n{\"scripts\":{\"test\":\"node --test\"}}\n```\n\n### `src/main.js`\n```js\nexport const ready = true;\n```""",
             {
                 "package.json": '{"scripts":{"test":"node --test"}}\n',
@@ -640,6 +648,7 @@ def test_workspace_batch_parser_rejects_truncated_json_without_complete_file() -
         '{"workspace_batch":{"files":{},"complete":true,"continuation":""}}',
         '{"workspace_batch":{"files":{"../escape.txt":"no"},"complete":true,"continuation":""}}',
         '{"workspace_batch":{"files":{"src/main.py":42},"complete":true,"continuation":""}}',
+        '{"workspace_batch":{"files":{"src/main.py":"ok"},"complete":false,"continuation":null}}',
         "I created the project files and everything is ready.",
     ),
 )

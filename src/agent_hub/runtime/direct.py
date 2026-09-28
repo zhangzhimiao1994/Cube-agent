@@ -433,6 +433,8 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
             raw_batch = raw_workspace_batch
             complete = raw_workspace_batch.get("complete")
             continuation = raw_workspace_batch.get("continuation", "")
+            if complete is True and continuation is None:
+                continuation = ""
         else:
             raw_bundle = parsed.get("workspace_bundle")
             raw_batch = raw_bundle if isinstance(raw_bundle, Mapping) else parsed
