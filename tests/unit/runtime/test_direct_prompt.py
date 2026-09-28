@@ -636,6 +636,30 @@ def test_workspace_batch_parser_recovers_complete_files_from_truncated_json() ->
     assert batch.continuation == "continue with the remaining project files"
 
 
+def test_workspace_batch_parser_normalizes_structured_continuation() -> None:
+    text = json.dumps(
+        {
+            "workspace_batch": {
+                "files": {"src/main.js": "export const ready = true;\n"},
+                "complete": False,
+                "continuation": {
+                    "remaining_files": ["README.md", "tests/main.test.js"],
+                    "delivered": ["src/main.js"],
+                },
+            }
+        }
+    )
+
+    batch = _workspace_batch_from_model_text(text)
+
+    assert batch is not None
+    assert json.loads(batch.continuation) == {
+        "delivered": ["src/main.js"],
+        "remaining_files": ["README.md", "tests/main.test.js"],
+    }
+    assert batch.complete is False
+
+
 def test_workspace_batch_parser_rejects_truncated_json_without_complete_file() -> None:
     text = '{"workspace_batch":{"files":{"src/incomplete.js":"unfinished'
 

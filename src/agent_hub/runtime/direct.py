@@ -433,8 +433,16 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
             raw_batch = raw_workspace_batch
             complete = raw_workspace_batch.get("complete")
             continuation = raw_workspace_batch.get("continuation", "")
-            if complete is True and continuation is None:
+            if complete is True:
                 continuation = ""
+            elif isinstance(continuation, Mapping | list):
+                continuation = json.dumps(
+                    continuation,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
         else:
             raw_bundle = parsed.get("workspace_bundle")
             raw_batch = raw_bundle if isinstance(raw_bundle, Mapping) else parsed
