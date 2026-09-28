@@ -889,6 +889,7 @@ def execute_project_scale_plan(
                         request_body,
                         run_request.case_id,
                         benchmark_kind=plan.benchmark_kind,
+                        effective_mode=final_observed_mode,
                         source_workspace_bundle=current_workspace_bundle,
                         failed_reasons=(
                             *deliverable_quality.reasons,
@@ -2899,9 +2900,12 @@ def _deliverable_repair_body(
     *,
     failed_reasons: Sequence[str] = (),
     benchmark_kind: str = "fixture",
+    effective_mode: str | None = None,
     source_workspace_bundle: bytes | None = None,
 ) -> dict[str, object]:
     repair_body = dict(body)
+    if effective_mode in {"direct", "dispatch", "hybrid"}:
+        repair_body["mode"] = effective_mode
     original_message = body.get("message")
     if benchmark_kind == "capability":
         original = original_message if isinstance(original_message, str) else ""

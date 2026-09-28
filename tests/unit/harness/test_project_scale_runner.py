@@ -132,7 +132,7 @@ def test_generated_project_command_uses_writable_sandbox_home(
 
     def record_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         del args
-        captured_env.update(kwargs["env"])  # type: ignore[arg-type]
+        captured_env.update(cast(Mapping[str, str], kwargs["env"]))
         return subprocess.CompletedProcess(("npm", "test"), 0, "", "")
 
     monkeypatch.setattr(
@@ -328,6 +328,24 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
     assert "all true" not in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
+
+
+def test_capability_repair_pins_the_observed_mode_for_auto_requests() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("small",), flows=("direct",), benchmark_kind="capability"
+    )
+    body = dict(plan.requests[0].body)
+    body["mode"] = "auto"
+
+    repaired = _deliverable_repair_body(
+        body,
+        "small:auto",
+        failed_reasons=("generated_project_validation: source files missing",),
+        benchmark_kind="capability",
+        effective_mode="direct",
+    )
+
+    assert repaired["mode"] == "direct"
 
 
 def test_capability_repair_bounds_long_medium_request_without_blocking_repair() -> None:
@@ -1517,6 +1535,23 @@ def test_execute_project_scale_plan_preserves_initial_mode_across_repair() -> No
     assert result.observed_mode == "direct"
     assert result.final_observed_mode == "hybrid"
     assert result.to_payload()["initial_observed_mode"] == "direct"
+
+
+def test_execute_auto_scale_repair_submits_the_observed_mode() -> None:
+    plan = _auto_scale_plan("small")
+    client = FakeAcceptanceClient(
+        run_id="run-small-auto",
+        session_id="project-scale-small-auto",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        actual_mode="direct",
+        deliverable_quality_sequence=(False, True),
+    )
+
+    execute_project_scale_plan(plan, client)
+
+    assert client.submitted_bodies[0]["mode"] == "auto"
+    assert client.submitted_bodies[1]["mode"] == "direct"
 
 
 def test_multi_agent_participation_requires_distinct_agents_with_events() -> None:
