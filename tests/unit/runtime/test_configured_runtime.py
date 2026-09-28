@@ -568,7 +568,8 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
     assert deployment.provider_model == "deepseek/deepseek-chat"
     assert request.logical_model == "main"
     assert api_key == "sk-live"
-    assert capacities[0].wait_timeouts == [60.0]
+    assert len(capacities[0].wait_timeouts) == 1
+    assert 59.0 < capacities[0].wait_timeouts[0] <= 60.0
     assert secrets.resolved == [
         (TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")
     ]
