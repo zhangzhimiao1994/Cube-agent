@@ -750,6 +750,12 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
                             "files": {
                                 "src/main.js": "export const ready = true;\n",
                                 "tests/main.test.js": "// verified\n",
+                                "IMPLEMENTATION_PLAN.md": (
+                                    "Read before implementation: AGENTS.md workspace rules, "
+                                    "HANDOFF current-state index, PROJECT_REQUIREMENTS.md, "
+                                    "and applicable SKILL.md agent-standard rules.\n"
+                                ),
+                                "VERIFICATION.md": "npm run build and npm test passed.\n",
                             },
                             "complete": True,
                             "continuation": "",
@@ -788,6 +794,8 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
         "package.json",
         "src/main.js",
         "tests/main.test.js",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
         "DELIVERY_MANIFEST.json",
     ]
     assert capabilities.calls[-1][0] == "workspace.bundle"
@@ -797,6 +805,7 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
     assert "package.json" not in rendered
     completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
     assert completed.payload["workspace_delivery"]
+    assert completed.payload["agent_standard_verification"]["constraints_read"] is True
 
 
 @pytest.mark.asyncio

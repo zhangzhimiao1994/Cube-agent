@@ -67,6 +67,13 @@ _MAX_MODEL_OUTPUT_TOKENS = 1_000_000
 _RUNTIME_TOKEN_ABSOLUTE_LIMIT = 10_000_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_AGENT_STANDARD_EVIDENCE_FILENAMES = frozenset(
+    {
+        "implementation_plan.md",
+        "verification.md",
+        "constraints_reading_evidence.json",
+    }
+)
 
 
 def _model_output_has_agent_standard_evidence(value: object) -> bool:
@@ -90,6 +97,28 @@ def _model_output_has_agent_standard_evidence(value: object) -> bool:
             or "read_before_implementation" in lowered
             or "before implementation" in lowered
             or "先读" in lowered
+        )
+    )
+
+
+def _workspace_files_have_agent_standard_evidence(
+    files: Mapping[str, str],
+) -> bool:
+    evidence_files = {
+        path: content
+        for path, content in files.items()
+        if path.rsplit("/", 1)[-1].casefold()
+        in _AGENT_STANDARD_EVIDENCE_FILENAMES
+    }
+    if not evidence_files:
+        return False
+    return _model_output_has_agent_standard_evidence(
+        json.dumps(
+            {"files": evidence_files},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
     )
 
@@ -138,6 +167,7 @@ class _BatchedWorkspaceOutcome:
     completion: GatewayCompletion
     request: ModelRequest
     written_paths: tuple[str, ...]
+    agent_standard_evidence: bool
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1060,6 +1090,7 @@ class DirectRuntime:
         completion = initial_completion
         request = initial_request
         known_files: dict[str, str] = {}
+        evidence_files: dict[str, str] = {}
         summaries: list[str] = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
@@ -1100,6 +1131,14 @@ class DirectRuntime:
                 known_files=known_files,
                 deadline=deadline,
             )
+            evidence_files.update(
+                {
+                    path: content
+                    for path, content in batch.files.items()
+                    if path.rsplit("/", 1)[-1].casefold()
+                    in _AGENT_STANDARD_EVIDENCE_FILENAMES
+                }
+            )
             progress_units += max(1, len(batch.files))
             completed_batches += 1
             active_token_limit = _workspace_delivery_token_limit(
@@ -1135,6 +1174,9 @@ class DirectRuntime:
                     completion=completion,
                     request=request,
                     written_paths=tuple(sorted(known_files)),
+                    agent_standard_evidence=(
+                        _workspace_files_have_agent_standard_evidence(evidence_files)
+                    ),
                 )
 
             remaining_run_tokens = active_token_limit - consumed_tokens
@@ -1519,6 +1561,7 @@ class DirectRuntime:
                 self._active_task = gateway_task
             workspace_delivery: Mapping[str, JsonValue] | None = None
             artifact_origin: str | None = None
+            batched_agent_standard_evidence = False
             batch = (
                 _workspace_batch_from_model_text(text)
                 if self._capability_gateway is not None
@@ -1543,6 +1586,7 @@ class DirectRuntime:
                 usage_completion_exceeded_request = False
                 completion = batched.completion
                 request = batched.request
+                batched_agent_standard_evidence = batched.agent_standard_evidence
                 if (
                     context.routing_decision.get("website_preview_required") is True
                     and not any(
@@ -1734,7 +1778,10 @@ class DirectRuntime:
             completion_fallback_reason = completion.fallback_reason
             detected_agent_standard_verification: dict[str, JsonValue] | None = (
                 dict(project_scale_artifact_agent_standard_verification())
-                if _model_output_has_agent_standard_evidence(text)
+                if (
+                    _model_output_has_agent_standard_evidence(text)
+                    or batched_agent_standard_evidence
+                )
                 else None
             )
             await self._consume_task_terminal(gateway_task)

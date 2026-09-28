@@ -315,6 +315,7 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
         benchmark_kind="capability",
     )
     message = str(repaired["message"])
+    assert "project_scale=small" in message
     assert "Build a real small business project for flow=direct" in message
     assert "persistent task management API" in message
     assert "POST /tasks" in message

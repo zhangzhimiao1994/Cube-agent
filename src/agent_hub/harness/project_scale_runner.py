@@ -2911,7 +2911,7 @@ def _deliverable_repair_body(
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
         guidance = (
-            f"Repair same project for case_id={case_id} scale={scale} flow={flow}; "
+            f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
             "preserve requirements. Return full workspace_bundle.files "
             "or ### `path` fences: source/tests/README/PROJECT_REQUIREMENTS.md/"
             "IMPLEMENTATION_PLAN.md/VERIFICATION.md/constraints_reading_evidence.json. "
