@@ -857,6 +857,13 @@ def execute_project_scale_plan(
                         run_request.case_id if plan.benchmark_kind == "capability" else None
                     ),
                 )
+                generated_project_validation = _merge_evidence_checks(
+                    generated_project_validation,
+                    _validate_requested_web_preview(
+                        observation.workspace_bundle,
+                        request_body,
+                    ),
+                )
                 evidence["generated_project_validation"] = generated_project_validation.passed
                 if plan.benchmark_kind == "capability":
                     evidence["requirements_validation"] = generated_project_validation.passed
@@ -1132,6 +1139,13 @@ def execute_project_scale_plan(
                         timeout_seconds=generated_project_timeout_seconds,
                         requirements_case_id=(
                             run_request.case_id if plan.benchmark_kind == "capability" else None
+                        ),
+                    )
+                    generated_project_validation = _merge_evidence_checks(
+                        generated_project_validation,
+                        _validate_requested_web_preview(
+                            repair_workspace_bundle,
+                            request_body,
                         ),
                     )
                     evidence["generated_project_validation"] = (
@@ -1752,6 +1766,75 @@ def _workspace_bundle_from_file_bytes(files: Mapping[str, bytes]) -> bytes:
         for path in sorted(files):
             archive.writestr(path, files[path])
     return buffer.getvalue()
+
+
+def _merge_evidence_checks(*checks: _EvidenceCheck) -> _EvidenceCheck:
+    reasons = tuple(dict.fromkeys(reason for check in checks for reason in check.reasons))
+    return _EvidenceCheck(
+        passed=all(check.passed for check in checks),
+        reasons=reasons,
+    )
+
+
+def _validate_requested_web_preview(
+    workspace_bundle: bytes | None,
+    request_body: Mapping[str, object],
+) -> _EvidenceCheck:
+    message = (_string_value(request_body.get("message")) or "").casefold()
+    preview_requested = any(
+        marker in message
+        for marker in (
+            "interactive website",
+            "website preview",
+            "web preview",
+            "preview.html",
+            "index.html entrypoint",
+            "\u7f51\u7ad9\u9884\u89c8",
+            "\u7f51\u9875\u9884\u89c8",
+        )
+    )
+    if not preview_requested:
+        return _EvidenceCheck(passed=True, reasons=())
+    files = _workspace_bundle_file_bytes(workspace_bundle) if workspace_bundle is not None else None
+    if not files:
+        return _EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "requirements: requested web preview entrypoint missing; "
+                    "add preview.html or index.html"
+                ),
+            ),
+        )
+    candidates = (
+        "dist/index.html",
+        "build/index.html",
+        "public/preview.html",
+        "public/index.html",
+        "preview.html",
+        "index.html",
+    )
+    normalized = {path.replace("\\", "/").casefold(): content for path, content in files.items()}
+    for path in candidates:
+        content = normalized.get(path)
+        if content is None:
+            continue
+        prefix = content[:4096].lstrip().lower()
+        if b"<html" in prefix or b"<!doctype html" in prefix:
+            return _EvidenceCheck(passed=True, reasons=())
+        return _EvidenceCheck(
+            passed=False,
+            reasons=(f"requirements: requested web preview entrypoint is not HTML: {path}",),
+        )
+    return _EvidenceCheck(
+        passed=False,
+        reasons=(
+            (
+                "requirements: requested web preview entrypoint missing; "
+                "add preview.html or index.html"
+            ),
+        ),
+    )
 
 
 def _validate_generated_project_bundle(

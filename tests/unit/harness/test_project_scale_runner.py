@@ -860,6 +860,44 @@ def test_capability_execution_enforces_generated_project_validation(
     assert report.to_payload()["capability_verified"] is False
 
 
+def test_requested_web_preview_requires_a_workspace_html_entrypoint() -> None:
+    request = {
+        "message": (
+            "Build the API and include a complete interactive website. "
+            "Put a self-contained preview.html or index.html entrypoint in the workspace."
+        )
+    }
+
+    missing = project_scale_runner_module._validate_requested_web_preview(
+        _project_bundle({"README.md": "# API\n", "src/server.ts": "export {};\n"}),
+        request,
+    )
+    present = project_scale_runner_module._validate_requested_web_preview(
+        _project_bundle(
+            {
+                "README.md": "# API and UI\n",
+                "public/index.html": "<!doctype html><html><body><button>Run</button></body></html>",
+            }
+        ),
+        request,
+    )
+
+    assert missing.passed is False
+    assert missing.reasons == (
+        "requirements: requested web preview entrypoint missing; add preview.html or index.html",
+    )
+    assert present.passed is True
+
+
+def test_non_preview_request_does_not_require_html_entrypoint() -> None:
+    result = project_scale_runner_module._validate_requested_web_preview(
+        _project_bundle({"README.md": "# API only\n"}),
+        {"message": "Build a REST API with tests."},
+    )
+
+    assert result.passed is True
+
+
 def test_capability_build_success_cannot_replace_independent_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
