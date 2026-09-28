@@ -16,7 +16,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.hybrid import HybridPlan, HybridRuntime, HybridUpgrade
 from agent_hub.runtime.project_scale_artifact import ProjectScaleArtifactPreseedRuntime
 
 
@@ -1079,6 +1079,44 @@ async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_af
         )
     ]
 
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "partial_hybrid_after_discussion_failure"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_skips_failed_preflight_discussion_and_runs_dispatch() -> None:
+    run_id = uuid4()
+    request_context = artifact("conversation_history", "original request")
+    dispatch_output = artifact("implementer", "generated workspace bundle")
+    dispatch = MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,))
+    runtime = HybridRuntime(
+        dispatch,
+        FailingRuntime(
+            TaskMode.DISCUSS,
+            "model gateway failed: model request deadline exhausted",
+        ),
+        UnusedRuntime(TaskMode.DIRECT, "unused"),
+        plan=HybridPlan(upgrade=HybridUpgrade.DISCUSS_DISPATCH_DISCUSS),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a large project",
+                artifacts=(request_context,),
+            )
+        )
+    ]
+
+    assert len(dispatch.contexts) == 1
     assert any(
         event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
         for event in events

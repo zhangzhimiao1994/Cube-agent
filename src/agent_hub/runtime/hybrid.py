@@ -269,6 +269,11 @@ class HybridRuntime:
                         sequence,
                         stage_budget,
                         child_checkpoint,
+                        allow_gateway_failure=(
+                            stage_index == 0
+                            and self._plan.upgrade
+                            is HybridUpgrade.DISCUSS_DISPATCH_DISCUSS
+                        ),
                     )
                     if is_discussion
                     else self._run_child(
@@ -497,6 +502,8 @@ class HybridRuntime:
         sequence: int,
         stage_budget: _StageBudget,
         checkpoint: RuntimeCheckpoint | None,
+        *,
+        allow_gateway_failure: bool = False,
     ) -> AsyncIterator[RunEvent]:
         participants = getattr(self._discussion, "participant_ids", ("main", "reviewer"))
         if not isinstance(participants, tuple) or not 2 <= len(participants) <= 8:
@@ -510,19 +517,28 @@ class HybridRuntime:
             participants=participants,
             inputs=artifacts,
         )
-        async for event in self._run_child(
-            self._discussion,
-            parent,
-            TaskMode.DISCUSS,
-            artifacts,
-            sequence + 1,
-            stage_budget,
-            checkpoint,
-        ):
-            # The composite owns the normalized discussion.started event.
-            if event.kind is EventKind.DISCUSSION_STARTED:
-                continue
-            yield event
+        try:
+            async for event in self._run_child(
+                self._discussion,
+                parent,
+                TaskMode.DISCUSS,
+                artifacts,
+                sequence + 1,
+                stage_budget,
+                checkpoint,
+            ):
+                # The composite owns the normalized discussion.started event.
+                if event.kind is EventKind.DISCUSSION_STARTED:
+                    continue
+                yield event
+        except RuntimeExecutionError as error:
+            reason = _safe_failure_reason(error, fallback="discussion_failed")
+            if not (
+                allow_gateway_failure
+                and reason.startswith("hybrid discuss failed: model gateway failed")
+            ):
+                raise
+            self._active_child = None
 
     async def _run_child(
         self,

@@ -689,6 +689,43 @@ def test_capability_repair_pins_the_observed_mode_for_auto_requests() -> None:
     assert repaired["mode"] == "direct"
 
 
+@pytest.mark.parametrize(
+    ("requested_mode", "status", "reason", "expected"),
+    (
+        ("auto", "failed", "structured output invalid", "direct"),
+        ("dispatch", "failed", "structured output invalid", "dispatch"),
+        ("auto", "completed", "structured output invalid", "dispatch"),
+        ("auto", "failed", "capability execution failed", "dispatch"),
+    ),
+)
+def test_capability_repair_mode_falls_back_only_for_auto_dispatch_contract_failure(
+    requested_mode: str,
+    status: str,
+    reason: str,
+    expected: str,
+) -> None:
+    mode = project_scale_runner_module._deliverable_repair_mode(
+        {"mode": requested_mode},
+        effective_mode="dispatch",
+        status=status,
+        events=(
+            {
+                "kind": "runtime.failed",
+                "reason": reason,
+                "payload": {
+                    "error_code": (
+                        "model.structured_output_invalid"
+                        if reason == "structured output invalid"
+                        else "runtime.capability_execution_failed"
+                    )
+                },
+            },
+        ),
+    )
+
+    assert mode == expected
+
+
 def test_capability_repair_bounds_long_medium_request_without_blocking_repair() -> None:
     plan = build_project_scale_run_plan(
         scales=("medium",), flows=("direct",), benchmark_kind="capability"

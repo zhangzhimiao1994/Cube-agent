@@ -961,7 +961,12 @@ def execute_project_scale_plan(
                         request_body,
                         run_request.case_id,
                         benchmark_kind=plan.benchmark_kind,
-                        effective_mode=final_observed_mode,
+                        effective_mode=_deliverable_repair_mode(
+                            request_body,
+                            effective_mode=final_observed_mode,
+                            status=status,
+                            events=observation.events,
+                        ),
                         source_workspace_bundle=current_workspace_bundle,
                         failed_reasons=(
                             *deliverable_quality.reasons,
@@ -3325,6 +3330,29 @@ def _deliverable_repair_body(
     )
     repair_body["skip_evolution_proposal"] = True
     return repair_body
+
+
+def _deliverable_repair_mode(
+    body: Mapping[str, object],
+    *,
+    effective_mode: str | None,
+    status: str | None,
+    events: Sequence[object] | None,
+) -> str | None:
+    if effective_mode not in {"direct", "dispatch", "hybrid"}:
+        return effective_mode
+    if body.get("mode") != "auto" or effective_mode != "dispatch" or status != "failed":
+        return effective_mode
+    for event in events or ():
+        if not isinstance(event, Mapping):
+            continue
+        payload = event.get("payload")
+        error_code = payload.get("error_code") if isinstance(payload, Mapping) else None
+        if error_code == "model.structured_output_invalid":
+            return "direct"
+        if event.get("reason") == "structured output invalid":
+            return "direct"
+    return effective_mode
 
 
 def _workspace_repair_context(
