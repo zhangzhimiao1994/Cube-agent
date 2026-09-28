@@ -124,6 +124,38 @@ def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     )
 
 
+def test_generated_project_command_uses_writable_sandbox_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_env: dict[str, str] = {}
+
+    def record_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args
+        captured_env.update(kwargs["env"])  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(("npm", "test"), 0, "", "")
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_generated_project_validation_is_isolated",
+        lambda: True,
+    )
+    monkeypatch.setattr(subprocess, "run", record_run)
+
+    reason = project_scale_runner_module._run_generated_project_command(
+        ("npm", "test"),
+        cwd=tmp_path,
+        timeout_seconds=30,
+    )
+
+    sandbox_home = tmp_path / ".agent-hub-validation-home"
+    assert reason is None
+    assert captured_env["HOME"] == str(sandbox_home)
+    assert captured_env["USERPROFILE"] == str(sandbox_home)
+    assert captured_env["NPM_CONFIG_CACHE"] == str(sandbox_home / ".npm")
+    assert sandbox_home.is_dir()
+
+
 def test_validator_infrastructure_failure_is_not_treated_as_project_repair() -> None:
     result = project_scale_runner_module._EvidenceCheck(
         passed=False,

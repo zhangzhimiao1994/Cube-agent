@@ -1699,7 +1699,16 @@ def _run_generated_project_command(
             "generated_project_validation: isolated systemd validator is required "
             "for generated npm/node commands"
         )
+    validation_home = cwd / ".agent-hub-validation-home"
+    validation_home.mkdir(parents=True, exist_ok=True)
     safe_env = _generated_project_command_env()
+    safe_env.update(
+        {
+            "HOME": str(validation_home),
+            "USERPROFILE": str(validation_home),
+            "NPM_CONFIG_CACHE": str(validation_home / ".npm"),
+        }
+    )
     executable = shutil.which(command[0], path=safe_env.get("PATH")) or command[0]
     resolved_command = [executable, *command[1:]]
     try:
