@@ -892,6 +892,12 @@ def execute_project_scale_plan(
                     generated_project_validation=generated_project_validation,
                 ),
             )
+            deliverable_repair_safety_limit = max_deliverable_repair_attempts
+            if plan.benchmark_kind == "capability":
+                deliverable_repair_safety_limit = _deliverable_repair_safety_limit(
+                    run_request.case_id,
+                    evidence=evidence,
+                )
             seen_repair_progress_signatures = {repair_progress_state.signature}
             repair_progress_observed = True
             if not _generated_project_validation_is_repairable(
@@ -1154,8 +1160,31 @@ def execute_project_scale_plan(
                 )
                 seen_repair_progress_signatures.add(next_progress_state.signature)
                 repair_progress_state = next_progress_state
+                if (
+                    plan.benchmark_kind == "capability"
+                    and repair_progress_observed
+                    and deliverable_repair_attempts >= max_deliverable_repair_attempts
+                    and max_deliverable_repair_attempts < deliverable_repair_safety_limit
+                ):
+                    max_deliverable_repair_attempts += 1
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
+            if (
+                plan.benchmark_kind == "capability"
+                and deliverable_repair_attempts >= deliverable_repair_safety_limit
+                and _should_attempt_deliverable_repair(
+                    status=status,
+                    evidence=evidence,
+                    case_id=run_request.case_id,
+                    benchmark_kind=plan.benchmark_kind,
+                )
+            ):
+                _extend_unique(
+                    errors,
+                    (
+                        f"deliverable_repair: dynamic safety limit exhausted after {deliverable_repair_attempts} attempts",
+                    ),
+                )
             if (
                 evidence["workspace_bundle"]
                 and evidence["final_artifacts"]
@@ -3012,7 +3041,9 @@ def _deliverable_repair_idempotency_key(
     suffix = "deliverable-repair"
     if repair_attempt > 1:
         suffix = f"{suffix}-{repair_attempt}"
-    return f"{_idempotency_key(case_id, index, execution_id=execution_id)}-{suffix}"[:90]
+    base = _idempotency_key(case_id, index, execution_id=execution_id)
+    base = base[: 90 - len(suffix) - 1].rstrip("-")
+    return f"{base}-{suffix}"
 
 
 def _deliverable_repair_attempt_limit(
@@ -3027,6 +3058,19 @@ def _deliverable_repair_attempt_limit(
         return _CAPABILITY_DELIVERABLE_REPAIR_MAX_BY_SCALE[scale]
     except KeyError as error:
         raise ValueError(f"unknown project scale in case id: {case_id}") from error
+
+
+def _deliverable_repair_safety_limit(
+    case_id: str,
+    *,
+    evidence: Mapping[str, bool],
+) -> int:
+    initial_limit = _deliverable_repair_attempt_limit(
+        case_id,
+        benchmark_kind="capability",
+    )
+    deficit_count = len(_deliverable_repair_evidence_deficits(evidence, case_id=case_id))
+    return initial_limit + max(3, deficit_count * 2)
 
 
 def _deliverable_repair_progress_state(

@@ -4675,6 +4675,199 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
     ]
 
 
+def test_capability_repair_extends_past_scale_budget_while_validation_progresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=2 "
+                    f'command=npm run build output_tail="src/repair-{attempt}.ts: error TS{2300 + attempt}"'
+                ),
+            ),
+        )
+        for attempt in range(6)
+    ] + [project_scale_runner_module._EvidenceCheck(passed=True, reasons=())]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-direct-dynamic-budget",
+        session_id="project-scale-small-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Task API\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Task API requirement satisfied\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed by real HTTP checks\n"
+                ),
+                "constraints_reading_evidence.json": json.dumps(
+                    {
+                        "read_before_implementation": True,
+                        "constraints": [
+                            "AGENTS.md workspace rules",
+                            "HANDOFF",
+                            "PROJECT_REQUIREMENTS.md",
+                        ],
+                        "skills": ["applicable SKILL.md or agent-standard rules"],
+                    }
+                ),
+                "package.json": json.dumps(
+                    {"scripts": {"build": "tsc", "test": "node --test"}}
+                ),
+                "src/app.ts": _functional_ts_source(),
+                "tests/unit.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert project_scale_runner_module._deliverable_repair_attempt_limit(
+        "small:direct", benchmark_kind="capability"
+    ) == 5
+    assert len(client.submitted_bodies) == 7
+    assert validation_results == []
+    result = report.results[0]
+    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.errors == ()
+    repair_keys = [
+        call[2]
+        for call in client.calls
+        if call[0] == "POST"
+        and call[1] == "/api/v1/runs"
+        and call[2] is not None
+        and "deliverable-repair" in call[2]
+    ]
+    assert repair_keys == [
+        "project-scale-small-direct-0-deliverable-repair",
+        "project-scale-small-direct-0-deliverable-repair-2",
+        "project-scale-small-direct-0-deliverable-repair-3",
+        "project-scale-small-direct-0-deliverable-repair-4",
+        "project-scale-small-direct-0-deliverable-repair-5",
+        "project-scale-small-direct-0-deliverable-repair-6",
+    ]
+
+
+def test_capability_repair_stops_at_dynamic_safety_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=2 "
+                    f'command=npm run build output_tail="src/next-{attempt}.ts: error TS{2400 + attempt}"'
+                ),
+            ),
+        )
+        for attempt in range(15)
+    ] + [project_scale_runner_module._EvidenceCheck(passed=True, reasons=())]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-direct-safety-limit",
+        session_id="project-scale-small-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is False
+    assert len(client.submitted_bodies) == 14
+    assert len(validation_results) == 2
+    assert (
+        "deliverable_repair: dynamic safety limit exhausted after 13 attempts"
+        in report.results[0].errors
+    )
+
+
+def test_deliverable_repair_idempotency_keys_reserve_attempt_suffix() -> None:
+    evidence = {
+        "workspace_bundle": False,
+        "deliverable_quality": False,
+        "agent_standard_verification": False,
+        "discussion_trace": False,
+        "plugin_contract": False,
+        "multi_agent_participation": False,
+        "self_repair_trace": False,
+        "generated_project_validation": False,
+        "requirements_validation": False,
+    }
+    safety_limit = project_scale_runner_module._deliverable_repair_safety_limit(
+        "ultra:multi_agent",
+        evidence=evidence,
+    )
+    keys = {
+        project_scale_runner_module._deliverable_repair_idempotency_key(
+            "ultra:multi_agent",
+            99,
+            execution_id="acceptance-" + "x" * 120,
+            repair_attempt=attempt,
+        )
+        for attempt in range(1, safety_limit + 1)
+    }
+
+    assert len(keys) == safety_limit
+    assert all(len(key) <= 90 for key in keys)
+    assert any(key.endswith(f"-deliverable-repair-{safety_limit}") for key in keys)
+
+
 def test_execute_project_scale_plan_rejects_unsafe_generated_project_zip_paths() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
