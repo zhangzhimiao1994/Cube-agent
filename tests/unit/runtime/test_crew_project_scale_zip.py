@@ -1,5 +1,4 @@
 import json
-from collections.abc import Mapping
 from decimal import Decimal
 from uuid import UUID
 
@@ -252,15 +251,13 @@ def test_natural_workspace_project_unparseable_output_does_not_fabricate_bundle(
     )
     completion = _completion("I will build the project later.")
 
-    updated = _project_scale_artifact_zip_completion(
-        context,
-        _project_scale_step(task),
-        completion,
-        completion.response,
-    )
-
-    assert updated is completion
-    assert updated.response.tool_calls == ()
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle is missing"):
+        _project_scale_artifact_zip_completion(
+            context,
+            _project_scale_step(task),
+            completion,
+            completion.response,
+        )
 
 
 def test_natural_workspace_project_oversized_unparseable_output_does_not_fabricate_bundle() -> None:
@@ -284,15 +281,13 @@ def test_natural_workspace_project_oversized_unparseable_output_does_not_fabrica
     )
     completion = _completion("Implementation notes:\n" + ("x" * 70_000))
 
-    updated = _project_scale_artifact_zip_completion(
-        context,
-        _project_scale_step(task),
-        completion,
-        completion.response,
-    )
-
-    assert updated is completion
-    assert updated.response.tool_calls == ()
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle is missing"):
+        _project_scale_artifact_zip_completion(
+            context,
+            _project_scale_step(task),
+            completion,
+            completion.response,
+        )
 
 
 def test_project_zip_tool_uses_project_bundle_argument_limit() -> None:
@@ -333,7 +328,7 @@ def test_project_zip_tool_uses_default_limit_without_planner_budget() -> None:
     assert _tool_argument_byte_limit(step, "project.generate_zip") == _MAX_TOOL_ARGUMENT_BYTES
 
 
-def test_real_project_scale_short_unparseable_output_uses_zip_fallback() -> None:
+def test_real_project_scale_short_unparseable_output_does_not_use_fixture_fallback() -> None:
     task = (
         "Role mission: implement.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -341,26 +336,16 @@ def test_real_project_scale_short_unparseable_output_uses_zip_fallback() -> None
     )
     completion = _completion("I will build the project later.")
 
-    updated = _project_scale_artifact_zip_completion(
-        _project_scale_context(),
-        _project_scale_step(task),
-        completion,
-        completion.response,
-    )
-
-    assert updated is not completion
-    assert len(updated.response.tool_calls) == 1
-    call = updated.response.tool_calls[0]
-    assert call.name == "project.generate_zip"
-    assert call.arguments["project_id"] == "project-scale-acceptance"
-    assert call.arguments["workspace_session_id"] == "project-scale-small-dispatch"
-    files = call.arguments["files"]
-    assert isinstance(files, Mapping)
-    assert "package.json" in files
-    assert "README.md" in files
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle is missing"):
+        _project_scale_artifact_zip_completion(
+            _project_scale_context(),
+            _project_scale_step(task),
+            completion,
+            completion.response,
+        )
 
 
-def test_real_project_scale_oversized_unparseable_output_uses_zip_fallback() -> None:
+def test_real_project_scale_oversized_unparseable_output_does_not_use_fixture_fallback() -> None:
     task = (
         "Role mission: implement.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -368,23 +353,13 @@ def test_real_project_scale_oversized_unparseable_output_uses_zip_fallback() -> 
     )
     completion = _completion("Implementation notes:\n" + ("x" * 70_000))
 
-    updated = _project_scale_artifact_zip_completion(
-        _project_scale_context(),
-        _project_scale_step(task),
-        completion,
-        completion.response,
-    )
-
-    assert updated is not completion
-    assert len(updated.response.tool_calls) == 1
-    call = updated.response.tool_calls[0]
-    assert call.name == "project.generate_zip"
-    assert call.arguments["project_id"] == "project-scale-acceptance"
-    assert call.arguments["workspace_session_id"] == "project-scale-small-dispatch"
-    files = call.arguments["files"]
-    assert isinstance(files, Mapping)
-    assert "package.json" in files
-    assert "README.md" in files
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle is missing"):
+        _project_scale_artifact_zip_completion(
+            _project_scale_context(),
+            _project_scale_step(task),
+            completion,
+            completion.response,
+        )
 
 
 def test_rejected_real_project_scale_bundle_is_converted_to_zip_tool_call() -> None:

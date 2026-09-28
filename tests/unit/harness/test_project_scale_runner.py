@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -1530,22 +1532,391 @@ def test_multi_agent_participation_requires_distinct_agents_with_events() -> Non
             {
                 "kind": "step.started",
                 "actor": "architect",
-                "payload": {"role": "Architect"},
+                "payload": {"agent_id": "architect", "role": "Architect"},
             },
             {
                 "kind": "model.started",
                 "actor": "reviewer",
-                "payload": {"role": "Reviewer"},
+                "payload": {"agent_id": "reviewer", "role": "Reviewer"},
             },
             {
                 "kind": "step.completed",
                 "actor": "architect",
-                "payload": {"role": "Architect"},
+                "payload": {"agent_id": "architect", "role": "Architect"},
             },
         ]
     )
     assert crew_participants == ("architect", "reviewer")
     assert crew_events == ("step.started", "model.started", "step.completed")
+
+    role_is_not_identity, role_event_kinds = _multi_agent_participation(
+        [
+            {
+                "kind": "step.started",
+                "actor": "agent-1",
+                "payload": {"agent_id": "agent-1", "role": "Architect"},
+            },
+            {
+                "kind": "step.completed",
+                "actor": "agent-1",
+                "payload": {"agent_id": "agent-1", "role": "Tester"},
+            },
+        ]
+    )
+    assert role_is_not_identity == ("agent_1",)
+    assert role_event_kinds == ("step.started", "step.completed")
+
+    crew_actor_participants, crew_actor_events = _multi_agent_participation(
+        [
+            {"kind": "step.started", "actor": "architect"},
+            {"kind": "step.completed", "actor": "tester"},
+        ]
+    )
+    assert crew_actor_participants == ("architect", "tester")
+    assert crew_actor_events == ("step.started", "step.completed")
+
+
+def _real_crew_multi_agent_events() -> list[dict[str, object]]:
+    return [
+        {
+            "kind": "step.started",
+            "step_id": "architecture_step",
+            "actor": "architect",
+            "inputs": [],
+            "payload": {"role": "Architect", "depends_on": ()},
+        },
+        {
+            "kind": "step.completed",
+            "step_id": "architecture_step",
+            "actor": "architect",
+            "payload": {"role": "Architect", "artifact_id": "artifact-architecture"},
+        },
+        {
+            "kind": "step.started",
+            "step_id": "implementation_step",
+            "actor": "implementer",
+            "inputs": [{"id": "artifact-architecture"}],
+            "payload": {"role": "Implementer", "depends_on": ("architecture_step",)},
+        },
+        {
+            "kind": "step.completed",
+            "step_id": "implementation_step",
+            "actor": "implementer",
+            "payload": {"role": "Implementer", "artifact_id": "artifact-implementation"},
+        },
+        {
+            "kind": "step.started",
+            "step_id": "test_step",
+            "actor": "tester",
+            "inputs": [{"id": "artifact-implementation"}],
+            "payload": {"role": "Tester", "depends_on": ("implementation_step",)},
+        },
+        {
+            "kind": "step.completed",
+            "step_id": "test_step",
+            "actor": "tester",
+            "payload": {"role": "Tester", "artifact_id": "artifact-test"},
+        },
+        {
+            "kind": "step.started",
+            "step_id": "synthesis_step",
+            "actor": "final_synthesizer",
+            "inputs": [
+                {"id": "artifact-architecture"},
+                {"id": "artifact-implementation"},
+                {"id": "artifact-test"},
+            ],
+            "payload": {
+                "role": "Final Synthesizer",
+                "depends_on": (
+                    "architecture_step",
+                    "implementation_step",
+                    "test_step",
+                ),
+            },
+        },
+        {
+            "kind": "step.completed",
+            "step_id": "synthesis_step",
+            "actor": "final_synthesizer",
+            "payload": {"role": "Final Synthesizer", "artifact_id": "artifact-final"},
+        },
+    ]
+
+
+def test_multi_agent_contract_accepts_real_crew_event_chain() -> None:
+    events = _real_crew_multi_agent_events()
+
+    assert project_scale_runner_module._multi_agent_contract_reasons(events) == ()
+    participants, event_kinds = _multi_agent_participation(events)
+    assert participants == ("architect", "implementer", "synthesizer", "tester")
+    assert event_kinds.count("step.started") == 4
+    assert event_kinds.count("step.completed") == 4
+
+
+def test_multi_agent_contract_rejects_missing_lifecycle_and_dependency_order() -> None:
+    events = _real_crew_multi_agent_events()
+    broken = [
+        event
+        for event in events
+        if not (event.get("kind") == "step.completed" and event.get("actor") == "tester")
+    ]
+    synthesizer_start = next(
+        event
+        for event in broken
+        if event.get("kind") == "step.started" and event.get("actor") == "final_synthesizer"
+    )
+    payload = dict(cast(Mapping[str, object], synthesizer_start["payload"]))
+    payload["depends_on"] = ("implementation_step",)
+    synthesizer_start["payload"] = payload
+
+    reasons = project_scale_runner_module._multi_agent_contract_reasons(broken)
+
+    assert any("tester" in reason and "completed" in reason for reason in reasons)
+    assert any("synthesizer" in reason and "dependencies" in reason for reason in reasons)
+
+
+def test_multi_agent_contract_requires_traceable_predecessor_artifacts() -> None:
+    events = _real_crew_multi_agent_events()
+    architect_completed = next(
+        event
+        for event in events
+        if event.get("kind") == "step.completed" and event.get("actor") == "architect"
+    )
+    architect_completed["payload"] = {"role": "Architect"}
+    synthesis_started = next(
+        event
+        for event in events
+        if event.get("kind") == "step.started" and event.get("actor") == "final_synthesizer"
+    )
+    synthesis_started["inputs"] = [{"id": "artifact-implementation"}]
+
+    reasons = project_scale_runner_module._multi_agent_contract_reasons(events)
+
+    assert any("architect" in reason and "artifact" in reason for reason in reasons)
+    assert any("synthesizer" in reason and "consume" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    ("actor", "expected_predecessor"),
+    (("implementer", "architect"), ("tester", "implementer")),
+)
+def test_multi_agent_contract_requires_each_intermediate_artifact_handoff(
+    actor: str,
+    expected_predecessor: str,
+) -> None:
+    events = _real_crew_multi_agent_events()
+    started = next(
+        event
+        for event in events
+        if event.get("kind") == "step.started" and event.get("actor") == actor
+    )
+    started["inputs"] = []
+
+    reasons = project_scale_runner_module._multi_agent_contract_reasons(events)
+
+    assert any(
+        actor in reason and expected_predecessor in reason and "artifact" in reason
+        for reason in reasons
+    )
+
+
+def test_public_route_evidence_proves_large_direct_upgrade_from_server_decision() -> None:
+    evidence = project_scale_runner_module._public_route_evidence(
+        {
+            "mode": "hybrid",
+            "status": "queued",
+            "requested_mode": "direct",
+            "effective_mode": "hybrid",
+            "effective_scale": "large",
+            "route_reason": "project_scale_mode_upgrade",
+            "mode_source": "project_scale_assessment",
+        },
+        requested_body={
+            "mode": "direct",
+            "message": "Build a real large business project for flow=direct.",
+        },
+    )
+
+    assert evidence == (
+        "project_scale_mode_upgrade",
+        "project_scale_assessment",
+        "large",
+        "direct",
+    )
+
+
+def test_public_route_evidence_rejects_request_text_without_server_decision() -> None:
+    evidence = project_scale_runner_module._public_route_evidence(
+        {"mode": "hybrid", "status": "queued"},
+        requested_body={
+            "mode": "direct",
+            "message": "Build a real ultra business project for flow=direct.",
+        },
+    )
+
+    assert evidence == (None, None, None, None)
+
+
+def test_public_route_evidence_rejects_other_hybrid_reason_as_scale_upgrade() -> None:
+    evidence = project_scale_runner_module._public_route_evidence(
+        {
+            "mode": "hybrid",
+            "requested_mode": "direct",
+            "effective_mode": "hybrid",
+            "effective_scale": "large",
+            "route_reason": "hermes_recommendation",
+            "mode_source": "hermes",
+        },
+        requested_body={"mode": "direct", "message": "Build a large project."},
+    )
+
+    assert evidence == ("hermes_recommendation", "hermes", "large", "direct")
+
+
+def test_public_route_evidence_rejects_unexposed_nested_routing_claims() -> None:
+    evidence = project_scale_runner_module._public_route_evidence(
+        {
+            "mode": "hybrid",
+            "routing_decision": {
+                "reason": "project_scale_mode_upgrade",
+                "mode_source": "project_scale_assessment",
+                "project_scale": "large",
+                "requested_mode": "direct",
+            }
+        },
+        requested_body={"mode": "direct", "message": "Build a business project."},
+    )
+
+    assert evidence == (None, None, None, None)
+
+
+def test_artifact_origin_requires_explicit_provenance_for_embedded_bundle() -> None:
+    bundle = _project_bundle({"README.md": "# Current\n"})
+    assert (
+        project_scale_runner_module._artifact_origin(
+            {"status": "completed"},
+            [{"kind": "artifact.created", "payload": {"workspace_bundle": {}}}],
+            bundle_source="embedded_bundle",
+            workspace_bundle=bundle,
+        )
+        is None
+    )
+
+
+def test_artifact_origin_rejects_fixture_marker_even_with_claimed_real_origin() -> None:
+    bundle = _project_bundle({"README.md": "# Fixture\n"})
+    assert project_scale_runner_module._artifact_origin(
+        None,
+        [
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "artifact_origin": "model_workspace_bundle",
+                    "producer": "project_scale_artifact_preseed",
+                    "workspace_bundle": {"files": {"README.md": "# Fixture\n"}},
+                },
+            }
+        ],
+        bundle_source="embedded_bundle",
+        workspace_bundle=bundle,
+    ) == "builtin_fixture"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "kind": "tool.completed",
+            "payload": {"result": {"artifact_origin": "tool_workspace_write"}},
+        },
+        {
+            "kind": "artifact.created",
+            "artifact": {"content": {"artifact_origin": "model_workspace_bundle"}},
+        },
+    ],
+)
+def test_artifact_origin_reads_real_nested_event_contracts(event: dict[str, object]) -> None:
+    bundle = _project_bundle({"README.md": "# Current\n"})
+    payload = dict(cast(Mapping[str, object], event.get("payload", {})))
+    payload["workspace_bundle"] = {"files": {"README.md": "# Current\n"}}
+    event["payload"] = payload
+    assert project_scale_runner_module._artifact_origin(
+        None,
+        [event],
+        bundle_source="embedded_bundle",
+        workspace_bundle=bundle,
+    ) in {"tool_workspace_write", "model_workspace_bundle"}
+
+
+def test_artifact_origin_rejects_unrelated_provenance_event_for_public_bundle() -> None:
+    bundle = _project_bundle({"README.md": "# Current\n"})
+
+    assert (
+        project_scale_runner_module._artifact_origin(
+            None,
+            [
+                {
+                    "kind": "tool.completed",
+                    "payload": {
+                        "artifact_id": "artifact-old",
+                        "result": {"artifact_origin": "tool_workspace_write"},
+                    },
+                }
+            ],
+            bundle_source="public_workspace_api",
+            workspace_bundle=bundle,
+        )
+        is None
+    )
+
+
+def test_artifact_origin_accepts_public_bundle_only_when_workspace_metadata_matches() -> None:
+    content = b"# Current\n"
+    bundle = _project_bundle({"README.md": content.decode("utf-8")})
+    event: dict[str, object] = {
+        "kind": "tool.completed",
+        "tool_name": "workspace.bundle",
+        "payload": {
+            "artifact_id": "artifact-current",
+            "result": {
+                "artifact_origin": "incremental_workspace_delivery",
+                "workspace_files": [
+                    {
+                        "path": "README.md",
+                        "size_bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                ],
+            },
+        },
+    }
+
+    assert (
+        project_scale_runner_module._artifact_origin(
+            None,
+            [event],
+            bundle_source="public_workspace_api",
+            workspace_bundle=bundle,
+        )
+        == "incremental_workspace_delivery"
+    )
+
+    mismatched = copy.deepcopy(event)
+    payload = cast(dict[str, object], mismatched["payload"])
+    result = cast(dict[str, object], payload["result"])
+    result["workspace_files"] = [
+        {"path": "README.md", "sha256": "0" * 64, "size_bytes": len(content)}
+    ]
+    assert (
+        project_scale_runner_module._artifact_origin(
+            None,
+            [mismatched],
+            bundle_source="public_workspace_api",
+            workspace_bundle=bundle,
+        )
+        is None
+    )
 
 
 def test_run_submission_scope_requires_matching_conversation() -> None:
@@ -1570,7 +1941,7 @@ def test_run_submission_scope_requires_matching_conversation() -> None:
         )
 
 
-def test_multi_agent_participation_is_not_combined_across_repair_runs() -> None:
+def test_multi_agent_participation_is_recomputed_from_successful_repair_run() -> None:
     plan = build_project_scale_run_plan(
         benchmark_kind="fixture",
         scales=("small",),
@@ -1583,15 +1954,43 @@ def test_multi_agent_participation_is_not_combined_across_repair_runs() -> None:
         status="completed",
         artifacts=[{"id": "artifact-1"}],
         events=[{"kind": "agent.started", "agent_id": "architect"}],
-        repair_events=[{"kind": "agent.completed", "agent_id": "reviewer"}],
+        repair_events=_real_crew_multi_agent_events(),
         deliverable_quality_sequence=(False, True),
     )
 
     result = execute_project_scale_plan(plan, client).results[0]
 
-    assert result.evidence["multi_agent_participation"] is False
-    assert result.participant_agent_ids == ("architect",), result.errors
-    assert result.participant_event_count == 1
+    assert result.evidence["multi_agent_participation"] is True
+    assert result.participant_agent_ids == (
+        "architect",
+        "implementer",
+        "synthesizer",
+        "tester",
+    ), result.errors
+    assert result.participant_event_count == 8
+
+
+def test_capability_multi_agent_repair_requires_real_collaboration_evidence() -> None:
+    repaired = _deliverable_repair_body(
+        {
+            "message": "Build the requested project",
+            "mode": "dispatch",
+        },
+        "small:multi_agent",
+        benchmark_kind="capability",
+        failed_reasons=(
+            "discussion_trace: missing hybrid/discussion process evidence",
+            "multi_agent_participation: fewer than two distinct agents",
+        ),
+    )
+
+    message = str(repaired["message"])
+    assert "Architecture Agent" in message
+    assert "Implementation Agent" in message
+    assert "Test Agent" in message
+    assert "Synthesis Agent" in message
+    assert "discussion_trace" in message
+    assert "normalized agent_id values architect, implementer, tester, and synthesizer" in message
 
 
 def test_execute_project_scale_plan_records_multi_agent_participation_evidence() -> None:
@@ -1606,18 +2005,20 @@ def test_execute_project_scale_plan_records_multi_agent_participation_evidence()
         session_id="project-scale-small-multi_agent",
         status="completed",
         artifacts=[{"id": "artifact-1"}],
-        events=[
-            {"kind": "agent.started", "agent_id": "architect"},
-            {"kind": "agent.completed", "payload": {"agent_id": "reviewer"}},
-        ],
+        events=_real_crew_multi_agent_events(),
     )
 
     result = execute_project_scale_plan(plan, client).results[0]
 
     assert result.ok is True
     assert result.evidence["multi_agent_participation"] is True
-    assert result.participant_agent_ids == ("architect", "reviewer")
-    assert result.participant_event_count == 2
+    assert result.participant_agent_ids == (
+        "architect",
+        "implementer",
+        "synthesizer",
+        "tester",
+    )
+    assert result.participant_event_count == 8
     assert "multi_agent_participation" in result.required_evidence
 
 

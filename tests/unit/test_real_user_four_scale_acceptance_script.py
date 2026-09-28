@@ -341,6 +341,11 @@ def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> No
         run_id="run-small",
         status="completed",
         observed_mode="direct",
+        final_observed_mode="direct",
+        requested_mode="direct",
+        effective_scale="small",
+        artifact_origin="model_workspace_bundle",
+        workspace_bundle_source="embedded_bundle",
         evidence={
             "run_details": True,
             "run_events": True,
@@ -385,6 +390,152 @@ def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> No
     assert payload["dynamic_web_preview"]["status"] == "passed"
     assert payload["dynamic_web_preview"]["counted_as_passed"] is True
     assert payload["success_basis"]["admin_internal_run_data"] is False
+    assert payload["artifact_provenance"] == {
+        "artifact_origin": "model_workspace_bundle",
+        "embedded_bundle_available": True,
+        "public_materialized": True,
+        "preview_available": True,
+        "fixture_origin_allowed": False,
+    }
+
+
+def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverage() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="large:direct",
+        run_id="run-large",
+        status="completed",
+        observed_mode="direct",
+        final_observed_mode="hybrid",
+        requested_mode="direct",
+        route_reason="project_scale_mode_upgrade",
+        mode_source="project_scale_assessment",
+        effective_scale="large",
+        artifact_origin="tool_workspace_write",
+        workspace_bundle_source="public_workspace_api",
+        evidence=_passing_evidence(),
+    )
+
+    payload = module.build_case_report(
+        scale="large",
+        project={"project_id": "project-large"},
+        conversation={"conversation_id": "conv-large"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["core_acceptance_ok"] is True
+    assert payload["route_policy_ok"] is True
+    assert payload["exact_mode_coverage_ok"] is False
+    assert payload["coverage_credit"] == "safe_upgrade"
+    assert payload["final_observed_mode"] == "hybrid"
+
+
+def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="small:direct",
+        run_id="run-small",
+        status="completed",
+        observed_mode="direct",
+        final_observed_mode="direct",
+        requested_mode="direct",
+        effective_scale=None,
+        artifact_origin="model_workspace_bundle",
+        workspace_bundle_source="embedded_bundle",
+        evidence=_passing_evidence(),
+    )
+
+    payload = module.build_case_report(
+        scale="small",
+        project={"project_id": "project-small"},
+        conversation={"conversation_id": "conv-small"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["effective_scale"] is None
+    assert payload["scale_fidelity_ok"] is False
+    assert payload["core_acceptance_ok"] is False
+
+
+def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="large:direct",
+        run_id="run-large",
+        status="completed",
+        observed_mode="direct",
+        final_observed_mode="hybrid",
+        requested_mode="direct",
+        effective_scale="large",
+        artifact_origin="builtin_fixture",
+        workspace_bundle_source="embedded_bundle",
+        evidence=_passing_evidence(),
+    )
+
+    payload = module.build_case_report(
+        scale="large",
+        project={"project_id": "project-large"},
+        conversation={"conversation_id": "conv-large"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["route_policy_ok"] is False
+    assert payload["artifact_origin_ok"] is False
+    assert payload["core_acceptance_ok"] is False
+
+
+def test_report_rejects_medium_case_when_effective_scale_drifts_to_large() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="medium:dispatch",
+        run_id="run-medium",
+        status="completed",
+        observed_mode="dispatch",
+        final_observed_mode="dispatch",
+        requested_mode="dispatch",
+        effective_scale="large",
+        artifact_origin="tool_workspace_write",
+        workspace_bundle_source="public_workspace_api",
+        evidence=_passing_evidence(),
+    )
+
+    payload = module.build_case_report(
+        scale="medium",
+        project={"project_id": "project-medium"},
+        conversation={"conversation_id": "conv-medium"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["scale_fidelity_ok"] is False
+    assert payload["core_acceptance_ok"] is False
+
+
+def _passing_evidence() -> dict[str, bool]:
+    return {
+        "run_details": True,
+        "run_events": True,
+        "terminal_status": True,
+        "final_artifacts": True,
+        "deliverable_quality": True,
+        "agent_standard_verification": True,
+        "discussion_trace": True,
+        "plugin_contract": False,
+        "deliverable_repair_trace": False,
+        "self_repair_trace": False,
+        "project_preflight_approval": True,
+        "workspace_bundle": True,
+        "cleanup_cancel": True,
+        "generated_project_validation": True,
+        "requirements_validation": True,
+    }
 
 
 def _real_device_evidence(execution_id: str) -> dict[str, object]:
@@ -780,13 +931,26 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
                 if route_intent == "multi_agent"
                 else route_intent
             ),
-            participant_agent_ids=("planner", "reviewer")
+            requested_mode=str(plan.requests[0].body["mode"]),
+            effective_scale=scale,
+            artifact_origin="tool_workspace_write",
+            workspace_bundle_source="public_workspace_api",
+            participant_agent_ids=("architect", "implementer", "synthesizer", "tester")
             if route_intent == "multi_agent"
             else (),
-            participant_event_kinds=("agent.started", "agent.completed")
+            participant_event_kinds=(
+                "step.started",
+                "step.completed",
+                "step.started",
+                "step.completed",
+                "step.started",
+                "step.completed",
+                "step.started",
+                "step.completed",
+            )
             if route_intent == "multi_agent"
             else (),
-            participant_event_count=2 if route_intent == "multi_agent" else 0,
+            participant_event_count=8 if route_intent == "multi_agent" else 0,
             evidence={
                 "run_details": True,
                 "run_events": True,

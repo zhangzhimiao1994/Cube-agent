@@ -889,6 +889,36 @@ async def test_hybrid_project_scale_artifact_preseed_generates_zip_before_dispat
 
 
 @pytest.mark.asyncio
+async def test_real_project_scale_request_does_not_preseed_fixture_or_skip_child() -> None:
+    harness = RecordingHarnessToolGateway()
+    child = MultiArtifactRuntime(TaskMode.DISPATCH, ())
+    runtime = ProjectScaleArtifactPreseedRuntime(
+        child,
+        harness_tool_gateway=harness,
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISPATCH,
+        request=(
+            "Build a real small business project for flow=dispatch. "
+            "Return strict JSON workspace_bundle.files (relative paths to full content)."
+        ),
+        routing_decision={
+            "benchmark_kind": "capability",
+            "project_id": "project-scale-acceptance",
+            "workspace_session_id": "project-scale-small-dispatch",
+        },
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert harness.calls == []
+    assert child.contexts == [context]
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
 async def test_project_scale_plugin_preseed_records_plugin_contract_evidence() -> None:
     harness = RecordingHarnessToolGateway()
     runtime = ProjectScaleArtifactPreseedRuntime(

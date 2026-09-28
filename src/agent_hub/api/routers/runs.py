@@ -433,6 +433,11 @@ class SubmittedRunResponse(BaseModel):
     openclaw_proposal: dict[str, object] | None = None
     project_preflight_proposal: dict[str, object] | None = None
     repair_proposal: dict[str, object] | None = None
+    requested_mode: TaskMode | None = None
+    effective_mode: TaskMode | None = None
+    effective_scale: str | None = None
+    route_reason: str | None = None
+    mode_source: str | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -460,6 +465,11 @@ class SubmittedRunResponse(BaseModel):
             openclaw_proposal=run.openclaw_proposal,
             project_preflight_proposal=run.project_preflight_proposal,
             repair_proposal=_repair_proposal_response(run.repair_proposal),
+            requested_mode=run.requested_mode,
+            effective_mode=run.effective_mode,
+            effective_scale=run.effective_scale,
+            route_reason=run.route_reason,
+            mode_source=run.mode_source,
         )
 
 
@@ -476,6 +486,11 @@ class RunSummaryResponse(BaseModel):
     decision_token: str | None = None
     clarification_reason: str | None = None
     approval_id: str | None = None
+    requested_mode: TaskMode | None = None
+    effective_mode: TaskMode | None = None
+    effective_scale: str | None = None
+    route_reason: str | None = None
+    mode_source: str | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -492,6 +507,11 @@ class RunSummaryResponse(BaseModel):
             decision_token=run.decision_token,
             clarification_reason=run.clarification_reason,
             approval_id=run.approval_id,
+            requested_mode=run.requested_mode,
+            effective_mode=run.effective_mode,
+            effective_scale=run.effective_scale,
+            route_reason=run.route_reason,
+            mode_source=run.mode_source,
         )
 
 

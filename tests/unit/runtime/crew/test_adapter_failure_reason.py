@@ -1640,6 +1640,180 @@ async def test_step_events_include_orchestration_contract_context() -> None:
     assert "orchestration_protocol" not in single_step_started.payload
 
 
+async def test_real_multi_agent_events_include_normalized_agent_identity() -> None:
+    class MultiAgentGateway:
+        def __init__(self) -> None:
+            self.implementer_calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if request.logical_model == "implementer_model":
+                self.implementer_calls += 1
+                response = (
+                    ModelResponse(
+                        text=None,
+                        tool_calls=(
+                            ToolCall(
+                                id="implementation-search",
+                                name="web_search",
+                                arguments={"q": "implementation contract"},
+                            ),
+                        ),
+                        usage=TokenUsage(1, 1, 2),
+                    )
+                    if self.implementer_calls == 1
+                    else ModelResponse(
+                        text=_role_output_text(request, fallback="implemented"),
+                        usage=TokenUsage(1, 1, 2),
+                    )
+                )
+            else:
+                response = ModelResponse(
+                    text=_role_output_text(
+                        request,
+                        fallback=f"completed by {request.logical_model}",
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="architect",
+                role="Architecture Owner",
+                goal="Define the contract",
+                logical_model="architect_model",
+                output_schema={"summary": "string"},
+            ),
+            AgentSpec(
+                id="implementer",
+                role="Implementation Owner",
+                goal="Implement the contract",
+                logical_model="implementer_model",
+                allowed_tools=("web.search",),
+                output_schema={"summary": "string"},
+            ),
+            AgentSpec(
+                id="tester",
+                role="Independent Test Owner",
+                goal="Verify the implementation",
+                logical_model="tester_model",
+                output_schema={"summary": "string"},
+            ),
+            AgentSpec(
+                id="synthesizer",
+                role="Final Delivery Owner",
+                goal="Synthesize the delivery",
+                logical_model="synthesizer_model",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="architecture",
+                agent="architect",
+                task="Define architecture",
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="implementation",
+                agent="implementer",
+                task="Implement architecture",
+                depends_on=("architecture",),
+                tools=("web.search",),
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="verification",
+                agent="tester",
+                task="Verify implementation",
+                depends_on=("implementation",),
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="synthesizer",
+                task="Synthesize verified delivery",
+                depends_on=("architecture", "implementation", "verification"),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=400,
+    )
+    runtime = CrewDispatchRuntime(
+        MultiAgentGateway(),
+        plan,
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=RecordingHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    expected_by_step = {
+        "architecture": "architect",
+        "implementation": "implementer",
+        "verification": "tester",
+        "final_response": "synthesizer",
+    }
+    for step_id, agent_id in expected_by_step.items():
+        owned = [
+            event
+            for event in events
+            if event.step_id == step_id
+            and event.kind in {EventKind.STEP_STARTED, EventKind.STEP_COMPLETED}
+        ]
+        assert {event.kind for event in owned} == {
+            EventKind.STEP_STARTED,
+            EventKind.STEP_COMPLETED,
+        }
+        assert all(event.payload["agent_id"] == agent_id for event in owned)
+
+        artifact_events = [
+            event
+            for event in events
+            if event.kind is EventKind.ARTIFACT_CREATED
+            and event.artifact is not None
+            and event.artifact.producer == agent_id
+        ]
+        assert artifact_events
+        assert all(event.payload["agent_id"] == agent_id for event in artifact_events)
+        role_event = next(event for event in artifact_events if "role" in event.payload)
+        assert role_event.payload["role"] != agent_id
+
+    model_events = [event for event in events if event.kind is EventKind.MODEL_STARTED]
+    assert {event.payload["agent_id"] for event in model_events} == set(
+        expected_by_step.values()
+    )
+    implementer_tool_events = [
+        event
+        for event in events
+        if event.kind
+        in {
+            EventKind.TOOL_REQUESTED,
+            EventKind.TOOL_STARTED,
+            EventKind.TOOL_COMPLETED,
+        }
+    ]
+    assert implementer_tool_events
+    assert all(event.actor == "implementer" for event in implementer_tool_events)
+    completed_tool = next(
+        event
+        for event in implementer_tool_events
+        if event.kind is EventKind.TOOL_COMPLETED
+    )
+    assert completed_tool.artifact is not None
+    assert completed_tool.artifact.content["agent_id"] == "implementer"
+
+
 async def test_orchestration_checkpoint_frontier_mismatch_reports_recovery_reason() -> None:
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
@@ -3004,6 +3178,8 @@ async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() 
         for message in gateway.requests[1].messages
     )
     completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.artifact is not None
+    assert completed.artifact.content["artifact_origin"] == "builtin_fixture"
     assert completed.payload["deliverable_quality"] == {
         "requirements_satisfied": True,
         "build_passed": True,
@@ -3160,6 +3336,16 @@ async def test_natural_large_project_writes_workspace_incrementally_before_bundl
         "workspace.list",
         "workspace.bundle",
     ]
+    bundle_completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.TOOL_COMPLETED
+        and event.tool_name == "workspace.bundle"
+    )
+    assert bundle_completed.artifact is not None
+    assert bundle_completed.artifact.content["artifact_origin"] == (
+        "incremental_workspace_delivery"
+    )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
@@ -3954,6 +4140,9 @@ async def test_missing_usage_after_capacity_retry_project_zip_tool_call_is_estim
     assert isinstance(usage, Mapping)
     tokens = usage.get("tokens")
     assert type(tokens) is int and tokens > 0
+    completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert completed.artifact is not None
+    assert completed.artifact.content["artifact_origin"] == "tool_workspace_write"
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 

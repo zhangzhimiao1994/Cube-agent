@@ -92,15 +92,23 @@ class ProjectScaleArtifactPreseedRuntime:
                     role=context.actor_role,
                 )
                 if result.status == "succeeded":
-                    payload = augment_project_scale_artifact_result(
-                        result.payload,
-                        include_plugin_contract=is_project_scale_plugin_request(context.request),
+                    payload = dict(
+                        augment_project_scale_artifact_result(
+                            result.payload,
+                            include_plugin_contract=is_project_scale_plugin_request(
+                                context.request
+                            ),
+                        )
                     )
+                    payload["artifact_origin"] = "builtin_fixture"
                     artifact = Artifact(
                         id=uuid4(),
                         type="tool_result",
                         producer=PROJECT_SCALE_ARTIFACT_ACTOR,
-                        content={"result": payload},
+                        content={
+                            "result": payload,
+                            "artifact_origin": "builtin_fixture",
+                        },
                     )
                     yield RunEvent(
                         kind=EventKind.TOOL_COMPLETED,
@@ -186,8 +194,7 @@ def is_project_scale_artifact_request(request: object) -> bool:
 
 
 def is_project_scale_preseed_request(request: object) -> bool:
-    text = str(request).casefold()
-    return is_project_scale_artifact_request(request) or _is_real_project_scale_artifact_request(text)
+    return is_project_scale_artifact_request(request)
 
 
 def _is_real_project_scale_artifact_request(text: str) -> bool:

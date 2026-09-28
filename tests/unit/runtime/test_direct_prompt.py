@@ -27,6 +27,7 @@ from agent_hub.runtime.direct import (
     RuntimeExecutionError,
     _normalized_workspace_bundle,
     _project_scale_workspace_bundle_from_model_text,
+    _workspace_delivery_token_limit,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from tests.contracts.test_runtime_contract import FakeGateway
@@ -671,6 +672,117 @@ async def test_direct_project_delivery_keeps_request_window_separate_from_run_bu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("project_scale", ("large", "ultra"))
+async def test_direct_workspace_batches_extend_soft_token_budget_from_progress(
+    project_scale: str,
+) -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "workspace_batch": {
+                            "files": {"src/first.txt": "first\n"},
+                            "complete": False,
+                            "continuation": "continue",
+                        }
+                    }
+                ),
+                usage=TokenUsage(1_500, 2_000, 3_500),
+            ),
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "workspace_batch": {
+                            "files": {"src/second.txt": "second\n"},
+                            "complete": True,
+                            "continuation": "",
+                        }
+                    }
+                ),
+                usage=TokenUsage(800, 1_200, 2_000),
+            ),
+        )
+    )
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=RecordingCapabilityGateway(),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request=f"Build a {project_scale} project in multiple batches.",
+        timeout_seconds=600,
+        token_budget=5_000,
+        routing_decision={
+            "project_scale": project_scale,
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+            "critical_path_complexity_units": 4,
+            "runtime_token_soft_base_tokens": 2_000,
+            "runtime_token_absolute_tokens": 6_500,
+        },
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert len(gateway.requests) == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_direct_workspace_budget_does_not_grow_without_completed_progress() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build an ultra project.",
+        token_budget=5_000,
+        routing_decision={
+            "project_scale": "ultra",
+            "critical_path_complexity_units": 4,
+            "runtime_token_soft_base_tokens": 2_000,
+            "runtime_token_absolute_tokens": 9_000,
+        },
+    )
+
+    assert _workspace_delivery_token_limit(
+        context,
+        initial_soft_limit=5_000,
+        completed_files=0,
+        completed_batches=0,
+        consumed_tokens=4_900,
+        last_batch_tokens=4_900,
+    ) == 5_000
+
+
+def test_direct_workspace_budget_never_exceeds_configured_hard_limit() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build an ultra project.",
+        token_budget=5_000,
+        routing_decision={
+            "project_scale": "ultra",
+            "critical_path_complexity_units": 1,
+            "runtime_token_soft_base_tokens": 2_000,
+            "runtime_token_absolute_tokens": 5_500,
+        },
+    )
+
+    assert _workspace_delivery_token_limit(
+        context,
+        initial_soft_limit=5_000,
+        completed_files=20,
+        completed_batches=20,
+        consumed_tokens=5_400,
+        last_batch_tokens=4_000,
+    ) == 5_500
+
+
+@pytest.mark.asyncio
 async def test_direct_retry_budget_allows_distinct_retryable_failures_then_success() -> None:
     gateway = SequencedDirectGateway(
         (
@@ -792,9 +904,11 @@ async def test_direct_natural_website_wraps_single_html_block_as_preview_workspa
 <!doctype html><html><body><button id="upload">上传</button></body></html>
 ```
 """
+    capabilities = RecordingCapabilityGateway()
     runtime = DirectRuntime(
         FakeGateway(ModelResponse(text=response_text, usage=TokenUsage(20, 30, 50))),
         logical_model="main",
+        capability_gateway=capabilities,
     )
 
     events = [
@@ -820,12 +934,21 @@ async def test_direct_natural_website_wraps_single_html_block_as_preview_workspa
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
     assert artifact_event.artifact.type == "tool_result"
-    assert artifact_event.artifact.content["workspace_bundle"] == {
-        "files": {
-            "preview.html": (
-                '<!doctype html><html><body><button id="upload">上传</button></body></html>\n'
-            )
-        }
+    assert artifact_event.artifact.content["artifact_origin"] == "model_workspace_bundle"
+    workspace_delivery = cast(
+        Mapping[str, JsonValue], artifact_event.artifact.content["workspace_delivery"]
+    )
+    assert workspace_delivery["artifact_origin"] == "incremental_workspace_delivery"
+    assert [name for name, _arguments, _key in capabilities.calls] == [
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.bundle",
+    ]
+    assert capabilities.calls[0][1] == {
+        "path": "preview.html",
+        "content": (
+            '<!doctype html><html><body><button id="upload">上传</button></body></html>\n'
+        ),
     }
 
 
@@ -867,7 +990,7 @@ async def test_direct_website_bundle_without_preview_entry_is_rejected() -> None
 
 
 @pytest.mark.asyncio
-async def test_direct_medium_capability_request_emits_controlled_artifact_without_model() -> None:
+async def test_direct_capability_request_without_model_workspace_bundle_fails() -> None:
     request = (
         "Build a real medium business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
@@ -878,9 +1001,10 @@ async def test_direct_medium_capability_request_emits_controlled_artifact_withou
         logical_model="main",
     )
 
-    events = [
-        event
-        async for event in runtime.run(
+    with pytest.raises(RuntimeExecutionError, match="workspace bundle is missing"):
+        _ = [
+            event
+            async for event in runtime.run(
             TaskContext(
                 run_id=uuid4(),
                 tenant_id=uuid4(),
@@ -889,31 +1013,30 @@ async def test_direct_medium_capability_request_emits_controlled_artifact_withou
                 timeout_seconds=60,
                 token_budget=100_000,
             )
-        )
-    ]
-
-    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
-    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
-    assert artifact_event.artifact is not None
-    workspace_bundle = artifact_event.payload["workspace_bundle"]
-    assert isinstance(workspace_bundle, Mapping)
-    files = workspace_bundle["files"]
-    assert isinstance(files, Mapping)
-    assert {"package.json", "src/server.js", "tests/crm.test.js"}.issubset(files)
-    assert artifact_event.payload["deliverable_quality"]
-    assert artifact_event.payload["agent_standard_verification"]
+            )
+        ]
 
 
 @pytest.mark.asyncio
-async def test_direct_large_capability_request_emits_controlled_artifact_without_model() -> None:
+async def test_direct_capability_request_uses_model_bundle_and_materializes_workspace() -> None:
     request = (
         "Build a real large business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
         "Acceptance conditions: source, tests, verification, and interaction evidence."
     )
+    capabilities = RecordingCapabilityGateway()
+    model_bundle = {
+        "workspace_bundle": {
+            "files": {
+                "README.md": "# Real model project\n",
+                "src/server.js": "export const ready = true;\n",
+            }
+        }
+    }
     runtime = DirectRuntime(
-        FakeGateway(ModelResponse(text="Here is a short summary only.", usage=TokenUsage(20, 8, 28))),
+        FakeGateway(ModelResponse(text=json.dumps(model_bundle), usage=TokenUsage(20, 8, 28))),
         logical_model="main",
+        capability_gateway=capabilities,
     )
 
     events = [
@@ -930,21 +1053,21 @@ async def test_direct_large_capability_request_emits_controlled_artifact_without
         )
     ]
 
-    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    assert any(event.kind is EventKind.MODEL_STARTED for event in events)
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
-    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
-    assert isinstance(workspace_bundle, Mapping)
-    files = workspace_bundle["files"]
-    assert isinstance(files, Mapping)
-    assert {"package.json", "src/server.js", "tests/order-ops.test.js"}.issubset(files)
-    assert artifact_event.payload["workspace_bundle"] == workspace_bundle
-    assert artifact_event.payload["deliverable_quality"]
-    assert artifact_event.payload["agent_standard_verification"]
+    assert artifact_event.artifact.content["artifact_origin"] == "model_workspace_bundle"
+    assert artifact_event.payload["artifact_origin"] == "model_workspace_bundle"
+    assert [name for name, _arguments, _key in capabilities.calls] == [
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.bundle",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_direct_large_capability_request_replaces_untrusted_model_workspace_bundle() -> None:
+async def test_direct_large_capability_request_does_not_replace_model_workspace_bundle() -> None:
     request = (
         "Build a real large business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
@@ -958,9 +1081,11 @@ async def test_direct_large_capability_request_replaces_untrusted_model_workspac
             }
         }
     }
+    capabilities = RecordingCapabilityGateway()
     runtime = DirectRuntime(
         FakeGateway(ModelResponse(text=json.dumps(bad_bundle), usage=TokenUsage(60, 20, 80))),
         logical_model="main",
+        capability_gateway=capabilities,
     )
 
     events = [
@@ -979,24 +1104,38 @@ async def test_direct_large_capability_request_replaces_untrusted_model_workspac
 
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
-    workspace_bundle = artifact_event.artifact.content["workspace_bundle"]
-    assert isinstance(workspace_bundle, Mapping)
-    files = workspace_bundle["files"]
-    assert isinstance(files, Mapping)
-    assert "broken.js" not in files
-    assert {"package.json", "src/server.js", "tests/order-ops.test.js"}.issubset(files)
-    assert artifact_event.payload["deliverable_quality"]
+    assert artifact_event.artifact.content["artifact_origin"] == "model_workspace_bundle"
+    writes = [arguments for name, arguments, _key in capabilities.calls if name == "workspace.write_text"]
+    assert {item["path"] for item in writes} == {
+        "package.json",
+        "broken.js",
+        "DELIVERY_MANIFEST.json",
+    }
+    assert all("tests/order-ops.test.js" not in str(item) for item in writes)
 
 
 @pytest.mark.asyncio
-async def test_direct_ultra_capability_request_replaces_untrusted_model_workspace_bundle() -> None:
+async def test_direct_ultra_capability_request_uses_model_workspace_bundle() -> None:
     request = (
         "Build a real ultra-large business project for flow=direct. Return full bundle as "
         "workspace_bundle.files with package.json build/test/start scripts. "
         "Acceptance conditions: enterprise portfolio OS APIs, analytics, RBAC, persistence, "
         "source, tests, verification, and interaction evidence."
     )
-    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+    model_bundle = {
+        "workspace_bundle": {
+            "files": {
+                "README.md": "# Portfolio generated by model\n",
+                "src/app.ts": "export const portfolio = true;\n",
+            }
+        }
+    }
+    capabilities = RecordingCapabilityGateway()
+    runtime = DirectRuntime(
+        FakeGateway(ModelResponse(text=json.dumps(model_bundle), usage=TokenUsage(60, 20, 80))),
+        logical_model="main",
+        capability_gateway=capabilities,
+    )
 
     events = [
         event
@@ -1012,26 +1151,20 @@ async def test_direct_ultra_capability_request_replaces_untrusted_model_workspac
         )
     ]
 
-    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
+    assert any(event.kind is EventKind.MODEL_STARTED for event in events)
     artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
     assert artifact_event.artifact is not None
-    assert artifact_event.artifact.content["workspace_bundle"] == artifact_event.payload["workspace_bundle"]
-    assert artifact_event.artifact.content["deliverable_quality"] == artifact_event.payload["deliverable_quality"]
-    assert (
-        artifact_event.artifact.content["agent_standard_verification"]
-        == artifact_event.payload["agent_standard_verification"]
-    )
-    workspace_bundle = artifact_event.payload["workspace_bundle"]
-    assert isinstance(workspace_bundle, Mapping)
-    files = workspace_bundle["files"]
-    assert isinstance(files, Mapping)
-    assert "src/app.ts" not in files
-    assert {"package.json", "src/server.js", "tests/portfolio-os.test.js"}.issubset(files)
-    assert artifact_event.payload["deliverable_quality"]
+    assert artifact_event.artifact.content["artifact_origin"] == "model_workspace_bundle"
+    writes = [arguments for name, arguments, _key in capabilities.calls if name == "workspace.write_text"]
+    assert {item["path"] for item in writes} == {
+        "README.md",
+        "src/app.ts",
+        "DELIVERY_MANIFEST.json",
+    }
 
 
 @pytest.mark.asyncio
-async def test_direct_ultra_capability_request_emits_controlled_artifact_without_gateway() -> None:
+async def test_direct_ultra_capability_request_does_not_emit_fixture_without_gateway() -> None:
     request = (
         "Build a real ultra business project for flow=direct. Build an ultra-large project: "
         "a TypeScript/Node enterprise project portfolio operating system. Return strict JSON "
@@ -1040,9 +1173,10 @@ async def test_direct_ultra_capability_request_emits_controlled_artifact_without
     )
     runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
 
-    events = [
-        event
-        async for event in runtime.run(
+    with pytest.raises(RuntimeExecutionError, match="model gateway failed"):
+        _ = [
+            event
+            async for event in runtime.run(
             TaskContext(
                 run_id=uuid4(),
                 tenant_id=uuid4(),
@@ -1051,18 +1185,8 @@ async def test_direct_ultra_capability_request_emits_controlled_artifact_without
                 timeout_seconds=60,
                 token_budget=100_000,
             )
-        )
-    ]
-
-    assert all(event.kind is not EventKind.MODEL_STARTED for event in events)
-    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
-    assert artifact_event.payload["workspace_bundle"] == {
-        "files": project_scale_artifact_zip_files(request)
-    }
-    text = artifact_event.artifact.content["text"] if artifact_event.artifact else ""
-    assert isinstance(text, str)
-    assert "### `src/server.js`" in text
-    assert "### `tests/portfolio-os.test.js`" in text
+            )
+        ]
 
 
 def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:

@@ -64,6 +64,7 @@ _CONTEXT_BYTES_PER_TOKEN = 6
 _HISTORY_TOKEN_SHARE = 0.5
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
 _MAX_MODEL_OUTPUT_TOKENS = 1_000_000
+_RUNTIME_TOKEN_ABSOLUTE_LIMIT = 10_000_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
@@ -205,6 +206,50 @@ def _effective_context_token_budget(context: TaskContext) -> int:
     return max(1, budget)
 
 
+def _workspace_delivery_token_limit(
+    context: TaskContext,
+    *,
+    initial_soft_limit: int,
+    completed_files: int,
+    completed_batches: int,
+    consumed_tokens: int,
+    last_batch_tokens: int,
+) -> int:
+    decision = context.routing_decision
+    scale = decision.get("project_scale")
+    base_tokens = decision.get("runtime_token_soft_base_tokens")
+    absolute_tokens = decision.get("runtime_token_absolute_tokens")
+    if (
+        type(scale) is not str
+        or scale not in {"small", "medium", "large", "ultra"}
+        or type(base_tokens) is not int
+        or base_tokens <= 0
+        or type(absolute_tokens) is not int
+        or absolute_tokens <= 0
+    ):
+        return initial_soft_limit
+
+    hard_limit = min(absolute_tokens, _RUNTIME_TOKEN_ABSOLUTE_LIMIT)
+    soft_limit = min(initial_soft_limit, hard_limit)
+    progress_units = max(0, completed_files) + max(0, completed_batches)
+    if progress_units <= 0:
+        return soft_limit
+
+    complexity = decision.get("critical_path_complexity_units")
+    normalized_complexity = (
+        complexity if type(complexity) is int and complexity > 0 else 1
+    )
+    bounded_progress = min(progress_units, normalized_complexity)
+    earned_tokens = min(
+        base_tokens,
+        (base_tokens * bounded_progress + normalized_complexity - 1)
+        // normalized_complexity,
+    )
+    progress_cap = min(hard_limit, soft_limit + earned_tokens)
+    projected_usage = max(0, consumed_tokens) + max(0, last_batch_tokens)
+    return min(progress_cap, max(soft_limit, projected_usage))
+
+
 def _prompt_token_budget(context: TaskContext) -> int:
     effective = _effective_context_token_budget(context)
     output_reserve = min(
@@ -250,12 +295,8 @@ def _truncate_prompt_text_to_budget(
 
 
 def _should_emit_project_scale_direct_artifact(context: TaskContext) -> bool:
-    return (
-        context.mode is TaskMode.DIRECT
-        and is_project_scale_artifact_request(context.request)
-    ) or (
-        context.mode is TaskMode.DIRECT
-        and _is_project_scale_capability_request(context.request)
+    return context.mode is TaskMode.DIRECT and is_project_scale_artifact_request(
+        context.request
     )
 
 
@@ -283,22 +324,6 @@ def _is_workspace_project_delivery(context: TaskContext) -> bool:
         and context.routing_decision.get("artifact_strategy") == "workspace_bundle"
         and context.routing_decision.get("project_scale")
         in {"small", "medium", "large", "ultra"}
-    )
-
-
-def _can_recover_project_scale_capability_request(request: object) -> bool:
-    text = str(request).casefold()
-    return (
-        "real small business project" in text
-        or "scale=small" in text
-        or "real medium business project" in text
-        or "scale=medium" in text
-        or "real large business project" in text
-        or "scale=large" in text
-        or "real ultra-large business project" in text
-        or "real ultra business project" in text
-        or "ultra-large project" in text
-        or "scale=ultra" in text
     )
 
 
@@ -868,7 +893,7 @@ class DirectRuntime:
             ),
             deadline=deadline,
         )
-        return await self._execute_workspace_capability(
+        result = await self._execute_workspace_capability(
             context,
             name="workspace.bundle",
             arguments={
@@ -879,6 +904,10 @@ class DirectRuntime:
             idempotency_key=f"direct-bundle-{context.run_id.hex}-{manifest_sha256[:16]}",
             deadline=deadline,
         )
+        return {
+            **result,
+            "artifact_origin": "incremental_workspace_delivery",
+        }
 
     async def _deliver_workspace_batches(
         self,
@@ -923,6 +952,16 @@ class DirectRuntime:
         total_completion_tokens = 0
         usage_estimated = False
         progress_units = 0
+        completed_batches = 0
+        initial_token_limit = context.token_budget
+        active_token_limit = _workspace_delivery_token_limit(
+            context,
+            initial_soft_limit=initial_token_limit,
+            completed_files=0,
+            completed_batches=0,
+            consumed_tokens=0,
+            last_batch_tokens=0,
+        )
         base_messages = request.messages
         while True:
             budget_outcome = self._verified_budget_usage(
@@ -939,7 +978,8 @@ class DirectRuntime:
             total_prompt_tokens += budget_outcome.usage.prompt_tokens
             total_completion_tokens += budget_outcome.usage.completion_tokens
             usage_estimated = usage_estimated or budget_outcome.estimated
-            if total_prompt_tokens + total_completion_tokens > context.token_budget:
+            consumed_tokens = total_prompt_tokens + total_completion_tokens
+            if consumed_tokens > active_token_limit:
                 _raise_execution_error("model response budget exceeds runtime limit")
             await self._write_workspace_batch(
                 context,
@@ -948,6 +988,15 @@ class DirectRuntime:
                 deadline=deadline,
             )
             progress_units += max(1, len(batch.files))
+            completed_batches += 1
+            active_token_limit = _workspace_delivery_token_limit(
+                context,
+                initial_soft_limit=initial_token_limit,
+                completed_files=len(known_files),
+                completed_batches=completed_batches,
+                consumed_tokens=consumed_tokens,
+                last_batch_tokens=budget_outcome.usage.total_tokens,
+            )
             delivery_deadline.observe(
                 progress_units=progress_units,
                 now=asyncio.get_running_loop().time(),
@@ -975,9 +1024,7 @@ class DirectRuntime:
                     written_paths=tuple(sorted(known_files)),
                 )
 
-            remaining_run_tokens = context.token_budget - (
-                total_prompt_tokens + total_completion_tokens
-            )
+            remaining_run_tokens = active_token_limit - consumed_tokens
             remaining_seconds = deadline - asyncio.get_running_loop().time()
             progress_payload = json.dumps(
                 {
@@ -1125,6 +1172,7 @@ class DirectRuntime:
                         "workspace_bundle": workspace_bundle,
                         "deliverable_quality": deliverable_quality,
                         "agent_standard_verification": agent_standard_verification,
+                        "artifact_origin": "builtin_fixture",
                     },
                     version=1,
                 )
@@ -1142,6 +1190,7 @@ class DirectRuntime:
                         "workspace_bundle": workspace_bundle,
                         "deliverable_quality": deliverable_quality,
                         "agent_standard_verification": agent_standard_verification,
+                        "artifact_origin": "builtin_fixture",
                     },
                     artifact=direct_artifact,
                 )
@@ -1178,6 +1227,7 @@ class DirectRuntime:
                         "workspace_bundle": workspace_bundle,
                         "deliverable_quality": deliverable_quality,
                         "agent_standard_verification": agent_standard_verification,
+                        "artifact_origin": "builtin_fixture",
                     },
                     inputs=(direct_artifact,),
                 )
@@ -1355,6 +1405,7 @@ class DirectRuntime:
                 gateway_task.add_done_callback(lambda _task: submission_ready.set())
                 self._active_task = gateway_task
             workspace_delivery: Mapping[str, JsonValue] | None = None
+            artifact_origin: str | None = None
             batch = (
                 _workspace_batch_from_model_text(text)
                 if self._capability_gateway is not None
@@ -1372,6 +1423,7 @@ class DirectRuntime:
                     deadline=retry_deadline,
                 )
                 workspace_delivery = batched.delivery
+                artifact_origin = "incremental_workspace_delivery"
                 text = batched.summary
                 budget_usage = batched.usage
                 usage_estimated = batched.usage_estimated
@@ -1405,14 +1457,6 @@ class DirectRuntime:
                     gateway_task = None
                     del text, response, completion, request, included_source_ids, context
                     _raise_execution_error("website preview entry is missing")
-                if (
-                    extracted_workspace_bundle is None
-                    and _is_workspace_project_delivery(context)
-                    and len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
-                ):
-                    extracted_workspace_bundle = _normalized_workspace_bundle(
-                        {"files": {"DIRECT_RESPONSE.md": text}}
-                    )
                 incremental_workspace_delivery = (
                     extracted_workspace_bundle is not None
                     and _requires_incremental_workspace_delivery(extracted_workspace_bundle)
@@ -1473,22 +1517,22 @@ class DirectRuntime:
             is_project_scale_capability = _is_project_scale_capability_request(context.request)
             project_scale_workspace_bundle = extracted_workspace_bundle
             del extracted_workspace_bundle
-            deterministic_project_scale_recovery = (
-                is_project_scale_capability
-                and _can_recover_project_scale_capability_request(context.request)
-            )
-            if deterministic_project_scale_recovery:
-                project_scale_workspace_bundle = _project_scale_workspace_bundle_payload(context.request)
-                text = _project_scale_direct_artifact_text(context.request)
-            elif is_project_scale_capability and project_scale_workspace_bundle is None:
+            if project_scale_workspace_bundle is not None:
+                artifact_origin = "model_workspace_bundle"
+            if (
+                is_project_scale_capability or _is_workspace_project_delivery(context)
+            ) and project_scale_workspace_bundle is None and workspace_delivery is None:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
                 del text, response, completion, request, included_source_ids, context
-                _raise_execution_error("project-scale workspace bundle is missing")
+                _raise_execution_error("project workspace bundle is missing")
             if (
                 project_scale_workspace_bundle is not None
-                and incremental_workspace_delivery
+                and (
+                    is_project_scale_capability
+                    or _is_workspace_project_delivery(context)
+                )
             ):
                 workspace_delivery = await self._deliver_workspace_incrementally(
                     context,
@@ -1506,12 +1550,15 @@ class DirectRuntime:
                     artifact_content = {
                         "workspace_bundle": project_scale_workspace_bundle,
                         "summary": artifact_text_preview,
+                        "artifact_origin": "model_workspace_bundle",
                     }
                 elif workspace_delivery is not None:
                     artifact_type = "tool_result"
                     artifact_content = {
                         "workspace_delivery": workspace_delivery,
                         "summary": artifact_text_preview,
+                        "artifact_origin": artifact_origin
+                        or "incremental_workspace_delivery",
                     }
                 else:
                     artifact_content = {"text": text}
@@ -1574,8 +1621,7 @@ class DirectRuntime:
             completion_fallback_reason = completion.fallback_reason
             detected_agent_standard_verification: dict[str, JsonValue] | None = (
                 dict(project_scale_artifact_agent_standard_verification())
-                if deterministic_project_scale_recovery
-                or _model_output_has_agent_standard_evidence(text)
+                if _model_output_has_agent_standard_evidence(text)
                 else None
             )
             await self._consume_task_terminal(gateway_task)
@@ -1614,6 +1660,9 @@ class DirectRuntime:
                 "artifact_id": str(artifact.id),
                 "summary": artifact_text_preview,
             }
+            if artifact_origin is not None:
+                artifact_payload["artifact_origin"] = artifact_origin
+                completed_payload["artifact_origin"] = artifact_origin
             if detected_agent_standard_verification is not None:
                 artifact_payload["agent_standard_verification"] = (
                     detected_agent_standard_verification
@@ -1621,10 +1670,6 @@ class DirectRuntime:
                 completed_payload["agent_standard_verification"] = (
                     detected_agent_standard_verification
                 )
-            if deterministic_project_scale_recovery:
-                deliverable_quality = dict(project_scale_artifact_deliverable_quality())
-                artifact_payload["deliverable_quality"] = deliverable_quality
-                completed_payload["deliverable_quality"] = deliverable_quality
             if project_scale_workspace_bundle is not None:
                 artifact_payload["workspace_bundle"] = project_scale_workspace_bundle
                 completed_payload["workspace_bundle"] = project_scale_workspace_bundle
@@ -1636,11 +1681,7 @@ class DirectRuntime:
                 sequence=2 + injection_offset,
                 run_id=context.run_id,
                 actor="main_agent",
-                message=(
-                    "已生成受控大型项目直连恢复产物。"
-                    if deterministic_project_scale_recovery
-                    else "模型已返回直连回答。"
-                ),
+                message="模型已返回直连回答。",
                 payload=artifact_payload,
                 artifact=artifact,
             )

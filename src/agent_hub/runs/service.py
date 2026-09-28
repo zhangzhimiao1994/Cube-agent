@@ -131,6 +131,11 @@ class SubmittedRun:
     openclaw_proposal: dict[str, object] | None = None
     project_preflight_proposal: dict[str, object] | None = None
     repair_proposal: dict[str, object] | None = None
+    requested_mode: TaskMode | None = None
+    effective_mode: TaskMode | None = None
+    effective_scale: str | None = None
+    route_reason: str | None = None
+    mode_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +153,11 @@ class RunSummary:
     decision_token: str | None = None
     clarification_reason: str | None = None
     approval_id: str | None = None
+    requested_mode: TaskMode | None = None
+    effective_mode: TaskMode | None = None
+    effective_scale: str | None = None
+    route_reason: str | None = None
+    mode_source: str | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -516,6 +526,7 @@ class RunService:
         idempotency_key: str | None = None,
         blocked_by_run_id: UUID | None = None,
     ) -> SubmittedRun:
+        requested_mode = mode
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
         conversation = None
         if conversation_id is not None and self._conversation_repository is not None:
@@ -539,6 +550,7 @@ class RunService:
         if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
             raise ValueError("direct_model must be a safe logical model identifier")
         operator_selection: dict[str, object] = {
+            "requested_mode": requested_mode.value,
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
             "allow_workflow_adjustment": allow_workflow_adjustment,
@@ -706,16 +718,15 @@ class RunService:
             )
             continuation_reason = "conversation_mode_continuation"
             continuation_source = "previous_conversation_run"
-            if continuation_mode is not None and project_delivery is not None:
-                project_mode = _local_main_agent_auto_mode(message, attachment_ids)
-                if (
-                    project_mode is TaskMode.HYBRID
-                    and continuation_mode is not TaskMode.HYBRID
-                ) or (
-                    project_mode is TaskMode.DISPATCH
-                    and continuation_mode in {TaskMode.DIRECT, TaskMode.DISCUSS}
-                ):
-                    continuation_mode = project_mode
+            if continuation_mode is not None:
+                continued_mode = _main_agent_adjusted_ready_mode(
+                    continuation_mode,
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
+                if continued_mode is not continuation_mode:
+                    continuation_mode = continued_mode
                     continuation_reason = "project_scale_mode_upgrade"
                     continuation_source = "project_scale_assessment"
             if continuation_mode is not None:
@@ -756,6 +767,7 @@ class RunService:
                     decision.mode,
                     message=message,
                     attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
                 )
                 proposal = await self._safe_temporary_agent_proposal(
                     tenant_id=tenant_id,
@@ -803,7 +815,12 @@ class RunService:
                 return _submitted(record)
 
             if decision is None:
-                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                local_mode = _main_agent_adjusted_ready_mode(
+                    _local_main_agent_auto_mode(message, attachment_ids),
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
                 if local_mode is not TaskMode.DIRECT and local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
@@ -859,16 +876,24 @@ class RunService:
             )
             if _usable_hermes_advice(hermes_advice):
                 assert hermes_advice is not None
+                selected_mode = _main_agent_adjusted_ready_mode(
+                    hermes_advice.recommended_mode,
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
                 routing_payload = {
                     "reason": "hermes_recommendation",
                     "hermes": _hermes_advice_payload(hermes_advice),
+                    "main_agent_selected_mode": selected_mode.value,
+                    "main_agent_adjusted": selected_mode is not hermes_advice.recommended_mode,
                     **operator_selection,
                 }
                 proposal = await self._safe_temporary_agent_proposal(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     message=message,
-                    mode=hermes_advice.recommended_mode,
+                    mode=selected_mode,
                     agent_ids=agent_ids,
                     workflow_id=workflow_id,
                     allow_workflow_adjustment=allow_workflow_adjustment,
@@ -879,7 +904,7 @@ class RunService:
                         actor_id=actor_id,
                         actor_role=actor_role,
                         message=message,
-                        mode=hermes_advice.recommended_mode,
+                        mode=selected_mode,
                         proposal=proposal,
                         idempotency_key=idempotency_key,
                         operator_selection=routing_payload,
@@ -889,13 +914,13 @@ class RunService:
                     actor_id=actor_id,
                     actor_role=actor_role,
                     request=message,
-                    mode=hermes_advice.recommended_mode,
+                    mode=selected_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
                     routing_decision=self._with_harness_decision(
                         tenant_id=tenant_id,
                         message=message,
-                        mode=hermes_advice.recommended_mode,
+                        mode=selected_mode,
                         routing_decision=routing_payload,
                     ),
                     enqueue=True,
@@ -904,7 +929,12 @@ class RunService:
 
             if _local_resolvable_unavailable_route_decision(decision):
                 assert decision is not None
-                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                local_mode = _main_agent_adjusted_ready_mode(
+                    _local_main_agent_auto_mode(message, attachment_ids),
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
                 if local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
@@ -955,11 +985,17 @@ class RunService:
             if _auto_resolvable_route_decision(decision):
                 assert decision is not None
                 selected = _select_auto_route_assessment(decision.assessments)
+                selected_mode = _main_agent_adjusted_ready_mode(
+                    selected.mode,
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
                 proposal = await self._safe_temporary_agent_proposal(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     message=message,
-                    mode=selected.mode,
+                    mode=selected_mode,
                     agent_ids=agent_ids,
                     workflow_id=workflow_id,
                     allow_workflow_adjustment=allow_workflow_adjustment,
@@ -969,6 +1005,8 @@ class RunService:
                     "auto_resolution_reason": decision.clarification_reason
                     or "routing_requires_user_choice",
                     "auto_resolution_selected_mode": selected.mode.value,
+                    "main_agent_selected_mode": selected_mode.value,
+                    "main_agent_adjusted": selected_mode is not selected.mode,
                     "auto_resolution_selected_confidence": selected.confidence,
                     "auto_resolution_source_modes": [
                         item.mode.value for item in decision.assessments
@@ -984,7 +1022,7 @@ class RunService:
                         actor_id=actor_id,
                         actor_role=actor_role,
                         message=message,
-                        mode=selected.mode,
+                        mode=selected_mode,
                         proposal=proposal,
                         idempotency_key=idempotency_key,
                         operator_selection=routing_payload,
@@ -994,13 +1032,13 @@ class RunService:
                     actor_id=actor_id,
                     actor_role=actor_role,
                     request=message,
-                    mode=selected.mode,
+                    mode=selected_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
                     routing_decision=self._with_harness_decision(
                         tenant_id=tenant_id,
                         message=message,
-                        mode=selected.mode,
+                        mode=selected_mode,
                         routing_decision=routing_payload,
                     ),
                     enqueue=True,
@@ -1008,7 +1046,12 @@ class RunService:
                 return _submitted(record)
 
             if decision is None:
-                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                local_mode = _main_agent_adjusted_ready_mode(
+                    _local_main_agent_auto_mode(message, attachment_ids),
+                    message=message,
+                    attachment_ids=attachment_ids,
+                    project_delivery=project_delivery,
+                )
                 if local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
@@ -1145,6 +1188,10 @@ class RunService:
         mode: TaskMode,
         routing_decision: dict[str, object],
     ) -> dict[str, object]:
+        routing_decision = _with_public_routing_decision(
+            routing_decision,
+            effective_mode=mode,
+        )
         scheduler = self._harness_scheduler
         if scheduler is None:
             if _routing_requests_vibe_coding(routing_decision):
@@ -1700,10 +1747,14 @@ class RunService:
                 routing_decision,
                 main_agent_context_window_tokens,
             )
+            runtime_routing_decision = _with_runtime_token_budget_policy(
+                routing_decision,
+                configured_tokens=self._runtime_token_budget,
+            )
             token_budget = _runtime_token_budget(
                 mode,
                 configured_tokens=self._runtime_token_budget,
-                routing_decision=routing_decision,
+                routing_decision=runtime_routing_decision,
                 progress_units=_checkpoint_progress_units(checkpoint),
             )
             instructions = None
@@ -1742,16 +1793,18 @@ class RunService:
                     tenant_id=tenant_id,
                     run_id=run_id,
                     current_request=request,
-                    routing_decision=routing_decision,
+                    routing_decision=runtime_routing_decision,
                     runtime_token_budget=token_budget,
                 ),
                 checkpoint=checkpoint,
-                routing_decision=cast(Mapping[str, JsonValue], routing_decision),
+                routing_decision=cast(
+                    Mapping[str, JsonValue], runtime_routing_decision
+                ),
                 timeout_seconds=_runtime_timeout_seconds(
                     mode,
                     configured_seconds=self._runtime_timeout_seconds,
                     explicit_seconds=_routing_runtime_timeout_seconds(
-                        routing_decision,
+                        runtime_routing_decision,
                         progress_units=_checkpoint_progress_units(checkpoint),
                     ),
                 ),
@@ -1794,7 +1847,7 @@ class RunService:
                     runtime,
                     context,
                     configured_tokens=self._runtime_token_budget,
-                    routing_decision=routing_decision,
+                    routing_decision=runtime_routing_decision,
                     initial_progress_units=_checkpoint_progress_units(checkpoint),
                 ):
                     cancel_runtime = False
@@ -2381,6 +2434,11 @@ class RunService:
                 else None
             ),
             approval_id=capability_approval_id,
+            requested_mode=_task_mode_or_none(routing_decision.get("requested_mode")),
+            effective_mode=_task_mode_or_none(routing_decision.get("effective_mode")),
+            effective_scale=_project_scale_or_none(routing_decision.get("effective_scale")),
+            route_reason=_string_or_none(routing_decision.get("route_reason")),
+            mode_source=_string_or_none(routing_decision.get("mode_source")),
         )
 
     async def _safe_notify_terminal_hooks(
@@ -3236,7 +3294,41 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         repair_proposal=cast(dict[str, object], repair_proposal)
         if isinstance(repair_proposal, dict) and repair_proposal_is_actionable
         else None,
+        requested_mode=_task_mode_or_none(decision.get("requested_mode")),
+        effective_mode=_task_mode_or_none(decision.get("effective_mode")),
+        effective_scale=_project_scale_or_none(decision.get("effective_scale")),
+        route_reason=_string_or_none(decision.get("route_reason")),
+        mode_source=_string_or_none(decision.get("mode_source")),
     )
+
+
+def _with_public_routing_decision(
+    routing_decision: Mapping[str, object],
+    *,
+    effective_mode: TaskMode,
+) -> dict[str, object]:
+    decision = dict(routing_decision)
+    decision["effective_mode"] = effective_mode.value
+    scale = _project_scale_or_none(decision.get("project_scale"))
+    if scale is not None:
+        decision["effective_scale"] = scale
+    reason = _string_or_none(decision.get("reason"))
+    if reason is not None:
+        decision["route_reason"] = reason
+    return decision
+
+
+def _task_mode_or_none(value: object) -> TaskMode | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return TaskMode(value)
+    except ValueError:
+        return None
+
+
+def _project_scale_or_none(value: object) -> str | None:
+    return value if value in {"small", "medium", "large", "ultra"} else None
 
 
 def _repair_proposal_is_auto_executable(proposal: Mapping[str, object] | None) -> bool:
@@ -3570,7 +3662,10 @@ def _project_delivery_assessment(message: str) -> dict[str, object] | None:
         "small project",
         "simple",
     )
-    if any(marker in text for marker in ultra_markers):
+    declared_scale = _declared_project_scale(text)
+    if declared_scale is not None:
+        scale = declared_scale
+    elif any(marker in text for marker in ultra_markers):
         scale = "ultra"
     elif any(marker in text for marker in large_markers):
         scale = "large"
@@ -3604,7 +3699,11 @@ def _project_delivery_assessment(message: str) -> dict[str, object] | None:
         "audit",
         "payment",
     )
-    if scale == "medium" and sum(marker in text for marker in feature_markers) >= 4:
+    if (
+        declared_scale is None
+        and scale == "medium"
+        and sum(marker in text for marker in feature_markers) >= 4
+    ):
         scale = "large"
 
     website_preview_required = any(
@@ -3643,6 +3742,37 @@ def _project_delivery_assessment(message: str) -> dict[str, object] | None:
         "critical_path_complexity_units": critical_path_complexity,
         "critical_path_baseline_units": baseline_complexity,
     }
+
+
+def _declared_project_scale(text: str) -> str | None:
+    patterns = (
+        (
+            r'(?:^|[\s{,;])["\']?project_scale["\']?\s*[:=]\s*["\']?'
+            r"(?P<scale>ultra(?:-large)?|large|medium|small)[\"']?"
+        ),
+        (
+            r"\bbuild\s+a\s+real\s+"
+            r"(?P<scale>ultra(?:-large)?|large|medium|small)\s+business\s+project\b"
+        ),
+        r"\b(?P<scale>ultra(?:-large)?|large|medium|small)\s+project\b",
+        r"(?:项目规模|规模)\s*[:：=]\s*(?P<scale>超大型|大型|中型|小型)",
+    )
+    normalized = {
+        "small": "small",
+        "medium": "medium",
+        "large": "large",
+        "ultra": "ultra",
+        "ultra-large": "ultra",
+        "小型": "small",
+        "中型": "medium",
+        "大型": "large",
+        "超大型": "ultra",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is not None:
+            return normalized[match.group("scale").casefold()]
+    return None
 
 
 def _critical_path_complexity_units(text: str) -> int:
@@ -4520,6 +4650,34 @@ def _with_main_agent_context_window(
     return decision
 
 
+def _with_runtime_token_budget_policy(
+    routing_decision: Mapping[str, object],
+    *,
+    configured_tokens: int,
+) -> dict[str, object]:
+    decision = dict(routing_decision)
+    soft_base = (
+        configured_tokens
+        if type(configured_tokens) is int and configured_tokens > 0
+        else 1_000_000
+    )
+    decision["runtime_token_soft_base_tokens"] = min(
+        soft_base,
+        _RUNTIME_TOKEN_ABSOLUTE_LIMIT,
+    )
+    configured_absolute = decision.get("runtime_token_absolute_tokens")
+    absolute_limit = (
+        configured_absolute
+        if type(configured_absolute) is int and configured_absolute > 0
+        else _RUNTIME_TOKEN_ABSOLUTE_LIMIT
+    )
+    decision["runtime_token_absolute_tokens"] = min(
+        absolute_limit,
+        _RUNTIME_TOKEN_ABSOLUTE_LIMIT,
+    )
+    return decision
+
+
 async def _adaptive_runtime_events(
     runtime: ExecutionRuntime,
     context: TaskContext,
@@ -4790,8 +4948,18 @@ def _main_agent_adjusted_ready_mode(
     *,
     message: str,
     attachment_ids: tuple[str, ...],
+    project_delivery: Mapping[str, object] | None = None,
 ) -> TaskMode:
-    local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+    if project_delivery is None:
+        project_delivery = _project_delivery_assessment(message)
+    if project_delivery is not None:
+        local_mode = (
+            TaskMode.HYBRID
+            if project_delivery.get("project_scale") in {"large", "ultra"}
+            else TaskMode.DISPATCH
+        )
+    else:
+        local_mode = _local_main_agent_auto_mode(message, attachment_ids)
     if local_mode is TaskMode.HYBRID:
         return TaskMode.HYBRID
     if {router_mode, local_mode} == {TaskMode.DISPATCH, TaskMode.DISCUSS}:

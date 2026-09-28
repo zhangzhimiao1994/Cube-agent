@@ -1632,12 +1632,12 @@ def _project_scale_artifact_zip_completion(
     if project_id is None or workspace_session_id is None:
         return completion
     generated_files = _project_scale_generated_files_from_text(response.text)
-    if generated_files is None and not (
-        is_project_scale_artifact_request(step.task)
-        or _is_project_scale_acceptance_handoff(step.task)
-    ):
-        return completion
-    files = generated_files or project_scale_artifact_zip_files(step.task)
+    is_fixture = is_project_scale_artifact_request(step.task)
+    if generated_files is None:
+        if not is_fixture:
+            _fail("project workspace bundle is missing")
+        generated_files = project_scale_artifact_zip_files(step.task)
+    files = generated_files
     _require_website_preview_entry(context, files)
     return GatewayCompletion(
         response=ModelResponse(
@@ -3634,7 +3634,12 @@ class CrewDispatchRuntime:
                     if write_id is not None:
                         state.pending_artifact_writes.pop(write_id, None)
                     if artifact is not None:
-                        await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
+                        await emit(
+                            kind=EventKind.ARTIFACT_CREATED,
+                            artifact=artifact,
+                            actor=actor,
+                            payload={"agent_id": actor},
+                        )
                     if response_cost:
                         await emit(
                             kind=EventKind.COST_RECORDED,
@@ -3642,6 +3647,7 @@ class CrewDispatchRuntime:
                             provider_id=completion.provider_id,
                             cost_usd=response_cost,
                             currency="USD",
+                            payload={"agent_id": actor},
                         )
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
                     if terminal_phase is not None:
@@ -3913,10 +3919,24 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
     ) -> _StepResult:
+        agents = {agent.id: agent for agent in plan.agents}
+
         async def event(**values: object) -> None:
+            actor = values.get("actor")
+            if type(actor) is str and actor in agents:
+                kind = values.get("kind")
+                if kind not in {
+                    EventKind.TOOL_REQUESTED,
+                    EventKind.TOOL_STARTED,
+                    EventKind.TOOL_COMPLETED,
+                    EventKind.TOOL_FAILED,
+                }:
+                    raw_payload = values.get("payload")
+                    payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+                    payload["agent_id"] = actor
+                    values["payload"] = payload
             await emit(**values)
 
-        agents = {agent.id: agent for agent in plan.agents}
         agent = agents[step.agent]
         retries = prior_retries
         feedback_artifact = review_ledger.artifacts.get(step.id)
@@ -4100,6 +4120,7 @@ class CrewDispatchRuntime:
                                 kind="review.failed",
                                 payload={
                                     "actor": step.reviewer,
+                                    "agent_id": step.reviewer,
                                     "step_id": step.id,
                                     "review_status": "unverified",
                                     "logical_model": reviewer.logical_model,
@@ -5445,6 +5466,7 @@ class CrewDispatchRuntime:
                         type="tool_result",
                         producer=step.agent,
                         content={
+                            "agent_id": step.agent,
                             "result": reusable_result,
                             "tool_name": tool_call.name,
                             "arguments_sha256": arguments_sha256,
@@ -5602,7 +5624,7 @@ class CrewDispatchRuntime:
                             id=uuid4(),
                             type="tool_result",
                             producer=step.agent,
-                            content={"result": result},
+                            content={"agent_id": step.agent, "result": result},
                             source_ids=(str(trigger_model_artifact.id),),
                         )
                         await emit(
@@ -5726,7 +5748,7 @@ class CrewDispatchRuntime:
                             id=uuid4(),
                             type="tool_result",
                             producer=step.agent,
-                            content={"result": result},
+                            content={"agent_id": step.agent, "result": result},
                             source_ids=(str(trigger_model_artifact.id),),
                         )
                         await emit(
@@ -5765,6 +5787,7 @@ class CrewDispatchRuntime:
                             type="tool_result",
                             producer=step.agent,
                             content={
+                                "agent_id": step.agent,
                                 "result": reusable_result,
                                 "tool_name": tool_call.name,
                                 "arguments_sha256": arguments_sha256,
@@ -5816,11 +5839,24 @@ class CrewDispatchRuntime:
                     raise RuntimeExecutionError("capability execution failed") from None
                 try:
                     result = cast(Mapping[str, JsonValue], _mutable_json(tool_result.payload))
-                    if (
-                        tool_call.name == PROJECT_SCALE_ARTIFACT_TOOL_NAME
-                        and _is_project_scale_artifact_handoff(step)
-                    ):
-                        result = augment_project_scale_artifact_result(result)
+                    if tool_call.name == PROJECT_SCALE_ARTIFACT_TOOL_NAME:
+                        result = (
+                            dict(augment_project_scale_artifact_result(result))
+                            if _is_project_scale_artifact_handoff(step)
+                            else dict(result)
+                        )
+                        result["artifact_origin"] = (
+                            "builtin_fixture"
+                            if is_project_scale_artifact_request(step.task)
+                            else "tool_workspace_write"
+                        )
+                    elif tool_call.name in {"workspace.write_text", "workspace.bundle"}:
+                        result = dict(result)
+                        result["artifact_origin"] = (
+                            "incremental_workspace_delivery"
+                            if tool_call.name == "workspace.bundle"
+                            else "tool_workspace_write"
+                        )
                     encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
                     if len(encoded.encode("utf-8")) > content_limits.prompt_bytes:
                         _fail("capability result exceeds limit")
@@ -5884,9 +5920,15 @@ class CrewDispatchRuntime:
                     type="tool_result",
                     producer=step.agent,
                     content={
+                        "agent_id": step.agent,
                         "result": result,
                         "tool_name": tool_call.name,
                         "arguments_sha256": arguments_sha256,
+                        **(
+                            {"artifact_origin": result["artifact_origin"]}
+                            if "artifact_origin" in result
+                            else {}
+                        ),
                     },
                     source_ids=(str(trigger_model_artifact.id),),
                 )

@@ -389,6 +389,30 @@ async def test_auto_ready_direct_is_promoted_for_generation_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_ready_router_obeys_declared_medium_project_scale() -> None:
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(ready_decision(TaskMode.DIRECT)),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build a real medium business project: a CRM-lite website.",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["router_selected_mode"] == "direct"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+@pytest.mark.asyncio
 async def test_auto_ready_dispatch_is_promoted_to_hybrid_for_generation_with_review() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
@@ -1096,7 +1120,7 @@ async def test_auto_mode_resolves_low_risk_router_uncertainty_through_main_agent
     )
 
     assert submitted.status is RunStatus.QUEUED
-    assert submitted.mode is TaskMode.DISCUSS
+    assert submitted.mode is TaskMode.HYBRID
     assert submitted.decision_token is None
     assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}")]
     routing = repository.records[submitted.id].routing_decision
@@ -1104,6 +1128,38 @@ async def test_auto_mode_resolves_low_risk_router_uncertainty_through_main_agent
     assert routing["reason"] == "main_agent_auto_resolved"
     assert routing["auto_resolution_reason"] == "routing_requires_user_choice"
     assert routing["auto_resolution_source_modes"] == ["dispatch", "discuss"]
+    assert routing["auto_resolution_selected_mode"] == "discuss"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["main_agent_adjusted"] is True
+
+
+@pytest.mark.asyncio
+async def test_auto_candidate_selection_obeys_declared_medium_project_scale() -> None:
+    repository = FakeRepository()
+    decision = waiting_decision(
+        assessment(TaskMode.DIRECT, confidence=0.91),
+        assessment(TaskMode.DISCUSS, confidence=0.62),
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(decision),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build a real medium business project: a CRM-lite website.",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["reason"] == "main_agent_auto_resolved"
+    assert routing["auto_resolution_selected_mode"] == "direct"
+    assert routing["main_agent_selected_mode"] == "dispatch"
 
 
 @pytest.mark.asyncio

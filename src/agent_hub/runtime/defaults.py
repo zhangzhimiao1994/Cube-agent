@@ -240,6 +240,11 @@ _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
 _MAX_CAPABILITY_INVENTORY_FAILURE_CODES = 32
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
+_MAX_PLAN_SUMMARY_IDS = 256
+_MAX_PLAN_EVENT_HANDOFF_PAGE_SIZE = 48
+_MAX_PLAN_EVIDENCE_PAGE_NODES = 512
+_CAPABILITY_ASSIGNMENT_PAGE_SIZE = 32
+_CAPABILITY_INVENTORY_PAGE_SIZE = 16
 _ABSOLUTE_MAX_ORCHESTRATION_HANDOFFS = 4096
 _ABSOLUTE_MAX_ORCHESTRATION_HANDOFF_PAGE_SIZE = 256
 _ORCHESTRATION_HANDOFF_PAGE_SIZE_BY_SCALE = {
@@ -432,11 +437,86 @@ class _PlannedRuntime:
         self._required_capabilities_by_role = required_capabilities_by_role
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
-        sequence_offset = 1
+        sequence_offset = 0
         if context.checkpoint is None:
-            yield RunEvent(
-                kind=EventKind.STEP_STARTED,
+            planning_events = self._planning_events(context)
+            sequence_offset = len(planning_events)
+            for event in planning_events:
+                yield event
+        async for event in self._child.run(context):
+            yield _renumber_event(event, sequence_offset, run_id=context.run_id)
+
+    def _planning_events(self, context: TaskContext) -> tuple[RunEvent, ...]:
+        model_plan = dict(
+            _model_execution_plan_payload(
+                _bounded_plan_event_context(context),
+                main_agent_model=self._main_agent_model,
+                roles=self._roles,
+                steps=self._steps,
+                model_routing_matrix=self._model_routing_matrix,
+                model_routing_matrix_truncated=self._model_routing_matrix_truncated,
+                deployment_constraints=self._deployment_constraints,
+                deployment_constraint=self._deployment_constraint,
+                fallback_policy=self._fallback_policy,
+                config=self._config,
+                required_capabilities_by_role=self._required_capabilities_by_role,
+            )
+        )
+        orchestration_details = {
+            key: model_plan.pop(key)
+            for key in (
+                "orchestration_handoffs",
+                "orchestration_contracts",
+                "orchestration_protocol",
+            )
+        }
+        evidence_payloads: list[Mapping[str, JsonValue]] = [
+            *_role_step_plan_evidence_pages(roles=self._roles, steps=self._steps),
+            {
+                "schema_version": 1,
+                "evidence_kind": "model_execution_plan",
+                "page": 1,
+                "page_count": 1,
+                "details": model_plan,
+            },
+            {
+                "schema_version": 1,
+                "evidence_kind": "orchestration_handoff_plan",
+                "page": 1,
+                "page_count": 1,
+                "details": orchestration_details,
+            },
+            {
+                "schema_version": 1,
+                "evidence_kind": "dispatch_discussion_trace",
+                "page": 1,
+                "page_count": 1,
+                "details": _dispatch_discussion_trace_payload(
+                    roles=self._roles,
+                    steps=self._steps,
+                ),
+            },
+        ]
+        evidence_payloads.extend(
+            _capability_execution_plan_evidence_pages(
+                _capability_execution_plan_payload(
+                    self._roles,
+                    tenant_id=context.tenant_id,
+                    capability_gateway=self._capability_gateway,
+                )
+            )
+        )
+        detail_references = _plan_detail_references(evidence_payloads, first_sequence=3)
+        events: list[RunEvent] = [
+            RunEvent(
+                kind="runtime.context_loaded",
                 sequence=1,
+                run_id=context.run_id,
+                payload=_runtime_context_loaded_payload(context),
+            ),
+            RunEvent(
+                kind=EventKind.STEP_STARTED,
+                sequence=2,
                 run_id=context.run_id,
                 actor="main_agent",
                 step_id="main_agent_plan",
@@ -446,34 +526,22 @@ class _PlannedRuntime:
                     "logical_model": self._main_agent_model,
                     "task": "选择运行模式、角色和模型。",
                     "summary": "主 Agent 已选择运行模式、角色和模型。",
-                    "roles": self._roles,
-                    "steps": self._steps,
-                    "model_execution_plan": _model_execution_plan_payload(
-                        context,
-                        main_agent_model=self._main_agent_model,
-                        roles=self._roles,
-                        steps=self._steps,
-                        model_routing_matrix=self._model_routing_matrix,
-                        model_routing_matrix_truncated=self._model_routing_matrix_truncated,
-                        deployment_constraints=self._deployment_constraints,
-                        deployment_constraint=self._deployment_constraint,
-                        fallback_policy=self._fallback_policy,
-                        config=self._config,
-                        required_capabilities_by_role=self._required_capabilities_by_role,
-                    ),
-                    "dispatch_discussion_trace": _dispatch_discussion_trace_payload(
-                        roles=self._roles,
-                        steps=self._steps,
-                    ),
-                    "capability_execution_plan": _capability_execution_plan_payload(
-                        self._roles,
-                        tenant_id=context.tenant_id,
-                        capability_gateway=self._capability_gateway,
-                    ),
+                    "roles": _plan_id_summary(self._roles),
+                    "steps": _plan_id_summary(self._steps),
+                    "detail_references": detail_references,
                 },
+            ),
+        ]
+        events.extend(
+            RunEvent(
+                kind="runtime.plan_created",
+                sequence=sequence,
+                run_id=context.run_id,
+                payload=payload,
             )
-        async for event in self._child.run(context):
-            yield _renumber_event(event, sequence_offset, run_id=context.run_id)
+            for sequence, payload in enumerate(evidence_payloads, start=3)
+        )
+        return tuple(events)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         return await self._child.save_checkpoint()
@@ -483,6 +551,241 @@ class _PlannedRuntime:
 
     async def cancel(self) -> None:
         await self._child.cancel()
+
+
+def _runtime_context_loaded_payload(context: TaskContext) -> Mapping[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "evidence_kind": "runtime_context",
+        "mode": context.mode.value,
+        "request_bytes": len(context.request.encode("utf-8")),
+        "artifact_count": len(context.artifacts),
+        "checkpoint_loaded": context.checkpoint is not None,
+        "routing_entry_count": len(context.routing_decision),
+    }
+
+
+def _plan_id_summary(
+    items: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    ids = tuple(
+        item_id
+        for item in items
+        if isinstance((item_id := item.get("id")), str) and item_id
+    )
+    returned_ids = ids[:_MAX_PLAN_SUMMARY_IDS]
+    return {
+        "count": len(items),
+        "ids": returned_ids,
+        "truncated": len(returned_ids) < len(ids),
+    }
+
+
+def _bounded_plan_event_context(context: TaskContext) -> TaskContext:
+    _, requested_page_size = _orchestration_handoff_page_request(context)
+    if requested_page_size <= _MAX_PLAN_EVENT_HANDOFF_PAGE_SIZE:
+        return context
+    routing_decision = dict(context.routing_decision)
+    routing_decision["orchestration_handoff_page_size"] = _MAX_PLAN_EVENT_HANDOFF_PAGE_SIZE
+    return context.model_copy(update={"routing_decision": routing_decision})
+
+
+def _plan_detail_references(
+    payloads: Sequence[Mapping[str, JsonValue]],
+    *,
+    first_sequence: int,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    ranges: OrderedDict[str, tuple[int, int]] = OrderedDict()
+    for sequence, payload in enumerate(payloads, start=first_sequence):
+        evidence_kind = payload.get("evidence_kind")
+        if not isinstance(evidence_kind, str):
+            continue
+        first, count = ranges.get(evidence_kind, (sequence, 0))
+        ranges[evidence_kind] = (first, count + 1)
+    return tuple(
+        {
+            "id": evidence_kind,
+            "event_kind": "runtime.plan_created",
+            "first_sequence": first,
+            "event_count": count,
+        }
+        for evidence_kind, (first, count) in ranges.items()
+    )
+
+
+def _role_step_plan_evidence_pages(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    raw_pages: list[Mapping[str, JsonValue]] = []
+    raw_pages.extend(
+        {"section": "roles", "items": chunk}
+        for chunk in _bounded_mapping_pages(roles)
+    )
+    raw_pages.extend(
+        {"section": "steps", "items": chunk}
+        for chunk in _bounded_mapping_pages(steps)
+    )
+    page_count = len(raw_pages)
+    pages: list[Mapping[str, JsonValue]] = []
+    for page, raw_page in enumerate(raw_pages, start=1):
+        payload: dict[str, JsonValue] = {
+            "schema_version": 1,
+            "evidence_kind": "role_step_plan",
+            "page": page,
+            "page_count": page_count,
+            "role_count": len(roles),
+            "step_count": len(steps),
+        }
+        payload.update(raw_page)
+        pages.append(payload)
+    return tuple(pages)
+
+
+def _bounded_mapping_pages(
+    items: Sequence[Mapping[str, JsonValue]],
+) -> tuple[tuple[Mapping[str, JsonValue], ...], ...]:
+    pages: list[tuple[Mapping[str, JsonValue], ...]] = []
+    current: list[Mapping[str, JsonValue]] = []
+    current_nodes = 0
+    for item in items:
+        item_nodes = _estimated_json_nodes(item)
+        bounded_item = (
+            item
+            if item_nodes <= _MAX_PLAN_EVIDENCE_PAGE_NODES
+            else _oversized_plan_item_summary(item, original_node_count=item_nodes)
+        )
+        bounded_item_nodes = _estimated_json_nodes(bounded_item)
+        if (
+            current
+            and current_nodes + bounded_item_nodes > _MAX_PLAN_EVIDENCE_PAGE_NODES
+        ):
+            pages.append(tuple(current))
+            current = []
+            current_nodes = 0
+        current.append(bounded_item)
+        current_nodes += bounded_item_nodes
+    if current:
+        pages.append(tuple(current))
+    return tuple(pages)
+
+
+def _estimated_json_nodes(value: JsonValue) -> int:
+    if isinstance(value, Mapping):
+        return 1 + sum(1 + _estimated_json_nodes(item) for item in value.values())
+    if isinstance(value, tuple | list):
+        return 1 + sum(_estimated_json_nodes(item) for item in value)
+    return 1
+
+
+def _oversized_plan_item_summary(
+    item: Mapping[str, JsonValue],
+    *,
+    original_node_count: int,
+) -> Mapping[str, JsonValue]:
+    item_id = item.get("id")
+    top_level_keys = tuple(sorted(key for key in item if isinstance(key, str)))[:32]
+    return {
+        "id": item_id if isinstance(item_id, str) and item_id else "unknown",
+        "summary": "Oversized plan item omitted; use the configured runtime definition.",
+        "truncated": True,
+        "original_node_count": original_node_count,
+        "top_level_keys": top_level_keys,
+    }
+
+
+def _capability_execution_plan_evidence_pages(
+    plan: Mapping[str, JsonValue],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    raw_assignments = plan.get("role_capability_assignments")
+    assignments = (
+        tuple(item for item in raw_assignments if isinstance(item, Mapping))
+        if isinstance(raw_assignments, tuple | list)
+        else ()
+    )
+    raw_inventory = plan.get("capability_inventory")
+    inventory = raw_inventory if isinstance(raw_inventory, Mapping) else None
+    raw_inventory_items = inventory.get("items") if inventory is not None else None
+    inventory_items = (
+        tuple(item for item in raw_inventory_items if isinstance(item, Mapping))
+        if isinstance(raw_inventory_items, tuple | list)
+        else ()
+    )
+    inventory_schema_version = inventory.get("schema_version", 1) if inventory else 1
+    inventory_truncated = inventory.get("truncated") is True if inventory else False
+
+    raw_pages: list[Mapping[str, JsonValue]] = [
+        {
+            "section": "summary",
+            "details": {
+                "schema_version": plan.get("schema_version", 1),
+                "permission_boundary": plan.get(
+                    "permission_boundary", "runtime_capability_gateway"
+                ),
+                "role_assignment_count": len(assignments),
+                "inventory_item_count": len(inventory_items),
+                "inventory_truncated": (
+                    inventory.get("truncated") is True if inventory is not None else False
+                ),
+            },
+        }
+    ]
+    for assignment in assignments:
+        role_id = assignment.get("role_id")
+        raw_capabilities = assignment.get("capabilities")
+        capabilities = (
+            tuple(item for item in raw_capabilities if isinstance(item, Mapping))
+            if isinstance(raw_capabilities, tuple | list)
+            else ()
+        )
+        capability_chunks = tuple(
+            capabilities[index : index + _CAPABILITY_ASSIGNMENT_PAGE_SIZE]
+            for index in range(0, len(capabilities), _CAPABILITY_ASSIGNMENT_PAGE_SIZE)
+        ) or ((),)
+        for role_page, chunk in enumerate(capability_chunks, start=1):
+            raw_pages.append(
+                {
+                    "section": "role_capability_assignments",
+                    "details": {
+                        "role_id": role_id if isinstance(role_id, str) else "unknown",
+                        "capabilities": chunk,
+                        "capability_count": len(capabilities),
+                        "role_page": role_page,
+                        "role_page_count": len(capability_chunks),
+                    },
+                }
+            )
+    inventory_chunks = tuple(
+        inventory_items[index : index + _CAPABILITY_INVENTORY_PAGE_SIZE]
+        for index in range(0, len(inventory_items), _CAPABILITY_INVENTORY_PAGE_SIZE)
+    )
+    for inventory_page, chunk in enumerate(inventory_chunks, start=1):
+        raw_pages.append(
+            {
+                "section": "capability_inventory",
+                "details": {
+                    "schema_version": inventory_schema_version,
+                    "items": chunk,
+                    "total_count": len(inventory_items),
+                    "inventory_page": inventory_page,
+                    "inventory_page_count": len(inventory_chunks),
+                    "truncated": inventory_truncated,
+                },
+            }
+        )
+
+    page_count = len(raw_pages)
+    return tuple(
+        {
+            "schema_version": 1,
+            "evidence_kind": "capability_execution_plan",
+            "page": page,
+            "page_count": page_count,
+            **raw_page,
+        }
+        for page, raw_page in enumerate(raw_pages, start=1)
+    )
 
 
 def _renumber_event(event: RunEvent, offset: int, *, run_id: UUID) -> RunEvent:
@@ -1409,6 +1712,12 @@ def _dispatch_plan(
                 model="main",
             ),
         )
+    multi_agent_chain = _is_default_multi_agent_chain_request(context, selected_roles)
+    if multi_agent_chain:
+        roles_by_id = {role.id: role for role in selected_roles}
+        selected_roles = tuple(
+            roles_by_id[role_id] for role_id in ("architect", "implementer", "tester")
+        )
     plan_allowed_tools = _plan_allowed_tools(
         selected_roles,
         context,
@@ -1478,11 +1787,12 @@ def _dispatch_plan(
                 },
             )
         )
-    if not any(agent.id == "final_synthesizer" for agent in agents):
+    final_agent_id = "synthesizer" if multi_agent_chain else "final_synthesizer"
+    if not any(agent.id == final_agent_id for agent in agents):
         agents.append(
             AgentSpec(
-                id="final_synthesizer",
-                role="Final Synthesizer",
+                id=final_agent_id,
+                role="Synthesizer" if multi_agent_chain else "Final Synthesizer",
                 goal="Merge role outputs into one concise, evidence-aware final answer.",
                 logical_model=_dispatch_final_synthesizer_model(context, selected_roles[0].model),
                 allowed_tools=(),
@@ -1556,10 +1866,11 @@ def _dispatch_plan(
                 f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
-            depends_on=(
-                producer_step_ids
-                if _is_post_product_role(role) and producer_step_ids
-                else preflight_dependencies
+            depends_on=_dispatch_step_dependencies(
+                role,
+                producer_step_ids=producer_step_ids,
+                preflight_dependencies=preflight_dependencies,
+                multi_agent_chain=multi_agent_chain,
             ),
             tools=role_tools_by_id[role.id],
             tool_argument_budget_bytes=_tool_argument_budgets_for_step(
@@ -1581,7 +1892,7 @@ def _dispatch_plan(
     final_dependencies = tuple(step.id for step in (*preflight_steps, *role_steps))
     final_step = DispatchStep(
         id="final_response_step",
-        agent="final_synthesizer",
+        agent=final_agent_id,
         task=(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
@@ -1603,11 +1914,54 @@ def _dispatch_plan(
         steps=steps,
         allowed_tools=plan_allowed_tools,
         max_steps=_dispatch_max_steps(context),
-        max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
+        max_parallelism=(
+            1
+            if multi_agent_chain
+            else max(1, min(max_parallelism, len(role_steps) or 1))
+        ),
         total_token_budget=context.token_budget,
         total_timeout_seconds=sum(step.timeout_seconds for step in steps),
         total_cost_usd=sum((step.cost_budget_usd for step in steps), Decimal(0)),
     )
+
+
+def _is_default_multi_agent_chain_request(
+    context: TaskContext,
+    roles: tuple[RoleAssignment, ...],
+) -> bool:
+    explicit_flow = next(
+        (
+            context.routing_decision.get(key)
+            for key in ("flow", "route_intent", "requested_flow")
+            if context.routing_decision.get(key) is not None
+        ),
+        None,
+    )
+    request = str(context.request).casefold()
+    requested = explicit_flow == "multi_agent" or bool(
+        re.search(r"\bflow\s*=\s*multi[_-]agent\b", request)
+    )
+    return requested and {"architect", "implementer", "tester"} <= {
+        role.id for role in roles
+    }
+
+
+def _dispatch_step_dependencies(
+    role: RoleAssignment,
+    *,
+    producer_step_ids: tuple[str, ...],
+    preflight_dependencies: tuple[str, ...],
+    multi_agent_chain: bool,
+) -> tuple[str, ...]:
+    if multi_agent_chain:
+        return {
+            "architect": preflight_dependencies,
+            "implementer": ("architect_step",),
+            "tester": ("implementer_step",),
+        }[role.id]
+    if _is_post_product_role(role) and producer_step_ids:
+        return producer_step_ids
+    return preflight_dependencies
 
 
 def _is_post_product_role(role: RoleAssignment) -> bool:

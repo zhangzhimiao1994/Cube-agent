@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
@@ -77,6 +78,7 @@ class ConversationModeRepository:
     def __init__(self, previous_mode: TaskMode | None) -> None:
         self.previous_mode = previous_mode
         self.created: list[dict[str, object]] = []
+        self.record: RunRecord | None = None
 
     async def latest_resolved_mode_for_conversation(
         self,
@@ -110,7 +112,7 @@ class ConversationModeRepository:
                 "routing_decision": routing_decision,
             }
         )
-        return RunRecord(
+        self.record = RunRecord(
             id=uuid4(),
             tenant_id=tenant_id,
             actor_id=actor_id,
@@ -121,6 +123,25 @@ class ConversationModeRepository:
             created_at=datetime.now(UTC),
             routing_decision=routing_decision,
         )
+        return self.record
+
+    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+        assert self.record is not None
+        assert self.record.tenant_id == tenant_id
+        assert self.record.id == run_id
+        return self.record
+
+    async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
+        del tenant_id, run_id
+        return ()
+
+    async def artifact_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[UUID, ...]:
+        del tenant_id, run_id
+        return ()
+
+    async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> Decimal:
+        del tenant_id, run_id
+        return Decimal(0)
 
 
 class ConversationMetadataRepository:
@@ -588,11 +609,25 @@ async def test_explicit_direct_large_project_is_upgraded_before_runtime(
     )
 
     assert submitted.mode is TaskMode.HYBRID
+    assert submitted.requested_mode is TaskMode.DIRECT
+    assert submitted.effective_mode is TaskMode.HYBRID
+    assert submitted.effective_scale == expected_scale
+    assert submitted.route_reason == "project_scale_mode_upgrade"
+    assert submitted.mode_source == "project_scale_assessment"
+    queried = await service.get(submitted.tenant_id, submitted.id)
+    assert queried.requested_mode is TaskMode.DIRECT
+    assert queried.effective_mode is TaskMode.HYBRID
+    assert queried.effective_scale == expected_scale
+    assert queried.route_reason == "project_scale_mode_upgrade"
+    assert queried.mode_source == "project_scale_assessment"
     routing = repository.created[-1]["routing_decision"]
     assert isinstance(routing, dict)
     assert routing.items() >= {
         "reason": "project_scale_mode_upgrade",
+        "route_reason": "project_scale_mode_upgrade",
         "requested_mode": "direct",
+        "effective_mode": "hybrid",
+        "effective_scale": expected_scale,
         "main_agent_selected_mode": "hybrid",
         "mode_source": "project_scale_assessment",
         "project_scale": expected_scale,
@@ -1057,6 +1092,88 @@ async def test_auto_submission_uses_hermes_before_local_direct_router_fallback()
     routing = repository.created[0]["routing_decision"]
     assert isinstance(routing, dict)
     assert routing["reason"] == "hermes_recommendation"
+
+
+async def test_auto_hermes_recommendation_obeys_declared_medium_project_scale() -> None:
+    repository = ConversationModeRepository(None)
+    advisor = RecordingHermesAdvisor(
+        HermesRunAdvice(
+            recommended_mode=TaskMode.DIRECT,
+            confidence=0.86,
+            reasons=("matched previous execution pattern",),
+            recommended_skills=(),
+            requires_approval=False,
+        )
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+        hermes_advisor=advisor,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build a real medium business project: a CRM-lite website.",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-medium-hermes",
+    )
+
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "hermes_recommendation"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+async def test_auto_conversation_continuation_obeys_declared_medium_project_scale() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build a real medium business project: a CRM-lite website.",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-medium-continuation",
+    )
+
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "project_scale_mode_upgrade"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+async def test_auto_local_fallback_obeys_declared_medium_project_scale() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build a real medium business project: a CRM-lite website.",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-medium-local",
+    )
+
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "dispatch"
 
 
 async def test_auto_submission_records_hermes_injected_memory_payload() -> None:

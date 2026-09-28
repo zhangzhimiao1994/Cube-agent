@@ -541,13 +541,31 @@ def build_case_report(
         "multi_agent": frozenset({"dispatch"}),
     }
     allowed_modes = expected_modes.get(route_intent)
-    observed_route_ok = allowed_modes is None or result.observed_mode in allowed_modes
+    final_mode = result.final_observed_mode or result.observed_mode
+    exact_mode_coverage_ok = allowed_modes is None or final_mode in allowed_modes
+    safe_upgrade = (
+        route_intent == "direct"
+        and result.requested_mode == "direct"
+        and final_mode == "hybrid"
+        and result.route_reason == "project_scale_mode_upgrade"
+        and result.mode_source == "project_scale_assessment"
+        and result.effective_scale in {"large", "ultra"}
+    )
+    route_policy_ok = exact_mode_coverage_ok or safe_upgrade
+    effective_scale = result.effective_scale
+    scale_fidelity_ok = effective_scale == scale
+    artifact_origin_ok = result.artifact_origin in {
+        "model_workspace_bundle",
+        "tool_workspace_write",
+        "incremental_workspace_delivery",
+    }
+    required_multi_agent_ids = {"architect", "implementer", "tester", "synthesizer"}
     multi_agent_evidence_ok = (
         route_intent != "multi_agent"
         or (
             result.evidence.get("multi_agent_participation") is True
-            and len(result.participant_agent_ids) >= 2
-            and result.participant_event_count >= 2
+            and required_multi_agent_ids <= set(result.participant_agent_ids)
+            and result.participant_event_count >= 8
         )
     )
     core_ok = (
@@ -556,7 +574,9 @@ def build_case_report(
         and requirements_ok
         and public_artifacts_ok
         and preview_ok
-        and observed_route_ok
+        and route_policy_ok
+        and scale_fidelity_ok
+        and artifact_origin_ok
         and multi_agent_evidence_ok
     )
     return {
@@ -566,9 +586,20 @@ def build_case_report(
         "route_intent": route_intent,
         "observed_mode": result.observed_mode,
         "initial_observed_mode": result.observed_mode,
-        "final_observed_mode": result.final_observed_mode or result.observed_mode,
-        "observed_route_ok": observed_route_ok,
-        "autonomous_mode_selected": case_kind == "auto_scale" and observed_route_ok,
+        "final_observed_mode": final_mode,
+        "requested_mode": result.requested_mode,
+        "route_reason": result.route_reason,
+        "mode_source": result.mode_source,
+        "effective_scale": effective_scale,
+        "scale_fidelity_ok": scale_fidelity_ok,
+        "route_policy_ok": route_policy_ok,
+        "observed_route_ok": route_policy_ok,
+        "exact_mode_coverage_ok": exact_mode_coverage_ok,
+        "coverage_credit": (
+            "exact_mode" if exact_mode_coverage_ok else "safe_upgrade" if safe_upgrade else "none"
+        ),
+        "artifact_origin_ok": artifact_origin_ok,
+        "autonomous_mode_selected": case_kind == "auto_scale" and route_policy_ok,
         "multi_agent_evidence_ok": multi_agent_evidence_ok,
         "status": "pending_real_device" if core_ok else "failed",
         "core_acceptance_ok": core_ok,
@@ -586,13 +617,23 @@ def build_case_report(
         },
         "public_artifacts": dict(public_artifacts),
         "dynamic_web_preview": dict(dynamic_web_preview),
+        "artifact_provenance": {
+            "artifact_origin": result.artifact_origin,
+            "embedded_bundle_available": result.workspace_bundle_source == "embedded_bundle",
+            "public_materialized": public_artifacts_ok,
+            "preview_available": preview_ok,
+            "fixture_origin_allowed": False,
+        },
         "success_basis": {
             "logged_in_user_http_api": True,
             "public_run_api": True,
             "public_workspace_file_api": public_artifacts_ok,
             "public_workspace_zip": public_artifacts_ok,
             "public_preview_lifecycle": preview_ok,
-            "observed_route": observed_route_ok,
+            "observed_route": route_policy_ok,
+            "exact_mode_coverage": exact_mode_coverage_ok,
+            "scale_fidelity": scale_fidelity_ok,
+            "artifact_origin": artifact_origin_ok,
             "multi_agent_participation": multi_agent_evidence_ok,
             "admin_internal_run_data": False,
         },

@@ -50,7 +50,8 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "POST /tasks/:id/restore" in messages["small:direct"]
     assert "PORT environment variable" in messages["small:direct"]
     assert "DATA_DIR" in messages["small:direct"]
-    assert "tenant-aware CRM-lite" in messages["medium:direct"]
+    assert "CRM" not in messages["medium:direct"]
+    assert "tenant-aware customer account service" in messages["medium:direct"]
     assert "must not require pre-created tenant records" in messages["medium:direct"]
     assert "contacts must accept {account_id,name,email}" in messages["medium:direct"]
     assert "GET /tenants/:tenant_id/opportunities" in messages["medium:direct"]
@@ -65,3 +66,21 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "ultra-large project" in messages["ultra:direct"]
     assert "enterprise project portfolio" in messages["ultra:direct"]
     assert len(set(messages.values())) == 4
+
+
+def test_multi_agent_capability_request_requires_role_artifact_dependencies() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("small",),
+        flows=("multi_agent",),
+        benchmark_kind="capability",
+    )
+
+    message = str(plan.requests[0].body["message"])
+
+    assert "Architecture Agent" in message
+    assert "Implementation Agent" in message
+    assert "Test Agent" in message
+    assert "Synthesis Agent" in message
+    assert "must depend on the architecture contract" in message
+    assert "must run after implementation artifacts exist" in message
+    assert "must depend on the architecture, implementation, and test artifacts" in message

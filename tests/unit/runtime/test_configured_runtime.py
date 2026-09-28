@@ -46,6 +46,7 @@ from agent_hub.runtime.defaults import (
     _dispatch_parallelism,
     _dispatch_plan,
     _model_execution_plan_payload,
+    _PlannedRuntime,
     _prepare_capability_gateway_for_tenant,
     _role_model_fallbacks_by_id,
     _role_model_routing_matrix_payload,
@@ -435,6 +436,7 @@ class FakeTransport:
 
 
 class ProbeDispatchRuntime:
+    mode = TaskMode.DISPATCH
     instances: ClassVar[list["ProbeDispatchRuntime"]] = []
 
     def __init__(
@@ -509,6 +511,317 @@ class CancellableProbeRuntime:
 
     async def cancel(self) -> None:
         self.cancel_count += 1
+
+
+def _main_plan_event(events: Sequence[RunEvent]) -> RunEvent:
+    return next(event for event in events if event.step_id == "main_agent_plan")
+
+
+def _plan_evidence_pages(
+    events: Sequence[RunEvent],
+    evidence_kind: str,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    return tuple(
+        event.payload
+        for event in events
+        if event.kind == "runtime.plan_created"
+        and event.payload.get("evidence_kind") == evidence_kind
+    )
+
+
+def _role_step_plan_from_events(
+    events: Sequence[RunEvent],
+) -> tuple[tuple[Mapping[str, JsonValue], ...], tuple[Mapping[str, JsonValue], ...]]:
+    roles: list[Mapping[str, JsonValue]] = []
+    steps: list[Mapping[str, JsonValue]] = []
+    for page in _plan_evidence_pages(events, "role_step_plan"):
+        raw_items = page.get("items")
+        assert isinstance(raw_items, tuple)
+        items = cast(tuple[Mapping[str, JsonValue], ...], raw_items)
+        if page.get("section") == "roles":
+            roles.extend(items)
+        elif page.get("section") == "steps":
+            steps.extend(items)
+    return tuple(roles), tuple(steps)
+
+
+def _model_execution_plan_from_events(events: Sequence[RunEvent]) -> Mapping[str, JsonValue]:
+    model_pages = _plan_evidence_pages(events, "model_execution_plan")
+    assert len(model_pages) == 1
+    raw_model = model_pages[0].get("details")
+    assert isinstance(raw_model, Mapping)
+    plan = dict(raw_model)
+    orchestration_pages = _plan_evidence_pages(events, "orchestration_handoff_plan")
+    assert len(orchestration_pages) == 1
+    raw_orchestration = orchestration_pages[0].get("details")
+    assert isinstance(raw_orchestration, Mapping)
+    plan.update(raw_orchestration)
+    return plan
+
+
+def _discussion_trace_from_events(events: Sequence[RunEvent]) -> Mapping[str, JsonValue]:
+    pages = _plan_evidence_pages(events, "dispatch_discussion_trace")
+    assert len(pages) == 1
+    details = pages[0].get("details")
+    assert isinstance(details, Mapping)
+    return details
+
+
+def _capability_execution_plan_from_events(
+    events: Sequence[RunEvent],
+) -> Mapping[str, JsonValue]:
+    pages = _plan_evidence_pages(events, "capability_execution_plan")
+    assert pages
+    summary = next(page for page in pages if page.get("section") == "summary")
+    raw_summary = summary.get("details")
+    assert isinstance(raw_summary, Mapping)
+    capabilities_by_role: dict[str, list[Mapping[str, JsonValue]]] = {}
+    inventory_items: list[Mapping[str, JsonValue]] = []
+    inventory_schema_version: JsonValue = 1
+    inventory_truncated = raw_summary.get("inventory_truncated") is True
+    for page in pages:
+        details = page.get("details")
+        assert isinstance(details, Mapping)
+        if page.get("section") == "role_capability_assignments":
+            role_id = details.get("role_id")
+            assert isinstance(role_id, str)
+            raw_capabilities = details.get("capabilities")
+            assert isinstance(raw_capabilities, tuple)
+            capabilities_by_role.setdefault(role_id, []).extend(
+                cast(tuple[Mapping[str, JsonValue], ...], raw_capabilities)
+            )
+        elif page.get("section") == "capability_inventory":
+            raw_items = details.get("items")
+            assert isinstance(raw_items, tuple)
+            inventory_items.extend(cast(tuple[Mapping[str, JsonValue], ...], raw_items))
+            inventory_schema_version = details.get("schema_version", 1)
+            inventory_truncated = details.get("truncated") is True
+    plan: dict[str, JsonValue] = {
+        "schema_version": raw_summary.get("schema_version", 1),
+        "permission_boundary": raw_summary.get(
+            "permission_boundary", "runtime_capability_gateway"
+        ),
+        "role_capability_assignments": tuple(
+            {"role_id": role_id, "capabilities": tuple(capabilities)}
+            for role_id, capabilities in capabilities_by_role.items()
+        ),
+    }
+    if raw_summary.get("inventory_item_count") or raw_summary.get("inventory_truncated") is True:
+        plan["capability_inventory"] = {
+            "schema_version": inventory_schema_version,
+            "items": tuple(inventory_items),
+            "truncated": inventory_truncated,
+        }
+    return plan
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_emits_compact_plan_index_and_trusted_events_before_child() -> None:
+    run_id = uuid4()
+    runtime = _PlannedRuntime(
+        ProbeDispatchRuntime(None, object()),
+        mode=TaskMode.DISPATCH,
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "architect",
+                "role": "Architect",
+                "purpose": "plan",
+                "logical_model": "main",
+                "tools": ("read_context",),
+                "has_output_schema": True,
+            },
+            {
+                "id": "implementer",
+                "role": "Implementer",
+                "purpose": "execute",
+                "logical_model": "main",
+                "tools": ("workspace.write_text",),
+                "has_output_schema": True,
+            },
+        ),
+        steps=(
+            {
+                "id": "architecture_step",
+                "agent": "architect",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": ("read_context",),
+            },
+            {
+                "id": "implementation_step",
+                "agent": "implementer",
+                "depends_on": ("architecture_step",),
+                "final_synthesizer": False,
+                "tools": ("workspace.write_text",),
+            },
+        ),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Build the project.",
+            )
+        )
+    ]
+
+    main_plan = next(event for event in events if event.step_id == "main_agent_plan")
+    assert set(main_plan.payload) == {
+        "mode",
+        "main_agent_model",
+        "logical_model",
+        "task",
+        "summary",
+        "roles",
+        "steps",
+        "detail_references",
+    }
+    assert main_plan.payload["roles"] == {
+        "count": 2,
+        "ids": ("architect", "implementer"),
+        "truncated": False,
+    }
+    assert main_plan.payload["steps"] == {
+        "count": 2,
+        "ids": ("architecture_step", "implementation_step"),
+        "truncated": False,
+    }
+    assert "model_execution_plan" not in main_plan.payload
+    assert "capability_execution_plan" not in main_plan.payload
+    assert "dispatch_discussion_trace" not in main_plan.payload
+    assert events[0].kind == "runtime.context_loaded"
+    assert any(event.kind == "runtime.plan_created" for event in events[:-1])
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].sequence == len(events)
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_pages_maximum_capability_evidence_without_validation_error() -> None:
+    tools = tuple(f"plugin.tool_{index}" for index in range(96))
+    roles: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}",
+            "role": f"Worker {index}",
+            "purpose": "execute",
+            "logical_model": "main",
+            "tools": tools,
+            "has_output_schema": True,
+        }
+        for index in range(24)
+    )
+    steps = tuple(
+        {
+            "id": f"step_{index}",
+            "agent": f"worker_{index % len(roles)}",
+            "depends_on": (() if index == 0 else (f"step_{index - 1}",)),
+            "final_synthesizer": False,
+            "tools": tools,
+        }
+        for index in range(256)
+    )
+    capability_gateway = BadManifestCapabilityGateway(
+        {
+            "schema_version": 1,
+            "capabilities": tuple(
+                {
+                    "id": tool,
+                    "kind": "plugin",
+                    "adapter": "plugin_registry",
+                    "permission_class": "plugin.use",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "inherit",
+                    "available": True,
+                    "availability_reason": None,
+                    "failure_codes": ("plugin.timeout",),
+                    "replay_safe": False,
+                    "aliases": (),
+                }
+                for tool in tools
+            ),
+        }
+    )
+    runtime = _PlannedRuntime(
+        ProbeDispatchRuntime(None, object()),
+        mode=TaskMode.DISPATCH,
+        main_agent_model="main",
+        roles=roles,
+        steps=steps,
+        capability_gateway=capability_gateway,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Build an ultra project.",
+                routing_decision={"project_scale": "ultra"},
+            )
+        )
+    ]
+
+    capability_pages = [
+        event
+        for event in events
+        if event.kind == "runtime.plan_created"
+        and event.payload.get("evidence_kind") == "capability_execution_plan"
+    ]
+    assert len(capability_pages) > 1
+    assert all(event.payload["page_count"] == len(capability_pages) for event in capability_pages)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_role_step_plan_summarizes_one_oversized_schema_within_event_limits() -> None:
+    oversized_role: Mapping[str, JsonValue] = {
+        "id": "architect",
+        "role": "Architect",
+        "purpose": "plan",
+        "logical_model": "main",
+        "output_schema": {
+            f"field_{index}": {
+                "type": "string",
+                "description": f"Architecture field {index}",
+            }
+            for index in range(1_200)
+        },
+    }
+
+    pages = defaults_module._role_step_plan_evidence_pages(
+        roles=(oversized_role,),
+        steps=(),
+    )
+
+    assert len(pages) == 1
+    items = cast(tuple[Mapping[str, JsonValue], ...], pages[0]["items"])
+    assert items == (
+        {
+            "id": "architect",
+            "summary": "Oversized plan item omitted; use the configured runtime definition.",
+            "truncated": True,
+            "original_node_count": defaults_module._estimated_json_nodes(oversized_role),
+            "top_level_keys": (
+                "id",
+                "logical_model",
+                "output_schema",
+                "purpose",
+                "role",
+            ),
+        },
+    )
+    event = RunEvent(
+        kind="runtime.plan_created",
+        sequence=1,
+        run_id=uuid4(),
+        payload=pages[0],
+    )
+    assert RunEvent.from_payload(event.to_payload()).payload["items"] == items
 
 
 @pytest.mark.asyncio
@@ -2745,12 +3058,13 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    assert events[0].actor == "main_agent"
-    assert events[0].step_id == "main_agent_plan"
-    assert events[0].payload["mode"] == "dispatch"
-    assert events[0].payload["main_agent_model"] == "main"
-    assert events[0].payload["roles"] == (
+    main_plan = _main_plan_event(events)
+    roles, steps = _role_step_plan_from_events(events)
+    assert main_plan.kind is EventKind.STEP_STARTED
+    assert main_plan.actor == "main_agent"
+    assert main_plan.payload["mode"] == "dispatch"
+    assert main_plan.payload["main_agent_model"] == "main"
+    assert roles == (
         {
             "id": "copywriter",
             "role": "Copywriter",
@@ -2768,7 +3082,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
             "has_output_schema": False,
         },
     )
-    assert events[0].payload["steps"] == (
+    assert steps == (
         {
             "id": "copywriter_step",
             "agent": "copywriter",
@@ -2785,10 +3099,10 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
         },
     )
     assert _discussion_trace_payload_passes(
-        events[0].payload["dispatch_discussion_trace"]
+        _discussion_trace_from_events(events)
     )
-    assert events[1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[1].sequence == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].sequence == len(events)
 
 
 @pytest.mark.asyncio
@@ -2989,8 +3303,8 @@ async def test_config_backed_dispatch_runtime_routes_inventory_skill_tools_to_ca
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    assert _main_plan_event(events).kind is EventKind.STEP_STARTED
+    role_plan, _ = _role_step_plan_from_events(events)
     assert role_plan[0]["id"] == "scheduler"
     assert role_plan[0]["logical_model"] == "qwen_tools"
     assert role_plan[0]["tools"] == ("calendar.create_event",)
@@ -3089,14 +3403,11 @@ async def test_model_capability_self_repair_retry_reassigns_tool_role_to_capable
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    assert _main_plan_event(events).kind is EventKind.STEP_STARTED
+    role_plan, _ = _role_step_plan_from_events(events)
     assert role_plan[0]["id"] == "scheduler"
     assert role_plan[0]["logical_model"] == "qwen_tools"
-    model_execution_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["model_execution_plan"],
-    )
+    model_execution_plan = _model_execution_plan_from_events(events)
     assignments = cast(
         tuple[Mapping[str, JsonValue], ...],
         model_execution_plan["role_model_assignments"],
@@ -3221,8 +3532,10 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         )
     ]
 
-    assert events[0].payload["main_agent_model"] == "main"
-    assert events[0].payload["roles"] == (
+    main_plan = _main_plan_event(events)
+    roles, _ = _role_step_plan_from_events(events)
+    assert main_plan.payload["main_agent_model"] == "main"
+    assert roles == (
         {
             "id": "copywriter",
             "role": "Copywriter",
@@ -3244,7 +3557,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         "deepseek/deepseek-chat",
         "kimi/kimi-k2-latest",
     }
-    model_execution_plan_raw = events[0].payload["model_execution_plan"]
+    model_execution_plan_raw = _model_execution_plan_from_events(events)
     assert isinstance(model_execution_plan_raw, Mapping)
     model_execution_plan = model_execution_plan_raw
     assert model_execution_plan["schema_version"] == 1
@@ -3511,8 +3824,8 @@ async def test_config_backed_dispatch_runtime_routes_roles_away_from_constrained
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    role_plan = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    assert _main_plan_event(events).kind is EventKind.STEP_STARTED
+    role_plan, _ = _role_step_plan_from_events(events)
     assert role_plan[0]["id"] == "planner"
     assert role_plan[0]["logical_model"] == "structured"
 
@@ -3606,7 +3919,7 @@ async def test_config_backed_dispatch_runtime_caps_parallelism_to_constrained_de
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
+    assert _main_plan_event(events).kind is EventKind.STEP_STARTED
     plan = cast(DispatchPlan, ProbeDispatchRuntime.instances[-1].plan)
     assert plan.max_parallelism == 2
 
@@ -3703,7 +4016,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_execution_plan(
         )
     ]
 
-    assert events[0].payload["capability_execution_plan"] == {
+    assert _capability_execution_plan_from_events(events) == {
         "schema_version": 1,
         "permission_boundary": "runtime_capability_gateway",
         "role_capability_assignments": (
@@ -3797,10 +4110,7 @@ async def test_config_backed_dispatch_runtime_treats_uncertain_capabilities_as_p
         )
     ]
 
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     role_capability_assignments = cast(
         tuple[Mapping[str, JsonValue], ...],
         capability_plan["role_capability_assignments"],
@@ -3876,10 +4186,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
         )
     ]
 
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     assert capability_plan["capability_inventory"] == {
         "schema_version": 1,
         "items": (
@@ -3987,10 +4294,7 @@ async def test_config_backed_dispatch_runtime_omits_invalid_capability_inventory
         )
     ]
 
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     assert "capability_inventory" not in capability_plan
 
 
@@ -4080,10 +4384,7 @@ async def test_config_backed_dispatch_runtime_bounds_capability_inventory(
         )
     ]
 
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     inventory = cast(Mapping[str, JsonValue], capability_plan["capability_inventory"])
     items = cast(tuple[Mapping[str, JsonValue], ...], inventory["items"])
     assert inventory["truncated"] is True
@@ -4198,10 +4499,7 @@ async def test_config_backed_dispatch_runtime_bounds_invalid_inventory_scan(
         )
     ]
 
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     inventory = cast(Mapping[str, JsonValue], capability_plan["capability_inventory"])
     assert inventory["items"] == ()
     assert inventory["truncated"] is True
@@ -4523,13 +4821,11 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    assert events[0].actor == "main_agent"
-    assert events[0].step_id == "main_agent_plan"
-    assert events[0].payload["mode"] == "hybrid"
-    roles = events[0].payload["roles"]
-    assert isinstance(roles, tuple)
-    roles = cast(tuple[Mapping[str, JsonValue], ...], roles)
+    main_plan = _main_plan_event(events)
+    assert main_plan.kind is EventKind.STEP_STARTED
+    assert main_plan.actor == "main_agent"
+    assert main_plan.payload["mode"] == "hybrid"
+    roles, _ = _role_step_plan_from_events(events)
     assert {role["id"] for role in roles} >= {"copywriter", "reviewer", "final_synthesizer"}
     assert any(
         role["id"] == "copywriter"
@@ -4545,8 +4841,8 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
         and role["logical_model"]
         for role in roles
     )
-    assert events[1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[1].sequence == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].sequence == len(events)
 
 
 @pytest.mark.asyncio
@@ -4631,11 +4927,12 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    assert events[0].actor == "main_agent"
-    assert events[0].step_id == "main_agent_plan"
-    assert events[0].payload["mode"] == "discuss"
-    assert events[0].payload["roles"] == (
+    main_plan = _main_plan_event(events)
+    roles, steps = _role_step_plan_from_events(events)
+    assert main_plan.kind is EventKind.STEP_STARTED
+    assert main_plan.actor == "main_agent"
+    assert main_plan.payload["mode"] == "discuss"
+    assert roles == (
         {
             "id": "strategist",
             "role": "Strategist",
@@ -4653,7 +4950,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
             "has_output_schema": False,
         },
     )
-    assert events[0].payload["steps"] == (
+    assert steps == (
         {
             "id": "discussion",
             "agent": "strategist",
@@ -4669,8 +4966,8 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
             "tools": (),
         },
     )
-    assert events[1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[1].sequence == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].sequence == len(events)
 
 
 @pytest.mark.asyncio
@@ -4740,16 +5037,17 @@ async def test_config_backed_discussion_runtime_does_not_require_structured_mode
         )
     ]
 
-    assert events[0].kind is EventKind.STEP_STARTED
-    assert events[0].actor == "main_agent"
-    assert events[0].payload["main_agent_model"] == "plain"
-    model_execution_plan = events[0].payload["model_execution_plan"]
+    main_plan = _main_plan_event(events)
+    assert main_plan.kind is EventKind.STEP_STARTED
+    assert main_plan.actor == "main_agent"
+    assert main_plan.payload["main_agent_model"] == "plain"
+    model_execution_plan = _model_execution_plan_from_events(events)
     assert isinstance(model_execution_plan, Mapping)
     negotiation = model_execution_plan["model_capability_negotiation"]
     assert isinstance(negotiation, Mapping)
     assert negotiation["satisfied_count"] == 2
     assert negotiation["missing_count"] == 0
-    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio
@@ -4823,10 +5121,9 @@ async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory
     ]
 
     assert capability_gateway.prepared_tenants == [TENANT_ID]
-    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    roles, steps = _role_step_plan_from_events(events)
     scheduler = next(role for role in roles if role["id"] == "scheduler")
     assert scheduler["tools"] == ("read_context", "calendar.create_event")
-    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
     scheduler_step = next(step for step in steps if step["agent"] == "scheduler")
     assert scheduler_step["tools"] == ("read_context", "calendar.create_event")
 
@@ -5830,10 +6127,7 @@ async def test_config_backed_dispatch_runtime_prepares_tenant_before_inventory_p
     ]
 
     assert capability_gateway.prepared_tenants == [TENANT_ID]
-    capability_plan = cast(
-        Mapping[str, JsonValue],
-        events[0].payload["capability_execution_plan"],
-    )
+    capability_plan = _capability_execution_plan_from_events(events)
     assignments = cast(
         tuple[Mapping[str, JsonValue], ...],
         capability_plan["role_capability_assignments"],
@@ -7771,6 +8065,96 @@ def test_selected_dispatch_reviewer_runs_after_selected_producers() -> None:
         "copywriter_step",
         "quality_reviewer_step",
     )
+
+
+def test_multi_agent_default_dispatch_plan_enforces_artifact_handoff_chain() -> None:
+    roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Define architecture and interfaces.",
+            must_answer=("What should be built?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"architecture": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Implement the architecture.",
+            must_answer=("What was implemented?",),
+            allowed_tools=("workspace.write_text",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"implementation": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="tester",
+            role="Tester",
+            purpose=RolePurpose.VERIFY,
+            mission="Verify the implementation independently.",
+            must_answer=("What passed?",),
+            allowed_tools=("run_safe_command",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"verification": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="security_reviewer",
+            role="Security Reviewer",
+            purpose=RolePurpose.RISK_REVIEW,
+            mission="Review security risks.",
+            must_answer=("What risks remain?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"risks": "string"},
+            model="main",
+        ),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request=(
+            "Build a real large business project for flow=multi_agent. "
+            "Use four distinct agents with mandatory artifact dependencies."
+        ),
+        routing_decision={"project_scale": "large"},
+    )
+
+    plan = _dispatch_plan(roles, context, max_parallelism=4)
+
+    assert tuple(agent.id for agent in plan.agents) == (
+        "architect",
+        "implementer",
+        "tester",
+        "synthesizer",
+    )
+    steps = {step.agent: step for step in plan.steps}
+    assert steps["architect"].depends_on == ()
+    assert steps["implementer"].depends_on == ("architect_step",)
+    assert steps["tester"].depends_on == ("implementer_step",)
+    assert steps["synthesizer"].depends_on == (
+        "architect_step",
+        "implementer_step",
+        "tester_step",
+    )
+    assert plan.layers == (
+        ("architect_step",),
+        ("implementer_step",),
+        ("tester_step",),
+        ("final_response_step",),
+    )
+    assert plan.max_parallelism == 1
+
+
 def test_configured_runtime_registry_registers_all_production_modes() -> None:
     registry = configured_runtime_registry(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]

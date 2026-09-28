@@ -139,6 +139,11 @@ class StubRunService:
     summary_decision_token: str | None = None
     summary_clarification_reason: str | None = None
     summary_approval_id: str | None = None
+    summary_requested_mode: TaskMode | None = TaskMode.DIRECT
+    summary_effective_mode: TaskMode | None = TaskMode.HYBRID
+    summary_effective_scale: str | None = "large"
+    summary_route_reason: str | None = "project_scale_mode_upgrade"
+    summary_mode_source: str | None = "project_scale_assessment"
 
     async def submit(
         self,
@@ -491,6 +496,11 @@ class StubRunService:
             decision_token=self.summary_decision_token,
             clarification_reason=self.summary_clarification_reason,
             approval_id=self.summary_approval_id,
+            requested_mode=self.summary_requested_mode,
+            effective_mode=self.summary_effective_mode,
+            effective_scale=self.summary_effective_scale,
+            route_reason=self.summary_route_reason,
+            mode_source=self.summary_mode_source,
         )
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
@@ -2059,6 +2069,26 @@ def test_run_details_include_version_for_capability_approval() -> None:
     assert details.status_code == 200
     assert summary.json()["version"] == 7
     assert details.json()["version"] == 7
+
+
+def test_run_details_expose_persisted_server_routing_decision() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    summary = client.get(f"/api/v1/runs/{run_id}", headers=bearer())
+    details = client.get(f"/api/v1/runs/{run_id}/details", headers=bearer())
+
+    expected = {
+        "requested_mode": "direct",
+        "effective_mode": "hybrid",
+        "effective_scale": "large",
+        "route_reason": "project_scale_mode_upgrade",
+        "mode_source": "project_scale_assessment",
+    }
+    assert summary.status_code == 200
+    assert details.status_code == 200
+    assert summary.json().items() >= expected.items()
+    assert details.json().items() >= expected.items()
 
 
 def test_run_details_expose_actionable_mode_decision_after_reconnect() -> None:

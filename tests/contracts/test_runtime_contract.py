@@ -103,6 +103,28 @@ class CompatibleGatewayCompletion(GatewayCompletion):
     pass
 
 
+class RecordingWorkspaceCapabilities:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, arguments, idempotency_key
+        self.calls.append(name)
+        return {"summary": f"{name} completed"}
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name in {"workspace.write_text", "workspace.bundle"}
+
+
 class SubclassGateway(FakeGateway):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
@@ -1112,9 +1134,11 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
         }
     }
     text = json.dumps(bundle)
+    capabilities = RecordingWorkspaceCapabilities()
     runtime = DirectRuntime(
         FakeGateway(ModelResponse(text=text, usage=TokenUsage(1, 1, 2))),
         logical_model="general",
+        capability_gateway=capabilities,
     )
 
     events = await collect(runtime, context(request=request, token_budget=100_000))
@@ -1122,6 +1146,8 @@ async def test_direct_allows_project_scale_capability_bundle_over_default_output
     assert len(text.encode("utf-8")) > 1_048_576
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].inputs
+    assert events[-1].inputs[0].content["artifact_origin"] == "model_workspace_bundle"
+    assert capabilities.calls[-1] == "workspace.bundle"
 
 
 async def test_direct_accepts_large_markdown_workspace_bundle_for_natural_project_request() -> None:

@@ -358,7 +358,7 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "{error:{code,message}}."
         ),
         "medium": (
-            "Build a TypeScript/Node tenant-aware CRM-lite service for accounts, contacts, "
+            "Build a medium TypeScript/Node tenant-aware customer account service for accounts, contacts, "
             "opportunities, and follow-up reminders. Include validation, tenant isolation, "
             "search/filter endpoints, deterministic seed data, and integration tests that "
             "prove one tenant cannot read or mutate another tenant's records. npm start must "
@@ -422,7 +422,16 @@ def _capability_message(case: ProjectScaleCase) -> str:
         "direct": "Use direct mode and return a complete project bundle without pretending to run tools.",
         "dispatch": "Use dispatch coordination and preserve clear assignment evidence.",
         "hybrid": "Use hybrid planning plus execution and preserve decision evidence.",
-        "multi_agent": "Use multi-agent decomposition with explicit role ownership.",
+        "multi_agent": (
+            "Use four distinct agents with normalized agent_id values architect, implementer, tester, "
+            "and synthesizer, with mandatory artifact dependencies. "
+            "The Architecture Agent must produce architecture decisions and an interface contract. "
+            "The Implementation Agent must depend on the architecture contract and produce source files. "
+            "The Test Agent must run after implementation artifacts exist, independently execute black-box "
+            "tests, and publish test evidence. The Synthesis Agent must depend on the architecture, "
+            "implementation, and test artifacts, address test feedback, and deliver the final workspace. "
+            "Record each agent's step.started and step.completed events plus explicit handoffs."
+        ),
         "plugin": "Use plugin-style integration boundaries where appropriate.",
         "model_failure": "Exercise failure recovery without hiding the failed attempt.",
         "self_repair": "Exercise self-repair when verification exposes a defect.",

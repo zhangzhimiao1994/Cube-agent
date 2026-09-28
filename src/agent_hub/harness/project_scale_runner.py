@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -225,6 +226,12 @@ class ProjectScaleCaseResult:
     evidence: dict[str, bool]
     observed_mode: str | None = None
     final_observed_mode: str | None = None
+    requested_mode: str | None = None
+    route_reason: str | None = None
+    mode_source: str | None = None
+    effective_scale: str | None = None
+    artifact_origin: str | None = None
+    workspace_bundle_source: str | None = None
     participant_agent_ids: tuple[str, ...] = ()
     participant_event_kinds: tuple[str, ...] = ()
     participant_event_count: int = 0
@@ -291,6 +298,12 @@ class ProjectScaleCaseResult:
             "observed_mode": self.observed_mode,
             "initial_observed_mode": self.observed_mode,
             "final_observed_mode": self.final_observed_mode or self.observed_mode,
+            "requested_mode": self.requested_mode,
+            "route_reason": self.route_reason,
+            "mode_source": self.mode_source,
+            "effective_scale": self.effective_scale,
+            "artifact_origin": self.artifact_origin,
+            "workspace_bundle_source": self.workspace_bundle_source,
             "participant_agent_ids": list(self.participant_agent_ids),
             "participant_event_kinds": list(self.participant_event_kinds),
             "participant_event_count": self.participant_event_count,
@@ -501,6 +514,14 @@ class _RunObservation:
     details: dict[str, object] | None
     events: list[object] | None
     workspace_bundle: bytes | None
+    workspace_bundle_source: str | None
+    artifact_origin: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DownloadedWorkspaceBundle:
+    content: bytes
+    artifact_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,8 +578,15 @@ def execute_project_scale_plan(
         status: str | None = None
         observed_mode: str | None = None
         final_observed_mode: str | None = None
+        requested_mode = _string_value(request_body.get("mode"))
+        route_reason: str | None = None
+        mode_source: str | None = None
+        effective_scale: str | None = None
+        artifact_origin: str | None = None
+        workspace_bundle_source: str | None = None
         participant_agent_ids: set[str] = set()
         participant_event_kinds: list[str] = []
+        multi_agent_contract_reasons: tuple[str, ...] = ()
         case_deadline = time.monotonic() + max(wait_seconds, 0)
         try:
             _report_progress(progress, f"{case_label}: submitting run")
@@ -589,6 +617,13 @@ def execute_project_scale_plan(
             )
             if mode_choice_response is not None:
                 response = mode_choice_response
+            response_reason, response_source, response_scale, response_requested = (
+                _public_route_evidence(response, requested_body=request_body)
+            )
+            route_reason = response_reason or route_reason
+            mode_source = response_source or mode_source
+            effective_scale = response_scale or effective_scale
+            requested_mode = response_requested or requested_mode
             status = _string_value(response.get("status"))
             observed_mode = _execution_mode(response) or observed_mode
             final_observed_mode = _execution_mode(response) or final_observed_mode
@@ -634,9 +669,22 @@ def execute_project_scale_plan(
             )
             participant_agent_ids.update(observed_participants)
             participant_event_kinds.extend(observed_event_kinds)
-            evidence["multi_agent_participation"] = (
-                len(participant_agent_ids) >= 2 and len(participant_event_kinds) >= 2
+            multi_agent_contract_reasons = _multi_agent_contract_reasons(observation.events)
+            evidence["multi_agent_participation"] = _multi_agent_evidence_passes(
+                run_request.case_id,
+                participant_agent_ids,
+                participant_event_kinds,
+                multi_agent_contract_reasons,
             )
+            workspace_bundle_source = observation.workspace_bundle_source
+            artifact_origin = observation.artifact_origin
+            observed_reason, observed_source, observed_scale, observed_requested = (
+                _public_route_evidence(observation.details, requested_body=request_body)
+            )
+            route_reason = observed_reason or route_reason
+            mode_source = observed_source or mode_source
+            effective_scale = observed_scale or effective_scale
+            requested_mode = observed_requested or requested_mode
             initial_self_repair_trace = _has_self_repair_trace(observation.events)
             _extend_unique(
                 errors,
@@ -706,6 +754,32 @@ def execute_project_scale_plan(
                             _execution_mode(self_repair_observation.details)
                             or final_observed_mode
                         )
+                        repaired_participants, repaired_event_kinds = _multi_agent_participation(
+                            self_repair_observation.events
+                        )
+                        participant_agent_ids = set(repaired_participants)
+                        participant_event_kinds = list(repaired_event_kinds)
+                        multi_agent_contract_reasons = _multi_agent_contract_reasons(
+                            self_repair_observation.events
+                        )
+                        evidence["multi_agent_participation"] = _multi_agent_evidence_passes(
+                            run_request.case_id,
+                            participant_agent_ids,
+                            participant_event_kinds,
+                            multi_agent_contract_reasons,
+                        )
+                        workspace_bundle_source = self_repair_observation.workspace_bundle_source
+                        artifact_origin = self_repair_observation.artifact_origin
+                        repaired_reason, repaired_source, repaired_scale, repaired_requested = (
+                            _public_route_evidence(
+                                self_repair_observation.details,
+                                requested_body=request_body,
+                            )
+                        )
+                        route_reason = repaired_reason or route_reason
+                        mode_source = repaired_source or mode_source
+                        effective_scale = repaired_scale or effective_scale
+                        requested_mode = repaired_requested or requested_mode
                         _extend_unique(
                             errors,
                             _validate_mode_control(
@@ -824,6 +898,7 @@ def execute_project_scale_plan(
                             *_multi_agent_participation_reasons(
                                 evidence,
                                 case_id=run_request.case_id,
+                                contract_reasons=multi_agent_contract_reasons,
                             ),
                             *generated_project_validation.reasons,
                             *_self_repair_trace_reasons(
@@ -888,6 +963,32 @@ def execute_project_scale_plan(
                 final_observed_mode = (
                     _execution_mode(repair_observation.details) or final_observed_mode
                 )
+                repaired_participants, repaired_event_kinds = _multi_agent_participation(
+                    repair_observation.events
+                )
+                participant_agent_ids = set(repaired_participants)
+                participant_event_kinds = list(repaired_event_kinds)
+                multi_agent_contract_reasons = _multi_agent_contract_reasons(
+                    repair_observation.events
+                )
+                evidence["multi_agent_participation"] = _multi_agent_evidence_passes(
+                    run_request.case_id,
+                    participant_agent_ids,
+                    participant_event_kinds,
+                    multi_agent_contract_reasons,
+                )
+                workspace_bundle_source = repair_observation.workspace_bundle_source
+                artifact_origin = repair_observation.artifact_origin
+                repaired_reason, repaired_source, repaired_scale, repaired_requested = (
+                    _public_route_evidence(
+                        repair_observation.details,
+                        requested_body=request_body,
+                    )
+                )
+                route_reason = repaired_reason or route_reason
+                mode_source = repaired_source or mode_source
+                effective_scale = repaired_scale or effective_scale
+                requested_mode = repaired_requested or requested_mode
                 _extend_unique(
                     errors,
                     _validate_mode_control(
@@ -1012,6 +1113,7 @@ def execute_project_scale_plan(
                         _multi_agent_participation_reasons(
                             evidence,
                             case_id=run_request.case_id,
+                            contract_reasons=multi_agent_contract_reasons,
                         )
                     )
                 if validate_generated_project and not evidence["generated_project_validation"]:
@@ -1049,6 +1151,12 @@ def execute_project_scale_plan(
             evidence=evidence,
             observed_mode=observed_mode,
             final_observed_mode=final_observed_mode or observed_mode,
+            requested_mode=requested_mode,
+            route_reason=route_reason,
+            mode_source=mode_source,
+            effective_scale=effective_scale,
+            artifact_origin=artifact_origin,
+            workspace_bundle_source=workspace_bundle_source,
             participant_agent_ids=tuple(sorted(participant_agent_ids)),
             participant_event_kinds=tuple(participant_event_kinds),
             participant_event_count=len(participant_event_kinds),
@@ -1417,7 +1525,7 @@ def _downloaded_workspace_bundle_from_artifacts(
     run_id: str,
     details: Mapping[str, object] | None,
     events: Sequence[object] | None,
-) -> bytes | None:
+) -> _DownloadedWorkspaceBundle | None:
     for path in _artifact_download_paths(run_id=run_id, details=details, events=events):
         try:
             raw = client.request_bytes("GET", path)
@@ -1427,8 +1535,16 @@ def _downloaded_workspace_bundle_from_artifacts(
             continue
         bundle = _workspace_bundle_from_downloaded_artifact(raw)
         if bundle is not None:
-            return bundle
+            return _DownloadedWorkspaceBundle(
+                content=bundle,
+                artifact_id=_artifact_id_from_download_path(path),
+            )
     return None
+
+
+def _artifact_id_from_download_path(path: str) -> str | None:
+    match = re.search(r"/artifacts/([^/]+)/download$", path)
+    return match.group(1) if match is not None else None
 
 
 def _workspace_bundle_from_downloaded_artifact(raw: bytes) -> bytes | None:
@@ -1716,6 +1832,8 @@ def _collect_run_observation(
     details: dict[str, object] | None = None
     events: list[object] | None = None
     workspace_bundle: bytes | None = None
+    workspace_bundle_source: str | None = None
+    workspace_bundle_artifact_id: str | None = None
     approved_capabilities: set[str] = set()
 
     deadline = time.monotonic() + max(wait_seconds, 0)
@@ -1793,13 +1911,18 @@ def _collect_run_observation(
             details=details,
             events=events,
             workspace_bundle=None,
+            workspace_bundle_source=None,
+            artifact_origin=None,
         )
 
     try:
         workspace_bundle = client.request_bytes("GET", _workspace_bundle_path(body))
         evidence["workspace_bundle"] = True
+        workspace_bundle_source = "public_workspace_api"
     except Exception as error:  # noqa: BLE001 - acceptance reports must continue cleanup.
         workspace_bundle = _embedded_workspace_bundle_from_observation(details, events)
+        if workspace_bundle is not None:
+            workspace_bundle_source = "embedded_bundle"
         downloaded_bundle = _downloaded_workspace_bundle_from_artifacts(
             client,
             run_id=run_id,
@@ -1807,7 +1930,9 @@ def _collect_run_observation(
             events=events,
         )
         if downloaded_bundle is not None:
-            workspace_bundle = downloaded_bundle
+            workspace_bundle = downloaded_bundle.content
+            workspace_bundle_source = "artifact_download"
+            workspace_bundle_artifact_id = downloaded_bundle.artifact_id
         if workspace_bundle is None:
             admin_details = _admin_run_details(client, run_id=run_id)
             if admin_details is not None:
@@ -1820,7 +1945,9 @@ def _collect_run_observation(
                         events=events,
                     )
                     if downloaded_bundle is not None:
-                        workspace_bundle = downloaded_bundle
+                        workspace_bundle = downloaded_bundle.content
+                        workspace_bundle_source = "artifact_download"
+                        workspace_bundle_artifact_id = downloaded_bundle.artifact_id
         if workspace_bundle is not None:
             evidence["workspace_bundle"] = True
         else:
@@ -1831,6 +1958,14 @@ def _collect_run_observation(
         details=details,
         events=events,
         workspace_bundle=workspace_bundle,
+        workspace_bundle_source=workspace_bundle_source,
+        artifact_origin=_artifact_origin(
+            details,
+            events,
+            bundle_source=workspace_bundle_source,
+            workspace_bundle=workspace_bundle,
+            bundle_artifact_id=workspace_bundle_artifact_id,
+        ),
     )
 
 
@@ -2182,8 +2317,202 @@ def _execution_mode(response: Mapping[str, object] | None) -> str | None:
     return None
 
 
-def _multi_agent_participation(
+def _public_route_evidence(
+    response: Mapping[str, object] | None,
+    *,
+    requested_body: Mapping[str, object],
+) -> tuple[str | None, str | None, str | None, str | None]:
+    del requested_body
+    if response is None:
+        return None, None, None, None
+    requested_mode = _string_value(response.get("requested_mode"))
+    effective_mode = _string_value(response.get("effective_mode"))
+    effective_scale = _string_value(response.get("effective_scale"))
+    route_reason = _string_value(response.get("route_reason"))
+    mode_source = _string_value(response.get("mode_source"))
+    actual_mode = _execution_mode(response)
+    if effective_mode != actual_mode:
+        return None, None, None, None
+    if requested_mode not in {"auto", "direct", "dispatch", "discuss", "hybrid"}:
+        requested_mode = None
+    if effective_scale not in {"small", "medium", "large", "ultra"}:
+        effective_scale = None
+    return route_reason, mode_source, effective_scale, requested_mode
+
+
+def _artifact_origin(
+    details: Mapping[str, object] | None,
     events: list[object] | None,
+    *,
+    bundle_source: str | None,
+    workspace_bundle: bytes | None,
+    bundle_artifact_id: str | None = None,
+) -> str | None:
+    if bundle_source is None or workspace_bundle is None:
+        return None
+    bundle_manifest = _workspace_bundle_manifest(workspace_bundle)
+    if bundle_manifest is None:
+        return None
+    candidates: list[Mapping[str, object]] = []
+    if details is not None:
+        candidates.append(details)
+    candidates.extend(event for event in events or () if isinstance(event, Mapping))
+    for mapping in candidates:
+        if not _mapping_produced_workspace_bundle(
+            mapping,
+            bundle_source=bundle_source,
+            bundle_manifest=bundle_manifest,
+            bundle_artifact_id=bundle_artifact_id,
+        ):
+            continue
+        markers = json.dumps(mapping, ensure_ascii=True, sort_keys=True).casefold()
+        if "project_scale_artifact_preseed" in markers or "builtin_fixture" in markers:
+            return "builtin_fixture"
+        if "deterministic_recovery" in markers:
+            return "deterministic_recovery"
+        explicit = _nested_artifact_origin(mapping)
+        if explicit is not None:
+            return explicit
+        if _mapping_contains_tool(mapping, "workspace.bundle"):
+            return "incremental_workspace_delivery"
+    return None
+
+
+def _workspace_bundle_manifest(bundle: bytes) -> dict[str, tuple[int, str]] | None:
+    files = _workspace_bundle_file_bytes(bundle)
+    if files is None or not files:
+        return None
+    return {
+        path: (len(content), hashlib.sha256(content).hexdigest())
+        for path, content in files.items()
+    }
+
+
+def _mapping_produced_workspace_bundle(
+    mapping: Mapping[str, object],
+    *,
+    bundle_source: str,
+    bundle_manifest: Mapping[str, tuple[int, str]],
+    bundle_artifact_id: str | None,
+) -> bool:
+    if bundle_source == "artifact_download":
+        return bundle_artifact_id is not None and bundle_artifact_id in _mapping_artifact_ids(mapping)
+    if bundle_source == "embedded_bundle":
+        for nested in _nested_mappings(mapping):
+            embedded = _embedded_workspace_bundle_from_payload(nested)
+            if embedded is None:
+                continue
+            if _workspace_bundle_manifest(embedded) == bundle_manifest:
+                return True
+        return False
+    if bundle_source == "public_workspace_api":
+        return any(
+            _workspace_files_manifest(nested.get("workspace_files")) == bundle_manifest
+            for nested in _nested_mappings(mapping)
+        )
+    return False
+
+
+def _nested_mappings(mapping: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    pending: list[Mapping[str, object]] = [mapping]
+    found: list[Mapping[str, object]] = []
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append(current)
+        for value in current.values():
+            if isinstance(value, Mapping):
+                pending.append(value)
+            elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+                pending.extend(item for item in value if isinstance(item, Mapping))
+    return tuple(found)
+
+
+def _workspace_files_manifest(value: object) -> dict[str, tuple[int, str]] | None:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes) or not value:
+        return None
+    manifest: dict[str, tuple[int, str]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        path = _string_value(item.get("path")) or _string_value(item.get("relative_path"))
+        sha256 = _string_value(item.get("sha256"))
+        size = item.get("size_bytes", item.get("size"))
+        if path is None or sha256 is None or type(size) is not int:
+            return None
+        manifest[path] = (size, sha256.casefold())
+    return manifest
+
+
+def _mapping_artifact_ids(mapping: Mapping[str, object]) -> set[str]:
+    artifact_ids: set[str] = set()
+    for nested in _nested_mappings(mapping):
+        for key in ("id", "artifact_id"):
+            value = _string_value(nested.get(key))
+            if value is not None:
+                artifact_ids.add(value)
+    return artifact_ids
+
+
+def _mapping_contains_tool(mapping: Mapping[str, object], tool_name: str) -> bool:
+    return any(
+        nested.get("tool_name") == tool_name or nested.get("name") == tool_name
+        for nested in _nested_mappings(mapping)
+    )
+
+
+def _nested_artifact_origin(mapping: Mapping[str, object]) -> str | None:
+    for current in _nested_mappings(mapping):
+        value = current.get("artifact_origin")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+_MULTI_AGENT_CANONICAL_ALIASES = {
+    "architecture": "architect",
+    "architecture_agent": "architect",
+    "architect": "architect",
+    "implementation": "implementer",
+    "implementation_agent": "implementer",
+    "implementer": "implementer",
+    "test_agent": "tester",
+    "tester": "tester",
+    "testing_agent": "tester",
+    "final_synthesizer": "synthesizer",
+    "synthesis_agent": "synthesizer",
+    "synthesizer": "synthesizer",
+}
+_MULTI_AGENT_REQUIRED_IDS = ("architect", "implementer", "tester", "synthesizer")
+
+
+def _normalized_agent_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().casefold()).strip("_")
+    if not normalized:
+        return None
+    return _MULTI_AGENT_CANONICAL_ALIASES.get(normalized, normalized)
+
+
+def _event_agent_id(event: Mapping[str, object], *, event_kind: str) -> str | None:
+    for mapping in (event, event.get("payload")):
+        if not isinstance(mapping, Mapping):
+            continue
+        normalized = _normalized_agent_id(mapping.get("agent_id"))
+        if normalized is not None:
+            return normalized
+    if event_kind.startswith(("step.", "model.", "review.")):
+        return _normalized_agent_id(event.get("actor"))
+    return None
+
+
+def _multi_agent_participation(
+    events: Sequence[object] | None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return distinct participant identities and one kind entry per attributable event."""
 
@@ -2200,44 +2529,141 @@ def _multi_agent_participation(
             else "participant.event"
         )
         normalized_kind = event_kind.casefold()
-        actor = event.get("actor")
-        runtime_lifecycle_event = (
-            normalized_kind.startswith(("step.", "model.", "review."))
-            and isinstance(actor, str)
-            and bool(actor.strip())
-        )
+        runtime_lifecycle_event = normalized_kind.startswith(("step.", "model.", "review."))
         agent_scoped_event = runtime_lifecycle_event or any(
             marker in event_kind.casefold()
             for marker in ("agent", "worker", "dispatch", "participant")
         )
         if not agent_scoped_event:
             continue
-        mappings = [event]
-        payload = event.get("payload")
-        if isinstance(payload, Mapping):
-            mappings.append(payload)
-        for mapping in mappings:
-            for key in ("actor", "agent_id", "agent", "participant_id", "member"):
-                value = mapping.get(key)
-                if isinstance(value, str) and value.strip():
-                    event_participants.add(value.strip().casefold())
-            role = mapping.get("role")
-            if agent_scoped_event and isinstance(role, str) and role.strip():
-                event_participants.add(role.strip().casefold())
-            raw_participants = mapping.get("participants")
-            if isinstance(raw_participants, Sequence) and not isinstance(
-                raw_participants, str | bytes
-            ):
-                event_participants.update(
-                    item.strip().casefold()
-                    for item in raw_participants
-                    if isinstance(item, str) and item.strip()
-                )
+        agent_id = _event_agent_id(event, event_kind=normalized_kind)
+        if agent_id is not None:
+            event_participants.add(agent_id)
         if not event_participants:
             continue
         participants.update(event_participants)
         event_kinds.append(event_kind)
     return tuple(sorted(participants)), tuple(event_kinds)
+
+
+def _multi_agent_contract_reasons(events: Sequence[object] | None) -> tuple[str, ...]:
+    lifecycle: dict[str, dict[str, tuple[int, Mapping[str, object]]]] = {
+        agent_id: {} for agent_id in _MULTI_AGENT_REQUIRED_IDS
+    }
+    for index, event in enumerate(events or ()):
+        if not isinstance(event, Mapping):
+            continue
+        raw_kind = event.get("kind")
+        if raw_kind not in {"step.started", "step.completed"}:
+            continue
+        agent_id = _event_agent_id(event, event_kind=raw_kind)
+        if agent_id not in lifecycle:
+            continue
+        lifecycle[agent_id].setdefault(raw_kind, (index, event))
+
+    reasons: list[str] = []
+    for agent_id in _MULTI_AGENT_REQUIRED_IDS:
+        for kind in ("step.started", "step.completed"):
+            if kind not in lifecycle[agent_id]:
+                reasons.append(f"multi_agent_contract: {agent_id} missing {kind}")
+        started = lifecycle[agent_id].get("step.started")
+        completed = lifecycle[agent_id].get("step.completed")
+        if started is not None and completed is not None and started[0] >= completed[0]:
+            reasons.append(f"multi_agent_contract: {agent_id} completed before started")
+
+    chain = (("architect", "implementer"), ("implementer", "tester"), ("tester", "synthesizer"))
+    for predecessor, successor in chain:
+        completed = lifecycle[predecessor].get("step.completed")
+        started = lifecycle[successor].get("step.started")
+        if completed is not None and started is not None and completed[0] >= started[0]:
+            reasons.append(
+                f"multi_agent_contract: {successor} must start after {predecessor} completed"
+            )
+
+    step_ids = {
+        agent_id: _event_step_id(lifecycle[agent_id].get("step.started"))
+        for agent_id in _MULTI_AGENT_REQUIRED_IDS
+    }
+    expected_dependencies = {
+        "implementer": ("architect",),
+        "tester": ("implementer",),
+        "synthesizer": ("architect", "implementer", "tester"),
+    }
+    for agent_id, predecessors in expected_dependencies.items():
+        started = lifecycle[agent_id].get("step.started")
+        if started is None:
+            continue
+        actual = _event_dependencies(started[1])
+        expected = {step_ids[item] for item in predecessors if step_ids[item] is not None}
+        if not expected <= actual:
+            reasons.append(f"multi_agent_contract: {agent_id} missing required dependencies")
+
+    for predecessor, successor in (("architect", "implementer"), ("implementer", "tester")):
+        completed = lifecycle[predecessor].get("step.completed")
+        started = lifecycle[successor].get("step.started")
+        if completed is None or started is None:
+            continue
+        artifact_id = _event_artifact_id(completed)
+        if artifact_id is None:
+            reasons.append(f"multi_agent_contract: {predecessor} missing completed artifact")
+        elif artifact_id not in _event_input_ids(started[1]):
+            reasons.append(
+                f"multi_agent_contract: {successor} did not consume {predecessor} artifact"
+            )
+
+    synthesis_started = lifecycle["synthesizer"].get("step.started")
+    if synthesis_started is not None:
+        expected_artifacts: set[str] = set()
+        for agent_id in ("architect", "implementer", "tester"):
+            artifact_id = _event_artifact_id(lifecycle[agent_id].get("step.completed"))
+            if artifact_id is None:
+                reasons.append(f"multi_agent_contract: {agent_id} missing completed artifact")
+            else:
+                expected_artifacts.add(artifact_id)
+        if not expected_artifacts <= _event_input_ids(synthesis_started[1]) or len(
+            expected_artifacts
+        ) != 3:
+            reasons.append("multi_agent_contract: synthesizer did not consume predecessor artifacts")
+    return tuple(reasons)
+
+
+def _event_step_id(
+    located: tuple[int, Mapping[str, object]] | None,
+) -> str | None:
+    if located is None:
+        return None
+    value = located[1].get("step_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _event_dependencies(event: Mapping[str, object]) -> set[str]:
+    payload = event.get("payload")
+    raw = payload.get("depends_on") if isinstance(payload, Mapping) else None
+    if not isinstance(raw, list | tuple):
+        return set()
+    return {item.strip() for item in raw if isinstance(item, str) and item.strip()}
+
+
+def _event_artifact_id(
+    located: tuple[int, Mapping[str, object]] | None,
+) -> str | None:
+    if located is None:
+        return None
+    payload = located[1].get("payload")
+    value = payload.get("artifact_id") if isinstance(payload, Mapping) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _event_input_ids(event: Mapping[str, object]) -> set[str]:
+    inputs = event.get("inputs")
+    if not isinstance(inputs, list | tuple):
+        return set()
+    values: set[str] = set()
+    for item in inputs:
+        value = item.get("id") if isinstance(item, Mapping) else item
+        if isinstance(value, str) and value.strip():
+            values.add(value.strip())
+    return values
 
 
 def _validate_run_details_scope(details: dict[str, object], run_id: str) -> None:
@@ -2501,6 +2927,14 @@ def _deliverable_repair_body(
         )
         if case_id.startswith("medium:"):
             guidance += medium_guidance
+        if case_id.endswith(":multi_agent"):
+            guidance += (
+                "Use normalized agent_id values architect, implementer, tester, and synthesizer for "
+                "the Architecture Agent, Implementation Agent, Test Agent, and Synthesis Agent. "
+                "Preserve mandatory architecture -> implementation "
+                "-> independent test -> synthesis artifact dependencies, emit step.started and "
+                "step.completed per agent_id, and record discussion_trace plus explicit handoffs. "
+            )
         context = _workspace_repair_context(
             source_workspace_bundle,
             failed_reasons=failed_reasons,
@@ -3812,14 +4246,28 @@ def _multi_agent_participation_reasons(
     evidence: Mapping[str, bool],
     *,
     case_id: str,
+    contract_reasons: Sequence[str] = (),
 ) -> tuple[str, ...]:
     if not _case_requires_multi_agent_participation(case_id):
         return ()
     if evidence.get("multi_agent_participation") is True:
         return ()
+    if contract_reasons:
+        return tuple(contract_reasons)
     return (
-        "multi_agent_participation: fewer than two distinct agents with attributable events",
+        "multi_agent_participation: required four-agent lifecycle evidence is missing",
     )
+
+
+def _multi_agent_evidence_passes(
+    case_id: str,
+    participant_agent_ids: set[str],
+    participant_event_kinds: Sequence[str],
+    contract_reasons: Sequence[str],
+) -> bool:
+    if _case_requires_multi_agent_participation(case_id):
+        return not contract_reasons
+    return len(participant_agent_ids) >= 2 and len(participant_event_kinds) >= 2
 
 
 def _self_repair_trace_reasons(

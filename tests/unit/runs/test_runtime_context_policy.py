@@ -20,6 +20,7 @@ from agent_hub.runs.service import (
     _runtime_timeout_seconds,
     _runtime_token_budget,
     _with_main_agent_context_window,
+    _with_runtime_token_budget_policy,
 )
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -105,6 +106,31 @@ def test_runtime_token_budget_extends_from_current_run_progress_with_absolute_fu
         routing_decision=decision,
         progress_units=4,
     ) == 10_000_000
+
+
+def test_runtime_token_policy_exposes_soft_base_and_bounded_absolute_limit() -> None:
+    assert _with_runtime_token_budget_policy(
+        {"project_scale": "large"},
+        configured_tokens=2_000,
+    ) == {
+        "project_scale": "large",
+        "runtime_token_soft_base_tokens": 2_000,
+        "runtime_token_absolute_tokens": 10_000_000,
+    }
+    assert _with_runtime_token_budget_policy(
+        {
+            "project_scale": "ultra",
+            "runtime_token_absolute_tokens": 7_500,
+        },
+        configured_tokens=2_000,
+    )["runtime_token_absolute_tokens"] == 7_500
+    assert _with_runtime_token_budget_policy(
+        {
+            "project_scale": "ultra",
+            "runtime_token_absolute_tokens": 99_000_000,
+        },
+        configured_tokens=2_000,
+    )["runtime_token_absolute_tokens"] == 10_000_000
 
 
 @pytest.mark.asyncio
@@ -339,6 +365,23 @@ def test_project_delivery_assessment_upgrades_feature_rich_website_to_large() ->
     assert assessment is not None
     assert assessment["project_scale"] == "large"
     assert assessment["runtime_timeout_seconds"] == 1200.0
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Build a real medium business project for flow=direct: a CRM-lite website.",
+        "project_scale=medium; develop a CRM website",
+    ),
+)
+def test_project_delivery_assessment_prefers_declared_medium_scale_over_crm_keyword(
+    message: str,
+) -> None:
+    assessment = _project_delivery_assessment(message)
+
+    assert assessment is not None
+    assert assessment["project_scale"] == "medium"
+    assert assessment["runtime_timeout_soft_seconds"] == 600.0
 
 
 def test_project_delivery_budget_grows_when_complexity_exceeds_declared_scale() -> None:
