@@ -1986,7 +1986,7 @@ function isSafeWorkspaceSegment(value: string): boolean {
 function isSafeWorkspaceRelativePath(value: string): boolean {
   if (!value || value !== value.trim() || value.length > 512) return false;
   if (value.includes("\\") || value.startsWith("/") || value.includes("//")) return false;
-  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== ".." && !part.startsWith("."));
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 }
 
 function isSupportedWorkspaceDownloadPath(path: string): boolean {

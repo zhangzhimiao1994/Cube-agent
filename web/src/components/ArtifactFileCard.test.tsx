@@ -227,6 +227,54 @@ describe("ArtifactFileCard", () => {
     });
   });
 
+  it("downloads safe workspace dotfiles from backend-issued workspace paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["node_modules/\n"], { type: "text/plain" }), {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    const anchorClick = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:workspace-dotfile"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(document, "createElement").mockImplementation((tagName) => {
+      const element = document.createElementNS("http://www.w3.org/1999/xhtml", tagName);
+      if (tagName.toLowerCase() === "a") {
+        Object.defineProperty(element, "click", { value: anchorClick });
+      }
+      return element as HTMLElement;
+    });
+
+    render(
+      <ArtifactFileCard
+        artifact={{
+          ...workspaceDownloadable,
+          filename: ".gitignore",
+          download_url:
+            "/api/v1/workspaces/projects/project/sessions/session/files/download?path=.gitignore",
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "下载 .gitignore" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /^\/api\/v1\/workspaces\/projects\/project\/sessions\/session\/files\/download\?path=\.gitignore&_=/,
+        ),
+        expect.objectContaining({
+          cache: "no-store",
+          credentials: "include",
+        }),
+      );
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("downloads workspace bundles from backend-issued bundle paths", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(new Blob(["zip"], { type: "application/zip" }), {
@@ -280,6 +328,29 @@ describe("ArtifactFileCard", () => {
         artifact={{
           ...workspaceBundleDownloadable,
           download_url: "/api/v1/workspaces/projects/../sessions/session/bundle/download",
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "下载 源码包" }));
+
+    await waitFor(() => {
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(screen.getByRole("alert").textContent).toContain("unsupported download URL");
+    });
+  });
+
+  it("rejects workspace file download paths containing traversal segments", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["unsafe"], { type: "text/plain" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <ArtifactFileCard
+        artifact={{
+          ...workspaceDownloadable,
+          download_url:
+            "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src%2F..%2Fsecret.txt",
         }}
       />,
     );
