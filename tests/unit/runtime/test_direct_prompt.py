@@ -27,6 +27,7 @@ from agent_hub.runtime.direct import (
     RuntimeExecutionError,
     _normalized_workspace_bundle,
     _project_scale_workspace_bundle_from_model_text,
+    _workspace_batch_from_model_text,
     _workspace_delivery_token_limit,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -551,6 +552,112 @@ async def test_direct_large_bundle_switches_to_incremental_workspace_delivery() 
     delivery = artifact_event.artifact.content["workspace_delivery"]
     assert isinstance(delivery, Mapping)
     assert delivery["bundle_download_url"] == "/api/workspaces/project/session/bundle"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_files", "expected_complete"),
+    (
+        (
+            """```json
+{"workspace_batch":{"files":{"src/main.js":"export const ready = true;\\n"},"complete":true,"continuation":""},"summary":"done"}
+```""",
+            {"src/main.js": "export const ready = true;\n"},
+            True,
+        ),
+        (
+            (
+                "Here is the requested batch:\n"
+                '{"workspace_batch":{"files":{"README.md":"ready\\n"},'
+                '"complete":false,"continuation":"write tests"}}\n'
+                "The JSON above is the machine-readable result."
+            ),
+            {"README.md": "ready\n"},
+            False,
+        ),
+        (
+            (
+                '{"workspace_bundle":{"files":{"package.json":"{}\\n"}},'
+                '"summary":"complete bundle"}'
+            ),
+            {"package.json": "{}\n"},
+            True,
+        ),
+        (
+            '{"files":{"index.html":"<main>ready</main>\\n"}}',
+            {"index.html": "<main>ready</main>\n"},
+            True,
+        ),
+    ),
+)
+def test_workspace_batch_parser_accepts_real_model_json_variants(
+    text: str,
+    expected_files: dict[str, str],
+    expected_complete: bool,
+) -> None:
+    batch = _workspace_batch_from_model_text(text)
+
+    assert batch is not None
+    assert batch.files == expected_files
+    assert batch.complete is expected_complete
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        '{"workspace_batch":{"files":{},"complete":true,"continuation":""}}',
+        '{"workspace_batch":{"files":{"../escape.txt":"no"},"complete":true,"continuation":""}}',
+        '{"workspace_batch":{"files":{"src/main.py":42},"complete":true,"continuation":""}}',
+        "I created the project files and everything is ready.",
+    ),
+)
+def test_workspace_batch_parser_rejects_unsafe_or_non_file_outputs(text: str) -> None:
+    assert _workspace_batch_from_model_text(text) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_project_delivery_writes_fenced_model_batch() -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelResponse(
+                text="""```json
+{"workspace_batch":{"files":{"package.json":"{\\"scripts\\":{\\"test\\":\\"node --test\\"}}"},"complete":true,"continuation":""},"summary":"Project completed."}
+```""",
+                usage=TokenUsage(100, 80, 180),
+            ),
+        )
+    )
+    capabilities = RecordingCapabilityGateway()
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=capabilities,
+    )
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a real project workspace.",
+        timeout_seconds=600,
+        token_budget=50_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+
+    events = [event async for event in runtime.run(task)]
+
+    assert [call[0] for call in capabilities.calls] == [
+        "workspace.write_text",
+        "workspace.write_text",
+        "workspace.bundle",
+    ]
+    assert capabilities.calls[0][1] == {
+        "path": "package.json",
+        "content": '{"scripts":{"test":"node --test"}}',
+    }
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio

@@ -416,19 +416,22 @@ def _project_scale_workspace_bundle_from_model_text(
 
 
 def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
-    try:
-        parsed = json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(parsed, Mapping):
+    parsed = _json_mapping_from_model_text(text)
+    if parsed is None:
         return None
     raw_batch = parsed.get("workspace_batch")
-    if not isinstance(raw_batch, Mapping):
-        return None
+    complete: object
+    continuation: object
+    if isinstance(raw_batch, Mapping):
+        complete = raw_batch.get("complete")
+        continuation = raw_batch.get("continuation", "")
+    else:
+        raw_bundle = parsed.get("workspace_bundle")
+        raw_batch = raw_bundle if isinstance(raw_bundle, Mapping) else parsed
+        complete = True
+        continuation = ""
     raw_files = raw_batch.get("files")
-    complete = raw_batch.get("complete")
-    continuation = raw_batch.get("continuation", "")
-    summary = parsed.get("summary", "")
+    summary = parsed.get("summary", raw_batch.get("summary", ""))
     if (
         not isinstance(raw_files, Mapping)
         or type(complete) is not bool
@@ -480,16 +483,30 @@ def _workspace_bundle_has_website_preview(bundle: Mapping[str, object]) -> bool:
 
 def _json_mapping_from_model_text(text: str) -> Mapping[str, object] | None:
     candidate = text.strip()
-    if candidate.startswith("```"):
-        first = candidate.find("{")
-        last = candidate.rfind("}")
-        if first >= 0 and last > first:
-            candidate = candidate[first : last + 1]
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, Mapping) else None
+    candidates = [candidate]
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(
+            r"(?is)```(?:json)?[ \t]*\r?\n(.*?)(?:\r?\n)?```",
+            candidate,
+        )
+    )
+    decoder = json.JSONDecoder()
+    for raw_candidate in candidates:
+        try:
+            parsed = json.loads(raw_candidate)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            return parsed
+        for match in re.finditer(r"\{", raw_candidate):
+            try:
+                embedded, _end = decoder.raw_decode(raw_candidate, match.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(embedded, Mapping):
+                return embedded
+    return None
 
 
 def _workspace_bundle_from_mapping(mapping: Mapping[str, object]) -> dict[str, JsonValue] | None:
