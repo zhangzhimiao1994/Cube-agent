@@ -91,6 +91,7 @@ class RunServiceProtocol(Protocol):
         workflow_id: str | None = None,
         reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
+        allow_scale_mode_upgrade: bool = True,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
@@ -258,6 +259,7 @@ class CreateRunRequest(BaseModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
     allow_workflow_adjustment: bool = False
+    allow_scale_mode_upgrade: bool = True
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
@@ -1183,6 +1185,7 @@ async def create_run(
             workflow_id=body.workflow_id,
             reference_workflow_id=body.reference_workflow_id,
             allow_workflow_adjustment=body.allow_workflow_adjustment,
+            allow_scale_mode_upgrade=body.allow_scale_mode_upgrade,
             conversation_id=body.conversation_id,
             reference_conversation_id=body.reference_conversation_id,
             attachment_ids=body.attachment_ids,
@@ -1266,6 +1269,7 @@ async def queue_conversation_message(
             workflow_id=body.workflow_id,
             reference_workflow_id=body.reference_workflow_id,
             allow_workflow_adjustment=body.allow_workflow_adjustment,
+            allow_scale_mode_upgrade=body.allow_scale_mode_upgrade,
             direct_model=body.direct_model,
             vibe_coding=body.vibe_coding,
             skip_evolution_proposal=body.skip_evolution_proposal,

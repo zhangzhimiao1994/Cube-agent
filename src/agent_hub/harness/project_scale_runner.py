@@ -3306,6 +3306,8 @@ def _deliverable_repair_body(
     repair_body = dict(body)
     if effective_mode in {"direct", "dispatch", "hybrid"}:
         repair_body["mode"] = effective_mode
+    if body.get("mode") == "auto" and effective_mode == "direct":
+        repair_body["allow_scale_mode_upgrade"] = False
     original_message = body.get("message")
     if benchmark_kind == "capability":
         original = original_message if isinstance(original_message, str) else ""

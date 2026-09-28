@@ -767,6 +767,14 @@ def test_auto_hybrid_partial_discussion_completion_falls_back_to_direct() -> Non
 
     assert mode == "direct"
 
+    repair = project_scale_runner_module._deliverable_repair_body(
+        {"mode": "auto", "message": "Build a real large business project."},
+        "large:auto",
+        benchmark_kind="capability",
+        effective_mode=mode,
+    )
+    assert repair["allow_scale_mode_upgrade"] is False
+
 
 def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(
     monkeypatch: pytest.MonkeyPatch,

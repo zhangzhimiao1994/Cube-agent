@@ -509,6 +509,7 @@ class RunService:
         workflow_id: str | None = None,
         reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
+        allow_scale_mode_upgrade: bool = True,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
@@ -554,6 +555,7 @@ class RunService:
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
             "allow_workflow_adjustment": allow_workflow_adjustment,
+            "allow_scale_mode_upgrade": allow_scale_mode_upgrade,
             "workflow_adjustment_policy": "ask_before_apply"
             if allow_workflow_adjustment
             else "strict_preset",
@@ -569,6 +571,7 @@ class RunService:
             operator_selection.update(project_delivery)
             if (
                 mode is TaskMode.DIRECT
+                and allow_scale_mode_upgrade
                 and project_delivery.get("project_scale") in {"large", "ultra"}
             ):
                 mode = TaskMode.HYBRID

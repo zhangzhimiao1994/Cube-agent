@@ -157,6 +157,7 @@ class StubRunService:
         workflow_id: str | None = None,
         reference_workflow_id: str | None = None,
         allow_workflow_adjustment: bool = False,
+        allow_scale_mode_upgrade: bool = True,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
@@ -173,6 +174,7 @@ class StubRunService:
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        del allow_scale_mode_upgrade
         if conversation_id in self.archived_conversation_ids:
             raise ConversationArchived("archived conversation cannot accept new runs")
         if vibe_coding and "no capable harness" in message:

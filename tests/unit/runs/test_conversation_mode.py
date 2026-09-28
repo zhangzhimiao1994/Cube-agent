@@ -636,6 +636,32 @@ async def test_explicit_direct_large_project_is_upgraded_before_runtime(
     }.items()
 
 
+async def test_explicit_direct_large_project_can_lock_recovery_mode() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="Build and repair a real large business project; preserve project_scale=large.",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-large-direct-recovery",
+        allow_scale_mode_upgrade=False,
+    )
+
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.requested_mode is TaskMode.DIRECT
+    assert submitted.effective_scale == "large"
+    routing = repository.created[-1]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["allow_scale_mode_upgrade"] is False
+
+
 async def test_reference_workflow_is_advisory_and_persisted_without_selecting_workflow() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     service = RunService(
