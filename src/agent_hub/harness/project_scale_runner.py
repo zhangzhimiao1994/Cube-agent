@@ -104,7 +104,7 @@ _REPAIR_CONTEXT_EXTENSIONS = frozenset(
     }
 )
 _REPAIR_CONTEXT_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.@+/-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|mts|ts|tsx|yaml|yml))(?![A-Za-z0-9_./-])"
+    r"(?<![A-Za-z0-9_./\\-])([A-Za-z0-9_.@+:/\\-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|mts|ts|tsx|yaml|yml))(?![A-Za-z0-9_./\\-])"
 )
 _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
     "plugin_contract",
@@ -3406,7 +3406,11 @@ def _repair_context_relevant_paths(
 
     failed_text = "\n".join(failed_reasons)
     for match in _REPAIR_CONTEXT_PATH_RE.finditer(failed_text):
-        add(match.group(1))
+        candidate = re.sub(r"/+", "/", match.group(1).replace("\\", "/"))
+        for path in paths:
+            normalized_path = path.replace("\\", "/").lstrip("/")
+            if candidate == normalized_path or candidate.endswith(f"/{normalized_path}"):
+                add(path)
     for path in paths:
         basename = PurePosixPath(path).name.lower()
         if basename in {"package.json", "tsconfig.json"}:

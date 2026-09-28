@@ -93,6 +93,31 @@ def test_generated_project_command_env_allows_npm_registry_override(
     assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org/"
 
 
+@pytest.mark.parametrize(
+    "failed_reason",
+    (
+        "failure at file:///tmp/agent-hub-project-scale-a1/tests/concurrency.test.mjs:70:14",
+        r"failure at C:\Temp\agent-hub-project-scale-a1\tests\concurrency.test.mjs:70:14",
+    ),
+)
+def test_repair_context_maps_absolute_failure_paths_to_workspace_files(
+    failed_reason: str,
+) -> None:
+    selected = project_scale_runner_module._repair_context_relevant_paths(
+        (
+            "package.json",
+            "src/service.ts",
+            "tests/concurrency.test.mjs",
+            "tsconfig.json",
+        ),
+        (failed_reason,),
+    )
+
+    assert selected[0] == "tests/concurrency.test.mjs"
+    assert "package.json" in selected
+    assert "tsconfig.json" in selected
+
+
 def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
