@@ -441,9 +441,13 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
         summary = parsed.get("summary", raw_batch.get("summary", ""))
     raw_files = raw_batch.get("files")
     if not isinstance(raw_files, Mapping):
-        markdown_bundle = _workspace_bundle_from_markdown_file_blocks(text)
-        raw_files = None if markdown_bundle is None else markdown_bundle.get("files")
-        markdown_fallback = isinstance(raw_files, Mapping)
+        recovered_files = _workspace_files_from_truncated_json(text)
+        if recovered_files:
+            raw_files = recovered_files
+        else:
+            markdown_bundle = _workspace_bundle_from_markdown_file_blocks(text)
+            raw_files = None if markdown_bundle is None else markdown_bundle.get("files")
+            markdown_fallback = isinstance(raw_files, Mapping)
         complete = False
         continuation = "continue with the remaining project files"
         summary = ""
@@ -473,6 +477,55 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
         continuation=continuation,
         summary=summary.strip(),
     )
+
+
+def _workspace_files_from_truncated_json(text: str) -> dict[str, str]:
+    decoder = json.JSONDecoder()
+    for marker in re.finditer(r'"files"\s*:\s*\{', text):
+        position = marker.end()
+        files: dict[str, str] = {}
+        while position < len(text):
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position < len(text) and text[position] == "}":
+                break
+            try:
+                raw_path, position = decoder.raw_decode(text, position)
+            except json.JSONDecodeError:
+                break
+            if type(raw_path) is not str:
+                files.clear()
+                break
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] != ":":
+                files.clear()
+                break
+            position += 1
+            while position < len(text) and text[position].isspace():
+                position += 1
+            try:
+                raw_content, position = decoder.raw_decode(text, position)
+            except json.JSONDecodeError:
+                break
+            if type(raw_content) is not str:
+                files.clear()
+                break
+            path = _safe_workspace_bundle_path(raw_path)
+            if path is None:
+                files.clear()
+                break
+            files[path] = raw_content
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] == "}":
+                break
+            if text[position] != ",":
+                break
+            position += 1
+        if files:
+            return files
+    return {}
 
 
 def _markdown_workspace_batch_is_complete(files: Mapping[str, str]) -> bool:

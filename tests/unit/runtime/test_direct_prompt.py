@@ -609,6 +609,31 @@ def test_workspace_batch_parser_accepts_real_model_json_variants(
     assert batch.complete is expected_complete
 
 
+def test_workspace_batch_parser_recovers_complete_files_from_truncated_json() -> None:
+    text = """```json
+{"workspace_batch":{"files":{
+  "package.json":"{\\"scripts\\":{\\"test\\":\\"node --test\\"}}\\n",
+  "src/main.js":"export const ready = true;\\n",
+  "src/incomplete.js":"export const unfinished =
+"""
+
+    batch = _workspace_batch_from_model_text(text)
+
+    assert batch is not None
+    assert batch.files == {
+        "package.json": '{"scripts":{"test":"node --test"}}\n',
+        "src/main.js": "export const ready = true;\n",
+    }
+    assert batch.complete is False
+    assert batch.continuation == "continue with the remaining project files"
+
+
+def test_workspace_batch_parser_rejects_truncated_json_without_complete_file() -> None:
+    text = '{"workspace_batch":{"files":{"src/incomplete.js":"unfinished'
+
+    assert _workspace_batch_from_model_text(text) is None
+
+
 @pytest.mark.parametrize(
     "text",
     (
