@@ -417,21 +417,34 @@ def _project_scale_workspace_bundle_from_model_text(
 
 def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
     parsed = _json_mapping_from_model_text(text)
-    if parsed is None:
-        return None
-    raw_batch = parsed.get("workspace_batch")
+    raw_batch: Mapping[str, object]
     complete: object
     continuation: object
-    if isinstance(raw_batch, Mapping):
-        complete = raw_batch.get("complete")
-        continuation = raw_batch.get("continuation", "")
-    else:
-        raw_bundle = parsed.get("workspace_bundle")
-        raw_batch = raw_bundle if isinstance(raw_bundle, Mapping) else parsed
+    summary: object
+    if parsed is None:
+        raw_batch = {}
         complete = True
         continuation = ""
+        summary = ""
+    else:
+        raw_workspace_batch = parsed.get("workspace_batch")
+        if isinstance(raw_workspace_batch, Mapping):
+            raw_batch = raw_workspace_batch
+            complete = raw_workspace_batch.get("complete")
+            continuation = raw_workspace_batch.get("continuation", "")
+        else:
+            raw_bundle = parsed.get("workspace_bundle")
+            raw_batch = raw_bundle if isinstance(raw_bundle, Mapping) else parsed
+            complete = True
+            continuation = ""
+        summary = parsed.get("summary", raw_batch.get("summary", ""))
     raw_files = raw_batch.get("files")
-    summary = parsed.get("summary", raw_batch.get("summary", ""))
+    if not isinstance(raw_files, Mapping):
+        markdown_bundle = _workspace_bundle_from_markdown_file_blocks(text)
+        raw_files = None if markdown_bundle is None else markdown_bundle.get("files")
+        complete = True
+        continuation = ""
+        summary = ""
     if (
         not isinstance(raw_files, Mapping)
         or type(complete) is not bool

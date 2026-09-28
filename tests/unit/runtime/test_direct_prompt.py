@@ -587,6 +587,14 @@ async def test_direct_large_bundle_switches_to_incremental_workspace_delivery() 
             {"index.html": "<main>ready</main>\n"},
             True,
         ),
+        (
+            """Project files follow.\n\n### `package.json`\n```json\n{\"scripts\":{\"test\":\"node --test\"}}\n```\n\n### `src/main.js`\n```js\nexport const ready = true;\n```""",
+            {
+                "package.json": '{"scripts":{"test":"node --test"}}\n',
+                "src/main.js": "export const ready = true;\n",
+            },
+            True,
+        ),
     ),
 )
 def test_workspace_batch_parser_accepts_real_model_json_variants(
