@@ -593,7 +593,7 @@ async def test_direct_large_bundle_switches_to_incremental_workspace_delivery() 
                 "package.json": '{"scripts":{"test":"node --test"}}\n',
                 "src/main.js": "export const ready = true;\n",
             },
-            True,
+            False,
         ),
     ),
 )

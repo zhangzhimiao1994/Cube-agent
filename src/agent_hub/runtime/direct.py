@@ -417,6 +417,7 @@ def _project_scale_workspace_bundle_from_model_text(
 
 def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
     parsed = _json_mapping_from_model_text(text)
+    markdown_fallback = False
     raw_batch: Mapping[str, object]
     complete: object
     continuation: object
@@ -442,8 +443,9 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
     if not isinstance(raw_files, Mapping):
         markdown_bundle = _workspace_bundle_from_markdown_file_blocks(text)
         raw_files = None if markdown_bundle is None else markdown_bundle.get("files")
-        complete = True
-        continuation = ""
+        markdown_fallback = isinstance(raw_files, Mapping)
+        complete = False
+        continuation = "continue with the remaining project files"
         summary = ""
     if (
         not isinstance(raw_files, Mapping)
@@ -460,6 +462,9 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
         if path is None:
             return None
         files[path] = raw_content
+    if markdown_fallback and _markdown_workspace_batch_is_complete(files):
+        complete = True
+        continuation = ""
     if not files or (not complete and not continuation.strip()):
         return None
     return _WorkspaceBatch(
@@ -467,6 +472,21 @@ def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
         complete=complete,
         continuation=continuation,
         summary=summary.strip(),
+    )
+
+
+def _markdown_workspace_batch_is_complete(files: Mapping[str, str]) -> bool:
+    paths = set(files)
+    required = {
+        "package.json",
+        "README.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+    }
+    return (
+        required.issubset(paths)
+        and any(path.startswith("src/") for path in paths)
+        and any(path.startswith("tests/") for path in paths)
     )
 
 
