@@ -125,7 +125,13 @@ _DEFAULT_GENERATED_PROJECT_COMMANDS: tuple[tuple[str, ...], ...] = (
 _DEFAULT_GENERATED_PROJECT_NPM_REGISTRY = "https://registry.npmmirror.com"
 _GENERATED_PROJECT_OUTPUT_TAIL_CHARS = 2_000
 _EXECUTE_QUEUE_GRACE_SECONDS = 900.0
-_CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS = 3
+_CAPABILITY_DELIVERABLE_REPAIR_SOFT_ATTEMPTS = 3
+_CAPABILITY_DELIVERABLE_REPAIR_MAX_BY_SCALE = {
+    "small": 5,
+    "medium": 6,
+    "large": 8,
+    "ultra": 10,
+}
 _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
@@ -530,6 +536,30 @@ class _EvidenceCheck:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _DeliverableRepairProgress:
+    deficits: tuple[str, ...]
+    failure_fingerprints: tuple[str, ...]
+    validation_stage: int = 0
+    progress_metrics: tuple[tuple[str, int, int], ...] = ()
+
+    @property
+    def signature(
+        self,
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        int,
+        tuple[tuple[str, int, int], ...],
+    ]:
+        return (
+            self.deficits,
+            self.failure_fingerprints,
+            self.validation_stage,
+            self.progress_metrics,
+        )
+
+
 def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
     if progress is not None:
         progress(message)
@@ -838,11 +868,32 @@ def execute_project_scale_plan(
                 _drop_recovered_workspace_bundle_errors(errors)
             deliverable_repair_attempts = 0
             current_workspace_bundle = observation.workspace_bundle
-            max_deliverable_repair_attempts = (
-                _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS
+            max_deliverable_repair_attempts = _deliverable_repair_attempt_limit(
+                run_request.case_id,
+                benchmark_kind=plan.benchmark_kind,
+            )
+            soft_deliverable_repair_attempts = (
+                _CAPABILITY_DELIVERABLE_REPAIR_SOFT_ATTEMPTS
                 if plan.benchmark_kind == "capability"
                 else _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
             )
+            repair_progress_state = _deliverable_repair_progress_state(
+                evidence,
+                case_id=run_request.case_id,
+                generated_project_validation=generated_project_validation,
+                failure_reasons=_deliverable_repair_failure_reasons(
+                    deliverable_quality=deliverable_quality,
+                    agent_standard_verification=agent_standard_verification,
+                    discussion_trace=discussion_trace,
+                    plugin_contract=plugin_contract,
+                    evidence=evidence,
+                    case_id=run_request.case_id,
+                    multi_agent_contract_reasons=multi_agent_contract_reasons,
+                    generated_project_validation=generated_project_validation,
+                ),
+            )
+            seen_repair_progress_signatures = {repair_progress_state.signature}
+            repair_progress_observed = True
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
             ):
@@ -856,11 +907,26 @@ def execute_project_scale_plan(
                     benchmark_kind=plan.benchmark_kind,
                 )
             ):
+                if (
+                    deliverable_repair_attempts >= soft_deliverable_repair_attempts
+                    and not repair_progress_observed
+                ):
+                    break
                 if deliverable_repair_attempts > 0 and not _has_followup_deliverable_repair_reason(
                     evidence,
                     case_id=run_request.case_id,
                 ):
                     break
+                case_deadline = _extend_repair_deadline(
+                    case_deadline,
+                    configured_wait_seconds=wait_seconds,
+                    request_body=request_body,
+                    benchmark_kind=plan.benchmark_kind,
+                    generated_project_timeout_seconds=generated_project_timeout_seconds,
+                    generated_project_command_count=len(
+                        generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS
+                    ),
+                )
                 if not _has_remaining_repair_wait_budget(case_deadline, wait_seconds):
                     _extend_unique(
                         errors,
@@ -1066,6 +1132,28 @@ def execute_project_scale_plan(
                         generated_project_validation
                     ):
                         break
+                next_progress_state = _deliverable_repair_progress_state(
+                    evidence,
+                    case_id=run_request.case_id,
+                    generated_project_validation=generated_project_validation,
+                    failure_reasons=_deliverable_repair_failure_reasons(
+                        deliverable_quality=deliverable_quality,
+                        agent_standard_verification=agent_standard_verification,
+                        discussion_trace=discussion_trace,
+                        plugin_contract=plugin_contract,
+                        evidence=evidence,
+                        case_id=run_request.case_id,
+                        multi_agent_contract_reasons=multi_agent_contract_reasons,
+                        generated_project_validation=generated_project_validation,
+                    ),
+                )
+                repair_progress_observed = _deliverable_repair_made_progress(
+                    repair_progress_state,
+                    next_progress_state,
+                    seen_signatures=seen_repair_progress_signatures,
+                )
+                seen_repair_progress_signatures.add(next_progress_state.signature)
+                repair_progress_state = next_progress_state
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
             if (
@@ -1190,6 +1278,7 @@ def _effective_execute_wait_seconds(
     configured_wait_seconds: float,
     *,
     generated_project_timeout_seconds: float = 0.0,
+    generated_project_command_count: int = len(_DEFAULT_GENERATED_PROJECT_COMMANDS),
 ) -> float:
     wait_seconds = max(configured_wait_seconds, 0.0)
     runtime_timeouts: list[float] = []
@@ -1199,20 +1288,51 @@ def _effective_execute_wait_seconds(
             runtime_timeouts.append(float(value))
     if runtime_timeouts:
         runtime_wait_seconds = max(runtime_timeouts)
-        repair_attempts = (
-            _CAPABILITY_DELIVERABLE_REPAIR_ATTEMPTS
-            if plan.benchmark_kind == "capability"
-            else _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
+        validation_command_count = max(generated_project_command_count, 0) + (
+            1 if plan.benchmark_kind == "capability" else 0
         )
-        validation_grace_seconds = max(
-            _EXECUTE_QUEUE_GRACE_SECONDS,
-            max(generated_project_timeout_seconds, 0.0) * 2,
+        validation_budget_seconds = (
+            max(generated_project_timeout_seconds, 0.0)
+            * validation_command_count
         )
         wait_seconds = max(
             wait_seconds,
-            runtime_wait_seconds * (1 + repair_attempts) + validation_grace_seconds,
+            runtime_wait_seconds
+            + validation_budget_seconds
+            + _EXECUTE_QUEUE_GRACE_SECONDS,
         )
     return wait_seconds
+
+
+def _extend_repair_deadline(
+    deadline: float,
+    *,
+    configured_wait_seconds: float,
+    request_body: Mapping[str, object],
+    benchmark_kind: ProjectScaleBenchmarkKind,
+    generated_project_timeout_seconds: float,
+    generated_project_command_count: int,
+) -> float:
+    if configured_wait_seconds <= 0:
+        return deadline
+    runtime_timeout = request_body.get("runtime_timeout_seconds")
+    runtime_budget = (
+        float(runtime_timeout)
+        if isinstance(runtime_timeout, int | float)
+        and not isinstance(runtime_timeout, bool)
+        and runtime_timeout > 0
+        else 0.0
+    )
+    validation_count = max(generated_project_command_count, 0) + (
+        1 if benchmark_kind == "capability" else 0
+    )
+    validation_budget = max(generated_project_timeout_seconds, 0.0) * validation_count
+    return (
+        max(deadline, time.monotonic())
+        + _EXECUTE_QUEUE_GRACE_SECONDS
+        + runtime_budget
+        + validation_budget
+    )
 
 
 def _env_flag(name: str) -> bool:
@@ -1320,6 +1440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan,
                 args.wait_seconds,
                 generated_project_timeout_seconds=args.artifact_build_timeout,
+                generated_project_command_count=len(_DEFAULT_GENERATED_PROJECT_COMMANDS),
             ),
             poll_interval_seconds=args.poll_interval,
             execution_id=args.execution_id or _default_execution_id(),
@@ -2894,6 +3015,149 @@ def _deliverable_repair_idempotency_key(
     return f"{_idempotency_key(case_id, index, execution_id=execution_id)}-{suffix}"[:90]
 
 
+def _deliverable_repair_attempt_limit(
+    case_id: str,
+    *,
+    benchmark_kind: str,
+) -> int:
+    if benchmark_kind != "capability":
+        return _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS
+    scale = case_id.partition(":")[0]
+    try:
+        return _CAPABILITY_DELIVERABLE_REPAIR_MAX_BY_SCALE[scale]
+    except KeyError as error:
+        raise ValueError(f"unknown project scale in case id: {case_id}") from error
+
+
+def _deliverable_repair_progress_state(
+    evidence: Mapping[str, bool],
+    *,
+    case_id: str,
+    generated_project_validation: _EvidenceCheck,
+    failure_reasons: Sequence[str] = (),
+) -> _DeliverableRepairProgress:
+    deficits = _deliverable_repair_evidence_deficits(evidence, case_id=case_id)
+    combined_reasons = tuple(dict.fromkeys((*failure_reasons, *generated_project_validation.reasons)))
+    return _DeliverableRepairProgress(
+        deficits=deficits,
+        failure_fingerprints=tuple(
+            sorted({_normalize_repair_failure_reason(reason) for reason in combined_reasons})
+        ),
+        validation_stage=_generated_project_validation_stage(generated_project_validation),
+        progress_metrics=_repair_progress_metrics(combined_reasons),
+    )
+
+
+def _generated_project_validation_stage(validation: _EvidenceCheck) -> int:
+    if validation.passed:
+        return 4
+    reasons = " ".join(validation.reasons).casefold()
+    command_match = re.search(r"\bcommand=(.*?)(?:\s+output_tail=|$)", reasons)
+    command = command_match.group(1).strip(' "\'') if command_match is not None else reasons
+    if any(marker in command for marker in ("npm install", "pnpm install", "yarn install")):
+        return 0
+    if any(marker in command for marker in ("npm run build", "pnpm build", "yarn build")):
+        return 1
+    if any(marker in command for marker in ("npm test", "npm run test", "pnpm test", "yarn test")):
+        return 2
+    if any(marker in reasons for marker in ("requirements", "http", "crud", "persistence")):
+        return 3
+    return 0
+
+
+def _repair_progress_metrics(reasons: Sequence[str]) -> tuple[tuple[str, int, int], ...]:
+    metrics: list[tuple[str, int, int]] = []
+    for reason in reasons:
+        for match in re.finditer(r"\b(\d+)\s*!==?\s*(\d+)\b", reason):
+            actual = int(match.group(1))
+            expected = int(match.group(2))
+            context = _normalize_repair_failure_reason(reason[max(0, match.start() - 80) : match.start()])
+            metrics.append((context, expected, abs(expected - actual)))
+    return tuple(sorted(metrics))
+
+
+def _normalize_repair_failure_reason(reason: str) -> str:
+    normalized = reason.casefold()
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b",
+        "<timestamp>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "<uuid>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?:[a-z]:[\\/](?:[^\s\"']+[\\/])*(?:tmp|temp)[\\/][^\s\"']*|/tmp/[^\s\"']*)",
+        "<temp-path>",
+        normalized,
+    )
+    normalized = re.sub(r"\(\d+,\d+\)", "(<line>,<column>)", normalized)
+    normalized = re.sub(r"\b\d+\s*!==?\s*\d+\b", "<actual> != <expected>", normalized)
+    normalized = re.sub(r"\b(?:port\s*[=:]?\s*)\d{2,5}\b", "port <number>", normalized)
+    return " ".join(normalized.split())
+
+
+def _deliverable_repair_made_progress(
+    previous: _DeliverableRepairProgress,
+    current: _DeliverableRepairProgress,
+    *,
+    seen_signatures: set[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            int,
+            tuple[tuple[str, int, int], ...],
+        ]
+    ],
+) -> bool:
+    if current.signature in seen_signatures:
+        return False
+    previous_deficits = set(previous.deficits)
+    current_deficits = set(current.deficits)
+    if not current_deficits.issubset(previous_deficits):
+        return False
+    if current.validation_stage < previous.validation_stage:
+        return False
+    metric_progress = _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics)
+    if metric_progress is False:
+        return False
+    previous_failures = set(previous.failure_fingerprints)
+    current_failures = set(current.failure_fingerprints)
+    if current_failures > previous_failures:
+        return False
+    if current_deficits < previous_deficits:
+        return True
+    if current.validation_stage > previous.validation_stage:
+        return True
+    if metric_progress is True:
+        return True
+    if current_failures < previous_failures:
+        return True
+    return current_failures != previous_failures
+
+
+def _repair_metrics_progressed(
+    previous: tuple[tuple[str, int, int], ...],
+    current: tuple[tuple[str, int, int], ...],
+) -> bool | None:
+    if not previous or not current or len(previous) != len(current):
+        return None
+    if tuple((label, expected) for label, expected, _gap in previous) != tuple(
+        (label, expected) for label, expected, _gap in current
+    ):
+        return None
+    previous_gaps = tuple(gap for _label, _expected, gap in previous)
+    current_gaps = tuple(gap for _label, _expected, gap in current)
+    if any(current_gap > previous_gap for previous_gap, current_gap in zip(previous_gaps, current_gaps)):
+        return False
+    return any(
+        current_gap < previous_gap
+        for previous_gap, current_gap in zip(previous_gaps, current_gaps)
+    )
+
+
 def _deliverable_repair_body(
     body: dict[str, object],
     case_id: str,
@@ -2938,6 +3202,14 @@ def _deliverable_repair_body(
             "Generated tests must compile: validator helpers that require a field argument "
             "must be called with that field name, or define safe defaults before testing. "
         )
+        small_guidance = (
+            "For small file-backed task API repairs, use single-flight initialization and "
+            "serialized read-modify-write transactions so concurrent creates, "
+            "patches, deletes, and restores cannot overwrite each other. Atomic rename alone "
+            "does not prevent lost updates; rerun the concurrency and restart-persistence tests. "
+        )
+        if case_id.startswith("small:"):
+            guidance += small_guidance
         if case_id.startswith("medium:"):
             guidance += medium_guidance
         if case_id.endswith(":multi_agent"):
@@ -4198,28 +4470,7 @@ def _should_attempt_deliverable_repair(
     return (
         (status in {"completed", "failed"} or has_observable_deliverable)
         and (evidence.get("final_artifacts") is True or has_capability_validation_failure)
-        and (
-            evidence.get("workspace_bundle") is not True
-            or evidence.get("deliverable_quality") is not True
-            or evidence.get("agent_standard_verification") is not True
-            or (
-                _case_requires_discussion_trace(case_id)
-                and evidence.get("discussion_trace") is not True
-            )
-            or (
-                _case_requires_plugin_contract(case_id)
-                and evidence.get("plugin_contract") is not True
-            )
-            or (
-                _case_requires_multi_agent_participation(case_id)
-                and evidence.get("multi_agent_participation") is not True
-            )
-            or evidence.get("generated_project_validation") is False
-            or (
-                _case_requires_self_repair_trace(case_id)
-                and evidence.get("self_repair_trace") is not True
-            )
-        )
+        and bool(_deliverable_repair_evidence_deficits(evidence, case_id=case_id))
     )
 
 
@@ -4228,25 +4479,60 @@ def _has_followup_deliverable_repair_reason(
     *,
     case_id: str,
 ) -> bool:
-    return (
-        evidence.get("workspace_bundle") is not True
-        or evidence.get("deliverable_quality") is not True
-        or (
-            _case_requires_discussion_trace(case_id)
-            and evidence.get("discussion_trace") is not True
-        )
-        or (
-            _case_requires_plugin_contract(case_id)
-            and evidence.get("plugin_contract") is not True
-        )
-        or (
-            _case_requires_multi_agent_participation(case_id)
-            and evidence.get("multi_agent_participation") is not True
-        )
-        or evidence.get("generated_project_validation") is False
-        or (
-            _case_requires_self_repair_trace(case_id)
-            and evidence.get("self_repair_trace") is not True
+    return bool(_deliverable_repair_evidence_deficits(evidence, case_id=case_id))
+
+
+def _deliverable_repair_evidence_deficits(
+    evidence: Mapping[str, bool],
+    *,
+    case_id: str,
+) -> tuple[str, ...]:
+    required = [
+        "workspace_bundle",
+        "deliverable_quality",
+        "agent_standard_verification",
+    ]
+    if _case_requires_discussion_trace(case_id):
+        required.append("discussion_trace")
+    if _case_requires_plugin_contract(case_id):
+        required.append("plugin_contract")
+    if _case_requires_multi_agent_participation(case_id):
+        required.append("multi_agent_participation")
+    if _case_requires_self_repair_trace(case_id):
+        required.append("self_repair_trace")
+    if "generated_project_validation" in evidence:
+        required.append("generated_project_validation")
+    if "requirements_validation" in evidence:
+        required.append("requirements_validation")
+    return tuple(sorted(key for key in required if evidence.get(key) is not True))
+
+
+def _deliverable_repair_failure_reasons(
+    *,
+    deliverable_quality: _EvidenceCheck,
+    agent_standard_verification: _EvidenceCheck,
+    discussion_trace: _EvidenceCheck,
+    plugin_contract: _EvidenceCheck,
+    evidence: Mapping[str, bool],
+    case_id: str,
+    multi_agent_contract_reasons: Sequence[str],
+    generated_project_validation: _EvidenceCheck,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *deliverable_quality.reasons,
+                *agent_standard_verification.reasons,
+                *discussion_trace.reasons,
+                *plugin_contract.reasons,
+                *_multi_agent_participation_reasons(
+                    evidence,
+                    case_id=case_id,
+                    contract_reasons=multi_agent_contract_reasons,
+                ),
+                *generated_project_validation.reasons,
+                *_self_repair_trace_reasons(evidence, case_id=case_id),
+            )
         )
     )
 

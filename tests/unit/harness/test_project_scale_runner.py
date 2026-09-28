@@ -192,7 +192,7 @@ def test_effective_execute_wait_seconds_reserves_capability_repair_budget() -> N
             120,
             generated_project_timeout_seconds=240,
         )
-        == 4500
+        == 2760
     )
     assert (
         project_scale_runner_module._effective_execute_wait_seconds(
@@ -201,6 +201,344 @@ def test_effective_execute_wait_seconds_reserves_capability_repair_budget() -> N
             generated_project_timeout_seconds=240,
         )
         == 5000
+    )
+
+    assert (
+        project_scale_runner_module._effective_execute_wait_seconds(
+            plan,
+            120,
+            generated_project_timeout_seconds=240,
+            generated_project_command_count=5,
+        )
+        == 3240
+    )
+
+
+def test_repair_deadline_extends_by_one_actual_execution_and_validation_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 50.0)
+
+    assert (
+        project_scale_runner_module._extend_repair_deadline(
+            100.0,
+            configured_wait_seconds=120.0,
+            request_body={"runtime_timeout_seconds": 900},
+            benchmark_kind="capability",
+            generated_project_timeout_seconds=240.0,
+            generated_project_command_count=3,
+        )
+        == 2860.0
+    )
+
+
+def test_deliverable_repair_attempt_limit_rejects_unknown_scale() -> None:
+    with pytest.raises(ValueError, match="unknown project scale"):
+        project_scale_runner_module._deliverable_repair_attempt_limit(
+            "unexpected:direct",
+            benchmark_kind="capability",
+        )
+
+
+def test_deliverable_repair_progress_ignores_volatile_failure_and_bundle_changes() -> None:
+    evidence = {
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "agent_standard_verification": True,
+        "discussion_trace": True,
+        "plugin_contract": True,
+        "multi_agent_participation": True,
+        "generated_project_validation": False,
+        "self_repair_trace": True,
+    }
+    previous = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    'generated_project_validation: command failed exit=1 command=npm test '
+                    'output_tail="failed at 2026-09-28T10:11:12.123Z in '
+                    '/tmp/agent-hub-project-scale-abcd/tests/api.test.ts(41,16)"'
+                ),
+            ),
+        ),
+    )
+    current = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    'generated_project_validation: command failed exit=1 command=npm test '
+                    'output_tail="failed at 2026-09-28T10:12:13.456Z in '
+                    '/tmp/agent-hub-project-scale-wxyz/tests/api.test.ts(99,2)"'
+                ),
+            ),
+        ),
+    )
+
+    assert current.signature == previous.signature
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_stops_seen_ab_cycle() -> None:
+    evidence = {
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "agent_standard_verification": True,
+        "generated_project_validation": False,
+    }
+    state_a = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="medium:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: error TS2322 incompatible type",),
+        ),
+    )
+    state_b = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="medium:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: error TS2554 missing argument",),
+        ),
+    )
+
+    assert project_scale_runner_module._deliverable_repair_made_progress(
+        state_a,
+        state_b,
+        seen_signatures={state_a.signature},
+    )
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        state_b,
+        state_a,
+        seen_signatures={state_a.signature, state_b.signature},
+    )
+
+
+def test_deliverable_repair_progress_includes_non_validation_evidence() -> None:
+    before = project_scale_runner_module._deliverable_repair_progress_state(
+        {
+            "workspace_bundle": True,
+            "deliverable_quality": True,
+            "agent_standard_verification": False,
+            "generated_project_validation": True,
+        },
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+    after = project_scale_runner_module._deliverable_repair_progress_state(
+        {
+            "workspace_bundle": True,
+            "deliverable_quality": True,
+            "agent_standard_verification": True,
+            "generated_project_validation": True,
+        },
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=True,
+            reasons=(),
+        ),
+    )
+
+    assert "agent_standard_verification" in before.deficits
+    assert "agent_standard_verification" not in after.deficits
+    assert project_scale_runner_module._deliverable_repair_made_progress(
+        before,
+        after,
+        seen_signatures={before.signature},
+    )
+
+
+def test_deliverable_repair_progress_rejects_evidence_regression() -> None:
+    before = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("build failed",),
+    )
+    after = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("agent_standard_verification", "generated_project_validation"),
+        failure_fingerprints=("test failed",),
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        before,
+        after,
+        seen_signatures={before.signature},
+    )
+
+
+def test_deliverable_repair_progress_rejects_validation_stage_regression() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm test failed",),
+        validation_stage=2,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm install failed",),
+        validation_stage=0,
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_validation_stage_uses_failed_command_not_output_tail_text() -> None:
+    validation = project_scale_runner_module._EvidenceCheck(
+        passed=False,
+        reasons=(
+            (
+                "generated_project_validation: command=npm test "
+                'output_tail="setup message says run npm install first"'
+            ),
+        ),
+    )
+
+    assert project_scale_runner_module._generated_project_validation_stage(validation) == 2
+
+
+def test_deliverable_repair_progress_accepts_quantified_improvement() -> None:
+    evidence = {
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "agent_standard_verification": True,
+        "generated_project_validation": False,
+    }
+    previous = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('command=npm test output_tail="concurrent creates: 1 !== 25"',),
+        ),
+    )
+    current = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('command=npm test output_tail="concurrent creates: 24 !== 25"',),
+        ),
+    )
+
+    assert project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_accepts_partial_quality_reason_reduction() -> None:
+    evidence = {
+        "workspace_bundle": True,
+        "deliverable_quality": False,
+        "agent_standard_verification": True,
+        "generated_project_validation": True,
+    }
+    validation = project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+    previous = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=validation,
+        failure_reasons=("missing plan", "missing verification"),
+    )
+    current = project_scale_runner_module._deliverable_repair_progress_state(
+        evidence,
+        case_id="small:direct",
+        generated_project_validation=validation,
+        failure_reasons=("missing verification",),
+    )
+
+    assert project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_rejects_added_failure_reason() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("deliverable_quality",),
+        failure_fingerprints=("missing verification",),
+        validation_stage=4,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("deliverable_quality",),
+        failure_fingerprints=("missing plan", "missing verification"),
+        validation_stage=4,
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_does_not_mix_quantified_metrics() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("quantified failures",),
+        validation_stage=2,
+        progress_metrics=(("create", 25, 1), ("update", 25, 10)),
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("quantified failures",),
+        validation_stage=2,
+        progress_metrics=(("create", 25, 5), ("update", 25, 0)),
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_rejects_cross_dimension_regression() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("deliverable_quality", "generated_project_validation"),
+        failure_fingerprints=("quality and concurrency",),
+        validation_stage=2,
+        progress_metrics=(("create", 25, 1),),
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("concurrency",),
+        validation_stage=2,
+        progress_metrics=(("create", 25, 20),),
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_followup_repair_includes_agent_standard_verification_deficit() -> None:
+    assert project_scale_runner_module._has_followup_deliverable_repair_reason(
+        {
+            "workspace_bundle": True,
+            "deliverable_quality": True,
+            "agent_standard_verification": False,
+        },
+        case_id="small:direct",
     )
 
 
@@ -326,6 +664,8 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
     assert "No ellipses" in message
     assert "VERIFICATION.md" in message
     assert "constraints_reading_evidence.json" in message
+    assert "single-flight initialization" in message
+    assert "serialized read-modify-write" in message
     assert "all true" not in message
     assert len(message) <= 2_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
@@ -525,7 +865,7 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     claimed_standard: bool,
     validation_failure: str | None,
 ) -> None:
-    outcomes = [False, True] if validation_failure else [True, True]
+    outcomes = [False, True, True, True] if validation_failure else [True, True, True, True]
 
     def validate(bundle: bytes | None, **kwargs: object) -> object:
         passed = outcomes.pop(0)
@@ -544,7 +884,7 @@ def test_capability_standard_stays_unverified_after_delivery_validation_and_repa
     report = execute_project_scale_plan(plan, client)
 
     result = report.results[0]
-    assert len(client.submitted_bodies) == 2
+    assert len(client.submitted_bodies) == 4
     assert result.evidence["agent_standard_verification"] is False
     assert result.evidence["generated_project_validation"] is True
     assert result.evidence["requirements_validation"] is True
@@ -4105,7 +4445,7 @@ def test_capability_repair_stops_when_validator_isolation_disappears(
     )
 
 
-def test_execute_project_scale_plan_does_not_start_unobservable_repair_after_wait_budget_expires(
+def test_execute_project_scale_plan_extends_wait_budget_for_observable_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("medium",), flows=("artifact_production",), execute=True)
@@ -4163,22 +4503,19 @@ def test_execute_project_scale_plan_does_not_start_unobservable_repair_after_wai
     )
 
     result = report.results[0]
-    assert report.ok is False
-    assert result.run_id == "run-medium-artifact-validation"
-    assert result.evidence["deliverable_repair_trace"] is False
-    assert result.evidence["generated_project_validation"] is False
-    assert len(client.submitted_bodies) == 1
-    assert not any(
+    assert report.ok is True
+    assert result.run_id == "run-medium-artifact-validation-repair"
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert result.evidence["generated_project_validation"] is True
+    assert len(client.submitted_bodies) == 2
+    assert any(
         call[0] == "POST" and call[1] == "/api/v1/runs" and "deliverable-repair" in (call[2] or "")
         for call in client.calls
     )
-    assert set(result.errors) == {
-        'generated_project_validation: command failed exit=7 command=npm test output_tail="boom"',
-        "deliverable_repair: wait budget exhausted before follow-up repair could be observed",
-    }
+    assert result.errors == ()
 
 
-def test_capability_generated_project_repair_can_use_second_round(
+def test_capability_generated_project_repair_extends_soft_limit_while_progressing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -4215,6 +4552,15 @@ def test_capability_generated_project_repair_can_use_second_round(
                     "command=npm run build output_tail="
                     '"src/routes/accounts.ts(10,34): error TS2339: '
                     "Property 'tenant_id' does not exist on type '{}'.\""
+                ),
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=1 "
+                    'command=npm test output_tail="concurrent creates: 1 !== 25"'
                 ),
             ),
         ),
@@ -4285,7 +4631,7 @@ def test_capability_generated_project_repair_can_use_second_round(
     assert result.run_id == "run-medium-direct-validation-repair"
     assert result.evidence["generated_project_validation"] is True
     assert result.evidence["deliverable_repair_trace"] is True
-    assert len(client.submitted_bodies) == 4
+    assert len(client.submitted_bodies) == 5
     repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
     assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
     assert "Current workspace context for precise repair" in repair_messages[0]
@@ -4294,6 +4640,7 @@ def test_capability_generated_project_repair_can_use_second_round(
     assert "validator helpers that require a field argument" in repair_messages[1]
     assert "Property 'tenant_id' does not exist" in repair_messages[2]
     assert "Request<{tenant_id:string" in repair_messages[2]
+    assert "concurrent creates: 1 !== 25" in repair_messages[3]
     repair_keys = [
         call[2]
         for call in client.calls
@@ -4306,6 +4653,7 @@ def test_capability_generated_project_repair_can_use_second_round(
         "project-scale-medium-direct-0-deliverable-repair",
         "project-scale-medium-direct-0-deliverable-repair-2",
         "project-scale-medium-direct-0-deliverable-repair-3",
+        "project-scale-medium-direct-0-deliverable-repair-4",
     ]
 
 
