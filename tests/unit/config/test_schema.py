@@ -276,6 +276,31 @@ def test_deployment_pricing_round_trips_and_builds_runtime_deployment() -> None:
     assert runtime.request_model == "gpt-5"
 
 
+def test_deployment_token_limits_round_trip_and_build_runtime_deployment() -> None:
+    definition = deployment(
+        context_window_tokens=128_000,
+        max_output_tokens=16_384,
+    )
+
+    restored = DeploymentDefinition.model_validate_json(definition.model_dump_json())
+    runtime = restored.to_deployment(deployment_id="primary-1", logical_model="primary")
+
+    assert restored.context_window_tokens == 128_000
+    assert restored.max_output_tokens == 16_384
+    assert runtime.context_window_tokens == 128_000
+    assert runtime.max_output_tokens == 16_384
+
+
+def test_deployment_runtime_applies_safe_token_defaults_for_legacy_config() -> None:
+    runtime = deployment().to_deployment(
+        deployment_id="primary-1",
+        logical_model="primary",
+    )
+
+    assert runtime.context_window_tokens == 65_536
+    assert runtime.max_output_tokens == 8_192
+
+
 def test_deployment_pricing_distinguishes_unknown_from_explicit_free() -> None:
     unknown = deployment()
     free = deployment(input_per_million_usd="0", output_per_million_usd="0")

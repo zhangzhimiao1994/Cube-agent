@@ -8,6 +8,7 @@ import pytest
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
+from agent_hub.runtime import hybrid as hybrid_module
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -48,6 +49,120 @@ class MultiArtifactRuntime:
 
     async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
         raise AssertionError(f"not used: {checkpoint.id}")
+
+    async def cancel(self) -> None:
+        return None
+
+
+class UsageRecordingRuntime(MultiArtifactRuntime):
+    def __init__(self, mode: TaskMode, output: Artifact, *, tokens_used: int) -> None:
+        super().__init__(mode, (output,))
+        self.tokens_used = tokens_used
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        yield RunEvent(
+            kind=EventKind.ARTIFACT_CREATED,
+            sequence=1,
+            run_id=context.run_id,
+            artifact=self.outputs[0],
+        )
+        yield RunEvent(
+            kind=EventKind.CHECKPOINT_SAVED,
+            sequence=2,
+            run_id=context.run_id,
+            checkpoint=RuntimeCheckpoint(
+                id=uuid4(),
+                runtime_type=f"test_{self.mode.value}",
+                runtime_version="1",
+                run_id=context.run_id,
+                tenant_id=context.tenant_id,
+                mode=self.mode,
+                state={"usage": {"tokens": self.tokens_used}},
+            ),
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=3,
+            run_id=context.run_id,
+            reason="explicit_completion",
+        )
+
+
+class AdvancingUsageRuntime(UsageRecordingRuntime):
+    def __init__(
+        self,
+        mode: TaskMode,
+        output: Artifact,
+        *,
+        tokens_used: int,
+        clock: list[float],
+        elapsed_seconds: float,
+    ) -> None:
+        super().__init__(mode, output, tokens_used=tokens_used)
+        self.clock = clock
+        self.elapsed_seconds = elapsed_seconds
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        async for event in super().run(context):
+            yield event
+        self.clock[0] += self.elapsed_seconds
+
+
+class ResumableCheckpointRuntime:
+    def __init__(
+        self,
+        mode: TaskMode,
+        *,
+        initial_tokens: int,
+        resumed_tokens: int,
+        clock: list[float],
+        initial_elapsed_seconds: float,
+        resumed_elapsed_seconds: float,
+    ) -> None:
+        self.mode = mode
+        self.initial_tokens = initial_tokens
+        self.resumed_tokens = resumed_tokens
+        self.clock = clock
+        self.initial_elapsed_seconds = initial_elapsed_seconds
+        self.resumed_elapsed_seconds = resumed_elapsed_seconds
+        self.contexts: list[TaskContext] = []
+        self.restored_checkpoints: list[RuntimeCheckpoint] = []
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        resumed = bool(self.restored_checkpoints)
+        self.clock[0] += (
+            self.resumed_elapsed_seconds if resumed else self.initial_elapsed_seconds
+        )
+        tokens = self.resumed_tokens if resumed else self.initial_tokens
+        checkpoint = RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type=f"test_{self.mode.value}",
+            runtime_version="1",
+            run_id=context.run_id,
+            tenant_id=context.tenant_id,
+            mode=self.mode,
+            state={"usage": {"tokens": tokens}},
+        )
+        yield RunEvent(
+            kind=EventKind.CHECKPOINT_SAVED,
+            sequence=1,
+            run_id=context.run_id,
+            checkpoint=checkpoint,
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="explicit_completion",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored_checkpoints.append(checkpoint)
 
     async def cancel(self) -> None:
         return None
@@ -224,6 +339,286 @@ def final_zip_artifact() -> Artifact:
             }
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_hybrid_stages_share_remaining_parent_token_budget() -> None:
+    dispatch = UsageRecordingRuntime(
+        TaskMode.DISPATCH,
+        artifact("researcher", "evidence"),
+        tokens_used=30,
+    )
+    discussion = UsageRecordingRuntime(
+        TaskMode.DISCUSS,
+        artifact("critic", "review"),
+        tokens_used=40,
+    )
+    synthesis = UsageRecordingRuntime(
+        TaskMode.DIRECT,
+        artifact("main", "answer"),
+        tokens_used=20,
+    )
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.HYBRID,
+        request="Resolve the question.",
+        token_budget=120,
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert [
+        dispatch.contexts[0].token_budget,
+        discussion.contexts[0].token_budget,
+        synthesis.contexts[0].token_budget,
+    ] == [120, 90, 50]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_stages_share_parent_timeout_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_000.0]
+    monkeypatch.setattr(hybrid_module, "monotonic", lambda: clock[0], raising=False)
+    dispatch = AdvancingUsageRuntime(
+        TaskMode.DISPATCH,
+        artifact("researcher", "evidence"),
+        tokens_used=1,
+        clock=clock,
+        elapsed_seconds=10.0,
+    )
+    discussion = AdvancingUsageRuntime(
+        TaskMode.DISCUSS,
+        artifact("critic", "review"),
+        tokens_used=1,
+        clock=clock,
+        elapsed_seconds=20.0,
+    )
+    synthesis = AdvancingUsageRuntime(
+        TaskMode.DIRECT,
+        artifact("main", "answer"),
+        tokens_used=1,
+        clock=clock,
+        elapsed_seconds=30.0,
+    )
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.HYBRID,
+        request="Resolve the question.",
+        timeout_seconds=90.0,
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert [
+        dispatch.contexts[0].timeout_seconds,
+        discussion.contexts[0].timeout_seconds,
+        synthesis.contexts[0].timeout_seconds,
+    ] == [90.0, 80.0, 60.0]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_wraps_and_resumes_child_checkpoint_with_remaining_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_000.0]
+    monkeypatch.setattr(hybrid_module, "monotonic", lambda: clock[0], raising=False)
+    initial_dispatch = ResumableCheckpointRuntime(
+        TaskMode.DISPATCH,
+        initial_tokens=30,
+        resumed_tokens=30,
+        clock=clock,
+        initial_elapsed_seconds=12.0,
+        resumed_elapsed_seconds=0.0,
+    )
+    initial_runtime = HybridRuntime(
+        initial_dispatch,
+        UsageRecordingRuntime(
+            TaskMode.DISCUSS,
+            artifact("critic", "initial review"),
+            tokens_used=5,
+        ),
+        UsageRecordingRuntime(
+            TaskMode.DIRECT,
+            artifact("main", "initial answer"),
+            tokens_used=5,
+        ),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.HYBRID,
+        request="Resolve the question.",
+        token_budget=100,
+        timeout_seconds=90.0,
+    )
+
+    initial_events = [event async for event in initial_runtime.run(context)]
+    in_stage_checkpoints = [
+        event.checkpoint
+        for event in initial_events
+        if event.kind is EventKind.CHECKPOINT_SAVED
+        and event.checkpoint is not None
+        and event.checkpoint.state["next_stage"] == 0
+    ]
+
+    assert len(in_stage_checkpoints) == 1
+    outer_checkpoint = in_stage_checkpoints[0]
+    outer_payload = outer_checkpoint.to_payload()
+    outer_state = outer_payload["state"]
+    assert isinstance(outer_state, Mapping)
+    child_payload = outer_state["child_checkpoint"]
+    assert isinstance(child_payload, Mapping)
+    child_checkpoint = RuntimeCheckpoint.from_payload(child_payload)
+    assert child_checkpoint.runtime_type == "test_dispatch"
+    assert outer_checkpoint.state["remaining_token_budget"] == 70
+    assert outer_checkpoint.state["remaining_timeout_seconds"] == 78.0
+
+    resumed_dispatch = ResumableCheckpointRuntime(
+        TaskMode.DISPATCH,
+        initial_tokens=30,
+        resumed_tokens=45,
+        clock=clock,
+        initial_elapsed_seconds=0.0,
+        resumed_elapsed_seconds=8.0,
+    )
+    resumed_discussion = UsageRecordingRuntime(
+        TaskMode.DISCUSS,
+        artifact("critic", "resumed review"),
+        tokens_used=5,
+    )
+    resumed_synthesis = UsageRecordingRuntime(
+        TaskMode.DIRECT,
+        artifact("main", "resumed answer"),
+        tokens_used=5,
+    )
+    resumed_runtime = HybridRuntime(
+        resumed_dispatch,
+        resumed_discussion,
+        resumed_synthesis,
+    )
+    await resumed_runtime.restore_checkpoint(outer_checkpoint)
+
+    resumed_events = [
+        event
+        async for event in resumed_runtime.run(
+            context.model_copy(
+                update={
+                    "checkpoint": outer_checkpoint,
+                    "token_budget": 1_000,
+                    "timeout_seconds": 300.0,
+                }
+            )
+        )
+    ]
+
+    assert resumed_dispatch.restored_checkpoints == [child_checkpoint]
+    assert resumed_dispatch.contexts[0].checkpoint == child_checkpoint
+    assert resumed_dispatch.contexts[0].token_budget == 100
+    assert resumed_dispatch.contexts[0].timeout_seconds == 78.0
+    assert resumed_discussion.contexts[0].token_budget == 55
+    assert resumed_discussion.contexts[0].timeout_seconds == 70.0
+    assert resumed_synthesis.contexts[0].token_budget == 50
+    assert resumed_events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_restores_legacy_v1_checkpoint_at_completed_stage() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    dispatch = UnusedRuntime(TaskMode.DISPATCH, "completed legacy stage must not rerun")
+    discussion = UsageRecordingRuntime(
+        TaskMode.DISCUSS,
+        artifact("critic", "legacy review"),
+        tokens_used=5,
+    )
+    synthesis = UsageRecordingRuntime(
+        TaskMode.DIRECT,
+        artifact("main", "legacy answer"),
+        tokens_used=5,
+    )
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+    legacy_checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="hybrid",
+        runtime_version="1",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mode=TaskMode.HYBRID,
+        state={
+            "plan_digest": runtime._plan.digest,
+            "artifact_registry": {},
+            "next_sequence": 7,
+            "next_stage": 1,
+            "terminal": False,
+            "reason": None,
+            "remaining_token_budget": 70,
+            "remaining_timeout_seconds": 45.0,
+        },
+    )
+
+    await runtime.restore_checkpoint(legacy_checkpoint)
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=tenant_id,
+                mode=TaskMode.HYBRID,
+                request="Resume legacy work.",
+                checkpoint=legacy_checkpoint,
+                token_budget=1_000,
+                timeout_seconds=300.0,
+            )
+        )
+    ]
+
+    assert discussion.contexts[0].token_budget == 70
+    assert discussion.contexts[0].timeout_seconds <= 45.0
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_handoff_bounds_more_than_64_artifacts_to_anchors_and_latest() -> None:
+    dispatch_outputs = tuple(
+        artifact("researcher", f"evidence-{index}") for index in range(70)
+    )
+    dispatch = MultiArtifactRuntime(TaskMode.DISPATCH, dispatch_outputs)
+    discussion = RecordingArtifactRuntime(
+        TaskMode.DISCUSS,
+        artifact("critic", "review"),
+    )
+    synthesis = RecordingArtifactRuntime(TaskMode.DIRECT, artifact("main", "answer"))
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.HYBRID,
+        request="Resolve the question.",
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    handoff = discussion.contexts[0].artifacts
+    assert len(handoff) == 64
+    assert handoff[:8] == dispatch_outputs[:8]
+    assert handoff[8:] == dispatch_outputs[-56:]
+    assert sum(event.kind is EventKind.ARTIFACT_CREATED for event in events) == 72
+    checkpoints = [
+        event.checkpoint
+        for event in events
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    assert checkpoints
+    registries = [checkpoint.state["artifact_registry"] for checkpoint in checkpoints]
+    assert all(isinstance(registry, Mapping) and len(registry) == 64 for registry in registries)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio

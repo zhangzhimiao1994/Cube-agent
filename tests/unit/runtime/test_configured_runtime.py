@@ -7128,6 +7128,49 @@ def test_discussion_plan_uses_bounded_generation_limits() -> None:
     assert plan.selector_max_output_tokens <= 512
 
 
+def test_discussion_plan_inherits_runtime_resource_budget() -> None:
+    roles = (
+        RoleAssignment(
+            id="director",
+            role="导演",
+            purpose=RolePurpose.EXPERTISE,
+            mission="负责创意方向。",
+            must_answer=("方向是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={"position": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="reviewer",
+            role="审查员",
+            purpose=RolePurpose.CRITIQUE,
+            mission="负责审查风险。",
+            must_answer=("风险是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={"position": "string"},
+            model="main",
+        ),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISCUSS,
+        request="讨论一个超大型项目。",
+        timeout_seconds=1_800.0,
+        token_budget=900_000,
+    )
+
+    plan = _discussion_plan(roles, "main", context)
+
+    assert plan.wall_time_seconds == 1_800.0
+    assert plan.token_budget == 900_000
+    assert plan.max_turns == 4
+
+
 def test_selected_agent_ids_are_resolved_from_config_without_extra_roles() -> None:
     config = PlatformConfig.model_validate(
         {

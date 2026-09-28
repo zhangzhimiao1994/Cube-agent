@@ -45,6 +45,7 @@ class InMemoryCapacityRedis:
         self.acquire_started = asyncio.Event()
         self.allow_acquire = asyncio.Event()
         self.acquire_calls = 0
+        self.acquire_token_estimates: list[int] = []
 
     async def eval(self, script: str, key_count: int, *args: object) -> object:
         del script
@@ -66,6 +67,7 @@ class InMemoryCapacityRedis:
             return [base, int(str(args[9])), int(str(args[10])), created, len(owners)]
         if key_count == 5:
             self.acquire_calls += 1
+            self.acquire_token_estimates.append(int(str(args[7])))
             if self.block_first_acquire and self.acquire_calls == 1:
                 self.acquire_started.set()
                 await self.allow_acquire.wait()
@@ -161,6 +163,24 @@ async def test_scoped_views_preserve_weighted_routing_progress() -> None:
         await view.release(acquired)
 
     assert selected_ids == ["a", "b"]
+
+
+async def test_scoped_views_use_each_deployments_token_estimate() -> None:
+    redis = InMemoryCapacityRedis()
+    first = deployment("a", "shared-scope")
+    second = deployment("b", "shared-scope")
+    capacity = pool(redis, [first, second])
+    view = capacity.scoped([first, second])
+    await view.initialize()
+
+    estimates = {"a": 11, "b": 22}
+    for _ in range(2):
+        acquired = await view.acquire(
+            [first, second], wait_timeout=0.1, estimated_tokens=estimates
+        )
+        await view.release(acquired)
+
+    assert redis.acquire_token_estimates == [11, 22]
 
 
 async def test_scoped_view_registers_global_most_restrictive_shared_scope_policy() -> None:

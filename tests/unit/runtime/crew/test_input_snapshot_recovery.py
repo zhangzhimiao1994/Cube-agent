@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from typing import Any, cast
@@ -13,7 +14,11 @@ from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, RuntimeCheckpoint
-from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeExecutionError
+from agent_hub.runtime.crew.adapter import (
+    CrewDispatchRuntime,
+    CrewRunStream,
+    RuntimeExecutionError,
+)
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
     FastFactory,
     _context,
@@ -175,7 +180,72 @@ async def test_partial_checkpoint_records_ordered_exact_input_refs() -> None:
     assert checkpoint.state.get("input_refs") == tuple(
         {"id": str(artifact.id), "sha256": artifact.content_sha256} for artifact in inputs
     )
-    assert checkpoint.runtime_version == "9"
+    assert checkpoint.runtime_version == "10"
+    remaining = checkpoint.state.get("remaining_timeout_seconds")
+    assert isinstance(remaining, float)
+    assert 0 < remaining <= 60.0
+
+
+async def test_v10_checkpoint_restores_only_saved_remaining_wall_time() -> None:
+    checkpoint, repository = await capture_partial(())
+    state = dict(checkpoint.state)
+    state["remaining_timeout_seconds"] = 5.0
+    bounded = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type=checkpoint.runtime_type,
+        runtime_version="10",
+        run_id=checkpoint.run_id,
+        tenant_id=checkpoint.tenant_id,
+        mode=checkpoint.mode,
+        state=state,
+    )
+    runtime = CrewDispatchRuntime(
+        RepairCaptureGateway(
+            ('{"verdict":"approve"}', 8, False),
+            ("actual final answer", 11, False),
+        ),
+        _reviewed_step_plan(),
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await runtime.restore_checkpoint(bounded)
+    stream = cast(
+        CrewRunStream,
+        runtime.run(_context(checkpoint=bounded, timeout_seconds=60.0)),
+    )
+
+    await anext(stream)
+    deadline = stream._state.deadline
+    assert deadline is not None
+    remaining = deadline - asyncio.get_running_loop().time()
+    await stream.aclose()
+
+    assert 0 < remaining <= 5.0
+
+
+async def test_v9_checkpoint_without_remaining_wall_time_stays_compatible() -> None:
+    checkpoint, repository = await capture_partial(())
+    state = dict(checkpoint.state)
+    state.pop("remaining_timeout_seconds", None)
+    state.pop("remaining_absolute_timeout_seconds", None)
+    state.pop("timeout_progress_units", None)
+    legacy = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type=checkpoint.runtime_type,
+        runtime_version="9",
+        run_id=checkpoint.run_id,
+        tenant_id=checkpoint.tenant_id,
+        mode=checkpoint.mode,
+        state=state,
+    )
+    runtime = CrewDispatchRuntime(
+        RepairCaptureGateway(),
+        _reviewed_step_plan(),
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+
+    await runtime.restore_checkpoint(legacy)
 
 
 async def test_partial_checkpoint_inputs_are_stored_in_private_repository() -> None:

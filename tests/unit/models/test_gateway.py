@@ -151,7 +151,7 @@ class CapacityStub:
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         assert self.initialized is True
         self.events.append(
@@ -998,6 +998,142 @@ class DeploymentAwareTransport:
         return ModelResponse(text="backup ok")
 
 
+class TokenLimitAwareTransport:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, int]] = []
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del api_key
+        self.requests.append((deployment.id, model_request.max_output_tokens))
+        if deployment.id == "primary-key":
+            raise ModelTransportError("primary busy", status_code=429)
+        return ModelResponse(text="backup ok")
+
+
+class PerDeploymentEstimateCapacity(CapacityStub):
+    async def acquire(
+        self,
+        candidates: Sequence[Deployment],
+        wait_timeout: float,
+        *,
+        estimated_tokens: int | Mapping[str, int],
+    ) -> CapacityLease:
+        assert self.initialized is True
+        self.events.append(
+            ("acquire", tuple(item.id for item in candidates), wait_timeout, estimated_tokens)
+        )
+        assert isinstance(estimated_tokens, Mapping)
+        assert estimated_tokens["small-key"] < estimated_tokens["large-key"]
+        return lease("small-key")
+
+
+async def test_gateway_clamps_primary_and_fallback_before_capacity_acquire() -> None:
+    primary = deployment(
+        "primary-key",
+        context_window_tokens=32_768,
+        max_output_tokens=4096,
+    )
+    backup = deployment(
+        "backup-key",
+        "backup",
+        context_window_tokens=16_384,
+        max_output_tokens=2048,
+    )
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    transport = TokenLimitAwareTransport()
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+    )
+    oversized = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="private prompt"),),
+        max_output_tokens=1_000_000,
+    )
+
+    completion = await gateway.complete_with_context(oversized)
+
+    assert completion.response.text == "backup ok"
+    assert transport.requests == [
+        ("primary-key", 4096),
+        ("backup-key", 2048),
+    ]
+    capacity_estimates = [
+        event[3]
+        for event in capacity.events
+        if isinstance(event, tuple) and event[:1] == ("acquire",)
+    ]
+    assert len(capacity_estimates) == 2
+    assert all(0 < estimate < 32_768 for estimate in capacity_estimates)
+
+
+async def test_gateway_skips_context_incompatible_primary_for_larger_fallback() -> None:
+    primary = deployment(
+        "primary-key",
+        context_window_tokens=64,
+        max_output_tokens=32,
+    )
+    backup = deployment(
+        "backup-key",
+        "backup",
+        context_window_tokens=4096,
+        max_output_tokens=512,
+    )
+    capacity = CapacityStub([lease("backup-key")])
+    transport = TokenLimitAwareTransport()
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+    )
+    model_request = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content="请分析这个大型项目的架构、依赖和交付风险。" * 16),),
+        max_output_tokens=512,
+    )
+
+    completion = await gateway.complete_with_context(model_request)
+
+    assert completion.deployment_id == "backup-key"
+    assert transport.requests == [("backup-key", 512)]
+    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    assert [event[1] for event in acquire_events] == [("backup-key",)]
+
+
+async def test_gateway_passes_candidate_specific_estimates_to_capacity() -> None:
+    small = deployment(
+        "small-key",
+        context_window_tokens=4096,
+        max_output_tokens=128,
+    )
+    large = deployment(
+        "large-key",
+        context_window_tokens=4096,
+        max_output_tokens=1024,
+    )
+    capacity = PerDeploymentEstimateCapacity([])
+    transport = TransportStub(capacity.events)
+    gateway = ModelGateway(
+        ModelRegistry([small, large]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+    )
+
+    assert (await gateway.complete(request())).text == "ok"
+    acquire = next(event for event in capacity.events if event[0] == "acquire")  # type: ignore[index]
+    estimates = acquire[3]  # type: ignore[index]
+    assert isinstance(estimates, Mapping)
+    assert estimates["small-key"] < estimates["large-key"]
+
+
 async def test_transport_failure_tries_fallback_model_when_available() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
@@ -1745,6 +1881,26 @@ def test_default_estimator_is_deterministic_positive_and_prompt_safe() -> None:
     assert "private prompt" not in repr(estimator)
 
 
+def test_default_estimator_counts_chinese_as_tokens_not_raw_utf8_bytes() -> None:
+    estimator = ConservativeTokenEstimator()
+    empty = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content=""),),
+        max_output_tokens=1,
+    )
+    chinese_text = "你好世界" * 50
+    chinese = ModelRequest(
+        logical_model="primary",
+        messages=(ModelMessage(role="user", content=chinese_text),),
+        max_output_tokens=1,
+    )
+
+    estimated_text_tokens = estimator.estimate(chinese) - estimator.estimate(empty)
+
+    assert len(chinese_text) <= estimated_text_tokens
+    assert estimated_text_tokens < len(chinese_text.encode("utf-8"))
+
+
 def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() -> None:
     huge_integer = 10**999
     schema_value: Mapping[str, JsonValue] = {
@@ -1773,14 +1929,14 @@ def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() ->
         max_output_tokens=17,
     )
     estimator = ConservativeTokenEstimator()
-    serialized_schema_bytes = len(
-        json.dumps(schema_value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    serialized_schema = json.dumps(
+        schema_value, ensure_ascii=False, separators=(",", ":")
     )
 
     estimate = estimator.estimate(model_request)
 
-    assert estimate >= serialized_schema_bytes + 17
-    assert estimate > 1100
+    assert estimate >= (len(serialized_schema) + 3) // 4 + 17
+    assert estimate > 300
 
 
 @pytest.mark.parametrize("allowance", [0, -1, 1.0, True, None, 1_000_001])

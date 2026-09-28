@@ -28,7 +28,6 @@ from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
     DiscussionPlan,
-    RuntimeExecutionError,
 )
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -215,9 +214,9 @@ async def test_participants_can_use_different_logical_models() -> None:
     ("overrides", "replies", "expected"),
     [
         (
-            {"max_turns": 1},
+            {"max_turns": 1, "wall_time_seconds": 1.0},
             [("analyst", 1, Decimal("0.01")), ("No conclusion", 1, Decimal("0.01"))],
-            "max_turns",
+            "resource_limit",
         ),
         (
             {"token_budget": 2},
@@ -268,12 +267,86 @@ async def test_unpriced_but_token_accounted_usage_does_not_block_discussion() ->
             ("critic reply", 1, None),
             ("analyst", 1, None),
             ("analyst follow-up", 1, None),
+            ("critic", 1, None),
+            ("[COMPLETE] final answer", 1, None),
         ]
     )
     events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[-1].reason == "max_turns"
+    assert events[-1].reason == "explicit_completion"
     assert len(terminal_events(events)) == 1
+
+
+async def test_soft_turn_limit_extends_when_discussion_makes_progress() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("analyst", 1, Decimal(0)),
+            ("Initial position", 1, Decimal(0)),
+            ("critic", 1, Decimal(0)),
+            ("[EVIDENCE] independent review", 1, Decimal(0)),
+            ("analyst", 1, Decimal(0)),
+            ("[COMPLETE] reconciled answer", 1, Decimal(0)),
+        ]
+    )
+
+    events = await collect(
+        AutoGenDiscussionRuntime(
+            gateway,
+            plan(max_turns=2, wall_time_seconds=20.0, token_budget=100),
+        ),
+        context(),
+    )
+
+    assert events[-1].reason == "explicit_completion"
+    assert len(gateway.requests) == 6
+
+
+async def test_soft_turn_limit_stops_after_extension_window_without_progress() -> None:
+    gateway = ScriptedGateway(
+        [
+            item
+            for _ in range(4)
+            for item in (
+                ("analyst", 1, Decimal(0)),
+                ("No new information", 1, Decimal(0)),
+            )
+        ]
+    )
+
+    events = await collect(
+        AutoGenDiscussionRuntime(
+            gateway,
+            plan(max_turns=2, wall_time_seconds=20.0, token_budget=100),
+        ),
+        context(),
+    )
+
+    assert events[-1].reason == "no_progress"
+    assert len(gateway.requests) == 8
+
+
+async def test_repeated_error_stops_before_soft_turn_limit() -> None:
+    gateway = ScriptedGateway(
+        [
+            item
+            for _ in range(4)
+            for item in (
+                ("analyst", 1, Decimal(0)),
+                ("ERROR: dependency timeout", 1, Decimal(0)),
+            )
+        ]
+    )
+
+    events = await collect(
+        AutoGenDiscussionRuntime(
+            gateway,
+            plan(max_turns=4, wall_time_seconds=20.0, token_budget=100),
+        ),
+        context(),
+    )
+
+    assert events[-1].reason == "repeated_error"
+    assert len(gateway.requests) == 4
 
 
 async def test_cancel_propagates_and_runtime_is_reusable() -> None:
@@ -866,6 +939,13 @@ async def test_partial_checkpoint_resumes_from_explicit_transcript_without_repea
             checkpoint = event.checkpoint
     await cast(Any, stream).aclose()
     assert checkpoint is not None
+    control = cast(Mapping[str, JsonValue], checkpoint.state["discussion_control"])
+    turns = cast(int, control["turns"])
+    soft_limit = cast(int, control["soft_limit"])
+    hard_limit = cast(int, control["hard_limit"])
+    assert turns == 1
+    assert soft_limit >= 1
+    assert hard_limit >= soft_limit
     # SelectorGroupChat may prefetch the next selector turn before the consumer
     # observes our checkpoint.  The durable boundary is the explicit message,
     # not the framework's internal scheduling point.
@@ -967,21 +1047,36 @@ async def test_exact_tool_call_limit_is_accepted_by_gateway_client() -> None:
     assert len(result.content) == 16
 
 
-async def test_cumulative_message_limit_rejects_before_gateway_side_effect() -> None:
-    class NeverGateway(ScriptedGateway):
+async def test_long_message_history_is_compacted_before_gateway_side_effect() -> None:
+    class RecordingGateway(ScriptedGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
-            raise AssertionError("message preflight must run before the gateway")
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text="compacted",
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                ),
+                deployment_id="shared",
+                logical_model=request.logical_model,
+                provider_id="openai",
+                provider_model="openai/test",
+                cost_usd=Decimal(0),
+            )
 
     from agent_hub.runtime.autogen.adapter import GatewayChatCompletionClient
     from agent_hub.runtime.autogen.termination import DiscussionUsage
 
-    gateway = NeverGateway([])
+    gateway = RecordingGateway([])
     client = GatewayChatCompletionClient(gateway, "shared", DiscussionUsage())
     messages = [UserMessage(content=f"message-{index}", source="user") for index in range(129)]
-    with pytest.raises(RuntimeExecutionError, match="history"):
-        await client.create(messages)
-    assert gateway.requests == []
+    await client.create(messages)
+
+    assert len(gateway.requests) == 1
+    compacted = gateway.requests[0].messages
+    assert len(compacted) < 128
+    assert any("COMPRESSED_DISCUSSION_HISTORY_JSON=" in message.content for message in compacted)
+    assert compacted[0].content == "message-0"
+    assert compacted[-1].content == "message-128"
 
 
 async def test_repository_put_failure_aborts_reserved_artifact_write() -> None:

@@ -439,11 +439,13 @@ class ConfigBackedDirectRuntime:
         secret_service: SecretService,
         capacity_factory: CapacityFactory,
         transport: ModelTransport | None = None,
+        capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
+        self._capability_gateway = capability_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -484,7 +486,7 @@ class ConfigBackedDirectRuntime:
         if not config.models:
             return UnavailableRuntime(TaskMode.DIRECT)
         try:
-            gateway, logical_model, _fallback_policy = await _gateway_for_config(
+            gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
                 tenant_id=context.tenant_id,
                 secret_service=self._secret_service,
@@ -494,7 +496,17 @@ class ConfigBackedDirectRuntime:
             )
         except HarnessModelSelectionError:
             return UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
-        return DirectRuntime(gateway, logical_model=logical_model)
+        return DirectRuntime(
+            gateway,
+            logical_model=logical_model,
+            capability_gateway=self._capability_gateway,
+            available_model_attempts=_direct_available_model_attempts(
+                config,
+                logical_model,
+                fallback_policy=fallback_policy,
+                routing_decision=context.routing_decision,
+            ),
+        )
 
 
 class ConfigBackedDispatchRuntime:
@@ -3465,7 +3477,7 @@ def _discussion_plan(
     *,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
 ) -> DiscussionPlan:
-    selected_roles = tuple(roles[:6])
+    selected_roles = tuple(roles[:8])
     if len(selected_roles) < 2:
         selected_roles = (
             RoleAssignment(
@@ -3494,6 +3506,9 @@ def _discussion_plan(
             ),
         )
     participant_ids = _autogen_participant_ids(selected_roles)
+    soft_turns = max(4, len(selected_roles) * 2)
+    wall_time_seconds = context.timeout_seconds if context is not None else 300.0
+    token_budget = context.token_budget if context is not None else 65_536
     participants = tuple(
         DiscussionParticipant(
             id=participant_id,
@@ -3513,9 +3528,9 @@ def _discussion_plan(
         participants=participants,
         selector_model=default_model,
         selector_max_output_tokens=512,
-        max_turns=min(12, max(4, len(participants) * 2)),
-        wall_time_seconds=300.0,
-        token_budget=65_536,
+        max_turns=soft_turns,
+        wall_time_seconds=wall_time_seconds,
+        token_budget=token_budget,
         cost_budget_usd=Decimal(10),
         consensus_votes=min(2, len(participants)),
     )
@@ -3664,6 +3679,29 @@ def _fallbacks(config: PlatformConfig) -> dict[str, str]:
     }
 
 
+def _direct_available_model_attempts(
+    config: PlatformConfig,
+    logical_model: str,
+    *,
+    fallback_policy: FallbackExecutionPolicy,
+    routing_decision: object | None,
+) -> int:
+    if (
+        fallback_policy == "disabled"
+        or _deployment_routing_constraint(config, routing_decision) is not None
+    ):
+        return 1
+    fallbacks = _fallbacks(config)
+    seen = {logical_model}
+    current = logical_model
+    while current in fallbacks:
+        current = fallbacks[current]
+        if current in seen:
+            break
+        seen.add(current)
+    return len(seen)
+
+
 def default_runtime_registry() -> RuntimeRegistry:
     return RuntimeRegistry(
         UnavailableRuntime(mode)
@@ -3701,6 +3739,7 @@ def configured_runtime_registry(
                 secret_service=secret_service,
                 capacity_factory=capacity_factory,
                 transport=transport,
+                capability_gateway=capability_gateway,
             ),
             ConfigBackedDispatchRuntime(
                 config_service=config_service,

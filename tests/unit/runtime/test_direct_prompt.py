@@ -13,11 +13,19 @@ from agent_hub.harness.project_scale_runner import (
     _workspace_bundle_agent_standard_reasons,
     _workspace_bundle_project_quality_reasons,
 )
-from agent_hub.models.types import ModelResponse, TokenUsage
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from agent_hub.models.litellm_client import ModelTransportError
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.direct import (
     DirectRuntime,
     RuntimeExecutionError,
+    _normalized_workspace_bundle,
     _project_scale_workspace_bundle_from_model_text,
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
@@ -26,6 +34,91 @@ from tests.contracts.test_runtime_contract import FakeGateway
 
 class UnusedGateway:
     pass
+
+
+class RecordingCapabilityGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Mapping[str, JsonValue], str]] = []
+
+    async def execute(
+        self,
+        *,
+        tenant_id: object,
+        run_id: object,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor
+        self.calls.append((name, arguments, idempotency_key))
+        if name == "workspace.bundle":
+            return {
+                "summary": "Generated workspace ZIP artifact project.zip.",
+                "artifact_id": str(uuid4()),
+                "bundle_download_url": "/api/workspaces/project/session/bundle",
+            }
+        return {"summary": f"Wrote {arguments['path']}."}
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name in {"workspace.write_text", "workspace.bundle"}
+
+
+class SequencedDirectGateway:
+    def __init__(self, outcomes: tuple[ModelResponse | BaseException, ...]) -> None:
+        self._outcomes = list(outcomes)
+        self.requests: list[object] = []
+
+    async def complete_with_context(self, request: object) -> object:
+        from agent_hub.models.gateway import GatewayCompletion
+
+        self.requests.append(request)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return GatewayCompletion(
+            response=outcome,
+            deployment_id="primary",
+            logical_model="main",
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-chat",
+            attempted_logical_models=("main",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_project_preflight_terminal_checkpoint_resumes_at_sequence_three() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="direct",
+        runtime_version="1",
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DIRECT,
+        state={
+            "completed": True,
+            "artifact_id": str(uuid4()),
+            "artifact_sha256": "a" * 64,
+            "next_sequence": 3,
+        },
+    )
+    context = TaskContext(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mode=TaskMode.DIRECT,
+        request="Resume completed project preflight.",
+        checkpoint=checkpoint,
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    await runtime.restore_checkpoint(checkpoint)
+    events = [event async for event in runtime.run(context)]
+
+    assert len(events) == 1
+    assert events[0].kind is EventKind.RUNTIME_COMPLETED
+    assert events[0].sequence == 3
 
 
 def test_project_scale_fixture_files_include_agent_standard_reading_evidence() -> None:
@@ -276,6 +369,264 @@ def test_direct_prompt_truncates_large_artifact_text_for_capacity_estimation() -
     assert request.max_output_tokens <= 8192
     assert len(user_content.encode("utf-8")) < len(original_text.encode("utf-8"))
     assert artifact.content["text"] == original_text
+
+
+def test_direct_prompt_compacts_many_artifacts_at_soft_waterline() -> None:
+    artifacts = tuple(
+        Artifact(
+            id=uuid4(),
+            type="text",
+            producer="planner",
+            content={"text": f"artifact-{index}:" + "x" * 60_000},
+        )
+        for index in range(64)
+    )
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Synthesize every referenced artifact without dropping provenance.",
+        artifacts=artifacts,
+        token_budget=1_000_000,
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    outcome = runtime._build_prompt(task)
+
+    assert outcome.messages is not None
+    assert outcome.error_code is None
+    assert outcome.included_source_ids == tuple(str(artifact.id) for artifact in artifacts)
+    assert outcome.prompt_estimate <= 196_608
+    rendered = "\n".join(cast(str, item.content) for item in outcome.messages)
+    assert "compacted_artifact_count" in rendered
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+def test_direct_project_output_budget_uses_remaining_runtime_budget_not_scale_cap(
+    scale: str,
+) -> None:
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request=f"Build a {scale} project.",
+        token_budget=200_000,
+        routing_decision={
+            "project_scale": scale,
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    outcome = runtime._build_request(task)
+
+    assert outcome.request is not None
+    assert outcome.request.max_output_tokens == task.token_budget - outcome.prompt_estimate
+    assert outcome.request.max_output_tokens > 65_536
+
+
+def test_direct_workspace_bundle_limits_are_storage_fuses_not_inline_waterlines() -> None:
+    over_inline_file_count = {
+        "files": {f"src/file_{index}.txt": "ok" for index in range(201)}
+    }
+    over_inline_bytes = {
+        "files": {
+            "src/a.txt": "a" * 400_000,
+            "src/b.txt": "b" * 400_000,
+            "src/c.txt": "c" * 400_000,
+        }
+    }
+
+    assert _normalized_workspace_bundle(over_inline_file_count) is not None
+    assert _normalized_workspace_bundle(over_inline_bytes) is not None
+    assert _normalized_workspace_bundle(
+        {"files": {f"src/file_{index}.txt": "ok" for index in range(513)}}
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_large_bundle_switches_to_incremental_workspace_delivery() -> None:
+    files = {
+        f"src/module_{index}.txt": (str(index) * 6_000)
+        for index in range(201)
+    }
+    response_text = json.dumps({"workspace_bundle": {"files": files}})
+    gateway = FakeGateway(
+        ModelResponse(text=response_text, usage=TokenUsage(100, 100_000, 100_100))
+    )
+    capabilities = RecordingCapabilityGateway()
+    runtime = DirectRuntime(
+        gateway,
+        logical_model="main",
+        capability_gateway=capabilities,
+    )
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a large project.",
+        timeout_seconds=600,
+        token_budget=500_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+
+    events = [event async for event in runtime.run(task)]
+
+    assert [name for name, _arguments, _key in capabilities.calls].count(
+        "workspace.write_text"
+    ) == 202
+    assert capabilities.calls[-2][1]["path"] == "DELIVERY_MANIFEST.json"
+    assert capabilities.calls[-1][0] == "workspace.bundle"
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    assert "workspace_bundle" not in artifact_event.artifact.content
+    delivery = artifact_event.artifact.content["workspace_delivery"]
+    assert isinstance(delivery, Mapping)
+    assert delivery["bundle_download_url"] == "/api/workspaces/project/session/bundle"
+
+
+@pytest.mark.asyncio
+async def test_direct_project_delivery_generates_and_writes_multiple_model_batches() -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "workspace_batch": {
+                            "files": {"package.json": '{"scripts":{"test":"node --test"}}'},
+                            "complete": False,
+                            "continuation": "continue with source and tests",
+                        },
+                        "summary": "Project manifest written.",
+                    }
+                ),
+                usage=TokenUsage(100, 80, 180),
+            ),
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "workspace_batch": {
+                            "files": {
+                                "src/main.js": "export const ready = true;\n",
+                                "tests/main.test.js": "// verified\n",
+                            },
+                            "complete": True,
+                            "continuation": "",
+                        },
+                        "summary": "Project source and tests completed.",
+                    }
+                ),
+                usage=TokenUsage(120, 100, 220),
+            ),
+        )
+    )
+    capabilities = RecordingCapabilityGateway()
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=capabilities,
+    )
+    task = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="Build a large project with source and tests.",
+        timeout_seconds=600,
+        token_budget=50_000,
+        routing_decision={
+            "project_scale": "large",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+
+    events = [event async for event in runtime.run(task)]
+
+    assert len(gateway.requests) == 2
+    assert [call[1]["path"] for call in capabilities.calls[:-1]] == [
+        "package.json",
+        "src/main.js",
+        "tests/main.test.js",
+        "DELIVERY_MANIFEST.json",
+    ]
+    assert capabilities.calls[-1][0] == "workspace.bundle"
+    second_request = cast(ModelRequest, gateway.requests[1])
+    rendered = "\n".join(cast(str, message.content) for message in second_request.messages)
+    assert "continue with source and tests" in rendered
+    assert "package.json" not in rendered
+    completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    assert completed.payload["workspace_delivery"]
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_budget_allows_distinct_retryable_failures_then_success() -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelTransportError("model transport failed", status_code=503),
+            ModelTransportError("model transport failed", status_code=429),
+            ModelResponse(text="Recovered", usage=TokenUsage(10, 2, 12)),
+        )
+    )
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        available_model_attempts=3,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="Build a medium project.",
+                timeout_seconds=60,
+                token_budget=20_000,
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_budget_stops_on_repeated_error_fingerprint() -> None:
+    gateway = SequencedDirectGateway(
+        (
+            ModelTransportError("model transport failed", status_code=503),
+            ModelTransportError("model transport failed", status_code=503),
+            ModelResponse(text="must not be reached", usage=TokenUsage(10, 2, 12)),
+        )
+    )
+    runtime = DirectRuntime(
+        gateway,  # type: ignore[arg-type]
+        logical_model="main",
+        available_model_attempts=3,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="model transport failed"):
+        _ = [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=uuid4(),
+                    mode=TaskMode.DIRECT,
+                    request="Build a medium project.",
+                    timeout_seconds=60,
+                    token_budget=20_000,
+                )
+            )
+        ]
+
+    assert len(gateway.requests) == 2
 
 
 def test_direct_capability_repair_request_uses_project_sized_output_budget() -> None:

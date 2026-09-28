@@ -146,6 +146,8 @@ class Deployment:
     reserved_slots: int = 0
     rpm: int | None = None
     tpm: int | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     weight: int = 100
     input_per_million_usd: Decimal | None = None
     output_per_million_usd: Decimal | None = None
@@ -203,6 +205,20 @@ class Deployment:
             raise ValueError("rpm must be positive")
         if self.tpm is not None and (not _is_int(self.tpm) or self.tpm <= 0):
             raise ValueError("tpm must be positive")
+        if self.context_window_tokens is not None and (
+            not _is_int(self.context_window_tokens) or self.context_window_tokens <= 0
+        ):
+            raise ValueError("context_window_tokens must be positive")
+        if self.max_output_tokens is not None and (
+            not _is_int(self.max_output_tokens) or self.max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be positive")
+        if (
+            self.context_window_tokens is not None
+            and self.max_output_tokens is not None
+            and self.max_output_tokens > self.context_window_tokens
+        ):
+            raise ValueError("max_output_tokens must not exceed context_window_tokens")
         if not _is_int(self.weight) or self.weight <= 0:
             raise ValueError("weight must be positive")
         prices = (self.input_per_million_usd, self.output_per_million_usd)

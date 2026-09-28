@@ -7,12 +7,14 @@ import hashlib
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.capacity import CapacityUnavailable
+from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput, ModelGatewayError
+from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -20,6 +22,7 @@ from agent_hub.models.types import (
     ModelResponse,
     TokenUsage,
 )
+from agent_hub.runtime.adaptive_budget import deadline_from_routing
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -43,13 +46,17 @@ from agent_hub.runtime.self_repair_context import self_repair_context_text
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
 _MAX_OUTPUT_BYTES = 65_536
-_MAX_PROJECT_SCALE_OUTPUT_BYTES = 2_000_000
-_MAX_PROJECT_SCALE_BUNDLE_BYTES = 1_000_000
-_MAX_PROJECT_SCALE_BUNDLE_FILES = 200
+_INLINE_PROJECT_OUTPUT_WATERLINE_BYTES = 2_000_000
+_INLINE_BUNDLE_WATERLINE_BYTES = 1_000_000
+_INLINE_BUNDLE_WATERLINE_FILES = 200
+_MAX_WORKSPACE_BUNDLE_BYTES = 100 * 1024 * 1024
+_MAX_WORKSPACE_FILE_BYTES = 50 * 1024 * 1024
+_MAX_WORKSPACE_BUNDLE_FILES = 512
+_MAX_MODEL_RESPONSE_BYTES = _MAX_WORKSPACE_BUNDLE_BYTES + 4 * 1024 * 1024
 _MAX_CONTEXT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
-_MAX_PROJECT_SCALE_DIRECT_OUTPUT_TOKENS = 65_536
+_MAX_MODEL_OUTPUT_TOKENS = 1_000_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
@@ -83,12 +90,46 @@ class Gateway(Protocol):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion: ...
 
 
+class CapabilityGateway(Protocol):
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]: ...
+
+    def is_replay_safe(self, name: str) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _PromptOutcome:
     messages: tuple[ModelMessage, ...] | None = field(default=None, repr=False)
     included_source_ids: tuple[str, ...] = ()
     prompt_estimate: int = 0
     error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceBatch:
+    files: Mapping[str, str]
+    complete: bool
+    continuation: str
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchedWorkspaceOutcome:
+    delivery: Mapping[str, JsonValue]
+    summary: str
+    usage: TokenUsage
+    usage_estimated: bool
+    completion: GatewayCompletion
+    request: ModelRequest
+    written_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -211,7 +252,7 @@ def _max_output_bytes_for_context(context: TaskContext) -> int:
     if _is_project_scale_capability_request(context.request) or _is_workspace_project_delivery(
         context
     ):
-        return _MAX_PROJECT_SCALE_OUTPUT_BYTES
+        return _MAX_MODEL_RESPONSE_BYTES
     return _MAX_OUTPUT_BYTES
 
 
@@ -219,8 +260,58 @@ def _max_direct_output_tokens_for_context(context: TaskContext) -> int:
     if _is_project_scale_capability_request(context.request) or _is_workspace_project_delivery(
         context
     ):
-        return _MAX_PROJECT_SCALE_DIRECT_OUTPUT_TOKENS
+        return _MAX_MODEL_OUTPUT_TOKENS
     return _MAX_DIRECT_OUTPUT_TOKENS
+
+
+def _bundle_size(bundle: Mapping[str, object]) -> tuple[int, int]:
+    raw_files = bundle.get("files")
+    if not isinstance(raw_files, Mapping):
+        return 0, 0
+    total_bytes = sum(
+        len(content.encode("utf-8"))
+        for content in raw_files.values()
+        if isinstance(content, str)
+    )
+    return len(raw_files), total_bytes
+
+
+def _requires_incremental_workspace_delivery(bundle: Mapping[str, object]) -> bool:
+    file_count, total_bytes = _bundle_size(bundle)
+    return (
+        file_count > _INLINE_BUNDLE_WATERLINE_FILES
+        or total_bytes > _INLINE_BUNDLE_WATERLINE_BYTES
+    )
+
+
+def _retryable_gateway_failure(error: BaseException) -> bool:
+    if isinstance(error, ModelResponseError | GatewayRejectedOutput):
+        return False
+    if isinstance(error, CapacityUnavailable):
+        return True
+    if isinstance(error, ModelTransportError):
+        return error.status_code is None or error.status_code in {
+            408,
+            409,
+            425,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }
+    if isinstance(error, ModelGatewayError):
+        return str(error) in {
+            "model transport failed",
+            "model response text is empty",
+            "model response is empty",
+        }
+    return False
+
+
+def _failure_fingerprint(error: BaseException) -> str:
+    status_code = getattr(error, "status_code", None)
+    return f"{type(error).__name__}:{status_code}:{_gateway_failure_reason(cast(Exception, error))}"
 
 
 def _project_scale_workspace_bundle_from_model_text(
@@ -232,6 +323,45 @@ def _project_scale_workspace_bundle_from_model_text(
         if bundle is not None:
             return bundle
     return _workspace_bundle_from_markdown_file_blocks(text)
+
+
+def _workspace_batch_from_model_text(text: str) -> _WorkspaceBatch | None:
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    raw_batch = parsed.get("workspace_batch")
+    if not isinstance(raw_batch, Mapping):
+        return None
+    raw_files = raw_batch.get("files")
+    complete = raw_batch.get("complete")
+    continuation = raw_batch.get("continuation", "")
+    summary = parsed.get("summary", "")
+    if (
+        not isinstance(raw_files, Mapping)
+        or type(complete) is not bool
+        or type(continuation) is not str
+        or type(summary) is not str
+    ):
+        return None
+    files: dict[str, str] = {}
+    for raw_path, raw_content in raw_files.items():
+        if type(raw_path) is not str or type(raw_content) is not str:
+            return None
+        path = _safe_workspace_bundle_path(raw_path)
+        if path is None:
+            return None
+        files[path] = raw_content
+    if not files or (not complete and not continuation.strip()):
+        return None
+    return _WorkspaceBatch(
+        files=files,
+        complete=complete,
+        continuation=continuation,
+        summary=summary.strip(),
+    )
 
 
 def _website_preview_workspace_bundle_from_model_text(
@@ -362,7 +492,7 @@ def _normalized_workspace_bundle(bundle: Mapping[str, object]) -> dict[str, Json
     raw_files = bundle.get("files")
     if not isinstance(raw_files, Mapping) or not raw_files:
         return None
-    if len(raw_files) > _MAX_PROJECT_SCALE_BUNDLE_FILES:
+    if len(raw_files) > _MAX_WORKSPACE_BUNDLE_FILES:
         return None
     files: dict[str, str] = {}
     total_bytes = 0
@@ -373,8 +503,10 @@ def _normalized_workspace_bundle(bundle: Mapping[str, object]) -> dict[str, Json
         if path is None:
             return None
         content_bytes = len(raw_content.encode("utf-8"))
+        if content_bytes > _MAX_WORKSPACE_FILE_BYTES:
+            return None
         total_bytes += content_bytes
-        if total_bytes > _MAX_PROJECT_SCALE_BUNDLE_BYTES:
+        if total_bytes > _MAX_WORKSPACE_BUNDLE_BYTES:
             return None
         files[path] = raw_content
     if not files:
@@ -396,6 +528,66 @@ def _safe_workspace_bundle_path(value: str) -> str | None:
     if len(normalized) > 512:
         return None
     return normalized
+
+
+def _serialized_prior_artifacts(
+    artifacts: tuple[Artifact, ...],
+) -> tuple[str, tuple[str, ...]]:
+    entries: list[dict[str, object]] = []
+    source_ids: list[str] = []
+    source_texts: list[str | None] = []
+    for artifact in artifacts:
+        if artifact.type != "text":
+            continue
+        text = artifact.content.get("text")
+        if type(text) is not str:
+            continue
+        entries.append(
+            {
+                "id": str(artifact.id),
+                "producer": artifact.producer,
+                "content_sha256": artifact.content_sha256,
+            }
+        )
+        source_ids.append(str(artifact.id))
+        source_texts.append(text)
+
+    included_text = 0
+    budget = _MAX_CONTEXT_BYTES // 2
+    for index in range(len(entries) - 1, -1, -1):
+        text = source_texts[index]
+        if text is None:
+            continue
+        entries[index]["text"] = _truncate_prompt_text(
+            text,
+            max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+        )
+        candidate = json.dumps(
+            {
+                "artifacts": entries,
+                "compacted_artifact_count": len(entries) - included_text - 1,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(candidate.encode("utf-8")) > budget:
+            entries[index].pop("text", None)
+            continue
+        included_text += 1
+
+    payload = json.dumps(
+        {
+            "artifacts": entries,
+            "compacted_artifact_count": len(entries) - included_text,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c").replace(">", "\\u003e")
+    return payload, tuple(source_ids)
 
 
 def _project_scale_direct_artifact_text(request: object) -> str:
@@ -455,11 +647,22 @@ class DirectRunStream:
 class DirectRuntime:
     mode = TaskMode.DIRECT
 
-    def __init__(self, gateway: Gateway, *, logical_model: str) -> None:
+    def __init__(
+        self,
+        gateway: Gateway,
+        *,
+        logical_model: str,
+        capability_gateway: CapabilityGateway | None = None,
+        available_model_attempts: int = 2,
+    ) -> None:
         if _SAFE_ID.fullmatch(logical_model) is None:
             raise ValueError("logical_model must be a safe identifier")
+        if type(available_model_attempts) is not int or available_model_attempts < 1:
+            raise ValueError("available_model_attempts must be positive")
         self._gateway = gateway
         self._logical_model = logical_model
+        self._capability_gateway = capability_gateway
+        self._available_model_attempts = available_model_attempts
         self._cancel_lock = asyncio.Lock()
         self._active_token: object | None = None
         self._active_stream: DirectRunStream | None = None
@@ -467,6 +670,330 @@ class DirectRuntime:
         self._active_task: asyncio.Task[GatewayCompletion] | None = None
         self._last_checkpoint: RuntimeCheckpoint | None = None
         self._restored_checkpoint: RuntimeCheckpoint | None = None
+
+    async def _deliver_workspace_incrementally(
+        self,
+        context: TaskContext,
+        bundle: Mapping[str, object],
+    ) -> Mapping[str, JsonValue]:
+        raw_files = bundle.get("files")
+        if self._capability_gateway is None or not isinstance(raw_files, Mapping):
+            _raise_execution_error("incremental workspace delivery is unavailable")
+        files: dict[str, str] = {}
+        for raw_path, raw_content in raw_files.items():
+            if type(raw_path) is not str or type(raw_content) is not str:
+                _raise_execution_error("incremental workspace delivery is unavailable")
+            files[raw_path] = raw_content
+        deadline = asyncio.get_running_loop().time() + context.timeout_seconds
+        known_files: dict[str, str] = {}
+        await self._write_workspace_batch(
+            context,
+            _WorkspaceBatch(
+                files=files,
+                complete=True,
+                continuation="",
+                summary="",
+            ),
+            known_files=known_files,
+            deadline=deadline,
+        )
+        return await self._finish_workspace_delivery(
+            context,
+            known_files=known_files,
+            deadline=deadline,
+        )
+
+    async def _execute_workspace_capability(
+        self,
+        context: TaskContext,
+        *,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+        deadline: float,
+    ) -> Mapping[str, JsonValue]:
+        gateway = self._capability_gateway
+        if gateway is None:
+            _raise_execution_error("incremental workspace delivery is unavailable")
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            _raise_execution_error("incremental workspace delivery timed out")
+        try:
+            async with asyncio.timeout(remaining_seconds):
+                return await gateway.execute(
+                    tenant_id=context.tenant_id,
+                    run_id=context.run_id,
+                    actor="main_agent",
+                    name=name,
+                    arguments=arguments,
+                    idempotency_key=idempotency_key,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - redact capability boundary
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            _raise_execution_error("incremental workspace delivery failed")
+
+    async def _write_workspace_batch(
+        self,
+        context: TaskContext,
+        batch: _WorkspaceBatch,
+        *,
+        known_files: dict[str, str],
+        deadline: float,
+    ) -> None:
+        changed = False
+        for path, content in batch.files.items():
+            content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if known_files.get(path) == content_sha256:
+                continue
+            changed = True
+            write_sha256 = hashlib.sha256(
+                path.encode("utf-8") + b"\x00" + content.encode("utf-8")
+            ).hexdigest()
+            await self._execute_workspace_capability(
+                context,
+                name="workspace.write_text",
+                arguments={"path": path, "content": content},
+                idempotency_key=f"direct-write-{context.run_id.hex}-{write_sha256[:16]}",
+                deadline=deadline,
+            )
+            known_files[path] = content_sha256
+        if not changed:
+            _raise_execution_error("workspace batch made no progress")
+
+    async def _finish_workspace_delivery(
+        self,
+        context: TaskContext,
+        *,
+        known_files: Mapping[str, str],
+        deadline: float,
+    ) -> Mapping[str, JsonValue]:
+        manifest = json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": str(context.run_id),
+                "files": dict(sorted(known_files.items())),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        manifest_sha256 = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+        await self._execute_workspace_capability(
+            context,
+            name="workspace.write_text",
+            arguments={"path": "DELIVERY_MANIFEST.json", "content": manifest},
+            idempotency_key=(
+                f"direct-manifest-{context.run_id.hex}-{manifest_sha256[:16]}"
+            ),
+            deadline=deadline,
+        )
+        return await self._execute_workspace_capability(
+            context,
+            name="workspace.bundle",
+            arguments={
+                "title": "Direct Project Workspace",
+                "filename": "direct-project.zip",
+                "presentation": "final_attachment",
+            },
+            idempotency_key=f"direct-bundle-{context.run_id.hex}-{manifest_sha256[:16]}",
+            deadline=deadline,
+        )
+
+    async def _deliver_workspace_batches(
+        self,
+        context: TaskContext,
+        *,
+        initial_batch: _WorkspaceBatch,
+        initial_response: ModelResponse,
+        initial_completion: GatewayCompletion,
+        initial_request: ModelRequest,
+        prompt_estimate: int,
+        deadline: float,
+    ) -> _BatchedWorkspaceOutcome:
+        loop_time = asyncio.get_running_loop().time()
+        initial_remaining = max(0.001, deadline - loop_time)
+        configured_absolute = context.routing_decision.get(
+            "runtime_timeout_absolute_seconds"
+        )
+        absolute_seconds = (
+            float(configured_absolute)
+            if isinstance(configured_absolute, int | float)
+            and not isinstance(configured_absolute, bool)
+            else context.timeout_seconds
+        )
+        elapsed_seconds = max(0.0, context.timeout_seconds - initial_remaining)
+        delivery_deadline = deadline_from_routing(
+            context.routing_decision,
+            now=loop_time,
+            initial_seconds=initial_remaining,
+            restored_absolute_seconds=max(
+                0.001,
+                absolute_seconds - elapsed_seconds,
+            ),
+        )
+        deadline = delivery_deadline.deadline
+        batch = initial_batch
+        response = initial_response
+        completion = initial_completion
+        request = initial_request
+        known_files: dict[str, str] = {}
+        summaries: list[str] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        usage_estimated = False
+        progress_units = 0
+        base_messages = request.messages
+        while True:
+            budget_outcome = self._verified_budget_usage(
+                response.usage,
+                prompt_estimate=prompt_estimate,
+                response_text=response.text or "",
+                request_max_output_tokens=request.max_output_tokens,
+                context_token_budget=context.token_budget,
+            )
+            if budget_outcome.usage is None:
+                _raise_execution_error(
+                    budget_outcome.error_code or "model response budget is unverifiable"
+                )
+            total_prompt_tokens += budget_outcome.usage.prompt_tokens
+            total_completion_tokens += budget_outcome.usage.completion_tokens
+            usage_estimated = usage_estimated or budget_outcome.estimated
+            if total_prompt_tokens + total_completion_tokens > context.token_budget:
+                _raise_execution_error("model response budget exceeds runtime limit")
+            await self._write_workspace_batch(
+                context,
+                batch,
+                known_files=known_files,
+                deadline=deadline,
+            )
+            progress_units += max(1, len(batch.files))
+            delivery_deadline.observe(
+                progress_units=progress_units,
+                now=asyncio.get_running_loop().time(),
+            )
+            deadline = delivery_deadline.deadline
+            if batch.summary:
+                summaries.append(batch.summary)
+            if batch.complete:
+                delivery = await self._finish_workspace_delivery(
+                    context,
+                    known_files=known_files,
+                    deadline=deadline,
+                )
+                return _BatchedWorkspaceOutcome(
+                    delivery=delivery,
+                    summary="\n".join(summaries) or "Project workspace completed.",
+                    usage=TokenUsage(
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=total_completion_tokens,
+                        total_tokens=total_prompt_tokens + total_completion_tokens,
+                    ),
+                    usage_estimated=usage_estimated,
+                    completion=completion,
+                    request=request,
+                    written_paths=tuple(sorted(known_files)),
+                )
+
+            remaining_tokens = context.token_budget - (
+                total_prompt_tokens + total_completion_tokens
+            )
+            remaining_seconds = deadline - asyncio.get_running_loop().time()
+            progress_payload = json.dumps(
+                {
+                    "written_file_count": len(known_files),
+                    "continuation": batch.continuation,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            progress_message = ModelMessage(
+                role="user",
+                content=(
+                    "Continue the same workspace delivery. Return only the next "
+                    "workspace_batch JSON object. Progress: " + progress_payload
+                ),
+            )
+            next_messages = (*base_messages, progress_message)
+            next_prompt_estimate = len(
+                json.dumps(
+                    [
+                        {"role": item.role, "content": item.content}
+                        for item in next_messages
+                    ],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            next_output_tokens = min(
+                initial_request.max_output_tokens,
+                remaining_tokens - next_prompt_estimate,
+            )
+            if remaining_seconds <= 0 or next_output_tokens <= 0:
+                _raise_execution_error("workspace delivery budget is exhausted")
+            request = replace(
+                initial_request,
+                messages=next_messages,
+                timeout_seconds=min(initial_request.timeout_seconds, remaining_seconds),
+                max_output_tokens=next_output_tokens,
+            )
+            prompt_estimate = next_prompt_estimate
+            gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
+            self._active_task = gateway_task
+            try:
+                completion = await gateway_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - redact gateway boundary
+                failure_reason = _gateway_failure_reason(error)
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+                del error
+                _raise_execution_error(failure_reason)
+            validated_completion = self._strict_completion(completion)
+            if validated_completion is None:
+                _raise_execution_error("model response is invalid")
+            completion = validated_completion
+            response = completion.response
+            if response.tool_calls or response.text is None or not response.text.strip():
+                _raise_execution_error("model response is unsupported")
+            next_batch = _workspace_batch_from_model_text(response.text)
+            if next_batch is None:
+                _raise_execution_error("workspace batch is invalid")
+            batch = next_batch
+
+    @staticmethod
+    def _retry_request(
+        request: ModelRequest,
+        *,
+        context: TaskContext,
+        prompt_estimate: int,
+        consumed_tokens: int,
+        deadline: float,
+    ) -> ModelRequest | None:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        remaining_tokens = context.token_budget - consumed_tokens
+        max_output_tokens = min(
+            request.max_output_tokens,
+            remaining_tokens - prompt_estimate,
+        )
+        if remaining_seconds <= 0 or max_output_tokens <= 0:
+            return None
+        return replace(
+            request,
+            timeout_seconds=min(request.timeout_seconds, remaining_seconds),
+            max_output_tokens=max_output_tokens,
+        )
 
     def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         context = self._strict_context(context)
@@ -598,6 +1125,7 @@ class DirectRuntime:
                 submission_ready.set()
                 return await self._gateway.complete_with_context(model_request)
 
+            retry_deadline = asyncio.get_running_loop().time() + context.timeout_seconds
             gateway_task = asyncio.create_task(submit_model(request))
             gateway_task.add_done_callback(lambda _task: submission_ready.set())
             if self._active_token is not token:  # pragma: no cover - defensive
@@ -643,156 +1171,221 @@ class DirectRuntime:
                     "instruction": _event_text_preview(context.request),
                 },
             )
-            gateway_failed = False
-            gateway_failure_reason = "model gateway failed"
             completion: GatewayCompletion | None = None
-            try:
-                completion = await gateway_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - redact the gateway boundary
-                gateway_failure_reason = _gateway_failure_reason(error)
-                error.__traceback__ = None
-                error.__context__ = None
-                error.__cause__ = None
-                del error
-                gateway_failed = True
-            if gateway_failed or completion is None:
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del completion, request, included_source_ids, context
-                _raise_execution_error(gateway_failure_reason)
-
-            validated_completion = self._strict_completion(completion)
-            del completion
-            if validated_completion is None:
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del request, included_source_ids, context
-                _raise_execution_error("model response is invalid")
-            completion = validated_completion
-            del validated_completion
-            response = completion.response
-            if response.tool_calls or response.text is None:
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del response, completion, request, included_source_ids, context
-                _raise_execution_error("model response is unsupported")
-            text = response.text
-            if not text.strip():
-                await self._consume_task_terminal(gateway_task)
-                gateway_task = asyncio.create_task(submit_model(request))
-                gateway_task.add_done_callback(lambda _task: submission_ready.set())
-                self._active_task = gateway_task
-                retry_gateway_failed = False
-                retry_failure_reason = "model gateway failed"
-                retry_completion: GatewayCompletion | None = None
+            response: ModelResponse | None = None
+            text = ""
+            attempt_count = 0
+            consumed_retry_tokens = 0
+            failure_fingerprints: dict[str, int] = {}
+            while True:
+                attempt_count += 1
                 try:
-                    retry_completion = await gateway_task
+                    completion = await gateway_task
                 except asyncio.CancelledError:
                     raise
-                except Exception as error:  # noqa: BLE001 - redact retry boundary
-                    retry_failure_reason = _gateway_failure_reason(error)
+                except Exception as error:  # noqa: BLE001 - redact gateway boundary
+                    failure_reason = _gateway_failure_reason(error)
+                    fingerprint = _failure_fingerprint(error)
+                    fingerprint_count = failure_fingerprints.get(fingerprint, 0) + 1
+                    failure_fingerprints[fingerprint] = fingerprint_count
+                    retryable = _retryable_gateway_failure(error)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
                     del error
-                    retry_gateway_failed = True
-                if retry_gateway_failed or retry_completion is None:
+                    await self._consume_task_terminal(gateway_task)
                     self._active_task = None
                     gateway_task = None
-                    del text, response, completion, request, included_source_ids, context
-                    _raise_execution_error(retry_failure_reason)
-                retry_validated = self._strict_completion(retry_completion)
-                del retry_completion
-                if retry_validated is None:
+                    consumed_retry_tokens += prompt_estimate
+                    retry_request = self._retry_request(
+                        request,
+                        context=context,
+                        prompt_estimate=prompt_estimate,
+                        consumed_tokens=consumed_retry_tokens,
+                        deadline=retry_deadline,
+                    )
+                    if (
+                        not retryable
+                        or fingerprint_count >= 2
+                        or attempt_count >= self._available_model_attempts
+                        or retry_request is None
+                    ):
+                        del completion, request, included_source_ids, context
+                        _raise_execution_error(failure_reason)
+                    request = retry_request
+                    gateway_task = asyncio.create_task(submit_model(request))
+                    gateway_task.add_done_callback(lambda _task: submission_ready.set())
+                    self._active_task = gateway_task
+                    continue
+                if completion is None:
                     self._active_task = None
                     gateway_task = None
-                    del text, response, completion, request, included_source_ids, context
+                    del request, included_source_ids, context
+                    _raise_execution_error("model gateway failed")
+                validated_completion = self._strict_completion(completion)
+                del completion
+                if validated_completion is None:
+                    await self._consume_task_terminal(gateway_task)
+                    self._active_task = None
+                    gateway_task = None
+                    del request, included_source_ids, context
                     _raise_execution_error("model response is invalid")
-                completion = retry_validated
-                del retry_validated
+                completion = validated_completion
+                del validated_completion
                 response = completion.response
                 if response.tool_calls or response.text is None:
+                    await self._consume_task_terminal(gateway_task)
                     self._active_task = None
                     gateway_task = None
-                    del text, response, completion, request, included_source_ids, context
+                    del response, completion, request, included_source_ids, context
                     _raise_execution_error("model response is unsupported")
                 text = response.text
-                if not text.strip():
+                if text.strip():
+                    break
+                fingerprint = "empty_response"
+                fingerprint_count = failure_fingerprints.get(fingerprint, 0) + 1
+                failure_fingerprints[fingerprint] = fingerprint_count
+                consumed_retry_tokens += (
+                    response.usage.total_tokens
+                    if response.usage is not None
+                    else prompt_estimate
+                )
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                retry_request = self._retry_request(
+                    request,
+                    context=context,
+                    prompt_estimate=prompt_estimate,
+                    consumed_tokens=consumed_retry_tokens,
+                    deadline=retry_deadline,
+                )
+                if (
+                    fingerprint_count >= 2
+                    or attempt_count >= self._available_model_attempts
+                    or retry_request is None
+                ):
+                    del text, response, completion, request, included_source_ids, context
+                    _raise_execution_error("model response text is empty")
+                request = retry_request
+                gateway_task = asyncio.create_task(submit_model(request))
+                gateway_task.add_done_callback(lambda _task: submission_ready.set())
+                self._active_task = gateway_task
+            workspace_delivery: Mapping[str, JsonValue] | None = None
+            batch = (
+                _workspace_batch_from_model_text(text)
+                if self._capability_gateway is not None
+                and _is_workspace_project_delivery(context)
+                else None
+            )
+            if batch is not None:
+                batched = await self._deliver_workspace_batches(
+                    context,
+                    initial_batch=batch,
+                    initial_response=response,
+                    initial_completion=completion,
+                    initial_request=request,
+                    prompt_estimate=prompt_estimate,
+                    deadline=retry_deadline,
+                )
+                workspace_delivery = batched.delivery
+                text = batched.summary
+                budget_usage = batched.usage
+                usage_estimated = batched.usage_estimated
+                usage_completion_exceeded_request = False
+                completion = batched.completion
+                request = batched.request
+                if (
+                    context.routing_decision.get("website_preview_required") is True
+                    and not any(
+                        path.casefold() in {"preview.html", "index.html"}
+                        for path in batched.written_paths
+                    )
+                ):
+                    _raise_execution_error("website preview entry is missing")
+                extracted_workspace_bundle = None
+                incremental_workspace_delivery = False
+            else:
+                extracted_workspace_bundle = _project_scale_workspace_bundle_from_model_text(text)
+                if extracted_workspace_bundle is None:
+                    extracted_workspace_bundle = _website_preview_workspace_bundle_from_model_text(
+                        text,
+                        context,
+                    )
+                if (
+                    context.routing_decision.get("website_preview_required") is True
+                    and extracted_workspace_bundle is not None
+                    and not _workspace_bundle_has_website_preview(extracted_workspace_bundle)
+                ):
+                    await self._consume_task_terminal(gateway_task)
                     self._active_task = None
                     gateway_task = None
                     del text, response, completion, request, included_source_ids, context
-                    _raise_execution_error("model response text is empty")
-            extracted_workspace_bundle = _project_scale_workspace_bundle_from_model_text(text)
-            if extracted_workspace_bundle is None:
-                extracted_workspace_bundle = _website_preview_workspace_bundle_from_model_text(
-                    text,
-                    context,
+                    _raise_execution_error("website preview entry is missing")
+                if (
+                    extracted_workspace_bundle is None
+                    and _is_workspace_project_delivery(context)
+                    and len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
+                ):
+                    extracted_workspace_bundle = _normalized_workspace_bundle(
+                        {"files": {"DIRECT_RESPONSE.md": text}}
+                    )
+                incremental_workspace_delivery = (
+                    extracted_workspace_bundle is not None
+                    and _requires_incremental_workspace_delivery(extracted_workspace_bundle)
                 )
-            if (
-                context.routing_decision.get("website_preview_required") is True
-                and extracted_workspace_bundle is not None
-                and not _workspace_bundle_has_website_preview(extracted_workspace_bundle)
-            ):
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del text, response, completion, request, included_source_ids, context
-                _raise_execution_error("website preview entry is missing")
-            output_byte_limit = (
-                _MAX_PROJECT_SCALE_OUTPUT_BYTES
-                if extracted_workspace_bundle is not None
-                else _max_output_bytes_for_context(context)
-            )
-            if len(text.encode("utf-8")) > output_byte_limit:
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del (
-                    extracted_workspace_bundle,
-                    output_byte_limit,
-                    text,
-                    response,
-                    completion,
-                    request,
-                    included_source_ids,
-                    context,
+                output_byte_limit = (
+                    _MAX_MODEL_RESPONSE_BYTES
+                    if incremental_workspace_delivery
+                    else _INLINE_PROJECT_OUTPUT_WATERLINE_BYTES
+                    if extracted_workspace_bundle is not None
+                    else _max_output_bytes_for_context(context)
                 )
-                _raise_execution_error("model response is invalid")
-            del output_byte_limit
-            budget_outcome = self._verified_budget_usage(
-                response.usage,
-                prompt_estimate=prompt_estimate,
-                response_text=text,
-                request_max_output_tokens=request.max_output_tokens,
-                context_token_budget=context.token_budget,
-            )
-            if budget_outcome.usage is None:
-                budget_error_code = (
-                    budget_outcome.error_code or "model response budget is unverifiable"
+                if len(text.encode("utf-8")) > output_byte_limit:
+                    await self._consume_task_terminal(gateway_task)
+                    self._active_task = None
+                    gateway_task = None
+                    del (
+                        extracted_workspace_bundle,
+                        output_byte_limit,
+                        text,
+                        response,
+                        completion,
+                        request,
+                        included_source_ids,
+                        context,
+                    )
+                    _raise_execution_error("model response is invalid")
+                del output_byte_limit
+                budget_outcome = self._verified_budget_usage(
+                    response.usage,
+                    prompt_estimate=prompt_estimate,
+                    response_text=text,
+                    request_max_output_tokens=request.max_output_tokens,
+                    context_token_budget=context.token_budget,
                 )
-                await self._consume_task_terminal(gateway_task)
-                self._active_task = None
-                gateway_task = None
-                del (
-                    budget_outcome,
-                    text,
-                    response,
-                    completion,
-                    request,
-                    included_source_ids,
-                    context,
+                if budget_outcome.usage is None:
+                    budget_error_code = (
+                        budget_outcome.error_code or "model response budget is unverifiable"
+                    )
+                    await self._consume_task_terminal(gateway_task)
+                    self._active_task = None
+                    gateway_task = None
+                    del (
+                        budget_outcome,
+                        text,
+                        response,
+                        completion,
+                        request,
+                        included_source_ids,
+                        context,
+                    )
+                    _raise_execution_error(budget_error_code)
+                budget_usage = budget_outcome.usage
+                usage_estimated = budget_outcome.estimated
+                usage_completion_exceeded_request = (
+                    budget_outcome.completion_exceeded_request
                 )
-                _raise_execution_error(budget_error_code)
-            budget_usage = budget_outcome.usage
-            usage_estimated = budget_outcome.estimated
-            usage_completion_exceeded_request = (
-                budget_outcome.completion_exceeded_request
-            )
 
             is_project_scale_capability = _is_project_scale_capability_request(context.request)
             project_scale_workspace_bundle = extracted_workspace_bundle
@@ -810,6 +1403,15 @@ class DirectRuntime:
                 gateway_task = None
                 del text, response, completion, request, included_source_ids, context
                 _raise_execution_error("project-scale workspace bundle is missing")
+            if (
+                project_scale_workspace_bundle is not None
+                and incremental_workspace_delivery
+            ):
+                workspace_delivery = await self._deliver_workspace_incrementally(
+                    context,
+                    project_scale_workspace_bundle,
+                )
+                project_scale_workspace_bundle = None
             artifact_text_preview = _event_text_preview(text)
             artifact_failed = False
             artifact: Artifact | None = None
@@ -820,6 +1422,12 @@ class DirectRuntime:
                     artifact_type = "tool_result"
                     artifact_content = {
                         "workspace_bundle": project_scale_workspace_bundle,
+                        "summary": artifact_text_preview,
+                    }
+                elif workspace_delivery is not None:
+                    artifact_type = "tool_result"
+                    artifact_content = {
+                        "workspace_delivery": workspace_delivery,
                         "summary": artifact_text_preview,
                     }
                 else:
@@ -858,6 +1466,7 @@ class DirectRuntime:
                     context,
                     is_project_scale_capability,
                     project_scale_workspace_bundle,
+                    workspace_delivery,
                     artifact_text_preview,
                     artifact_content,
                     artifact_type,
@@ -936,6 +1545,9 @@ class DirectRuntime:
             if project_scale_workspace_bundle is not None:
                 artifact_payload["workspace_bundle"] = project_scale_workspace_bundle
                 completed_payload["workspace_bundle"] = project_scale_workspace_bundle
+            if workspace_delivery is not None:
+                artifact_payload["workspace_delivery"] = workspace_delivery
+                completed_payload["workspace_delivery"] = workspace_delivery
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2 + injection_offset,
@@ -1038,10 +1650,7 @@ class DirectRuntime:
     def _build_prompt(
         self, context: TaskContext
     ) -> _PromptOutcome:
-        prior: list[dict[str, object]] = []
-        included_source_ids: list[str] = []
-        artifact: Artifact | None = None
-        text: object = None
+        included_source_ids: tuple[str, ...] = ()
         task_payload: str | None = None
         prior_payload: str | None = None
         hermes_context: str | None = None
@@ -1053,24 +1662,7 @@ class DirectRuntime:
         messages: tuple[ModelMessage, ...] | None = None
         error_code: str | None = None
         try:
-            for artifact in context.artifacts:
-                if artifact.type != "text":
-                    continue
-                text = artifact.content.get("text")
-                if type(text) is not str:
-                    continue
-                prior.append(
-                    {
-                        "id": str(artifact.id),
-                        "producer": artifact.producer,
-                        "content_sha256": artifact.content_sha256,
-                        "text": _truncate_prompt_text(
-                            text,
-                            max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
-                        ),
-                    }
-                )
-                included_source_ids.append(str(artifact.id))
+            prior_payload, included_source_ids = _serialized_prior_artifacts(context.artifacts)
             task_payload = json.dumps(
                 {"request": context.request},
                 ensure_ascii=False,
@@ -1078,13 +1670,6 @@ class DirectRuntime:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            prior_payload = json.dumps(
-                prior,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).replace("<", "\\u003c").replace(">", "\\u003e")
             hermes_context = runtime_memory_context_text(context.routing_decision)
             repair_context = self_repair_context_text(context.routing_decision)
             preflight_context = project_preflight_context_text(context.routing_decision)
@@ -1093,12 +1678,24 @@ class DirectRuntime:
             )
             project_delivery_context = ""
             if _is_workspace_project_delivery(context):
-                project_delivery_context = (
-                    "PROJECT_DELIVERY_CONTRACT: Return the complete deliverable as strict JSON "
-                    "with workspace_bundle.files mapping safe relative paths to full UTF-8 file "
-                    "contents, or Markdown file blocks headed with an exact relative file path. "
-                    "Keep the chat summary concise instead of pasting unrelated prose. "
-                )
+                if self._capability_gateway is not None:
+                    project_delivery_context = (
+                        "PROJECT_DELIVERY_CONTRACT: Build the deliverable in coherent batches. "
+                        "Return strict JSON with workspace_batch.files mapping safe relative paths "
+                        "to complete UTF-8 file contents, workspace_batch.complete as a boolean, "
+                        "workspace_batch.continuation as compact state for the next batch, and a "
+                        "concise top-level summary. Do not repeat unchanged files. Set complete=true "
+                        "only after source, tests, documentation, and required preview files are all "
+                        "included across the batches. The runtime writes each batch immediately and "
+                        "will ask for the next batch while time and token budgets remain. "
+                    )
+                else:
+                    project_delivery_context = (
+                        "PROJECT_DELIVERY_CONTRACT: Return the complete deliverable as strict JSON "
+                        "with workspace_bundle.files mapping safe relative paths to full UTF-8 file "
+                        "contents, or Markdown file blocks headed with an exact relative file path. "
+                        "Keep the chat summary concise instead of pasting unrelated prose. "
+                    )
                 if context.routing_decision.get("website_preview_required") is True:
                     project_delivery_context += (
                         "Include a self-contained preview.html (or index.html) that demonstrates "
@@ -1149,17 +1746,14 @@ class DirectRuntime:
         if error_code is None and messages is not None and serialized_messages is not None:
             outcome = _PromptOutcome(
                 messages=messages,
-                included_source_ids=tuple(included_source_ids),
+                included_source_ids=included_source_ids,
                 prompt_estimate=len(serialized_messages.encode("utf-8")),
             )
         else:
             outcome = _PromptOutcome(error_code=error_code or "runtime prompt is invalid")
         del (
             context,
-            prior,
             included_source_ids,
-            artifact,
-            text,
             task_payload,
             prior_payload,
             hermes_context,
@@ -1372,7 +1966,7 @@ class DirectRuntime:
             and type(artifact_sha256) is str
             and _SHA256.fullmatch(artifact_sha256) is not None
             and type(state["next_sequence"]) is int
-            and state["next_sequence"] in (4, 5)
+            and state["next_sequence"] in (3, 4, 5)
         )
 
     async def cancel(self) -> None:

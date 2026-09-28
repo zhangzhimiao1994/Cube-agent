@@ -29,8 +29,8 @@ from uuid import UUID, uuid4
 import autogen_agentchat
 import autogen_core
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import ChatAgent, TaskResult, Team
-from autogen_agentchat.messages import BaseChatMessage
+from autogen_agentchat.base import ChatAgent, TaskResult, Team, TerminationCondition
+from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, StopMessage
 from autogen_agentchat.teams import SelectorGroupChat
 from autogen_core import CancellationToken, FunctionCall, SingleThreadedAgentRuntime
 from autogen_core.models import (
@@ -64,6 +64,7 @@ from agent_hub.models.types import (
     TokenUsage,
 )
 from agent_hub.models.types import ToolCall as GatewayToolCall
+from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
     ArtifactRepository,
@@ -89,9 +90,15 @@ from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
-_RUNTIME_VERSION = "1"
+_RUNTIME_VERSION = "2"
+_LEGACY_RUNTIME_VERSION = "1"
 _AUTOGEN_VERSION = "0.7.5"
 _MAX_MESSAGES = 128
+_MESSAGE_COMPACTION_WATERMARK = 112
+_MESSAGE_COMPACTION_TARGET = 96
+_MIN_MODEL_TOKENS_PER_TURN = 2
+_MIN_SECONDS_PER_TURN = 1.0
+_CHECKPOINT_ARTIFACT_WINDOW = 64
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_PAYLOAD_BYTES = 65_536
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
@@ -149,6 +156,76 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     if not stripped:
         return None
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
+
+
+def _compact_llm_messages(messages: Sequence[LLMMessage]) -> tuple[LLMMessage, ...]:
+    history = tuple(messages)
+    if len(history) <= _MESSAGE_COMPACTION_WATERMARK:
+        return history
+    head_indexes: list[int] = []
+    for index, message in enumerate(history[:8]):
+        if not isinstance(message, SystemMessage):
+            break
+        head_indexes.append(index)
+    first_user_index = next(
+        (index for index, message in enumerate(history) if isinstance(message, UserMessage)),
+        None,
+    )
+    if first_user_index is not None and first_user_index not in head_indexes:
+        head_indexes.append(first_user_index)
+    head_indexes.sort()
+    head_index_set = set(head_indexes)
+    tail_count = max(1, _MESSAGE_COMPACTION_TARGET - len(head_indexes) - 1)
+    tail_indexes = [
+        index
+        for index in range(len(history) - 1, -1, -1)
+        if index not in head_index_set
+    ][:tail_count]
+    tail_indexes.reverse()
+    retained_tail = tuple(history[index] for index in tail_indexes)
+    retained_indexes = head_index_set | set(tail_indexes)
+    compacted = tuple(
+        message for index, message in enumerate(history) if index not in retained_indexes
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "type": type(message).__name__,
+                    "source": getattr(message, "source", ""),
+                    "content": str(message.content),
+                }
+                for message in compacted
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    samples = [
+        {
+            "type": type(message).__name__,
+            "source": getattr(message, "source", ""),
+            "preview": _truncate_prompt_text(str(message.content), max_bytes=256),
+        }
+        for message in compacted[-8:]
+    ]
+    summary = UserMessage(
+        content="COMPRESSED_DISCUSSION_HISTORY_JSON="
+        + json.dumps(
+            {
+                "compacted_messages": len(compacted),
+                "sha256": digest,
+                "recent_samples": samples,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        source="user",
+    )
+    retained_head = tuple(history[index] for index in head_indexes)
+    return (*retained_head, summary, *retained_tail)
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -740,7 +817,7 @@ class DiscussionPlan:
             or not 1 <= self.selector_max_output_tokens <= 1_000_000
         ):
             raise ValueError("selector output limit is invalid")
-        if type(self.max_turns) is not int or not 1 <= self.max_turns <= 64:
+        if type(self.max_turns) is not int or self.max_turns < 1:
             raise ValueError("max turns is invalid")
         if (
             isinstance(self.wall_time_seconds, bool)
@@ -788,6 +865,271 @@ class DiscussionPlan:
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+def _discussion_hard_turn_limit(
+    plan: DiscussionPlan,
+    context: TaskContext,
+    used_tokens: int,
+) -> int:
+    remaining_tokens = max(
+        0,
+        min(plan.token_budget, context.token_budget) - max(0, used_tokens),
+    )
+    token_capacity = max(1, remaining_tokens // _MIN_MODEL_TOKENS_PER_TURN)
+    remaining_seconds = min(plan.wall_time_seconds, context.timeout_seconds)
+    time_capacity = max(1, int(remaining_seconds // _MIN_SECONDS_PER_TURN))
+    return min(token_capacity, time_capacity)
+
+
+def _checkpoint_wall_time_seconds(
+    plan: DiscussionPlan,
+    context: TaskContext,
+    checkpoint: RuntimeCheckpoint | None,
+) -> float:
+    wall_seconds = min(plan.wall_time_seconds, context.timeout_seconds)
+    if checkpoint is None or checkpoint.runtime_version == _LEGACY_RUNTIME_VERSION:
+        return wall_seconds
+    remaining = checkpoint.state["remaining_timeout_seconds"]
+    if isinstance(remaining, bool) or not isinstance(remaining, int | float):
+        raise RuntimeExecutionError("runtime checkpoint is incompatible")
+    return min(wall_seconds, float(remaining))
+
+
+def _bounded_checkpoint_artifacts(
+    artifacts: Sequence[Artifact],
+) -> tuple[Artifact, ...]:
+    unique: dict[UUID, Artifact] = {}
+    for artifact in artifacts:
+        unique[artifact.id] = artifact
+    ordered = tuple(unique.values())
+    if len(ordered) <= _CHECKPOINT_ARTIFACT_WINDOW:
+        return ordered
+    return (ordered[0], *ordered[-(_CHECKPOINT_ARTIFACT_WINDOW - 1) :])
+
+
+def _bounded_source_ids(artifacts: Sequence[Artifact]) -> tuple[str, ...]:
+    ordered = tuple(dict.fromkeys(str(artifact.id) for artifact in artifacts))
+    if len(ordered) <= _CHECKPOINT_ARTIFACT_WINDOW:
+        return ordered
+    return (ordered[0], *ordered[-(_CHECKPOINT_ARTIFACT_WINDOW - 1) :])
+
+
+@dataclass(slots=True)
+class _DiscussionControl:
+    soft_limit: int
+    hard_limit: int
+    extension_size: int
+    turns: int = 0
+    seen_participants: set[str] = field(default_factory=set)
+    seen_outputs: set[str] = field(default_factory=set)
+    progress_since_extension: bool = False
+    last_error_fingerprint: str | None = None
+    repeated_error_count: int = 0
+    progress_units: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        plan: DiscussionPlan,
+        context: TaskContext,
+        usage: DiscussionUsage,
+    ) -> _DiscussionControl:
+        hard_limit = _discussion_hard_turn_limit(plan, context, usage.tokens)
+        return cls(
+            soft_limit=min(plan.max_turns, hard_limit),
+            hard_limit=hard_limit,
+            extension_size=max(1, len(plan.participants)),
+        )
+
+    @classmethod
+    def from_state(
+        cls,
+        state: object,
+        plan: DiscussionPlan,
+        context: TaskContext,
+        usage: DiscussionUsage,
+    ) -> _DiscussionControl:
+        del usage
+        required_state = {
+            "soft_limit",
+            "hard_limit",
+            "extension_size",
+            "turns",
+            "seen_participants",
+            "seen_outputs",
+            "progress_since_extension",
+            "last_error_fingerprint",
+            "repeated_error_count",
+        }
+        if (
+            not isinstance(state, Mapping)
+            or not required_state <= set(state) <= required_state | {"progress_units"}
+        ):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        soft_limit = state["soft_limit"]
+        hard_limit = state["hard_limit"]
+        extension_size = state["extension_size"]
+        turns = state["turns"]
+        seen_participants = state["seen_participants"]
+        seen_outputs = state["seen_outputs"]
+        progress_since_extension = state["progress_since_extension"]
+        last_error_fingerprint = state["last_error_fingerprint"]
+        repeated_error_count = state["repeated_error_count"]
+        progress_units = state.get("progress_units", len(seen_participants))
+        if (
+            type(soft_limit) is not int
+            or type(hard_limit) is not int
+            or type(extension_size) is not int
+            or type(turns) is not int
+            or not 1 <= soft_limit <= hard_limit
+            or hard_limit > _discussion_hard_turn_limit(plan, context, 0)
+            or extension_size != max(1, len(plan.participants))
+            or not 0 <= turns <= hard_limit
+            or not isinstance(seen_participants, tuple)
+            or not isinstance(seen_outputs, tuple)
+            or len(seen_participants) > len(plan.participants)
+            or len(seen_outputs) > _MESSAGE_COMPACTION_TARGET
+            or any(type(item) is not str for item in seen_participants)
+            or any(type(item) is not str for item in seen_outputs)
+            or type(progress_since_extension) is not bool
+            or (last_error_fingerprint is not None and type(last_error_fingerprint) is not str)
+            or type(repeated_error_count) is not int
+            or not 0 <= repeated_error_count <= 2
+            or type(progress_units) is not int
+            or progress_units < 0
+        ):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        return cls(
+            soft_limit=soft_limit,
+            hard_limit=hard_limit,
+            extension_size=extension_size,
+            turns=turns,
+            seen_participants=set(seen_participants),
+            seen_outputs=set(seen_outputs),
+            progress_since_extension=progress_since_extension,
+            last_error_fingerprint=last_error_fingerprint,
+            repeated_error_count=repeated_error_count,
+            progress_units=progress_units,
+        )
+
+    @classmethod
+    def from_legacy_transcript(
+        cls,
+        plan: DiscussionPlan,
+        context: TaskContext,
+        usage: DiscussionUsage,
+        artifacts: Sequence[Artifact],
+    ) -> _DiscussionControl:
+        control = cls.create(plan, context, usage)
+        for artifact in artifacts[: control.hard_limit]:
+            text = artifact.content.get("text")
+            if artifact.type == "text" and type(text) is str:
+                control.observe(artifact.producer, text)
+        control.turns = min(control.turns, control.hard_limit)
+        control.soft_limit = min(
+            control.hard_limit,
+            max(control.soft_limit, control.turns + control.extension_size),
+        )
+        control.progress_since_extension = False
+        control.last_error_fingerprint = None
+        control.repeated_error_count = 0
+        return control
+
+    def observe(self, participant: str, text: str) -> str | None:
+        normalized = " ".join(text.casefold().split())
+        fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
+        self.turns += 1
+        progressed = participant not in self.seen_participants or (
+            fingerprint not in self.seen_outputs
+            and any(
+                marker in normalized
+                for marker in ("[evidence]", "[consensus]", "[complete]")
+            )
+        )
+        self.seen_participants.add(participant)
+        self.seen_outputs.add(fingerprint)
+        if len(self.seen_outputs) > _MESSAGE_COMPACTION_TARGET:
+            self.seen_outputs = {
+                fingerprint,
+                *sorted(self.seen_outputs)[-(_MESSAGE_COMPACTION_TARGET - 1) :],
+            }
+        if progressed:
+            self.progress_since_extension = True
+            self.progress_units += 1
+
+        if re.search(r"(?:\berror\b|\bfail(?:ed|ure)?\b|\btimeout\b|错误|失败|超时)", normalized):
+            if fingerprint == self.last_error_fingerprint:
+                self.repeated_error_count += 1
+            else:
+                self.last_error_fingerprint = fingerprint
+                self.repeated_error_count = 1
+            if self.repeated_error_count >= 2:
+                return "repeated_error"
+        else:
+            self.last_error_fingerprint = None
+            self.repeated_error_count = 0
+
+        if self.turns >= self.hard_limit:
+            return "resource_limit"
+        if self.turns < self.soft_limit:
+            return None
+        if not self.progress_since_extension:
+            return "no_progress"
+        self.soft_limit = min(
+            self.hard_limit,
+            self.soft_limit + self.extension_size,
+        )
+        self.progress_since_extension = False
+        return None
+
+    def to_state(self) -> dict[str, JsonValue]:
+        return {
+            "soft_limit": self.soft_limit,
+            "hard_limit": self.hard_limit,
+            "extension_size": self.extension_size,
+            "turns": self.turns,
+            "seen_participants": tuple(sorted(self.seen_participants)),
+            "seen_outputs": tuple(sorted(self.seen_outputs)),
+            "progress_since_extension": self.progress_since_extension,
+            "last_error_fingerprint": self.last_error_fingerprint,
+            "repeated_error_count": self.repeated_error_count,
+            "progress_units": self.progress_units,
+        }
+
+
+@dataclass(slots=True)
+class _AdaptiveDiscussionTermination(TerminationCondition):
+    base: CompositeDiscussionTermination
+    control: _DiscussionControl
+    participants: frozenset[str]
+    reason: str | None = field(default=None, init=False)
+
+    @property
+    def terminated(self) -> bool:
+        return self.reason is not None or self.base.terminated
+
+    async def __call__(
+        self,
+        messages: Sequence[BaseAgentEvent | BaseChatMessage],
+    ) -> StopMessage | None:
+        base_stop = await self.base(messages)
+        if base_stop is not None:
+            self.reason = (
+                "resource_limit" if self.base.reason == "max_turns" else self.base.reason
+            )
+            return StopMessage(content=self.reason or "terminated", source="agent_hub")
+        for message in messages:
+            if not isinstance(message, BaseChatMessage) or message.source not in self.participants:
+                continue
+            self.reason = self.control.observe(message.source, message.to_text())
+            if self.reason is not None:
+                return StopMessage(content=self.reason, source="agent_hub")
+        return None
+
+    async def reset(self) -> None:
+        self.reason = None
+        await self.base.reset()
 
 
 class _DynamicToolArguments(BaseModel):
@@ -1149,7 +1491,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         del tool_choice, extra_create_args
         if json_output not in {None, False}:
             raise RuntimeExecutionError("unsupported AutoGen model request")
-        normalized = tuple(self._message(message) for message in messages)
+        compacted_messages = _compact_llm_messages(messages)
+        normalized = tuple(self._message(message) for message in compacted_messages)
         if not normalized or len(normalized) > _MAX_MESSAGES:
             raise RuntimeExecutionError("AutoGen message history is invalid")
         request = ModelRequest(
@@ -1393,6 +1736,9 @@ class AutoGenDiscussionRuntime:
         self._restored: RuntimeCheckpoint | None = None
         self._pending_artifact_writes: dict[UUID, ArtifactReference] = {}
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._discussion_control: _DiscussionControl | None = None
+        self._wall_deadline: float | None = None
+        self._wall_budget: AdaptiveDeadline | None = None
         self.last_team: SelectorGroupChat | None = None
 
     @property
@@ -1455,6 +1801,44 @@ class AutoGenDiscussionRuntime:
             )
             sequence += 1
             usage = self._restored_usage(restored)
+            discussion_control = (
+                _DiscussionControl.from_state(
+                    restored.state["discussion_control"],
+                    self._plan,
+                    context,
+                    usage,
+                )
+                if restored is not None
+                and restored.runtime_version == _RUNTIME_VERSION
+                else _DiscussionControl.create(self._plan, context, usage)
+            )
+            if restored is not None and restored.runtime_version == _LEGACY_RUNTIME_VERSION:
+                discussion_control = _DiscussionControl.from_legacy_transcript(
+                    self._plan,
+                    context,
+                    usage,
+                    message_artifacts,
+                )
+            self._discussion_control = discussion_control
+            wall_seconds = _checkpoint_wall_time_seconds(self._plan, context, restored)
+            restored_absolute_seconds: float | None = None
+            if restored is not None and restored.runtime_version == _RUNTIME_VERSION:
+                restored_absolute = restored.state.get(
+                    "remaining_absolute_timeout_seconds"
+                )
+                if isinstance(restored_absolute, int | float) and not isinstance(
+                    restored_absolute, bool
+                ):
+                    restored_absolute_seconds = float(restored_absolute)
+            loop_time = asyncio.get_running_loop().time()
+            self._wall_budget = deadline_from_routing(
+                context.routing_decision,
+                now=loop_time,
+                initial_seconds=max(0.001, wall_seconds),
+                restored_absolute_seconds=restored_absolute_seconds,
+                progress_units=discussion_control.progress_units,
+            )
+            self._wall_deadline = self._wall_budget.deadline
 
             async def publish_ledger_checkpoint(
                 durable_artifacts: tuple[Artifact, ...],
@@ -1496,14 +1880,18 @@ class AutoGenDiscussionRuntime:
                 self._cancel_token is None
                 or (self._cancel_token.is_cancelled() and not wall_expired.is_set())
             )
-            termination = CompositeDiscussionTermination(
-                usage=usage,
-                max_turns=self._plan.max_turns,
-                token_budget=min(self._plan.token_budget, context.token_budget),
-                cost_budget_usd=self._plan.cost_budget_usd,
-                wall_time_seconds=min(self._plan.wall_time_seconds, context.timeout_seconds),
-                consensus_votes=self._plan.consensus_votes,
-                cancelled=cancelled,
+            termination = _AdaptiveDiscussionTermination(
+                base=CompositeDiscussionTermination(
+                    usage=usage,
+                    max_turns=discussion_control.hard_limit,
+                    token_budget=min(self._plan.token_budget, context.token_budget),
+                    cost_budget_usd=self._plan.cost_budget_usd,
+                    wall_time_seconds=wall_seconds,
+                    consensus_votes=self._plan.consensus_votes,
+                    cancelled=cancelled,
+                ),
+                control=discussion_control,
+                participants=frozenset(self.participant_ids),
             )
             clients = {
                 participant.id: GatewayChatCompletionClient(
@@ -1612,16 +2000,15 @@ class AutoGenDiscussionRuntime:
                 agents,
                 selector,
                 termination_condition=termination,
-                max_turns=self._plan.max_turns,
+                max_turns=discussion_control.hard_limit,
                 # Keep selection model-mediated even with two participants; policy still
                 # constrains candidates through the published participant list.
                 allow_repeated_speaker=True,
                 runtime=framework_runtime,
             )
             self.last_team = team
-            source_ids = tuple(str(item.id) for item in (*context.artifacts, *message_artifacts))
+            source_ids = _bounded_source_ids((*context.artifacts, *message_artifacts))
             reason: str | None = None
-            wall_seconds = min(self._plan.wall_time_seconds, context.timeout_seconds)
 
             def expire_wall_time() -> None:
                 wall_expired.set()
@@ -1630,7 +2017,20 @@ class AutoGenDiscussionRuntime:
                 if self._cancel_event is not None:
                     self._cancel_event.set()
 
-            wall_handle = asyncio.get_running_loop().call_later(wall_seconds, expire_wall_time)
+            deadline = self._wall_deadline
+            if deadline is None:
+                raise RuntimeExecutionError("discussion wall deadline is unavailable")
+            wall_budget = self._wall_budget
+            if wall_budget is None:
+                raise RuntimeExecutionError("discussion wall budget is unavailable")
+            wall_handle = asyncio.get_running_loop().call_later(
+                max(
+                    0.0,
+                    wall_budget.absolute_deadline
+                    - asyncio.get_running_loop().time(),
+                ),
+                expire_wall_time,
+            )
             framework_runtime.start()
             framework_failed = False
             framework_timed_out = False
@@ -1639,10 +2039,14 @@ class AutoGenDiscussionRuntime:
                     task=self._task_text(context, tuple(message_artifacts)),
                     cancellation_token=self._cancel_token,
                 )
-                deadline = asyncio.get_running_loop().time() + wall_seconds
                 while True:
                     item_task: asyncio.Task[Any] = asyncio.create_task(anext(stream))
                     while not item_task.done():
+                        deadline = self._wall_deadline
+                        if deadline is None:
+                            raise RuntimeExecutionError(
+                                "discussion wall deadline is unavailable"
+                            )
                         remaining = deadline - asyncio.get_running_loop().time()
                         if remaining <= 0:
                             framework_timed_out = True
@@ -1738,15 +2142,6 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
-                        if _discussion_has_enough_distinct_outputs(
-                            message_artifacts,
-                            participant_count=len(self._plan.participants),
-                            consensus_votes=self._plan.consensus_votes,
-                        ):
-                            reason = "sufficient_discussion"
-                            if self._cancel_token is not None:
-                                self._cancel_token.cancel()
-                            break
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
             except BaseException:
@@ -1961,6 +2356,9 @@ class AutoGenDiscussionRuntime:
             self._active_task = None
             self._cancel_token = None
             self._cancel_event = None
+            self._discussion_control = None
+            self._wall_deadline = None
+            self._wall_budget = None
 
     @staticmethod
     def _task_text(context: TaskContext, transcript: tuple[Artifact, ...] = ()) -> str:
@@ -1993,6 +2391,9 @@ class AutoGenDiscussionRuntime:
             "wall_time",
             "cancelled",
             "max_turns",
+            "no_progress",
+            "repeated_error",
+            "resource_limit",
         }:
             return reason
         if reason and "maximum number of turns" in reason.casefold():
@@ -2138,6 +2539,26 @@ class AutoGenDiscussionRuntime:
         model_ledger: tuple[_LedgerEntry, ...] = (),
         tool_ledger: tuple[_LedgerEntry, ...] = (),
     ) -> RuntimeCheckpoint:
+        discussion_control = self._discussion_control
+        if discussion_control is None:
+            raise RuntimeExecutionError("dynamic discussion control is unavailable")
+        wall_deadline = self._wall_deadline
+        if wall_deadline is None:
+            raise RuntimeExecutionError("discussion wall deadline is unavailable")
+        wall_budget = self._wall_budget
+        loop_time = asyncio.get_running_loop().time()
+        if wall_budget is not None:
+            wall_budget.observe(
+                progress_units=discussion_control.progress_units,
+                now=loop_time,
+            )
+            wall_deadline = wall_budget.deadline
+            self._wall_deadline = wall_deadline
+            remaining_absolute_timeout_seconds = wall_budget.absolute_remaining(
+                now=loop_time
+            )
+        else:
+            remaining_absolute_timeout_seconds = max(0.0, wall_deadline - loop_time)
         return RuntimeCheckpoint(
             id=uuid4(),
             runtime_type=_RUNTIME_TYPE,
@@ -2151,8 +2572,17 @@ class AutoGenDiscussionRuntime:
                 "terminal": terminal,
                 "reason": reason,
                 "next_sequence": next_sequence,
-                "artifact_registry": {str(item.id): item.content_sha256 for item in artifacts},
+                "artifact_registry": {
+                    str(item.id): item.content_sha256
+                    for item in _bounded_checkpoint_artifacts(artifacts)
+                },
                 "usage": {"tokens": usage.tokens, "cost_usd": str(usage.cost_usd)},
+                "discussion_control": discussion_control.to_state(),
+                "remaining_timeout_seconds": max(
+                    0.0,
+                    wall_deadline - loop_time,
+                ),
+                "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
                 "model_ledger": model_ledger,
                 "tool_ledger": tool_ledger,
             },
@@ -2161,7 +2591,8 @@ class AutoGenDiscussionRuntime:
     def _validate_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE
-            or checkpoint.runtime_version != _RUNTIME_VERSION
+            or checkpoint.runtime_version
+            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
             or checkpoint.mode is not self.mode
             or checkpoint.run_id != context.run_id
             or checkpoint.tenant_id != context.tenant_id
@@ -2171,7 +2602,7 @@ class AutoGenDiscussionRuntime:
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         state = checkpoint.state
-        if set(state) != {
+        required_state = {
             "plan_digest",
             "autogen_version",
             "terminal",
@@ -2181,12 +2612,30 @@ class AutoGenDiscussionRuntime:
             "usage",
             "model_ledger",
             "tool_ledger",
-        }:
+        }
+        if checkpoint.runtime_version == _RUNTIME_VERSION:
+            required_state.update(
+                {
+                    "discussion_control",
+                    "remaining_timeout_seconds",
+                }
+            )
+        optional_state = (
+            {"remaining_absolute_timeout_seconds"}
+            if checkpoint.runtime_version == _RUNTIME_VERSION
+            else set()
+        )
+        if not required_state <= set(state) <= required_state | optional_state:
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
         usage = state["usage"]
         model_ledger = state["model_ledger"]
         tool_ledger = state["tool_ledger"]
+        discussion_control = state.get("discussion_control")
+        remaining_timeout_seconds = state.get("remaining_timeout_seconds")
+        remaining_absolute_timeout_seconds = state.get(
+            "remaining_absolute_timeout_seconds"
+        )
         if (
             type(state["terminal"]) is not bool
             or (state["reason"] is not None and type(state["reason"]) is not str)
@@ -2197,6 +2646,30 @@ class AutoGenDiscussionRuntime:
             or not isinstance(usage, Mapping)
             or set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
+            or (
+                checkpoint.runtime_version == _RUNTIME_VERSION
+                and not isinstance(discussion_control, Mapping)
+            )
+            or (
+                checkpoint.runtime_version == _RUNTIME_VERSION
+                and (
+                    isinstance(remaining_timeout_seconds, bool)
+                    or not isinstance(remaining_timeout_seconds, int | float)
+                    or not math.isfinite(remaining_timeout_seconds)
+                    or not 0 <= remaining_timeout_seconds <= 3600
+                    or (
+                        remaining_absolute_timeout_seconds is not None
+                        and (
+                            isinstance(remaining_absolute_timeout_seconds, bool)
+                            or not isinstance(
+                                remaining_absolute_timeout_seconds, int | float
+                            )
+                            or not math.isfinite(remaining_absolute_timeout_seconds)
+                            or not 0 <= remaining_absolute_timeout_seconds <= 3600
+                        )
+                    )
+                )
+            )
             or not isinstance(model_ledger, tuple)
             or not isinstance(tool_ledger, tuple)
             or len(model_ledger) > 64
@@ -2278,7 +2751,10 @@ class AutoGenDiscussionRuntime:
         validated = RuntimeCheckpoint.from_payload(checkpoint.to_payload())
         if (
             validated.runtime_type != _RUNTIME_TYPE
-            or validated.runtime_version != _RUNTIME_VERSION
+            or validated.runtime_version not in {
+                _LEGACY_RUNTIME_VERSION,
+                _RUNTIME_VERSION,
+            }
             or validated.mode is not self.mode
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")

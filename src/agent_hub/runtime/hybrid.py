@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from time import monotonic
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
     ArtifactRepository,
@@ -21,6 +24,7 @@ from agent_hub.runtime.artifacts import (
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -36,7 +40,10 @@ from agent_hub.runtime.generated_file_recovery import (
 )
 
 _RUNTIME_TYPE = "hybrid"
-_RUNTIME_VERSION = "1"
+_RUNTIME_VERSION = "2"
+_LEGACY_RUNTIME_VERSION = "1"
+_MAX_HANDOFF_ARTIFACTS = 64
+_MAX_HANDOFF_ANCHORS = 8
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -78,6 +85,24 @@ class HybridPlan:
         return hashlib.sha256(
             json.dumps({"upgrade": self.upgrade.value}, sort_keys=True).encode()
         ).hexdigest()
+
+
+@dataclass(slots=True)
+class _StageBudget:
+    token_limit: int
+    timeout_limit: float
+    checkpoint_tokens: int = 0
+    checkpoint_token_baseline: int = 0
+    artifact_tokens: int = 0
+    accounted_artifact_ids: set[UUID] = field(default_factory=set)
+
+    @property
+    def consumed_tokens(self) -> int:
+        checkpoint_delta = max(
+            0,
+            self.checkpoint_tokens - self.checkpoint_token_baseline,
+        )
+        return max(checkpoint_delta, self.artifact_tokens)
 
 
 class HybridRuntime:
@@ -125,6 +150,14 @@ class HybridRuntime:
         sequence = 1
         artifacts = list(context.artifacts)
         known = {artifact.id for artifact in artifacts}
+        remaining_tokens = context.token_budget
+        remaining_timeout_seconds = context.timeout_seconds
+        deadline: float | None = None
+        adaptive_deadline: AdaptiveDeadline | None = None
+        timeout_progress_units = 0
+        restored_absolute_timeout_seconds: float | None = None
+        last_child_progress_fingerprint: str | None = None
+        restored_child_checkpoint: RuntimeCheckpoint | None = None
         try:
             restored = self._restored
             if restored is not None:
@@ -146,6 +179,30 @@ class HybridRuntime:
                     )
                     return
                 next_stage = cast(int, restored.state["next_stage"])
+                restored_tokens = restored.state.get("remaining_token_budget")
+                restored_timeout = restored.state.get("remaining_timeout_seconds")
+                restored_absolute_timeout = restored.state.get(
+                    "remaining_absolute_timeout_seconds"
+                )
+                restored_progress_units = restored.state.get("timeout_progress_units")
+                restored_progress_fingerprint = restored.state.get(
+                    "last_child_progress_fingerprint"
+                )
+                if type(restored_tokens) is int:
+                    remaining_tokens = restored_tokens
+                if isinstance(restored_timeout, int | float) and not isinstance(
+                    restored_timeout, bool
+                ):
+                    remaining_timeout_seconds = float(restored_timeout)
+                if isinstance(restored_absolute_timeout, int | float) and not isinstance(
+                    restored_absolute_timeout, bool
+                ):
+                    restored_absolute_timeout_seconds = float(restored_absolute_timeout)
+                if type(restored_progress_units) is int and restored_progress_units >= 0:
+                    timeout_progress_units = restored_progress_units
+                if type(restored_progress_fingerprint) is str:
+                    last_child_progress_fingerprint = restored_progress_fingerprint
+                restored_child_checkpoint = _child_checkpoint_from_state(restored)
             elif context.checkpoint is not None:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
             else:
@@ -155,6 +212,15 @@ class HybridRuntime:
                 await self._repository.put(context.tenant_id, context.run_id, artifact)
 
             stages = self._stages()
+            loop_time = monotonic()
+            adaptive_deadline = deadline_from_routing(
+                context.routing_decision,
+                now=loop_time,
+                initial_seconds=max(0.001, remaining_timeout_seconds),
+                restored_absolute_seconds=restored_absolute_timeout_seconds,
+                progress_units=timeout_progress_units,
+            )
+            deadline = adaptive_deadline.deadline
             if (
                 restored is None
                 and self._plan.upgrade is HybridUpgrade.DISPATCH_TO_HYBRID
@@ -164,13 +230,112 @@ class HybridRuntime:
 
             for stage_index in range(next_stage, len(stages)):
                 child, mode, is_discussion = stages[stage_index]
-                child_events = (
-                    self._run_discussion(context, tuple(artifacts), sequence)
+                child_checkpoint = (
+                    restored_child_checkpoint if stage_index == next_stage else None
+                )
+                stage_timeout = deadline - monotonic()
+                if remaining_tokens < 1:
+                    raise RuntimeExecutionError("hybrid token budget exhausted")
+                if stage_timeout <= 0:
+                    raise RuntimeExecutionError("hybrid timeout budget exhausted")
+                handoff_artifacts = _bounded_handoff_artifacts(
+                    _discussion_handoff_artifacts(tuple(artifacts))
                     if is_discussion
-                    else self._run_child(child, context, mode, tuple(artifacts), sequence)
+                    else tuple(artifacts)
+                )
+                stage_budget = _StageBudget(
+                    token_limit=remaining_tokens,
+                    timeout_limit=stage_timeout,
+                    checkpoint_tokens=(
+                        _reported_tokens(child_checkpoint.state)
+                        if child_checkpoint is not None
+                        else 0
+                    ),
+                    checkpoint_token_baseline=(
+                        _reported_tokens(child_checkpoint.state)
+                        if child_checkpoint is not None
+                        else 0
+                    ),
+                    accounted_artifact_ids=(
+                        {artifact.id for artifact in handoff_artifacts}
+                        if child_checkpoint is not None
+                        else set()
+                    ),
+                )
+                child_events = (
+                    self._run_discussion(
+                        context,
+                        handoff_artifacts,
+                        sequence,
+                        stage_budget,
+                        child_checkpoint,
+                    )
+                    if is_discussion
+                    else self._run_child(
+                        child,
+                        context,
+                        mode,
+                        handoff_artifacts,
+                        sequence,
+                        stage_budget,
+                        child_checkpoint,
+                    )
                 )
                 async for event in child_events:
                     sequence = event.sequence + 1
+                    if event.kind is EventKind.CHECKPOINT_SAVED:
+                        if event.checkpoint is None:
+                            raise RuntimeExecutionError(
+                                "hybrid child checkpoint is unavailable"
+                            )
+                        if stage_budget.consumed_tokens > remaining_tokens:
+                            raise RuntimeExecutionError(
+                                "hybrid child exceeded token budget"
+                            )
+                        child_progress_fingerprint = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "stage": stage_index,
+                                    "state_sha256": event.checkpoint.state_sha256,
+                                    "consumed_tokens": stage_budget.consumed_tokens,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        if child_progress_fingerprint != last_child_progress_fingerprint:
+                            last_child_progress_fingerprint = child_progress_fingerprint
+                            timeout_progress_units += 1
+                            adaptive_deadline.observe(
+                                progress_units=timeout_progress_units,
+                                now=monotonic(),
+                            )
+                        deadline = adaptive_deadline.deadline
+                        in_stage_checkpoint = self._checkpoint(
+                            context,
+                            artifacts=tuple(artifacts),
+                            next_sequence=sequence,
+                            next_stage=stage_index,
+                            terminal=False,
+                            reason=None,
+                            remaining_tokens=(
+                                remaining_tokens - stage_budget.consumed_tokens
+                            ),
+                            remaining_timeout_seconds=max(0.0, deadline - monotonic()),
+                            remaining_absolute_timeout_seconds=(
+                                adaptive_deadline.absolute_remaining(now=monotonic())
+                            ),
+                            timeout_progress_units=timeout_progress_units,
+                            last_child_progress_fingerprint=(
+                                last_child_progress_fingerprint
+                            ),
+                            child_checkpoint=event.checkpoint,
+                        )
+                        self._last_checkpoint = in_stage_checkpoint
+                        yield event.model_copy(
+                            update={"checkpoint": in_stage_checkpoint}
+                        )
+                        continue
                     if event.artifact is not None and event.artifact.id not in known:
                         await self._repository.put(
                             context.tenant_id, context.run_id, event.artifact
@@ -178,6 +343,16 @@ class HybridRuntime:
                         artifacts.append(event.artifact)
                         known.add(event.artifact.id)
                     yield event
+                if stage_budget.consumed_tokens > remaining_tokens:
+                    raise RuntimeExecutionError("hybrid child exceeded token budget")
+                remaining_tokens -= stage_budget.consumed_tokens
+                timeout_progress_units += 1
+                adaptive_deadline.observe(
+                    progress_units=timeout_progress_units,
+                    now=monotonic(),
+                )
+                deadline = adaptive_deadline.deadline
+                remaining_timeout_seconds = max(0.0, deadline - monotonic())
                 stage_checkpoint = self._checkpoint(
                     context,
                     artifacts=tuple(artifacts),
@@ -185,6 +360,14 @@ class HybridRuntime:
                     next_stage=stage_index + 1,
                     terminal=False,
                     reason=None,
+                    remaining_tokens=remaining_tokens,
+                    remaining_timeout_seconds=remaining_timeout_seconds,
+                    remaining_absolute_timeout_seconds=(
+                        adaptive_deadline.absolute_remaining(now=monotonic())
+                    ),
+                    timeout_progress_units=timeout_progress_units,
+                    last_child_progress_fingerprint=last_child_progress_fingerprint,
+                    child_checkpoint=None,
                 )
                 self._last_checkpoint = stage_checkpoint
                 yield RunEvent(
@@ -201,6 +384,14 @@ class HybridRuntime:
                 next_stage=len(stages),
                 terminal=True,
                 reason="explicit_completion",
+                remaining_tokens=remaining_tokens,
+                remaining_timeout_seconds=max(0.0, deadline - monotonic()),
+                remaining_absolute_timeout_seconds=(
+                    adaptive_deadline.absolute_remaining(now=monotonic())
+                ),
+                timeout_progress_units=timeout_progress_units,
+                last_child_progress_fingerprint=last_child_progress_fingerprint,
+                child_checkpoint=None,
             )
             self._last_checkpoint = checkpoint
             yield RunEvent(
@@ -234,6 +425,20 @@ class HybridRuntime:
                     next_stage=len(self._stages()),
                     terminal=True,
                     reason=partial_reason,
+                    remaining_tokens=remaining_tokens,
+                    remaining_timeout_seconds=(
+                        max(0.0, deadline - monotonic())
+                        if deadline is not None
+                        else max(0.0, remaining_timeout_seconds)
+                    ),
+                    remaining_absolute_timeout_seconds=(
+                        adaptive_deadline.absolute_remaining(now=monotonic())
+                        if adaptive_deadline is not None
+                        else max(0.0, remaining_timeout_seconds)
+                    ),
+                    timeout_progress_units=timeout_progress_units,
+                    last_child_progress_fingerprint=last_child_progress_fingerprint,
+                    child_checkpoint=None,
                 )
                 self._last_checkpoint = checkpoint
                 yield RunEvent(
@@ -290,8 +495,9 @@ class HybridRuntime:
         parent: TaskContext,
         artifacts: tuple[Artifact, ...],
         sequence: int,
+        stage_budget: _StageBudget,
+        checkpoint: RuntimeCheckpoint | None,
     ) -> AsyncIterator[RunEvent]:
-        handoff_artifacts = _discussion_handoff_artifacts(artifacts)
         participants = getattr(self._discussion, "participant_ids", ("main", "reviewer"))
         if not isinstance(participants, tuple) or not 2 <= len(participants) <= 8:
             raise RuntimeExecutionError("discussion participants are invalid")
@@ -302,10 +508,16 @@ class HybridRuntime:
             actor=participants[0],
             session_id=str(parent.run_id),
             participants=participants,
-            inputs=handoff_artifacts,
+            inputs=artifacts,
         )
         async for event in self._run_child(
-            self._discussion, parent, TaskMode.DISCUSS, handoff_artifacts, sequence + 1
+            self._discussion,
+            parent,
+            TaskMode.DISCUSS,
+            artifacts,
+            sequence + 1,
+            stage_budget,
+            checkpoint,
         ):
             # The composite owns the normalized discussion.started event.
             if event.kind is EventKind.DISCUSSION_STARTED:
@@ -319,9 +531,9 @@ class HybridRuntime:
         mode: TaskMode,
         artifacts: tuple[Artifact, ...],
         sequence: int,
+        stage_budget: _StageBudget,
+        checkpoint: RuntimeCheckpoint | None,
     ) -> AsyncIterator[RunEvent]:
-        if len(artifacts) > 64:
-            raise RuntimeExecutionError("hybrid artifact handoff exceeds limit")
         child_context = TaskContext(
             run_id=parent.run_id,
             tenant_id=parent.tenant_id,
@@ -331,14 +543,21 @@ class HybridRuntime:
             request=parent.request,
             artifacts=artifacts,
             routing_decision=parent.routing_decision,
-            timeout_seconds=parent.timeout_seconds,
-            token_budget=parent.token_budget,
+            timeout_seconds=stage_budget.timeout_limit,
+            token_budget=min(
+                10_000_000,
+                stage_budget.token_limit + stage_budget.checkpoint_token_baseline,
+            ),
+            checkpoint=checkpoint,
         )
         self._active_child = child
         terminal_seen = False
         child_failure_reason: str | None = None
         try:
+            if checkpoint is not None:
+                await child.restore_checkpoint(checkpoint)
             async for item in child.run(child_context):
+                _record_stage_usage(stage_budget, item)
                 if item.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and item.reason:
                     child_failure_reason = item.reason
                 if item.kind is EventKind.RUNTIME_FAILED:
@@ -350,6 +569,13 @@ class HybridRuntime:
                     terminal_seen = True
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
+                    yield _renumber_child_event(
+                        item,
+                        sequence,
+                        parent.run_id,
+                        inputs=artifacts,
+                    )
+                    sequence += 1
                     continue
                 if mode is TaskMode.DIRECT:
                     item = _reconcile_synthesis_event(item, artifacts)
@@ -379,7 +605,14 @@ class HybridRuntime:
         next_stage: int,
         terminal: bool,
         reason: str | None,
+        remaining_tokens: int,
+        remaining_timeout_seconds: float,
+        remaining_absolute_timeout_seconds: float,
+        timeout_progress_units: int,
+        last_child_progress_fingerprint: str | None,
+        child_checkpoint: RuntimeCheckpoint | None,
     ) -> RuntimeCheckpoint:
+        checkpoint_artifacts = _bounded_handoff_artifacts(artifacts)
         return RuntimeCheckpoint(
             id=uuid4(),
             runtime_type=_RUNTIME_TYPE,
@@ -390,19 +623,31 @@ class HybridRuntime:
             state={
                 "plan_digest": self._plan.digest,
                 "artifact_registry": {
-                    str(artifact.id): artifact.content_sha256 for artifact in artifacts
+                    str(artifact.id): artifact.content_sha256
+                    for artifact in checkpoint_artifacts
                 },
                 "next_sequence": next_sequence,
                 "next_stage": next_stage,
                 "terminal": terminal,
                 "reason": reason,
+                "remaining_token_budget": remaining_tokens,
+                "remaining_timeout_seconds": remaining_timeout_seconds,
+                "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
+                "timeout_progress_units": timeout_progress_units,
+                "last_child_progress_fingerprint": last_child_progress_fingerprint,
+                "child_checkpoint": (
+                    None
+                    if child_checkpoint is None
+                    else cast(JsonValue, child_checkpoint.to_payload())
+                ),
             },
         )
 
     def _validate_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE
-            or checkpoint.runtime_version != _RUNTIME_VERSION
+            or checkpoint.runtime_version
+            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
             or checkpoint.mode is not self.mode
             or checkpoint.run_id != context.run_id
             or checkpoint.tenant_id != context.tenant_id
@@ -412,24 +657,86 @@ class HybridRuntime:
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         state = checkpoint.state
         registry = state.get("artifact_registry")
-        if (
-            set(state)
-            != {
-                "plan_digest",
-                "artifact_registry",
-                "next_sequence",
-                "next_stage",
-                "terminal",
-                "reason",
+        required_state = {
+            "plan_digest",
+            "artifact_registry",
+            "next_sequence",
+            "next_stage",
+            "terminal",
+            "reason",
+        }
+        budget_state = {"remaining_token_budget", "remaining_timeout_seconds"}
+        adaptive_budget_state = {
+            "remaining_absolute_timeout_seconds",
+            "timeout_progress_units",
+            "last_child_progress_fingerprint",
+        }
+        child_state = {"child_checkpoint"}
+        has_budget_state = budget_state.issubset(state)
+        allowed_state = (
+            {frozenset(required_state), frozenset(required_state | budget_state)}
+            if checkpoint.runtime_version == _LEGACY_RUNTIME_VERSION
+            else {
+                frozenset(required_state | budget_state | child_state),
+                frozenset(
+                    required_state
+                    | budget_state
+                    | adaptive_budget_state
+                    | child_state
+                )
             }
+        )
+        if (
+            frozenset(state) not in allowed_state
             or not isinstance(registry, Mapping)
-            or len(registry) > 64
+            or len(registry) > _MAX_HANDOFF_ARTIFACTS
             or type(state.get("next_sequence")) is not int
             or cast(int, state["next_sequence"]) < 1
             or type(state.get("next_stage")) is not int
             or not 0 <= cast(int, state["next_stage"]) <= len(self._stages())
             or type(state.get("terminal")) is not bool
             or (state.get("reason") is not None and type(state["reason"]) is not str)
+            or (
+                has_budget_state
+                and (
+                    type(state["remaining_token_budget"]) is not int
+                    or not 0 <= state["remaining_token_budget"] <= 10_000_000
+                    or isinstance(state["remaining_timeout_seconds"], bool)
+                    or not isinstance(state["remaining_timeout_seconds"], int | float)
+                    or not math.isfinite(float(state["remaining_timeout_seconds"]))
+                    or not 0.0 <= float(state["remaining_timeout_seconds"]) <= 3600.0
+                    or (
+                        checkpoint.runtime_version == _RUNTIME_VERSION
+                        and adaptive_budget_state.issubset(state)
+                        and (
+                            isinstance(
+                                state["remaining_absolute_timeout_seconds"], bool
+                            )
+                            or not isinstance(
+                                state["remaining_absolute_timeout_seconds"], int | float
+                            )
+                            or not math.isfinite(
+                                float(state["remaining_absolute_timeout_seconds"])
+                            )
+                            or not 0.0
+                            <= float(state["remaining_absolute_timeout_seconds"])
+                            <= 3600.0
+                            or type(state["timeout_progress_units"]) is not int
+                            or state["timeout_progress_units"] < 0
+                            or (
+                                state["last_child_progress_fingerprint"] is not None
+                                and (
+                                    type(
+                                        state["last_child_progress_fingerprint"]
+                                    )
+                                    is not str
+                                    or len(state["last_child_progress_fingerprint"]) != 64
+                                )
+                            )
+                        )
+                    )
+                )
+            )
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         try:
@@ -439,6 +746,17 @@ class HybridRuntime:
                 ArtifactReference(id=UUID(artifact_id), sha256=sha256)
         except (TypeError, ValueError):
             raise RuntimeExecutionError("runtime checkpoint is incompatible") from None
+        child_checkpoint = _child_checkpoint_from_state(checkpoint)
+        next_stage = cast(int, state["next_stage"])
+        if child_checkpoint is not None and (
+            checkpoint.runtime_version != _RUNTIME_VERSION
+            or state["terminal"] is True
+            or next_stage >= len(self._stages())
+            or child_checkpoint.run_id != context.run_id
+            or child_checkpoint.tenant_id != context.tenant_id
+            or child_checkpoint.mode is not self._stages()[next_stage][1]
+        ):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
 
     async def _hydrate_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext
@@ -473,7 +791,8 @@ class HybridRuntime:
         validated = RuntimeCheckpoint.from_payload(checkpoint.to_payload())
         if (
             validated.runtime_type != _RUNTIME_TYPE
-            or validated.runtime_version != _RUNTIME_VERSION
+            or validated.runtime_version
+            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
             or validated.mode is not self.mode
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
@@ -491,6 +810,28 @@ class HybridRuntime:
 
 def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
     return safe_runtime_failure_reason(error, fallback=fallback)
+
+
+def _child_checkpoint_from_state(
+    checkpoint: RuntimeCheckpoint,
+) -> RuntimeCheckpoint | None:
+    payload = checkpoint.state.get("child_checkpoint")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise RuntimeExecutionError("runtime checkpoint is incompatible")
+    try:
+        return RuntimeCheckpoint.from_payload(_mutable_json_value(payload))
+    except (TypeError, ValueError):
+        raise RuntimeExecutionError("runtime checkpoint is incompatible") from None
+
+
+def _mutable_json_value(value: JsonValue) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json_value(item) for item in value]
+    return value
 
 
 def _is_forwardable_child_event(event: RunEvent) -> bool:
@@ -556,6 +897,63 @@ def _reconcile_synthesis_event(
         next_payload["output"] = reconciled.content["text"]
         updates["payload"] = next_payload
     return event.model_copy(update=updates)
+
+
+def _record_stage_usage(stage_budget: _StageBudget, event: RunEvent) -> None:
+    artifact = event.artifact
+    if artifact is not None and artifact.id not in stage_budget.accounted_artifact_ids:
+        stage_budget.accounted_artifact_ids.add(artifact.id)
+        stage_budget.artifact_tokens += _reported_tokens(artifact.content)
+    checkpoint = event.checkpoint
+    if checkpoint is not None:
+        stage_budget.checkpoint_tokens = max(
+            stage_budget.checkpoint_tokens,
+            _reported_tokens(checkpoint.state),
+        )
+
+
+def _reported_tokens(payload: Mapping[str, object]) -> int:
+    raw_usage = payload.get("usage")
+    if not isinstance(raw_usage, Mapping):
+        return 0
+    total_tokens = raw_usage.get("total_tokens")
+    if type(total_tokens) is int and total_tokens >= 0:
+        return total_tokens
+    tokens = raw_usage.get("tokens")
+    if type(tokens) is int and tokens >= 0:
+        return tokens
+    prompt_tokens = raw_usage.get("prompt_tokens")
+    completion_tokens = raw_usage.get("completion_tokens")
+    if (
+        type(prompt_tokens) is int
+        and type(completion_tokens) is int
+        and prompt_tokens >= 0
+        and completion_tokens >= 0
+    ):
+        return prompt_tokens + completion_tokens
+    return 0
+
+
+def _bounded_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    if len(artifacts) <= _MAX_HANDOFF_ARTIFACTS:
+        return artifacts
+    anchors = artifacts[:_MAX_HANDOFF_ANCHORS]
+    anchor_ids = {artifact.id for artifact in anchors}
+    latest_count = _MAX_HANDOFF_ARTIFACTS - len(anchors)
+    latest = tuple(
+        artifact
+        for artifact in artifacts[-latest_count:]
+        if artifact.id not in anchor_ids
+    )
+    if len(latest) < latest_count:
+        latest_ids = {artifact.id for artifact in latest}
+        fill = tuple(
+            artifact
+            for artifact in artifacts[_MAX_HANDOFF_ANCHORS : -latest_count]
+            if artifact.id not in anchor_ids and artifact.id not in latest_ids
+        )[-(latest_count - len(latest)) :]
+        latest = fill + latest
+    return anchors + latest
 
 
 def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:

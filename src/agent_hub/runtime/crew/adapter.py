@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -56,6 +57,7 @@ from agent_hub.models.types import (
     _require_safe_identifier,
 )
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
+from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
     ArtifactRepository,
@@ -102,16 +104,22 @@ from agent_hub.runtime.self_repair_context import (
 _LOGGER = logging.getLogger(__name__)
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "9"
+_RUNTIME_VERSION = "10"
+_LEGACY_RUNTIME_VERSION = "9"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
 _MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES = 2_048
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
-_MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS = 32
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
-_MAX_STEP_ARTIFACT_LINEAGE = 128
+_MAX_CHECKPOINT_TOOL_LEDGER_ENTRIES = 4_096
+_MAX_CHECKPOINT_MODEL_LEDGER_ENTRIES = 4_096
+_MAX_STEP_ARTIFACT_LINEAGE = 64
+_SOFT_INTERACTION_MESSAGE_LIMIT = 48
+_SOFT_INTERACTION_PROMPT_BYTES = _MAX_PROMPT_BYTES * 3 // 4
+_MIN_AUDITED_TOKENS_PER_TOOL_ROUND = 2
+_MIN_SECONDS_PER_TOOL_ROUND = 1.0
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_CONFIGURED_TOOL_ARGUMENT_BYTES = 10_000_000
 _MAX_AUDITED_TOKENS = 100_000_000
@@ -167,29 +175,45 @@ class _ToolRoundBudget:
 
 
 def _tool_round_budget(context: TaskContext, step: DispatchStep) -> _ToolRoundBudget:
-    del step
-    routing_decision = context.routing_decision
-    raw_project_scale = (
-        routing_decision.get("project_scale")
-        if isinstance(routing_decision, Mapping)
-        else None
+    available_tokens = min(context.token_budget, step.token_budget)
+    available_seconds = min(context.timeout_seconds, step.timeout_seconds)
+    token_limit = max(
+        _MAX_TOOL_ROUNDS,
+        available_tokens // _MIN_AUDITED_TOKENS_PER_TOOL_ROUND,
     )
-    project_scale = raw_project_scale if type(raw_project_scale) is str else None
-    hard_limits = {
-        "medium": 16,
-        "large": 24,
-        "ultra": _MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS,
-    }
-    hard_limit = (
-        hard_limits.get(project_scale, _MAX_TOOL_ROUNDS)
-        if project_scale is not None
-        else _MAX_TOOL_ROUNDS
+    timeout_limit = max(
+        _MAX_TOOL_ROUNDS,
+        int(available_seconds // _MIN_SECONDS_PER_TOOL_ROUND),
+    )
+    hard_limit = min(
+        token_limit,
+        timeout_limit,
     )
     return _ToolRoundBudget(
         initial_limit=_MAX_TOOL_ROUNDS,
         extension_size=_MAX_TOOL_ROUNDS,
         hard_limit=hard_limit,
     )
+
+
+def _lineage_window_ids(
+    source_ids: Sequence[str],
+    *,
+    anchor_count: int = 0,
+) -> tuple[str, ...]:
+    ordered = tuple(dict.fromkeys(source_ids))
+    if len(ordered) <= _MAX_STEP_ARTIFACT_LINEAGE:
+        return ordered
+    bounded_anchor_count = min(max(anchor_count, 0), len(ordered))
+    if bounded_anchor_count == len(ordered):
+        return ordered[-_MAX_STEP_ARTIFACT_LINEAGE:]
+    retained_anchor_count = min(
+        bounded_anchor_count,
+        _MAX_STEP_ARTIFACT_LINEAGE - 1,
+    )
+    anchors = ordered[:retained_anchor_count]
+    recent_capacity = _MAX_STEP_ARTIFACT_LINEAGE - len(anchors)
+    return (*anchors, *ordered[-recent_capacity:])
 _CREWAI_BOUND_TASKS: weakref.WeakKeyDictionary[asyncio.Task[Any], int] = weakref.WeakKeyDictionary()
 _CREWAI_BOUND_TASKS_LOCK = threading.Lock()
 _CREWAI_INVOCATION_THREAD = threading.local()
@@ -1092,8 +1116,16 @@ def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
 
 
-def _subagent_model_attempt(retries: int, recovery_attempt: int) -> int:
-    return retries * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + recovery_attempt
+def _subagent_model_attempt(
+    retries: int,
+    recovery_attempt: int,
+    recovery_limit: int = _STEP_TIMEOUT_RECOVERY_RETRIES,
+) -> int:
+    return retries * (recovery_limit + 1) + recovery_attempt
+
+
+def _subagent_business_attempt(model_attempt: int, recovery_limit: int) -> int:
+    return model_attempt // (recovery_limit + 1)
 
 
 def _subagent_recovery_payload(
@@ -1133,6 +1165,15 @@ def _agent_model_fallback_label(agent: AgentSpec, recovery_attempt: int) -> str 
 
 def _subagent_recovery_attempt_limit(agent: AgentSpec) -> int:
     return max(_STEP_TIMEOUT_RECOVERY_RETRIES, len(agent.fallback_models))
+
+
+def _checkpoint_recovery_attempt_limit(
+    agent: AgentSpec,
+    runtime_version: str,
+) -> int:
+    if runtime_version == _LEGACY_RUNTIME_VERSION:
+        return _STEP_TIMEOUT_RECOVERY_RETRIES
+    return _subagent_recovery_attempt_limit(agent)
 
 
 def _step_orchestration_payload(
@@ -2674,6 +2715,7 @@ class _RunToken:
 class _RunState:
     token: _RunToken
     deadline: float | None = None
+    adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
     open: bool = True
     artifact_writes_open: bool = True
@@ -2908,9 +2950,14 @@ class CrewDispatchRuntime:
         try:
             plan = DispatchPlan.revalidate(self._plan)
             self._validate_checkpoint_metadata_budget(plan)
-            state.deadline = asyncio.get_running_loop().time() + min(
-                context.timeout_seconds, plan.total_timeout_seconds
+            loop_time = asyncio.get_running_loop().time()
+            initial_timeout = min(context.timeout_seconds, plan.total_timeout_seconds)
+            state.adaptive_deadline = deadline_from_routing(
+                context.routing_decision,
+                now=loop_time,
+                initial_seconds=initial_timeout,
             )
+            state.deadline = state.adaptive_deadline.deadline
             state.crew_generation = self._prepare_private_generation(plan)
             if context.token_budget < plan.total_token_budget:
                 _fail("task token budget is below the dispatch plan budget")
@@ -2918,6 +2965,41 @@ class CrewDispatchRuntime:
                 self._validate_checkpoint(restored, context, plan)
                 if context.checkpoint is None or context.checkpoint.id != restored.id:
                     _fail("runtime checkpoint mismatch")
+                if restored.runtime_version == _RUNTIME_VERSION:
+                    saved_remaining = cast(
+                        float,
+                        restored.state["remaining_timeout_seconds"],
+                    )
+                    raw_absolute_remaining = restored.state.get(
+                        "remaining_absolute_timeout_seconds", saved_remaining
+                    )
+                    raw_progress_units = restored.state.get("timeout_progress_units", 0)
+                    saved_absolute_remaining = (
+                        float(raw_absolute_remaining)
+                        if isinstance(raw_absolute_remaining, int | float)
+                        and not isinstance(raw_absolute_remaining, bool)
+                        else saved_remaining
+                    )
+                    saved_progress_units = (
+                        raw_progress_units
+                        if type(raw_progress_units) is int and raw_progress_units >= 0
+                        else 0
+                    )
+                    loop_time = asyncio.get_running_loop().time()
+                    state.adaptive_deadline = deadline_from_routing(
+                        context.routing_decision,
+                        now=loop_time,
+                        initial_seconds=max(
+                            0.001,
+                            min(self._remaining_timeout_value(state), saved_remaining),
+                        ),
+                        restored_absolute_seconds=max(
+                            0.001,
+                            saved_absolute_remaining,
+                        ),
+                        progress_units=saved_progress_units,
+                    )
+                    state.deadline = state.adaptive_deadline.deadline
                 sequence.value = cast(int, restored.state["next_sequence"]) - 1
             elif context.checkpoint is not None:
                 _fail("runtime checkpoint was not restored")
@@ -3040,6 +3122,7 @@ class CrewDispatchRuntime:
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
+                        state,
                         completed,
                         retry_counts,
                         tool_ledger,
@@ -3049,6 +3132,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=usage_ledger.terminal_phase is not None,
                         phase=usage_ledger.terminal_phase or "running",
+                        remaining_timeout_seconds=self._remaining_timeout_value(state),
                         repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
@@ -3070,6 +3154,7 @@ class CrewDispatchRuntime:
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
+                        state,
                         completed,
                         retry_counts,
                         tool_ledger,
@@ -3079,6 +3164,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=usage_ledger.terminal_phase is not None,
                         phase=usage_ledger.terminal_phase or "running",
+                        remaining_timeout_seconds=self._remaining_timeout_value(state),
                         repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
@@ -3114,6 +3200,7 @@ class CrewDispatchRuntime:
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
+                        state,
                         completed,
                         retry_counts,
                         tool_ledger,
@@ -3123,6 +3210,7 @@ class CrewDispatchRuntime:
                         next_sequence=sequence.value + 2,
                         terminal=False,
                         phase="running",
+                        remaining_timeout_seconds=self._remaining_timeout_value(state),
                         repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     self._publish_checkpoint(state, checkpoint)
@@ -3234,13 +3322,6 @@ class CrewDispatchRuntime:
                         artifact is not None and isinstance(completion, GatewayCompletion)
                         and completion.response.tool_calls and model_state["purpose"] == "step"
                     ):
-                        if (
-                            len(artifact.source_ids)
-                            + 1
-                            + len(completion.response.tool_calls)
-                            >= _MAX_STEP_ARTIFACT_LINEAGE
-                        ):
-                            _fail("artifact lineage exceeds limit")
                         provisional = _ToolLedger(
                             states=dict(tool_ledger.states),
                             artifacts=dict(tool_ledger.artifacts),
@@ -3313,6 +3394,7 @@ class CrewDispatchRuntime:
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
+                        state,
                         completed,
                         retry_counts,
                         candidate_tools,
@@ -3327,12 +3409,14 @@ class CrewDispatchRuntime:
                         ),
                         terminal=terminal_phase is not None,
                         phase=terminal_phase or "running",
+                        remaining_timeout_seconds=self._remaining_timeout_value(state),
                         artifact_registry=candidate_registry,
                         repair_reopened_contract_ids=repair_reopened_contract_ids,
                     )
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
+                        state,
                         completed,
                         retry_counts,
                         tool_ledger,
@@ -3347,6 +3431,7 @@ class CrewDispatchRuntime:
                         ),
                         terminal=terminal_phase is not None,
                         phase=terminal_phase or "running",
+                        remaining_timeout_seconds=self._remaining_timeout_value(state),
                         artifact_registry=candidate_registry if artifact is None else {
                             **artifact_registry, str(artifact.id): artifact,
                         },
@@ -3453,6 +3538,7 @@ class CrewDispatchRuntime:
                                 checkpoint = self._make_checkpoint(
                                     context,
                                     plan,
+                                    state,
                                     completed,
                                     retry_counts,
                                     tool_ledger,
@@ -3472,6 +3558,7 @@ class CrewDispatchRuntime:
                                             else "running"
                                         )
                                     ),
+                                    remaining_timeout_seconds=self._remaining_timeout_value(state),
                                     repair_reopened_contract_ids=repair_reopened_contract_ids,
                                 )
                                 self._publish_checkpoint(state, checkpoint)
@@ -3500,6 +3587,7 @@ class CrewDispatchRuntime:
                         checkpoint = self._make_checkpoint(
                             context,
                             plan,
+                            state,
                             completed,
                             retry_counts,
                             tool_ledger,
@@ -3509,6 +3597,7 @@ class CrewDispatchRuntime:
                             next_sequence=sequence.value + 3,
                             terminal=False,
                             phase="cancelled",
+                            remaining_timeout_seconds=self._remaining_timeout_value(state),
                             repair_reopened_contract_ids=repair_reopened_contract_ids,
                         )
                         self._publish_checkpoint(state, checkpoint)
@@ -3666,7 +3755,8 @@ class CrewDispatchRuntime:
         recovery_attempt = 0
         while True:
             attempt_sources = self._ordered_artifacts(
-                (*sources, *((feedback_artifact,) if feedback_artifact is not None else ()))
+                (*sources, *((feedback_artifact,) if feedback_artifact is not None else ())),
+                anchor_count=len(sources),
             )
             await event(
                 kind=EventKind.STEP_STARTED,
@@ -3707,7 +3797,10 @@ class CrewDispatchRuntime:
                 artifact = self._artifact(
                     step,
                     completion,
-                    self._ordered_artifacts((*attempt_sources, *evidence)),
+                    self._ordered_artifacts(
+                        (*attempt_sources, *evidence),
+                        anchor_count=len(attempt_sources),
+                    ),
                     version=retries + 1,
                 )
                 await event(
@@ -3870,7 +3963,8 @@ class CrewDispatchRuntime:
                                     source_ids=tuple(
                                         str(item.id)
                                         for item in self._ordered_artifacts(
-                                            (artifact, *review_evidence)
+                                            (artifact, *review_evidence),
+                                            anchor_count=1,
                                         )
                                     ),
                                 )
@@ -4179,7 +4273,11 @@ class CrewDispatchRuntime:
                     evidence,
                     sources,
                     retries,
-                    _subagent_model_attempt(retries, recovery_attempt),
+                    _subagent_model_attempt(
+                        retries,
+                        recovery_attempt,
+                        _subagent_recovery_attempt_limit(agent),
+                    ),
                     recovery_attempt,
                     run_state,
                     step_deadline,
@@ -4283,6 +4381,7 @@ class CrewDispatchRuntime:
     def _response_contract_messages(
         cls, messages: Sequence[ModelMessage], schema: StructuredResponseSchema | None,
     ) -> tuple[ModelMessage, ...]:
+        messages = cls._compact_interaction_messages(messages)
         if schema is None:
             return tuple(messages)
         _structured_validator(schema)
@@ -4818,6 +4917,18 @@ class CrewDispatchRuntime:
         last_round_progressed = True
         force_result_synthesis = False
         for _round in range(round_budget.hard_limit + 1):
+            if len(model_ledger.states) >= _MAX_CHECKPOINT_MODEL_LEDGER_ENTRIES:
+                _fail("dispatch model ledger capacity exhausted")
+            if len(evidence) >= _MAX_CHECKPOINT_ARTIFACTS:
+                _fail("dispatch artifact ledger capacity exhausted")
+            if not force_result_synthesis and (
+                len(tool_ledger.states)
+                > _MAX_CHECKPOINT_TOOL_LEDGER_ENTRIES - _MAX_TOOL_CALLS_PER_RESPONSE
+                or len(model_ledger.states) >= _MAX_CHECKPOINT_MODEL_LEDGER_ENTRIES - 1
+                or len(evidence)
+                > _MAX_CHECKPOINT_ARTIFACTS - (_MAX_TOOL_CALLS_PER_RESPONSE + 1)
+            ):
+                force_result_synthesis = True
             round_tools = () if force_result_synthesis else request_tools
             round_required_capabilities = set(required_capabilities)
             if force_result_synthesis:
@@ -4844,11 +4955,18 @@ class CrewDispatchRuntime:
                 response_schema=response_schema,
                 tools=round_tools,
             )
-            model_attempt_index = _subagent_model_attempt(retries, recovery_attempt)
+            model_attempt_index = _subagent_model_attempt(
+                retries,
+                recovery_attempt,
+                _subagent_recovery_attempt_limit(agent),
+            )
             completion, model_artifact = await self._execute_model_request(
                 context, step, agent.id, request, purpose="step", attempt=model_attempt_index,
                 cursor=call_cursor, ledger=model_ledger,
-                sources=self._ordered_artifacts((*input_sources, *evidence)),
+                sources=self._ordered_artifacts(
+                    (*input_sources, *evidence),
+                    anchor_count=len(input_sources),
+                ),
                 emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
                 run_state=run_state, step_deadline=step_deadline,
             )
@@ -5511,6 +5629,8 @@ class CrewDispatchRuntime:
             if reused_generated_file_results == len(response.tool_calls):
                 return _generated_file_ready_completion(completion, response)
             force_result_synthesis = reused_result_count == len(response.tool_calls)
+            if round_progressed and run_state.deadline is not None:
+                step_deadline = max(step_deadline, run_state.deadline)
             last_round_progressed = round_progressed
             messages.append(
                 ModelMessage(
@@ -5537,16 +5657,24 @@ class CrewDispatchRuntime:
         _fail("step capability round limit exceeded")
 
     @staticmethod
-    def _ordered_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    def _ordered_artifacts(
+        artifacts: tuple[Artifact, ...],
+        *,
+        anchor_count: int = 0,
+    ) -> tuple[Artifact, ...]:
         ordered: list[Artifact] = []
         seen: set[UUID] = set()
         for artifact in artifacts:
             if artifact.id not in seen:
                 seen.add(artifact.id)
                 ordered.append(artifact)
-        if len(ordered) > _MAX_STEP_ARTIFACT_LINEAGE:
-            _fail("artifact lineage exceeds limit")
-        return tuple(ordered)
+        retained_ids = set(
+            _lineage_window_ids(
+                tuple(str(artifact.id) for artifact in ordered),
+                anchor_count=anchor_count,
+            )
+        )
+        return tuple(artifact for artifact in ordered if str(artifact.id) in retained_ids)
 
     @staticmethod
     def _model_call_key(
@@ -5799,6 +5927,65 @@ class CrewDispatchRuntime:
             _fail("model response artifact is invalid")
 
     @staticmethod
+    def _compact_interaction_messages(
+        messages: Sequence[ModelMessage],
+    ) -> tuple[ModelMessage, ...]:
+        def encoded_content(message: ModelMessage) -> bytes:
+            return json.dumps(
+                _mutable_json(message.content),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        current = tuple(messages)
+        current_bytes = sum(len(encoded_content(message)) for message in current)
+        if (
+            len(current) <= _SOFT_INTERACTION_MESSAGE_LIMIT
+            and current_bytes <= _SOFT_INTERACTION_PROMPT_BYTES
+        ):
+            return current
+
+        anchor_count = min(2, len(current))
+        anchors = current[:anchor_count]
+        remaining_bytes = _SOFT_INTERACTION_PROMPT_BYTES - sum(
+            len(encoded_content(message)) for message in anchors
+        )
+        recent: list[ModelMessage] = []
+        recent_bytes = 0
+        recent_capacity = max(1, _SOFT_INTERACTION_MESSAGE_LIMIT - anchor_count - 1)
+        for message in reversed(current[anchor_count:]):
+            message_bytes = len(encoded_content(message))
+            if recent and (
+                len(recent) >= recent_capacity
+                or recent_bytes + message_bytes > max(0, remaining_bytes - 512)
+            ):
+                break
+            recent.append(message)
+            recent_bytes += message_bytes
+        recent.reverse()
+        retained = (*anchors, *recent)
+        retained_ids = {id(message) for message in retained}
+        omitted = tuple(message for message in current if id(message) not in retained_ids)
+        digest = hashlib.sha256(
+            b"\n".join(
+                message.role.encode("utf-8") + b":" + encoded_content(message)
+                for message in omitted
+            )
+        ).hexdigest()
+        summary = ModelMessage(
+            role="system",
+            content=(
+                "EARLIER_INTERACTION_WINDOW_COMPRESSED: Older model and capability-result "
+                "messages remain available through the artifact/checkpoint ledger. Continue "
+                f"from the retained recent state. omitted_messages={len(omitted)} "
+                f"sha256={digest}"
+            ),
+        )
+        return (*anchors, summary, *recent)
+
+    @staticmethod
     def _normalize_crewai_messages(messages: object) -> tuple[ModelMessage, ...]:
         if type(messages) is str:
             raw_messages: tuple[object, ...] = ({"role": "user", "content": messages},)
@@ -5906,9 +6093,16 @@ class CrewDispatchRuntime:
                 )
                 completion, model_artifact = await runtime._execute_model_request(
                     context, step, reviewer.id, request, purpose="review",
-                    attempt=_subagent_model_attempt(retries, recovery_attempt),
+                    attempt=_subagent_model_attempt(
+                        retries,
+                        recovery_attempt,
+                        _subagent_recovery_attempt_limit(reviewer),
+                    ),
                     cursor=call_cursor, ledger=model_ledger,
-                    sources=runtime._ordered_artifacts((artifact, *evidence)),
+                    sources=runtime._ordered_artifacts(
+                        (artifact, *evidence),
+                        anchor_count=1,
+                    ),
                     emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
                     run_state=run_state, step_deadline=step_deadline,
                 )
@@ -6128,6 +6322,13 @@ class CrewDispatchRuntime:
         return remaining
 
     @staticmethod
+    def _remaining_timeout_value(run_state: _RunState) -> float:
+        deadline = run_state.deadline
+        if deadline is None:
+            return 0.0
+        return max(0.0, deadline - asyncio.get_running_loop().time())
+
+    @staticmethod
     def _recovery_step_deadline(
         run_state: _RunState,
         step_deadline: float,
@@ -6235,6 +6436,7 @@ class CrewDispatchRuntime:
         self,
         context: TaskContext,
         plan: DispatchPlan,
+        run_state: _RunState,
         completed: Mapping[str, Artifact],
         retries: Mapping[str, int],
         tool_ledger: _ToolLedger,
@@ -6245,12 +6447,30 @@ class CrewDispatchRuntime:
         next_sequence: int,
         terminal: bool,
         phase: str,
+        remaining_timeout_seconds: float,
         artifact_registry: Mapping[str, Artifact] | None = None,
         repair_reopened_contract_ids: Sequence[str] = (),
     ) -> RuntimeCheckpoint:
         checkpoint_artifacts = (
             self._current_artifact_registry if artifact_registry is None else artifact_registry
         )
+        input_ids = {str(artifact.id) for artifact in context.artifacts}
+        progress_units = len(completed) + sum(
+            artifact_id not in input_ids for artifact_id in checkpoint_artifacts
+        )
+        adaptive_deadline = run_state.adaptive_deadline
+        if adaptive_deadline is not None:
+            loop_time = asyncio.get_running_loop().time()
+            adaptive_deadline.observe(progress_units=progress_units, now=loop_time)
+            run_state.deadline = adaptive_deadline.deadline
+            remaining_timeout_seconds = adaptive_deadline.remaining(now=loop_time)
+            remaining_absolute_timeout_seconds = adaptive_deadline.absolute_remaining(
+                now=loop_time
+            )
+            timeout_progress_units = adaptive_deadline.progress_units
+        else:
+            remaining_absolute_timeout_seconds = remaining_timeout_seconds
+            timeout_progress_units = progress_units
         completed_ids = tuple(sorted(completed))
         frontier = tuple(
             step.id
@@ -6284,6 +6504,9 @@ class CrewDispatchRuntime:
                 "next_sequence": next_sequence,
                 "terminal": terminal,
                 "phase": phase,
+                "remaining_timeout_seconds": remaining_timeout_seconds,
+                "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
+                "timeout_progress_units": timeout_progress_units,
                 "tools": {key: dict(tool_ledger.states[key]) for key in sorted(tool_ledger.states)},
                 "models": {
                     key: dict(model_ledger.states[key]) for key in sorted(model_ledger.states)
@@ -6328,7 +6551,8 @@ class CrewDispatchRuntime:
         checkpoint_failure_reason = self._checkpoint_failure_reason(plan)
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE
-            or checkpoint.runtime_version != _RUNTIME_VERSION
+            or checkpoint.runtime_version
+            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
             or checkpoint.mode is not self.mode
             or checkpoint.run_id != context.run_id
             or checkpoint.tenant_id != context.tenant_id
@@ -6358,6 +6582,11 @@ class CrewDispatchRuntime:
             "audit_overflow",
         }
         optional_state_keys = {"repair_reopened_contract_ids"}
+        if checkpoint.runtime_version == _RUNTIME_VERSION:
+            required_state_keys.add("remaining_timeout_seconds")
+            optional_state_keys.update(
+                {"remaining_absolute_timeout_seconds", "timeout_progress_units"}
+            )
         if not required_state_keys <= set(state) <= required_state_keys | optional_state_keys:
             _fail("runtime checkpoint is incompatible")
         completed = state["completed"]
@@ -6372,6 +6601,11 @@ class CrewDispatchRuntime:
         step_usage = state["step_usage"]
         audit_overflow = state["audit_overflow"]
         repair_reopened_contract_ids = state.get("repair_reopened_contract_ids", ())
+        remaining_timeout_seconds = state.get("remaining_timeout_seconds")
+        remaining_absolute_timeout_seconds = state.get(
+            "remaining_absolute_timeout_seconds"
+        )
+        timeout_progress_units = state.get("timeout_progress_units")
         if (
             not isinstance(completed, tuple)
             or not isinstance(frontier, tuple)
@@ -6399,6 +6633,33 @@ class CrewDispatchRuntime:
                 "audit_overflow",
             }
             or not 1 <= state["next_sequence"] <= 2**63 - 1
+            or (
+                checkpoint.runtime_version == _RUNTIME_VERSION
+                and (
+                    isinstance(remaining_timeout_seconds, bool)
+                    or not isinstance(remaining_timeout_seconds, int | float)
+                    or not math.isfinite(remaining_timeout_seconds)
+                    or not 0 <= remaining_timeout_seconds <= 3600
+                    or (
+                        remaining_absolute_timeout_seconds is not None
+                        and (
+                            isinstance(remaining_absolute_timeout_seconds, bool)
+                            or not isinstance(
+                                remaining_absolute_timeout_seconds, int | float
+                            )
+                            or not math.isfinite(remaining_absolute_timeout_seconds)
+                            or not 0 <= remaining_absolute_timeout_seconds <= 3600
+                        )
+                    )
+                    or (
+                        timeout_progress_units is not None
+                        and (
+                            type(timeout_progress_units) is not int
+                            or timeout_progress_units < 0
+                        )
+                    )
+                )
+            )
         ):
             _fail("runtime checkpoint is incompatible")
         if len(artifact_registry) > _MAX_CHECKPOINT_ARTIFACTS:
@@ -6464,6 +6725,7 @@ class CrewDispatchRuntime:
         ):
             _fail("runtime checkpoint is incompatible")
         steps = {step.id: step for step in plan.steps}
+        agents = {agent.id: agent for agent in plan.agents}
         token_overflow_steps = set(cast(tuple[str, ...], audit_overflow["step_tokens"]))
         cost_overflow_steps = set(cast(tuple[str, ...], audit_overflow["step_cost_usd"]))
         if (
@@ -6555,7 +6817,7 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint is incompatible")
             if not set(steps[step_id].depends_on) <= completed_set:
                 _fail("runtime checkpoint is incompatible")
-        if len(tools) > 4096:
+        if len(tools) > _MAX_CHECKPOINT_TOOL_LEDGER_ENTRIES:
             _fail("runtime checkpoint is incompatible")
         tool_entries = cast(Mapping[str, Mapping[str, JsonValue]], tools)
         tool_indices: dict[tuple[str, int, int], set[int]] = {}
@@ -6595,13 +6857,21 @@ class CrewDispatchRuntime:
                 or type(attempt) is not int
                 or not 0
                 <= attempt
-                <= (
-                    steps[tool_step_id].reviewer_retries
-                    * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1)
-                    + _STEP_TIMEOUT_RECOVERY_RETRIES
+                <= _subagent_model_attempt(
+                    steps[tool_step_id].reviewer_retries,
+                    _checkpoint_recovery_attempt_limit(
+                        agents[steps[tool_step_id].agent],
+                        checkpoint.runtime_version,
+                    ),
+                    _checkpoint_recovery_attempt_limit(
+                        agents[steps[tool_step_id].agent],
+                        checkpoint.runtime_version,
+                    ),
                 )
                 or type(round_index) is not int
-                or not 0 <= round_index <= _MAX_INCREMENTAL_WORKSPACE_TOOL_ROUNDS
+                or not 0
+                <= round_index
+                <= _tool_round_budget(context, steps[tool_step_id]).hard_limit
                 or type(tool_index) is not int
                 or not 0 <= tool_index <= 64
                 or type(name) is not str
@@ -6654,7 +6924,7 @@ class CrewDispatchRuntime:
             elif value["artifact_id"] is not None or value["sha256"] is not None:
                 _fail("runtime checkpoint is incompatible")
         model_indices: dict[tuple[str, int, str, str], set[int]] = {}
-        if len(models) > 4096:
+        if len(models) > _MAX_CHECKPOINT_MODEL_LEDGER_ENTRIES:
             _fail("runtime checkpoint is incompatible")
         model_entries = cast(Mapping[str, Mapping[str, JsonValue]], models)
         model_state_keys = {
@@ -6688,28 +6958,43 @@ class CrewDispatchRuntime:
             call_index = value["call_index"]
             failure_reason = value.get("failure_reason")
             if (
-                status not in {"prepared", "running", "succeeded", "failed", "rejected", "received_cancelled"}
-                or type(model_step_id) is not str
+                type(model_step_id) is not str
                 or model_step_id not in steps
+                or purpose not in {"step", "review"}
+            ):
+                _fail("runtime checkpoint is incompatible")
+            model_step = steps[model_step_id]
+            model_agent_id = (
+                model_step.agent
+                if purpose == "step"
+                else model_step.reviewer
+            )
+            if model_agent_id is None:
+                _fail("runtime checkpoint is incompatible")
+            recovery_limit = _checkpoint_recovery_attempt_limit(
+                agents[model_agent_id],
+                checkpoint.runtime_version,
+            )
+            if (
+                status not in {"prepared", "running", "succeeded", "failed", "rejected", "received_cancelled"}
                 or type(attempt) is not int
                 or not 0
                 <= attempt
                 <= _subagent_model_attempt(
-                    steps[model_step_id].reviewer_retries,
-                    _STEP_TIMEOUT_RECOVERY_RETRIES,
+                    model_step.reviewer_retries,
+                    recovery_limit,
+                    recovery_limit,
                 )
-                or purpose not in {"step", "review"}
                 or type(actor) is not str
                 or type(call_index) is not int
-                or not 0 <= call_index <= 64
+                or not 0
+                <= call_index
+                <= _tool_round_budget(context, model_step).hard_limit
                 or type(value["request_sha256"]) is not str
                 or _SHA256.fullmatch(value["request_sha256"]) is None
             ):
                 _fail("runtime checkpoint is incompatible")
-            expected_actor = (
-                steps[model_step_id].agent if purpose == "step" else steps[model_step_id].reviewer
-            )
-            if actor != expected_actor or key != self._model_call_key(
+            if actor != model_agent_id or key != self._model_call_key(
                 context.run_id,
                 model_step_id,
                 attempt,
@@ -7000,11 +7285,13 @@ class CrewDispatchRuntime:
         model_ledger: _ModelLedger,
         review_ledger: _ReviewLedger,
         input_ids: tuple[str, ...],
+        runtime_version: str = _RUNTIME_VERSION,
     ) -> None:
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
             _fail("runtime checkpoint artifact graph is invalid")
         steps_by_id = {step.id: step for step in plan.steps}
+        agents_by_id = {agent.id: agent for agent in plan.agents}
         for step_id, repair in model_ledger.structured_repairs.items():
             if repair["purpose"] != "review":
                 continue
@@ -7012,10 +7299,22 @@ class CrewDispatchRuntime:
             correction_state = model_ledger.states[cast(str, repair["correction_key"])]
             linked_candidate = by_id.get(cast(str, repair["candidate_artifact_id"]))
             corrected_artifact = model_ledger.artifacts.get(cast(str, repair["correction_key"]))
+            reviewer_id = steps_by_id[step_id].reviewer
+            if reviewer_id is None:
+                _fail("runtime checkpoint artifact graph is invalid")
+            reviewer_recovery_limit = _checkpoint_recovery_attempt_limit(
+                agents_by_id[reviewer_id],
+                runtime_version,
+            )
             if (
                 linked_candidate is None or linked_candidate.type != "text"
                 or linked_candidate.producer != steps_by_id[step_id].agent
-                or linked_candidate.version != cast(int, correction_state["attempt"]) // (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + 1
+                or linked_candidate.version
+                != _subagent_business_attempt(
+                    cast(int, correction_state["attempt"]),
+                    reviewer_recovery_limit,
+                )
+                + 1
                 or linked_candidate.content_sha256 != repair["candidate_sha256"]
                 or (corrected_artifact is not None and corrected_artifact.source_ids != source["source_ids"])
             ):
@@ -7097,10 +7396,23 @@ class CrewDispatchRuntime:
         model_step_ids = {group[0] for group in models}
         tool_step_ids = {group[0] for group in tools}
 
-        def model_attempt_candidates(business_attempt: int) -> tuple[int, ...]:
-            candidates = [_subagent_model_attempt(business_attempt, 0)]
-            for recovery_attempt in range(1, _STEP_TIMEOUT_RECOVERY_RETRIES + 1):
-                model_attempt = _subagent_model_attempt(business_attempt, recovery_attempt)
+        def model_attempt_candidates(
+            business_attempt: int,
+            agent: AgentSpec,
+        ) -> tuple[int, ...]:
+            recovery_limit = _checkpoint_recovery_attempt_limit(
+                agent,
+                runtime_version,
+            )
+            candidates = [
+                _subagent_model_attempt(business_attempt, 0, recovery_limit)
+            ]
+            for recovery_attempt in range(1, recovery_limit + 1):
+                model_attempt = _subagent_model_attempt(
+                    business_attempt,
+                    recovery_attempt,
+                    recovery_limit,
+                )
                 if model_attempt not in candidates:
                     candidates.append(model_attempt)
             return tuple(candidates)
@@ -7110,7 +7422,10 @@ class CrewDispatchRuntime:
             business_attempt: int,
             input_ids: tuple[str, ...],
         ) -> dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]:
-            for model_attempt in model_attempt_candidates(business_attempt):
+            for model_attempt in model_attempt_candidates(
+                business_attempt,
+                agents_by_id[step.agent],
+            ):
                 calls = models.get((step.id, model_attempt, "step"), {})
                 if not calls:
                     continue
@@ -7125,7 +7440,12 @@ class CrewDispatchRuntime:
             output_sources: tuple[str, ...],
             last_model: Artifact | None,
         ) -> dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]:
-            for model_attempt in model_attempt_candidates(business_attempt):
+            if step.reviewer is None:
+                return {}
+            for model_attempt in model_attempt_candidates(
+                business_attempt,
+                agents_by_id[step.reviewer],
+            ):
                 calls = models.get((step.id, model_attempt, "review"), {})
                 if not calls:
                     continue
@@ -7188,7 +7508,10 @@ class CrewDispatchRuntime:
                             _fail("runtime checkpoint artifact graph is invalid")
                         incomplete = True
                         break
-                    expected_model_sources = (*input_ids, *evidence_ids)
+                    expected_model_sources = _lineage_window_ids(
+                        (*input_ids, *evidence_ids),
+                        anchor_count=len(input_ids),
+                    )
                     if (
                         model_artifact.source_ids != expected_model_sources
                         or model_artifact.producer != step.agent
@@ -7233,7 +7556,10 @@ class CrewDispatchRuntime:
                         break
                     if call_index < len(step_calls) - 1 and len(round_tools) != len(calls):
                         _fail("runtime checkpoint artifact graph is invalid")
-                output_sources = (*input_ids, *evidence_ids)
+                output_sources = _lineage_window_ids(
+                    (*input_ids, *evidence_ids),
+                    anchor_count=len(input_ids),
+                )
                 review_calls = review_model_calls(step, attempt, output_sources, last_model)
                 candidate: Artifact | None = None
                 if review_calls:
@@ -7270,7 +7596,11 @@ class CrewDispatchRuntime:
                             incomplete = True
                             break
                         if (
-                            review_model.source_ids != (str(candidate.id), *review_evidence)
+                            review_model.source_ids
+                            != _lineage_window_ids(
+                                (str(candidate.id), *review_evidence),
+                                anchor_count=1,
+                            )
                             or review_model.producer != step.reviewer
                             or step.reviewer is None
                             or not model_artifact_matches_state(review_model, state)
@@ -7303,7 +7633,10 @@ class CrewDispatchRuntime:
                         )
                         if historical.get("verdict") != "revise":
                             _fail("runtime checkpoint historical review is unverified")
-                        expected_feedback_sources = (str(candidate.id), *review_evidence)
+                        expected_feedback_sources = _lineage_window_ids(
+                            (str(candidate.id), *review_evidence),
+                            anchor_count=1,
+                        )
                         matches = feedback_by_sources.get(
                             (cast(str, step.reviewer), expected_feedback_sources), []
                         )
@@ -7544,6 +7877,7 @@ class CrewDispatchRuntime:
             tuple(reference["id"] for reference in cast(
                 tuple[Mapping[str, str], ...], checkpoint.state["input_refs"],
             )),
+            checkpoint.runtime_version,
         )
         if outcome_error is not None:
             raise outcome_error
@@ -7583,6 +7917,7 @@ class CrewDispatchRuntime:
                 request="checkpoint validation",
                 checkpoint=validated,
                 token_budget=plan.total_token_budget,
+                timeout_seconds=3600.0,
             )
             self._validate_checkpoint(validated, dummy, plan)
         except RuntimeExecutionError as error:

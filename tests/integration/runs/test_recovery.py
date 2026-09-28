@@ -999,10 +999,72 @@ async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_win
         before_run_id=current.id,
     )
 
-    assert len(items) == 6
+    assert len(items) == 10
     assert items[0].run_id == first.id
     assert items[-1].run_id == latest.id
     assert all(item.run_id != current.id for item in items)
+
+
+async def test_conversation_context_includes_relevant_middle_turn_with_budgeted_candidates(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    conversation_id = "conv-middle-search"
+    repository = RunRepository(run_session_factory)
+
+    first = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="初始目标：完成数据库迁移",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    relevant = None
+    for index in range(18):
+        record = await repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=user_id,
+            request=(
+                "关键结论：数据库迁移使用蓝绿双写方案"
+                if index == 7
+                else f"普通讨论 {index}"
+            ),
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.COMPLETED,
+            idempotency_key=None,
+            routing_decision={"conversation_id": conversation_id},
+            enqueue=False,
+        )
+        if index == 7:
+            relevant = record
+    current = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="继续数据库迁移的蓝绿双写方案",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.QUEUED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+
+    items = await repository.conversation_context(
+        tenant_id,
+        conversation_id,
+        before_run_id=current.id,
+        query=current.request,
+        candidate_limit=6,
+    )
+
+    assert relevant is not None
+    assert len(items) == 6
+    assert items[0].run_id == first.id
+    assert any(item.run_id == relevant.id for item in items)
+    assert items[-1].run_id == record.id
 
 
 async def test_list_conversation_returns_all_runs_in_chronological_order(

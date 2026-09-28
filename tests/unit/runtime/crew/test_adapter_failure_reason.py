@@ -2250,14 +2250,14 @@ async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
 @pytest.mark.parametrize(
     ("project_scale", "hard_limit"),
     [
-        (None, 8),
-        ("small", 8),
-        ("medium", 16),
-        ("large", 24),
-        ("ultra", 32),
+        (None, 50),
+        ("small", 50),
+        ("medium", 50),
+        ("large", 50),
+        ("ultra", 50),
     ],
 )
-def test_tool_round_budget_scales_with_project_size(
+def test_tool_round_budget_uses_dynamic_resource_cap_for_projects(
     project_scale: str | None,
     hard_limit: int,
 ) -> None:
@@ -2266,6 +2266,49 @@ def test_tool_round_budget_scales_with_project_size(
     budget = _tool_round_budget(
         _context(routing_decision=routing_decision),
         _tool_plan().steps[0],
+    )
+
+    assert budget.initial_limit == 8
+    assert budget.extension_size == 8
+    assert budget.hard_limit == hard_limit
+
+
+def test_tool_round_budget_does_not_depend_on_scale_metadata_shape() -> None:
+    budget = _tool_round_budget(
+        _context(routing_decision={"project_scale": {"unexpected": "mapping"}}),
+        _tool_plan().steps[0],
+    )
+
+    assert budget.initial_limit == 8
+    assert budget.extension_size == 8
+    assert budget.hard_limit == 50
+
+
+@pytest.mark.parametrize(
+    ("token_budget", "timeout_seconds", "hard_limit"),
+    [
+        (10, 60.0, 8),
+        (100, 60.0, 50),
+        (1_000, 200.0, 200),
+        (1_000_000, 3_600.0, 3_600),
+    ],
+)
+def test_tool_round_budget_dynamic_cap_follows_step_resources(
+    token_budget: int,
+    timeout_seconds: float,
+    hard_limit: int,
+) -> None:
+    step = _tool_plan().steps[0].model_copy(
+        update={"token_budget": token_budget, "timeout_seconds": timeout_seconds}
+    )
+
+    budget = _tool_round_budget(
+        _context(
+            routing_decision={"project_scale": "small"},
+            token_budget=token_budget,
+            timeout_seconds=timeout_seconds,
+        ),
+        step,
     )
 
     assert budget.initial_limit == 8
@@ -2336,9 +2379,9 @@ async def test_tool_round_budget_extends_only_while_new_results_arrive(
 
 @pytest.mark.parametrize(
     ("project_scale", "hard_limit"),
-    [("small", 8), ("medium", 16), ("large", 24), ("ultra", 32)],
+    [("small", 50), ("medium", 50), ("large", 50), ("ultra", 50)],
 )
-async def test_tool_round_budget_stops_at_scale_hard_limit(
+async def test_tool_round_budget_stops_at_audited_resource_fuse(
     project_scale: str,
     hard_limit: int,
 ) -> None:
@@ -2378,7 +2421,7 @@ async def test_tool_round_budget_stops_at_scale_hard_limit(
         crew_factory=FastFactory(),
     )
 
-    with pytest.raises(RuntimeExecutionError, match="step capability round limit exceeded"):
+    with pytest.raises(RuntimeExecutionError, match="dispatch budget exhausted"):
         _ = [
             event
             async for event in runtime.run(
@@ -2388,6 +2431,21 @@ async def test_tool_round_budget_stops_at_scale_hard_limit(
 
     assert len(harness.calls) == hard_limit
     assert len(gateway.requests) == hard_limit + 1
+    assert max(len(request.messages) for request in gateway.requests) <= 48
+    assert any(
+        "EARLIER_INTERACTION_WINDOW_COMPRESSED" in message.content
+        for request in gateway.requests
+        for message in request.messages
+    )
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        EndlessProgressGateway(),
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=RecordingHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+    await restored.restore_checkpoint(checkpoint)
 
 
 async def test_crew_runtime_uses_manifest_sandbox_for_plugin_tool_facade() -> None:
@@ -4445,6 +4503,13 @@ async def test_agent_fallback_provider_bad_request_retries_next_fallback_model()
     assert retrying[0].payload["error_code"] == "model.capacity_unavailable"
     assert retrying[1].payload["error_code"] == "model.provider_bad_request"
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan_with_two_model_fallbacks(),
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
 
 
 async def test_agent_capacity_unavailable_compact_retries_before_completing() -> None:

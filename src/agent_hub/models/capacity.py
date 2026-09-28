@@ -21,6 +21,31 @@ _STATE_TTL_MS = 3_600_000
 _MAX_OWNER_RECORDS = 4096
 
 
+def _deployment_token_estimates(
+    candidates: Sequence[Deployment],
+    estimated_tokens: int | Mapping[str, int],
+) -> Mapping[str, int]:
+    if type(estimated_tokens) is int:
+        if estimated_tokens <= 0:
+            raise ValueError("estimated_tokens must be a strict positive integer")
+        return {candidate.id: estimated_tokens for candidate in candidates}
+    if not isinstance(estimated_tokens, Mapping):
+        raise TypeError(
+            "estimated_tokens must be a strict positive integer or deployment mapping"
+        )
+    expected_ids = {candidate.id for candidate in candidates}
+    if set(estimated_tokens) != expected_ids:
+        raise ValueError("estimated_tokens mapping must match capacity candidates")
+    normalized: dict[str, int] = {}
+    for deployment_id, estimate in estimated_tokens.items():
+        if type(deployment_id) is not str or type(estimate) is not int or estimate <= 0:
+            raise ValueError(
+                "estimated_tokens mapping values must be strict positive integers"
+            )
+        normalized[deployment_id] = estimate
+    return normalized
+
+
 class CapacityUnavailable(asyncio.TimeoutError):
     """Stable base class for ordinary capacity admission failures."""
 
@@ -603,7 +628,7 @@ class CapacityPool:
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         ordered = tuple(candidates)
         if not ordered:
@@ -617,8 +642,7 @@ class CapacityPool:
             or wait_timeout < 0
         ):
             raise ValueError("wait_timeout must be nonnegative and finite")
-        if type(estimated_tokens) is not int or estimated_tokens <= 0:
-            raise ValueError("estimated_tokens must be a strict positive integer")
+        token_estimates = _deployment_token_estimates(ordered, estimated_tokens)
         self._require_initialized()
         for candidate in ordered:
             if self._catalog_by_id.get(candidate.id) != candidate:
@@ -631,7 +655,9 @@ class CapacityPool:
             deadline = asyncio.get_running_loop().time() + float(wait_timeout)
             while True:
                 for deployment in self._ordered_candidates(ordered):
-                    lease = await self._try_acquire(deployment, estimated_tokens)
+                    lease = await self._try_acquire(
+                        deployment, token_estimates[deployment.id]
+                    )
                     if lease is not None:
                         return lease
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1019,7 +1045,7 @@ class _CapacityScopeView:
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         ordered = tuple(candidates)
         if not ordered:
@@ -1033,8 +1059,7 @@ class _CapacityScopeView:
             or wait_timeout < 0
         ):
             raise ValueError("wait_timeout must be nonnegative and finite")
-        if type(estimated_tokens) is not int or estimated_tokens <= 0:
-            raise ValueError("estimated_tokens must be a strict positive integer")
+        token_estimates = _deployment_token_estimates(ordered, estimated_tokens)
         self._require_initialized()
         for candidate in ordered:
             if self._catalog_by_id.get(candidate.id) != candidate:
@@ -1048,7 +1073,9 @@ class _CapacityScopeView:
             deadline = asyncio.get_running_loop().time() + float(wait_timeout)
             while True:
                 for deployment in root._ordered_candidates(ordered):
-                    lease = await root._try_acquire(deployment, estimated_tokens)
+                    lease = await root._try_acquire(
+                        deployment, token_estimates[deployment.id]
+                    )
                     if lease is not None:
                         return lease
                 remaining = deadline - asyncio.get_running_loop().time()

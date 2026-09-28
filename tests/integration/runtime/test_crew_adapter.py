@@ -3494,35 +3494,39 @@ async def test_tool_call_response_at_limit_executes_normally() -> None:
 
 
 @pytest.mark.parametrize(
-    ("last_batch", "succeeds", "expected_calls"),
-    ((11, True, 59), (12, False, 48)),
+    ("last_batch", "expected_calls"),
+    ((11, 59), (12, 60)),
 )
-async def test_cumulative_tool_evidence_budget_is_preflighted_before_batch(
+async def test_cumulative_tool_evidence_uses_bounded_lineage_window(
     last_batch: int,
-    succeeds: bool,
     expected_calls: int,
 ) -> None:
     gateway = BatchedToolGateway((16, 16, 16, last_batch, 0))
     capabilities = FakeCapabilities()
+    repository = InMemoryArtifactRepository()
     runtime = make_runtime(
         gateway,
         one_step_plan(tools=("web.search",)),
         capability_gateway=capabilities,
+        artifact_repository=repository,
     )
 
-    if succeeds:
-        assert (await collect(runtime, context(token_budget=100)))[
-            -1
-        ].kind is EventKind.RUNTIME_COMPLETED
-    else:
-        with pytest.raises(RuntimeExecutionError):
-            await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
-        checkpoint = await runtime.save_checkpoint()
-        models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
-        latest = max(models.values(), key=lambda item: cast(int, item["call_index"]))
-        assert latest["status"] == "running"
-        assert checkpoint.state["usage"] == {"tokens": 6, "cost_usd": "0"}
+    assert (await collect(runtime, context(token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
     assert len(capabilities.calls) == expected_calls
+    checkpoint = await runtime.save_checkpoint()
+    replay_gateway = BatchedToolGateway((0,))
+    replay = make_runtime(
+        replay_gateway,
+        one_step_plan(tools=("web.search",)),
+        capability_gateway=FakeCapabilities(),
+        artifact_repository=repository,
+    )
+    await replay.restore_checkpoint(checkpoint)
+    resumed = await collect(replay, context(token_budget=100, checkpoint=checkpoint))
+    assert [event.kind for event in resumed] == [EventKind.RUNTIME_COMPLETED]
+    assert replay_gateway.requests == []
 
 
 async def test_checkpoint_serialization_failure_still_terminates_and_allows_reuse(

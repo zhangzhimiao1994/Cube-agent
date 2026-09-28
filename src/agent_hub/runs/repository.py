@@ -1535,8 +1535,13 @@ class RunRepository:
         conversation_id: str,
         *,
         before_run_id: UUID,
-        limit: int = 6,
+        limit: int | None = 32,
+        query: str | None = None,
+        candidate_limit: int | None = None,
     ) -> tuple[ConversationContextItem, ...]:
+        effective_limit = candidate_limit if candidate_limit is not None else limit
+        if effective_limit is not None and (type(effective_limit) is not int or effective_limit < 1):
+            raise ValueError("conversation context candidate limit must be positive")
         async with self._session_factory() as session:
             current = await session.scalar(
                 select(RunRow.created_at).where(
@@ -1552,18 +1557,63 @@ class RunRepository:
                 .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
                 .where(RunRow.created_at <= current)
             )
-            rows = (
-                await session.scalars(
-                    base_filter.order_by(RunRow.created_at.desc(), RunRow.id.desc()).limit(limit)
+            if effective_limit is None:
+                ordered_rows = tuple(
+                    (
+                        await session.scalars(
+                            base_filter.order_by(RunRow.created_at.asc(), RunRow.id.asc())
+                        )
+                    ).all()
                 )
-            ).all()
-            ordered_rows = tuple(reversed(rows))
-            if limit > 1 and len(ordered_rows) >= limit:
+            else:
                 origin = await session.scalar(
                     base_filter.order_by(RunRow.created_at.asc(), RunRow.id.asc()).limit(1)
                 )
-                if origin is not None and all(row.id != origin.id for row in ordered_rows):
-                    ordered_rows = (origin, *ordered_rows[-(limit - 1) :])
+                recent_rows = (
+                    await session.scalars(
+                        base_filter.order_by(RunRow.created_at.desc(), RunRow.id.desc()).limit(
+                            effective_limit
+                        )
+                    )
+                ).all()
+                relevant_rows: list[RunRow] = []
+                query_terms = _conversation_context_query_terms(query)
+                if query_terms:
+                    relevant_filter = or_(
+                        *(
+                            RunRow.request.ilike(
+                                f"%{_escape_ilike(term)}%",
+                                escape="\\",
+                            )
+                            for term in query_terms
+                        )
+                    )
+                    relevant_rows = list(
+                        (
+                            await session.scalars(
+                                base_filter.where(relevant_filter)
+                                .order_by(RunRow.created_at.desc(), RunRow.id.desc())
+                                .limit(effective_limit)
+                            )
+                        ).all()
+                    )
+                selected: dict[UUID, RunRow] = {}
+                if origin is not None:
+                    selected[origin.id] = origin
+                relevance_slots = max(0, (effective_limit - len(selected)) // 2)
+                for row in relevant_rows:
+                    if relevance_slots <= 0 or len(selected) >= effective_limit:
+                        break
+                    if row.id not in selected:
+                        selected[row.id] = row
+                        relevance_slots -= 1
+                for row in recent_rows:
+                    if len(selected) >= effective_limit:
+                        break
+                    selected.setdefault(row.id, row)
+                ordered_rows = tuple(
+                    sorted(selected.values(), key=lambda row: (row.created_at, row.id))
+                )
             if not ordered_rows:
                 return ()
             run_ids = [row.id for row in ordered_rows]
@@ -1974,6 +2024,31 @@ def _encode_question_search_cursor(created_at: datetime, run_id: UUID) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _conversation_context_query_terms(query: str | None) -> tuple[str, ...]:
+    if query is None:
+        return ()
+    normalized = re.sub(r"\s+", " ", query.casefold()).strip()
+    if not normalized:
+        return ()
+    candidates: list[str] = []
+    candidates.extend(re.findall(r"[a-z0-9][a-z0-9_.:-]{1,63}", normalized))
+    for chunk in re.findall(r"[\u3400-\u9fff]{2,}", normalized):
+        if len(chunk) <= 6:
+            candidates.append(chunk)
+            continue
+        for width in (6, 5, 4, 3, 2):
+            candidates.extend(
+                chunk[index : index + width] for index in range(len(chunk) - width + 1)
+            )
+    ignored = {"继续", "当前", "之前", "这个", "那个", "方案", "项目", "任务"}
+    unique = {candidate for candidate in candidates if candidate not in ignored}
+    return tuple(sorted(unique, key=lambda value: (-len(value), value))[:24])
+
+
+def _escape_ilike(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _question_search_excerpt(question: str, query: str, *, max_chars: int = 600) -> str:

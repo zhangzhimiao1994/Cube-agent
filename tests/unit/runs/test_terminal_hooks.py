@@ -272,6 +272,8 @@ class ExecutableFakeRepository:
         conversation_id: str,
         *,
         before_run_id: UUID,
+        query: str | None = None,
+        candidate_limit: int | None = None,
     ) -> list[object]:
         assert tenant_id == TENANT_ID
         assert before_run_id == self.run_id
@@ -281,6 +283,8 @@ class ExecutableFakeRepository:
                 "tenant_id": tenant_id,
                 "conversation_id": conversation_id,
                 "before_run_id": before_run_id,
+                "query": query,
+                "candidate_limit": candidate_limit,
             }
         )
         return []
@@ -2633,13 +2637,16 @@ async def test_execute_records_hermes_outcome_when_cleared_conversation_has_no_c
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.COMPLETED
-    assert repository.conversation_context_calls == [
-        {
-            "tenant_id": TENANT_ID,
-            "conversation_id": "conv-cleared-then-continued",
-            "before_run_id": repository.run_id,
-        }
-    ]
+    assert len(repository.conversation_context_calls) == 1
+    context_call = repository.conversation_context_calls[0]
+    candidate_limit = context_call.pop("candidate_limit")
+    assert isinstance(candidate_limit, int) and candidate_limit > 6
+    assert context_call == {
+        "tenant_id": TENANT_ID,
+        "conversation_id": "conv-cleared-then-continued",
+        "before_run_id": repository.run_id,
+        "query": "run evolution round",
+    }
     assert len(hermes.outcomes) == 1
     outcome = hermes.outcomes[0]
     assert outcome.status is RunStatus.COMPLETED

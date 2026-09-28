@@ -36,6 +36,10 @@ class StrictConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+_DEFAULT_DEPLOYMENT_CONTEXT_WINDOW_TOKENS = 65_536
+_DEFAULT_DEPLOYMENT_MAX_OUTPUT_TOKENS = 8_192
+
+
 class DeploymentDefinition(StrictConfigModel):
     provider: str = Field(max_length=512)
     model: str = Field(max_length=512)
@@ -53,6 +57,8 @@ class DeploymentDefinition(StrictConfigModel):
     reserved_slots: int = Field(default=0, ge=0)
     rpm: int | None = Field(default=None, gt=0)
     tpm: int | None = Field(default=None, gt=0)
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
     input_per_million_usd: Decimal | None = None
     output_per_million_usd: Decimal | None = None
     capabilities: set[Capability] = Field(
@@ -72,6 +78,12 @@ class DeploymentDefinition(StrictConfigModel):
             self.output_per_million_usd is None
         ):
             raise ValueError("deployment pricing must provide both input and output rates")
+        if (
+            self.context_window_tokens is not None
+            and self.max_output_tokens is not None
+            and self.max_output_tokens > self.context_window_tokens
+        ):
+            raise ValueError("max_output_tokens must not exceed context_window_tokens")
         return self
 
     @field_validator("input_per_million_usd", "output_per_million_usd", mode="before")
@@ -109,6 +121,13 @@ class DeploymentDefinition(StrictConfigModel):
             "reserved_slots": self.reserved_slots,
             "rpm": self.rpm,
             "tpm": self.tpm,
+            "context_window_tokens": (
+                self.context_window_tokens
+                or _DEFAULT_DEPLOYMENT_CONTEXT_WINDOW_TOKENS
+            ),
+            "max_output_tokens": (
+                self.max_output_tokens or _DEFAULT_DEPLOYMENT_MAX_OUTPUT_TOKENS
+            ),
             "capabilities": frozenset(ModelCapability(item) for item in self.capabilities),
             "input_per_million_usd": self.input_per_million_usd,
             "output_per_million_usd": self.output_per_million_usd,

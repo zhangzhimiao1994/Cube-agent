@@ -8,7 +8,7 @@ import logging
 import math
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType
@@ -270,7 +270,7 @@ class CapacityController(Protocol):
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease: ...
 
     async def renew(self, lease: CapacityLease) -> CapacityLease | None: ...
@@ -288,9 +288,12 @@ class CapacityController(Protocol):
 
 
 class ConservativeTokenEstimator:
-    """Deterministic local upper estimate using the request's output budget."""
+    """Deterministic token estimate with explicit text and JSON structure costs."""
 
     def estimate(self, request: ModelRequest) -> int:
+        return self.estimate_input(request) + request.max_output_tokens
+
+    def estimate_input(self, request: ModelRequest) -> int:
         payload: dict[str, object] = {
             "logical_model": request.logical_model,
             "messages": [
@@ -314,8 +317,31 @@ class ConservativeTokenEstimator:
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8")
-        return len(normalized) + request.max_output_tokens
+        )
+        return max(1, self._estimate_text_tokens(normalized))
+
+    @staticmethod
+    def _estimate_text_tokens(value: str) -> int:
+        tokens = 0
+        ascii_run = 0
+
+        def flush_ascii_run() -> None:
+            nonlocal ascii_run, tokens
+            if ascii_run:
+                tokens += math.ceil(ascii_run / 4)
+                ascii_run = 0
+
+        for character in value:
+            if character.isascii() and (character.isalnum() or character.isspace()):
+                ascii_run += 1
+                continue
+            flush_ascii_run()
+            if character.isascii():
+                tokens += 1
+            else:
+                tokens += max(1, math.ceil(len(character.encode("utf-8")) / 3))
+        flush_ascii_run()
+        return tokens
 
     def _mutable_json(self, value: object) -> object:
         if isinstance(value, Mapping):
@@ -426,9 +452,6 @@ class ModelGateway:
         )
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
-        estimated_tokens = self._token_estimator.estimate(request)
-        if type(estimated_tokens) is not int or estimated_tokens <= 0:
-            raise ValueError("token estimator must return a strict positive integer")
         (
             candidate_groups,
             attempted_logical_models,
@@ -442,13 +465,25 @@ class ModelGateway:
         )
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
+        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         last_retryable_error: BaseException | None = None
         for logical_model, candidates in candidate_groups:
             attempted_logical_models.append(logical_model)
+            compatible_candidates = self._context_compatible_candidates(
+                candidates, input_tokens
+            )
+            if not compatible_candidates:
+                if fallback_from_logical_model is None:
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = "context_window_exceeded"
+                continue
+            estimated_tokens = self._capacity_token_estimates(
+                request, compatible_candidates, input_tokens
+            )
             try:
                 await capacity.initialize()
                 lease = await capacity.acquire(
-                    candidates,
+                    compatible_candidates,
                     self._capacity_wait_timeout,
                     estimated_tokens=estimated_tokens,
                 )
@@ -457,7 +492,14 @@ class ModelGateway:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
                 continue
-            selected = next((item for item in candidates if item.id == lease.deployment_id), None)
+            selected = next(
+                (
+                    item
+                    for item in compatible_candidates
+                    if item.id == lease.deployment_id
+                ),
+                None,
+            )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
                 cleanup_error = await self._release_cleanup(capacity, lease)
                 if isinstance(cleanup_error, asyncio.CancelledError):
@@ -465,18 +507,21 @@ class ModelGateway:
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
+            selected_request = self._request_for_deployment(request, selected, input_tokens)
             try:
-                response = await self._complete_leased(capacity, selected, lease, request)
+                response = await self._complete_leased(
+                    capacity, selected, lease, selected_request
+                )
             except ModelResponseCancelled as error:
                 cancelled = self._cancelled_output(
-                    selected, request, error.receipt, fallback_from_logical_model,
+                    selected, selected_request, error.receipt, fallback_from_logical_model,
                     fallback_reason, attempted_logical_models,
                 )
                 cancelled.args = error.args
                 raise cancelled from None
             except ModelResponseError as error:
                 raise self._rejected_output(
-                    selected, request, error.evidence, fallback_from_logical_model,
+                    selected, selected_request, error.evidence, fallback_from_logical_model,
                     fallback_reason, attempted_logical_models,
                 ) from None
             except (ModelTransportError, ModelGatewayError) as error:
@@ -513,9 +558,6 @@ class ModelGateway:
         self, request: ModelRequest
     ) -> AsyncIterator[NormalizedProviderEvent]:
         streaming_transport = self._streaming_transport()
-        estimated_tokens = self._token_estimator.estimate(request)
-        if type(estimated_tokens) is not int or estimated_tokens <= 0:
-            raise ValueError("token estimator must return a strict positive integer")
         last_retryable_error: BaseException | None = None
         (
             candidate_groups,
@@ -530,8 +572,20 @@ class ModelGateway:
         )
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
+        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         for logical_model, candidates in candidate_groups:
             attempted_logical_models.append(logical_model)
+            compatible_candidates = self._context_compatible_candidates(
+                candidates, input_tokens
+            )
+            if not compatible_candidates:
+                if fallback_from_logical_model is None:
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = "context_window_exceeded"
+                continue
+            estimated_tokens = self._capacity_token_estimates(
+                request, compatible_candidates, input_tokens
+            )
             if (
                 fallback_from_logical_model is not None
                 and fallback_reason is not None
@@ -546,7 +600,7 @@ class ModelGateway:
             try:
                 await capacity.initialize()
                 lease = await capacity.acquire(
-                    candidates,
+                    compatible_candidates,
                     self._capacity_wait_timeout,
                     estimated_tokens=estimated_tokens,
                 )
@@ -554,7 +608,14 @@ class ModelGateway:
                 fallback_from_logical_model = logical_model
                 fallback_reason = "capacity_unavailable"
                 continue
-            selected = next((item for item in candidates if item.id == lease.deployment_id), None)
+            selected = next(
+                (
+                    item
+                    for item in compatible_candidates
+                    if item.id == lease.deployment_id
+                ),
+                None,
+            )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
                 cleanup_error = await self._release_cleanup(capacity, lease)
                 if isinstance(cleanup_error, asyncio.CancelledError):
@@ -562,12 +623,13 @@ class ModelGateway:
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
+            selected_request = self._request_for_deployment(request, selected, input_tokens)
             yielded = False
             events = self._stream_openai_compatible_leased(
                 capacity,
                 selected,
                 lease,
-                request,
+                selected_request,
                 streaming_transport,
             )
             try:
@@ -585,7 +647,7 @@ class ModelGateway:
                     continue
             except ModelResponseError as error:
                 raise self._rejected_output(
-                    selected, request, error.evidence, fallback_from_logical_model,
+                    selected, selected_request, error.evidence, fallback_from_logical_model,
                     fallback_reason, attempted_logical_models,
                 ) from None
             except (ModelTransportError, ModelGatewayError) as error:
@@ -601,6 +663,74 @@ class ModelGateway:
         if last_retryable_error is not None:
             raise last_retryable_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
+
+    def _estimate_tokens(self, request: ModelRequest) -> int:
+        estimated_tokens = self._token_estimator.estimate(request)
+        if type(estimated_tokens) is not int or estimated_tokens <= 0:
+            raise ValueError("token estimator must return a strict positive integer")
+        return estimated_tokens
+
+    def _estimated_input_tokens(
+        self, request: ModelRequest, deployments: Sequence[Deployment]
+    ) -> int | None:
+        if not any(item.context_window_tokens is not None for item in deployments):
+            return None
+        estimate_input = getattr(self._token_estimator, "estimate_input", None)
+        if callable(estimate_input):
+            estimated_input = estimate_input(request)
+            if type(estimated_input) is not int or estimated_input <= 0:
+                raise ValueError("input token estimator must return a strict positive integer")
+            return estimated_input
+        minimal_output_request = replace(request, max_output_tokens=1)
+        return max(0, self._estimate_tokens(minimal_output_request) - 1)
+
+    @staticmethod
+    def _context_compatible_candidates(
+        candidates: Sequence[Deployment], input_tokens: int | None
+    ) -> tuple[Deployment, ...]:
+        if input_tokens is None:
+            return tuple(candidates)
+        return tuple(
+            deployment
+            for deployment in candidates
+            if deployment.context_window_tokens is None
+            or input_tokens < deployment.context_window_tokens
+        )
+
+    @staticmethod
+    def _request_for_deployment(
+        request: ModelRequest,
+        deployment: Deployment,
+        input_tokens: int | None,
+    ) -> ModelRequest:
+        output_limit = request.max_output_tokens
+        if deployment.max_output_tokens is not None:
+            output_limit = min(output_limit, deployment.max_output_tokens)
+        if deployment.context_window_tokens is not None and input_tokens is not None:
+            output_limit = min(
+                output_limit,
+                max(1, deployment.context_window_tokens - input_tokens),
+            )
+        if output_limit == request.max_output_tokens:
+            return request
+        return replace(request, max_output_tokens=output_limit)
+
+    def _capacity_token_estimates(
+        self,
+        request: ModelRequest,
+        candidates: Sequence[Deployment],
+        input_tokens: int | None,
+    ) -> int | Mapping[str, int]:
+        estimates = {
+            deployment.id: self._estimate_tokens(
+                self._request_for_deployment(request, deployment, input_tokens)
+            )
+            for deployment in candidates
+        }
+        unique_estimates = set(estimates.values())
+        if len(unique_estimates) == 1:
+            return next(iter(unique_estimates))
+        return MappingProxyType(estimates)
 
     def _capable_candidate_groups(
         self, request: ModelRequest
