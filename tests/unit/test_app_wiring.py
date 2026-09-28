@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Self, cast
@@ -1441,11 +1441,14 @@ class ImmediateCapacity:
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         assert candidates
         assert wait_timeout > 0
-        assert estimated_tokens > 0
+        if isinstance(estimated_tokens, Mapping):
+            assert all(value > 0 for value in estimated_tokens.values())
+        else:
+            assert estimated_tokens > 0
         return CapacityLease(
             id=str(uuid4()),
             deployment_id=candidates[0].id,

@@ -1103,7 +1103,11 @@ async def test_gateway_skips_context_incompatible_primary_for_larger_fallback() 
 
     assert completion.deployment_id == "backup-key"
     assert transport.requests == [("backup-key", 512)]
-    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    acquire_events = [
+        cast(tuple[object, ...], event)
+        for event in capacity.events
+        if isinstance(event, tuple) and event[:1] == ("acquire",)
+    ]
     assert [event[1] for event in acquire_events] == [("backup-key",)]
 
 

@@ -362,10 +362,13 @@ class ImmediateCapacity:
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         self.wait_timeouts.append(wait_timeout)
-        assert estimated_tokens > 0
+        if isinstance(estimated_tokens, Mapping):
+            assert all(value > 0 for value in estimated_tokens.values())
+        else:
+            assert estimated_tokens > 0
         candidate = next(iter(candidates))
         assert isinstance(candidate, Deployment)
         return CapacityLease(
@@ -401,12 +404,15 @@ class TimeoutCapacity(ImmediateCapacity):
         candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | Mapping[str, int],
     ) -> CapacityLease:
         self.wait_timeouts.append(wait_timeout)
         self.events = getattr(self, "events", [])
         self.events.append(tuple(deployment.provider_model for deployment in candidates))
-        assert estimated_tokens > 0
+        if isinstance(estimated_tokens, Mapping):
+            assert all(value > 0 for value in estimated_tokens.values())
+        else:
+            assert estimated_tokens > 0
         raise CapacityWaitTimeout("busy")
 
 
@@ -1024,11 +1030,14 @@ async def test_config_backed_direct_runtime_uses_configured_fallback(
             candidates: Sequence[Deployment],
             wait_timeout: float,
             *,
-            estimated_tokens: int,
+            estimated_tokens: int | Mapping[str, int],
         ) -> CapacityLease:
             self.wait_timeouts.append(wait_timeout)
             self.events.append(tuple(deployment.provider_model for deployment in candidates))
-            assert estimated_tokens > 0
+            if isinstance(estimated_tokens, Mapping):
+                assert all(value > 0 for value in estimated_tokens.values())
+            else:
+                assert estimated_tokens > 0
             if len(self.events) == 1:
                 raise CapacityWaitTimeout("busy")
             candidate = next(iter(candidates))
