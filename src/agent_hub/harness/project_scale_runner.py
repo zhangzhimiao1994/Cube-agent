@@ -914,6 +914,7 @@ def execute_project_scale_plan(
             repair_progress_observed = True
             repair_followup_warranted = False
             regression_repair_followups_remaining = 1
+            force_authoritative_repair = False
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
             ):
@@ -982,6 +983,7 @@ def execute_project_scale_plan(
                     benchmark_kind=plan.benchmark_kind,
                     effective_mode=repair_mode,
                     source_workspace_bundle=current_workspace_bundle,
+                    force_workspace_replacement=force_authoritative_repair,
                     failed_reasons=(
                         *deliverable_quality.reasons,
                         *agent_standard_verification.reasons,
@@ -999,6 +1001,7 @@ def execute_project_scale_plan(
                         ),
                     ),
                 )
+                force_authoritative_repair = False
                 repair_response = client.request_json(
                     "POST",
                     "/api/v1/runs",
@@ -1200,8 +1203,20 @@ def execute_project_scale_plan(
                     next_progress_state,
                     seen_signatures=seen_repair_progress_signatures,
                 )
+                repeated_build_regression = (
+                    _deliverable_repair_requires_authoritative_recovery(
+                        repair_progress_state,
+                        next_progress_state,
+                        seen_signatures=seen_repair_progress_signatures,
+                    )
+                )
+                if repeated_build_regression and regression_repair_followups_remaining > 0:
+                    repair_followup_warranted = True
+                    regression_repair_followups_remaining -= 1
+                    force_authoritative_repair = True
                 if (
                     repair_followup_warranted
+                    and not repeated_build_regression
                     and next_progress_state.validation_stage
                     < repair_progress_state.validation_stage
                 ):
@@ -1209,6 +1224,7 @@ def execute_project_scale_plan(
                         repair_followup_warranted = False
                     else:
                         regression_repair_followups_remaining -= 1
+                        force_authoritative_repair = True
                 seen_repair_progress_signatures.add(next_progress_state.signature)
                 repair_progress_state = next_progress_state
                 if (
@@ -3530,6 +3546,33 @@ def _deliverable_repair_followup_warranted(
     return current.failure_fingerprints != previous.failure_fingerprints
 
 
+def _deliverable_repair_requires_authoritative_recovery(
+    previous: _DeliverableRepairProgress,
+    current: _DeliverableRepairProgress,
+    *,
+    seen_signatures: set[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            int,
+            tuple[tuple[str, int, int], ...],
+        ]
+    ],
+) -> bool:
+    if current.signature not in seen_signatures or not current.failure_fingerprints:
+        return False
+    if previous.validation_stage < 2 or current.validation_stage != 1:
+        return False
+    added_deficits = set(current.deficits) - set(previous.deficits)
+    return added_deficits.issubset(
+        {
+            "deliverable_quality",
+            "generated_project_validation",
+            "requirements_validation",
+        }
+    )
+
+
 def _repair_metrics_progressed(
     previous: tuple[tuple[str, int, int], ...],
     current: tuple[tuple[str, int, int], ...],
@@ -3558,6 +3601,7 @@ def _deliverable_repair_body(
     benchmark_kind: str = "fixture",
     effective_mode: str | None = None,
     source_workspace_bundle: bytes | None = None,
+    force_workspace_replacement: bool = False,
 ) -> dict[str, object]:
     repair_body = dict(body)
     if effective_mode in {"direct", "dispatch", "hybrid"}:
@@ -3571,7 +3615,7 @@ def _deliverable_repair_body(
             if source_workspace_bundle is not None
             else None
         )
-        incremental_repair = bool(source_files)
+        incremental_repair = bool(source_files) and not force_workspace_replacement
         repair_body["replace_workspace_files"] = not incremental_repair
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
@@ -3581,7 +3625,8 @@ def _deliverable_repair_body(
             "preserve their imports, exports, scripts, and public contracts. "
             if incremental_repair
             else (
-                "Return full workspace_bundle.files or ### `path` fences: "
+                "Replace the entire workspace with one coherent implementation. Return full "
+                "workspace_bundle.files or ### `path` fences and omit obsolete files: "
                 "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md/"
                 "VERIFICATION.md/constraints_reading_evidence.json. "
             )

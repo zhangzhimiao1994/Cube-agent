@@ -5507,6 +5507,8 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
     assert "validator helpers that require a field argument" in repair_messages[1]
     assert "trusted runtime context/plan evidence unavailable" in repair_messages[2]
     assert "npm start exited before CRM API became ready" in repair_messages[3]
+    assert client.submitted_bodies[4]["replace_workspace_files"] is True
+    assert "Replace the entire workspace" in repair_messages[3]
     if second_regression:
         assert "root cause repair evidence unavailable" in repair_messages[4]
     assert validation_results == []
@@ -5528,6 +5530,48 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
     if second_regression:
         expected_repair_keys.append("project-scale-medium-direct-0-deliverable-repair-5")
     assert repair_keys == expected_repair_keys
+
+
+def test_repeated_build_regression_requires_one_authoritative_recovery() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm test failed",),
+        validation_stage=2,
+        progress_metrics=(),
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm run build failed",),
+        validation_stage=1,
+        progress_metrics=(),
+    )
+
+    assert project_scale_runner_module._deliverable_repair_requires_authoritative_recovery(
+        previous,
+        current,
+        seen_signatures={current.signature},
+    )
+
+
+def test_repeated_same_stage_failure_does_not_force_authoritative_recovery() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm run build failed once",),
+        validation_stage=1,
+        progress_metrics=(),
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm run build failed again",),
+        validation_stage=1,
+        progress_metrics=(),
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_requires_authoritative_recovery(
+        previous,
+        current,
+        seen_signatures={current.signature},
+    )
 
 
 def test_capability_repair_extends_past_scale_budget_while_validation_progresses(
