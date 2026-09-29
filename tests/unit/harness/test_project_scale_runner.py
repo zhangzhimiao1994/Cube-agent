@@ -5623,6 +5623,40 @@ def test_workspace_bundle_agent_standard_accepts_json_source_names_as_keys() -> 
     assert _workspace_bundle_agent_standard_reasons(bundle) == ()
 
 
+def test_workspace_bundle_agent_standard_accepts_combined_skill_rule_field() -> None:
+    bundle = _project_bundle(
+        {
+            "README.md": "# Acceptance Fixture\n\nImplements the requested project scope.\n",
+            "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n- Interaction verified\n",
+            "IMPLEMENTATION_PLAN.md": "- Build project\n",
+            "constraints_reading_evidence.json": json.dumps(
+                {
+                    "read_before_implementation": True,
+                    "constraints": [
+                        "AGENTS.md workspace rules",
+                        "HANDOFF.md current-state index",
+                        "PROJECT_REQUIREMENTS.md requirements",
+                    ],
+                    "skills_or_agent_standard_rules": [
+                        "SKILL.md applicable skill guidance",
+                        "agent-standard rules",
+                    ],
+                },
+                sort_keys=True,
+            ),
+            "VERIFICATION.md": "- No checks were executed in this environment.\n",
+            "package.json": json.dumps(
+                {"scripts": {"build": "node --check src/main.js", "test": "node --test"}},
+                sort_keys=True,
+            ),
+            "src/main.js": _functional_js_source(),
+            "tests/main.test.js": _functional_js_test(),
+        }
+    )
+
+    assert _workspace_bundle_agent_standard_reasons(bundle) == ()
+
+
 def test_agent_standard_verification_accepts_public_tool_event_evidence() -> None:
     bundle = _project_bundle(
         {

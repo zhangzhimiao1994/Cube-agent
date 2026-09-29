@@ -4494,7 +4494,13 @@ def _reading_evidence_payload_passes(value: object) -> bool:
         )
         and _reading_evidence_has_required_skill_sources(
             value,
-            ("skills", "skill_rules", "rules", "skill_sources"),
+            (
+                "skills",
+                "skill_rules",
+                "rules",
+                "skill_sources",
+                "skills_or_agent_standard_rules",
+            ),
         )
     )
 
