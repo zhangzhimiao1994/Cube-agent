@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
@@ -379,6 +380,15 @@ describe("ConfigPage", () => {
     expect(screen.getByText("服务器未安装 Docker CLI。")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "重新探测" }));
     await waitFor(() => expect(screen.getByText("当前可用")).not.toBeNull());
+  });
+
+  it("keeps long execution backend statuses inside mobile cards", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toContain(".execution-environment-heading {\n  align-items: start;\n  display: flex;\n  flex-wrap: wrap;");
+    expect(stylesCss).toContain(".execution-environment-card .status-pill {\n  max-width: 100%;\n  min-width: 0;");
+    expect(stylesCss).toContain("overflow-wrap: anywhere;");
+    expect(stylesCss).toContain("white-space: normal;");
   });
 
   it("shows package subprocess registration status as runtime state", async () => {

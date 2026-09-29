@@ -5986,12 +5986,25 @@ article:hover {
 .execution-environment-heading {
   align-items: start;
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   justify-content: space-between;
 }
 
+.execution-environment-heading > div {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
 .execution-environment-heading h3 {
   margin: 0.2rem 0 0;
+}
+
+.execution-environment-card .status-pill {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .execution-environment-card .status-pill.success {
