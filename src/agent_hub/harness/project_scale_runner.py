@@ -2054,13 +2054,134 @@ def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
     )
 
 
+def _redact_generated_project_output(value: str) -> str:
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    value = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@",
+        r"\1<redacted>@",
+        value,
+    )
+    value = re.sub(
+        r"(?im)^(\s*(?:authorization|cookie|set-cookie)\s*[:=]).*$",
+        r"\1 <redacted>",
+        value,
+    )
+    sensitive_key = (
+        r"(?:password|passwd|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+        r"api[_-]?key|secret|token|jwt)"
+    )
+    value = re.sub(
+        rf"(?im)^(\s*{sensitive_key}\s*[:=]).*$",
+        r"\1 <redacted>",
+        value,
+    )
+    value = re.sub(
+        rf"(?i)\b({sensitive_key})(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1\2<redacted>",
+        value,
+    )
+    value = re.sub(r"(?i)\b(bearer\s+)[^\s,;]+", r"\1<redacted>", value)
+    value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", value)
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+        "<redacted>",
+        value,
+    )
+    return value
+
+
+def _generated_project_diagnostic_excerpt(lines: Sequence[str]) -> str:
+    markers = (
+        "not ok ",
+        "failuretype:",
+        "error:",
+        "assertionerror",
+        "referenceerror",
+        "typeerror",
+        "syntaxerror",
+        "exception",
+        "actual:",
+        "expected:",
+        "received:",
+        "operator:",
+        "traceback",
+        "error ts",
+        "command not found",
+        "is not recognized",
+        "failed ",
+        "# fail ",
+    )
+    anchors = tuple(
+        index
+        for index, line in enumerate(lines)
+        if "not ok " in line.casefold()
+        or line.casefold().startswith(("fail ", "failed "))
+    )
+    blocks: list[str] = []
+    for anchor_position, anchor in enumerate(anchors[:3]):
+        end = anchors[anchor_position + 1] if anchor_position + 1 < len(anchors) else len(lines)
+        block_lines = [lines[anchor]]
+        for line in lines[anchor + 1 : end]:
+            if any(marker in line.casefold() for marker in markers):
+                block_lines.append(line)
+        block = " | ".join(dict.fromkeys(block_lines))
+        blocks.append(block if len(block) <= 320 else f"{block[:240]} ... {block[-60:]}")
+    if blocks:
+        if len(anchors) > len(blocks):
+            blocks.append(f"... {len(anchors) - len(blocks)} additional failure blocks omitted")
+        diagnostics = " || ".join(blocks)
+    else:
+        diagnostic_lines = tuple(
+            dict.fromkeys(
+                line
+                for line in lines
+                if any(marker in line.casefold() for marker in markers)
+            )
+        )
+        diagnostics = " | ".join(
+            line if len(line) <= 180 else f"{line[:130]} ... {line[-30:]}"
+            for line in diagnostic_lines[:6]
+        )
+    summaries = tuple(
+        line for line in lines if line.casefold().startswith(("# tests ", "# pass ", "# fail "))
+    )
+    if summaries:
+        diagnostics = " | ".join(part for part in (diagnostics, *summaries) if part)
+    return diagnostics[:1_100]
+
+
 def _generated_project_output_tail(value: str) -> str:
-    text = re.sub(r"\s+", " ", value).strip()
+    value = _redact_generated_project_output(value)
+    lines = tuple(
+        line if len(line) <= 500 else f"{line[:360]} ... {line[-120:]}"
+        for raw_line in value.splitlines()
+        if (line := re.sub(r"\s+", " ", raw_line).strip())
+    )
+    text = " ".join(lines)
     if not text:
         return ""
-    if len(text) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS:
-        text = "..." + text[-_GENERATED_PROJECT_OUTPUT_TAIL_CHARS:]
-    return json.dumps(text, ensure_ascii=False)
+    if len(json.dumps(text, ensure_ascii=False)) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS:
+        diagnostics = _generated_project_diagnostic_excerpt(lines)
+        head = text[:240]
+        tail = text[-500:]
+        text = f"... head={head} failures={diagnostics} tail={tail}"
+    encoded = json.dumps(text, ensure_ascii=False)
+    while len(encoded) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS and tail:
+        excess = len(encoded) - _GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+        tail = tail[min(excess + 16, len(tail)) :]
+        text = f"... head={head} failures={diagnostics} tail={tail}"
+        encoded = json.dumps(text, ensure_ascii=False)
+    while len(encoded) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS and head:
+        excess = len(encoded) - _GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+        head = head[: max(len(head) - excess - 16, 0)]
+        text = f"... head={head} failures={diagnostics} tail={tail}"
+        encoded = json.dumps(text, ensure_ascii=False)
+    if len(encoded) > _GENERATED_PROJECT_OUTPUT_TAIL_CHARS:
+        diagnostics = diagnostics[:700]
+        text = f"... failures={diagnostics}"
+        encoded = json.dumps(text, ensure_ascii=False)
+    return encoded
 
 
 def _generated_project_command_env() -> dict[str, str]:

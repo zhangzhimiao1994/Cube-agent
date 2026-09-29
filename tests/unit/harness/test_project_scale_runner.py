@@ -301,6 +301,116 @@ def test_capability_repair_keeps_workspace_context_after_long_failure_output() -
     assert len(message) <= 6_000
 
 
+def test_generated_project_output_excerpt_preserves_middle_test_failure() -> None:
+    output = "\n".join(
+        (
+            "> project@test\n> node --test",
+            "ok 1 - startup works",
+            "setup noise " * 120,
+            "not ok 2 - duplicate request returns conflict",
+            "  failureType: 'testCodeFailure'",
+            "  error: 'Expected values to be strictly equal: 200 !== 409'",
+            "  actual: 200",
+            "  expected: 409",
+            "  operator: 'strictEqual'",
+            "passing test output " * 180,
+            "not ok 3 - cancelled job cannot be completed",
+            "  failureType: 'testCodeFailure'",
+            "  error: 'Expected values to be strictly equal: 200 !== 409'",
+            "  actual: 200",
+            "  expected: 409",
+            "  operator: 'strictEqual'",
+            "# tests 13",
+            "# pass 11",
+            "# fail 2",
+        )
+    )
+
+    encoded = project_scale_runner_module._generated_project_output_tail(output)
+    excerpt = json.loads(encoded)
+
+    assert len(excerpt) <= project_scale_runner_module._GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+    assert "not ok 2 - duplicate request returns conflict" in excerpt
+    assert "not ok 3 - cancelled job cannot be completed" in excerpt
+    assert "actual: 200" in excerpt
+    assert "expected: 409" in excerpt
+    assert "# fail 2" in excerpt
+
+
+def test_generated_project_output_excerpt_redacts_secrets_and_bounds_json() -> None:
+    output = "\n".join(
+        (
+            "Authorization: Bearer secret-bearer-value:still-secret",
+            "password: alpha beta gamma",
+            "access_token=raw-token client_secret=client-secret-value",
+            "bare key sk-project-secret must not escape",
+            "Cookie: session=private-cookie",
+            "Set-Cookie: sid=one; refresh=two",
+            "request=https://user:pass@example.test/run?token=query-secret",
+            "database=postgres://dbuser:dbpass@example.test/app",
+            "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "not ok 1 - token validation reports a useful error",
+            "  error: " + ('path C:\\\\workspace\\\\' + '\"quoted\" ') * 250,
+            "# fail 1",
+        )
+    )
+
+    encoded = project_scale_runner_module._generated_project_output_tail(output)
+    excerpt = json.loads(encoded)
+
+    assert len(encoded) <= project_scale_runner_module._GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+    assert "secret-bearer-value" not in excerpt
+    assert "alpha beta gamma" not in excerpt
+    assert "raw-token" not in excerpt
+    assert "client-secret-value" not in excerpt
+    assert "sk-project-secret" not in excerpt
+    assert "private-cookie" not in excerpt
+    assert "refresh=two" not in excerpt
+    assert "user:pass" not in excerpt
+    assert "dbuser:dbpass" not in excerpt
+    assert "query-secret" not in excerpt
+    assert "eyJhbGciOiJIUzI1NiJ9" not in excerpt
+    assert "<redacted>" in excerpt
+    assert "token validation reports a useful error" in excerpt
+
+
+def test_generated_project_output_excerpt_keeps_failure_after_json_expansion() -> None:
+    output = (
+        "command output "
+        + ("C:\\\\quoted\\\\path " * 90)
+        + "\nnot ok 4 - final contract\n"
+        + "  error: expected conflict response\n"
+        + "  actual: 200\n"
+        + "  expected: 409\n"
+        + "# fail 1"
+    )
+    assert len(output) < project_scale_runner_module._GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+
+    encoded = project_scale_runner_module._generated_project_output_tail(output)
+    excerpt = json.loads(encoded)
+
+    assert len(encoded) <= project_scale_runner_module._GENERATED_PROJECT_OUTPUT_TAIL_CHARS
+    assert "not ok 4 - final contract" in excerpt
+    assert "expected: 409" in excerpt
+    assert "# fail 1" in excerpt
+
+
+def test_generated_project_output_excerpt_reports_omitted_failure_blocks() -> None:
+    failures = "\n".join(
+        f"not ok {index} - contract {index}\n  error: failure {index}\n  expected: {index + 1}"
+        for index in range(1, 6)
+    )
+    output = "\n".join((*("passing noise " * 20 for _ in range(30)), failures, "# fail 5"))
+
+    excerpt = json.loads(project_scale_runner_module._generated_project_output_tail(output))
+
+    assert "not ok 1 - contract 1" in excerpt
+    assert "not ok 2 - contract 2" in excerpt
+    assert "not ok 3 - contract 3" in excerpt
+    assert "2 additional failure blocks omitted" in excerpt
+    assert "# fail 5" in excerpt
+
+
 def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
