@@ -642,6 +642,8 @@ def _tool_sandbox(
     sandbox_profile: str | None = None,
     arguments: Mapping[str, JsonValue] | None = None,
 ) -> str:
+    if name in {"workspace.write_text", "workspace.bundle"}:
+        return "workspace_write" if sandbox_profile == "workspace_write" else "restricted"
     if (
         name == "project.generate_zip"
         and _has_project_workspace_write_side_effect(arguments)
@@ -665,8 +667,18 @@ def _tool_sandbox(
     return "restricted"
 
 
-def _tool_requires_approval(name: str) -> bool:
-    return _tool_sandbox(name) == "restricted"
+def _effective_tool_sandbox_profile(
+    name: str,
+    metadata: Mapping[str, JsonValue],
+    routing_decision: Mapping[str, JsonValue],
+) -> str | None:
+    routing_profile = _routing_sandbox_profile(routing_decision)
+    if (
+        name in {"workspace.write_text", "workspace.bundle", "project.generate_zip"}
+        and routing_profile == "workspace_write"
+    ):
+        return routing_profile
+    return _manifest_sandbox_profile(metadata) or routing_profile
 
 
 def _has_project_workspace_write_side_effect(arguments: Mapping[str, JsonValue] | None) -> bool:
@@ -1371,7 +1383,10 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 actor=self._actor,
                 tool_name=self.name,
                 arguments=cast(Mapping[str, JsonValue], arguments),
-                approval_required=self._approval_envelope_required and _tool_requires_approval(self.name),
+                approval_required=(
+                    self._approval_envelope_required
+                    and tool_sandbox in {"restricted", "workspace_write"}
+                ),
                 sandbox=tool_sandbox,
                 idempotency_key=idempotency_key,
                 call_id=safe_call_id,
@@ -2045,8 +2060,11 @@ class AutoGenDiscussionRuntime:
                             user_id=context.actor_id,
                             role=context.actor_role,
                             approval_envelope_required=self._uses_external_harness_tool_gateway,
-                            sandbox_profile=_manifest_sandbox_profile(metadata)
-                            or _routing_sandbox_profile(context.routing_decision),
+                            sandbox_profile=_effective_tool_sandbox_profile(
+                                name,
+                                metadata,
+                                context.routing_decision,
+                            ),
                             description=_manifest_description(metadata, name),
                             input_schema=_manifest_input_schema(metadata),
                             failure_codes=_manifest_failure_codes(metadata),

@@ -3440,6 +3440,20 @@ async def test_natural_large_project_writes_workspace_incrementally_before_bundl
         "workspace.list",
         "workspace.bundle",
     ]
+    assert [call.approval_required for call in harness.calls] == [True, False, True]
+    workspace_events = [
+        (event.kind, event.tool_name)
+        for event in events
+        if event.kind in {EventKind.TOOL_STARTED, EventKind.TOOL_COMPLETED}
+    ]
+    assert workspace_events == [
+        (EventKind.TOOL_STARTED, "workspace.write_text"),
+        (EventKind.TOOL_COMPLETED, "workspace.write_text"),
+        (EventKind.TOOL_STARTED, "workspace.list"),
+        (EventKind.TOOL_COMPLETED, "workspace.list"),
+        (EventKind.TOOL_STARTED, "workspace.bundle"),
+        (EventKind.TOOL_COMPLETED, "workspace.bundle"),
+    ]
     bundle_completed = next(
         event
         for event in events

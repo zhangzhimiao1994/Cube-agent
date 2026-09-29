@@ -22,8 +22,112 @@ from agent_hub.runtime.autogen.adapter import (
     GatewayCapabilityTool,
     RuntimeExecutionError,
     _DiscussionDurability,
+    _effective_tool_sandbox_profile,
+    _tool_sandbox,
 )
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+
+
+def test_workspace_tools_use_authorized_run_sandbox_in_autogen() -> None:
+    metadata: Mapping[str, JsonValue] = {"sandbox_profile": "project_workspace_store"}
+    routing: Mapping[str, JsonValue] = {"sandbox_profile": "workspace_write"}
+
+    profile = _effective_tool_sandbox_profile(
+        "workspace.write_text",
+        metadata,
+        routing,
+    )
+
+    assert profile == "workspace_write"
+    assert _tool_sandbox("workspace.write_text", sandbox_profile=profile) == "workspace_write"
+
+
+async def test_workspace_tool_routes_workspace_write_approval_envelope() -> None:
+    class ReplayGateway:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "workspace.write_text"
+
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            del kwargs
+            raise AssertionError("tool execution must be routed through harness")
+
+    class HarnessGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"summary": "workspace file written"},
+            )
+
+    async def publish(
+        durable_artifacts: tuple[Artifact, ...],
+        model_entries: tuple[dict[str, JsonValue], ...],
+        tool_entries: tuple[dict[str, JsonValue], ...],
+    ) -> None:
+        del durable_artifacts, model_entries, tool_entries
+
+    async def store(artifact: Artifact) -> UUID:
+        del artifact
+        return uuid4()
+
+    async def abort(write_id: UUID) -> bool:
+        del write_id
+        return True
+
+    def finalize(write_id: UUID) -> None:
+        del write_id
+
+    run_id = uuid4()
+    harness = HarnessGateway()
+    records: list[Any] = []
+    tool = GatewayCapabilityTool(
+        ReplayGateway(),
+        tenant_id=uuid4(),
+        run_id=run_id,
+        actor="implementer",
+        name="workspace.write_text",
+        records=records,
+        durability=_DiscussionDurability(
+            publish,
+            store,
+            abort,
+            finalize,
+            run_id=run_id,
+        ),
+        harness_tool_gateway=harness,
+        user_id=uuid4(),
+        role=Role.OPERATOR,
+        sandbox_profile="workspace_write",
+    )
+
+    await tool.run_json(
+        {"path": "README.md", "content": "trusted\n"},
+        CancellationToken(),
+        call_id="workspace-call",
+    )
+
+    assert len(harness.calls) == 1
+    request = harness.calls[0]
+    assert request.tool_name == "workspace.write_text"
+    assert request.sandbox == "workspace_write"
+    assert request.approval_required is True
+    assert [record.kind for record in records] == [
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+    ]
 
 
 async def test_gateway_capability_tool_routes_through_harness_with_actor_identity() -> None:

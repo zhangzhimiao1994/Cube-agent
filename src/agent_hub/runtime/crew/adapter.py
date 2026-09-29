@@ -702,10 +702,6 @@ def _tool_sandbox(
     return "restricted"
 
 
-def _tool_requires_approval(name: str) -> bool:
-    return _tool_sandbox(name) == "restricted"
-
-
 def _has_project_workspace_write_side_effect(arguments: Mapping[str, JsonValue] | None) -> bool:
     if arguments is None:
         return False
@@ -5589,7 +5585,7 @@ class CrewDispatchRuntime:
                         arguments=tool_call.arguments,
                         approval_required=(
                             self._uses_external_harness_tool_gateway
-                            and _tool_requires_approval(tool_call.name)
+                            and tool_sandbox in {"restricted", "workspace_write"}
                         ),
                         sandbox=tool_sandbox,
                         idempotency_key=idempotency_key,

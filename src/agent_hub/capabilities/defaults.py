@@ -68,24 +68,32 @@ class DefaultRuntimeCapabilityPolicyGateway:
         approval_required = await self._tool_approval_required(request.tenant_id)
         extra_rules = self._extra_policy_rules(request)
         explicit_plugin_effect = _explicit_policy_effect(extra_rules, request, role)
-        if explicit_plugin_effect is PolicyEffect.DENY:
+        policy = default_capability_policy(
+            request.tenant_id,
+            require_approval_for_tools=approval_required,
+            extra_rules=extra_rules,
+        )
+        policy_decision = policy.evaluate(request, role)
+        if policy_decision.effect is PolicyEffect.DENY:
             return CapabilityResult(
                 CapabilityStatus.DENIED,
                 request.run_id,
                 reason="capability denied",
             )
+        if not await _run_scope_belongs_to_request_actor(self._run_repository, request):
+            return CapabilityResult(
+                CapabilityStatus.DENIED,
+                request.run_id,
+                reason="capability denied",
+            )
+        if explicit_plugin_effect is PolicyEffect.ALLOW:
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if await _has_approved_capability_scope(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
-        if explicit_plugin_effect is PolicyEffect.ALLOW:
-            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         gateway = CapabilityGateway(
-            default_capability_policy(
-                request.tenant_id,
-                require_approval_for_tools=approval_required,
-                extra_rules=extra_rules,
-            ),
+            policy,
             self._approvals,
             self._run_repository,
             approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
@@ -201,6 +209,40 @@ async def _has_approved_capability_scope(repository: object, request: Capability
     return bool(await checker(request.tenant_id, request.run_id, approval_scope))
 
 
+async def _run_scope_belongs_to_request_actor(
+    repository: object,
+    request: CapabilityRequest,
+) -> bool:
+    if not _uses_run_scoped_workspace(request):
+        return True
+    getter = getattr(repository, "get", None)
+    if not callable(getter):
+        return False
+    try:
+        record = getter(request.tenant_id, request.run_id)
+        if isinstance(record, Awaitable):
+            record = await record
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        getattr(record, "tenant_id", None) == request.tenant_id
+        and getattr(record, "id", None) == request.run_id
+        and getattr(record, "actor_id", None) == request.user_id
+    )
+
+
+def _uses_run_scoped_workspace(request: CapabilityRequest) -> bool:
+    normalized_resource = normalize_resource(request.resource)
+    run_scoped_resource = normalized_resource is not None and any(
+        normalized_resource == prefix or normalized_resource.startswith(f"{prefix}/")
+        for prefix in ("workspace/current", "workspace/bundle")
+    )
+    return run_scoped_resource or (
+        normalized_resource == "generated/project.generate_zip"
+        and _has_workspace_write_side_effect(request)
+    )
+
+
 def default_capability_policy(
     tenant_id: UUID,
     *,
@@ -232,6 +274,7 @@ def default_capability_policy(
         for capability, operation, resource_prefix, effect in (
             ("calculator", "evaluate", "calculator", PolicyEffect.ALLOW),
             ("file", "read", "workspace", PolicyEffect.ALLOW),
+            ("file", "write", "workspace/current", generated_effect),
             ("file", "create", "workspace", generated_effect),
             ("file", "create", "generated", generated_effect),
             ("context", "read", "context", PolicyEffect.ALLOW),

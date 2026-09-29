@@ -322,6 +322,12 @@ def fingerprint_capability_request(request: CapabilityRequest) -> str:
 def capability_approval_scope(request: CapabilityRequest) -> str | None:
     normalized_resource = normalize_resource(request.resource)
     if (
+        request.capability == "file"
+        and request.operation == "write"
+        and normalized_resource == "workspace/current"
+    ):
+        return _run_capability_scope(request, normalized_resource)
+    if (
         request.capability != "file"
         or request.operation != "create"
         or normalized_resource is None
@@ -331,6 +337,10 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
     workspace_scope = _workspace_side_effect_scope(request, normalized_resource)
     if workspace_scope is not None:
         return workspace_scope
+    return _run_capability_scope(request, normalized_resource)
+
+
+def _run_capability_scope(request: CapabilityRequest, normalized_resource: str) -> str:
     return (
         "capability-scope:v1:"
         f"tenant={request.tenant_id}:"

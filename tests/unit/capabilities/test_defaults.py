@@ -203,6 +203,15 @@ class ScopeApprovedRepository:
     ) -> bool:
         return False
 
+    async def get(self, tenant_id: UUID, run_id: UUID) -> object:
+        return stored_run(
+            tenant=tenant_id,
+            run=run_id,
+            actor_id=USER_ID,
+            project_id="approved-project",
+            workspace_session_id="approved-session",
+        )
+
     async def is_capability_approval_scope_approved(
         self,
         _tenant_id: UUID,
@@ -380,6 +389,7 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
 
     calculator = policy.evaluate(request("calculator", "evaluate", "calculator"), Role.OPERATOR)
     read = policy.evaluate(request("file", "read", "workspace/docs/a.md"), Role.OPERATOR)
+    write = policy.evaluate(request("file", "write", "workspace/current"), Role.OPERATOR)
     create = policy.evaluate(
         request("file", "create", "generated/document.generate_docx"), Role.OPERATOR
     )
@@ -392,6 +402,7 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
 
     assert calculator.effect is PolicyEffect.ALLOW
     assert read.effect is PolicyEffect.ALLOW
+    assert write.effect is PolicyEffect.ALLOW
     assert create.effect is PolicyEffect.ALLOW
     assert project.effect is PolicyEffect.ALLOW
     assert skill.effect is PolicyEffect.ALLOW
@@ -399,12 +410,178 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
     assert plugin.effect is PolicyEffect.ALLOW
 
 
+async def test_default_runtime_stack_writes_only_to_authorized_run_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "project-workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            actor_id=USER_ID,
+            project_id="trusted-project",
+            workspace_session_id="trusted-session",
+        )
+    )
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "attachments",
+        project_workspace_dir=workspace_dir,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="implementer",
+            tool_name="workspace.write_text",
+            arguments={
+                "path": "README.md",
+                "content": "trusted\n",
+                "project_id": "attacker-project",
+                "workspace_session_id": "attacker-session",
+            },
+            approval_required=False,
+            sandbox="workspace_write",
+            idempotency_key="workspace-write-stack",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    trusted = (
+        workspace_dir
+        / str(TENANT_ID)
+        / "projects"
+        / "trusted-project"
+        / "sessions"
+        / "trusted-session"
+        / "README.md"
+    )
+    assert trusted.read_text(encoding="utf-8") == "trusted\n"
+    assert not (workspace_dir / str(TENANT_ID) / "projects" / "attacker-project").exists()
+
+
+async def test_default_runtime_stack_denies_workspace_write_without_run_permission(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "project-workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            actor_id=USER_ID,
+            sandbox_profile="read_only",
+            requested_permissions=["workspace.read"],
+        )
+    )
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "attachments",
+        project_workspace_dir=workspace_dir,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="implementer",
+            tool_name="workspace.write_text",
+            arguments={"path": "README.md", "content": "denied\n"},
+            approval_required=False,
+            sandbox="workspace_write",
+            idempotency_key="workspace-write-denied",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "workspace write is not authorized"
+    assert not workspace_dir.exists()
+
+
+async def test_default_runtime_stack_denies_workspace_write_for_another_run_owner(
+    tmp_path: Path,
+) -> None:
+    workspace_dir = tmp_path / "project-workspaces"
+    repository = FakeRunRepository(
+        stored_run(
+            tenant=TENANT_ID,
+            run=RUN_ID,
+            actor_id=uuid4(),
+            project_id="other-user-project",
+            workspace_session_id="other-user-session",
+        )
+    )
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "attachments",
+        project_workspace_dir=workspace_dir,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="implementer",
+            tool_name="workspace.write_text",
+            arguments={"path": "README.md", "content": "denied\n"},
+            approval_required=False,
+            sandbox="workspace_write",
+            idempotency_key="workspace-write-other-user",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability denied"
+    assert not workspace_dir.exists()
+
+
 def test_default_capability_policy_denies_viewer_runtime_tools() -> None:
     policy = default_capability_policy(TENANT_ID)
 
     decision = policy.evaluate(request("calculator", "evaluate", "calculator"), Role.VIEWER)
+    workspace_write = policy.evaluate(
+        request("file", "write", "workspace/current"),
+        Role.VIEWER,
+    )
 
     assert decision.effect is PolicyEffect.DENY
+    assert workspace_write.effect is PolicyEffect.DENY
+
+
+async def test_approved_workspace_scope_does_not_override_current_viewer_role() -> None:
+    repository = RequestApprovedRepository()
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+    )
+
+    result = await gateway.invoke(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="implementer",
+            capability="file",
+            operation="write",
+            resource="workspace/current",
+            idempotency_key="viewer-approved-workspace-write",
+            run_id=RUN_ID,
+        ),
+        role=Role.VIEWER,
+    )
+
+    assert result.status is CapabilityStatus.DENIED
 
 
 async def test_default_policy_gateway_allows_custom_plugin_permission_from_policy_effect() -> None:
@@ -948,6 +1125,73 @@ def test_workspace_side_effect_approval_scope_cannot_collide_on_argument_delimit
 
     assert first.arguments != second.arguments
     assert capability_approval_scope(first) != capability_approval_scope(second)
+
+
+def test_workspace_write_approval_scope_is_reused_only_within_current_run() -> None:
+    first = CapabilityRequest(
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        agent_id="implementer",
+        capability="file",
+        operation="write",
+        resource="workspace/current",
+        arguments={"path": "src/a.ts", "content": "a"},
+        idempotency_key="workspace-a",
+        run_id=RUN_ID,
+    )
+    second = CapabilityRequest(
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        agent_id="reviewer",
+        capability="file",
+        operation="write",
+        resource="workspace/current",
+        arguments={"path": "src/b.ts", "content": "b"},
+        idempotency_key="workspace-b",
+        run_id=RUN_ID,
+    )
+
+    assert capability_approval_scope(first) == capability_approval_scope(second)
+    assert capability_approval_scope(first) is not None
+    assert capability_approval_scope(first) != capability_approval_scope(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="implementer",
+            capability="file",
+            operation="write",
+            resource="workspace/current",
+            arguments={"path": "src/a.ts", "content": "a"},
+            idempotency_key="workspace-other-run",
+            run_id=uuid4(),
+        )
+    )
+
+
+def test_workspace_write_approval_scope_does_not_cover_other_resources() -> None:
+    workspace_write = CapabilityRequest(
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        agent_id="implementer",
+        capability="file",
+        operation="write",
+        resource="workspace/current",
+        idempotency_key="workspace-write",
+        run_id=RUN_ID,
+    )
+    sibling = CapabilityRequest(
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        agent_id="implementer",
+        capability="file",
+        operation="write",
+        resource="workspace/currently",
+        idempotency_key="workspace-sibling",
+        run_id=RUN_ID,
+    )
+
+    assert capability_approval_scope(workspace_write) is not None
+    assert capability_approval_scope(sibling) is None
 
 
 async def test_generated_file_scope_approval_does_not_authorize_other_tools_or_runs() -> None:

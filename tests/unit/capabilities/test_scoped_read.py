@@ -29,10 +29,12 @@ class StoredRun:
     tenant_id: UUID
     id: UUID
     routing_decision: Mapping[str, object] | None
+    actor_id: UUID | None = None
 
 
 def stored_run(
-    *, tenant: UUID = TENANT, run: UUID = RUN, session: str = 'session-a', **updates: object
+    *, tenant: UUID = TENANT, run: UUID = RUN, session: str = 'session-a',
+    actor_id: UUID | None = None, **updates: object
 ) -> StoredRun:
     routing: dict[str, object] = {
         'project_id': 'project-a',
@@ -42,7 +44,7 @@ def stored_run(
         'attachment_ids': [ATTACHMENT],
     }
     routing.update(updates)
-    return StoredRun(tenant, run, routing)
+    return StoredRun(tenant, run, routing, actor_id)
 
 
 class FakeRunRepository:
