@@ -4854,7 +4854,7 @@ async def test_config_backed_hybrid_runtime_keeps_plan_digest_stable_across_budg
             "agents": [],
         }
     )
-    routing_decision = {
+    routing_decision: dict[str, JsonValue] = {
         "project_scale": "large",
         "runtime_plan_token_budget": 2_500_000,
         "runtime_plan_timeout_seconds": 1_800.0,
@@ -4886,7 +4886,9 @@ async def test_config_backed_hybrid_runtime_keeps_plan_digest_stable_across_budg
         ]
 
     assert len(ProbeDispatchRuntime.instances) == 2
-    assert ProbeDispatchRuntime.instances[0].plan.digest == ProbeDispatchRuntime.instances[1].plan.digest
+    initial_plan = cast(DispatchPlan, ProbeDispatchRuntime.instances[0].plan)
+    resumed_plan = cast(DispatchPlan, ProbeDispatchRuntime.instances[1].plan)
+    assert initial_plan.digest == resumed_plan.digest
 
 
 @pytest.mark.asyncio
