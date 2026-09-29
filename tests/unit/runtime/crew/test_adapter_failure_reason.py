@@ -3928,10 +3928,12 @@ def test_project_preflight_tool_call_rejects_missing_server_scope(
 async def test_project_preflight_runtime_injects_server_scope_before_capability_execution() -> None:
     capabilities = ProjectPreflightCapabilities()
     model_gateway = ProjectPreflightToolGateway()
+    repository = InMemoryArtifactRepository()
     runtime = CrewDispatchRuntime(
         model_gateway,
         _project_preflight_tool_plan(),
         capability_gateway=capabilities,
+        artifact_repository=repository,
         crew_factory=FastFactory(),
     )
 
@@ -3972,6 +3974,63 @@ async def test_project_preflight_runtime_injects_server_scope_before_capability_
         },
     }
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        ProjectPreflightToolGateway(),
+        _project_preflight_tool_plan(),
+        capability_gateway=ProjectPreflightCapabilities(),
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    resumed_events = [
+        event
+        async for event in restored.run(
+            _context(
+                actor_id=uuid4(),
+                actor_role=Role.OPERATOR,
+                mode=TaskMode.DISPATCH,
+                checkpoint=checkpoint,
+                routing_decision={
+                    "project_id": "large-project",
+                    "workspace_session_id": "conv-large-project",
+                    "project_preflight_approved": True,
+                },
+            )
+        )
+    ]
+    assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+    changed_request = CrewDispatchRuntime(
+        ProjectPreflightToolGateway(),
+        _project_preflight_tool_plan(),
+        capability_gateway=ProjectPreflightCapabilities(),
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await changed_request.restore_checkpoint(checkpoint)
+    with pytest.raises(
+        RuntimeExecutionError,
+        match="runtime checkpoint capability artifact lineage is invalid",
+    ):
+        [
+            event
+            async for event in changed_request.run(
+                _context(
+                    actor_id=uuid4(),
+                    actor_role=Role.OPERATOR,
+                    mode=TaskMode.DISPATCH,
+                    request="不同的用户需求",
+                    checkpoint=checkpoint,
+                    routing_decision={
+                        "project_id": "large-project",
+                        "workspace_session_id": "conv-large-project",
+                        "project_preflight_approved": True,
+                    },
+                )
+            )
+        ]
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:

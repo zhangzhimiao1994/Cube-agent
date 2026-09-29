@@ -3540,6 +3540,7 @@ class CrewDispatchRuntime:
                         attempt = cast(int, model_state["attempt"])
                         round_index = cast(int, model_state["call_index"])
                         for tool_index, tool_call in enumerate(completion.response.tool_calls):
+                            tool_call = _scope_project_workspace_tool_call(context, tool_call)
                             if tool_call.name not in steps[step_id].tools:
                                 if _project_scale_can_skip_forbidden_tool_placeholders(
                                     steps[step_id],
@@ -7691,6 +7692,7 @@ class CrewDispatchRuntime:
     def _validate_artifact_graph(
         self,
         plan: DispatchPlan,
+        context: TaskContext,
         artifacts: tuple[Artifact, ...],
         completed: Mapping[str, Artifact],
         retries: Mapping[str, int],
@@ -7941,7 +7943,10 @@ class CrewDispatchRuntime:
                         _fail("runtime checkpoint capability artifact lineage is invalid")
                     for tool_index in range(len(round_tools)):
                         tool_state, tool_artifact = round_tools[tool_index]
-                        tool_call = calls[tool_index]
+                        tool_call = _scope_project_workspace_tool_call(
+                            context,
+                            calls[tool_index],
+                        )
                         canonical_arguments = json.dumps(
                             _mutable_json(tool_call.arguments),
                             ensure_ascii=False,
@@ -8281,6 +8286,7 @@ class CrewDispatchRuntime:
             review_ledger.artifacts[step_id] = artifact
         self._validate_artifact_graph(
             plan,
+            context,
             tuple(by_id.values()),
             completed,
             retries,
