@@ -158,4 +158,6 @@ async def test_ssh_sandbox_parses_strict_remote_result(
     )
 
     assert result.stdout == "ssh-ok"
-    assert json.loads(captured["stdin_payload"])["action"] == "run"
+    stdin_payload = captured["stdin_payload"]
+    assert isinstance(stdin_payload, bytes)
+    assert json.loads(stdin_payload)["action"] == "run"
