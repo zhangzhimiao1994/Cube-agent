@@ -47,6 +47,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _checkpoint_can_skip_forbidden_tool_placeholders,
     _crew_content_limits,
     _scope_project_workspace_tool_call,
     _should_check_framework_raw,
@@ -54,6 +55,7 @@ from agent_hub.runtime.crew.adapter import (
     _tool_definitions,
     _tool_round_budget,
     _tool_sandbox,
+    _ToolLedger,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -3678,10 +3680,12 @@ async def test_project_scale_repeating_read_context_round_limit_completes_from_t
 async def test_project_scale_tester_forbidden_tool_after_evidence_completes_from_tool_evidence() -> None:
     capabilities = ReadContextCapabilities()
     gateway = ReadContextThenForbiddenToolGateway()
+    repository = InMemoryArtifactRepository()
     runtime = CrewDispatchRuntime(
         gateway,
         _project_scale_repeating_read_context_plan(),
         capability_gateway=capabilities,
+        artifact_repository=repository,
         crew_factory=FastFactory(),
     )
 
@@ -3703,6 +3707,74 @@ async def test_project_scale_tester_forbidden_tool_after_evidence_completes_from
     assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert checkpoint.state["phase"] == "completed"
+
+    restored = CrewDispatchRuntime(
+        ReadContextThenForbiddenToolGateway(),
+        _project_scale_repeating_read_context_plan(),
+        capability_gateway=ReadContextCapabilities(),
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    resumed_events = [
+        event
+        async for event in restored.run(
+            _context(
+                actor_id=uuid4(),
+                actor_role=Role.OPERATOR,
+                token_budget=100_000,
+                checkpoint=checkpoint,
+            )
+        )
+    ]
+
+    assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
+def test_checkpoint_forbidden_tool_skip_requires_every_prior_allowed_tool() -> None:
+    step = _project_scale_repeating_read_context_plan().steps[0]
+    ledger = _ToolLedger(
+        states={
+            "prior": {
+                "step_id": step.id,
+                "status": "succeeded",
+            }
+        }
+    )
+    calls = (
+        ToolCall(
+            id="allowed",
+            name="read_context",
+            arguments={"query": "generated project verification evidence"},
+        ),
+        ToolCall(
+            id="forbidden",
+            name="project.generate_zip",
+            arguments={"title": "tester should not write"},
+        ),
+    )
+
+    assert not _checkpoint_can_skip_forbidden_tool_placeholders(
+        step,
+        ledger,
+        calls,
+        {},
+        is_last_model_call=True,
+    )
+    assert _checkpoint_can_skip_forbidden_tool_placeholders(
+        step,
+        ledger,
+        calls,
+        {0: ({}, None)},
+        is_last_model_call=True,
+    )
+    assert not _checkpoint_can_skip_forbidden_tool_placeholders(
+        step,
+        ledger,
+        calls,
+        {0: ({}, None)},
+        is_last_model_call=False,
+    )
 
 
 async def test_deterministic_harness_errors_record_failed_not_uncertain() -> None:

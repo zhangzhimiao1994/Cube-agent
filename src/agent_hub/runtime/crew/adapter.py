@@ -1941,12 +1941,7 @@ def _project_scale_forbidden_tool_structured_completion(
         return None
     payload = _project_scale_structured_payload_from_text(
         request.response_schema,
-        (
-            "Internal project-scale tool-scope fallback after the role requested a "
-            "capability outside its allowed step tools. Existing tool evidence was "
-            "already collected; finish this role from the available verification "
-            "evidence without requesting additional tools."
-        ),
+        _PROJECT_SCALE_TOOL_SCOPE_FALLBACK_SUMMARY,
     )
     if payload is None:
         return None
@@ -1978,6 +1973,60 @@ def _project_scale_can_skip_forbidden_tool_placeholders(
             for state in tool_ledger.states.values()
         )
     )
+
+
+_PROJECT_SCALE_TOOL_SCOPE_FALLBACK_SUMMARY = (
+    "Internal project-scale tool-scope fallback after the role requested a "
+    "capability outside its allowed step tools. Existing tool evidence was "
+    "already collected; finish this role from the available verification "
+    "evidence without requesting additional tools."
+)
+
+
+def _project_scale_tool_scope_fallback_output_matches(
+    agent: AgentSpec,
+    completion: GatewayCompletion,
+    output: Artifact,
+) -> bool:
+    schema = _agent_response_schema(agent)
+    provenance = output.provenance
+    if schema is None or provenance is None:
+        return False
+    payload = _project_scale_structured_payload_from_text(
+        schema,
+        _PROJECT_SCALE_TOOL_SCOPE_FALLBACK_SUMMARY,
+    )
+    if payload is None:
+        return False
+    expected_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return (
+        output.content == {"text": expected_text}
+        and provenance.logical_model == completion.logical_model
+        and provenance.deployment_id == "internal_project_scale"
+        and provenance.provider_id == "internal"
+        and provenance.provider_model == "internal/project-scale-tool-scope-fallback"
+    )
+
+
+def _checkpoint_can_skip_forbidden_tool_placeholders(
+    step: DispatchStep,
+    tool_ledger: _ToolLedger,
+    tool_calls: Sequence[ToolCall],
+    round_tools: Mapping[int, tuple[Mapping[str, JsonValue], Artifact | None]],
+    *,
+    is_last_model_call: bool,
+) -> bool:
+    if not is_last_model_call or not _project_scale_can_skip_forbidden_tool_placeholders(
+        step,
+        tool_ledger,
+        tool_calls,
+    ):
+        return False
+    first_forbidden = next(
+        (index for index, tool_call in enumerate(tool_calls) if tool_call.name not in step.tools),
+        None,
+    )
+    return first_forbidden is not None and set(round_tools) == set(range(first_forbidden))
 
 
 def _project_scale_empty_rejected_structured_completion(
@@ -7913,6 +7962,7 @@ class CrewDispatchRuntime:
                 step_calls = step_model_calls(step, attempt, input_ids)
                 evidence_ids: list[str] = []
                 last_model: Artifact | None = None
+                scope_fallback_completion: GatewayCompletion | None = None
                 incomplete = False
                 for call_index in range(len(step_calls)):
                     state, model_artifact = step_calls[call_index]
@@ -7972,7 +8022,23 @@ class CrewDispatchRuntime:
                         evidence_ids.append(str(tool_artifact.id))
                     if incomplete:
                         break
-                    if call_index < len(step_calls) - 1 and len(round_tools) != len(calls):
+                    skipped_forbidden_placeholders = (
+                        len(round_tools) != len(calls)
+                        and _checkpoint_can_skip_forbidden_tool_placeholders(
+                            step,
+                            tool_ledger,
+                            calls,
+                            round_tools,
+                            is_last_model_call=call_index == len(step_calls) - 1,
+                        )
+                    )
+                    if skipped_forbidden_placeholders:
+                        scope_fallback_completion = completion
+                    if (
+                        call_index < len(step_calls) - 1
+                        and len(round_tools) != len(calls)
+                        and not skipped_forbidden_placeholders
+                    ):
                         _fail("runtime checkpoint artifact graph is invalid")
                 output_sources = _lineage_window_ids(
                     (*input_ids, *evidence_ids),
@@ -8072,6 +8138,17 @@ class CrewDispatchRuntime:
                     if step.reviewer is not None:
                         _fail("runtime checkpoint review is unverified")
                     output = completed[step.id]
+                    provenance_matches = (
+                        last_model is not None
+                        and output.provenance == last_model.provenance
+                    ) or (
+                        scope_fallback_completion is not None
+                        and _project_scale_tool_scope_fallback_output_matches(
+                            agents_by_id[step.agent],
+                            scope_fallback_completion,
+                            output,
+                        )
+                    )
                     if (
                         incomplete
                         or last_model is None
@@ -8079,7 +8156,7 @@ class CrewDispatchRuntime:
                         or output.producer != step.agent
                         or output.version != attempt + 1
                         or output.source_ids != output_sources
-                        or output.provenance != last_model.provenance
+                        or not provenance_matches
                     ):
                         _fail("runtime checkpoint completed artifact lineage is invalid")
             if step.id in review_ledger.artifacts and feedback_id != str(
