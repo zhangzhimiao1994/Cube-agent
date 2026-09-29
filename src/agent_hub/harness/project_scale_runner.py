@@ -3561,14 +3561,29 @@ def _deliverable_repair_body(
         repair_body["allow_scale_mode_upgrade"] = False
     original_message = body.get("message")
     if benchmark_kind == "capability":
-        repair_body["replace_workspace_files"] = True
+        source_files = (
+            _workspace_bundle_file_bytes(source_workspace_bundle)
+            if source_workspace_bundle is not None
+            else None
+        )
+        incremental_repair = bool(source_files)
+        repair_body["replace_workspace_files"] = not incremental_repair
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
+        delivery_guidance = (
+            "Return only complete changed files as workspace_bundle.files or ### `path` fences. "
+            "Unchanged workspace files remain authoritative and will be merged with this patch; "
+            "preserve their imports, exports, scripts, and public contracts. "
+            if incremental_repair
+            else (
+                "Return full workspace_bundle.files or ### `path` fences: "
+                "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md/"
+                "VERIFICATION.md/constraints_reading_evidence.json. "
+            )
+        )
         guidance = (
             f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
-            "preserve requirements. Return full workspace_bundle.files "
-            "or ### `path` fences: source/tests/README/PROJECT_REQUIREMENTS.md/"
-            "IMPLEMENTATION_PLAN.md/VERIFICATION.md/constraints_reading_evidence.json. "
+            f"preserve requirements. {delivery_guidance}"
             "File keys must be safe relative paths, not endpoints/URLs/HTTP methods. "
             "constraints_reading_evidence.json must include read_before_implementation:true, "
             "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "

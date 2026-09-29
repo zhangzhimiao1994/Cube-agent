@@ -294,6 +294,9 @@ def test_capability_repair_keeps_workspace_context_after_long_failure_output() -
     )
 
     message = str(repair["message"])
+    assert repair["replace_workspace_files"] is False
+    assert "Return only complete changed files" in message
+    assert "Unchanged workspace files remain authoritative" in message
     assert "Current workspace context for precise repair" in message
     assert "vitest.config.ts" in message
     assert "tests/app.test.ts" in message
@@ -3963,6 +3966,8 @@ def test_deliverable_repair_prompt_includes_relevant_workspace_context() -> None
     )
 
     repair_message = str(repair_body["message"])
+    assert repair_body["replace_workspace_files"] is False
+    assert "Return only complete changed files" in repair_message
     assert "Current workspace context for precise repair" in repair_message
     assert "src/server.ts" in repair_message
     assert "src/types.ts" in repair_message
