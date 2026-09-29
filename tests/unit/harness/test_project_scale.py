@@ -71,6 +71,7 @@ def test_capability_benchmark_uses_real_scale_requirements_without_fixture_marke
     assert "cancelled and completed" in messages["large:direct"]
     assert "summary keys orders, inventory, and fulfillment" in messages["large:direct"]
     assert "test runner, test API imports, and test configuration must agree" in messages["large:direct"]
+    assert "Project-local build and test executables referenced by npm scripts" in messages["large:direct"]
     assert "ultra-large project" in messages["ultra:direct"]
     assert "enterprise project portfolio" in messages["ultra:direct"]
     assert len(set(messages.values())) == 4

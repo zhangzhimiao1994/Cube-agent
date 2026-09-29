@@ -216,6 +216,47 @@ def test_repair_context_adds_vitest_global_api_hint() -> None:
     assert "globals" in hint
 
 
+def test_repair_context_adds_missing_build_tool_dependency_hint() -> None:
+    hint = project_scale_runner_module._repair_context_failure_hints(
+        ("npm run build output_tail=\"sh: 1: tsc: not found\"",)
+    )
+
+    assert "package.json" in hint
+    assert "typescript" in hint
+    assert "devDependencies" in hint
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "sh: vitest: command not found",
+        "'tsc' is not recognized as an internal or external command",
+    ),
+)
+def test_repair_context_recognizes_supported_shell_missing_tool_formats(
+    failure: str,
+) -> None:
+    hint = project_scale_runner_module._repair_context_failure_hints((failure,))
+
+    assert "package.json" in hint
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "GET /orders/abc: not found",
+        "customer: not found",
+        "sh: 1: python3: not found",
+    ),
+)
+def test_repair_context_does_not_treat_business_or_system_errors_as_npm_tools(
+    failure: str,
+) -> None:
+    hint = project_scale_runner_module._repair_context_failure_hints((failure,))
+
+    assert "Missing npm-script executable" not in hint
+
+
 def test_capability_repair_keeps_workspace_context_after_long_failure_output() -> None:
     bundle = _project_bundle(
         {

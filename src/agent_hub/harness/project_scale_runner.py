@@ -3717,6 +3717,38 @@ def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
             "'vitest', or enable and verify the matching runner globals configuration. Ensure "
             "the npm test script loads that configuration."
         )
+    dependency_names = {
+        "tsc": "typescript",
+        "vite": "vite",
+        "vitest": "vitest",
+        "tsx": "tsx",
+        "eslint": "eslint",
+    }
+    supported_commands = "|".join(dependency_names)
+    posix_missing = re.findall(
+        rf"\b(?:sh|bash):\s*(?:\d+:\s*)?({supported_commands}):\s*"
+        r"(?:not found|command not found)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    windows_missing = re.findall(
+        rf"['\"]({supported_commands})['\"] is not recognized as an internal or external command",
+        text,
+        flags=re.IGNORECASE,
+    )
+    missing_commands = tuple(
+        dict.fromkeys(command.casefold() for command in (*posix_missing, *windows_missing))
+    )
+    if missing_commands:
+        repairs = ", ".join(
+            f"{command} -> {dependency_names[command]}"
+            for command in missing_commands
+        )
+        hints.append(
+            "Missing npm-script executable repair hint: every command used by package.json "
+            "scripts must be installed by dependencies or devDependencies in a clean npm "
+            f"install. Add the matching package(s): {repairs}."
+        )
     return "\n".join(hints)
 
 
