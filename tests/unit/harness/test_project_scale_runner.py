@@ -1167,6 +1167,36 @@ def test_capability_repair_preserves_business_request_without_claiming_success()
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
 
 
+def test_ultra_capability_repair_explains_rbac_acceptance_boundary() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("ultra",), flows=("direct",), benchmark_kind="capability"
+    )
+
+    repaired = _deliverable_repair_body(
+        plan.requests[0].body,
+        "ultra:direct",
+        failed_reasons=(
+            "requirements: portfolio workflow: POST /programs: expected 201, got 403",
+        ),
+        benchmark_kind="capability",
+    )
+
+    message = str(repaired["message"])
+    assert "POST /programs" in message
+    assert "must return 201 without requiring an authorization header" in message
+    assert "PATCH /approvals/:id" in message
+    assert "portfolio_admin" in message
+    assert "viewer" in message
+    assert "403 or 409" in message
+    assert "error.code" in message
+    assert "error.message" in message
+    assert "GET /analytics/portfolio.csv" in message
+    assert "GET /portfolio/read-model" in message
+    assert "Do not prefill pass records or fabricate execution" in message
+    assert len(message) <= 6_000
+    RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
+
+
 def test_capability_repair_pins_the_observed_mode_for_auto_requests() -> None:
     plan = build_project_scale_run_plan(
         scales=("small",), flows=("direct",), benchmark_kind="capability"

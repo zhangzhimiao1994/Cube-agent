@@ -1,3 +1,5 @@
+import pytest
+
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.role_catalog import RoleDefinition, default_role_catalog
 from agent_hub.runtime.role_planner import (
@@ -6,6 +8,15 @@ from agent_hub.runtime.role_planner import (
     RolePurpose,
     TaskProfile,
 )
+
+
+def test_role_planning_request_accepts_extended_project_task_contract() -> None:
+    RolePlanningRequest(task="x" * 6_000, mode=TaskMode.DIRECT)
+
+
+def test_role_planning_request_rejects_task_beyond_extended_contract_limit() -> None:
+    with pytest.raises(ValueError, match="task must be nonblank, unpadded, and bounded"):
+        RolePlanningRequest(task="x" * 6_001, mode=TaskMode.DIRECT)
 
 
 def test_discussion_software_task_gets_dynamic_constrained_discussion_roles() -> None:

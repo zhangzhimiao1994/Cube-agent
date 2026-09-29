@@ -3598,10 +3598,22 @@ def _deliverable_repair_body(
             "patches, deletes, and restores cannot overwrite each other. Atomic rename alone "
             "does not prevent lost updates; rerun the concurrency and restart-persistence tests. "
         )
+        ultra_guidance = (
+            "For the ultra generated-project acceptance initialization contract, baseline CRUD "
+            "including POST /programs, /projects, nested milestones/budgets/staffing/risks, "
+            "/dependencies, and /approvals must return 201 without requiring an authorization "
+            "header. Keep RBAC behavior explicit at PATCH /approvals/:id: JSON role viewer must "
+            "return 403 or 409 with nonempty error.code and error.message; role portfolio_admin "
+            "must return 200 with decision approved. POST /access/check must return 200 with "
+            "{allowed:false} for role viewer and action approve. This is the acceptance "
+            "initialization contract, not an instruction to remove production authentication. "
+        )
         if case_id.startswith("small:"):
             guidance += small_guidance
         if case_id.startswith("medium:"):
             guidance += medium_guidance
+        if case_id.startswith("ultra:"):
+            guidance += ultra_guidance
         if case_id.endswith(":multi_agent"):
             guidance += (
                 "Use normalized agent_id values architect, implementer, tester, and synthesizer for "
@@ -3621,7 +3633,7 @@ def _deliverable_repair_body(
         reasons = _format_failed_reasons(failed_reasons)
         context_section = f"\n{context}\n" if context else ""
         prefix = guidance + context_section + reasons + "\nOriginal request:\n"
-        max_chars = 6_000 if context else 2_000
+        max_chars = 6_000 if context or scale == "ultra" else 2_000
         available = max_chars - len(" ".join(prefix.split())) - 1
         bounded_original = original[: max(available, 0)]
         repair_body["message"] = _bounded_role_planning_task_text(

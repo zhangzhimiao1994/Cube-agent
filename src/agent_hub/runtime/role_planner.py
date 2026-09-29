@@ -39,6 +39,7 @@ class RolePurpose(StrEnum):
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _MAX_TEXT = 2_000
+_MAX_TASK_TEXT = 6_000
 _DISCUSSION_SCHEMA = MappingProxyType(
     {
         "position": "approve | reject | needs_user",
@@ -121,7 +122,7 @@ class RolePlanningRequest:
     model_overrides: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _require_text("task", self.task)
+        _require_text("task", self.task, max_length=_MAX_TASK_TEXT)
         if type(self.mode) is not TaskMode or self.mode is TaskMode.AUTO:
             raise ValueError("mode must be an executable task mode")
         if type(self.profile) is not TaskProfile:
@@ -1193,8 +1194,8 @@ def _require_identifier(name: str, value: str) -> str:
     return value
 
 
-def _require_text(name: str, value: str) -> None:
-    if type(value) is not str or not value or value != value.strip() or len(value) > _MAX_TEXT:
+def _require_text(name: str, value: str, *, max_length: int = _MAX_TEXT) -> None:
+    if type(value) is not str or not value or value != value.strip() or len(value) > max_length:
         raise ValueError(f"{name} must be nonblank, unpadded, and bounded")
     if any(ord(character) < 32 for character in value):
         raise ValueError(f"{name} must not contain control characters")
