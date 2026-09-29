@@ -3610,6 +3610,10 @@ def _deliverable_repair_body(
             "All tests must compile under strict TypeScript. HTTP JSON helpers must return "
             "explicit generic or interface types before tests access response properties; never "
             "leave parsed program, project, or workflow responses typed as unknown. "
+            "Generated scenario tests must assert only values guaranteed by the API contract and "
+            "their own fixtures. Portfolio CSV tests must verify the project row such as "
+            "Customer Migration and must not invent assertions for internal codes such as CORE "
+            "unless the documented CSV contract includes that column. "
         )
         if case_id.startswith("small:"):
             guidance += small_guidance
