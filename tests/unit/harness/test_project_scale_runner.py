@@ -1190,6 +1190,8 @@ def test_ultra_capability_repair_explains_rbac_acceptance_boundary() -> None:
     assert "403 or 409" in message
     assert "error.code" in message
     assert "error.message" in message
+    assert "HTTP JSON helpers must return explicit generic or interface types" in message
+    assert "tests must compile under strict TypeScript" in message
     assert "GET /analytics/portfolio.csv" in message
     assert "GET /portfolio/read-model" in message
     assert "Do not prefill pass records or fabricate execution" in message

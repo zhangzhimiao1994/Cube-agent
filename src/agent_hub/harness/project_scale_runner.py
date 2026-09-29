@@ -3607,6 +3607,9 @@ def _deliverable_repair_body(
             "must return 200 with decision approved. POST /access/check must return 200 with "
             "{allowed:false} for role viewer and action approve. This is the acceptance "
             "initialization contract, not an instruction to remove production authentication. "
+            "All tests must compile under strict TypeScript. HTTP JSON helpers must return "
+            "explicit generic or interface types before tests access response properties; never "
+            "leave parsed program, project, or workflow responses typed as unknown. "
         )
         if case_id.startswith("small:"):
             guidance += small_guidance
