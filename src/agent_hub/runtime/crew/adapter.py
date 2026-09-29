@@ -3151,7 +3151,14 @@ class CrewDispatchRuntime:
             )
             state.deadline = state.adaptive_deadline.deadline
             state.crew_generation = self._prepare_private_generation(plan)
-            if context.token_budget < plan.total_token_budget:
+            persisted_plan_budget = context.routing_decision.get(
+                "runtime_plan_token_budget"
+            )
+            adaptive_plan_envelope = (
+                type(persisted_plan_budget) is int
+                and persisted_plan_budget == plan.total_token_budget
+            )
+            if context.token_budget < plan.total_token_budget and not adaptive_plan_envelope:
                 _fail("task token budget is below the dispatch plan budget")
             if restored is not None:
                 self._validate_checkpoint(restored, context, plan)

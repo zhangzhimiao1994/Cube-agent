@@ -1597,6 +1597,29 @@ async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
 
 
+async def test_adaptive_runtime_allows_soft_context_budget_below_hard_plan_envelope() -> None:
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                token_budget=50,
+                routing_decision={
+                    "runtime_plan_token_budget": 100,
+                    "runtime_token_absolute_tokens": 100,
+                },
+            )
+        )
+    ]
+
+    assert any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
 async def test_step_events_include_orchestration_contract_context() -> None:
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
