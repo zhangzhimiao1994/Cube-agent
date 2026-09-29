@@ -2281,6 +2281,48 @@ async def test_choose_mode_persists_choice_and_enqueues_waiting_run(
     assert queue.enqueued == [waiting.id]
 
 
+async def test_choose_mode_preserves_project_scale_and_publishes_effective_route(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    queue = RecordingQueue([])
+    service = RunService(
+        RunRepository(run_session_factory),
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=UserChoiceRouter(),
+        task_queue=queue,
+    )
+
+    waiting = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="Build a real large business project for flow=auto.",
+        mode=TaskMode.AUTO,
+        idempotency_key="client-request-large-auto-mode-choice",
+    )
+    assert waiting.status is RunStatus.WAITING_USER_MODE
+    assert waiting.decision_token is not None
+
+    chosen = await service.choose_mode(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        run_id=waiting.id,
+        mode=TaskMode.HYBRID,
+        decision_token=waiting.decision_token,
+        version=waiting.version,
+    )
+    summary = await service.get(tenant_id, waiting.id)
+
+    assert chosen.effective_mode is TaskMode.HYBRID
+    assert chosen.effective_scale == "large"
+    assert chosen.route_reason == "routing_requires_user_choice"
+    assert chosen.mode_source == "user_mode_choice"
+    assert summary.effective_mode is TaskMode.HYBRID
+    assert summary.effective_scale == "large"
+    assert summary.route_reason == "routing_requires_user_choice"
+    assert summary.mode_source == "user_mode_choice"
+
+
 async def test_auto_submission_reuses_recent_conversation_mode_for_continuation(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

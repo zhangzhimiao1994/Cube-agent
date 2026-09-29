@@ -2150,7 +2150,10 @@ def _scope_project_workspace_tool_call(
     context: TaskContext,
     tool_call: ToolCall,
 ) -> ToolCall:
-    if tool_call.name != PROJECT_SCALE_ARTIFACT_TOOL_NAME:
+    if tool_call.name not in {
+        PROJECT_SCALE_ARTIFACT_TOOL_NAME,
+        "project.preflight_architecture",
+    }:
         return tool_call
     project_id = _routing_text(context.routing_decision, "project_id")
     workspace_session_id = _routing_text(context.routing_decision, "workspace_session_id")

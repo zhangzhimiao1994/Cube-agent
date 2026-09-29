@@ -470,6 +470,80 @@ async def test_repeated_mode_choice_returns_record_without_duplicate_outbox() ->
 
 
 @pytest.mark.asyncio
+async def test_mode_choice_publishes_effective_project_route_metadata() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="Build a real large business project for flow=auto.",
+        mode=None,
+        status=RunStatus.WAITING_USER_MODE.value,
+        version=7,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "reason": "routing_requires_user_choice",
+            "decision_token": "mode-token",
+            "project_scale": "large",
+        },
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.choose_mode_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        mode=TaskMode.HYBRID,
+        decision_token="mode-token",
+        version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.mode is TaskMode.HYBRID
+    assert record.routing_decision is not None
+    assert record.routing_decision["effective_mode"] == TaskMode.HYBRID.value
+    assert record.routing_decision["effective_scale"] == "large"
+    assert record.routing_decision["route_reason"] == "routing_requires_user_choice"
+    assert record.routing_decision["mode_source"] == "user_mode_choice"
+    assert len(session.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_mode_choice_ignores_invalid_project_scale_metadata() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="choose a mode",
+        mode=None,
+        status=RunStatus.WAITING_USER_MODE.value,
+        version=1,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "reason": "routing_requires_user_choice",
+            "decision_token": "mode-token",
+            "project_scale": {"unexpected": "mapping"},
+        },
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.choose_mode_and_enqueue(
+        tenant_id=row.tenant_id,
+        run_id=row.id,
+        mode=TaskMode.DISPATCH,
+        decision_token="mode-token",
+        version=1,
+    )
+
+    assert record.routing_decision is not None
+    assert "effective_scale" not in record.routing_decision
+
+
+@pytest.mark.asyncio
 async def test_repeated_capability_approval_returns_record_without_duplicate_outbox() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(

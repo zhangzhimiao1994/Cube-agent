@@ -3658,6 +3658,53 @@ def test_project_zip_tool_call_gets_server_owned_workspace_scope() -> None:
     assert scoped.arguments["workspace_session_id"] == "conv-cloud-drive"
 
 
+def test_project_preflight_tool_call_gets_server_owned_workspace_scope() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request="创建大型项目架构预检",
+        routing_decision={
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+            "project_preflight_approved": True,
+        },
+    )
+    original = ToolCall(
+        id="preflight-call",
+        name="project.preflight_architecture",
+        arguments={
+            "title": "大型项目",
+            "request": "生成架构计划",
+            "project_id": "model-supplied-project",
+            "workspace_session_id": "model-supplied-session",
+        },
+    )
+
+    scoped = _scope_project_workspace_tool_call(context, original)
+
+    assert original.arguments["project_id"] == "model-supplied-project"
+    assert scoped.arguments["project_id"] == "large-project"
+    assert scoped.arguments["workspace_session_id"] == "conv-large-project"
+
+
+def test_project_workspace_tool_call_is_unchanged_without_server_scope() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request="创建大型项目架构预检",
+        routing_decision={},
+    )
+    original = ToolCall(
+        id="preflight-call",
+        name="project.preflight_architecture",
+        arguments={"title": "大型项目", "request": "生成架构计划"},
+    )
+
+    assert _scope_project_workspace_tool_call(context, original) is original
+
+
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:
     runtime = CrewDispatchRuntime(
         UnusedGateway(),

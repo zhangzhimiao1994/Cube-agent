@@ -567,11 +567,25 @@ class RunRepository:
                 raise RunConflict("run version is stale")
 
             row.mode = mode.value
-            row.routing_decision = {
+            updated_routing_decision = {
                 **routing_decision,
                 "selected_mode": mode.value,
+                "effective_mode": mode.value,
+                "mode_source": "user_mode_choice",
                 **({"operator_note": operator_note} if operator_note else {}),
             }
+            project_scale = updated_routing_decision.get("project_scale")
+            if isinstance(project_scale, str) and project_scale in {
+                "small",
+                "medium",
+                "large",
+                "ultra",
+            }:
+                updated_routing_decision["effective_scale"] = project_scale
+            route_reason = updated_routing_decision.get("reason")
+            if isinstance(route_reason, str) and route_reason.strip():
+                updated_routing_decision["route_reason"] = route_reason
+            row.routing_decision = updated_routing_decision
             row.status = RunStatus.QUEUED.value
             row.version += 1
             await session.flush()
