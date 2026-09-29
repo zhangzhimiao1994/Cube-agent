@@ -1193,6 +1193,8 @@ def test_ultra_capability_repair_explains_rbac_acceptance_boundary() -> None:
     assert "403 or 409" in message
     assert "error.code" in message
     assert "error.message" in message
+    assert "created resource directly at the JSON top level" in message
+    assert "do not put it inside program, project, milestone, budget, staffing, risk, dependency, or approval" in message
     assert "HTTP JSON helpers must return explicit generic or interface types" in message
     assert "tests must compile under strict TypeScript" in message
     assert "must not invent assertions for internal codes such as CORE" in message
@@ -1202,6 +1204,77 @@ def test_ultra_capability_repair_explains_rbac_acceptance_boundary() -> None:
     assert "Do not prefill pass records or fabricate execution" in message
     assert len(message) <= 6_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
+
+
+def test_capability_repair_preserves_trusted_standard_events_across_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: first build failed",),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: validation_results.pop(0),
+    )
+    standard_event = {
+        "kind": "artifact.created",
+        "payload": {
+            "agent_standard_verification": {
+                "constraints_read": True,
+                "plan_before_implementation": True,
+                "reproducible_verification": True,
+                "root_cause_repair": True,
+            }
+        },
+    }
+    client = FakeAcceptanceClient(
+        run_id="run-medium-standard-event",
+        session_id="project-scale-medium-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[standard_event],
+        repair_events=[],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Service\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Requirement satisfied\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed\n"
+                ),
+                "constraints_reading_evidence.json": json.dumps(
+                    {
+                        "read_before_implementation": True,
+                        "constraints": ["AGENTS.md", "HANDOFF", "PROJECT_REQUIREMENTS.md"],
+                        "skills": ["applicable SKILL.md rules"],
+                    }
+                ),
+                "package.json": json.dumps({"scripts": {"build": "tsc", "test": "node --test"}}),
+                "src/app.ts": _functional_ts_source(),
+                "tests/app.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client, validate_generated_project=True)
+
+    assert report.ok is True
+    assert report.results[0].evidence["agent_standard_verification"] is True
+    assert len(client.submitted_bodies) == 2
+    assert validation_results == []
 
 
 def test_capability_repair_pins_the_observed_mode_for_auto_requests() -> None:

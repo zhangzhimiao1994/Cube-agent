@@ -691,6 +691,7 @@ def execute_project_scale_plan(
                 defer_artifacts_until_terminal=plan.benchmark_kind == "capability",
                 auto_approve_capability_requests=auto_approve_capability_requests,
             )
+            trusted_agent_standard_events = list(observation.events or ())
             status = observation.status
             observed_mode = observed_mode or _execution_mode(observation.details)
             final_observed_mode = _execution_mode(observation.details) or final_observed_mode
@@ -779,6 +780,9 @@ def execute_project_scale_plan(
                             auto_approve_capability_requests=auto_approve_capability_requests,
                         )
                         observation = self_repair_observation
+                        trusted_agent_standard_events.extend(
+                            self_repair_observation.events or ()
+                        )
                         status = self_repair_observation.status
                         final_observed_mode = (
                             _execution_mode(self_repair_observation.details)
@@ -829,7 +833,7 @@ def execute_project_scale_plan(
             evidence["deliverable_quality"] = deliverable_quality.passed
             agent_standard_verification = _evaluate_agent_standard_verification(
                 observation.details,
-                observation.events,
+                trusted_agent_standard_events,
                 observation.workspace_bundle,
                 benchmark_kind=plan.benchmark_kind,
             )
@@ -1053,6 +1057,7 @@ def execute_project_scale_plan(
                 )
                 status = repair_observation.status
                 current_observation_events = repair_observation.events
+                trusted_agent_standard_events.extend(repair_observation.events or ())
                 final_observed_mode = (
                     _execution_mode(repair_observation.details) or final_observed_mode
                 )
@@ -1117,7 +1122,7 @@ def execute_project_scale_plan(
                 evidence["deliverable_quality"] = deliverable_quality.passed
                 agent_standard_verification = _evaluate_agent_standard_verification(
                     repair_observation.details,
-                    repair_observation.events,
+                    trusted_agent_standard_events,
                     repair_workspace_bundle,
                     benchmark_kind=plan.benchmark_kind,
                 )
@@ -3622,6 +3627,10 @@ def _deliverable_repair_body(
             "must return 200 with decision approved. POST /access/check must return 200 with "
             "{allowed:false} for role viewer and action approve. This is the acceptance "
             "initialization contract, not an instruction to remove production authentication. "
+            "Every successful create endpoint in this acceptance contract must return the "
+            "created resource directly at the JSON top level, including its id; do not put it "
+            "inside program, project, milestone, budget, staffing, risk, dependency, or approval "
+            "wrapper fields. "
             "All tests must compile under strict TypeScript. HTTP JSON helpers must return "
             "explicit generic or interface types before tests access response properties; never "
             "leave parsed program, project, or workflow responses typed as unknown. "
