@@ -1925,7 +1925,15 @@ def _validate_generated_project_bundle(
                     )
                 failures = validator(root, timeout_seconds=timeout_seconds)
                 if failures:
-                    return _EvidenceCheck(passed=False, reasons=failures)
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=tuple(
+                            failure
+                            if failure.casefold().startswith("requirements:")
+                            else f"requirements: {failure}"
+                            for failure in failures
+                        ),
+                    )
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         return _EvidenceCheck(
             passed=False,
@@ -2046,11 +2054,17 @@ def _generated_project_validation_is_isolated() -> bool:
 def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
     if result.passed:
         return True
+    infrastructure_markers = (
+        "isolated systemd validator is required",
+        "npm executable unavailable",
+        "unsupported platform for process-tree cleanup",
+        "process-tree cleanup failed",
+        "temporary data_dir cleanup failed",
+    )
     return not any(
-        reason.startswith(
-            "generated_project_validation: isolated systemd validator is required"
-        )
+        marker in reason.casefold()
         for reason in result.reasons
+        for marker in infrastructure_markers
     )
 
 
@@ -3447,13 +3461,13 @@ def _deliverable_repair_made_progress(
     metric_progress = _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics)
     if metric_progress is False:
         return False
+    if current.validation_stage > previous.validation_stage:
+        return True
     previous_failures = set(previous.failure_fingerprints)
     current_failures = set(current.failure_fingerprints)
     if current_failures > previous_failures:
         return False
     if current_deficits < previous_deficits:
-        return True
-    if current.validation_stage > previous.validation_stage:
         return True
     if metric_progress is True:
         return True

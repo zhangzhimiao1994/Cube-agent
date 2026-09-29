@@ -514,15 +514,23 @@ def test_generated_project_command_uses_writable_sandbox_home(
     assert sandbox_home.is_dir()
 
 
-def test_validator_infrastructure_failure_is_not_treated_as_project_repair() -> None:
+@pytest.mark.parametrize(
+    "reason",
+    (
+        (
+            "generated_project_validation: isolated systemd validator is required "
+            "for generated npm/node commands"
+        ),
+        "requirements: npm executable unavailable; large order API was not validated",
+        "requirements: unsupported platform for process-tree cleanup: windows",
+        "requirements: process-tree cleanup failed: permission denied",
+        "requirements: temporary DATA_DIR cleanup failed: permission denied",
+    ),
+)
+def test_validator_infrastructure_failure_is_not_treated_as_project_repair(reason: str) -> None:
     result = project_scale_runner_module._EvidenceCheck(
         passed=False,
-        reasons=(
-            (
-                "generated_project_validation: isolated systemd validator is required "
-                "for generated npm/node commands"
-            ),
-        ),
+        reasons=(reason,),
     )
 
     assert not project_scale_runner_module._generated_project_validation_is_repairable(result)
@@ -749,6 +757,28 @@ def test_deliverable_repair_progress_rejects_validation_stage_regression() -> No
     )
 
     assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_deliverable_repair_progress_accepts_new_failure_after_validation_stage_advance() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm test failed",),
+        validation_stage=2,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=(
+            "npm test failed",
+            "post /inventory/stock: missing id",
+        ),
+        validation_stage=3,
+    )
+
+    assert project_scale_runner_module._deliverable_repair_made_progress(
         previous,
         current,
         seen_signatures={previous.signature},
@@ -1334,7 +1364,9 @@ def test_capability_large_uses_independent_order_requirements(
     monkeypatch.setattr(
         project_scale_runner_module,
         "validate_large_order_ops_api",
-        lambda root, timeout_seconds: ("requirements: stock conflict missing",),
+        lambda root, timeout_seconds: (
+            "order operations workflow: POST /inventory/stock: missing id",
+        ),
         raising=False,
     )
     result = project_scale_runner_module._validate_generated_project_bundle(
@@ -1344,7 +1376,10 @@ def test_capability_large_uses_independent_order_requirements(
         requirements_case_id="large:direct",
     )
     assert result.passed is False
-    assert "requirements: stock conflict missing" in result.reasons
+    assert result.reasons == (
+        "requirements: order operations workflow: POST /inventory/stock: missing id",
+    )
+    assert project_scale_runner_module._generated_project_validation_stage(result) == 3
 
 
 def test_capability_ultra_uses_independent_portfolio_requirements(
@@ -5162,20 +5197,15 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
             passed=False,
             reasons=(
                 (
-                    "generated_project_validation: command failed exit=2 "
-                    "command=npm run build output_tail="
-                    '"src/routes/accounts.ts(10,34): error TS2339: '
-                    "Property 'tenant_id' does not exist on type '{}'.\""
+                    "generated_project_validation: command failed exit=1 "
+                    'command=npm test output_tail="concurrent creates: 1 !== 25"'
                 ),
             ),
         ),
         project_scale_runner_module._EvidenceCheck(
             passed=False,
             reasons=(
-                (
-                    "generated_project_validation: command failed exit=1 "
-                    'command=npm test output_tail="concurrent creates: 1 !== 25"'
-                ),
+                "requirements: order operations workflow: POST /inventory/stock: missing id",
             ),
         ),
         project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
@@ -5252,9 +5282,8 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
     assert "src/app.ts" in repair_messages[0]
     assert "Expected 2 arguments, but got 1" in repair_messages[1]
     assert "validator helpers that require a field argument" in repair_messages[1]
-    assert "Property 'tenant_id' does not exist" in repair_messages[2]
-    assert "Request<{tenant_id:string" in repair_messages[2]
-    assert "concurrent creates: 1 !== 25" in repair_messages[3]
+    assert "concurrent creates: 1 !== 25" in repair_messages[2]
+    assert "POST /inventory/stock: missing id" in repair_messages[3]
     repair_keys = [
         call[2]
         for call in client.calls
