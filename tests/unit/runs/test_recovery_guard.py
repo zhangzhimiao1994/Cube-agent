@@ -526,6 +526,7 @@ async def test_mode_choice_ignores_invalid_project_scale_metadata() -> None:
             "reason": "routing_requires_user_choice",
             "decision_token": "mode-token",
             "project_scale": {"unexpected": "mapping"},
+            "effective_scale": "large",
         },
     )
     session = _CapabilityApprovalSession(row, approved=False)

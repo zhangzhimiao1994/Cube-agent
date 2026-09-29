@@ -582,9 +582,13 @@ class RunRepository:
                 "ultra",
             }:
                 updated_routing_decision["effective_scale"] = project_scale
+            elif "project_scale" in updated_routing_decision:
+                updated_routing_decision.pop("effective_scale", None)
             route_reason = updated_routing_decision.get("reason")
             if isinstance(route_reason, str) and route_reason.strip():
                 updated_routing_decision["route_reason"] = route_reason
+            elif "reason" in updated_routing_decision:
+                updated_routing_decision.pop("route_reason", None)
             row.routing_decision = updated_routing_decision
             row.status = RunStatus.QUEUED.value
             row.version += 1

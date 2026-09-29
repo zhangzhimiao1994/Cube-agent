@@ -2158,6 +2158,8 @@ def _scope_project_workspace_tool_call(
     project_id = _routing_text(context.routing_decision, "project_id")
     workspace_session_id = _routing_text(context.routing_decision, "workspace_session_id")
     if project_id is None or workspace_session_id is None:
+        if tool_call.name == "project.preflight_architecture":
+            raise RuntimeExecutionError("project preflight workspace scope is not configured")
         return tool_call
     arguments = dict(tool_call.arguments)
     arguments["project_id"] = project_id

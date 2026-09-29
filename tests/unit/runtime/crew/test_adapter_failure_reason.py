@@ -100,6 +100,37 @@ class ToolGateway:
         )
 
 
+class ProjectPreflightToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="preflight-call",
+                        name="project_preflight_architecture",
+                        arguments={"title": "Large Project", "request": "Plan the project"},
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="preflight ready", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class ToolResultAwareGateway:
     """Models a provider that needs a trusted continuation contract after a tool call."""
 
@@ -382,6 +413,30 @@ class FakeCapabilities:
 
     def is_replay_safe(self, name: str) -> bool:
         return name == "web.search"
+
+
+class ProjectPreflightCapabilities(FakeCapabilities):
+    def __init__(self) -> None:
+        super().__init__()
+        self.arguments: list[Mapping[str, JsonValue]] = []
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, idempotency_key
+        self.calls.append((actor, name))
+        self.arguments.append(dict(arguments))
+        return {"summary": "preflight ready"}
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "project.preflight_architecture"
 
 
 class ManifestCapabilities(FakeCapabilities):
@@ -1146,6 +1201,32 @@ def _tool_plan() -> DispatchPlan:
             ),
         ),
         allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+
+
+def _project_preflight_tool_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="project_preflight_architect",
+                role="Project Preflight Architect",
+                goal="Create the architecture preflight",
+                logical_model="general",
+                allowed_tools=("project.preflight_architecture",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="project_preflight_step",
+                agent="project_preflight_architect",
+                task="Create the architecture preflight",
+                tools=("project.preflight_architecture",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("project.preflight_architecture",),
         total_token_budget=100,
     )
 
@@ -3688,21 +3769,79 @@ def test_project_preflight_tool_call_gets_server_owned_workspace_scope() -> None
     assert scoped.arguments["workspace_session_id"] == "conv-large-project"
 
 
-def test_project_workspace_tool_call_is_unchanged_without_server_scope() -> None:
+@pytest.mark.parametrize(
+    "routing_decision",
+    (
+        {},
+        {"project_id": "large-project"},
+        {"workspace_session_id": "conv-large-project"},
+    ),
+)
+def test_project_preflight_tool_call_rejects_missing_server_scope(
+    routing_decision: Mapping[str, JsonValue],
+) -> None:
     context = TaskContext(
         run_id=RUN_ID,
         tenant_id=TENANT_ID,
         mode=TaskMode.HYBRID,
         request="创建大型项目架构预检",
-        routing_decision={},
+        routing_decision=routing_decision,
     )
     original = ToolCall(
         id="preflight-call",
         name="project.preflight_architecture",
-        arguments={"title": "大型项目", "request": "生成架构计划"},
+        arguments={
+            "title": "大型项目",
+            "request": "生成架构计划",
+            "project_id": "model-supplied-project",
+            "workspace_session_id": "model-supplied-session",
+        },
     )
 
-    assert _scope_project_workspace_tool_call(context, original) is original
+    with pytest.raises(
+        RuntimeExecutionError,
+        match="project preflight workspace scope is not configured",
+    ):
+        _scope_project_workspace_tool_call(context, original)
+
+
+async def test_project_preflight_runtime_injects_server_scope_before_capability_execution() -> None:
+    capabilities = ProjectPreflightCapabilities()
+    runtime = CrewDispatchRuntime(
+        ProjectPreflightToolGateway(),
+        _project_preflight_tool_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                actor_id=uuid4(),
+                actor_role=Role.OPERATOR,
+                mode=TaskMode.DISPATCH,
+                routing_decision={
+                    "project_id": "large-project",
+                    "workspace_session_id": "conv-large-project",
+                    "project_preflight_approved": True,
+                },
+            )
+        )
+    ]
+
+    assert capabilities.calls == [
+        ("project_preflight_architect", "project.preflight_architecture")
+    ]
+    assert capabilities.arguments == [
+        {
+            "title": "Large Project",
+            "request": "Plan the project",
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+        }
+    ]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:

@@ -2415,7 +2415,7 @@ class RunService:
         return _submitted(await self._repository.get(tenant_id, run_id))
 
     async def _summary(self, record: RunRecord) -> RunSummary:
-        routing_decision = record.routing_decision or {}
+        routing_decision = _public_record_routing_decision(record)
         waiting_for_decision = record.status in {
             RunStatus.WAITING_USER_MODE,
             RunStatus.WAITING_APPROVAL,
@@ -3245,7 +3245,7 @@ def _has_recorded_self_repair_proposal(
 
 
 def _submitted(record: RunRecord) -> SubmittedRun:
-    decision = record.routing_decision or {}
+    decision = _public_record_routing_decision(record)
     reason = str(decision.get("reason", "routing_requires_user_choice"))
     proposal = decision.get("temporary_agent_proposal")
     schedule_proposal = decision.get("schedule_proposal")
@@ -3328,9 +3328,25 @@ def _with_public_routing_decision(
     scale = _project_scale_or_none(decision.get("project_scale"))
     if scale is not None:
         decision["effective_scale"] = scale
+    elif "project_scale" in decision:
+        decision.pop("effective_scale", None)
     reason = _string_or_none(decision.get("reason"))
     if reason is not None:
         decision["route_reason"] = reason
+    elif "reason" in decision:
+        decision.pop("route_reason", None)
+    return decision
+
+
+def _public_record_routing_decision(record: RunRecord) -> dict[str, object]:
+    decision = dict(record.routing_decision or {})
+    if record.mode is None:
+        return decision
+    decision = _with_public_routing_decision(decision, effective_mode=record.mode)
+    if decision.get("selected_mode") == record.mode.value and not _string_or_none(
+        decision.get("mode_source")
+    ):
+        decision["mode_source"] = "user_mode_choice"
     return decision
 
 
@@ -3344,7 +3360,11 @@ def _task_mode_or_none(value: object) -> TaskMode | None:
 
 
 def _project_scale_or_none(value: object) -> str | None:
-    return value if value in {"small", "medium", "large", "ultra"} else None
+    return (
+        value
+        if isinstance(value, str) and value in {"small", "medium", "large", "ultra"}
+        else None
+    )
 
 
 def _repair_proposal_is_auto_executable(proposal: Mapping[str, object] | None) -> bool:

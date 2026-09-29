@@ -138,3 +138,50 @@ def test_submitted_projection_drops_write_permissions_without_sandbox_profile() 
 
     assert submitted.sandbox_profile is None
     assert submitted.requested_permissions == ("workspace.read",)
+
+
+def test_submitted_projection_backfills_legacy_mode_choice_route_metadata() -> None:
+    submitted = _submitted(
+        RunRecord(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            request="Build a real large business project for flow=auto.",
+            mode=TaskMode.HYBRID,
+            status=RunStatus.QUEUED,
+            version=8,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "reason": "routing_requires_user_choice",
+                "selected_mode": TaskMode.HYBRID.value,
+                "project_scale": "large",
+            },
+        )
+    )
+
+    assert submitted.effective_mode is TaskMode.HYBRID
+    assert submitted.effective_scale == "large"
+    assert submitted.route_reason == "routing_requires_user_choice"
+    assert submitted.mode_source == "user_mode_choice"
+
+
+def test_submitted_projection_ignores_invalid_project_scale_metadata() -> None:
+    submitted = _submitted(
+        RunRecord(
+            id=uuid4(),
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            request="choose a mode",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.QUEUED,
+            version=2,
+            created_at=datetime.now(UTC),
+            routing_decision={
+                "selected_mode": TaskMode.DISPATCH.value,
+                "project_scale": {"unexpected": "mapping"},
+                "effective_scale": "large",
+            },
+        )
+    )
+
+    assert submitted.effective_scale is None
