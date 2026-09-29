@@ -2384,6 +2384,53 @@ def test_execute_project_scale_plan_publicly_approves_capability_once_after_mode
     assert not any("/api/v1/admin/runs" in path for _, path, _ in client.calls)
 
 
+def test_execute_project_scale_plan_retries_capability_approval_after_conflict() -> None:
+    class ConflictThenApprovedClient(WaitingModeThenCapabilityApprovalClient):
+        def __init__(self) -> None:
+            super().__init__(
+                run_id="run-medium-auto-capability-conflict",
+                session_id="project-scale-medium-auto",
+            )
+            self.approval_attempts = 0
+            self.statuses = ["waiting_approval", "waiting_approval", "completed"]
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            if method == "POST" and path.endswith("/approve-capability"):
+                self.approval_attempts += 1
+                if self.approval_attempts == 1:
+                    raise RuntimeError(
+                        "POST /approve-capability failed status=409 "
+                        "body=approval checkpoint is not ready"
+                    )
+            return super().request_json(
+                method,
+                path,
+                body=body,
+                idempotency_key=idempotency_key,
+            )
+
+    client = ConflictThenApprovedClient()
+
+    result = execute_project_scale_plan(
+        _auto_scale_plan("medium"),
+        client,
+        wait_seconds=0.05,
+        poll_interval_seconds=0,
+        auto_approve_capability_requests=True,
+    ).results[0]
+
+    assert result.status == "completed"
+    assert result.evidence["capability_approval"] is True
+    assert client.approval_attempts == 2
+
+
 def test_execute_project_scale_plan_does_not_auto_approve_capability_without_opt_in() -> None:
     plan = _auto_scale_plan("medium")
     client = WaitingModeThenCapabilityApprovalClient(

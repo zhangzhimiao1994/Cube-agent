@@ -3128,7 +3128,6 @@ def _approve_pending_capability(
     approval_id, version = approval
     if approval_id in approved_capabilities:
         return None
-    approved_capabilities.add(approval_id)
     try:
         response = client.request_json(
             "POST",
@@ -3136,18 +3135,29 @@ def _approve_pending_capability(
             body={"approval_id": approval_id, "version": version},
         )
     except RuntimeError as error:
-        errors.append(f"capability_approval: {error}")
+        message = f"capability_approval: {error}"
+        _extend_unique(errors, (message,))
+        if "status=409" not in str(error):
+            approved_capabilities.add(approval_id)
         return None
     if not isinstance(response, dict):
+        approved_capabilities.add(approval_id)
         errors.append("capability_approval: approve-capability returned non-object JSON")
         return None
     response_run_id = response.get("id")
     if response_run_id is not None and str(response_run_id) != run_id:
+        approved_capabilities.add(approval_id)
         errors.append(
             "capability_approval: approve-capability returned mismatched run id "
             f"{response_run_id}"
         )
         return None
+    approved_capabilities.add(approval_id)
+    errors[:] = [
+        error
+        for error in errors
+        if not (error.startswith("capability_approval:") and "status=409" in error)
+    ]
     evidence["capability_approval"] = True
     return _string_value(response.get("status"))
 
