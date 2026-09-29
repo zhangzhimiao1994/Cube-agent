@@ -2057,19 +2057,20 @@ def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
 def _redact_generated_project_output(value: str) -> str:
     value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
     value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    value = value.replace('\\"', '"')
     value = re.sub(
         r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@",
         r"\1<redacted>@",
         value,
     )
     value = re.sub(
-        r"(?im)^(\s*(?:authorization|cookie|set-cookie)\s*[:=]).*$",
+        r"(?im)(\b(?:authorization|cookie|set-cookie)\s*[:=]).*$",
         r"\1 <redacted>",
         value,
     )
     sensitive_key = (
         r"(?:password|passwd|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
-        r"api[_-]?key|secret|token|jwt)"
+        r"aws[_-]?secret[_-]?access[_-]?key|api[_-]?key|secret|token|jwt)"
     )
     value = re.sub(
         rf"(?im)^(\s*{sensitive_key}\s*[:=]).*$",
@@ -2077,11 +2078,13 @@ def _redact_generated_project_output(value: str) -> str:
         value,
     )
     value = re.sub(
-        rf"(?i)\b({sensitive_key})(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        rf"(?i)(?<![A-Za-z0-9_])([\"']?{sensitive_key}[\"']?)"
+        rf"(?![A-Za-z0-9_])(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
         r"\1\2<redacted>",
         value,
     )
     value = re.sub(r"(?i)\b(bearer\s+)[^\s,;]+", r"\1<redacted>", value)
+    value = re.sub(r"(?i)(--user(?:=|\s+))[^\s]+", r"\1<redacted>", value)
     value = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", value)
     value = re.sub(
         r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
@@ -2118,18 +2121,29 @@ def _generated_project_diagnostic_excerpt(lines: Sequence[str]) -> str:
         if "not ok " in line.casefold()
         or line.casefold().startswith(("fail ", "failed "))
     )
-    blocks: list[str] = []
-    for anchor_position, anchor in enumerate(anchors[:3]):
+    unique_blocks: list[str] = []
+    block_fingerprints: set[str] = set()
+    for anchor_position, anchor in enumerate(anchors):
         end = anchors[anchor_position + 1] if anchor_position + 1 < len(anchors) else len(lines)
         block_lines = [lines[anchor]]
         for line in lines[anchor + 1 : end]:
             if any(marker in line.casefold() for marker in markers):
                 block_lines.append(line)
         block = " | ".join(dict.fromkeys(block_lines))
-        blocks.append(block if len(block) <= 320 else f"{block[:240]} ... {block[-60:]}")
+        fingerprint = re.sub(r"\bnot ok\s+\d+\b", "not ok <n>", block.casefold())
+        if fingerprint in block_fingerprints:
+            continue
+        block_fingerprints.add(fingerprint)
+        unique_blocks.append(block)
+    blocks = [
+        block if len(block) <= 320 else f"{block[:240]} ... {block[-60:]}"
+        for block in unique_blocks[:3]
+    ]
     if blocks:
-        if len(anchors) > len(blocks):
-            blocks.append(f"... {len(anchors) - len(blocks)} additional failure blocks omitted")
+        if len(unique_blocks) > len(blocks):
+            blocks.append(
+                f"... {len(unique_blocks) - len(blocks)} additional failure blocks omitted"
+            )
         diagnostics = " || ".join(blocks)
     else:
         diagnostic_lines = tuple(

@@ -341,11 +341,16 @@ def test_generated_project_output_excerpt_redacts_secrets_and_bounds_json() -> N
     output = "\n".join(
         (
             "Authorization: Bearer secret-bearer-value:still-secret",
+            "2026-09-29 INFO Authorization: Basic prefixed-basic-secret",
             "password: alpha beta gamma",
             "access_token=raw-token client_secret=client-secret-value",
+            'payload={\\"access_token\\":\\"escaped-secret\\"}',
+            "AWS_SECRET_ACCESS_KEY=aws-secret-value",
             "bare key sk-project-secret must not escape",
             "Cookie: session=private-cookie",
+            "DEBUG Cookie: sid=prefixed-cookie-secret",
             "Set-Cookie: sid=one; refresh=two",
+            "curl --user admin:curl-password https://example.test",
             "request=https://user:pass@example.test/run?token=query-secret",
             "database=postgres://dbuser:dbpass@example.test/app",
             "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
@@ -360,12 +365,17 @@ def test_generated_project_output_excerpt_redacts_secrets_and_bounds_json() -> N
 
     assert len(encoded) <= project_scale_runner_module._GENERATED_PROJECT_OUTPUT_TAIL_CHARS
     assert "secret-bearer-value" not in excerpt
+    assert "prefixed-basic-secret" not in excerpt
     assert "alpha beta gamma" not in excerpt
     assert "raw-token" not in excerpt
     assert "client-secret-value" not in excerpt
+    assert "escaped-secret" not in excerpt
+    assert "aws-secret-value" not in excerpt
     assert "sk-project-secret" not in excerpt
     assert "private-cookie" not in excerpt
+    assert "prefixed-cookie-secret" not in excerpt
     assert "refresh=two" not in excerpt
+    assert "curl-password" not in excerpt
     assert "user:pass" not in excerpt
     assert "dbuser:dbpass" not in excerpt
     assert "query-secret" not in excerpt
@@ -409,6 +419,36 @@ def test_generated_project_output_excerpt_reports_omitted_failure_blocks() -> No
     assert "not ok 3 - contract 3" in excerpt
     assert "2 additional failure blocks omitted" in excerpt
     assert "# fail 5" in excerpt
+
+
+def test_generated_project_output_excerpt_deduplicates_failures_before_budgeting() -> None:
+    duplicate = (
+        "not ok {index} - duplicate request conflict\n"
+        "  error: expected conflict\n"
+        "  actual: 200\n"
+        "  expected: 409"
+    )
+    independent = (
+        "not ok 4 - cancelled fulfillment transition\n"
+        "  error: cancelled job completed\n"
+        "  actual: 200\n"
+        "  expected: 409"
+    )
+    output = "\n".join(
+        (
+            *(duplicate.format(index=index) for index in range(1, 4)),
+            independent,
+            *("passing noise " * 20 for _ in range(30)),
+            "# fail 4",
+        )
+    )
+
+    excerpt = json.loads(project_scale_runner_module._generated_project_output_tail(output))
+
+    assert "duplicate request conflict" in excerpt
+    assert "cancelled fulfillment transition" in excerpt
+    assert "cancelled job completed" in excerpt
+    assert "# fail 4" in excerpt
 
 
 def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
