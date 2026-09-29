@@ -493,10 +493,18 @@ class ProbeDiscussionRuntime(ProbeDispatchRuntime):
 class ProbeHybridRuntime(ProbeDispatchRuntime):
     instances: ClassVar[list["ProbeDispatchRuntime"]] = []
 
-    def __init__(self, dispatch: object, discussion: object, direct: object) -> None:
+    def __init__(
+        self,
+        dispatch: object,
+        discussion: object,
+        direct: object,
+        *,
+        artifact_repository: object | None = None,
+    ) -> None:
         del direct
         self.dispatch = dispatch
         self.discussion = discussion
+        self.artifact_repository = artifact_repository
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
 
@@ -4745,6 +4753,69 @@ async def test_config_backed_hybrid_runtime_injects_harness_tool_gateway_into_ch
     hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[-1])
     assert hybrid.dispatch is ProbeDispatchRuntime.instances[-1]
     assert hybrid.discussion is ProbeDiscussionRuntime.instances[-1]
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_shares_artifact_repository_across_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    ProbeDiscussionRuntime.instances.clear()
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    artifact_repository = InMemoryArtifactRepository()
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": [
+                                    "text",
+                                    "tool_calling",
+                                    "structured_output",
+                                ],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        artifact_repository=artifact_repository,
+    )
+
+    _ = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.HYBRID,
+                request="Resume a hybrid run with durable artifacts.",
+            )
+        )
+    ]
+
+    assert ProbeDispatchRuntime.instances[-1].artifact_repository is artifact_repository
+    assert ProbeDiscussionRuntime.instances[-1].artifact_repository is artifact_repository
+    assert ProbeHybridRuntime.instances[-1].artifact_repository is artifact_repository
 
 
 @pytest.mark.asyncio
