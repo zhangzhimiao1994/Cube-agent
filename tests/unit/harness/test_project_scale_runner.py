@@ -841,6 +841,19 @@ def test_soft_repair_limit_allows_one_coupled_validation_regression() -> None:
         seen_signatures={previous.signature},
     )
 
+    requirements_regression = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=current.deficits,
+        failure_fingerprints=(
+            "requirements: crm workflow: startup: npm start exited before crm api became ready",
+        ),
+        validation_stage=3,
+    )
+    assert project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        requirements_regression,
+        seen_signatures={previous.signature},
+    )
+
     unrelated_regression = project_scale_runner_module._DeliverableRepairProgress(
         deficits=(
             "agent_standard_verification",
@@ -869,7 +882,7 @@ def test_soft_repair_limit_allows_one_coupled_validation_regression() -> None:
     )
 
     one_stage_added_deficit = project_scale_runner_module._DeliverableRepairProgress(
-        deficits=current.deficits,
+        deficits=("deliverable_quality", "generated_project_validation"),
         failure_fingerprints=("npm test failed",),
         validation_stage=3,
     )
@@ -5225,8 +5238,10 @@ def test_execute_project_scale_plan_extends_wait_budget_for_observable_repair(
     assert result.errors == ()
 
 
+@pytest.mark.parametrize("second_regression", (False, True), ids=("recovers", "stops"))
 def test_capability_generated_project_repair_allows_one_validation_regression_followup(
     monkeypatch: pytest.MonkeyPatch,
+    second_regression: bool,
 ) -> None:
     plan = build_project_scale_run_plan(
         benchmark_kind="capability",
@@ -5258,28 +5273,43 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
         project_scale_runner_module._EvidenceCheck(
             passed=False,
             reasons=(
-                (
-                    "generated_project_validation: command failed exit=2 "
-                    "command=npm run build "
-                    'output_tail="src/domain/orders.ts(166,7): error TS2322: '
-                    "Type 'OrderStatus' is not assignable"
-                ),
+                "requirements: CRM workflow: startup: npm start exited before CRM API became ready",
             ),
         ),
         project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
     ]
-    verification_results = [
-        project_scale_runner_module._EvidenceCheck(
-            passed=False,
-            reasons=(
-                (
-                    "agent_standard_verification: trusted runtime context/plan "
-                    "evidence unavailable"
+    if second_regression:
+        validation_results.append(
+            project_scale_runner_module._EvidenceCheck(
+                passed=False,
+                reasons=(
+                    "requirements: CRM workflow: startup: npm start exited before CRM API became ready",
                 ),
-            ),
+            )
         )
-        for _ in range(4)
-    ] + [project_scale_runner_module._EvidenceCheck(passed=True, reasons=())]
+    failed_verification = project_scale_runner_module._EvidenceCheck(
+        passed=False,
+        reasons=(
+            (
+                "agent_standard_verification: trusted runtime context/plan "
+                "evidence unavailable"
+            ),
+        ),
+    )
+    if second_regression:
+        alternate_failed_verification = project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("agent_standard_verification: root cause repair evidence unavailable",),
+        )
+        verification_results = [failed_verification for _ in range(4)] + [
+            alternate_failed_verification,
+            alternate_failed_verification,
+        ]
+    else:
+        verification_results = [failed_verification for _ in range(4)]
+        verification_results.append(
+            project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+        )
 
     def validate_generated_project_bundle(
         bundle: bytes | None, **kwargs: object
@@ -5351,12 +5381,12 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
 
     report = execute_project_scale_plan(plan, client)
 
-    assert report.ok is True
+    assert report.ok is not second_regression
     result = report.results[0]
     assert result.run_id == "run-medium-direct-validation-repair"
-    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["generated_project_validation"] is not second_regression
     assert result.evidence["deliverable_repair_trace"] is True
-    assert len(client.submitted_bodies) == 5
+    assert len(client.submitted_bodies) == (6 if second_regression else 5)
     repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
     assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
     assert "Current workspace context for precise repair" in repair_messages[0]
@@ -5364,8 +5394,9 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
     assert "Expected 2 arguments, but got 1" in repair_messages[1]
     assert "validator helpers that require a field argument" in repair_messages[1]
     assert "trusted runtime context/plan evidence unavailable" in repair_messages[2]
-    assert "src/domain/orders.ts(166,7): error TS2322" in repair_messages[3]
-    assert "OrderStatus" in repair_messages[3]
+    assert "npm start exited before CRM API became ready" in repair_messages[3]
+    if second_regression:
+        assert "root cause repair evidence unavailable" in repair_messages[4]
     assert validation_results == []
     assert verification_results == []
     repair_keys = [
@@ -5376,12 +5407,15 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
         and call[2] is not None
         and "deliverable-repair" in call[2]
     ]
-    assert repair_keys == [
+    expected_repair_keys = [
         "project-scale-medium-direct-0-deliverable-repair",
         "project-scale-medium-direct-0-deliverable-repair-2",
         "project-scale-medium-direct-0-deliverable-repair-3",
         "project-scale-medium-direct-0-deliverable-repair-4",
     ]
+    if second_regression:
+        expected_repair_keys.append("project-scale-medium-direct-0-deliverable-repair-5")
+    assert repair_keys == expected_repair_keys
 
 
 def test_capability_repair_extends_past_scale_budget_while_validation_progresses(

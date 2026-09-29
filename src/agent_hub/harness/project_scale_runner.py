@@ -3504,15 +3504,21 @@ def _deliverable_repair_followup_warranted(
     validation_stage_drop = previous.validation_stage - current.validation_stage
     if validation_stage_drop <= 0:
         return False
-    if validation_stage_drop == 1:
-        if added_deficits:
-            return False
-    elif not (
+    regression_deficit_by_stage = {
+        1: "generated_project_validation",
+        2: "generated_project_validation",
+        3: "requirements_validation",
+    }
+    expected_regression_deficit = regression_deficit_by_stage.get(current.validation_stage)
+    coupled_validation_regression = (
         previous.validation_stage == 4
-        and current.validation_stage in {1, 2, 3}
-        and added_deficits
-        and "generated_project_validation" in added_deficits
-    ):
+        and bool(added_deficits)
+        and expected_regression_deficit in added_deficits
+    )
+    if validation_stage_drop == 1:
+        if added_deficits and not coupled_validation_regression:
+            return False
+    elif not coupled_validation_regression:
         return False
     if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
         return False
