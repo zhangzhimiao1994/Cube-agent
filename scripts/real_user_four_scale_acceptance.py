@@ -542,7 +542,10 @@ def build_case_report(
     }
     allowed_modes = expected_modes.get(route_intent)
     final_mode = result.final_observed_mode or result.observed_mode
-    exact_mode_coverage_ok = allowed_modes is None or final_mode in allowed_modes
+    route_observed_mode = result.observed_mode if route_intent == "auto" else final_mode
+    exact_mode_coverage_ok = (
+        allowed_modes is None or route_observed_mode in allowed_modes
+    )
     safe_upgrade = (
         route_intent == "direct"
         and result.requested_mode == "direct"
@@ -587,6 +590,7 @@ def build_case_report(
         "observed_mode": result.observed_mode,
         "initial_observed_mode": result.observed_mode,
         "final_observed_mode": final_mode,
+        "route_observed_mode": route_observed_mode,
         "requested_mode": result.requested_mode,
         "route_reason": result.route_reason,
         "mode_source": result.mode_source,

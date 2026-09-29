@@ -432,6 +432,96 @@ def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverag
     assert payload["final_observed_mode"] == "hybrid"
 
 
+def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="large:auto",
+        run_id="run-large-repair",
+        status="completed",
+        observed_mode="hybrid",
+        final_observed_mode="direct",
+        requested_mode="direct",
+        effective_scale="large",
+        artifact_origin="incremental_workspace_delivery",
+        workspace_bundle_source="public_workspace_api",
+        evidence={**_passing_evidence(), "deliverable_repair_trace": True},
+    )
+
+    payload = module.build_case_report(
+        scale="large",
+        project={"project_id": "project-large"},
+        conversation={"conversation_id": "conv-large"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["core_acceptance_ok"] is True
+    assert payload["route_policy_ok"] is True
+    assert payload["exact_mode_coverage_ok"] is True
+    assert payload["route_observed_mode"] == "hybrid"
+    assert payload["initial_observed_mode"] == "hybrid"
+    assert payload["final_observed_mode"] == "direct"
+
+
+def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="large:auto",
+        run_id="run-large-repair",
+        status="completed",
+        observed_mode="direct",
+        final_observed_mode="hybrid",
+        requested_mode="hybrid",
+        effective_scale="large",
+        artifact_origin="incremental_workspace_delivery",
+        workspace_bundle_source="public_workspace_api",
+        evidence={**_passing_evidence(), "deliverable_repair_trace": True},
+    )
+
+    payload = module.build_case_report(
+        scale="large",
+        project={"project_id": "project-large"},
+        conversation={"conversation_id": "conv-large"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["core_acceptance_ok"] is False
+    assert payload["route_policy_ok"] is False
+    assert payload["route_observed_mode"] == "direct"
+
+
+def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        case_id="large:hybrid",
+        run_id="run-large-repair",
+        status="completed",
+        observed_mode="hybrid",
+        final_observed_mode="direct",
+        requested_mode="direct",
+        effective_scale="large",
+        artifact_origin="incremental_workspace_delivery",
+        workspace_bundle_source="public_workspace_api",
+        evidence={**_passing_evidence(), "deliverable_repair_trace": True},
+    )
+
+    payload = module.build_case_report(
+        scale="large",
+        project={"project_id": "project-large"},
+        conversation={"conversation_id": "conv-large"},
+        result=case,
+        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert payload["core_acceptance_ok"] is False
+    assert payload["route_policy_ok"] is False
+    assert payload["route_observed_mode"] == "direct"
+
+
 def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
