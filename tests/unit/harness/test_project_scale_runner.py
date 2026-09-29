@@ -1227,7 +1227,7 @@ def test_capability_repair_preserves_trusted_standard_events_across_runs(
         "_validate_generated_project_bundle",
         lambda bundle, **kwargs: validation_results.pop(0),
     )
-    standard_event = {
+    standard_event: dict[str, object] = {
         "kind": "artifact.created",
         "payload": {
             "agent_standard_verification": {
