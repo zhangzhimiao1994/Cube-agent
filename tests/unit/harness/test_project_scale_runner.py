@@ -819,6 +819,67 @@ def test_soft_repair_limit_allows_unseen_actionable_regression() -> None:
     )
 
 
+def test_soft_repair_limit_allows_one_coupled_validation_regression() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("deliverable_quality",),
+        failure_fingerprints=("workspace_bundle: missing constraints reading evidence",),
+        validation_stage=4,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=(
+            "deliverable_quality",
+            "generated_project_validation",
+            "requirements_validation",
+        ),
+        failure_fingerprints=("npm run build failed with ts2322",),
+        validation_stage=1,
+    )
+
+    assert project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+
+    unrelated_regression = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=(
+            "agent_standard_verification",
+            "deliverable_quality",
+            "generated_project_validation",
+            "requirements_validation",
+        ),
+        failure_fingerprints=("npm run build failed with ts2322",),
+        validation_stage=1,
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        unrelated_regression,
+        seen_signatures={previous.signature},
+    )
+
+    infrastructure_regression = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=current.deficits,
+        failure_fingerprints=("npm executable unavailable",),
+        validation_stage=0,
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        infrastructure_regression,
+        seen_signatures={previous.signature},
+    )
+
+    one_stage_added_deficit = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=current.deficits,
+        failure_fingerprints=("npm test failed",),
+        validation_stage=3,
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        one_stage_added_deficit,
+        seen_signatures={previous.signature},
+    )
+
+
 def test_validation_stage_uses_failed_command_not_output_tail_text() -> None:
     validation = project_scale_runner_module._EvidenceCheck(
         passed=False,
@@ -5164,7 +5225,7 @@ def test_execute_project_scale_plan_extends_wait_budget_for_observable_repair(
     assert result.errors == ()
 
 
-def test_capability_generated_project_repair_extends_soft_limit_while_progressing(
+def test_capability_generated_project_repair_allows_one_validation_regression_followup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -5193,23 +5254,32 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
                 ),
             ),
         ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
         project_scale_runner_module._EvidenceCheck(
             passed=False,
             reasons=(
                 (
-                    "generated_project_validation: command failed exit=1 "
-                    'command=npm test output_tail="concurrent creates: 1 !== 25"'
+                    "generated_project_validation: command failed exit=2 "
+                    "command=npm run build "
+                    'output_tail="src/domain/orders.ts(166,7): error TS2322: '
+                    "Type 'OrderStatus' is not assignable"
                 ),
-            ),
-        ),
-        project_scale_runner_module._EvidenceCheck(
-            passed=False,
-            reasons=(
-                "requirements: order operations workflow: POST /inventory/stock: missing id",
             ),
         ),
         project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
     ]
+    verification_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "agent_standard_verification: trusted runtime context/plan "
+                    "evidence unavailable"
+                ),
+            ),
+        )
+        for _ in range(4)
+    ] + [project_scale_runner_module._EvidenceCheck(passed=True, reasons=())]
 
     def validate_generated_project_bundle(
         bundle: bytes | None, **kwargs: object
@@ -5221,6 +5291,17 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
         project_scale_runner_module,
         "_validate_generated_project_bundle",
         validate_generated_project_bundle,
+    )
+
+    def evaluate_agent_standard_verification(
+        *args: object, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        return verification_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_evaluate_agent_standard_verification",
+        evaluate_agent_standard_verification,
     )
     client = FakeAcceptanceClient(
         run_id="run-medium-direct-validation",
@@ -5282,8 +5363,11 @@ def test_capability_generated_project_repair_extends_soft_limit_while_progressin
     assert "src/app.ts" in repair_messages[0]
     assert "Expected 2 arguments, but got 1" in repair_messages[1]
     assert "validator helpers that require a field argument" in repair_messages[1]
-    assert "concurrent creates: 1 !== 25" in repair_messages[2]
-    assert "POST /inventory/stock: missing id" in repair_messages[3]
+    assert "trusted runtime context/plan evidence unavailable" in repair_messages[2]
+    assert "src/domain/orders.ts(166,7): error TS2322" in repair_messages[3]
+    assert "OrderStatus" in repair_messages[3]
+    assert validation_results == []
+    assert verification_results == []
     repair_keys = [
         call[2]
         for call in client.calls

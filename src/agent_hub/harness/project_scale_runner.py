@@ -3491,9 +3491,28 @@ def _deliverable_repair_followup_warranted(
 ) -> bool:
     if current.signature in seen_signatures or not current.failure_fingerprints:
         return False
-    if not set(current.deficits).issubset(previous.deficits):
+    previous_deficits = set(previous.deficits)
+    current_deficits = set(current.deficits)
+    added_deficits = current_deficits - previous_deficits
+    coupled_validation_deficits = {
+        "deliverable_quality",
+        "generated_project_validation",
+        "requirements_validation",
+    }
+    if not added_deficits.issubset(coupled_validation_deficits):
         return False
-    if previous.validation_stage - current.validation_stage != 1:
+    validation_stage_drop = previous.validation_stage - current.validation_stage
+    if validation_stage_drop <= 0:
+        return False
+    if validation_stage_drop == 1:
+        if added_deficits:
+            return False
+    elif not (
+        previous.validation_stage == 4
+        and current.validation_stage in {1, 2, 3}
+        and added_deficits
+        and "generated_project_validation" in added_deficits
+    ):
         return False
     if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
         return False
