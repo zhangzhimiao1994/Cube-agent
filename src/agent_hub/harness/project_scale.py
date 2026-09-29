@@ -451,6 +451,8 @@ def _capability_message(case: ProjectScaleCase) -> str:
     return (
         f"Build a real {case.scale} business project for flow={case.flow}. {requirements} "
         "Include npm run build, npm test, source, tests, README, plan and verification instructions. "
+        "The test runner, test API imports, and test configuration must agree: test APIs must "
+        "either be imported explicitly or supplied by a verified runner globals setting. "
         "The bundle must include IMPLEMENTATION_PLAN.md saying it read before implementation: "
         "AGENTS.md workspace rules, HANDOFF current-state index, PROJECT_REQUIREMENTS.md, and "
         "applicable SKILL.md or agent-standard rules. Include constraints_reading_evidence.json "

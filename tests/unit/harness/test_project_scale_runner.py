@@ -139,6 +139,127 @@ def test_repair_context_prioritizes_runtime_endpoint_and_module_matches() -> Non
     assert "tsconfig.json" in selected
 
 
+def test_repair_context_reserves_test_configuration_when_many_tests_fail() -> None:
+    paths = (
+        "package.json",
+        "tsconfig.json",
+        "vitest.config.ts",
+        "vite.config.ts",
+        *(f"src/module-{index}.ts" for index in range(6)),
+        *(f"tests/case-{index}.test.ts" for index in range(10)),
+    )
+    failures = tuple(
+        f"ReferenceError: describe is not defined at /tmp/project/{path}:4:1"
+        for path in paths
+        if path.startswith(("src/", "tests/"))
+    )
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(paths, failures)
+
+    assert "package.json" in selected
+    assert "tsconfig.json" in selected
+    assert "vitest.config.ts" in selected
+    assert "vite.config.ts" in selected
+    assert len([path for path in selected if path.startswith("tests/")]) <= 3
+
+
+def test_repair_context_keeps_distinct_test_failures() -> None:
+    paths = (
+        "package.json",
+        "tsconfig.json",
+        "vitest.config.ts",
+        "vite.config.ts",
+        *(f"tests/case-{index}.test.ts" for index in range(4)),
+    )
+    failures = tuple(
+        f"AssertionError: distinct failure {index} at /tmp/project/tests/case-{index}.test.ts:4:1"
+        for index in range(4)
+    )
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(paths, failures)
+
+    assert {path for path in selected if path.startswith("tests/")} == {
+        f"tests/case-{index}.test.ts" for index in range(4)
+    }
+
+
+def test_repair_context_keeps_distinct_test_failure_mixed_with_global_errors() -> None:
+    paths = (
+        "package.json",
+        "tsconfig.json",
+        "vitest.config.ts",
+        "vite.config.ts",
+        *(f"tests/global-{index}.test.ts" for index in range(4)),
+        "tests/business-rule.test.ts",
+    )
+    failures = (
+        *(
+            f"ReferenceError: describe is not defined at /tmp/project/tests/global-{index}.test.ts:4:1"
+            for index in range(4)
+        ),
+        "AssertionError: expected 409 at /tmp/project/tests/business-rule.test.ts:20:3",
+    )
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(paths, failures)
+
+    assert "tests/business-rule.test.ts" in selected
+    assert len([path for path in selected if path.startswith("tests/global-")]) == 3
+
+
+def test_repair_context_adds_vitest_global_api_hint() -> None:
+    hint = project_scale_runner_module._repair_context_failure_hints(
+        ("ReferenceError: describe is not defined",)
+    )
+
+    assert "Vitest" in hint
+    assert "explicitly import" in hint
+    assert "globals" in hint
+
+
+def test_capability_repair_keeps_workspace_context_after_long_failure_output() -> None:
+    bundle = _project_bundle(
+        {
+            "package.json": json.dumps({"scripts": {"test": "vitest run"}}),
+            "tsconfig.json": json.dumps({"compilerOptions": {"strict": True}}),
+            "vitest.config.ts": "export default { test: { globals: false } };\n",
+            "src/app.ts": "export const app = true;\n",
+            "tests/app.test.ts": "describe('app', () => {});\n",
+            **{
+                f"src/module-{index}.ts": "export const value = '" + ("x" * 2_000) + "';\n"
+                for index in range(8)
+            },
+            "README.md": "# App\n",
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "VERIFICATION.md": "- npm test: failed\n",
+        }
+    )
+    long_failure = (
+        "generated_project_validation: command failed exit=1 command=npm test output_tail=\""
+        + "stack trace noise " * 180
+        + "ReferenceError: describe is not defined at /tmp/project/tests/app.test.ts:1:1\""
+    )
+
+    repair = _deliverable_repair_body(
+        {
+            "message": "Build a tested TypeScript service.",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "large:direct",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle,
+        failed_reasons=(long_failure,),
+    )
+
+    message = str(repair["message"])
+    assert "Current workspace context for precise repair" in message
+    assert "vitest.config.ts" in message
+    assert "tests/app.test.ts" in message
+    assert "Vitest test-runtime repair hint" in message
+    assert len(message) <= 6_000
+
+
 def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -439,6 +560,40 @@ def test_deliverable_repair_progress_rejects_validation_stage_regression() -> No
     assert not project_scale_runner_module._deliverable_repair_made_progress(
         previous,
         current,
+        seen_signatures={previous.signature},
+    )
+
+
+def test_soft_repair_limit_allows_unseen_actionable_regression() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm test failed",),
+        validation_stage=2,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm run build failed with ts2305",),
+        validation_stage=1,
+    )
+
+    assert project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        current,
+        previous,
+        seen_signatures={previous.signature, current.signature},
+    )
+    deeper_regression = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm install failed",),
+        validation_stage=0,
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        deeper_regression,
         seen_signatures={previous.signature},
     )
 

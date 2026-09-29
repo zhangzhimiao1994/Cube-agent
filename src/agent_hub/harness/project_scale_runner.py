@@ -85,7 +85,7 @@ _PLUGIN_CONTRACT_DETAIL_KEYS = (
     ("recovery_ref", "failure_modes", "recovery_plan", "failure_recovery"),
 )
 _REPAIR_CONTEXT_MAX_FILES = 24
-_REPAIR_CONTEXT_MAX_SNIPPET_CHARS = 700
+_REPAIR_CONTEXT_MAX_SNIPPET_CHARS = 320
 _REPAIR_CONTEXT_EXTENSIONS = frozenset(
     {
         ".cjs",
@@ -908,6 +908,8 @@ def execute_project_scale_plan(
                 )
             seen_repair_progress_signatures = {repair_progress_state.signature}
             repair_progress_observed = True
+            repair_followup_warranted = False
+            regression_repair_followups_remaining = 1
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
             ):
@@ -930,6 +932,7 @@ def execute_project_scale_plan(
                 if (
                     deliverable_repair_attempts >= soft_deliverable_repair_attempts
                     and not repair_progress_observed
+                    and not repair_followup_warranted
                     and repair_mode == final_observed_mode
                 ):
                     break
@@ -1187,6 +1190,20 @@ def execute_project_scale_plan(
                     next_progress_state,
                     seen_signatures=seen_repair_progress_signatures,
                 )
+                repair_followup_warranted = _deliverable_repair_followup_warranted(
+                    repair_progress_state,
+                    next_progress_state,
+                    seen_signatures=seen_repair_progress_signatures,
+                )
+                if (
+                    repair_followup_warranted
+                    and next_progress_state.validation_stage
+                    < repair_progress_state.validation_stage
+                ):
+                    if regression_repair_followups_remaining <= 0:
+                        repair_followup_warranted = False
+                    else:
+                        regression_repair_followups_remaining -= 1
                 seen_repair_progress_signatures.add(next_progress_state.signature)
                 repair_progress_state = next_progress_state
                 if (
@@ -3300,6 +3317,30 @@ def _deliverable_repair_made_progress(
     return current_failures != previous_failures
 
 
+def _deliverable_repair_followup_warranted(
+    previous: _DeliverableRepairProgress,
+    current: _DeliverableRepairProgress,
+    *,
+    seen_signatures: set[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            int,
+            tuple[tuple[str, int, int], ...],
+        ]
+    ],
+) -> bool:
+    if current.signature in seen_signatures or not current.failure_fingerprints:
+        return False
+    if not set(current.deficits).issubset(previous.deficits):
+        return False
+    if previous.validation_stage - current.validation_stage != 1:
+        return False
+    if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
+        return False
+    return current.failure_fingerprints != previous.failure_fingerprints
+
+
 def _repair_metrics_progressed(
     previous: tuple[tuple[str, int, int], ...],
     current: tuple[tuple[str, int, int], ...],
@@ -3394,13 +3435,13 @@ def _deliverable_repair_body(
             "Report executed checks only.\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
-        prefix = guidance + reasons + "\nOriginal request:\n"
-        suffix = f"\n{context}" if context else ""
-        max_chars = 2_600 if context else 2_000
-        available = max_chars - len(" ".join((prefix + suffix).split())) - 1
+        context_section = f"\n{context}\n" if context else ""
+        prefix = guidance + context_section + reasons + "\nOriginal request:\n"
+        max_chars = 6_000 if context else 2_000
+        available = max_chars - len(" ".join(prefix.split())) - 1
         bounded_original = original[: max(available, 0)]
         repair_body["message"] = _bounded_role_planning_task_text(
-            prefix + bounded_original + suffix,
+            prefix + bounded_original,
             max_chars=max_chars,
         )
         repair_body["skip_evolution_proposal"] = True
@@ -3523,9 +3564,14 @@ def _repair_context_relevant_paths(
 ) -> list[str]:
     path_set = set(paths)
     selected: list[str] = []
+    suppressed_repeated_test_paths: set[str] = set()
 
     def add(path: str) -> None:
-        if path in path_set and path not in selected:
+        if (
+            path in path_set
+            and path not in selected
+            and path not in suppressed_repeated_test_paths
+        ):
             selected.append(path)
 
     failed_text = "\n".join(failed_reasons)
@@ -3535,6 +3581,30 @@ def _repair_context_relevant_paths(
             normalized_path = path.replace("\\", "/").lstrip("/")
             if candidate == normalized_path or candidate.endswith(f"/{normalized_path}"):
                 add(path)
+    global_api_failure_test_paths: list[str] = []
+    for reason in failed_reasons:
+        if re.search(
+            r"\b(?:describe|it|test|expect|beforeEach|afterEach) is not defined\b",
+            reason,
+        ) is None:
+            continue
+        for match in _REPAIR_CONTEXT_PATH_RE.finditer(reason):
+            candidate = re.sub(r"/+", "/", match.group(1).replace("\\", "/"))
+            for path in paths:
+                normalized_path = path.replace("\\", "/").lstrip("/")
+                if (
+                    candidate == normalized_path
+                    or candidate.endswith(f"/{normalized_path}")
+                ) and path not in global_api_failure_test_paths:
+                    global_api_failure_test_paths.append(path)
+    if len(global_api_failure_test_paths) > 3:
+        representative_tests = set(global_api_failure_test_paths[:3])
+        suppressed_repeated_test_paths.update(global_api_failure_test_paths[3:])
+        selected = [
+            path
+            for path in selected
+            if path not in global_api_failure_test_paths or path in representative_tests
+        ]
     lowered_failed_text = failed_text.casefold()
     endpoints = tuple(
         dict.fromkeys(
@@ -3577,7 +3647,10 @@ def _repair_context_relevant_paths(
             add(path)
     for path in paths:
         basename = PurePosixPath(path).name.lower()
-        if basename in {"package.json", "tsconfig.json"}:
+        if (
+            basename in {"package.json", "tsconfig.json", "jsconfig.json"}
+            or basename.startswith(("vitest.config.", "vite.config."))
+        ):
             add(path)
     if "has no exported member" in failed_text or "TS2305" in failed_text:
         for path in paths:
@@ -3596,7 +3669,26 @@ def _repair_context_relevant_paths(
                 add(path)
             if len(selected) >= 4:
                 break
-    return selected[:8]
+    reserved_configuration_paths = [
+        path
+        for path in paths
+        if (
+            PurePosixPath(path).name.lower()
+            in {"package.json", "tsconfig.json", "jsconfig.json"}
+            or PurePosixPath(path).name.lower().startswith(
+                ("vitest.config.", "vite.config.")
+            )
+        )
+    ]
+    reserved_configuration_paths = reserved_configuration_paths[:4]
+    selected_without_reserved = [
+        path for path in selected if path not in reserved_configuration_paths
+    ]
+    available_slots = max(0, 8 - len(reserved_configuration_paths))
+    return [
+        *selected_without_reserved[:available_slots],
+        *reserved_configuration_paths,
+    ]
 
 
 def _compact_repair_snippet(text: str) -> str:
@@ -3608,15 +3700,24 @@ def _compact_repair_snippet(text: str) -> str:
 
 def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
     text = "\n".join(failed_reasons)
-    if "TS2305" not in text and "has no exported member" not in text:
-        return ""
-    symbols = re.findall(r"has no exported member '([^']+)'", text)
-    symbol_note = f" Missing export(s): {', '.join(dict.fromkeys(symbols))}." if symbols else ""
-    return (
-        "TypeScript import/export repair hint: TS2305 means the imported symbol must be "
-        "exported by that module, or the import must be corrected/removed."
-        f"{symbol_note}"
-    )
+    hints: list[str] = []
+    if "TS2305" in text or "has no exported member" in text:
+        symbols = re.findall(r"has no exported member '([^']+)'", text)
+        symbol_note = (
+            f" Missing export(s): {', '.join(dict.fromkeys(symbols))}." if symbols else ""
+        )
+        hints.append(
+            "TypeScript import/export repair hint: TS2305 means the imported symbol must be "
+            "exported by that module, or the import must be corrected/removed."
+            f"{symbol_note}"
+        )
+    if re.search(r"\b(?:describe|it|test|expect|beforeEach|afterEach) is not defined\b", text):
+        hints.append(
+            "Vitest test-runtime repair hint: explicitly import every used test API from "
+            "'vitest', or enable and verify the matching runner globals configuration. Ensure "
+            "the npm test script loads that configuration."
+        )
+    return "\n".join(hints)
 
 
 def _bounded_role_planning_task_text(value: str, *, max_chars: int = 2_000) -> str:
