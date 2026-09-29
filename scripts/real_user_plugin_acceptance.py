@@ -485,8 +485,8 @@ def run_real_user_plugin_acceptance(
         if _activation_state(approved) != "eligible":
             raise RuntimeError("approved plugin package is not eligible")
         phases.append("package_approved")
-        started = _mapping(client.request_json("POST", f"{plugin_path}/start", body={}), "start")
         enabled = _mapping(client.request_json("POST", f"{plugin_path}/enable", body={}), "enable")
+        started = _mapping(client.request_json("POST", f"{plugin_path}/start", body={}), "start")
         if started.get("status") != "running" or enabled.get("enabled") is not True:
             raise RuntimeError("plugin did not become running and enabled")
         phases.append("plugin_enabled")
@@ -494,8 +494,12 @@ def run_real_user_plugin_acceptance(
             client.request_json("GET", "/api/v1/admin/capabilities/manifest"),
             package.capability_id,
         )
-        if capability is None or capability.get("available") is not True:
-            raise RuntimeError("plugin capability is not available in the runtime manifest")
+        if capability is None:
+            raise RuntimeError("plugin capability is missing from the runtime manifest")
+        if capability.get("available") is not True:
+            reason = capability.get("availability_reason")
+            safe_reason = reason if isinstance(reason, str) and reason else "unknown_reason"
+            raise RuntimeError(f"plugin capability is unavailable: {safe_reason}")
         phases.append("capability_available")
         submitted = _mapping(
             client.request_json(

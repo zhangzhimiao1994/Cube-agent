@@ -23,8 +23,16 @@ def _load_script() -> Any:
 
 
 class FakePluginAcceptanceClient:
-    def __init__(self, *, audit_matches: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        audit_matches: bool = True,
+        capability_available: bool = True,
+        availability_reason: str | None = None,
+    ) -> None:
         self.audit_matches = audit_matches
+        self.capability_available = capability_available
+        self.availability_reason = availability_reason
         self.requests: list[tuple[str, str]] = []
         self.plugin_id = ""
         self.capability_id = ""
@@ -83,8 +91,8 @@ class FakePluginAcceptanceClient:
         if path.endswith("/enable"):
             return {
                 "id": self.plugin_id,
-                "status": "running",
-                "health": "healthy",
+                "status": "stopped",
+                "health": "stopped",
                 "enabled": True,
             }
         if path == "/api/v1/admin/capabilities/manifest":
@@ -92,7 +100,15 @@ class FakePluginAcceptanceClient:
             return {
                 "schema_version": 1,
                 "capabilities": (
-                    [{"id": self.capability_id, "available": True}] if active else []
+                    [
+                        {
+                            "id": self.capability_id,
+                            "available": self.capability_available,
+                            "availability_reason": self.availability_reason,
+                        }
+                    ]
+                    if active
+                    else []
                 ),
             }
         if path == "/api/v1/runs" and method == "POST":
@@ -235,6 +251,13 @@ def test_real_user_plugin_acceptance_runs_public_flow_and_cleans_up(tmp_path: Pa
         "runtime_output_schema_nonce": True,
     }
     assert ("POST", "/api/v1/runs") in client.requests
+    enable_index = next(
+        index for index, request in enumerate(client.requests) if request[1].endswith("/enable")
+    )
+    start_index = next(
+        index for index, request in enumerate(client.requests) if request[1].endswith("/start")
+    )
+    assert enable_index < start_index
     assert not any(path.startswith("/api/v1/admin/runs") for _, path in client.requests)
     assert any(path.endswith("/disable") for _, path in client.requests)
     assert any(path.endswith("/stop") for _, path in client.requests)
@@ -260,3 +283,24 @@ def test_real_user_plugin_acceptance_cleans_up_after_evidence_failure(tmp_path: 
     assert any(path.endswith("/stop") for _, path in client.requests)
     assert any(path.endswith("/uninstall") for _, path in client.requests)
     assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
+
+
+def test_real_user_plugin_acceptance_reports_manifest_unavailable_reason(tmp_path: Path) -> None:
+    module = _load_script()
+    client = FakePluginAcceptanceClient(
+        capability_available=False,
+        availability_reason="plugin_package_adapter_unavailable",
+    )
+
+    report = module.run_real_user_plugin_acceptance(
+        client,
+        execution_id="flow-unavailable",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert report["status"] == "failed"
+    assert report["errors"] == [
+        "plugin capability is unavailable: plugin_package_adapter_unavailable"
+    ]
