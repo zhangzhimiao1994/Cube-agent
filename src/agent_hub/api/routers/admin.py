@@ -2014,7 +2014,10 @@ class SystemSettingsRequest(BaseModel):
         pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
     )
     default_workflow_id: str | None = Field(default=None, max_length=128)
-    default_execution_backend: str = Field(default="systemd", pattern=r"^(systemd|docker)$")
+    default_execution_backend: str = Field(
+        default="systemd",
+        pattern=r"^(systemd|docker|ssh|modal|daytona|vercel)$",
+    )
     default_agent_ids: list[str] = Field(default_factory=list, max_length=64)
     log_level: str = Field(default="warning", pattern=r"^(warning|error)$")
     hermes_enabled: bool = True
@@ -2059,7 +2062,7 @@ class SystemSettingsResponse(SystemSettingsRequest):
 class ExecutionBackendResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(pattern=r"^(systemd|docker)$")
+    id: str = Field(pattern=r"^(systemd|docker|ssh|modal|daytona|vercel)$")
     name: str
     adapter: str
     description: str
@@ -3081,6 +3084,21 @@ class HermesInsightResponse(BaseModel):
     noise_risk: float = Field(default=0.0, ge=0, le=1)
     applies_to_modes: list[str] = Field(default_factory=list, max_length=8)
     candidate_source: str = Field(default="manual_feedback", min_length=1, max_length=64)
+    candidate_type: str = Field(
+        default="memory",
+        pattern=r"^(memory|rule|skill|ui_rule|test_rule)$",
+    )
+    requires_approval: Literal[True] = True
+    activation_status: str = Field(
+        default="pending_approval",
+        pattern=r"^(pending_approval|active|approved_pending_skill_lifecycle|rejected)$",
+    )
+    auto_activate: Literal[False] = False
+    activation_pipeline: str = Field(
+        default="hermes_confirm_promote_memory",
+        min_length=1,
+        max_length=96,
+    )
     evidence_summary: str | None = Field(default=None, max_length=1000)
     source_artifact_count: int = Field(default=0, ge=0, le=10_000)
     source_artifact_types: list[str] = Field(default_factory=list, max_length=16)
@@ -3090,6 +3108,34 @@ class HermesInsightResponse(BaseModel):
         pattern=r"^(pending_review|approved|rejected|ledger_only)$",
     )
     created_at: datetime
+
+
+class HermesJourneyChangeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1)
+    action: str
+    actor: str
+    details: dict[str, str] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class HermesJourneyItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    insight: HermesInsightResponse
+    changes: list[HermesJourneyChangeResponse] = Field(default_factory=list)
+
+
+class HermesJourneyPageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[HermesJourneyItemResponse]
+    total: int = Field(ge=0)
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=100)
+    pages: int = Field(ge=0)
+    status_counts: dict[str, int]
 
 
 class HermesRecommendationRequest(BaseModel):
@@ -3624,6 +3670,8 @@ class AdminResourceService(Protocol):
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
     async def reject_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
+
+    async def rollback_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
     async def delete_hermes_insight(self, insight_id: str) -> None: ...
 
@@ -7895,14 +7943,20 @@ class InMemoryAdminResourceService:
         current = self.hermes_insights[insight_id]
         _ensure_hermes_promotable(current)
         confirmed_at = datetime.now(UTC)
-        promoted = _hermes_promoted_memory(current, scope="main_agent_rule")
-        self.memory[promoted.id] = promoted
+        promoted = (
+            _hermes_promoted_memory(current, scope="main_agent_rule")
+            if _hermes_candidate_promotes_memory(current)
+            else None
+        )
+        if promoted is not None:
+            self.memory[promoted.id] = promoted
         updated = current.model_copy(
             update={
                 "confirmed_at": confirmed_at,
                 "rejected_at": None,
                 "reviewed_by": "in_memory_actor",
-                "promoted_memory_id": promoted.id,
+                "promoted_memory_id": promoted.id if promoted is not None else None,
+                "activation_status": _hermes_activation_status_after_confirmation(current),
                 "promotion_status": _hermes_promotion_status(
                     target=current.target,
                     memory_type=current.memory_type,
@@ -7912,6 +7966,15 @@ class InMemoryAdminResourceService:
             }
         )
         self.hermes_insights[insight_id] = updated
+        await self.record_audit_event(
+            actor=str(getattr(self, "actor_id", "in_memory_actor")),
+            action="hermes.confirm",
+            resource=f"hermes:{insight_id}",
+            details={
+                "id": insight_id,
+                "promoted_memory_id": promoted.id if promoted is not None else None,
+            },
+        )
         return updated
 
     async def reject_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
@@ -7926,6 +7989,7 @@ class InMemoryAdminResourceService:
                 "rejected_at": rejected_at,
                 "reviewed_by": "in_memory_actor",
                 "promoted_memory_id": None,
+                "activation_status": "rejected",
                 "promotion_status": _hermes_promotion_status(
                     target=current.target,
                     memory_type=current.memory_type,
@@ -7935,6 +7999,37 @@ class InMemoryAdminResourceService:
             }
         )
         self.hermes_insights[insight_id] = updated
+        await self.record_audit_event(
+            actor=str(getattr(self, "actor_id", "in_memory_actor")),
+            action="hermes.reject",
+            resource=f"hermes:{insight_id}",
+            details={"id": insight_id},
+        )
+        return updated
+
+    async def rollback_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        current = self.hermes_insights[insight_id]
+        _ensure_hermes_rollbackable(current)
+        previous_status = current.promotion_status
+        if current.promoted_memory_id is not None:
+            self.memory.pop(current.promoted_memory_id, None)
+        updated = current.model_copy(
+            update={
+                "confirmed_at": None,
+                "rejected_at": None,
+                "reviewed_by": None,
+                "promoted_memory_id": None,
+                "activation_status": "pending_approval",
+                "promotion_status": "pending_review",
+            }
+        )
+        self.hermes_insights[insight_id] = updated
+        await self.record_audit_event(
+            actor=str(getattr(self, "actor_id", "in_memory_actor")),
+            action="hermes.rollback",
+            resource=f"hermes:{insight_id}",
+            details={"id": insight_id, "from_status": previous_status, "to_status": "pending_review"},
+        )
         return updated
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
@@ -7955,6 +8050,7 @@ class InMemoryAdminResourceService:
             raise ValueError("sensitive content")
         insight = HermesInsightResponse(
             id=f"hermes-{uuid4().hex}",
+            category=request.category,
             outcome=request.outcome,
             lesson=request.lesson,
             summary=_hermes_feedback_summary(
@@ -7976,6 +8072,12 @@ class InMemoryAdminResourceService:
             created_at=datetime.now(UTC),
         )
         self.hermes_insights[insight.id] = insight
+        await self.record_audit_event(
+            actor=str(getattr(self, "actor_id", "in_memory_actor")),
+            action="hermes.feedback",
+            resource=f"hermes:{insight.id}",
+            details={"id": insight.id},
+        )
         return insight
 
     async def recommend_with_hermes(
@@ -12220,36 +12322,45 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             _ensure_hermes_promotable(current)
             confirmed_at = datetime.now(UTC)
             owner_actor_id = _optional_string(payload.get("owner_actor_id")) or str(self._actor_id)
-            promoted = _hermes_promoted_memory(current, scope=f"user:{owner_actor_id}")
+            promoted = (
+                _hermes_promoted_memory(current, scope=f"user:{owner_actor_id}")
+                if _hermes_candidate_promotes_memory(current)
+                else None
+            )
             payload["confirmed_at"] = confirmed_at.isoformat()
             payload["rejected_at"] = None
             payload["reviewed_by"] = str(self._actor_id)
             payload["owner_actor_id"] = owner_actor_id
-            payload["promoted_memory_id"] = promoted.id
+            payload["promoted_memory_id"] = promoted.id if promoted is not None else None
+            payload["activation_status"] = _hermes_activation_status_after_confirmation(current)
             row.payload = payload
-            await session.execute(
-                insert(AdminResourceRow)
-                .values(
-                    id=uuid4(),
-                    tenant_id=self._tenant_id,
-                    kind="memory",
-                    resource_id=promoted.id,
-                    payload=promoted.model_dump(mode="json"),
+            if promoted is not None:
+                await session.execute(
+                    insert(AdminResourceRow)
+                    .values(
+                        id=uuid4(),
+                        tenant_id=self._tenant_id,
+                        kind="memory",
+                        resource_id=promoted.id,
+                        payload=promoted.model_dump(mode="json"),
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[
+                            AdminResourceRow.tenant_id,
+                            AdminResourceRow.kind,
+                            AdminResourceRow.resource_id,
+                        ],
+                        set_={"payload": promoted.model_dump(mode="json")},
+                    )
                 )
-                .on_conflict_do_update(
-                    index_elements=[
-                        AdminResourceRow.tenant_id,
-                        AdminResourceRow.kind,
-                        AdminResourceRow.resource_id,
-                    ],
-                    set_={"payload": promoted.model_dump(mode="json")},
-                )
-            )
             await self._record_audit_in_session(
                 session,
                 "hermes.confirm",
                 f"hermes:{insight_id}",
-                {"id": insight_id, "promoted_memory_id": promoted.id},
+                {
+                    "id": insight_id,
+                    "promoted_memory_id": promoted.id if promoted is not None else None,
+                },
             )
         return _hermes_response_from_payload(payload)
 
@@ -12273,6 +12384,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             payload["rejected_at"] = datetime.now(UTC).isoformat()
             payload["reviewed_by"] = str(self._actor_id)
             payload["promoted_memory_id"] = None
+            payload["activation_status"] = "rejected"
             row.payload = payload
             if promoted_memory_id is not None:
                 await session.execute(
@@ -12286,6 +12398,50 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "hermes.reject",
                 f"hermes:{insight_id}",
                 {"id": insight_id},
+            )
+        return _hermes_response_from_payload(payload)
+
+    async def rollback_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        if self._session_factory is None:
+            payload = await self._get_admin_payload("hermes", insight_id)
+            if payload == {}:
+                raise KeyError(insight_id)
+            return await super().rollback_hermes_insight(insight_id)
+        async with self._session_factory() as session, session.begin():
+            await self._lock_hermes_memory_relation(
+                session, _hermes_promoted_memory_id(insight_id)
+            )
+            row = await self._locked_hermes_row(session, insight_id)
+            payload = dict(row.payload)
+            if not _hermes_payload_is_owned_by(payload, self._actor_id):
+                raise KeyError(insight_id)
+            current = _hermes_response_from_payload(payload)
+            _ensure_hermes_rollbackable(current)
+            previous_status = current.promotion_status
+            promoted_memory_id = _optional_string(payload.get("promoted_memory_id"))
+            payload["confirmed_at"] = None
+            payload["rejected_at"] = None
+            payload["reviewed_by"] = None
+            payload["promoted_memory_id"] = None
+            payload["activation_status"] = "pending_approval"
+            payload["promotion_status"] = "pending_review"
+            row.payload = payload
+            if promoted_memory_id is not None:
+                await session.execute(
+                    delete(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == "memory")
+                    .where(AdminResourceRow.resource_id == promoted_memory_id)
+                )
+            await self._record_audit_in_session(
+                session,
+                "hermes.rollback",
+                f"hermes:{insight_id}",
+                {
+                    "id": insight_id,
+                    "from_status": previous_status,
+                    "to_status": "pending_review",
+                },
             )
         return _hermes_response_from_payload(payload)
 
@@ -14845,6 +15001,7 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         limit=128,
     )
     applies_to_modes = _bounded_hermes_string_list(payload.get("applies_to_modes"), limit=8)
+    candidate_type = _hermes_candidate_type(payload.get("candidate_type"), memory_type=memory_type)
     return HermesInsightResponse(
         id=str(payload.get("id", "")),
         category=category,
@@ -14875,6 +15032,23 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         applies_to_modes=applies_to_modes,
         candidate_source=_bounded_hermes_string(
             payload.get("candidate_source"), default="runtime_observation" if run_id else "manual_feedback", limit=64
+        ),
+        candidate_type=candidate_type,
+        requires_approval=True,
+        activation_status=_hermes_activation_status(
+            candidate_type=candidate_type,
+            confirmed_at=confirmed_at,
+            rejected_at=rejected_at,
+        ),
+        auto_activate=False,
+        activation_pipeline=_bounded_hermes_string(
+            payload.get("activation_pipeline"),
+            default=(
+                "skill_quarantine_scan_approve_activate"
+                if candidate_type == "skill"
+                else "hermes_confirm_promote_memory"
+            ),
+            limit=96,
         ),
         evidence_summary=_optional_string(payload.get("evidence_summary")),
         source_artifact_count=_bounded_nonnegative_int(
@@ -15020,6 +15194,7 @@ def _hermes_insight_is_recommendable(insight: HermesInsightResponse) -> bool:
             "user_preference",
             "project_fact",
             "ui_rule",
+            "test_rule",
             "error_handling",
             "scheduling_rule",
         }
@@ -15038,6 +15213,106 @@ def _hermes_payload_is_owned_by(payload: dict[str, object], actor_id: UUID) -> b
 def _ensure_hermes_promotable(insight: HermesInsightResponse) -> None:
     if insight.promotion_status != "pending_review":
         raise ValueError("only pending Hermes candidates can be reviewed")
+
+
+def _hermes_candidate_type(value: object, *, memory_type: str) -> str:
+    if value in {"memory", "rule", "skill", "ui_rule", "test_rule"}:
+        return str(value)
+    if memory_type == "skill_candidate":
+        return "skill"
+    if memory_type == "ui_rule":
+        return "ui_rule"
+    if memory_type == "test_rule":
+        return "test_rule"
+    if memory_type in {"user_preference", "project_fact", "conversation_advice"}:
+        return "memory"
+    return "rule"
+
+
+def _hermes_activation_status(
+    *,
+    candidate_type: str,
+    confirmed_at: datetime | None,
+    rejected_at: datetime | None,
+) -> str:
+    if rejected_at is not None:
+        return "rejected"
+    if confirmed_at is None:
+        return "pending_approval"
+    return "approved_pending_skill_lifecycle" if candidate_type == "skill" else "active"
+
+
+def _hermes_candidate_promotes_memory(insight: HermesInsightResponse) -> bool:
+    return insight.candidate_type != "skill"
+
+
+def _hermes_activation_status_after_confirmation(insight: HermesInsightResponse) -> str:
+    return "approved_pending_skill_lifecycle" if insight.candidate_type == "skill" else "active"
+
+
+def _ensure_hermes_rollbackable(insight: HermesInsightResponse) -> None:
+    if insight.promotion_status not in {"approved", "rejected"}:
+        raise ValueError("Hermes candidate does not have a review decision to roll back")
+
+
+def _hermes_change_history(
+    insight: HermesInsightResponse,
+    audit_events: Iterable[AuditEventResponse],
+) -> list[HermesJourneyChangeResponse]:
+    resource = f"hermes:{insight.id}"
+    changes = [
+        HermesJourneyChangeResponse(
+            version=1,
+            action="hermes.created",
+            actor="system",
+            details={
+                "candidate_source": insight.candidate_source,
+                "promotion_status": (
+                    "ledger_only" if insight.promotion_status == "ledger_only" else "pending_review"
+                ),
+            },
+            created_at=insight.created_at,
+        )
+    ]
+    relevant = sorted(
+        (
+            event
+            for event in audit_events
+            if event.resource == resource and event.action.startswith("hermes.")
+        ),
+        key=lambda event: event.created_at,
+    )
+    changes.extend(
+        HermesJourneyChangeResponse(
+            version=index,
+            action=event.action,
+            actor=event.actor,
+            details=event.details,
+            created_at=event.created_at,
+        )
+        for index, event in enumerate(relevant, start=2)
+    )
+    return changes
+
+
+def _hermes_matches_journey_query(insight: HermesInsightResponse, query: str) -> bool:
+    normalized = query.strip().casefold()
+    if not normalized:
+        return True
+    values = (
+        insight.id,
+        insight.category,
+        insight.outcome,
+        insight.lesson,
+        insight.summary,
+        insight.user_summary or "",
+        insight.conversation_id or "",
+        str(insight.run_id or ""),
+        insight.memory_type,
+        insight.candidate_source,
+        *insight.tags,
+    )
+    return any(normalized in value.casefold() for value in values)
 
 
 def _hermes_feedback_summary(
@@ -19350,6 +19625,66 @@ async def list_hermes_insights(
     return list(await service.list_hermes_insights())
 
 
+@router.get(
+    "/hermes/journey",
+    response_model=HermesJourneyPageResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def list_hermes_journey(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 10,
+    category: Annotated[Literal["conversation", "scheduler"] | None, Query()] = None,
+    status: Annotated[
+        Literal["pending_review", "approved", "rejected", "ledger_only"] | None,
+        Query(),
+    ] = None,
+    source: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+    q: Annotated[str, Query(max_length=200)] = "",
+) -> HermesJourneyPageResponse:
+    _require(principal, "hermes:read")
+    insights = list(await service.list_hermes_insights())
+    base_items = [
+        insight
+        for insight in insights
+        if (category is None or insight.category == category)
+        and (source is None or insight.candidate_source == source)
+        and _hermes_matches_journey_query(insight, q)
+    ]
+    status_counts = {
+        candidate_status: sum(
+            insight.promotion_status == candidate_status for insight in base_items
+        )
+        for candidate_status in ("pending_review", "approved", "rejected", "ledger_only")
+    }
+    filtered = [
+        insight
+        for insight in base_items
+        if status is None or insight.promotion_status == status
+    ]
+    filtered.sort(key=lambda insight: (insight.created_at, insight.id), reverse=True)
+    total = len(filtered)
+    pages = (total + page_size - 1) // page_size
+    start = (page - 1) * page_size
+    page_items = filtered[start : start + page_size]
+    audit_events = await service.list_audit_events()
+    return HermesJourneyPageResponse(
+        items=[
+            HermesJourneyItemResponse(
+                insight=insight,
+                changes=_hermes_change_history(insight, audit_events),
+            )
+            for insight in page_items
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+        pages=pages,
+        status_counts=status_counts,
+    )
+
+
 @router.post(
     "/hermes/feedback",
     response_model=HermesInsightResponse,
@@ -19450,6 +19785,26 @@ async def bulk_delete_hermes_insights(
 
 
 @router.get(
+    "/hermes/{insight_id}/history",
+    response_model=list[HermesJourneyChangeResponse],
+    responses=error_responses(401, 403, 404, 422),
+)
+async def get_hermes_insight_history(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[HermesJourneyChangeResponse]:
+    _require(principal, "hermes:read")
+    try:
+        insight = await service.get_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
+    return _hermes_change_history(insight, await service.list_audit_events())
+
+
+@router.get(
     "/hermes/{insight_id}",
     response_model=HermesInsightResponse,
     responses=error_responses(401, 403, 404, 422),
@@ -19511,6 +19866,31 @@ async def reject_hermes_insight(
     except ValueError:
         raise PublicAPIError(
             422, "hermes_not_promotable", "Hermes ledger records cannot be rejected"
+        ) from None
+
+
+@router.post(
+    "/hermes/{insight_id}/rollback",
+    response_model=HermesInsightResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def rollback_hermes_insight(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesInsightResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.rollback_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
+    except ValueError:
+        raise PublicAPIError(
+            422,
+            "hermes_not_rollbackable",
+            "Only approved or rejected Hermes candidates can be returned to review",
         ) from None
 
 

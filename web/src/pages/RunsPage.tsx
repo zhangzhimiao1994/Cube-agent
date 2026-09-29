@@ -31,7 +31,7 @@ const SANDBOX_OPTIONS = [
   { value: "workspace_write", label: "项目写入", summary: "允许在项目工作区读写和执行命令" },
 ] as const;
 type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
-type ExecutionBackendId = "systemd" | "docker";
+type ExecutionBackendId = "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
 export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
   if (profile === "none") return [];
   if (profile === "read_only") return ["workspace.read"];
@@ -430,7 +430,7 @@ type ConversationCheckpoint = {
 export type SlashCommand = {
   aliases: string[];
   description: string;
-  id: "new" | "mode" | "memory" | "skills" | "usage";
+  id: "new" | "retry" | "undo" | "compress" | "mode" | "memory" | "skills" | "usage";
   label: string;
 };
 type EventGroupItem = {
@@ -444,6 +444,24 @@ const SLASH_COMMANDS: SlashCommand[] = [
     label: "/new 新建对话",
     description: "清空当前输入并开启一个新的连续对话。",
     aliases: ["new", "新建", "新对话"],
+  },
+  {
+    id: "retry",
+    label: "/retry 重试上一轮",
+    description: "使用上一轮用户问题创建一次新的运行，保留原运行作为历史证据。",
+    aliases: ["retry", "重试", "再试一次"],
+  },
+  {
+    id: "undo",
+    label: "/undo 撤销上一轮",
+    description: "确认后删除最近一轮，并把原问题恢复到输入框。",
+    aliases: ["undo", "撤销", "回退"],
+  },
+  {
+    id: "compress",
+    label: "/compress 压缩上下文",
+    description: "把最近对话整理成有界摘要草稿，并在同一项目中新建会话。",
+    aliases: ["compress", "压缩", "摘要"],
   },
   {
     id: "memory",
@@ -465,11 +483,45 @@ const SLASH_COMMANDS: SlashCommand[] = [
   },
   {
     id: "usage",
-    label: "/usage 日志",
-    description: "打开日志中心，排查模型调用、失败和运行记录。",
+    label: "/usage 会话用量",
+    description: "查看当前会话运行数、实际费用与明确标注的上下文估算。",
     aliases: ["usage", "logs", "log", "用量", "日志"],
   },
 ];
+
+export function conversationUsageSummary(runs: RunDetail[]) {
+  const requestCharacters = runs.reduce((total, run) => total + run.request.length, 0);
+  const cost = runs.reduce((total, run) => {
+    const value = Number.parseFloat(run.cost_usd);
+    return total + (Number.isFinite(value) ? value : 0);
+  }, 0);
+  return {
+    runCount: runs.length,
+    completedCount: runs.filter((run) => run.status === "completed").length,
+    failedCount: runs.filter((run) => run.status === "failed").length,
+    costUsd: cost.toFixed(6),
+    requestCharacters,
+    estimatedContextTokens: Math.ceil(requestCharacters / 3),
+  };
+}
+
+export function compactConversationDraft(runs: RunDetail[]) {
+  const recentRuns = runs.filter((run) => run.request.trim()).slice(-12);
+  const header = "压缩上下文：以下是上一会话最近几轮的有界摘要。请以此作为背景继续，不要假设未列出的历史细节。\n\n";
+  const suffix = "\n\n继续目标：";
+  const maxBodyLength = 5_000 - header.length - suffix.length;
+  const selected: string[] = [];
+  let used = 0;
+  for (const run of [...recentRuns].reverse()) {
+    const request = run.request.trim().slice(0, 700);
+    const line = `[${displayMode(run.mode)} / ${displayChatRunStatus(run.status)}] ${request}`;
+    if (selected.length > 0 && used + line.length + 1 > maxBodyLength) continue;
+    selected.push(line);
+    used += line.length + 1;
+  }
+  const numbered = selected.reverse().map((line, index) => `${index + 1}. ${line}`);
+  return `${header}${numbered.join("\n")}${suffix}`;
+}
 
 export function slashCommandsForQuery(value: string): SlashCommand[] {
   const trimmed = value.trim();
@@ -6511,6 +6563,7 @@ export function RunsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const [usageOpen, setUsageOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const configDialogRef = useRef<HTMLElement>(null);
   const configTriggerRef = useRef<HTMLButtonElement>(null);
@@ -7325,6 +7378,44 @@ export function RunsPage() {
     },
   });
 
+  const compressConversation = useMutation({
+    mutationFn: ({
+      conversationId: nextConversationId,
+      title,
+      project,
+    }: {
+      conversationId: string;
+      title: string;
+      project: ConversationProjectOption;
+      summaryDraft: string;
+    }) =>
+      api.createConversation({
+        conversation_id: nextConversationId,
+        title,
+        project_id: project.id,
+        project_label: project.label,
+        workspace_path: project.workspacePath,
+      }),
+    onSuccess: (created, variables) => {
+      queryClient.setQueryData<Conversation>(["conversation", created.conversation_id], {
+        ...created,
+        runs: [],
+      });
+      setConversationRunCache((current) => ({ ...current, [created.conversation_id]: [] }));
+      setConversationId(created.conversation_id);
+      setProjectId(created.project_id?.trim() || variables.project.id);
+      setProjectLabel(created.project_label?.trim() || variables.project.label);
+      setSelectedRunId(null);
+      clearConversationTransientState();
+      setMessage(variables.summaryDraft);
+      setHistoryOpen(false);
+      setUsageOpen(false);
+      setSubmitNotice("已创建压缩会话，并把有界上下文摘要放入输入框；检查后发送即可继续。");
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      if (linkedConversationId) navigate("/", { replace: true });
+    },
+  });
+
   const updateConversation = useMutation({
     mutationFn: ({
       conversationId: targetConversationId,
@@ -7607,6 +7698,27 @@ export function RunsPage() {
       queryClient.removeQueries({ queryKey: ["run", result.id] });
       setSubmitNotice("已删除对话。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
+
+  const undoLatestRun = useMutation({
+    mutationFn: ({ runId }: { runId: string; request: string }) => api.deleteRun(runId),
+    onSuccess: async (result, variables) => {
+      if (selectedRunId === result.id) setSelectedRunId(null);
+      setConversationRunCache((current) =>
+        Object.fromEntries(
+          Object.entries(current).map(([conversationKey, runs]) => [
+            conversationKey,
+            runs.filter((run) => run.id !== result.id),
+          ]),
+        ),
+      );
+      queryClient.removeQueries({ queryKey: ["run", result.id] });
+      setMessage(variables.request);
+      setUsageOpen(false);
+      setSubmitNotice("已撤销最近一轮，原问题已恢复到输入框。相关产物也已随该轮删除。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["conversation", activeConversationId] });
     },
   });
 
@@ -7987,28 +8099,85 @@ export function RunsPage() {
   }
 
   function executeSlashCommand(commandId: SlashCommand["id"]) {
+    const latestTerminalRun = [...visibleRuns]
+      .reverse()
+      .find((run) => TERMINAL_STATUSES.has(run.status) && run.request.trim());
     if (commandId === "new") {
+      setUsageOpen(false);
       startNewConversation();
       return;
     }
+    if (commandId === "retry") {
+      setUsageOpen(false);
+      if (!latestTerminalRun) {
+        setMessage("");
+        setSubmitNotice("当前会话还没有可重试的已完成轮次。");
+        return;
+      }
+      setMessage("");
+      createRun.mutate({
+        message: latestTerminalRun.request,
+        mode: "auto",
+        successNotice: "已按上一轮问题创建新的重试运行；原运行仍保留在历史中。",
+      });
+      return;
+    }
+    if (commandId === "undo") {
+      setUsageOpen(false);
+      setMessage("");
+      if (!latestTerminalRun) {
+        setSubmitNotice("当前会话还没有可撤销的已完成轮次。");
+        return;
+      }
+      if (!window.confirm("撤销会删除最近一轮及其关联产物，并把原问题恢复到输入框。确认继续吗？")) {
+        setSubmitNotice("已取消撤销。");
+        return;
+      }
+      undoLatestRun.mutate({ runId: latestTerminalRun.id, request: latestTerminalRun.request });
+      return;
+    }
+    if (commandId === "compress") {
+      setMessage("");
+      setUsageOpen(false);
+      const selectedProject =
+        conversationProjects.find((item) => item.id === projectId.trim()) ?? conversationProjects[0];
+      if (!selectedProject || visibleRuns.length === 0) {
+        setSubmitNotice("当前没有可压缩的项目会话。");
+        return;
+      }
+      const nextConversationId = newConversationId();
+      const currentTitle =
+        activeConversation.data?.title?.trim() || listedConversationMetadata?.title?.trim() || "会话";
+      compressConversation.mutate({
+        conversationId: nextConversationId,
+        title: `${currentTitle}（压缩）`,
+        project: selectedProject,
+        summaryDraft: compactConversationDraft(visibleRuns),
+      });
+      return;
+    }
     if (commandId === "mode") {
+      setUsageOpen(false);
       setConfigOpen(true);
       setMessage("");
       setSubmitNotice("已打开本轮运行设置，可调整参考方案、执行环境和沙箱权限。");
       return;
     }
     if (commandId === "memory") {
+      setUsageOpen(false);
       setMessage("");
       navigate("/memory");
       return;
     }
     if (commandId === "skills") {
+      setUsageOpen(false);
       setMessage("");
       navigate("/skills");
       return;
     }
     setMessage("");
-    navigate("/logs");
+    setUsageOpen(true);
+    setSubmitNotice("已显示当前会话用量；上下文 Token 为估算值，费用来自服务端记录。");
   }
 
   function loadReferenceConversation() {
@@ -8161,6 +8330,7 @@ export function RunsPage() {
     shouldMergeSelectedRun
       ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
       : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
+  const usageSummary = conversationUsageSummary(visibleRuns);
   const messages = conversationMessages(visibleRuns);
   const checkpoints = conversationCheckpoints(messages);
   const workspaceFiles = mergeWorkspaceFileList(
@@ -9253,6 +9423,26 @@ export function RunsPage() {
                     {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
                   </button>
                 ) : null}
+              </aside>
+            ) : null}
+            {usageOpen ? (
+              <aside className="composer-attachment-card" role="status" aria-label="当前会话用量">
+                <div>
+                  <span className="eyebrow">SESSION USAGE</span>
+                  <strong>当前会话用量</strong>
+                  <small>费用为服务端实际记录，上下文 Token 为字符数估算。</small>
+                </div>
+                <dl className="detail-grid">
+                  <div><dt>运行</dt><dd>{usageSummary.runCount}</dd></div>
+                  <div><dt>完成</dt><dd>{usageSummary.completedCount}</dd></div>
+                  <div><dt>失败</dt><dd>{usageSummary.failedCount}</dd></div>
+                  <div><dt>实际费用</dt><dd>${usageSummary.costUsd}</dd></div>
+                  <div><dt>问题字符</dt><dd>{usageSummary.requestCharacters.toLocaleString()}</dd></div>
+                  <div><dt>上下文估算</dt><dd>约 {usageSummary.estimatedContextTokens.toLocaleString()} tokens</dd></div>
+                </dl>
+                <button type="button" className="secondary-action" onClick={() => setUsageOpen(false)}>
+                  关闭用量
+                </button>
               </aside>
             ) : null}
             {slashCommandSuggestions.length > 0 ? (

@@ -11,6 +11,8 @@ import {
   ConversationManagerTabs,
   conversationManagerMetadata,
   conversationManagerSearchState,
+  conversationUsageSummary,
+  compactConversationDraft,
   currentConversationRuns,
   conversationIdFromSearch,
   conversationQuestionSearchHref,
@@ -1222,9 +1224,41 @@ describe("WorkbenchFilePreview", () => {
 
 describe("slashCommandsForQuery", () => {
   it("suggests command palette entries by slash prefix and Chinese aliases", () => {
-    expect(slashCommandsForQuery("/m").map((command) => command.id)).toEqual(["memory", "mode"]);
+    expect(slashCommandsForQuery("/m").map((command) => command.id)).toEqual(["compress", "memory", "mode"]);
     expect(slashCommandsForQuery("/记忆").map((command) => command.id)).toEqual(["memory"]);
+    expect(slashCommandsForQuery("/重试").map((command) => command.id)).toEqual(["retry"]);
+    expect(slashCommandsForQuery("/撤销").map((command) => command.id)).toEqual(["undo"]);
+    expect(slashCommandsForQuery("/压缩").map((command) => command.id)).toEqual(["compress"]);
     expect(slashCommandsForQuery("普通消息")).toEqual([]);
+  });
+
+  it("summarizes real conversation usage without presenting estimates as reported tokens", () => {
+    const summary = conversationUsageSummary([
+      { ...baseRun, request: "first request", cost_usd: "0.12", status: "completed" },
+      { ...baseRun, id: "33333333-3333-4333-8333-333333333333", request: "第二个问题", cost_usd: "0.08", status: "failed" },
+    ]);
+
+    expect(summary.runCount).toBe(2);
+    expect(summary.completedCount).toBe(1);
+    expect(summary.failedCount).toBe(1);
+    expect(summary.costUsd).toBe("0.200000");
+    expect(summary.estimatedContextTokens).toBeGreaterThan(0);
+  });
+
+  it("builds a bounded compression draft from recent turns", () => {
+    const runs = Array.from({ length: 20 }, (_, index) => ({
+      ...baseRun,
+      id: `${String(index).padStart(8, "0")}-2222-4222-8222-222222222222`,
+      request: `question-${index} ${"x".repeat(600)}`,
+      status: "completed",
+    }));
+
+    const draft = compactConversationDraft(runs);
+
+    expect(draft).toContain("压缩上下文");
+    expect(draft).toContain("question-19");
+    expect(draft).not.toContain("question-0 ");
+    expect(draft.length).toBeLessThanOrEqual(5_000);
   });
 });
 

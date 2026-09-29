@@ -52,6 +52,7 @@ from agent_hub.skills.sandbox.base import (
     SkillSandbox,
 )
 from agent_hub.skills.sandbox.docker import DockerSkillSandbox
+from agent_hub.skills.sandbox.remote import configured_remote_skill_sandboxes
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
@@ -169,6 +170,7 @@ class RuntimeCapabilityGateway:
             self._skill_sandboxes = {
                 "systemd": SystemdSkillSandbox(),
                 "docker": DockerSkillSandbox(),
+                **configured_remote_skill_sandboxes(),
             }
         self._calculator = calculator or Calculator()
         self._http_reader = http_reader or HttpReader.production()

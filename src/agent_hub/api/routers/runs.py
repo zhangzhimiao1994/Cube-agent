@@ -271,7 +271,7 @@ class CreateRunRequest(BaseModel):
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
     sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
-    execution_backend: Literal["systemd", "docker"] | None = None
+    execution_backend: Literal["systemd", "docker", "ssh", "modal", "daytona", "vercel"] | None = None
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     runtime_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
 

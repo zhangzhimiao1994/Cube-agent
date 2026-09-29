@@ -28,6 +28,12 @@ def test_probe_reports_systemd_and_docker_as_real_runtime_capabilities(
     assert statuses["systemd"].adapter == "SystemdSkillSandbox"
     assert statuses["docker"].available is True
     assert statuses["docker"].adapter == "DockerSkillSandbox"
+    assert statuses["ssh"].adapter == "SshSkillSandbox"
+    assert statuses["modal"].adapter == "HttpRemoteSkillSandbox"
+    assert statuses["daytona"].adapter == "HttpRemoteSkillSandbox"
+    assert statuses["vercel"].adapter == "HttpRemoteSkillSandbox"
+    assert statuses["ssh"].available is False
+    assert statuses["modal"].available is False
 
 
 def test_probe_explains_missing_docker_broker_instead_of_advertising_placeholder(

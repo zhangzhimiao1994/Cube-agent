@@ -10,6 +10,7 @@ This directory separates current operator and product guidance from historical d
 - [Troubleshooting](troubleshooting.md): first-response diagnostics for installation and runtime failures.
 - [Model pools](model-pools.md): provider capacity, quota scopes, queueing, and fallback.
 - [Skills and MCP](skills-and-mcp.md): capability discovery, approval, immutable environments, Team Skill Tap, MCP, and execution backends.
+- [Remote Skill execution](remote-skill-execution.md): SSH and HTTPS cloud sandbox protocol, configuration, and safety checks.
 - [Hermes learning and memory](hermes.md): layered memory, learning candidates, review, provenance, search, and journey views.
 - [Workspace file-read policy](workspace-file-read-policy.md): project workspace boundaries and file-access rules.
 - [Role planning and decisions](role-planning-and-decisions.md): how the main Agent chooses modes, roles, and execution posture.

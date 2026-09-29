@@ -418,6 +418,105 @@ async def test_completed_run_with_reviewable_artifacts_writes_rule_candidate() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact_type", "content", "candidate_type", "memory_type", "target", "pipeline"),
+    (
+        ("memory", {}, "memory", "project_fact", "main_agent", "hermes_confirm_promote_memory"),
+        ("tool_result", {}, "rule", "scheduling_rule", "main_agent", "hermes_confirm_promote_memory"),
+        ("skill_package", {}, "skill", "skill_candidate", "skill_registry", "skill_quarantine_scan_approve_activate"),
+        ("ui_rule", {}, "ui_rule", "ui_rule", "main_agent", "hermes_confirm_promote_memory"),
+        ("test_rule", {}, "test_rule", "test_rule", "main_agent", "hermes_confirm_promote_memory"),
+    ),
+)
+async def test_artifact_review_candidate_types_are_structured_and_approval_gated(
+    artifact_type: str,
+    content: dict[str, object],
+    candidate_type: str,
+    memory_type: str,
+    target: str,
+    pipeline: str,
+) -> None:
+    advisor = CapturingHermesAdvisor()
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=uuid4(),
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.HYBRID,
+            workflow_id="project-delivery",
+            conversation_id="conv-structured-candidate",
+            agent_ids=("implementer",),
+            artifacts=(
+                {
+                    "id": str(uuid4()),
+                    "type": artifact_type,
+                    "producer": "project_generator",
+                    "content": content,
+                },
+            ),
+        )
+    )
+
+    candidate = advisor.payloads[2][1]
+    assert candidate["candidate_type"] == candidate_type
+    assert candidate["memory_type"] == memory_type
+    assert candidate["target"] == target
+    assert candidate["requires_approval"] is True
+    assert candidate["activation_status"] == "pending_approval"
+    assert candidate["auto_activate"] is False
+    assert candidate["activation_pipeline"] == pipeline
+    assert candidate["confirmed_at"] is None
+    assert candidate["reviewed_by"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_structured_candidate_is_not_injected_before_approval() -> None:
+    actor_id = uuid4()
+    pending_candidate = {
+        "id": "hermes_candidate_pending_test_rule",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Always run the focused regression test before release.",
+        "summary": "Pending test rule candidate.",
+        "tags": ["regression", "release"],
+        "weight": 9,
+        "memory_type": "test_rule",
+        "candidate_type": "test_rule",
+        "target": "main_agent",
+        "confidence": 0.9,
+        "noise_risk": 0.1,
+        "requires_approval": True,
+        "activation_status": "pending_approval",
+        "auto_activate": False,
+        "confirmed_at": None,
+        "rejected_at": None,
+        "owner_actor_id": str(actor_id),
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(pending_candidate)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="prepare the regression release",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id="project-delivery",
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
 async def test_failed_run_with_scheduler_notice_writes_recovery_candidate() -> None:
     advisor = CapturingHermesAdvisor()
     run_id = uuid4()

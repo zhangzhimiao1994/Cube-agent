@@ -325,10 +325,19 @@ def test_execution_backends_endpoint_reports_only_real_implemented_adapters() ->
 
     assert response.status_code == 200
     payload = response.json()
-    assert {item["id"] for item in payload} == {"systemd", "docker"}
+    assert {item["id"] for item in payload} == {
+        "systemd",
+        "docker",
+        "ssh",
+        "modal",
+        "daytona",
+        "vercel",
+    }
     assert {item["adapter"] for item in payload} == {
         "SystemdSkillSandbox",
         "DockerSkillSandbox",
+        "SshSkillSandbox",
+        "HttpRemoteSkillSandbox",
     }
     assert all(isinstance(item["available"], bool) for item in payload)
 
@@ -17732,6 +17741,119 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
 
 
+def test_hermes_journey_is_paginated_filterable_and_tracks_changes() -> None:
+    api = client()
+    created = []
+    for index, (category, outcome, source) in enumerate(
+        (
+            ("conversation", "success", "manual_feedback"),
+            ("scheduler", "failure", "manual_feedback"),
+            ("conversation", "neutral", "manual_feedback"),
+        ),
+        start=1,
+    ):
+        response = api.post(
+            "/api/v1/admin/hermes/feedback",
+            headers=headers(),
+            json={
+                "category": category,
+                "outcome": outcome,
+                "lesson": f"Journey lesson {index}",
+                "conversation_id": f"conv-journey-{index}",
+                "tags": [source, f"item-{index}"],
+                "weight": index,
+            },
+        )
+        assert response.status_code == 200
+        created.append(response.json())
+
+    approved = api.post(f"/api/v1/admin/hermes/{created[2]['id']}/confirm", headers=headers())
+    assert approved.status_code == 200
+
+    first_page = api.get(
+        "/api/v1/admin/hermes/journey?page=1&page_size=2&q=Journey",
+        headers=headers(),
+    )
+    second_page = api.get(
+        "/api/v1/admin/hermes/journey?page=2&page_size=2&q=Journey",
+        headers=headers(),
+    )
+    filtered = api.get(
+        "/api/v1/admin/hermes/journey?page=1&page_size=10&category=scheduler&status=pending_review",
+        headers=headers(),
+    )
+    history = api.get(f"/api/v1/admin/hermes/{created[2]['id']}/history", headers=headers())
+
+    assert first_page.status_code == 200
+    assert first_page.json()["total"] == 3
+    assert first_page.json()["pages"] == 2
+    assert len(first_page.json()["items"]) == 2
+    assert second_page.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+    paged_insights = [
+        item["insight"]
+        for page_payload in (first_page.json(), second_page.json())
+        for item in page_payload["items"]
+    ]
+    assert {insight["id"] for insight in paged_insights} == {
+        insight["id"] for insight in created
+    }
+    assert [
+        (insight["created_at"], insight["id"]) for insight in paged_insights
+    ] == sorted(
+        ((insight["created_at"], insight["id"]) for insight in paged_insights),
+        reverse=True,
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] == 1
+    assert filtered.json()["items"][0]["insight"]["category"] == "scheduler"
+    assert first_page.json()["status_counts"] == {
+        "pending_review": 2,
+        "approved": 1,
+        "rejected": 0,
+        "ledger_only": 0,
+    }
+    assert history.status_code == 200
+    assert [change["action"] for change in history.json()] == [
+        "hermes.created",
+        "hermes.feedback",
+        "hermes.confirm",
+    ]
+    assert [change["version"] for change in history.json()] == [1, 2, 3]
+
+
+def test_hermes_rollback_reopens_review_and_revokes_promoted_memory() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Rollback must revoke the promoted memory.",
+            "tags": ["rollback"],
+        },
+    ).json()
+    approved = api.post(f"/api/v1/admin/hermes/{created['id']}/confirm", headers=headers()).json()
+
+    rolled_back = api.post(f"/api/v1/admin/hermes/{created['id']}/rollback", headers=headers())
+    memories = api.get("/api/v1/admin/memory", headers=headers()).json()
+    history = api.get(f"/api/v1/admin/hermes/{created['id']}/history", headers=headers()).json()
+
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["promotion_status"] == "pending_review"
+    assert rolled_back.json()["confirmed_at"] is None
+    assert rolled_back.json()["rejected_at"] is None
+    assert rolled_back.json()["reviewed_by"] is None
+    assert rolled_back.json()["promoted_memory_id"] is None
+    assert all(memory["id"] != approved["promoted_memory_id"] for memory in memories)
+    assert history[-1]["action"] == "hermes.rollback"
+    assert history[-1]["details"]["from_status"] == "approved"
+
+    second_rollback = api.post(f"/api/v1/admin/hermes/{created['id']}/rollback", headers=headers())
+    assert second_rollback.status_code == 422
+    assert second_rollback.json()["error"]["code"] == "hermes_not_rollbackable"
+
+
 def test_hermes_reject_preserves_candidate_but_excludes_it_from_recommendations() -> None:
     api = client()
     created = api.post(
@@ -17815,6 +17937,81 @@ def test_legacy_ledger_only_status_remains_non_promotable() -> None:
     )
 
     assert parsed.promotion_status == "ledger_only"
+
+
+def test_hermes_payload_exposes_structured_candidate_approval_contract() -> None:
+    parsed = admin_router._hermes_response_from_payload(
+        {
+            "id": "hermes-skill-candidate",
+            "outcome": "success",
+            "lesson": "Package the verified workflow as a skill candidate.",
+            "candidate_type": "skill",
+            "memory_type": "skill_candidate",
+            "target": "skill_registry",
+            "requires_approval": True,
+            "activation_status": "pending_approval",
+            "auto_activate": False,
+            "activation_pipeline": "skill_quarantine_scan_approve_activate",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+    assert parsed.candidate_type == "skill"
+    assert parsed.requires_approval is True
+    assert parsed.activation_status == "pending_approval"
+    assert parsed.auto_activate is False
+    assert parsed.activation_pipeline == "skill_quarantine_scan_approve_activate"
+
+
+def test_hermes_payload_cannot_disable_approval_or_enable_auto_activation() -> None:
+    parsed = admin_router._hermes_response_from_payload(
+        {
+            "id": "hermes-untrusted-candidate-contract",
+            "outcome": "success",
+            "lesson": "Treat candidate payload policy fields as untrusted.",
+            "candidate_type": "rule",
+            "requires_approval": False,
+            "auto_activate": True,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+    assert parsed.requires_approval is True
+    assert parsed.auto_activate is False
+
+
+def test_confirming_skill_candidate_does_not_promote_memory_or_activate_skill() -> None:
+    api = client()
+    service = cast(
+        admin_router.InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    insight_id = "hermes-skill-candidate"
+    service.hermes_insights[insight_id] = admin_router.HermesInsightResponse(
+        id=insight_id,
+        category="conversation",
+        outcome="success",
+        lesson="Package the verified workflow as a skill candidate.",
+        summary="Skill candidate awaiting review.",
+        tags=["skill"],
+        weight=8,
+        memory_type="skill_candidate",
+        candidate_type="skill",
+        target="skill_registry",
+        requires_approval=True,
+        activation_status="pending_approval",
+        auto_activate=False,
+        activation_pipeline="skill_quarantine_scan_approve_activate",
+        created_at=datetime.now(UTC),
+    )
+
+    response = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json()["promotion_status"] == "approved"
+    assert response.json()["activation_status"] == "approved_pending_skill_lifecycle"
+    assert response.json()["promoted_memory_id"] is None
+    assert f"hermes-rule-{insight_id}" not in service.memory
 
 
 def test_hermes_review_state_is_terminal_without_explicit_reopen() -> None:
@@ -18149,6 +18346,8 @@ async def test_persistent_hermes_missing_payload_does_not_fallback_to_in_memory_
     with pytest.raises(KeyError):
         await service.confirm_hermes_insight("hermes-1")
     with pytest.raises(KeyError):
+        await service.rollback_hermes_insight("hermes-1")
+    with pytest.raises(KeyError):
         await service.delete_hermes_insight("hermes-1")
 
 
@@ -18219,6 +18418,73 @@ async def test_persistent_hermes_confirmation_locks_candidate_and_uses_candidate
     assert row.payload["reviewed_by"] == str(owner_actor_id)
     assert row.payload["owner_actor_id"] == str(owner_actor_id)
     assert row.payload["promoted_memory_id"] == "hermes-rule-hermes-owned"
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_rollback_locks_candidate_and_revokes_memory() -> None:
+    owner_actor_id = uuid4()
+    row = AdminResourceRow(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        kind="hermes",
+        resource_id="hermes-approved",
+        payload={
+            "id": "hermes-approved",
+            "outcome": "success",
+            "lesson": "Approved guidance.",
+            "tags": ["review"],
+            "weight": 8,
+            "owner_actor_id": str(owner_actor_id),
+            "confirmed_at": datetime.now(UTC).isoformat(),
+            "reviewed_by": str(owner_actor_id),
+            "promoted_memory_id": "hermes-rule-hermes-approved",
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    class ScalarResult:
+        def scalar_one_or_none(self) -> AdminResourceRow:
+            return row
+
+    class CapturingSession:
+        def __init__(self) -> None:
+            self.statements: list[object] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        def begin(self) -> Self:
+            return self
+
+        async def execute(
+            self, statement: object, parameters: object | None = None
+        ) -> ScalarResult:
+            del parameters
+            self.statements.append(statement)
+            return ScalarResult()
+
+    session = CapturingSession()
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=owner_actor_id,
+        session_factory=cast(Any, lambda: session),
+    )
+
+    result = await service.rollback_hermes_insight("hermes-approved")
+
+    assert result.promotion_status == "pending_review"
+    assert result.promoted_memory_id is None
+    assert row.payload["confirmed_at"] is None
+    assert row.payload["reviewed_by"] is None
+    assert len(session.statements) == 4
+    assert "pg_advisory_xact_lock" in str(session.statements[0])
+    assert "FOR UPDATE" in str(session.statements[1])
+    assert "DELETE FROM agent_hub_admin_resources" in str(session.statements[2])
 
 
 @pytest.mark.asyncio

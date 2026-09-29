@@ -96,6 +96,16 @@ function confidenceLabel(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function hermesChangeLabel(action: string) {
+  if (action === "hermes.created") return "创建候选";
+  if (action === "hermes.feedback") return "记录经验";
+  if (action === "hermes.confirm") return "确认入库";
+  if (action === "hermes.reject") return "拒绝入库";
+  if (action === "hermes.rollback") return "撤销审批";
+  if (action === "hermes.delete") return "删除记录";
+  return action;
+}
+
 function hermesLearningSummary(insight: HermesInsight) {
   return insight.user_summary?.trim() || insight.summary;
 }
@@ -167,14 +177,33 @@ function sortedHermesInsights(items: HermesInsight[], sort: SortState<HermesSort
   return [...items].sort((left, right) => compareText(hermesColumnValue(left, sort.key), hermesColumnValue(right, sort.key), sort.direction));
 }
 
-function HermesJourney({ insights }: { insights: HermesInsight[] }) {
-  if (insights.length === 0) return null;
-  const pendingCount = insights.filter((insight) => insight.promotion_status === "pending_review").length;
-  const confirmedCount = insights.filter((insight) => insight.promotion_status === "approved").length;
-  const rejectedCount = insights.filter((insight) => insight.promotion_status === "rejected").length;
-  const journeyItems = [...insights]
-    .sort((left, right) => compareText(left.created_at, right.created_at, "desc"))
-    .slice(0, 6);
+function HermesJourney() {
+  const [page, setPage] = useState(1);
+  const [category, setCategory] = useState<"all" | HermesInsight["category"]>("all");
+  const [status, setStatus] = useState<"all" | HermesInsight["promotion_status"]>("all");
+  const [source, setSource] = useState("");
+  const [query, setQuery] = useState("");
+  const journey = useQuery({
+    queryKey: ["hermes", "journey", page, category, status, source, query],
+    queryFn: () => api.hermesJourney({
+      page,
+      pageSize: 6,
+      category: category === "all" ? undefined : category,
+      status: status === "all" ? undefined : status,
+      source: source || undefined,
+      query,
+    }),
+    refetchInterval: 5000,
+    refetchIntervalInBackground: true,
+  });
+  const data = journey.data;
+  const counts = data?.status_counts ?? {};
+  const journeyItems = data?.items ?? [];
+
+  function resetPage() {
+    setPage(1);
+  }
+
   return (
     <section className="hermes-journey" aria-label="Hermes 学习旅程">
       <div className="hermes-journey-header">
@@ -183,13 +212,72 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
           <h3>学习旅程</h3>
         </div>
         <div aria-label="Hermes 学习状态统计">
-          <strong>待确认 {pendingCount}</strong>
-          <strong>已确认 {confirmedCount}</strong>
-          {rejectedCount > 0 ? <strong>已拒绝 {rejectedCount}</strong> : null}
+          <strong>待确认 {counts.pending_review ?? 0}</strong>
+          <strong>已确认 {counts.approved ?? 0}</strong>
+          {(counts.rejected ?? 0) > 0 ? <strong>已拒绝 {counts.rejected}</strong> : null}
         </div>
       </div>
+      <div className="list-toolbar" aria-label="学习旅程筛选">
+        <label>
+          搜索旅程
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => { setQuery(event.currentTarget.value); resetPage(); }}
+            placeholder="摘要、对话、标签或来源"
+          />
+        </label>
+        <label>
+          分类
+          <select
+            aria-label="按旅程分类筛选"
+            value={category}
+            onChange={(event) => {
+              setCategory(event.currentTarget.value as typeof category);
+              resetPage();
+            }}
+          >
+            <option value="all">全部</option>
+            <option value="conversation">对话记忆</option>
+            <option value="scheduler">调度观察</option>
+          </select>
+        </label>
+        <label>
+          状态
+          <select
+            aria-label="按旅程状态筛选"
+            value={status}
+            onChange={(event) => {
+              setStatus(event.currentTarget.value as typeof status);
+              resetPage();
+            }}
+          >
+            <option value="all">全部</option>
+            <option value="pending_review">待确认</option>
+            <option value="approved">已确认</option>
+            <option value="rejected">已拒绝</option>
+            <option value="ledger_only">仅台账</option>
+          </select>
+        </label>
+        <label>
+          来源
+          <select
+            aria-label="按旅程来源筛选"
+            value={source}
+            onChange={(event) => { setSource(event.currentTarget.value); resetPage(); }}
+          >
+            <option value="">全部</option>
+            <option value="manual_feedback">手动经验</option>
+            <option value="artifact_review">产物复盘</option>
+            <option value="scheduler_review">调度复盘</option>
+            <option value="runtime_observation">运行观察</option>
+          </select>
+        </label>
+      </div>
+      {journey.isLoading ? <p>正在加载学习旅程...</p> : null}
+      {journey.isError ? <p role="alert">{formatApiError(journey.error, "学习旅程加载失败")}</p> : null}
       <ol>
-        {journeyItems.map((insight) => (
+        {journeyItems.map(({ insight, changes }) => (
           <li key={insight.id}>
             <time dateTime={insight.created_at}>{insight.created_at}</time>
             <div>
@@ -199,6 +287,7 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
                 {memoryLayerLabel(insight)} · {promotionStatusLabel(insight.promotion_status)} · {insight.conversation_id ?? "未关联对话"} · {insight.outcome} · 权重 {insight.weight}
                 {insight.tags.length > 0 ? ` · ${insight.tags.join(" / ")}` : ""}
               </small>
+              <small>可追踪变更 {changes.length} 项</small>
             </div>
             <Link
               to={`/hermes/${encodeURIComponent(insight.id)}`}
@@ -209,6 +298,31 @@ function HermesJourney({ insights }: { insights: HermesInsight[] }) {
           </li>
         ))}
       </ol>
+      {data && data.total === 0 ? <p>没有匹配的学习旅程记录。</p> : null}
+      {data ? (
+        <div className="inline-actions" aria-label="学习旅程分页">
+          <button
+            type="button"
+            className="secondary-action"
+            aria-label="上一页"
+            disabled={page <= 1}
+            onClick={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            上一页
+          </button>
+          <span>第 {page} / {Math.max(data.pages, 1)} 页</span>
+          <button
+            type="button"
+            className="secondary-action"
+            aria-label="下一页"
+            disabled={data.pages === 0 || page >= data.pages}
+            onClick={() => setPage((current) => current + 1)}
+          >
+            下一页
+          </button>
+          <small>共 {data.total} 条</small>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -362,7 +476,7 @@ function HermesLearningTable() {
         点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
       </p>
 
-      <HermesJourney insights={items} />
+      <HermesJourney />
 
       <section aria-label="Hermes 学习台账" {...navTargetProps(ledgerNavSection)}>
         <h3>学习台账</h3>
@@ -637,6 +751,12 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
     refetchInterval: 5000,
     refetchIntervalInBackground: true,
   });
+  const history = useQuery({
+    queryKey: ["hermes", insightId, "history"],
+    queryFn: () => api.hermesInsightHistory(insightId),
+    refetchInterval: 5000,
+    refetchIntervalInBackground: true,
+  });
   const confirm = useMutation({
     mutationFn: () => api.confirmHermesInsight(insightId),
     onSuccess: (updated) => {
@@ -649,6 +769,15 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
     onSuccess: (updated) => {
       queryClient.setQueryData(["hermes", insightId], updated);
       void queryClient.invalidateQueries({ queryKey: ["hermes"], exact: true });
+    },
+  });
+  const rollback = useMutation({
+    mutationFn: () => api.rollbackHermesInsight(insightId),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["hermes", insightId], updated);
+      void queryClient.invalidateQueries({ queryKey: ["hermes", insightId, "history"] });
+      void queryClient.invalidateQueries({ queryKey: ["hermes"], exact: true });
+      void queryClient.invalidateQueries({ queryKey: ["hermes", "journey"] });
     },
   });
   const deleteInsight = useMutation({
@@ -785,6 +914,33 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
             <dd>{item.promoted_memory_id ?? "尚未入库"}</dd>
           </div>
         </dl>
+        <section className="hermes-journey" aria-label="Hermes 变更历史">
+          <div className="hermes-journey-header">
+            <div>
+              <span className="eyebrow">Change history</span>
+              <h3>变更历史</h3>
+            </div>
+          </div>
+          {history.isLoading ? <p>正在加载变更历史...</p> : null}
+          {history.isError ? (
+            <p role="alert">{formatApiError(history.error, "Hermes 变更历史加载失败")}</p>
+          ) : null}
+          <ol>
+            {(history.data ?? []).map((change) => (
+              <li key={`${change.version}-${change.action}-${change.created_at}`}>
+                <time dateTime={change.created_at}>{change.created_at}</time>
+                <div>
+                  <span>版本 {change.version}</span>
+                  <strong>{hermesChangeLabel(change.action)}</strong>
+                  <small>操作者 {change.actor}</small>
+                  {Object.keys(change.details).length > 0 ? (
+                    <small>{Object.entries(change.details).map(([key, value]) => `${key}: ${value}`).join(" · ")}</small>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
         <div className="inline-actions">
           <button
             type="button"
@@ -801,6 +957,20 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
           >
             {item.promotion_status === "rejected" ? "已拒绝" : reject.isPending ? "正在拒绝..." : "拒绝入库"}
           </button>
+          {item.promotion_status === "approved" || item.promotion_status === "rejected" ? (
+            <button
+              type="button"
+              className="secondary-action"
+              disabled={rollback.isPending}
+              onClick={() => {
+                if (window.confirm("确认撤销这次审批并返回待审？已入库记忆会立即停止参与召回。")) {
+                  rollback.mutate();
+                }
+              }}
+            >
+              {rollback.isPending ? "正在撤销..." : "撤销审批，返回待审"}
+            </button>
+          ) : null}
           <button
             type="button"
             className="danger-action"
@@ -816,6 +986,7 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
         </div>
         {confirm.isError ? <p role="alert">{formatApiError(confirm.error, "Hermes 学习确认失败")}</p> : null}
         {reject.isError ? <p role="alert">{formatApiError(reject.error, "Hermes 学习拒绝失败")}</p> : null}
+        {rollback.isError ? <p role="alert">{formatApiError(rollback.error, "Hermes 审批撤销失败")}</p> : null}
         {deleteInsight.isError ? <p role="alert">{formatApiError(deleteInsight.error, "Hermes 学习删除失败")}</p> : null}
       </article>
     </section>

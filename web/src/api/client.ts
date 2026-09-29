@@ -252,7 +252,9 @@ const PluginPackageSubprocessRegistrationStatusSchema = z.enum([
 const SystemSettingsSchema = z.object({
   default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
   default_workflow_id: z.string().nullable(),
-  default_execution_backend: z.enum(["systemd", "docker"]).default("systemd"),
+  default_execution_backend: z
+    .enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"])
+    .default("systemd"),
   default_agent_ids: z.array(z.string()),
   log_level: z.enum(["warning", "error"]),
   hermes_enabled: z.boolean(),
@@ -281,7 +283,7 @@ const SystemSettingsSchema = z.object({
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
 
 const ExecutionBackendSchema = z.object({
-  id: z.enum(["systemd", "docker"]),
+  id: z.enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"]),
   name: z.string(),
   adapter: z.string(),
   description: z.string(),
@@ -696,7 +698,9 @@ const SubmittedRunSchema = z.object({
   workspace_session_path: z.string().nullable().optional(),
   workspace_artifacts_path: z.string().nullable().optional(),
   sandbox_profile: z.string().nullable().optional(),
-  execution_backend: z.enum(["systemd", "docker"]).default("systemd"),
+  execution_backend: z
+    .enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"])
+    .default("systemd"),
   requested_permissions: z.array(z.string()).default([]),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
@@ -1707,6 +1711,11 @@ const HermesInsightSchema = z.object({
   noise_risk: z.number().default(0),
   applies_to_modes: z.array(z.string()).default([]),
   candidate_source: z.string().default("manual_feedback"),
+  candidate_type: z.enum(["memory", "rule", "skill", "ui_rule", "test_rule"]).default("memory"),
+  requires_approval: z.boolean().default(true),
+  activation_status: z.enum(["pending_approval", "active", "approved_pending_skill_lifecycle", "rejected"]).default("pending_approval"),
+  auto_activate: z.boolean().default(false),
+  activation_pipeline: z.string().default("hermes_confirm_promote_memory"),
   evidence_summary: z.string().nullable().default(null),
   source_artifact_count: z.number().default(0),
   source_artifact_types: z.array(z.string()).default([]),
@@ -1716,6 +1725,30 @@ const HermesInsightSchema = z.object({
 });
 
 export type HermesInsight = z.infer<typeof HermesInsightSchema>;
+
+const HermesJourneyChangeSchema = z.object({
+  version: z.number(),
+  action: z.string(),
+  actor: z.string(),
+  details: z.record(z.string(), z.string()),
+  created_at: z.string(),
+});
+
+export type HermesJourneyChange = z.infer<typeof HermesJourneyChangeSchema>;
+
+const HermesJourneyPageSchema = z.object({
+  items: z.array(z.object({
+    insight: HermesInsightSchema,
+    changes: z.array(HermesJourneyChangeSchema),
+  })),
+  total: z.number(),
+  page: z.number(),
+  page_size: z.number(),
+  pages: z.number(),
+  status_counts: z.record(z.string(), z.number()),
+});
+
+export type HermesJourneyPage = z.infer<typeof HermesJourneyPageSchema>;
 
 const HermesBulkConfirmSchema = z.object({
   confirmed: z.array(HermesInsightSchema),
@@ -2365,7 +2398,7 @@ export const api = {
     project_label?: string | null;
     workspace_session_id?: string | null;
     sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
-    execution_backend?: "systemd" | "docker";
+    execution_backend?: "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
     requested_permissions?: string[];
     attachment_ids?: string[];
     vibe_coding?: boolean;
@@ -2389,7 +2422,7 @@ export const api = {
       project_label?: string | null;
       workspace_session_id?: string | null;
       sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
-      execution_backend?: "systemd" | "docker";
+      execution_backend?: "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
       requested_permissions?: string[];
     },
   ): Promise<ConversationQueueItem> {
@@ -3127,14 +3160,39 @@ export const api = {
   hermesInsights(): Promise<HermesInsight[]> {
     return request("/api/v1/admin/hermes", { method: "GET" }, z.array(HermesInsightSchema));
   },
+  hermesJourney(params: {
+    page: number;
+    pageSize: number;
+    category?: "conversation" | "scheduler";
+    status?: "pending_review" | "approved" | "rejected" | "ledger_only";
+    source?: string;
+    query?: string;
+  }): Promise<HermesJourneyPage> {
+    const query = new URLSearchParams({ page: String(params.page), page_size: String(params.pageSize) });
+    if (params.category) query.set("category", params.category);
+    if (params.status) query.set("status", params.status);
+    if (params.source) query.set("source", params.source);
+    if (params.query?.trim()) query.set("q", params.query.trim());
+    return request(`/api/v1/admin/hermes/journey?${query.toString()}`, { method: "GET" }, HermesJourneyPageSchema);
+  },
   hermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "GET" }, HermesInsightSchema);
+  },
+  hermesInsightHistory(id: string): Promise<HermesJourneyChange[]> {
+    return request(
+      `/api/v1/admin/hermes/${encodeURIComponent(id)}/history`,
+      { method: "GET" },
+      z.array(HermesJourneyChangeSchema),
+    );
   },
   confirmHermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/confirm`, { method: "POST" }, HermesInsightSchema);
   },
   rejectHermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/reject`, { method: "POST" }, HermesInsightSchema);
+  },
+  rollbackHermesInsight(id: string): Promise<HermesInsight> {
+    return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/rollback`, { method: "POST" }, HermesInsightSchema);
   },
   deleteHermesInsight(id: string): Promise<OperationStatus> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "DELETE" }, OperationStatusSchema);

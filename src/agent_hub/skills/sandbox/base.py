@@ -78,6 +78,7 @@ async def run_subprocess_with_limits(
     argv: tuple[str, ...],
     invocation: SkillInvocation,
     *,
+    stdin_payload: bytes | None = None,
     process_started: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_forced_terminate: Callable[[], Awaitable[None]] | None = None,
 ) -> SkillResult:
@@ -103,7 +104,11 @@ async def run_subprocess_with_limits(
             if process.returncode is None:
                 process.kill()
 
-    stdin = json.dumps(invocation.input, sort_keys=True, separators=(",", ":")).encode()
+    stdin = (
+        stdin_payload
+        if stdin_payload is not None
+        else json.dumps(invocation.input, sort_keys=True, separators=(",", ":")).encode()
+    )
     if process.stdin is not None:
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             process.stdin.write(stdin)

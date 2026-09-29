@@ -17,7 +17,8 @@ describe("HermesPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        const requestUrl = new URL(String(input), "https://agent-hub.test");
+        const path = requestUrl.pathname;
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
             user_id: "11111111-1111-4111-8111-111111111111",
@@ -64,6 +65,72 @@ describe("HermesPage", () => {
               created_at: "2026-09-02T00:05:01Z",
             },
           ]);
+        }
+        if (path === "/api/v1/admin/hermes/journey") {
+          const page = Number(requestUrl.searchParams.get("page") ?? "1");
+          const secondPage = {
+            id: "hermes_conversation_cccccccccccccccccccccccccccccccc",
+            category: "conversation",
+            outcome: "neutral",
+            lesson: "Second page journey lesson.",
+            summary: "Second page journey lesson.",
+            user_summary: "第二页经验",
+            run_id: null,
+            conversation_id: "conv-page-two",
+            confirmed_at: null,
+            rejected_at: null,
+            reviewed_by: null,
+            tags: ["journey"],
+            weight: 2,
+            promotion_status: "pending_review",
+            created_at: "2026-09-01T00:00:00Z",
+          };
+          const firstPage = [
+            {
+              id: "hermes_scheduler_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              category: "scheduler",
+              outcome: "failure",
+              lesson: "UI expansion drawers should open as full reading sheets on mobile.",
+              summary: "Hermes captured a UI lesson from a failed mobile verification.",
+              user_summary: "移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。",
+              run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              conversation_id: "conv-ui-polish",
+              confirmed_at: "2026-09-02T00:10:00Z",
+              rejected_at: null,
+              reviewed_by: "admin",
+              tags: ["ui", "mobile", "drawer"],
+              weight: 7,
+              memory_type: "ui_rule",
+              target: "main_agent",
+              promotion_status: "approved",
+              created_at: "2026-09-02T00:05:01Z",
+            },
+            {
+              id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              category: "conversation",
+              outcome: "success",
+              lesson: "Run completed with mode=hybrid, workflow=quality-review.",
+              summary: "Hermes recorded reusable conversation memory from conv-cleared-after-chat.",
+              user_summary: "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。",
+              run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              conversation_id: "conv-cleared-after-chat",
+              confirmed_at: null,
+              rejected_at: null,
+              reviewed_by: null,
+              tags: ["completed", "hybrid", "quality-review"],
+              weight: 4,
+              promotion_status: "pending_review",
+              created_at: "2026-09-02T00:00:01Z",
+            },
+          ];
+          return jsonResponse({
+            items: (page === 2 ? [secondPage] : firstPage).map((insight) => ({ insight, changes: [] })),
+            total: 3,
+            page,
+            page_size: 2,
+            pages: 2,
+            status_counts: { pending_review: 2, approved: 1, rejected: 0, ledger_only: 0 },
+          });
         }
         if (path === "/api/v1/admin/memory") {
           return jsonResponse([
@@ -113,6 +180,24 @@ describe("HermesPage", () => {
             created_at: "2026-09-02T00:00:01Z",
           });
         }
+        if (path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/history") {
+          return jsonResponse([
+            {
+              version: 1,
+              action: "hermes.created",
+              actor: "system",
+              details: { candidate_source: "artifact_review" },
+              created_at: "2026-09-02T00:00:01Z",
+            },
+            {
+              version: 2,
+              action: "hermes.reject",
+              actor: "11111111-1111-4111-8111-111111111111",
+              details: { id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+              created_at: "2026-09-02T00:20:00Z",
+            },
+          ]);
+        }
         if (
           path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/reject" &&
           init?.method === "POST"
@@ -141,6 +226,30 @@ describe("HermesPage", () => {
             source_artifact_count: 2,
             source_artifact_types: ["tool_result", "workspace_file"],
             promotion_status: "rejected",
+            created_at: "2026-09-02T00:00:01Z",
+          });
+        }
+        if (
+          path === "/api/v1/admin/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/rollback" &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse({
+            id: "hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            category: "conversation",
+            outcome: "success",
+            lesson: "Run completed with mode=hybrid, workflow=quality-review.",
+            summary: "Hermes recorded reusable conversation memory from conv-cleared-after-chat.",
+            user_summary: "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。",
+            run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            conversation_id: "conv-cleared-after-chat",
+            confirmed_at: null,
+            rejected_at: null,
+            reviewed_by: null,
+            tags: ["completed", "hybrid", "quality-review"],
+            weight: 4,
+            memory_type: "scheduling_rule",
+            target: "main_agent",
+            promotion_status: "pending_review",
             created_at: "2026-09-02T00:00:01Z",
           });
         }
@@ -238,11 +347,30 @@ describe("HermesPage", () => {
     const journey = await screen.findByRole("region", { name: "Hermes 学习旅程" });
 
     expect(within(journey).getByText("学习旅程")).not.toBeNull();
-    expect(within(journey).getByText("待确认 1")).not.toBeNull();
+    expect(await within(journey).findByText("待确认 2")).not.toBeNull();
     expect(within(journey).getByText("已确认 1")).not.toBeNull();
     expect(within(journey).getByText("移动端展开抽屉需要全屏阅读态，避免内容挤在小框里。")).not.toBeNull();
     expect(within(journey).getByText(/已确认规则 · 已确认入库/)).not.toBeNull();
     expect(within(journey).getByRole("link", { name: /查看 conv-ui-polish 的学习详情/ })).not.toBeNull();
+  });
+
+  it("paginates and filters the server-backed learning journey", async () => {
+    render(<TestApp initialPath="/hermes" />);
+
+    const journey = await screen.findByRole("region", { name: "Hermes 学习旅程" });
+    fireEvent.click(await within(journey).findByRole("button", { name: "下一页" }));
+
+    expect(await within(journey).findByText("第二页经验")).not.toBeNull();
+    expect(within(journey).getByText("第 2 / 2 页")).not.toBeNull();
+
+    fireEvent.change(within(journey).getByLabelText("按旅程状态筛选"), {
+      target: { value: "approved" },
+    });
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) =>
+        String(input).includes("status=approved"),
+      ),
+    ).toBe(true);
   });
 
   it("links Hermes detail records back to their source conversation", async () => {
@@ -275,5 +403,19 @@ describe("HermesPage", () => {
 
     expect(await screen.findByText("已拒绝入库")).not.toBeNull();
     expect(screen.getByText("保留审计记录，不参与主 Agent 召回")).not.toBeNull();
+  });
+
+  it("shows tracked changes and can safely return a reviewed candidate to pending", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<TestApp initialPath="/hermes/hermes_conversation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />);
+
+    const history = await screen.findByRole("region", { name: "Hermes 变更历史" });
+    expect(within(history).getByText("创建候选")).not.toBeNull();
+    expect(within(history).getByText("拒绝入库")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "拒绝入库" }));
+    fireEvent.click(await screen.findByRole("button", { name: "撤销审批，返回待审" }));
+
+    expect(await screen.findByText("等待人工确认")).not.toBeNull();
   });
 });

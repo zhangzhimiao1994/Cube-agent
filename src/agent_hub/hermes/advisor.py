@@ -23,8 +23,28 @@ _INJECTABLE_MEMORY_TYPES = {
     "user_preference",
     "project_fact",
     "ui_rule",
+    "test_rule",
     "error_handling",
     "scheduling_rule",
+}
+_ARTIFACT_CANDIDATE_CONTRACTS: dict[str, tuple[str, str, str]] = {
+    "memory": ("project_fact", "main_agent", "hermes_confirm_promote_memory"),
+    "rule": ("scheduling_rule", "main_agent", "hermes_confirm_promote_memory"),
+    "skill": ("skill_candidate", "skill_registry", "skill_quarantine_scan_approve_activate"),
+    "ui_rule": ("ui_rule", "main_agent", "hermes_confirm_promote_memory"),
+    "test_rule": ("test_rule", "main_agent", "hermes_confirm_promote_memory"),
+}
+_ARTIFACT_TYPE_TO_CANDIDATE_TYPE = {
+    "memory": "memory",
+    "memory_record": "memory",
+    "project_memory": "memory",
+    "rule": "rule",
+    "skill": "skill",
+    "skill_package": "skill",
+    "ui": "ui_rule",
+    "ui_rule": "ui_rule",
+    "test_rule": "test_rule",
+    "test_report": "test_rule",
 }
 _NON_INJECTABLE_TARGETS = {
     "learning_ledger",
@@ -390,6 +410,8 @@ def _artifact_review_candidate(
     artifact_ids = _unique_tags(
         [str(artifact.get("id", "")) for artifact in reviewable if artifact.get("id")]
     )[:12]
+    candidate_type = _artifact_candidate_type(reviewable)
+    memory_type, target, activation_pipeline = _ARTIFACT_CANDIDATE_CONTRACTS[candidate_type]
     evidence_items = artifact_types
     evidence_summary = (
         f"复盘 {len(reviewable)} 个可交付产物：{('、'.join(evidence_items))[:320]}。"
@@ -411,12 +433,17 @@ def _artifact_review_candidate(
         "user_summary": f"产物复盘形成规则候选：{evidence_summary}",
         "tags": _unique_tags([workflow, mode, *outcome.agent_ids[:8], *artifact_types]),
         "weight": min(10, 5 + len(reviewable)),
-        "memory_type": "scheduling_rule",
-        "target": "main_agent",
+        "memory_type": memory_type,
+        "candidate_type": candidate_type,
+        "target": target,
         "applies_to_modes": [mode] if mode != "unknown" else [],
         "confidence": min(0.9, 0.66 + len(reviewable) * 0.03),
         "noise_risk": 0.25,
         "candidate_source": "artifact_review",
+        "requires_approval": True,
+        "activation_status": "pending_approval",
+        "auto_activate": False,
+        "activation_pipeline": activation_pipeline,
         "evidence_summary": evidence_summary,
         "source_artifact_count": len(reviewable),
         "source_artifact_types": artifact_types,
@@ -430,6 +457,26 @@ def _artifact_review_candidate(
         "reviewed_by": None,
     }
     return candidate_id, payload
+
+
+def _artifact_candidate_type(artifacts: list[dict[str, object]]) -> str:
+    declared: list[str] = []
+    for artifact in artifacts:
+        content = artifact.get("content")
+        if isinstance(content, Mapping):
+            explicit = content.get("candidate_type")
+            if isinstance(explicit, str) and explicit in _ARTIFACT_CANDIDATE_CONTRACTS:
+                declared.append(explicit)
+                continue
+        artifact_type = artifact.get("type")
+        if isinstance(artifact_type, str):
+            candidate_type = _ARTIFACT_TYPE_TO_CANDIDATE_TYPE.get(artifact_type.casefold())
+            if candidate_type is not None:
+                declared.append(candidate_type)
+    for candidate_type in ("skill", "ui_rule", "test_rule", "memory", "rule"):
+        if candidate_type in declared:
+            return candidate_type
+    return "rule"
 
 
 def _scheduler_review_candidate(
@@ -463,11 +510,16 @@ def _scheduler_review_candidate(
         "tags": _unique_tags([workflow, mode, *triggers, *actions]),
         "weight": min(10, 6 + len(notices)),
         "memory_type": "error_handling",
+        "candidate_type": "rule",
         "target": "main_agent",
         "applies_to_modes": [mode] if mode != "unknown" else [],
         "confidence": min(0.9, 0.72 + len(notices) * 0.03),
         "noise_risk": 0.2,
         "candidate_source": "scheduler_review",
+        "requires_approval": True,
+        "activation_status": "pending_approval",
+        "auto_activate": False,
+        "activation_pipeline": "hermes_confirm_promote_memory",
         "evidence_summary": evidence_summary,
         "source_artifact_count": 0,
         "source_artifact_types": [],

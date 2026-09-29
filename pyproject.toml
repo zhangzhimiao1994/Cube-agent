@@ -32,6 +32,7 @@ dependencies = [
 
 [project.scripts]
 agent-hub-openclaw-adapter = "agent_hub.openclaw.local_adapter:main"
+agent-hub-skill-remote-runner = "agent_hub.skills.sandbox.remote_runner:main"
 [dependency-groups]
 dev = [
     "mypy>=1.17,<2",

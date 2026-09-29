@@ -11,6 +11,22 @@ const REASON_TEXT: Record<string, string> = {
   docker_daemon_unavailable: "Docker 服务不可访问。",
   docker_runner_image_not_found: "缺少 agent-hub-skill-runner:latest 运行镜像。",
   docker_runner_unavailable: "Docker 技能运行镜像无法按隔离策略启动。",
+  ssh_not_configured: "尚未配置 SSH 主机、用户和 known_hosts 文件。",
+  ssh_configuration_invalid: "SSH 配置不完整，或密钥、known_hosts 文件不可用。",
+  ssh_health_check_failed: "无法连接 SSH 远端 runner，或远端隔离代理未就绪。",
+  ssh_protocol_mismatch: "SSH 远端 runner 的协议版本不兼容。",
+  modal_not_configured: "尚未配置 Modal 技能沙箱 HTTPS 端点。",
+  modal_configuration_invalid: "Modal 技能沙箱端点配置无效。",
+  modal_health_check_failed: "Modal 技能沙箱健康检查失败。",
+  modal_protocol_mismatch: "Modal 技能沙箱协议版本不兼容。",
+  daytona_not_configured: "尚未配置 Daytona 技能沙箱 HTTPS 端点。",
+  daytona_configuration_invalid: "Daytona 技能沙箱端点配置无效。",
+  daytona_health_check_failed: "Daytona 技能沙箱健康检查失败。",
+  daytona_protocol_mismatch: "Daytona 技能沙箱协议版本不兼容。",
+  vercel_not_configured: "尚未配置 Vercel Sandbox HTTPS 端点。",
+  vercel_configuration_invalid: "Vercel Sandbox 端点配置无效。",
+  vercel_health_check_failed: "Vercel Sandbox 健康检查失败。",
+  vercel_protocol_mismatch: "Vercel Sandbox 协议版本不兼容。",
 };
 
 function backendStatusText(backend: ExecutionBackend) {
@@ -37,7 +53,6 @@ export function ExecutionEnvironmentsPage() {
       <p className="eyebrow">Execution environments</p>
       <h2>执行环境</h2>
       <p>这里显示服务端已经接入的真实技能执行器及当前可用状态。任务权限是访问上限，技能运行器始终采用更严格的固定隔离。</p>
-
       <div className="status-grid" aria-label="执行环境状态">
         <article className="status-card">
           <span>已接入</span>
