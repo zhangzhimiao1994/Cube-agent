@@ -35,6 +35,69 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
+_PREVIEW_STORAGE_SHIM = """<script data-agent-preview-storage-shim>
+(() => {
+  const installStorage = (name) => {
+    try {
+      window[name].length;
+      return;
+    } catch (_error) {
+      // Sandboxed previews intentionally have an opaque origin.
+    }
+    const maxEntries = 1024;
+    const maxCharacters = 5 * 1024 * 1024;
+    const values = new Map();
+    let usedCharacters = 0;
+    const storage = {
+      get length() { return values.size; },
+      clear() {
+        values.clear();
+        usedCharacters = 0;
+      },
+      getItem(key) {
+        const normalized = String(key);
+        return values.has(normalized) ? values.get(normalized) : null;
+      },
+      key(index) { return Array.from(values.keys())[Number(index)] ?? null; },
+      removeItem(key) {
+        const normalized = String(key);
+        const previous = values.get(normalized);
+        if (previous !== undefined) {
+          usedCharacters -= normalized.length + previous.length;
+          values.delete(normalized);
+        }
+      },
+      setItem(key, value) {
+        const normalizedKey = String(key);
+        const normalizedValue = String(value);
+        const previous = values.get(normalizedKey);
+        const previousCharacters = previous === undefined
+          ? 0
+          : normalizedKey.length + previous.length;
+        const nextCharacters = usedCharacters - previousCharacters
+          + normalizedKey.length + normalizedValue.length;
+        if (
+          (previous === undefined && values.size >= maxEntries)
+          || nextCharacters > maxCharacters
+        ) {
+          throw new DOMException("Storage quota exceeded", "QuotaExceededError");
+        }
+        values.set(normalizedKey, normalizedValue);
+        usedCharacters = nextCharacters;
+      },
+    };
+    Object.defineProperty(window, name, {
+      configurable: false,
+      enumerable: true,
+      value: storage,
+      writable: false,
+    });
+  };
+  installStorage("localStorage");
+  installStorage("sessionStorage");
+})();
+</script>"""
+
 
 class WebPreviewStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -193,6 +256,14 @@ class WebPreviewService:
                         doctype = re.match(r"\s*<!doctype\s+html\s*>", text, flags=re.IGNORECASE)
                         offset = doctype.end() if doctype is not None else 0
                         text = f"{text[:offset]}{base}{text[offset:]}"
+                if "text/html" in content_type:
+                    head = re.search(r"<head\b[^>]*>", text, flags=re.IGNORECASE)
+                    if head is not None:
+                        text = f"{text[: head.end()]}{_PREVIEW_STORAGE_SHIM}{text[head.end() :]}"
+                    else:
+                        doctype = re.match(r"\s*<!doctype\s+html\s*>", text, flags=re.IGNORECASE)
+                        offset = doctype.end() if doctype is not None else 0
+                        text = f"{text[:offset]}{_PREVIEW_STORAGE_SHIM}{text[offset:]}"
                 content = text.encode("utf-8")
         return Response(
             content=content,

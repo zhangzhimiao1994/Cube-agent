@@ -151,6 +151,15 @@ def test_preview_uses_http_only_cookie_and_rewrites_root_relative_assets(
     assert f'{payload["preview_url"]}style.css' in root.text
     assert f'{payload["preview_url"]}assets/app.js' in root.text
     assert f'<base href="{payload["preview_url"]}">' in root.text
+    storage_shim = root.text.index("data-agent-preview-storage-shim")
+    application_script = root.text.index(f'{payload["preview_url"]}assets/app.js')
+    assert storage_shim < application_script
+    assert "Object.defineProperty(window, name" in root.text
+    assert 'installStorage("localStorage")' in root.text
+    assert 'installStorage("sessionStorage")' in root.text
+    assert "const maxEntries = 1024" in root.text
+    assert "const maxCharacters = 5 * 1024 * 1024" in root.text
+    assert 'new DOMException("Storage quota exceeded", "QuotaExceededError")' in root.text
     assert asset.status_code == 200
     assert asset.text == "main { color: teal; }"
     assert script.status_code == 200
