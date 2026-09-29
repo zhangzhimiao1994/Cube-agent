@@ -1053,7 +1053,13 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "run_id": repository.run_id,
             "status": RunStatus.COMPLETED,
             "mode": TaskMode.DISPATCH,
-            "routing_decision": {"source": "evolution", "evolution_run_id": "evolution_1"},
+            "routing_decision": {
+                "source": "evolution",
+                "evolution_run_id": "evolution_1",
+                "runtime_token_soft_base_tokens": 1_000_000,
+                "runtime_token_absolute_tokens": 10_000_000,
+                "runtime_plan_token_budget": 10_000_000,
+            },
         }
     ]
 
@@ -2609,7 +2615,12 @@ async def test_execute_backfills_terminal_hooks_once_for_terminal_run_after_cras
             "run_id": repository.run_id,
             "status": RunStatus.COMPLETED,
             "mode": TaskMode.DISPATCH,
-            "routing_decision": {"source": "manual"},
+            "routing_decision": {
+                "source": "manual",
+                "runtime_token_soft_base_tokens": 1_000_000,
+                "runtime_token_absolute_tokens": 10_000_000,
+                "runtime_plan_token_budget": 10_000_000,
+            },
         }
     ]
     assert [event.kind for event in repository.event_log].count("terminal.notified") == 1

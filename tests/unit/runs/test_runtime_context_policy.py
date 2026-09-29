@@ -119,7 +119,7 @@ def test_runtime_token_policy_exposes_soft_base_and_bounded_absolute_limit() -> 
     ) == {
         "project_scale": "large",
         "runtime_plan_timeout_seconds": 1_200.0,
-        "runtime_plan_token_budget": 5_000,
+        "runtime_plan_token_budget": 10_000_000,
         "runtime_timeout_seconds": 1_200.0,
         "runtime_timeout_source": "project_scale_soft_budget",
         "runtime_token_soft_base_tokens": 2_000,
@@ -139,6 +139,25 @@ def test_runtime_token_policy_exposes_soft_base_and_bounded_absolute_limit() -> 
         },
         configured_tokens=2_000,
     )["runtime_token_absolute_tokens"] == 10_000_000
+
+
+def test_runtime_token_policy_preserves_persisted_plan_anchors() -> None:
+    decision = {
+        "project_scale": "large",
+        "runtime_plan_token_budget": 7_500_000,
+        "runtime_plan_timeout_seconds": 2_400.0,
+        "runtime_timeout_seconds": 1_200.0,
+        "runtime_timeout_absolute_seconds": 3_600.0,
+        "runtime_timeout_source": "project_scale_soft_budget",
+    }
+
+    updated = _with_runtime_token_budget_policy(
+        decision,
+        configured_tokens=3_000_000,
+    )
+
+    assert updated["runtime_plan_token_budget"] == 7_500_000
+    assert updated["runtime_plan_timeout_seconds"] == 2_400.0
 
 
 @pytest.mark.asyncio

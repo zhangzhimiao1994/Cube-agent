@@ -1687,6 +1687,12 @@ class RunService:
                 mode = TaskMode(row.mode)
                 request = row.request
                 routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+                routing_decision = _with_runtime_token_budget_policy(
+                    routing_decision,
+                    configured_tokens=self._runtime_token_budget,
+                    mode=mode,
+                )
+                row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
                 await self._safe_record_self_repair_decision_for_record(claimed_record)
@@ -1858,6 +1864,7 @@ class RunService:
                 ):
                     cancel_runtime = False
                     stop_runtime_loop = False
+                    persist_waiting_approval_checkpoint = False
                     async with await self._repository.run_transaction() as session, session.begin():
                         locked = await self._repository.get_for_update(session, run_id)
                         current_status = RunStatus(locked.status)
@@ -1871,6 +1878,9 @@ class RunService:
                         if current_status is RunStatus.WAITING_APPROVAL:
                             terminal = RunStatus.WAITING_APPROVAL
                             stop_runtime_loop = True
+                            persist_waiting_approval_checkpoint = (
+                                event.kind is EventKind.CHECKPOINT_SAVED
+                            )
                         if current_status in {
                             RunStatus.COMPLETED,
                             RunStatus.FAILED,
@@ -1895,7 +1905,7 @@ class RunService:
                             )
                             lease_lost = True
                             stop_runtime_loop = True
-                        if not stop_runtime_loop:
+                        if not stop_runtime_loop or persist_waiting_approval_checkpoint:
                             sequence = await self._repository.next_event_sequence(session, run_id)
                             event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
                             await self._repository.persist_event(
@@ -4662,6 +4672,7 @@ def _with_runtime_token_budget_policy(
     configured_tokens: int,
     mode: TaskMode = TaskMode.DIRECT,
 ) -> dict[str, object]:
+    del mode
     decision = dict(routing_decision)
     soft_base = (
         configured_tokens
@@ -4682,15 +4693,21 @@ def _with_runtime_token_budget_policy(
         absolute_limit,
         _RUNTIME_TOKEN_ABSOLUTE_LIMIT,
     )
-    decision["runtime_plan_token_budget"] = _runtime_token_budget(
-        mode,
-        configured_tokens=configured_tokens,
-        routing_decision=decision,
-        progress_units=0,
+    persisted_plan_tokens = decision.get("runtime_plan_token_budget")
+    if type(persisted_plan_tokens) is not int or persisted_plan_tokens <= 0:
+        decision["runtime_plan_token_budget"] = decision["runtime_token_absolute_tokens"]
+    persisted_plan_timeout = _explicit_runtime_timeout_seconds(
+        decision.get("runtime_plan_timeout_seconds")
     )
-    initial_timeout = _routing_runtime_timeout_seconds(decision, progress_units=0)
-    if initial_timeout is not None:
-        decision["runtime_plan_timeout_seconds"] = initial_timeout
+    if persisted_plan_timeout is None:
+        initial_timeout = _routing_runtime_timeout_seconds(decision, progress_units=0)
+        if initial_timeout is not None:
+            plan_timeout = initial_timeout
+            if decision.get("runtime_timeout_source") == "project_scale_soft_budget":
+                plan_timeout = _explicit_runtime_timeout_seconds(
+                    decision.get("runtime_timeout_absolute_seconds")
+                ) or initial_timeout
+            decision["runtime_plan_timeout_seconds"] = plan_timeout
     return decision
 
 

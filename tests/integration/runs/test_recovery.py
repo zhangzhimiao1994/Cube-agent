@@ -107,6 +107,69 @@ class FakeRuntime:
         raise AssertionError("not used")
 
 
+class ApprovalAfterArtifactRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self, repository: RunRepository) -> None:
+        self._repository = repository
+        self.calls = 0
+        self.restored: list[RuntimeCheckpoint] = []
+        self.approval_id = "approval-after-artifact"
+        self.approval_fingerprint = "fingerprint-after-artifact"
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.calls += 1
+        if context.checkpoint is not None:
+            yield RunEvent(
+                kind=EventKind.RUNTIME_COMPLETED,
+                sequence=1,
+                run_id=context.run_id,
+            )
+            return
+        artifact = Artifact(
+            id=uuid4(),
+            type="text",
+            producer="approval-boundary",
+            content={"text": "approval boundary artifact"},
+        )
+        checkpoint = RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type="approval-boundary-dispatch",
+            runtime_version="1",
+            run_id=context.run_id,
+            tenant_id=context.tenant_id,
+            mode=TaskMode.DISPATCH,
+            state={"artifact_id": str(artifact.id)},
+        )
+        yield RunEvent(
+            kind=EventKind.ARTIFACT_CREATED,
+            sequence=1,
+            run_id=context.run_id,
+            artifact=artifact,
+        )
+        await self._repository.begin_capability_approval(
+            context.tenant_id,
+            context.run_id,
+            approval_id=self.approval_id,
+            approval_fingerprint=self.approval_fingerprint,
+        )
+        yield RunEvent(
+            kind=EventKind.CHECKPOINT_SAVED,
+            sequence=2,
+            run_id=context.run_id,
+            checkpoint=checkpoint,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("service persists checkpoint events directly")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored.append(checkpoint)
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
 class ApprovalResumeCrashRuntime:
     mode = TaskMode.DISPATCH
 
@@ -1869,6 +1932,54 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
     assert [event["kind"] for event in events].count("approval.requested") == 1
     assert [event["kind"] for event in events].count("approval.resolved") == 1
     assert [event["kind"] for event in events].count("runtime.completed") == 1
+    assert not any(event["kind"] == "runtime.failed" for event in events)
+
+
+async def test_capability_approval_persists_following_checkpoint_before_stopping_runtime(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    runtime = ApprovalAfterArtifactRuntime(repository)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="pause at an approval boundary after producing an artifact",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.QUEUED,
+        idempotency_key=None,
+        routing_decision={},
+        enqueue=False,
+    )
+
+    waiting = await service.execute(submitted.id)
+    waiting_events = await service.events(tenant_id, submitted.id)
+    waiting_record = await repository.get(tenant_id, submitted.id)
+
+    assert waiting.status is RunStatus.WAITING_APPROVAL
+    assert [event["kind"] for event in waiting_events].count("artifact.created") == 1
+    assert [event["kind"] for event in waiting_events].count("checkpoint.saved") == 1
+    assert waiting_record.routing_decision is not None
+    assert waiting_record.routing_decision["runtime_plan_token_budget"] == 10_000_000
+
+    approved = await repository.approve_capability_and_enqueue(
+        tenant_id=tenant_id,
+        run_id=submitted.id,
+        approval_id=runtime.approval_id,
+        version=waiting.version,
+    )
+    resumed = await service.execute(approved.id)
+    events = await service.events(tenant_id, submitted.id)
+
+    assert resumed.status is RunStatus.COMPLETED
+    assert runtime.calls == 2
+    assert len(runtime.restored) == 1
     assert not any(event["kind"] == "runtime.failed" for event in events)
 
 
