@@ -1020,7 +1020,7 @@ class ConfigBackedDispatchRuntime:
         )
         plan = _dispatch_plan(
             roles,
-            context,
+            _runtime_plan_context(context),
             max_parallelism=_dispatch_parallelism(
                 config,
                 logical_model,
@@ -1196,7 +1196,7 @@ class ConfigBackedDiscussionRuntime:
         plan = _discussion_plan(
             roles,
             logical_model,
-            context,
+            _runtime_plan_context(context),
             capability_gateway=self._capability_gateway,
         )
         role_payload = _discussion_role_payload(plan)
@@ -1426,9 +1426,10 @@ class ConfigBackedHybridRuntime:
         )
         model_routing_matrix = (*dispatch_matrix, *discussion_matrix)
         model_routing_matrix_truncated = dispatch_matrix_truncated or discussion_matrix_truncated
+        plan_context = _runtime_plan_context(context)
         dispatch_plan = _dispatch_plan(
             dispatch_roles,
-            context,
+            plan_context,
             max_parallelism=_dispatch_parallelism(
                 config,
                 logical_model,
@@ -1443,7 +1444,7 @@ class ConfigBackedHybridRuntime:
         discussion_plan = _discussion_plan(
             discussion_roles,
             logical_model,
-            context,
+            plan_context,
             capability_gateway=self._capability_gateway,
         )
         role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
@@ -1504,6 +1505,21 @@ class ConfigBackedHybridRuntime:
             config=config,
             required_capabilities_by_role=role_capability_requirements,
         )
+
+
+def _runtime_plan_context(context: TaskContext) -> TaskContext:
+    token_budget = context.routing_decision.get("runtime_plan_token_budget")
+    timeout_seconds = context.routing_decision.get("runtime_plan_timeout_seconds")
+    updates: dict[str, object] = {}
+    if type(token_budget) is int and 1 <= token_budget <= 10_000_000:
+        updates["token_budget"] = token_budget
+    if (
+        isinstance(timeout_seconds, int | float)
+        and not isinstance(timeout_seconds, bool)
+        and 0 < timeout_seconds <= 3_600
+    ):
+        updates["timeout_seconds"] = float(timeout_seconds)
+    return context if not updates else context.model_copy(update=updates)
 
 
 async def _current_platform_config(

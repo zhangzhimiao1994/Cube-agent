@@ -1755,6 +1755,7 @@ class RunService:
             runtime_routing_decision = _with_runtime_token_budget_policy(
                 routing_decision,
                 configured_tokens=self._runtime_token_budget,
+                mode=mode,
             )
             token_budget = _runtime_token_budget(
                 mode,
@@ -4659,6 +4660,7 @@ def _with_runtime_token_budget_policy(
     routing_decision: Mapping[str, object],
     *,
     configured_tokens: int,
+    mode: TaskMode = TaskMode.DIRECT,
 ) -> dict[str, object]:
     decision = dict(routing_decision)
     soft_base = (
@@ -4680,6 +4682,15 @@ def _with_runtime_token_budget_policy(
         absolute_limit,
         _RUNTIME_TOKEN_ABSOLUTE_LIMIT,
     )
+    decision["runtime_plan_token_budget"] = _runtime_token_budget(
+        mode,
+        configured_tokens=configured_tokens,
+        routing_decision=decision,
+        progress_units=0,
+    )
+    initial_timeout = _routing_runtime_timeout_seconds(decision, progress_units=0)
+    if initial_timeout is not None:
+        decision["runtime_plan_timeout_seconds"] = initial_timeout
     return decision
 
 

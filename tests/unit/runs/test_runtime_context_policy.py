@@ -110,10 +110,18 @@ def test_runtime_token_budget_extends_from_current_run_progress_with_absolute_fu
 
 def test_runtime_token_policy_exposes_soft_base_and_bounded_absolute_limit() -> None:
     assert _with_runtime_token_budget_policy(
-        {"project_scale": "large"},
+        {
+            "project_scale": "large",
+            "runtime_timeout_seconds": 1_200.0,
+            "runtime_timeout_source": "project_scale_soft_budget",
+        },
         configured_tokens=2_000,
     ) == {
         "project_scale": "large",
+        "runtime_plan_timeout_seconds": 1_200.0,
+        "runtime_plan_token_budget": 5_000,
+        "runtime_timeout_seconds": 1_200.0,
+        "runtime_timeout_source": "project_scale_soft_budget",
         "runtime_token_soft_base_tokens": 2_000,
         "runtime_token_absolute_tokens": 10_000_000,
     }

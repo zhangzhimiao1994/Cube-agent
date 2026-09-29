@@ -4819,6 +4819,77 @@ async def test_config_backed_hybrid_runtime_shares_artifact_repository_across_st
 
 
 @pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_keeps_plan_digest_stable_across_budget_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    ProbeDiscussionRuntime.instances.clear()
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    config = FakeConfigService(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://main",
+                            "quota_scope_id": "deepseek_account",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": [
+                                "text",
+                                "tool_calling",
+                                "structured_output",
+                            ],
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+    routing_decision = {
+        "project_scale": "large",
+        "runtime_plan_token_budget": 2_500_000,
+        "runtime_plan_timeout_seconds": 1_800.0,
+    }
+    run_id = uuid4()
+
+    for token_budget, timeout_seconds in ((2_500_000, 1_800.0), (2_750_000, 2_100.0)):
+        runtime = ConfigBackedHybridRuntime(
+            config_service=config,  # type: ignore[arg-type]
+            secret_service=FakeSecretService(),  # type: ignore[arg-type]
+            capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+                tenant_id, deployments
+            ),
+            transport=FakeTransport(),
+        )
+        _ = [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=run_id,
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.HYBRID,
+                    request="Build a real large business project.",
+                    routing_decision=routing_decision,
+                    token_budget=token_budget,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
+        ]
+
+    assert len(ProbeDispatchRuntime.instances) == 2
+    assert ProbeDispatchRuntime.instances[0].plan.digest == ProbeDispatchRuntime.instances[1].plan.digest
+
+
+@pytest.mark.asyncio
 async def test_project_preflight_agent_uses_model_with_effective_tool_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
