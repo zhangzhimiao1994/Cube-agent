@@ -434,6 +434,7 @@ def run_real_user_plugin_acceptance(
     key_registered = False
     installed = False
     run_id = ""
+    run_terminal = False
     try:
         principal = _mapping(client.request_json("GET", "/api/v1/auth/me"), "principal")
         user_id = principal.get("user_id")
@@ -528,8 +529,10 @@ def run_real_user_plugin_acceptance(
             wait_seconds=wait_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
-        if details.get("status") != "completed":
-            raise RuntimeError(f"public plugin run ended with status {details.get('status')}")
+        run_status = details.get("status")
+        run_terminal = run_status in _TERMINAL_RUN_STATUSES
+        if run_status != "completed":
+            raise RuntimeError(f"public plugin run ended with status {run_status}")
         phases.append("public_run_completed")
         events = client.request_json(
             "GET", f"/api/v1/runs/{quote(run_id, safe='')}/events"
@@ -552,12 +555,25 @@ def run_real_user_plugin_acceptance(
     except Exception as error:  # noqa: BLE001 - always clean up and return machine-readable evidence.
         errors.append(str(error))
     finally:
+        run_cleanup_completed: list[str] = []
+        run_cleanup_errors: list[str] = []
+        if run_id and not run_terminal:
+            try:
+                client.request_json(
+                    "POST",
+                    f"/api/v1/runs/{quote(run_id, safe='')}/cancel",
+                )
+                run_cleanup_completed.append("cancel_run")
+            except Exception as error:  # noqa: BLE001 - plugin cleanup must still continue.
+                run_cleanup_errors.append(f"cancel_run: {error}")
         cleanup_completed, cleanup_errors = _cleanup(
             client,
             package,
             installed=installed,
             key_registered=key_registered,
         )
+        cleanup_completed = [*run_cleanup_completed, *cleanup_completed]
+        cleanup_errors = [*run_cleanup_errors, *cleanup_errors]
         errors.extend(cleanup_errors)
     passed = not errors and "verify_removed" in cleanup_completed
     return {

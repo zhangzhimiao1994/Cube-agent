@@ -29,10 +29,12 @@ class FakePluginAcceptanceClient:
         audit_matches: bool = True,
         capability_available: bool = True,
         availability_reason: str | None = None,
+        run_status: str = "completed",
     ) -> None:
         self.audit_matches = audit_matches
         self.capability_available = capability_available
         self.availability_reason = availability_reason
+        self.run_status = run_status
         self.requests: list[tuple[str, str]] = []
         self.plugin_id = ""
         self.capability_id = ""
@@ -117,7 +119,9 @@ class FakePluginAcceptanceClient:
             assert self.capability_id in str(body["message"])
             return {"id": "run-public-1", "status": "queued", "version": 1}
         if path == "/api/v1/runs/run-public-1/details":
-            return {"id": "run-public-1", "status": "completed", "version": 2}
+            return {"id": "run-public-1", "status": self.run_status, "version": 2}
+        if path == "/api/v1/runs/run-public-1/cancel" and method == "POST":
+            return {"id": "run-public-1", "status": "cancelled", "version": 3}
         if path == "/api/v1/runs/run-public-1/events":
             return {
                 "items": [
@@ -283,6 +287,30 @@ def test_real_user_plugin_acceptance_cleans_up_after_evidence_failure(tmp_path: 
     assert any(path.endswith("/stop") for _, path in client.requests)
     assert any(path.endswith("/uninstall") for _, path in client.requests)
     assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
+
+
+def test_real_user_plugin_acceptance_cancels_nonterminal_run_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    client = FakePluginAcceptanceClient(run_status="queued")
+
+    report = module.run_real_user_plugin_acceptance(
+        client,
+        execution_id="flow-timeout",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    assert report["status"] == "failed"
+    assert ("POST", "/api/v1/runs/run-public-1/cancel") in client.requests
+    assert "cancel_run" in report["cleanup"]["completed"]
+    cancel_index = client.requests.index(("POST", "/api/v1/runs/run-public-1/cancel"))
+    uninstall_index = next(
+        index for index, request in enumerate(client.requests) if request[1].endswith("/uninstall")
+    )
+    assert cancel_index < uninstall_index
 
 
 def test_real_user_plugin_acceptance_reports_manifest_unavailable_reason(tmp_path: Path) -> None:
