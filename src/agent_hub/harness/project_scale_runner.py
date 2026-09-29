@@ -3484,7 +3484,11 @@ def _workspace_repair_context(
     if not files:
         return ""
     paths = sorted(files)
-    relevant_paths = _repair_context_relevant_paths(paths, failed_reasons)
+    relevant_paths = _repair_context_relevant_paths(
+        paths,
+        failed_reasons,
+        file_bytes=files,
+    )
     snippets = []
     for path in relevant_paths:
         raw = files.get(path)
@@ -3514,6 +3518,8 @@ def _workspace_repair_context(
 def _repair_context_relevant_paths(
     paths: Sequence[str],
     failed_reasons: Sequence[str],
+    *,
+    file_bytes: Mapping[str, bytes] | None = None,
 ) -> list[str]:
     path_set = set(paths)
     selected: list[str] = []
@@ -3529,6 +3535,46 @@ def _repair_context_relevant_paths(
             normalized_path = path.replace("\\", "/").lstrip("/")
             if candidate == normalized_path or candidate.endswith(f"/{normalized_path}"):
                 add(path)
+    lowered_failed_text = failed_text.casefold()
+    endpoints = tuple(
+        dict.fromkeys(
+            match.rstrip(":,.;)")
+            for match in re.findall(r"/[A-Za-z0-9_./:-]+", failed_text)
+            if len(match.rstrip(":,.;)")) > 1
+        )
+    )
+    if file_bytes is not None and endpoints:
+        for path in paths:
+            raw = file_bytes.get(path)
+            if raw is None:
+                continue
+            content = raw.decode("utf-8", errors="replace").casefold()
+            if any(endpoint.casefold() in content for endpoint in endpoints):
+                add(path)
+    path_terms = {
+        term
+        for endpoint in endpoints
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", endpoint.casefold())
+    }
+    path_terms.update(
+        term
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", lowered_failed_text)
+        if term
+        not in {
+            "expected",
+            "missing",
+            "operations",
+            "workflow",
+            "request",
+            "response",
+            "status",
+        }
+    )
+    for path in paths:
+        normalized_path = path.replace("\\", "/").casefold()
+        path_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", normalized_path))
+        if path_words & path_terms:
+            add(path)
     for path in paths:
         basename = PurePosixPath(path).name.lower()
         if basename in {"package.json", "tsconfig.json"}:

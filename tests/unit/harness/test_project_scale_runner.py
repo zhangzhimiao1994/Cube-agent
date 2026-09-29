@@ -118,6 +118,27 @@ def test_repair_context_maps_absolute_failure_paths_to_workspace_files(
     assert "tsconfig.json" in selected
 
 
+def test_repair_context_prioritizes_runtime_endpoint_and_module_matches() -> None:
+    files = {
+        "package.json": b'{"scripts":{"test":"node --test"}}',
+        "tsconfig.json": b'{"compilerOptions":{"strict":true}}',
+        "src/app.ts": b"if (path === '/inventory/stock') return inventory.addStock(body);",
+        "src/modules/inventory.ts": b"export class InventoryService {}",
+        "src/modules/orders.ts": b"export class OrderService {}",
+        "tests/api.test.ts": b"test('inventory endpoint', () => {});",
+    }
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(
+        tuple(files),
+        ("order operations workflow: POST /inventory/stock: missing id",),
+        file_bytes=files,
+    )
+
+    assert selected[:2] == ["src/app.ts", "src/modules/inventory.ts"]
+    assert "package.json" in selected
+    assert "tsconfig.json" in selected
+
+
 def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
