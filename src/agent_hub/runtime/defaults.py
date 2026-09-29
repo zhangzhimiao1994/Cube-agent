@@ -1859,6 +1859,18 @@ def _dispatch_plan(
     producer_step_ids = tuple(
         f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
     )
+    approval_free_producer_step_ids = tuple(
+        f"{role.id}_step"
+        for role in selected_roles
+        if not _is_post_product_role(role)
+        and not _dispatch_role_may_require_approval(role)
+    )
+    approval_execute_step_ids = tuple(
+        f"{role.id}_step"
+        for role in selected_roles
+        if role.purpose is RolePurpose.EXECUTE
+        and _dispatch_role_may_require_approval(role)
+    )
     preflight_dependencies = (_PROJECT_PREFLIGHT_STEP_ID,) if preflight_context else ()
     preflight_steps = (
         (
@@ -1904,6 +1916,8 @@ def _dispatch_plan(
             depends_on=_dispatch_step_dependencies(
                 role,
                 producer_step_ids=producer_step_ids,
+                approval_free_producer_step_ids=approval_free_producer_step_ids,
+                approval_execute_step_ids=approval_execute_step_ids,
                 preflight_dependencies=preflight_dependencies,
                 multi_agent_chain=multi_agent_chain,
             ),
@@ -2027,6 +2041,8 @@ def _dispatch_step_dependencies(
     role: RoleAssignment,
     *,
     producer_step_ids: tuple[str, ...],
+    approval_free_producer_step_ids: tuple[str, ...],
+    approval_execute_step_ids: tuple[str, ...],
     preflight_dependencies: tuple[str, ...],
     multi_agent_chain: bool,
 ) -> tuple[str, ...]:
@@ -2038,7 +2054,24 @@ def _dispatch_step_dependencies(
         }[role.id]
     if _is_post_product_role(role) and producer_step_ids:
         return producer_step_ids
+    if role.purpose is RolePurpose.EXECUTE and _dispatch_role_may_require_approval(role):
+        current_step_id = f"{role.id}_step"
+        current_index = approval_execute_step_ids.index(current_step_id)
+        return tuple(
+            dict.fromkeys(
+                (
+                    *preflight_dependencies,
+                    *approval_free_producer_step_ids,
+                    *approval_execute_step_ids[:current_index],
+                )
+            )
+        )
     return preflight_dependencies
+
+
+def _dispatch_role_may_require_approval(role: RoleAssignment) -> bool:
+    approval_free_tools = {"read_context", "workspace.list"}
+    return any(tool not in approval_free_tools for tool in role.allowed_tools)
 
 
 def _is_post_product_role(role: RoleAssignment) -> bool:

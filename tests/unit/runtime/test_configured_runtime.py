@@ -6070,6 +6070,83 @@ def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> Non
     assert steps["final_response_step"].timeout_seconds <= 600
 
 
+def test_dispatch_plan_quiesces_planning_before_serial_execution_roles() -> None:
+    roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the implementation.",
+            must_answer=("What should be built?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the project files.",
+            must_answer=("What was implemented?",),
+            allowed_tools=("workspace.write_text", "workspace.bundle"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="installer",
+            role="Installer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Install the generated project.",
+            must_answer=("What was installed?",),
+            allowed_tools=("run_safe_command",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="tester",
+            role="Tester",
+            purpose=RolePurpose.VERIFY,
+            mission="Verify the completed project.",
+            must_answer=("What passed?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Build and verify a project that requires approved workspace writes.",
+        ),
+        max_parallelism=4,
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+    assert steps["architect"].depends_on == ()
+    assert steps["implementer"].depends_on == ("architect_step",)
+    assert steps["installer"].depends_on == (
+        "architect_step",
+        "implementer_step",
+    )
+    assert steps["tester"].depends_on == (
+        "architect_step",
+        "implementer_step",
+        "installer_step",
+    )
+
+
 def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> None:
     roles = tuple(
         RoleAssignment(
