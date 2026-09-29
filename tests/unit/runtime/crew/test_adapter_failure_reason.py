@@ -113,7 +113,10 @@ class ProjectPreflightToolGateway:
                     ToolCall(
                         id="preflight-call",
                         name="project_preflight_architecture",
-                        arguments={"title": "Large Project", "request": "Plan the project"},
+                        arguments={
+                            "title": "Large Project",
+                            "summary": "model supplied but unsupported",
+                        },
                     ),
                 ),
                 usage=TokenUsage(1, 1, 2),
@@ -437,6 +440,31 @@ class ProjectPreflightCapabilities(FakeCapabilities):
 
     def is_replay_safe(self, name: str) -> bool:
         return name == "project.preflight_architecture"
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, object]:
+        del tenant_id
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "project.preflight_architecture",
+                    "kind": "builtin",
+                    "adapter": "runtime_builtin",
+                    "available": True,
+                    "input_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 96,
+                            },
+                        },
+                    },
+                },
+            ),
+        }
 
 
 class ManifestCapabilities(FakeCapabilities):
@@ -3781,6 +3809,84 @@ def test_project_preflight_tool_call_gets_server_owned_workspace_scope() -> None
     assert original.arguments["project_id"] == "model-supplied-project"
     assert scoped.arguments["project_id"] == "large-project"
     assert scoped.arguments["workspace_session_id"] == "conv-large-project"
+    assert scoped.arguments["request"] == "创建大型项目架构预检"
+    assert set(scoped.arguments) == {
+        "title",
+        "request",
+        "project_id",
+        "workspace_session_id",
+    }
+
+
+def test_project_preflight_tool_call_restores_missing_request_from_context() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request="创建大型项目架构预检",
+        routing_decision={
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+        },
+    )
+    original = ToolCall(
+        id="preflight-call",
+        name="project.preflight_architecture",
+        arguments={"title": "大型项目", "summary": "模型生成的摘要"},
+    )
+
+    scoped = _scope_project_workspace_tool_call(context, original)
+
+    assert "request" not in original.arguments
+    assert scoped.arguments["request"] == context.request
+    assert "summary" not in scoped.arguments
+
+
+def test_project_preflight_tool_call_bounds_server_owned_request_and_title() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request="需" * 2_000,
+        routing_decision={
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+        },
+    )
+    original = ToolCall(
+        id="preflight-call",
+        name="project.preflight_architecture",
+        arguments={"title": " 标题 " + ("长" * 200)},
+    )
+
+    scoped = _scope_project_workspace_tool_call(context, original)
+
+    assert scoped.arguments["request"] == "需" * 1_200
+    assert scoped.arguments["title"] == ("标题 " + ("长" * 200))[:96]
+
+
+def test_project_preflight_tool_call_normalizes_whitespace_before_bounding() -> None:
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request=(" " * 1_300) + "保留真实需求",
+        routing_decision={
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+        },
+    )
+
+    scoped = _scope_project_workspace_tool_call(
+        context,
+        ToolCall(
+            id="preflight-call",
+            name="project.preflight_architecture",
+            arguments={},
+        ),
+    )
+
+    assert scoped.arguments["request"] == "保留真实需求"
 
 
 @pytest.mark.parametrize(
@@ -3821,8 +3927,9 @@ def test_project_preflight_tool_call_rejects_missing_server_scope(
 
 async def test_project_preflight_runtime_injects_server_scope_before_capability_execution() -> None:
     capabilities = ProjectPreflightCapabilities()
+    model_gateway = ProjectPreflightToolGateway()
     runtime = CrewDispatchRuntime(
-        ProjectPreflightToolGateway(),
+        model_gateway,
         _project_preflight_tool_plan(),
         capability_gateway=capabilities,
         crew_factory=FastFactory(),
@@ -3850,11 +3957,20 @@ async def test_project_preflight_runtime_injects_server_scope_before_capability_
     assert capabilities.arguments == [
         {
             "title": "Large Project",
-            "request": "Plan the project",
+            "request": "Write a short answer",
             "project_id": "large-project",
             "workspace_session_id": "conv-large-project",
         }
     ]
+    (tool_definition,) = model_gateway.requests[0].tools
+    assert tool_definition.name == "project_preflight_architecture"
+    assert tool_definition.parameters == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 96},
+        },
+    }
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 

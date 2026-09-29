@@ -1308,6 +1308,17 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "availability_reason": "project_workspace_store_not_configured",
                 "replay_safe": True,
                 "aliases": (),
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 96,
+                        },
+                    },
+                },
             },
             {
                 "id": "project.generate_zip",
@@ -1429,6 +1440,17 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "availability_reason": "project_workspace_store_not_configured",
             "replay_safe": True,
             "aliases": (),
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                    },
+                },
+            },
         },
         {
             "id": "project.generate_zip",

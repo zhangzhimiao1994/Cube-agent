@@ -10,6 +10,7 @@ from agent_hub.plugins.dependency_policy import (
     PluginPackageDependencyPolicy,
     plugin_package_dependency_lock,
 )
+from agent_hub.project_preflight import project_preflight_model_input_schema
 from agent_hub.runtime.contracts import JsonValue
 
 from .project_zip import (
@@ -328,6 +329,7 @@ def create_builtin_tool_registry() -> ToolRegistry:
         permission_class="file.create",
         sandbox_profile="project_workspace_store",
         replay_safe=True,
+        input_schema=project_preflight_model_input_schema(),
     )
     registry.register(
         PROJECT_ZIP_TOOL_NAME,

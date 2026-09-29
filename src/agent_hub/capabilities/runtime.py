@@ -39,7 +39,10 @@ from agent_hub.files.generated import (
     safe_generated_filename,
 )
 from agent_hub.files.workspace import ProjectWorkspaceFile, ProjectWorkspaceStore
-from agent_hub.project_preflight import build_project_preflight_files
+from agent_hub.project_preflight import (
+    build_project_preflight_files,
+    project_preflight_model_input_schema,
+)
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
@@ -1196,6 +1199,8 @@ def _builtin_sandbox_profile(name: str) -> str:
 
 
 def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+    if name == _PROJECT_PREFLIGHT_TOOL:
+        return project_preflight_model_input_schema()
     if name == _WORKSPACE_WRITE_TOOL:
         return {
             "type": "object",

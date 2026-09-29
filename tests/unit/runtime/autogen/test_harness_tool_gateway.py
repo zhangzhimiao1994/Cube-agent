@@ -130,6 +130,150 @@ async def test_workspace_tool_routes_workspace_write_approval_envelope() -> None
     ]
 
 
+async def test_project_preflight_tool_injects_server_owned_context() -> None:
+    class ReplayGateway:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.preflight_architecture"
+
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            del kwargs
+            raise AssertionError("tool execution must be routed through harness")
+
+    class HarnessGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"summary": "preflight ready"},
+            )
+
+    async def publish(
+        durable_artifacts: tuple[Artifact, ...],
+        model_entries: tuple[dict[str, JsonValue], ...],
+        tool_entries: tuple[dict[str, JsonValue], ...],
+    ) -> None:
+        del durable_artifacts, model_entries, tool_entries
+
+    async def store(artifact: Artifact) -> UUID:
+        del artifact
+        return uuid4()
+
+    async def abort(write_id: UUID) -> bool:
+        del write_id
+        return True
+
+    def finalize(write_id: UUID) -> None:
+        del write_id
+
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISCUSS,
+        request="创建大型项目架构预检",
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
+        routing_decision={
+            "project_id": "large-project",
+            "workspace_session_id": "conv-large-project",
+        },
+    )
+    harness = HarnessGateway()
+    tool = GatewayCapabilityTool(
+        ReplayGateway(),
+        tenant_id=context.tenant_id,
+        run_id=context.run_id,
+        actor="architect",
+        name="project.preflight_architecture",
+        records=[],
+        durability=_DiscussionDurability(
+            publish,
+            store,
+            abort,
+            finalize,
+            run_id=context.run_id,
+        ),
+        harness_tool_gateway=harness,
+        user_id=context.actor_id,
+        role=context.actor_role,
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 96},
+            },
+        },
+        server_context=context,
+    )
+
+    assert tool.schema["parameters"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 96},
+        },
+    }
+
+    await tool.run_json(
+        {
+            "title": " Large Project ",
+            "summary": "unsupported",
+            "request": "forged",
+            "project_id": "forged-project",
+        },
+        CancellationToken(),
+        call_id="preflight-call",
+    )
+
+    assert len(harness.calls) == 1
+    assert harness.calls[0].arguments == {
+        "title": "Large Project",
+        "request": context.request,
+        "project_id": "large-project",
+        "workspace_session_id": "conv-large-project",
+    }
+
+    missing_scope_tool = GatewayCapabilityTool(
+        ReplayGateway(),
+        tenant_id=context.tenant_id,
+        run_id=context.run_id,
+        actor="architect",
+        name="project.preflight_architecture",
+        records=[],
+        durability=_DiscussionDurability(
+            publish,
+            store,
+            abort,
+            finalize,
+            run_id=context.run_id,
+        ),
+        harness_tool_gateway=harness,
+        server_context=TaskContext(
+            run_id=context.run_id,
+            tenant_id=context.tenant_id,
+            mode=context.mode,
+            request=context.request,
+        ),
+    )
+    with pytest.raises(
+        RuntimeExecutionError,
+        match="project preflight workspace scope is not configured",
+    ):
+        await missing_scope_tool.run_json({}, CancellationToken(), call_id="missing-scope")
+
+
 async def test_gateway_capability_tool_routes_through_harness_with_actor_identity() -> None:
     class ReplayGateway:
         def is_replay_safe(self, name: str) -> bool:

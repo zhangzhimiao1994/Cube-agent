@@ -223,6 +223,17 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
                 "sandbox_profile": "project_workspace_store",
                 "replay_safe": True,
                 "aliases": (),
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 96,
+                        },
+                    },
+                },
             },
             {
                 "id": "workspace.bundle",

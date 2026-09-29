@@ -61,6 +61,7 @@ from agent_hub.models.types import (
     ToolDefinition,
     _require_safe_identifier,
 )
+from agent_hub.project_preflight import scoped_project_preflight_arguments
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
@@ -2157,9 +2158,19 @@ def _scope_project_workspace_tool_call(
         if tool_call.name == "project.preflight_architecture":
             raise RuntimeExecutionError("project preflight workspace scope is not configured")
         return tool_call
-    arguments = dict(tool_call.arguments)
-    arguments["project_id"] = project_id
-    arguments["workspace_session_id"] = workspace_session_id
+    if tool_call.name == "project.preflight_architecture":
+        arguments = dict(
+            scoped_project_preflight_arguments(
+                request=context.request,
+                project_id=project_id,
+                workspace_session_id=workspace_session_id,
+                model_arguments=tool_call.arguments,
+            )
+        )
+    else:
+        arguments = dict(tool_call.arguments)
+        arguments["project_id"] = project_id
+        arguments["workspace_session_id"] = workspace_session_id
     return ToolCall(id=tool_call.id, name=tool_call.name, arguments=arguments)
 
 

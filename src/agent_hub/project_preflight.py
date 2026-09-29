@@ -4,9 +4,45 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Mapping
+
+from agent_hub.runtime.contracts import JsonValue
 
 _MAX_TITLE_CHARS = 96
 _MAX_REQUEST_CHARS = 1200
+
+
+def project_preflight_model_input_schema() -> Mapping[str, JsonValue]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": _MAX_TITLE_CHARS},
+        },
+    }
+
+
+def scoped_project_preflight_arguments(
+    *,
+    request: str,
+    project_id: str,
+    workspace_session_id: str,
+    model_arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    arguments: dict[str, JsonValue] = {}
+    title = model_arguments.get("title")
+    if isinstance(title, str):
+        safe_title = _safe_text(title, default="", max_chars=_MAX_TITLE_CHARS)
+        if safe_title:
+            arguments["title"] = safe_title
+    arguments["request"] = _safe_text(
+        request,
+        default="No request text provided.",
+        max_chars=_MAX_REQUEST_CHARS,
+    )
+    arguments["project_id"] = project_id
+    arguments["workspace_session_id"] = workspace_session_id
+    return arguments
 
 
 def build_project_preflight_files(*, title: str, request: str) -> dict[str, bytes]:

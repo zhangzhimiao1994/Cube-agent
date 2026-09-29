@@ -64,6 +64,7 @@ from agent_hub.models.types import (
     TokenUsage,
 )
 from agent_hub.models.types import ToolCall as GatewayToolCall
+from agent_hub.project_preflight import scoped_project_preflight_arguments
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
@@ -1242,6 +1243,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         description: str | None = None,
         input_schema: Mapping[str, JsonValue] | None = None,
         failure_codes: Sequence[str] = (),
+        server_context: TaskContext | None = None,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -1264,6 +1266,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._approval_envelope_required = approval_envelope_required
         self._sandbox_profile = sandbox_profile
         self._input_schema = _safe_manifest_input_schema(input_schema)
+        self._server_context = server_context
 
     @property
     def schema(self) -> ToolSchema:
@@ -1306,6 +1309,24 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         )
         _safe_id(safe_call_id, "tool call id")
         arguments = dict(args.model_extra or {})
+        if self.name == "project.preflight_architecture":
+            context = self._server_context
+            if context is None:
+                raise RuntimeExecutionError("project preflight workspace scope is not configured")
+            project_id = context.routing_decision.get("project_id")
+            workspace_session_id = context.routing_decision.get("workspace_session_id")
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise RuntimeExecutionError("project preflight workspace scope is not configured")
+            if not isinstance(workspace_session_id, str) or not workspace_session_id.strip():
+                raise RuntimeExecutionError("project preflight workspace scope is not configured")
+            arguments = dict(
+                scoped_project_preflight_arguments(
+                    request=context.request,
+                    project_id=project_id,
+                    workspace_session_id=workspace_session_id,
+                    model_arguments=cast(Mapping[str, JsonValue], arguments),
+                )
+            )
         try:
             encoded = json.dumps(
                 arguments,
@@ -2068,6 +2089,7 @@ class AutoGenDiscussionRuntime:
                             description=_manifest_description(metadata, name),
                             input_schema=_manifest_input_schema(metadata),
                             failure_codes=_manifest_failure_codes(metadata),
+                            server_context=context,
                         )
                     )
                 return tools
