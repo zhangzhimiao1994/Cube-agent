@@ -3497,6 +3497,170 @@ async def test_natural_large_project_writes_workspace_incrementally_before_bundl
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+async def test_workspace_repair_prunes_obsolete_files_before_bundle() -> None:
+    order: list[tuple[str, object]] = []
+
+    class RepairGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.calls += 1
+            files = {
+                "package.json": '{"scripts":{"test":"node --test"}}',
+                "README.md": "# Repaired project\n",
+                "IMPLEMENTATION_PLAN.md": "# Plan\n",
+                "VERIFICATION.md": "# Verification\n",
+                "src/main.js": "export const ready = true;\n",
+                "tests/app.test.js": "import assert from 'node:assert';\nassert.ok(true);\n",
+            }
+            responses = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=tuple(
+                        ToolCall(
+                            id=f"write-{index}",
+                            name="workspace.write_text",
+                            arguments={"path": path, "content": content},
+                        )
+                        for index, (path, content) in enumerate(files.items())
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="bundle",
+                        name="workspace.bundle",
+                        arguments={"title": "Repaired project"},
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                ModelResponse(text="Workspace repair delivered.", usage=TokenUsage(1, 1, 2)),
+            )
+            return GatewayCompletion(
+                response=responses[min(self.calls - 1, len(responses) - 1)],
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+                cost_usd=Decimal(0),
+            )
+
+    class RepairCapabilities(FakeCapabilities):
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, idempotency_key
+            order.append((name, dict(arguments)))
+            return {"removed_paths": ("src/domain/validation.ts",)}
+
+        def is_replay_safe(self, name: str) -> bool:
+            return name in {"workspace.write_text", "workspace.bundle", "workspace.prune"}
+
+    class RepairHarness:
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            order.append((request.tool_name, dict(request.arguments)))
+            payload: Mapping[str, JsonValue] = {"summary": "completed"}
+            if request.tool_name == "workspace.bundle":
+                payload = {
+                    "artifact_id": str(uuid4()),
+                    "presentation": "final_attachment",
+                    "file": {"filename": "repaired-project.zip"},
+                }
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload=payload,
+            )
+
+    task = (
+        "Role mission: repair.\n"
+        "User task: repair the project\n"
+        "Project workspace delivery contract: produce complete workspace files and a downloadable bundle."
+    )
+    tools = ("workspace.write_text", "workspace.bundle")
+    plan = DispatchPlan(
+        agents=(AgentSpec(
+            id="implementer",
+            role="Implementer",
+            goal="Repair the project incrementally.",
+            logical_model="general",
+            allowed_tools=tools,
+        ),),
+        steps=(DispatchStep(
+            id="implementer_step",
+            agent="implementer",
+            task=task,
+            tools=tools,
+            final_synthesizer=True,
+            token_budget=10_000,
+            tool_argument_budget_bytes={"workspace.write_text": 512_000},
+        ),),
+        allowed_tools=tools,
+        total_token_budget=10_000,
+    )
+    runtime = CrewDispatchRuntime(
+        RepairGateway(),
+        plan,
+        capability_gateway=RepairCapabilities(),
+        harness_tool_gateway=RepairHarness(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(_context(
+            actor_id=uuid4(),
+            actor_role=Role.OPERATOR,
+            routing_decision={
+                "project_id": "repaired-project",
+                "workspace_session_id": "repaired-project-session",
+                "sandbox_profile": "workspace_write",
+                "project_scale": "large",
+                "project_delivery": "workspace",
+                "artifact_strategy": "workspace_bundle",
+                "replace_workspace_files": True,
+            },
+            token_budget=10_000,
+        ))
+    ]
+
+    names = [name for name, _arguments in order]
+    assert names == [
+        *("workspace.write_text" for _index in range(6)),
+        "workspace.prune",
+        "workspace.bundle",
+    ]
+    prune_arguments = order[-2][1]
+    assert isinstance(prune_arguments, Mapping)
+    assert prune_arguments["keep_paths"] == (
+        "IMPLEMENTATION_PLAN.md",
+        "README.md",
+        "VERIFICATION.md",
+        "package.json",
+        "src/main.js",
+        "tests/app.test.js",
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
     capabilities = FakeCapabilities()
     harness = FailingHarnessToolGateway()

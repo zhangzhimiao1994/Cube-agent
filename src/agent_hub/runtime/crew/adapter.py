@@ -1551,6 +1551,40 @@ def _is_incremental_workspace_contract_step(step: DispatchStep) -> bool:
     )
 
 
+def _workspace_write_paths_from_evidence(evidence: Sequence[Artifact]) -> set[str]:
+    paths: set[str] = set()
+    for artifact in evidence:
+        if artifact.type != "model_response":
+            continue
+        raw_calls = artifact.content.get("tool_calls")
+        if not isinstance(raw_calls, tuple | list):
+            continue
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, Mapping) or raw_call.get("name") != "workspace.write_text":
+                continue
+            arguments = raw_call.get("arguments")
+            if not isinstance(arguments, Mapping):
+                continue
+            path = arguments.get("path")
+            if isinstance(path, str) and path.strip():
+                paths.add(path.strip())
+    return paths
+
+
+def _workspace_file_set_is_authoritative(paths: set[str]) -> bool:
+    required = {
+        "package.json",
+        "README.md",
+        "IMPLEMENTATION_PLAN.md",
+        "VERIFICATION.md",
+    }
+    return (
+        required.issubset(paths)
+        and any(path.startswith("src/") for path in paths)
+        and any(path.startswith("tests/") for path in paths)
+    )
+
+
 def _step_timeout_recovery_window_seconds(step: DispatchStep) -> float:
     if _is_project_scale_tool_contract_step(step):
         return _PROJECT_SCALE_STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
@@ -5688,6 +5722,14 @@ class CrewDispatchRuntime:
                     )
                     await tool_boundary(idempotency_key, tool_running, None)
                 try:
+                    if tool_call.name == "workspace.bundle":
+                        await self._prune_replaced_workspace(
+                            context,
+                            step,
+                            evidence,
+                            run_state=run_state,
+                            step_deadline=step_deadline,
+                        )
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         tool_result = await self._tool_gateway.invoke(
                             context.tenant_id,
@@ -6072,6 +6114,52 @@ class CrewDispatchRuntime:
                 )
             )
         _fail("step capability round limit exceeded")
+
+    async def _prune_replaced_workspace(
+        self,
+        context: TaskContext,
+        step: DispatchStep,
+        evidence: Sequence[Artifact],
+        *,
+        run_state: _RunState,
+        step_deadline: float,
+    ) -> None:
+        if context.routing_decision.get("replace_workspace_files") is not True:
+            return
+        keep_paths = _workspace_write_paths_from_evidence(evidence)
+        if not _workspace_file_set_is_authoritative(keep_paths):
+            return
+        capabilities = self._capabilities
+        if capabilities is None:
+            _fail("incremental workspace replacement is unavailable")
+        canonical_paths = tuple(sorted(keep_paths))
+        digest = hashlib.sha256(
+            json.dumps(canonical_paths, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        try:
+            async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+                await capabilities.execute(
+                    tenant_id=context.tenant_id,
+                    run_id=context.run_id,
+                    actor=step.agent,
+                    name="workspace.prune",
+                    arguments={"keep_paths": canonical_paths},
+                    idempotency_key=f"crew-prune-{context.run_id.hex}-{digest[:16]}",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - redact internal maintenance boundary.
+            _LOGGER.warning(
+                "crew_workspace_prune_failed run_id=%s step_id=%s error_type=%s",
+                context.run_id,
+                step.id,
+                type(error).__name__,
+            )
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            _fail("incremental workspace replacement failed")
 
     @staticmethod
     def _ordered_artifacts(
