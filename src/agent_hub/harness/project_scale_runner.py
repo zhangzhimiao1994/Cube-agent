@@ -4596,7 +4596,8 @@ def _has_trusted_agent_standard_runtime_trace(events: Sequence[object]) -> bool:
     has_context = bool(kinds & {"context.loaded", "runtime.context.loaded"})
     has_plan = bool(kinds & {"plan.created", "runtime.plan.created"})
     has_execution = bool(kinds & {"step.completed", "tool.completed", "runtime.completed"})
-    return has_context and has_plan and has_execution
+    completed_direct_runtime = "runtime.completed" in kinds
+    return has_context and has_execution and (has_plan or completed_direct_runtime)
 
 
 def _event_has_trusted_agent_standard_payload(event: object) -> bool:
