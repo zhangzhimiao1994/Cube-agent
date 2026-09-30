@@ -5532,7 +5532,7 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
     assert repair_keys == expected_repair_keys
 
 
-def test_repeated_build_regression_requires_one_authoritative_recovery() -> None:
+def test_build_regression_requires_one_authoritative_recovery() -> None:
     previous = project_scale_runner_module._DeliverableRepairProgress(
         deficits=("generated_project_validation",),
         failure_fingerprints=("npm test failed",),
@@ -5549,7 +5549,6 @@ def test_repeated_build_regression_requires_one_authoritative_recovery() -> None
     assert project_scale_runner_module._deliverable_repair_requires_authoritative_recovery(
         previous,
         current,
-        seen_signatures={current.signature},
     )
 
 
@@ -5570,7 +5569,6 @@ def test_repeated_same_stage_failure_does_not_force_authoritative_recovery() -> 
     assert not project_scale_runner_module._deliverable_repair_requires_authoritative_recovery(
         previous,
         current,
-        seen_signatures={current.signature},
     )
 
 

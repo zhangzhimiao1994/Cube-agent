@@ -1207,7 +1207,6 @@ def execute_project_scale_plan(
                     _deliverable_repair_requires_authoritative_recovery(
                         repair_progress_state,
                         next_progress_state,
-                        seen_signatures=seen_repair_progress_signatures,
                     )
                 )
                 if repeated_build_regression and regression_repair_followups_remaining > 0:
@@ -3549,17 +3548,8 @@ def _deliverable_repair_followup_warranted(
 def _deliverable_repair_requires_authoritative_recovery(
     previous: _DeliverableRepairProgress,
     current: _DeliverableRepairProgress,
-    *,
-    seen_signatures: set[
-        tuple[
-            tuple[str, ...],
-            tuple[str, ...],
-            int,
-            tuple[tuple[str, int, int], ...],
-        ]
-    ],
 ) -> bool:
-    if current.signature not in seen_signatures or not current.failure_fingerprints:
+    if not current.failure_fingerprints:
         return False
     if previous.validation_stage < 2 or current.validation_stage != 1:
         return False
