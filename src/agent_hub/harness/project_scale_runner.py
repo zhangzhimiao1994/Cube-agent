@@ -1791,8 +1791,25 @@ def _merged_workspace_bundle(base: bytes | None, patch: bytes | None) -> bytes |
         return patch
     if patch_files is None:
         return base
-    base_files.update(patch_files)
+    for path, content in patch_files.items():
+        base_content = base_files.get(path)
+        if (
+            path.casefold().endswith(".json")
+            and base_content is not None
+            and _json_bytes_are_valid(base_content)
+            and not _json_bytes_are_valid(content)
+        ):
+            continue
+        base_files[path] = content
     return _workspace_bundle_from_file_bytes(base_files)
+
+
+def _json_bytes_are_valid(content: bytes) -> bool:
+    try:
+        json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def _workspace_bundle_file_bytes(workspace_bundle: bytes) -> dict[str, bytes] | None:
@@ -3670,14 +3687,16 @@ def _deliverable_repair_body(
             f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
             f"preserve requirements. {delivery_guidance}"
             "File keys must be safe relative paths, not endpoints/URLs/HTTP methods. "
+            "JSON files must use strict JSON syntax with double-quoted keys and strings; "
+            "never return Python or JavaScript object-literal syntax in a .json file. "
             "constraints_reading_evidence.json must include read_before_implementation:true, "
             "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
             "and skills/rules naming applicable SKILL.md or agent-standard rules. "
         )
         medium_guidance = (
             "For medium CRM repairs, include GET /tenants/:tenant_id/opportunities returning "
-            "{items:[...]} and verify created/patched opportunities persist after restart; "
-            "POST create and PATCH responses must be the object itself with top-level id, "
+            "{items:[...]}; verify created/patched opportunities persist after restart. "
+            "POST and PATCH responses require the object itself with top-level id, "
             "never {item:...}, {data:...}, or any wrapper. Medium CRM body fields are exact: "
             "accounts {name}; contacts {account_id,name,email}; opportunities "
             "{account_id,name,amount,stage}; PATCH opportunities {stage}; reminders "
@@ -3686,11 +3705,9 @@ def _deliverable_repair_body(
             "the URL tenant before validating unrelated fields; a missing or foreign "
             "reference returns 404 NOT_FOUND even if email, due_at, note, amount, or stage "
             "is absent or invalid. "
-            "Strict TypeScript must compile: when using Express, type route params "
-            "with Request<{tenant_id:string,...}> or an equivalent explicit params type "
-            "instead of reading tenant_id from default {} params. "
-            "Generated tests must compile: validator helpers that require a field argument "
-            "must be called with that field name, or define safe defaults before testing. "
+            "Strict TypeScript: type Express route params with Request<{tenant_id:string,...}> "
+            "or an equivalent explicit type, not default {} params. Generated tests: validator "
+            "helpers that require a field argument must receive it or define safe defaults. "
         )
         small_guidance = (
             "For small file-backed task API repairs, use single-flight initialization and "

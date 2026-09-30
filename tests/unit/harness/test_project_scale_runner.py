@@ -93,6 +93,31 @@ def test_generated_project_command_env_allows_npm_registry_override(
     assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org/"
 
 
+def test_incremental_workspace_merge_preserves_valid_json_when_patch_is_invalid() -> None:
+    base = _project_bundle(
+        {
+            "package.json": json.dumps(
+                {"scripts": {"build": "tsc", "test": "vitest run"}}
+            ),
+            "src/main.ts": "export const value = 1;\n",
+        }
+    )
+    patch = _project_bundle(
+        {
+            "package.json": "{'scripts': {'build': 'tsc', 'test': 'vitest run'}}\n",
+            "preview.html": "<!doctype html><title>Preview</title>\n",
+        }
+    )
+
+    merged = project_scale_runner_module._merged_workspace_bundle(base, patch)
+
+    assert merged is not None
+    with zipfile.ZipFile(BytesIO(merged)) as archive:
+        package = archive.read("package.json").decode("utf-8")
+        assert json.loads(package)["scripts"]["test"] == "vitest run"
+        assert archive.read("preview.html").decode("utf-8").startswith("<!doctype html>")
+
+
 @pytest.mark.parametrize(
     "failed_reason",
     (
@@ -4269,6 +4294,7 @@ def test_deliverable_repair_prompt_includes_relevant_workspace_context() -> None
     assert "src/types.ts" in repair_message
     assert "CreateServerOptions" in repair_message
     assert "TS2305 means the imported symbol must be exported" in repair_message
+    assert "JSON files must use strict JSON syntax with double-quoted keys and strings" in repair_message
 
 
 def test_deliverable_repair_prompt_preserves_runtime_constructor_exports() -> None:
