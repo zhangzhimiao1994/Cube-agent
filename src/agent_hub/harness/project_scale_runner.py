@@ -925,6 +925,14 @@ def execute_project_scale_plan(
                 1,
                 max_deliverable_repair_attempts - soft_deliverable_repair_attempts,
             )
+            stalled_repair_followups_remaining = max(
+                1,
+                (
+                    max_deliverable_repair_attempts
+                    - soft_deliverable_repair_attempts
+                )
+                // 2,
+            )
             force_authoritative_repair = False
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
@@ -1227,6 +1235,22 @@ def execute_project_scale_plan(
                 if status == "failed" and transient_repair_followups_remaining > 0:
                     repair_followup_warranted = True
                     transient_repair_followups_remaining -= 1
+                stalled_repair = (
+                    status == "completed"
+                    and deliverable_repair_attempts >= soft_deliverable_repair_attempts
+                    and next_progress_state.signature in seen_repair_progress_signatures
+                    and not repair_progress_observed
+                    and not repair_followup_warranted
+                    and stalled_repair_followups_remaining > 0
+                    and not generated_project_validation.passed
+                    and _generated_project_validation_is_repairable(
+                        generated_project_validation
+                    )
+                )
+                if stalled_repair:
+                    repair_followup_warranted = True
+                    stalled_repair_followups_remaining -= 1
+                    force_authoritative_repair = True
                 if (
                     repair_followup_warranted
                     and not repeated_build_regression

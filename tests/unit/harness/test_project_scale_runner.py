@@ -6272,6 +6272,88 @@ def test_capability_repair_retries_transient_failed_run_at_soft_limit(
     assert validation_results == []
 
 
+def test_capability_repair_escalates_stalled_failure_to_authoritative_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                f'generated_project_validation: command failed command=npm run build output_tail="failure-{attempt}"',
+            ),
+        )
+        for attempt in range(3)
+    ]
+    validation_results.extend(
+        (
+            project_scale_runner_module._EvidenceCheck(
+                passed=False,
+                reasons=(
+                    'generated_project_validation: command failed command=npm run build output_tail="failure-2"',
+                ),
+            ),
+            project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+        )
+    )
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-direct-stalled-repair",
+        session_id="project-scale-small-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Task API\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Task API requirement satisfied\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": "- npm run build: passed\n- npm test: passed\n",
+                "package.json": json.dumps(
+                    {"scripts": {"build": "tsc", "test": "node --test"}}
+                ),
+                "src/app.ts": _functional_ts_source(),
+                "tests/unit.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert len(client.submitted_bodies) == 5
+    assert client.submitted_bodies[-1]["replace_workspace_files"] is True
+    assert validation_results == []
+
+
 def test_capability_repair_stops_at_dynamic_safety_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
