@@ -5615,8 +5615,12 @@ def test_execute_project_scale_plan_extends_wait_budget_for_observable_repair(
     assert result.errors == ()
 
 
-@pytest.mark.parametrize("second_regression", (False, True), ids=("recovers", "stops"))
-def test_capability_generated_project_repair_allows_one_validation_regression_followup(
+@pytest.mark.parametrize(
+    "second_regression",
+    (False, True),
+    ids=("single_regression", "repeated_regression"),
+)
+def test_capability_generated_project_repair_allows_repeated_validation_regression_followup(
     monkeypatch: pytest.MonkeyPatch,
     second_regression: bool,
 ) -> None:
@@ -5664,6 +5668,9 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
                 ),
             )
         )
+        validation_results.append(
+            project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+        )
     failed_verification = project_scale_runner_module._EvidenceCheck(
         passed=False,
         reasons=(
@@ -5681,6 +5688,7 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
         verification_results = [failed_verification for _ in range(4)] + [
             alternate_failed_verification,
             alternate_failed_verification,
+            project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
         ]
     else:
         verification_results = [failed_verification for _ in range(4)]
@@ -5758,12 +5766,12 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
 
     report = execute_project_scale_plan(plan, client)
 
-    assert report.ok is not second_regression
+    assert report.ok is True
     result = report.results[0]
     assert result.run_id == "run-medium-direct-validation-repair"
-    assert result.evidence["generated_project_validation"] is not second_regression
+    assert result.evidence["generated_project_validation"] is True
     assert result.evidence["deliverable_repair_trace"] is True
-    assert len(client.submitted_bodies) == (6 if second_regression else 5)
+    assert len(client.submitted_bodies) == (7 if second_regression else 5)
     repair_messages = [str(body["message"]) for body in client.submitted_bodies[1:]]
     assert "src/app.ts(1,1): error TS2322" in repair_messages[0]
     assert "Current workspace context for precise repair" in repair_messages[0]
@@ -5794,6 +5802,7 @@ def test_capability_generated_project_repair_allows_one_validation_regression_fo
     ]
     if second_regression:
         expected_repair_keys.append("project-scale-medium-direct-0-deliverable-repair-5")
+        expected_repair_keys.append("project-scale-medium-direct-0-deliverable-repair-6")
     assert repair_keys == expected_repair_keys
 
 
@@ -5948,7 +5957,7 @@ def test_capability_repair_extends_past_scale_budget_while_validation_progresses
     ]
 
 
-def test_capability_repair_extends_past_scale_budget_for_actionable_stage_regression(
+def test_capability_repair_extends_past_scale_budget_for_repeated_actionable_regressions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -5981,6 +5990,19 @@ def test_capability_repair_extends_past_scale_budget_for_actionable_stage_regres
         project_scale_runner_module._EvidenceCheck(
             passed=False,
             reasons=('generated_project_validation: command failed command=npm test output_tail="new regression"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("requirements: task workflow expected persisted item, got empty list",),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    'generated_project_validation: command failed command=npm test '
+                    'output_tail="second new regression"'
+                ),
+            ),
         ),
         project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
     ]
@@ -6047,7 +6069,7 @@ def test_capability_repair_extends_past_scale_budget_for_actionable_stage_regres
     report = execute_project_scale_plan(plan, client)
 
     assert report.ok is True
-    assert len(client.submitted_bodies) == 7
+    assert len(client.submitted_bodies) == 9
     assert validation_results == []
 
 

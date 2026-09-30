@@ -916,7 +916,10 @@ def execute_project_scale_plan(
             seen_repair_progress_signatures = {repair_progress_state.signature}
             repair_progress_observed = True
             repair_followup_warranted = False
-            regression_repair_followups_remaining = 1
+            regression_repair_followups_remaining = max(
+                1,
+                max_deliverable_repair_attempts - soft_deliverable_repair_attempts,
+            )
             force_authoritative_repair = False
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
