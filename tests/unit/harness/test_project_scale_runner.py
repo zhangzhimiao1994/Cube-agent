@@ -2049,6 +2049,30 @@ def test_capability_standard_requires_runtime_contract(events: list[object] | No
     assert check.reasons
 
 
+def test_capability_standard_accepts_trusted_runtime_context_plan_and_execution_trace() -> None:
+    bundle = _project_bundle(
+        {
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "verification/report.md": "- npm test: passed\n- interaction smoke: passed\n",
+        }
+    )
+    events: list[object] = [
+        {"kind": "runtime.context_loaded", "payload": {"source_count": 3}},
+        {"kind": "runtime.plan_created", "payload": {"step_count": 2}},
+        {"kind": "step.completed", "step_id": "implementer_step"},
+    ]
+
+    check = _evaluate_agent_standard_verification(
+        None,
+        events,
+        bundle,
+        benchmark_kind="capability",
+    )
+
+    assert check.passed is True
+    assert check.reasons == ()
+
+
 def test_workspace_bundle_accepts_report_inside_verification_directory() -> None:
     bundle = _project_bundle(
         {

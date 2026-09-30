@@ -4580,7 +4580,23 @@ def _evaluate_agent_standard_verification(
 def _has_trusted_agent_standard_event(events: list[object] | None) -> bool:
     if not isinstance(events, list):
         return False
-    return any(_event_has_trusted_agent_standard_payload(event) for event in events)
+    return any(_event_has_trusted_agent_standard_payload(event) for event in events) or (
+        _has_trusted_agent_standard_runtime_trace(events)
+    )
+
+
+def _has_trusted_agent_standard_runtime_trace(events: Sequence[object]) -> bool:
+    kinds = {
+        normalized
+        for event in events
+        if isinstance(event, Mapping)
+        if (kind := _string_value(event.get("kind") or event.get("event") or event.get("type")))
+        if (normalized := kind.replace("_", ".").casefold())
+    }
+    has_context = bool(kinds & {"context.loaded", "runtime.context.loaded"})
+    has_plan = bool(kinds & {"plan.created", "runtime.plan.created"})
+    has_execution = bool(kinds & {"step.completed", "tool.completed", "runtime.completed"})
+    return has_context and has_plan and has_execution
 
 
 def _event_has_trusted_agent_standard_payload(event: object) -> bool:
