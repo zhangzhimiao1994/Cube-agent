@@ -4271,6 +4271,48 @@ def test_deliverable_repair_prompt_includes_relevant_workspace_context() -> None
     assert "TS2305 means the imported symbol must be exported" in repair_message
 
 
+def test_deliverable_repair_prompt_preserves_runtime_constructor_exports() -> None:
+    bundle = _project_bundle(
+        {
+            "package.json": json.dumps({"scripts": {"test": "vitest run"}}),
+            "tests/helper.ts": (
+                "import { Storage } from '../src/infrastructure/storage';\n"
+                "export function makeStorage(path: string) { return new Storage(path); }\n"
+            ),
+            "src/infrastructure/storage.ts": (
+                "export class PortfolioStorage {\n"
+                "  constructor(readonly dataDir: string) {}\n"
+                "}\n"
+            ),
+        }
+    )
+
+    repair_body = _deliverable_repair_body(
+        {
+            "message": "Build an enterprise portfolio API.",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "ultra:auto",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle,
+        failed_reasons=(
+            (
+                "generated_project_validation: command failed exit=1 command=npm test "
+                "output_tail=\"tests/helper.ts:18:17 TypeError: Storage is not a constructor\""
+            ),
+        ),
+    )
+
+    repair_message = str(repair_body["message"])
+    assert "tests/helper.ts" in repair_message
+    assert "src/infrastructure/storage.ts" in repair_message
+    assert "PortfolioStorage" in repair_message
+    assert "Runtime import/export repair hint" in repair_message
+    assert "compatible named export" in repair_message
+
+
 def test_execute_project_scale_plan_uses_embedded_workspace_bundle_artifact() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     embedded_bundle = {

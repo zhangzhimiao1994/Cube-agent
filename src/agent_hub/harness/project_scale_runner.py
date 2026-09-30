@@ -3943,6 +3943,49 @@ def _repair_context_relevant_paths(
                 if candidate in path_set and candidate not in priority_provider_paths:
                     priority_provider_paths.append(candidate)
                     add(candidate)
+    runtime_contract_symbols = tuple(
+        dict.fromkeys(
+            re.findall(
+                r"TypeError:\s*([A-Za-z_$][A-Za-z0-9_$]*)\s+is not a\s+"
+                r"(?:constructor|function)\b",
+                failed_text,
+            )
+        )
+    )
+    if file_bytes is not None and runtime_contract_symbols:
+        consumer_paths: list[str] = []
+        for match in _REPAIR_CONTEXT_PATH_RE.finditer(normalized_failed_text):
+            candidate = re.sub(r"/+", "/", match.group(1))
+            for path in _matching_workspace_paths(candidate, paths):
+                if path not in consumer_paths:
+                    consumer_paths.append(path)
+        for consumer_path in consumer_paths:
+            raw = file_bytes.get(consumer_path)
+            if raw is None:
+                continue
+            source = raw.decode("utf-8", errors="replace")
+            for symbol in runtime_contract_symbols:
+                for module_name in _typescript_import_modules_for_symbol(source, symbol):
+                    if not module_name.startswith("."):
+                        continue
+                    module_base = posixpath.normpath(
+                        posixpath.join(posixpath.dirname(consumer_path), module_name)
+                    )
+                    candidates = (
+                        module_base,
+                        *(
+                            f"{module_base}{suffix}"
+                            for suffix in (".ts", ".tsx", ".js", ".mjs", ".cjs")
+                        ),
+                        *(
+                            f"{module_base}/index{suffix}"
+                            for suffix in (".ts", ".tsx", ".js")
+                        ),
+                    )
+                    for candidate in candidates:
+                        if candidate in path_set and candidate not in priority_provider_paths:
+                            priority_provider_paths.append(candidate)
+                            add(candidate)
     global_api_failure_test_paths: list[str] = []
     for reason in failed_reasons:
         if re.search(
@@ -4081,7 +4124,12 @@ def _focused_repair_snippet(
             line_number = int(location.group(1) or location.group(2))
             break
     if line_number is None or not 1 <= line_number <= len(lines):
-        if "TS2305" in normalized_failures or "TS2724" in normalized_failures:
+        if (
+            "TS2305" in normalized_failures
+            or "TS2724" in normalized_failures
+            or "is not a constructor" in normalized_failures
+            or "is not a function" in normalized_failures
+        ):
             export_declarations = [
                 line.strip() for line in lines if re.match(r"\s*export\b", line)
             ]
@@ -4134,6 +4182,32 @@ def _matching_workspace_paths(candidate: str, paths: Sequence[str]) -> list[str]
     ]
 
 
+def _typescript_import_modules_for_symbol(source: str, symbol: str) -> tuple[str, ...]:
+    modules: list[str] = []
+    named_import = re.compile(
+        r"import\s*\{(?P<specifiers>.*?)\}\s*from\s*['\"](?P<module>[^'\"]+)['\"]",
+        flags=re.DOTALL,
+    )
+    for match in named_import.finditer(source):
+        for specifier in match.group("specifiers").split(","):
+            parts = re.split(r"\s+as\s+", specifier.strip())
+            imported = parts[0].strip()
+            local = parts[-1].strip()
+            if symbol not in {imported, local}:
+                continue
+            module_name = match.group("module")
+            if module_name not in modules:
+                modules.append(module_name)
+    default_import = re.compile(
+        rf"import\s+{re.escape(symbol)}\s+from\s*['\"](?P<module>[^'\"]+)['\"]"
+    )
+    for match in default_import.finditer(source):
+        module_name = match.group("module")
+        if module_name not in modules:
+            modules.append(module_name)
+    return tuple(modules)
+
+
 def _compact_repair_snippet(
     text: str,
     *,
@@ -4159,6 +4233,23 @@ def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
             "public interfaces used by other source files and tests while making the smallest "
             "compatible change."
             f"{symbol_note}"
+        )
+    runtime_contract_symbols = tuple(
+        dict.fromkeys(
+            re.findall(
+                r"TypeError:\s*([A-Za-z_$][A-Za-z0-9_$]*)\s+is not a\s+"
+                r"(?:constructor|function)\b",
+                text,
+            )
+        )
+    )
+    if runtime_contract_symbols:
+        hints.append(
+            "Runtime import/export repair hint: preserve the existing imported public contract "
+            f"for {', '.join(runtime_contract_symbols)}. Prefer adding a compatible named export, "
+            "alias, or wrapper with the same constructor/function signature in the provider "
+            "module; do not rename the consumer or replace an already-used API while repairing "
+            "an unrelated behavior."
         )
     if re.search(r"\b(?:describe|it|test|expect|beforeEach|afterEach) is not defined\b", text):
         hints.append(
