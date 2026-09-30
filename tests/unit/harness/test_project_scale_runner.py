@@ -1420,6 +1420,10 @@ def test_ultra_capability_repair_explains_rbac_acceptance_boundary() -> None:
     assert "Customer Migration" in message
     assert "GET /analytics/portfolio.csv" in message
     assert "GET /portfolio/read-model" in message
+    assert "GET /dependencies/:id" in message
+    assert "same stable id" in message
+    assert "after restart" in message
+    assert "missing-project" in message
     assert "Do not prefill pass records or fabricate execution" in message
     assert len(message) <= 6_000
     RolePlanningRequest(task=message, mode=TaskMode.DIRECT)
