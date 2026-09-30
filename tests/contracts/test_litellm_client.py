@@ -803,7 +803,7 @@ async def test_messages_endpoint_supports_tool_definitions_and_tool_use_response
                 parameters={
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
+                    "required": ("query",),
                 },
             )
         ],
