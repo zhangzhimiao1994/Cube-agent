@@ -654,6 +654,7 @@ def run_real_user_four_scale_acceptance(
     poll_interval_seconds: float,
     artifact_build_timeout_seconds: float,
     progress: Callable[[str], None] | None = None,
+    authentication_method: str = "password",
 ) -> dict[str, object]:
     started_at = _utc_now()
     principal = client.request_json("GET", "/api/v1/auth/me")
@@ -827,7 +828,9 @@ def run_real_user_four_scale_acceptance(
         "mode_capability_case_count": len(PROJECT_SCALE_TIERS) * len(_MODE_CAPABILITIES),
         "actor": {
             "username_from_environment": username,
-            "authenticated_via_password_environment": True,
+            "authentication_method": authentication_method,
+            "authenticated_via_password_environment": authentication_method == "password",
+            "authenticated_via_bearer_environment": authentication_method == "bearer_token",
             "principal": principal,
         },
         "case_count": len(cases),
@@ -1131,29 +1134,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if payload.get("acceptance_complete") is True else 1
 
     username, password, tenant_id = _acceptance_credentials_from_env()
-    if not username or not password:
+    bearer_token = os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "").strip()
+    if not bearer_token and (not username or not password):
         parser.error(
+            "AGENT_HUB_ACCEPTANCE_BEARER_TOKEN or "
             "AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required "
             "(AGENT_HUB_ACCEPTANCE_LOGIN_USERNAME/PASSWORD is also accepted)"
         )
+    login_username = None if bearer_token else username
+    login_password = None if bearer_token else password
 
     delegate = UrllibAcceptanceClient(
         base_url=args.base_url,
+        bearer_token=bearer_token,
         timeout=args.timeout,
-        username=username,
-        password=password,
+        username=login_username,
+        password=login_password,
         tenant_id=tenant_id,
     )
     client = RealUserAcceptanceClient(delegate)
     try:
         payload = run_real_user_four_scale_acceptance(
             client,
-            username=username,
+            username=username or "bearer-token",
             base_url=args.base_url,
             execution_id=args.execution_id,
             wait_seconds=args.wait_seconds,
             poll_interval_seconds=args.poll_interval,
             artifact_build_timeout_seconds=args.artifact_build_timeout,
+            authentication_method="bearer_token" if bearer_token else "password",
             progress=lambda message: print(
                 f"real-user-four-scale progress: {message}",
                 file=sys.stderr,

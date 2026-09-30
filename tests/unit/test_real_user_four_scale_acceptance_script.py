@@ -858,6 +858,43 @@ def test_restricted_client_blocks_admin_run_success_data() -> None:
     assert client.blocked_admin_run_requests == ["GET /api/v1/admin/runs/run-1"]
 
 
+def test_main_accepts_bearer_token_without_password(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = load_script()
+    output_path = tmp_path / "bearer-report.json"
+    captured: dict[str, object] = {}
+
+    class BearerClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    def run_acceptance(*args: object, **kwargs: object) -> dict[str, object]:
+        del args
+        captured["run_kwargs"] = kwargs
+        return {
+            "status": "pending_real_device",
+            "acceptance_complete": False,
+        }
+
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "short-lived-token")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_USERNAME", "ignored-user")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_PASSWORD", "ignored-password")
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", BearerClient)
+    monkeypatch.setattr(module, "run_real_user_four_scale_acceptance", run_acceptance)
+
+    exit_code = module.main(["--output", str(output_path)])
+
+    assert exit_code == 2
+    assert captured["bearer_token"] == "short-lived-token"
+    assert captured["username"] is None
+    assert captured["password"] is None
+    run_kwargs = captured["run_kwargs"]
+    assert isinstance(run_kwargs, dict)
+    assert run_kwargs["authentication_method"] == "bearer_token"
+
+
 def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scale(
     monkeypatch: Any,
 ) -> None:

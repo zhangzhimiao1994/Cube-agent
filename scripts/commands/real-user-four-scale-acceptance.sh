@@ -11,6 +11,7 @@ conversation per scale, handles approvals through project_scale_runner, and
 cross-checks public files, individual downloads, and the public workspace ZIP.
 
 Required environment:
+  AGENT_HUB_ACCEPTANCE_BEARER_TOKEN, or
   AGENT_HUB_ACCEPTANCE_USERNAME / AGENT_HUB_ACCEPTANCE_PASSWORD
   (LOGIN_USERNAME / LOGIN_PASSWORD aliases are also accepted.)
 
