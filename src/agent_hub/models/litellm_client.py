@@ -274,8 +274,6 @@ def _validate_transport_request(
         return ValueError("deployment lacks structured_output capability")
     if request.tools and ModelCapability.TOOL_CALLING not in deployment.capabilities:
         return ValueError("deployment lacks tool_calling capability")
-    if request.tools and _is_messages_endpoint(deployment.api_base):
-        return ValueError("messages endpoint tool definitions are not supported")
     if request.response_schema is not None and _is_messages_endpoint(deployment.api_base):
         return ValueError("messages endpoint response schemas are not supported")
     return None
@@ -923,6 +921,15 @@ def _messages_endpoint_payload(
     }
     if system_messages:
         payload["system"] = "\n\n".join(system_messages)
+    if request.tools:
+        payload["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": _json_mutable(cast(JsonValue, tool.parameters)),
+            }
+            for tool in request.tools
+        ]
     return payload
 
 
@@ -950,7 +957,8 @@ def _parse_messages_endpoint_response(
         raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
     content = payload.get("content")
     text = _messages_endpoint_text(content)
-    if text is None:
+    tool_calls = _messages_endpoint_tool_calls(content, deployment_id)
+    if text is None and not tool_calls:
         raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
     usage = _messages_endpoint_usage(payload.get("usage"))
     metadata: dict[str, JsonScalar] = {}
@@ -960,7 +968,12 @@ def _parse_messages_endpoint_response(
     model = _safe_provider_string(payload.get("model"), sensitive_values)
     if model is not None:
         metadata["model"] = model
-    return ModelResponse(text=text, usage=usage, provider_metadata=metadata)
+    return ModelResponse(
+        text=text,
+        tool_calls=tool_calls,
+        usage=usage,
+        provider_metadata=metadata,
+    )
 
 
 def _messages_endpoint_text(content: object) -> str | None:
@@ -975,6 +988,40 @@ def _messages_endpoint_text(content: object) -> str | None:
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             texts.append(cast(str, block["text"]))
     return "\n".join(texts) if texts else None
+
+
+def _messages_endpoint_tool_calls(
+    content: object,
+    deployment_id: str,
+) -> tuple[ToolCall, ...]:
+    if not isinstance(content, Sequence) or isinstance(content, str | bytes):
+        return ()
+    calls: list[ToolCall] = []
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+            continue
+        call_id = block.get("id")
+        name = block.get("name")
+        arguments = block.get("input")
+        if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(
+            arguments, Mapping
+        ):
+            raise ModelResponseError(
+                f"malformed messages tool call for deployment {deployment_id!r}"
+            )
+        try:
+            calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=name,
+                    arguments=cast(Mapping[str, JsonValue], arguments),
+                )
+            )
+        except (TypeError, ValueError):
+            raise ModelResponseError(
+                f"malformed messages tool call for deployment {deployment_id!r}"
+            ) from None
+    return tuple(calls)
 
 
 def _messages_endpoint_usage(usage: object) -> TokenUsage | None:

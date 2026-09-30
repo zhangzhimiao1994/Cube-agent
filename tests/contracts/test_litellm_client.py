@@ -766,41 +766,93 @@ async def test_messages_schema_is_rejected_before_constructing_clients(
     assert structured_request.response_schema is schema
 
 
-@pytest.mark.parametrize("with_schema", [False, True])
-async def test_messages_tools_rejection_is_preserved(with_schema: bool) -> None:
+async def test_messages_endpoint_supports_tool_definitions_and_tool_use_responses() -> None:
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "id": "msg_safe123",
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_safe123",
+                        "name": "lookup",
+                        "input": {"query": "release status"},
+                    },
+                ],
+                "usage": {"input_tokens": 8, "output_tokens": 9},
+            },
+        )
+    )
+    close = AsyncMock()
+    http_client = SimpleNamespace(post=post, aclose=close)
     openai_factory = MagicMock()
-    http_factory = MagicMock()
+    http_factory = MagicMock(return_value=http_client)
     transport = LiteLLMClient(
         client_factory=openai_factory,
         http_client_factory=http_factory,
     )
-    capabilities = {ModelCapability.TOOL_CALLING, ModelCapability.STRUCTURED_OUTPUT}
+    capabilities = {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
     tool_request = request(
         required_capabilities=capabilities,
         tools=[
             ToolDefinition(
-                name="lookup", description="Look up context.", parameters={"type": "object"}
+                name="lookup",
+                description="Look up context.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
             )
         ],
-        response_schema=(
-            StructuredResponseSchema(name="answer_contract", schema={"type": "object"})
-            if with_schema
-            else None
-        ),
     )
 
-    with pytest.raises(ValueError, match="messages endpoint tool definitions are not supported"):
-        await transport.complete(
-            deployment(
-                api_base="https://proxy.example.com/v1/messages",
-                capabilities=capabilities,
-            ),
-            tool_request,
-            API_KEY,
-        )
+    result = await transport.complete(
+        deployment(
+            api_base="https://proxy.example.com/v1/messages",
+            provider_model="openai-compatible/claude-sonnet-4-6",
+            request_model="claude-sonnet-4-6",
+            capabilities=capabilities,
+        ),
+        tool_request,
+        API_KEY,
+    )
 
     openai_factory.assert_not_called()
-    http_factory.assert_not_called()
+    post.assert_awaited_once_with(
+        "https://proxy.example.com/v1/messages",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": PROMPT}],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Look up context.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                }
+            ],
+        },
+    )
+    close.assert_awaited_once_with()
+    assert result.text is None
+    assert result.tool_calls == (
+        ToolCall(
+            id="toolu_safe123",
+            name="lookup",
+            arguments={"query": "release status"},
+        ),
+    )
 
 
 @pytest.mark.parametrize("declares_structured", [False, True])
