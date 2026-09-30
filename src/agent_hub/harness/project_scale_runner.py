@@ -2355,6 +2355,19 @@ def _collect_run_observation(
         if _is_terminal_status(status):
             evidence["terminal_status"] = True
             break
+        try:
+            polled_events_response = client.request_json(
+                "GET",
+                f"/api/v1/runs/{quote(run_id)}/events",
+            )
+        except Exception:  # noqa: BLE001 - detail polling remains the primary source.
+            polled_events_response = []
+        polled_events = _run_events_items(polled_events_response)
+        event_status = _terminal_status_from_events(polled_events)
+        if event_status is not None:
+            status = event_status
+            evidence["terminal_status"] = True
+            break
         remaining = deadline - time.monotonic()
         if wait_seconds <= 0 or remaining <= 0:
             break
@@ -2518,6 +2531,21 @@ def _run_events_items(response: dict[str, object] | list[object]) -> list[object
         return response
     items = response.get("items") if isinstance(response, dict) else None
     return items if isinstance(items, list) else None
+
+
+def _terminal_status_from_events(events: Sequence[object] | None) -> str | None:
+    if events is None:
+        return None
+    for event in reversed(events):
+        if not isinstance(event, Mapping) or event.get("kind") != "terminal.notified":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        status = _string_value(payload.get("status"))
+        if _is_terminal_status(status):
+            return status
+    return None
 
 
 def _admin_run_details(

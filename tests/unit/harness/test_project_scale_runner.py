@@ -6577,6 +6577,69 @@ def test_execute_project_scale_plan_can_wait_for_terminal_status() -> None:
     assert client.calls.count(("GET", "/api/v1/runs/run-small-self-repair/details", None)) == 2
 
 
+def test_execute_project_scale_plan_uses_terminal_event_when_details_stay_running() -> None:
+    class EventTerminalClient(FakeAcceptanceClient):
+        details_calls = 0
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            if path == f"/api/v1/runs/{self.run_id}/details":
+                self.details_calls += 1
+                if self.details_calls > 1:
+                    raise AssertionError("terminal event should stop details polling")
+                return {
+                    "id": self.run_id,
+                    "status": "running",
+                    "mode": "direct",
+                    "artifacts": [{"id": "artifact-1"}],
+                }
+            if path == f"/api/v1/runs/{self.run_id}/events":
+                return [
+                    {
+                        "kind": "terminal.notified",
+                        "run_id": self.run_id,
+                        "payload": {"status": "failed"},
+                    }
+                ]
+            return super().request_json(
+                method,
+                path,
+                body=body,
+                idempotency_key=idempotency_key,
+            )
+
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    client = EventTerminalClient(
+        run_id="run-small-direct-terminal-event",
+        session_id="project-scale-small-direct",
+        status="running",
+        artifacts=[{"id": "artifact-1"}],
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=5,
+        poll_interval_seconds=0,
+    )
+
+    result = report.results[0]
+    assert result.status == "failed"
+    assert result.evidence["terminal_status"] is True
+    assert client.details_calls == 1
+
+
 def test_execute_project_scale_plan_repairs_missing_self_repair_trace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
