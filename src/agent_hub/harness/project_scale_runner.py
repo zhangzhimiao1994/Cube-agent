@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -3860,6 +3861,7 @@ def _repair_context_relevant_paths(
 ) -> list[str]:
     path_set = set(paths)
     selected: list[str] = []
+    priority_provider_paths: list[str] = []
     suppressed_repeated_test_paths: set[str] = set()
     suppressed_ambiguous_paths: set[str] = set()
 
@@ -3885,6 +3887,30 @@ def _repair_context_relevant_paths(
                 suppressed_ambiguous_paths.add(path)
         for path in matched_paths:
             add(path)
+    typescript_module_error = re.compile(
+        r"(?P<importer>(?:[A-Za-z]:)?[^\s\"']+?\.(?:[cm]?[jt]sx?))"
+        r"\(\d+(?:,\d+)?\):\s*error\s+TS(?:2305|2724):\s*"
+        r"Module\s+['\"](?P<module>[^'\"]+)['\"]"
+    )
+    normalized_failed_text = failed_text.replace("\\", "/")
+    for match in typescript_module_error.finditer(normalized_failed_text):
+        module_name = match.group("module")
+        if not module_name.startswith("."):
+            continue
+        importer_matches = _matching_workspace_paths(match.group("importer"), paths)
+        for importer_path in importer_matches:
+            module_base = posixpath.normpath(
+                posixpath.join(posixpath.dirname(importer_path), module_name)
+            )
+            candidates = (
+                module_base,
+                *(f"{module_base}{suffix}" for suffix in (".ts", ".tsx", ".js", ".mjs", ".cjs")),
+                *(f"{module_base}/index{suffix}" for suffix in (".ts", ".tsx", ".js")),
+            )
+            for candidate in candidates:
+                if candidate in path_set and candidate not in priority_provider_paths:
+                    priority_provider_paths.append(candidate)
+                    add(candidate)
     global_api_failure_test_paths: list[str] = []
     for reason in failed_reasons:
         if re.search(
@@ -3984,6 +4010,14 @@ def _repair_context_relevant_paths(
     selected_without_reserved = [
         path for path in selected if path not in reserved_configuration_paths
     ]
+    selected_without_reserved = [
+        *priority_provider_paths,
+        *(
+            path
+            for path in selected_without_reserved
+            if path not in priority_provider_paths
+        ),
+    ]
     available_slots = max(0, 8 - len(reserved_configuration_paths))
     return [
         *selected_without_reserved[:available_slots],
@@ -4015,6 +4049,15 @@ def _focused_repair_snippet(
             line_number = int(location.group(1) or location.group(2))
             break
     if line_number is None or not 1 <= line_number <= len(lines):
+        if "TS2305" in normalized_failures or "TS2724" in normalized_failures:
+            export_declarations = [
+                line.strip() for line in lines if re.match(r"\s*export\b", line)
+            ]
+            if export_declarations:
+                return _compact_repair_snippet(
+                    "Existing export declarations: " + " ".join(export_declarations),
+                    max_chars=max_chars,
+                )
         return _compact_repair_snippet(
             text,
             max_chars=min(max_chars, _REPAIR_CONTEXT_MAX_SNIPPET_CHARS),
@@ -4080,7 +4123,9 @@ def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
         )
         hints.append(
             "TypeScript import/export repair hint: TS2305 means the imported symbol must be "
-            "exported by that module, or the import must be corrected/removed."
+            "exported by that module, or the import must be corrected/removed; preserve existing "
+            "public interfaces used by other source files and tests while making the smallest "
+            "compatible change."
             f"{symbol_note}"
         )
     if re.search(r"\b(?:describe|it|test|expect|beforeEach|afterEach) is not defined\b", text):

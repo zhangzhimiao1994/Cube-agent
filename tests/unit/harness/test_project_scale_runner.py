@@ -214,6 +214,69 @@ def test_repair_context_prioritizes_runtime_endpoint_and_module_matches() -> Non
     assert "tsconfig.json" in selected
 
 
+def test_repair_context_prioritizes_typescript_export_providers() -> None:
+    paths = (
+        "package.json",
+        "tsconfig.json",
+        "vitest.config.ts",
+        "vite.config.ts",
+        "src/rbac.ts",
+        "src/readModel.ts",
+        "src/storage.ts",
+        "src/store.ts",
+        "src/types.ts",
+        "tests/helpers.ts",
+        "tests/scenario.test.ts",
+    )
+    failures = (
+        (
+            "src/rbac.ts(1,10): error TS2305: Module './types' has no exported member "
+            "'Action'. src/readModel.ts(1,15): error TS2305: Module './store' has no "
+            "exported member 'PortfolioState'. src/storage.ts(3,15): error TS2305: "
+            "Module './types' has no exported member 'PortfolioSnapshot'. "
+            "tests/helpers.ts(4,10): error TS2305: Module '../src/store' has no exported "
+            "member 'getStore'."
+        ),
+    )
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(paths, failures)
+
+    assert "src/types.ts" in selected
+    assert "src/store.ts" in selected
+    assert selected.index("src/types.ts") < selected.index("src/rbac.ts")
+    assert selected.index("src/store.ts") < selected.index("src/readModel.ts")
+
+
+def test_repair_context_ts_export_hint_preserves_public_interfaces() -> None:
+    hint = project_scale_runner_module._repair_context_failure_hints(
+        ("src/rbac.ts(1,10): error TS2305: Module './types' has no exported member 'Action'",)
+    )
+
+    assert "preserve existing public interfaces" in hint
+
+
+def test_repair_context_ts_export_provider_summarizes_late_exports() -> None:
+    provider = "\n".join(
+        (
+            *(f"const internal{index} = {index};" for index in range(30)),
+            "export type Role = 'admin' | 'viewer';",
+            "export interface PortfolioState { projects: unknown[] }",
+        )
+    )
+
+    snippet = project_scale_runner_module._focused_repair_snippet(
+        "src/types.ts",
+        provider,
+        failed_reasons=(
+            "src/rbac.ts(1,10): error TS2305: Module './types' has no exported member 'Action'",
+        ),
+        max_chars=500,
+    )
+
+    assert "export type Role" in snippet
+    assert "export interface PortfolioState" in snippet
+
+
 def test_repair_context_reserves_test_configuration_when_many_tests_fail() -> None:
     paths = (
         "package.json",
