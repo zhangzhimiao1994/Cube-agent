@@ -3577,6 +3577,10 @@ def _deliverable_repair_followup_warranted(
     }
     if not added_deficits.issubset(coupled_validation_deficits):
         return False
+    if current.validation_stage == previous.validation_stage:
+        if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
+            return False
+        return current.failure_fingerprints != previous.failure_fingerprints
     validation_stage_drop = previous.validation_stage - current.validation_stage
     if validation_stage_drop <= 0:
         return False

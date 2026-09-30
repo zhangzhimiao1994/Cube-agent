@@ -1066,6 +1066,38 @@ def test_soft_repair_limit_allows_unseen_actionable_regression() -> None:
     )
 
 
+def test_soft_repair_limit_allows_unseen_same_stage_build_failure() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=(
+            "deliverable_quality",
+            "generated_project_validation",
+            "requirements_validation",
+        ),
+        failure_fingerprints=(
+            "npm run build failed in tests/helpers.ts with missing jsonstore export",
+        ),
+        validation_stage=1,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=previous.deficits,
+        failure_fingerprints=(
+            "npm run build failed in src/services/payment.ts with missing newid export",
+        ),
+        validation_stage=1,
+    )
+
+    assert project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        current,
+        seen_signatures={previous.signature, current.signature},
+    )
+
+
 def test_soft_repair_limit_allows_one_coupled_validation_regression() -> None:
     previous = project_scale_runner_module._DeliverableRepairProgress(
         deficits=("deliverable_quality",),
