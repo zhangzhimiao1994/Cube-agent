@@ -2049,6 +2049,19 @@ def test_capability_standard_requires_runtime_contract(events: list[object] | No
     assert check.reasons
 
 
+def test_workspace_bundle_accepts_report_inside_verification_directory() -> None:
+    bundle = _project_bundle(
+        {
+            "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+            "verification/report.md": "- npm test: passed\n- interaction smoke: passed\n",
+        }
+    )
+
+    reasons = _workspace_bundle_agent_standard_reasons(bundle)
+
+    assert "workspace_bundle: missing verification report artifact" not in reasons
+
+
 def test_capability_standard_accepts_public_event_with_workspace_plan_evidence() -> None:
     bundle = _project_bundle(
         {

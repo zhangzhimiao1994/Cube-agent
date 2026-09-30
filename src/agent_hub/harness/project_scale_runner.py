@@ -182,6 +182,7 @@ _VERIFICATION_REPORT_BASENAMES = frozenset(
         "validation.md",
     }
 )
+_VERIFICATION_REPORT_PATHS = frozenset({"verification/report.md"})
 _IMPLEMENTATION_PLAN_BASENAMES = frozenset(
     {
         "implementation-plan.md",
@@ -4930,7 +4931,10 @@ def _workspace_bundle_agent_standard_reasons(workspace_bundle: bytes | None) -> 
         reasons.append(
             "workspace_bundle: missing constraints and skill/rule reading evidence in implementation plan"
         )
-    if not (basenames & _VERIFICATION_REPORT_BASENAMES):
+    if not (
+        basenames & _VERIFICATION_REPORT_BASENAMES
+        or set(lowered) & _VERIFICATION_REPORT_PATHS
+    ):
         reasons.append("workspace_bundle: missing verification report artifact")
     return tuple(reasons)
 
