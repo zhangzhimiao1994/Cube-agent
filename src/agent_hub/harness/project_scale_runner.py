@@ -87,6 +87,7 @@ _PLUGIN_CONTRACT_DETAIL_KEYS = (
 _REPAIR_CONTEXT_MAX_FILES = 24
 _REPAIR_CONTEXT_MAX_SNIPPET_CHARS = 320
 _REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS = 1_200
+_REPAIR_CONTEXT_TOTAL_CHARS = 1_500
 _REPAIR_CONTEXT_EXTENSIONS = frozenset(
     {
         ".cjs",
@@ -1844,20 +1845,8 @@ def _validate_requested_web_preview(
     workspace_bundle: bytes | None,
     request_body: Mapping[str, object],
 ) -> _EvidenceCheck:
-    message = (_string_value(request_body.get("message")) or "").casefold()
-    preview_requested = any(
-        marker in message
-        for marker in (
-            "interactive website",
-            "website preview",
-            "web preview",
-            "preview.html",
-            "index.html entrypoint",
-            "\u7f51\u7ad9\u9884\u89c8",
-            "\u7f51\u9875\u9884\u89c8",
-        )
-    )
-    if not preview_requested:
+    message = _string_value(request_body.get("message")) or ""
+    if not _web_preview_requested(message):
         return _EvidenceCheck(passed=True, reasons=())
     files = _workspace_bundle_file_bytes(workspace_bundle) if workspace_bundle is not None else None
     if not files:
@@ -1898,6 +1887,22 @@ def _validate_requested_web_preview(
                 "add preview.html or index.html"
             ),
         ),
+    )
+
+
+def _web_preview_requested(message: str) -> bool:
+    lowered = message.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "interactive website",
+            "website preview",
+            "web preview",
+            "preview.html",
+            "index.html entrypoint",
+            "\u7f51\u7ad9\u9884\u89c8",
+            "\u7f51\u9875\u9884\u89c8",
+        )
     )
 
 
@@ -3610,18 +3615,7 @@ def _deliverable_repair_body(
         repair_body["replace_workspace_files"] = not incremental_repair
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
-        preview_required = any(
-            marker in f"{original}\n{' '.join(failed_reasons)}".casefold()
-            for marker in (
-                "interactive website",
-                "website preview",
-                "web preview",
-                "preview.html",
-                "index.html entrypoint",
-                "网站预览",
-                "网页预览",
-            )
-        )
+        preview_required = _web_preview_requested(original)
         authoritative_preview_guidance = (
             "Every authoritative replacement must include preview.html or index.html. "
             if not incremental_repair and preview_required
@@ -3690,8 +3684,10 @@ def _deliverable_repair_body(
             "leave parsed program, project, or workflow responses typed as unknown. "
             "Generated scenario tests must assert only values guaranteed by the API contract and "
             "their own fixtures. Portfolio CSV tests must verify the project row such as "
-            "Customer Migration and must not invent assertions for internal codes such as CORE "
+            "Customer Migration from GET /analytics/portfolio.csv and must not invent assertions "
+            "for internal codes such as CORE "
             "unless the documented CSV contract includes that column. "
+            "GET /portfolio/read-model must preserve the documented portfolio projection. "
         )
         if case_id.startswith("small:"):
             guidance += small_guidance
@@ -3716,13 +3712,12 @@ def _deliverable_repair_body(
             "Report executed checks only.\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
-        context_section = f"\n{context}\n" if context else ""
-        prefix = guidance + context_section + reasons + "\nOriginal request:\n"
         max_chars = 6_000 if context or scale == "ultra" else 2_000
-        available = max_chars - len(" ".join(prefix.split())) - 1
-        bounded_original = original[: max(available, 0)]
-        repair_body["message"] = _bounded_role_planning_task_text(
-            prefix + bounded_original,
+        repair_body["message"] = _compose_capability_repair_message(
+            guidance=guidance,
+            failed_evidence=reasons,
+            original_request=original,
+            workspace_context=context,
             max_chars=max_chars,
         )
         repair_body["skip_evolution_proposal"] = True
@@ -3799,6 +3794,7 @@ def _workspace_repair_context(
     workspace_bundle: bytes | None,
     *,
     failed_reasons: Sequence[str],
+    max_chars: int = _REPAIR_CONTEXT_TOTAL_CHARS,
 ) -> str:
     if workspace_bundle is None:
         return ""
@@ -3811,7 +3807,7 @@ def _workspace_repair_context(
         failed_reasons,
         file_bytes=files,
     )
-    snippets = []
+    decoded_files: list[tuple[str, str]] = []
     for path in relevant_paths:
         raw = files.get(path)
         if raw is None:
@@ -3820,10 +3816,7 @@ def _workspace_repair_context(
             text = raw.decode("utf-8", errors="replace")
         except AttributeError:
             continue
-        snippets.append(
-            f"- {path}: "
-            f"{_focused_repair_snippet(path, text, failed_reasons=failed_reasons)}"
-        )
+        decoded_files.append((path, text))
     inventory = ", ".join(paths[:_REPAIR_CONTEXT_MAX_FILES])
     if len(paths) > _REPAIR_CONTEXT_MAX_FILES:
         inventory += f", ... (+{len(paths) - _REPAIR_CONTEXT_MAX_FILES} more)"
@@ -3832,12 +3825,31 @@ def _workspace_repair_context(
         "Current workspace context for precise repair:",
         f"Files: {inventory}",
     ]
-    if snippets:
+    if decoded_files:
         parts.append("Relevant file snippets:")
-        parts.extend(snippets)
     if hints:
         parts.append(hints)
-    return "\n".join(parts)
+    fixed_chars = len("\n".join(parts))
+    prefix_chars = sum(len(f"- {path}: ") for path, _text in decoded_files)
+    separators = max(0, len(decoded_files) - 1)
+    snippet_budget = max(0, max_chars - fixed_chars - prefix_chars - separators - 1)
+    per_file_budget = (
+        min(
+            _REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS,
+            snippet_budget // len(decoded_files),
+        )
+        if decoded_files
+        else 0
+    )
+    snippets = [
+        f"- {path}: "
+        f"{_focused_repair_snippet(path, text, failed_reasons=failed_reasons, max_chars=per_file_budget)}"
+        for path, text in decoded_files
+        if per_file_budget > 0
+    ]
+    if snippets:
+        parts[3:3] = snippets
+    return _bounded_repair_section("\n".join(parts), max_chars=max_chars)
 
 
 def _repair_context_relevant_paths(
@@ -3849,22 +3861,30 @@ def _repair_context_relevant_paths(
     path_set = set(paths)
     selected: list[str] = []
     suppressed_repeated_test_paths: set[str] = set()
+    suppressed_ambiguous_paths: set[str] = set()
 
     def add(path: str) -> None:
         if (
             path in path_set
             and path not in selected
             and path not in suppressed_repeated_test_paths
+            and path not in suppressed_ambiguous_paths
         ):
             selected.append(path)
 
     failed_text = "\n".join(failed_reasons)
     for match in _REPAIR_CONTEXT_PATH_RE.finditer(failed_text):
         candidate = re.sub(r"/+", "/", match.group(1).replace("\\", "/"))
+        matched_paths = _matching_workspace_paths(candidate, paths)
         for path in paths:
             normalized_path = path.replace("\\", "/").lstrip("/")
-            if candidate == normalized_path or candidate.endswith(f"/{normalized_path}"):
-                add(path)
+            if (
+                path not in matched_paths
+                and candidate.endswith(f"/{normalized_path}")
+            ):
+                suppressed_ambiguous_paths.add(path)
+        for path in matched_paths:
+            add(path)
     global_api_failure_test_paths: list[str] = []
     for reason in failed_reasons:
         if re.search(
@@ -3874,12 +3894,8 @@ def _repair_context_relevant_paths(
             continue
         for match in _REPAIR_CONTEXT_PATH_RE.finditer(reason):
             candidate = re.sub(r"/+", "/", match.group(1).replace("\\", "/"))
-            for path in paths:
-                normalized_path = path.replace("\\", "/").lstrip("/")
-                if (
-                    candidate == normalized_path
-                    or candidate.endswith(f"/{normalized_path}")
-                ) and path not in global_api_failure_test_paths:
+            for path in _matching_workspace_paths(candidate, paths):
+                if path not in global_api_failure_test_paths:
                     global_api_failure_test_paths.append(path)
     if len(global_api_failure_test_paths) > 3:
         representative_tests = set(global_api_failure_test_paths[:3])
@@ -3980,19 +3996,30 @@ def _focused_repair_snippet(
     text: str,
     *,
     failed_reasons: Sequence[str],
+    max_chars: int = _REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS,
 ) -> str:
     normalized_failures = "\n".join(failed_reasons).replace("\\", "/")
-    normalized_path = path.replace("\\", "/").lstrip("/")
-    line_match = re.search(
-        rf"{re.escape(normalized_path)}:(\d+)(?::\d+)?",
-        normalized_failures,
-    )
-    if line_match is None:
-        return _compact_repair_snippet(text)
     lines = text.splitlines()
     if not lines:
         return ""
-    line_index = min(max(int(line_match.group(1)) - 1, 0), len(lines) - 1)
+    line_number: int | None = None
+    for match in _REPAIR_CONTEXT_PATH_RE.finditer(normalized_failures):
+        candidate = re.sub(r"/+", "/", match.group(1))
+        if path not in _matching_workspace_paths(candidate, (path,)):
+            continue
+        location = re.match(
+            r"(?::(\d+)(?::\d+)?|\((\d+)(?:,\d+)?\))",
+            normalized_failures[match.end() :],
+        )
+        if location is not None:
+            line_number = int(location.group(1) or location.group(2))
+            break
+    if line_number is None or not 1 <= line_number <= len(lines):
+        return _compact_repair_snippet(
+            text,
+            max_chars=min(max_chars, _REPAIR_CONTEXT_MAX_SNIPPET_CHARS),
+        )
+    line_index = line_number - 1
     start = max(0, line_index - 8)
     end = min(len(lines), line_index + 9)
     focused = "\n".join(
@@ -4000,8 +4027,36 @@ def _focused_repair_snippet(
     )
     return _compact_repair_snippet(
         focused,
-        max_chars=_REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS,
+        max_chars=max_chars,
     )
+
+
+def _matching_workspace_paths(candidate: str, paths: Sequence[str]) -> list[str]:
+    normalized_candidate = re.sub(
+        r"/+", "/", candidate.replace("\\", "/")
+    ).lstrip("/")
+    normalized_paths = {
+        path: re.sub(r"/+", "/", path.replace("\\", "/")).lstrip("/")
+        for path in paths
+    }
+    exact = [
+        path
+        for path, normalized in normalized_paths.items()
+        if normalized == normalized_candidate
+    ]
+    if exact:
+        return exact
+    suffix_matches = [
+        path
+        for path, normalized in normalized_paths.items()
+        if normalized_candidate.endswith(f"/{normalized}")
+    ]
+    if not suffix_matches:
+        return []
+    longest = max(len(normalized_paths[path]) for path in suffix_matches)
+    return [
+        path for path in suffix_matches if len(normalized_paths[path]) == longest
+    ]
 
 
 def _compact_repair_snippet(
@@ -4081,6 +4136,72 @@ def _bounded_role_planning_task_text(value: str, *, max_chars: int = 2_000) -> s
         if remaining > 0:
             return f"{prefix} {text[marker_index + len(marker):][:remaining].strip()} ...".strip()
     return text[: max_chars - 4].rstrip() + " ..."
+
+
+def _bounded_repair_section(value: str, *, max_chars: int) -> str:
+    text = " ".join(value.split())
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 8:
+        return text[:max_chars]
+    head_chars = max_chars * 3 // 4
+    tail_chars = max_chars - head_chars - 5
+    return f"{text[:head_chars].rstrip()} ... {text[-tail_chars:].lstrip()}"
+
+
+def _compose_capability_repair_message(
+    *,
+    guidance: str,
+    failed_evidence: str,
+    original_request: str,
+    workspace_context: str,
+    max_chars: int,
+) -> str:
+    compact_prompt = max_chars <= 2_000
+    evidence = _bounded_repair_section(
+        failed_evidence,
+        max_chars=240 if compact_prompt else 1_100,
+    )
+    if compact_prompt:
+        compact_guidance = " ".join(guidance.split())
+        fixed_suffix = " ".join(
+            part for part in (evidence, "Original request:") if part
+        )
+        guidance_budget = max(0, max_chars - len(fixed_suffix) - 1)
+        bounded_guidance = _bounded_repair_section(
+            compact_guidance,
+            max_chars=guidance_budget,
+        )
+        original_budget = max(
+            0,
+            max_chars - len(bounded_guidance) - len(fixed_suffix) - 2,
+        )
+        original = _bounded_repair_section(
+            original_request,
+            max_chars=original_budget,
+        )
+        return " ".join(
+            part for part in (bounded_guidance, evidence, "Original request:", original) if part
+        )[:max_chars]
+    original = _bounded_repair_section(original_request, max_chars=800)
+    context = _bounded_repair_section(
+        workspace_context,
+        max_chars=0 if compact_prompt else 1_500,
+    )
+    suffix = " ".join(
+        section
+        for section in (
+            evidence,
+            f"Original request: {original}",
+            context,
+        )
+        if section
+    )
+    guidance_budget = max(0, max_chars - len(suffix) - (1 if suffix else 0))
+    bounded_guidance = _bounded_repair_section(guidance, max_chars=guidance_budget)
+    return " ".join(part for part in (bounded_guidance, suffix) if part)[:max_chars]
 
 
 def _format_failed_reasons(reasons: Sequence[str]) -> str:

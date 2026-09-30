@@ -149,6 +149,50 @@ def test_repair_context_snippet_focuses_on_reported_failure_line() -> None:
     assert "expect(approval.status).toBe(201)" in context
 
 
+def test_repair_context_snippet_supports_parenthesized_typescript_location() -> None:
+    lines = [f"const filler{index} = {index};" for index in range(1, 60)]
+    lines[51] = "const exactFailure = await createApproval();"
+
+    snippet = project_scale_runner_module._focused_repair_snippet(
+        "tests/rbac.test.ts",
+        "\n".join(lines),
+        failed_reasons=(r"C:\project\tests\rbac.test.ts(52,27): error TS2322",),
+    )
+
+    assert "exactFailure" in snippet
+
+
+def test_repair_context_snippet_uses_longest_matching_workspace_path() -> None:
+    files = {
+        "src/app.ts": b"const wrongFile = true;",
+        "generated/src/app.ts": b"const rightFile = true;",
+    }
+
+    selected = project_scale_runner_module._repair_context_relevant_paths(
+        tuple(files),
+        ("failure at /tmp/project/generated/src/app.ts:1:1",),
+        file_bytes=files,
+    )
+
+    assert selected[0] == "generated/src/app.ts"
+    assert "src/app.ts" not in selected
+
+
+def test_repair_context_snippet_ignores_out_of_range_failure_line() -> None:
+    text = "const beginning = true;\n" + "\n".join(
+        f"const filler{index} = {index};" for index in range(2, 40)
+    )
+
+    snippet = project_scale_runner_module._focused_repair_snippet(
+        "src/app.ts",
+        text,
+        failed_reasons=("src/app.ts:999:1 failed",),
+    )
+
+    assert "beginning" in snippet
+    assert "filler39" not in snippet
+
+
 def test_repair_context_prioritizes_runtime_endpoint_and_module_matches() -> None:
     files = {
         "package.json": b'{"scripts":{"test":"node --test"}}',
@@ -335,6 +379,41 @@ def test_capability_repair_keeps_workspace_context_after_long_failure_output() -
     assert len(message) <= 6_000
 
 
+def test_capability_repair_preserves_failure_and_request_with_many_long_snippets() -> None:
+    files = {
+        f"src/module-{index}.ts": (
+            "\n".join(f"const line{line} = '{index}-{'x' * 80}';" for line in range(1, 80))
+        )
+        for index in range(8)
+    }
+    bundle = _project_bundle(files)
+    failures = tuple(
+        f"UNIQUE_FAILURE_{index} at /tmp/project/src/module-{index}.ts:52:3"
+        for index in range(8)
+    )
+
+    repair = _deliverable_repair_body(
+        {
+            "message": "ORIGINAL_REQUIREMENT build a non-web event processor",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "ultra:direct",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle,
+        failed_reasons=failures,
+    )
+
+    message = str(repair["message"])
+    assert "Previous failed evidence" in message
+    assert "UNIQUE_FAILURE_0" in message
+    assert "Original request" in message
+    assert "ORIGINAL_REQUIREMENT" in message
+    assert "Current workspace context for precise repair" in message
+    assert len(message) <= 6_000
+
+
 def test_authoritative_capability_repair_requires_preview_entrypoint() -> None:
     repair = _deliverable_repair_body(
         {
@@ -357,6 +436,28 @@ def test_authoritative_capability_repair_requires_preview_entrypoint() -> None:
     message = str(repair["message"])
     assert repair["replace_workspace_files"] is True
     assert "Every authoritative replacement must include preview.html or index.html" in message
+
+
+def test_authoritative_non_web_repair_does_not_infer_preview_from_failure_text() -> None:
+    repair = _deliverable_repair_body(
+        {
+            "message": "Build a command-line event processor.",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "ultra:direct",
+        benchmark_kind="capability",
+        source_workspace_bundle=_project_bundle(
+            {"package.json": json.dumps({"scripts": {"build": "tsc"}})}
+        ),
+        force_workspace_replacement=True,
+        failed_reasons=("tests/preview.html.test.ts:52:3 failed",),
+    )
+
+    assert "Every authoritative replacement must include preview.html" not in str(
+        repair["message"]
+    )
 
 
 def test_generated_project_output_excerpt_preserves_middle_test_failure() -> None:
