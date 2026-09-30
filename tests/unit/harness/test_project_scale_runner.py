@@ -118,6 +118,37 @@ def test_repair_context_maps_absolute_failure_paths_to_workspace_files(
     assert "tsconfig.json" in selected
 
 
+def test_repair_context_snippet_focuses_on_reported_failure_line() -> None:
+    test_lines = [f"const filler{index} = {index};" for index in range(1, 49)]
+    test_lines.extend(
+        (
+            "const approval = await request('/approvals', {",
+            "  body: JSON.stringify({ project_id: project.body.id, type: 'portfolio' }),",
+            "});",
+            "expect(approval.status).toBe(201);",
+        )
+    )
+    bundle = _project_bundle(
+        {
+            "package.json": json.dumps({"scripts": {"test": "vitest run"}}),
+            "tests/rbac.test.ts": "\n".join(test_lines),
+        }
+    )
+
+    context = project_scale_runner_module._workspace_repair_context(
+        bundle,
+        failed_reasons=(
+            (
+                "AssertionError: expected 400 to be 201 at "
+                "/tmp/project/tests/rbac.test.ts:52:27"
+            ),
+        ),
+    )
+
+    assert "project_id: project.body.id" in context
+    assert "expect(approval.status).toBe(201)" in context
+
+
 def test_repair_context_prioritizes_runtime_endpoint_and_module_matches() -> None:
     files = {
         "package.json": b'{"scripts":{"test":"node --test"}}',
@@ -302,6 +333,30 @@ def test_capability_repair_keeps_workspace_context_after_long_failure_output() -
     assert "tests/app.test.ts" in message
     assert "Vitest test-runtime repair hint" in message
     assert len(message) <= 6_000
+
+
+def test_authoritative_capability_repair_requires_preview_entrypoint() -> None:
+    repair = _deliverable_repair_body(
+        {
+            "message": "Build a complete interactive website.",
+            "mode": "direct",
+            "project_id": "project-1",
+            "workspace_session_id": "session-1",
+        },
+        "ultra:direct",
+        benchmark_kind="capability",
+        source_workspace_bundle=_project_bundle(
+            {"package.json": json.dumps({"scripts": {"build": "tsc"}})}
+        ),
+        force_workspace_replacement=True,
+        failed_reasons=(
+            "requirements: requested web preview entrypoint missing; add preview.html or index.html",
+        ),
+    )
+
+    message = str(repair["message"])
+    assert repair["replace_workspace_files"] is True
+    assert "Every authoritative replacement must include preview.html or index.html" in message
 
 
 def test_generated_project_output_excerpt_preserves_middle_test_failure() -> None:
@@ -5681,6 +5736,109 @@ def test_capability_repair_extends_past_scale_budget_while_validation_progresses
         "project-scale-small-direct-0-deliverable-repair-5",
         "project-scale-small-direct-0-deliverable-repair-6",
     ]
+
+
+def test_capability_repair_extends_past_scale_budget_for_actionable_stage_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("small",),
+        flows=("direct",),
+        execute=True,
+    )
+    validation_results = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('generated_project_validation: command failed command=npm run build output_tail="a"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('generated_project_validation: command failed command=npm run build output_tail="b"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('generated_project_validation: command failed command=npm run build output_tail="c"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('generated_project_validation: command failed command=npm test output_tail="d"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("requirements: task workflow expected 201, got 400",),
+        ),
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=('generated_project_validation: command failed command=npm test output_tail="new regression"',),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-direct-regression-budget",
+        session_id="project-scale-small-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# Task API\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Task API requirement satisfied\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed by real HTTP checks\n"
+                ),
+                "constraints_reading_evidence.json": json.dumps(
+                    {
+                        "read_before_implementation": True,
+                        "constraints": [
+                            "AGENTS.md workspace rules",
+                            "HANDOFF",
+                            "PROJECT_REQUIREMENTS.md",
+                        ],
+                        "skills": ["applicable SKILL.md or agent-standard rules"],
+                    }
+                ),
+                "package.json": json.dumps(
+                    {"scripts": {"build": "tsc", "test": "node --test"}}
+                ),
+                "src/app.ts": _functional_ts_source(),
+                "tests/unit.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert len(client.submitted_bodies) == 7
+    assert validation_results == []
 
 
 def test_capability_repair_stops_at_dynamic_safety_limit(

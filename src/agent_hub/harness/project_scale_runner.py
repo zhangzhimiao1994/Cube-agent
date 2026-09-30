@@ -86,6 +86,7 @@ _PLUGIN_CONTRACT_DETAIL_KEYS = (
 )
 _REPAIR_CONTEXT_MAX_FILES = 24
 _REPAIR_CONTEXT_MAX_SNIPPET_CHARS = 320
+_REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS = 1_200
 _REPAIR_CONTEXT_EXTENSIONS = frozenset(
     {
         ".cjs",
@@ -1228,7 +1229,7 @@ def execute_project_scale_plan(
                 repair_progress_state = next_progress_state
                 if (
                     plan.benchmark_kind == "capability"
-                    and repair_progress_observed
+                    and (repair_progress_observed or repair_followup_warranted)
                     and deliverable_repair_attempts >= max_deliverable_repair_attempts
                     and max_deliverable_repair_attempts < deliverable_repair_safety_limit
                 ):
@@ -3609,6 +3610,23 @@ def _deliverable_repair_body(
         repair_body["replace_workspace_files"] = not incremental_repair
         original = original_message if isinstance(original_message, str) else ""
         scale, _, flow = case_id.partition(":")
+        preview_required = any(
+            marker in f"{original}\n{' '.join(failed_reasons)}".casefold()
+            for marker in (
+                "interactive website",
+                "website preview",
+                "web preview",
+                "preview.html",
+                "index.html entrypoint",
+                "网站预览",
+                "网页预览",
+            )
+        )
+        authoritative_preview_guidance = (
+            "Every authoritative replacement must include preview.html or index.html. "
+            if not incremental_repair and preview_required
+            else ""
+        )
         delivery_guidance = (
             "Return only complete changed files as workspace_bundle.files or ### `path` fences. "
             "Unchanged workspace files remain authoritative and will be merged with this patch; "
@@ -3619,6 +3637,7 @@ def _deliverable_repair_body(
                 "workspace_bundle.files or ### `path` fences and omit obsolete files: "
                 "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md/"
                 "VERIFICATION.md/constraints_reading_evidence.json. "
+                f"{authoritative_preview_guidance}"
             )
         )
         guidance = (
@@ -3801,7 +3820,10 @@ def _workspace_repair_context(
             text = raw.decode("utf-8", errors="replace")
         except AttributeError:
             continue
-        snippets.append(f"- {path}: {_compact_repair_snippet(text)}")
+        snippets.append(
+            f"- {path}: "
+            f"{_focused_repair_snippet(path, text, failed_reasons=failed_reasons)}"
+        )
     inventory = ", ".join(paths[:_REPAIR_CONTEXT_MAX_FILES])
     if len(paths) > _REPAIR_CONTEXT_MAX_FILES:
         inventory += f", ... (+{len(paths) - _REPAIR_CONTEXT_MAX_FILES} more)"
@@ -3953,11 +3975,44 @@ def _repair_context_relevant_paths(
     ]
 
 
-def _compact_repair_snippet(text: str) -> str:
+def _focused_repair_snippet(
+    path: str,
+    text: str,
+    *,
+    failed_reasons: Sequence[str],
+) -> str:
+    normalized_failures = "\n".join(failed_reasons).replace("\\", "/")
+    normalized_path = path.replace("\\", "/").lstrip("/")
+    line_match = re.search(
+        rf"{re.escape(normalized_path)}:(\d+)(?::\d+)?",
+        normalized_failures,
+    )
+    if line_match is None:
+        return _compact_repair_snippet(text)
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    line_index = min(max(int(line_match.group(1)) - 1, 0), len(lines) - 1)
+    start = max(0, line_index - 8)
+    end = min(len(lines), line_index + 9)
+    focused = "\n".join(
+        f"{index + 1}: {lines[index]}" for index in range(start, end)
+    )
+    return _compact_repair_snippet(
+        focused,
+        max_chars=_REPAIR_CONTEXT_FOCUSED_SNIPPET_CHARS,
+    )
+
+
+def _compact_repair_snippet(
+    text: str,
+    *,
+    max_chars: int = _REPAIR_CONTEXT_MAX_SNIPPET_CHARS,
+) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
-    if len(compact) <= _REPAIR_CONTEXT_MAX_SNIPPET_CHARS:
+    if len(compact) <= max_chars:
         return compact
-    return compact[: _REPAIR_CONTEXT_MAX_SNIPPET_CHARS - 4].rstrip() + " ..."
+    return compact[: max_chars - 4].rstrip() + " ..."
 
 
 def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
