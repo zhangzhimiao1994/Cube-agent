@@ -5148,6 +5148,7 @@ def _reading_evidence_payload_passes(value: object) -> bool:
             (
                 "skills",
                 "skill_rules",
+                "skills_rules",
                 "skills_and_rules",
                 "rules",
                 "skill_sources",
