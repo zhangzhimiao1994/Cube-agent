@@ -135,6 +135,12 @@ _CAPABILITY_DELIVERABLE_REPAIR_MAX_BY_SCALE = {
     "large": 8,
     "ultra": 10,
 }
+_CAPABILITY_CASE_DEADLINE_MULTIPLIER_BY_SCALE = {
+    "small": 1.5,
+    "medium": 1.75,
+    "large": 2.0,
+    "ultra": 2.25,
+}
 _FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS = 1
 _DISCUSSION_TRACE_FLOWS = frozenset(
     {
@@ -621,7 +627,14 @@ def execute_project_scale_plan(
         participant_agent_ids: set[str] = set()
         participant_event_kinds: list[str] = []
         multi_agent_contract_reasons: tuple[str, ...] = ()
-        case_deadline = time.monotonic() + max(wait_seconds, 0)
+        case_started_at = time.monotonic()
+        case_deadline = case_started_at + max(wait_seconds, 0)
+        case_absolute_deadline = _case_absolute_deadline(
+            case_started_at,
+            configured_wait_seconds=wait_seconds,
+            case_id=run_request.case_id,
+            benchmark_kind=plan.benchmark_kind,
+        )
         try:
             _report_progress(progress, f"{case_label}: submitting run")
             response = client.request_json(
@@ -861,6 +874,7 @@ def execute_project_scale_plan(
                     observation.workspace_bundle,
                     commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
                     timeout_seconds=generated_project_timeout_seconds,
+                    absolute_deadline=case_absolute_deadline,
                     requirements_case_id=(
                         run_request.case_id if plan.benchmark_kind == "capability" else None
                     ),
@@ -933,6 +947,17 @@ def execute_project_scale_plan(
                 )
                 // 2,
             )
+            same_stage_repair_followups_remaining = max(
+                1,
+                min(
+                    2,
+                    (
+                        max_deliverable_repair_attempts
+                        - soft_deliverable_repair_attempts
+                    )
+                    // 2,
+                ),
+            )
             force_authoritative_repair = False
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
@@ -974,6 +999,7 @@ def execute_project_scale_plan(
                     generated_project_command_count=len(
                         generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS
                     ),
+                    absolute_deadline=case_absolute_deadline,
                 )
                 if not _has_remaining_repair_wait_budget(case_deadline, wait_seconds):
                     _extend_unique(
@@ -1173,6 +1199,7 @@ def execute_project_scale_plan(
                         repair_workspace_bundle,
                         commands=generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS,
                         timeout_seconds=generated_project_timeout_seconds,
+                        absolute_deadline=case_absolute_deadline,
                         requirements_case_id=(
                             run_request.case_id if plan.benchmark_kind == "capability" else None
                         ),
@@ -1222,6 +1249,17 @@ def execute_project_scale_plan(
                     next_progress_state,
                     seen_signatures=seen_repair_progress_signatures,
                 )
+                if (
+                    deliverable_repair_attempts >= soft_deliverable_repair_attempts
+                    and same_stage_repair_followups_remaining > 0
+                    and _deliverable_repair_exposes_new_same_stage_failure(
+                        repair_progress_state,
+                        next_progress_state,
+                        seen_signatures=seen_repair_progress_signatures,
+                    )
+                ):
+                    repair_followup_warranted = True
+                    same_stage_repair_followups_remaining -= 1
                 repeated_build_regression = (
                     _deliverable_repair_requires_authoritative_recovery(
                         repair_progress_state,
@@ -1445,6 +1483,7 @@ def _extend_repair_deadline(
     benchmark_kind: ProjectScaleBenchmarkKind,
     generated_project_timeout_seconds: float,
     generated_project_command_count: int,
+    absolute_deadline: float,
 ) -> float:
     if configured_wait_seconds <= 0:
         return deadline
@@ -1460,12 +1499,33 @@ def _extend_repair_deadline(
         1 if benchmark_kind == "capability" else 0
     )
     validation_budget = max(generated_project_timeout_seconds, 0.0) * validation_count
-    return (
-        max(deadline, time.monotonic())
-        + _EXECUTE_QUEUE_GRACE_SECONDS
-        + runtime_budget
-        + validation_budget
+    return min(
+        absolute_deadline,
+        (
+            max(deadline, time.monotonic())
+            + _EXECUTE_QUEUE_GRACE_SECONDS
+            + runtime_budget
+            + validation_budget
+        ),
     )
+
+
+def _case_absolute_deadline(
+    started_at: float,
+    *,
+    configured_wait_seconds: float,
+    case_id: str,
+    benchmark_kind: ProjectScaleBenchmarkKind,
+) -> float:
+    wait_seconds = max(configured_wait_seconds, 0.0)
+    if benchmark_kind != "capability":
+        return float("inf")
+    scale = case_id.partition(":")[0]
+    multiplier = _CAPABILITY_CASE_DEADLINE_MULTIPLIER_BY_SCALE.get(
+        scale,
+        1.5,
+    )
+    return started_at + wait_seconds * multiplier
 
 
 def _env_flag(name: str) -> bool:
@@ -1964,6 +2024,7 @@ def _validate_generated_project_bundle(
     *,
     commands: Sequence[Sequence[str]],
     timeout_seconds: float,
+    absolute_deadline: float = float("inf"),
     requirements_case_id: str | None = None,
 ) -> _EvidenceCheck:
     if workspace_bundle is None:
@@ -1981,14 +2042,30 @@ def _validate_generated_project_bundle(
             root = Path(temp_dir)
             _extract_workspace_bundle_safely(workspace_bundle, root)
             for command in commands:
+                remaining_seconds = absolute_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=(
+                            "generated_project_validation: absolute validation deadline exhausted",
+                        ),
+                    )
                 reason = _run_generated_project_command(
                     command,
                     cwd=root,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=min(timeout_seconds, remaining_seconds),
                 )
                 if reason is not None:
                     return _EvidenceCheck(passed=False, reasons=(reason,))
             if requirements_case_id is not None:
+                remaining_seconds = absolute_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=(
+                            "generated_project_validation: absolute validation deadline exhausted",
+                        ),
+                    )
                 scale = requirements_case_id.split(":", 1)[0]
                 validators = {
                     "large": validate_large_order_ops_api,
@@ -2002,7 +2079,10 @@ def _validate_generated_project_bundle(
                         passed=False,
                         reasons=("requirements: independent evaluator unavailable for this scale",),
                     )
-                failures = validator(root, timeout_seconds=timeout_seconds)
+                failures = validator(
+                    root,
+                    timeout_seconds=min(timeout_seconds, remaining_seconds),
+                )
                 if failures:
                     return _EvidenceCheck(
                         passed=False,
@@ -3578,9 +3658,7 @@ def _deliverable_repair_made_progress(
         return True
     if metric_progress is True:
         return True
-    if current_failures < previous_failures:
-        return True
-    return current_failures != previous_failures
+    return current_failures < previous_failures
 
 
 def _deliverable_repair_followup_warranted(
@@ -3609,9 +3687,7 @@ def _deliverable_repair_followup_warranted(
     if not added_deficits.issubset(coupled_validation_deficits):
         return False
     if current.validation_stage == previous.validation_stage:
-        if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
-            return False
-        return current.failure_fingerprints != previous.failure_fingerprints
+        return False
     validation_stage_drop = previous.validation_stage - current.validation_stage
     if validation_stage_drop <= 0:
         return False
@@ -3634,6 +3710,34 @@ def _deliverable_repair_followup_warranted(
     if _repair_metrics_progressed(previous.progress_metrics, current.progress_metrics) is False:
         return False
     return current.failure_fingerprints != previous.failure_fingerprints
+
+
+def _deliverable_repair_exposes_new_same_stage_failure(
+    previous: _DeliverableRepairProgress,
+    current: _DeliverableRepairProgress,
+    *,
+    seen_signatures: set[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            int,
+            tuple[tuple[str, int, int], ...],
+        ]
+    ],
+) -> bool:
+    if current.signature in seen_signatures:
+        return False
+    if current.validation_stage != previous.validation_stage:
+        return False
+    if set(current.deficits) != set(previous.deficits):
+        return False
+    previous_failures = set(previous.failure_fingerprints)
+    current_failures = set(current.failure_fingerprints)
+    return bool(
+        previous_failures
+        and current_failures
+        and previous_failures.isdisjoint(current_failures)
+    )
 
 
 def _deliverable_repair_requires_authoritative_recovery(

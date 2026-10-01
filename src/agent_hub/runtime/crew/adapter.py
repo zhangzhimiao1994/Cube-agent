@@ -200,6 +200,47 @@ class _CrewContentLimits:
     interaction_prompt_bytes: int
 
 
+def _model_call_timeout_seconds(
+    context: TaskContext,
+    *,
+    remaining_seconds: float,
+    max_output_tokens: int,
+    purpose: str,
+) -> float:
+    scale = context.routing_decision.get("project_scale")
+    scale_soft_limit = {
+        "medium": 600.0,
+        "large": 900.0,
+        "ultra": 1_500.0,
+    }.get(scale if type(scale) is str else "small", 300.0)
+    token_soft_limit = 120.0 + min(max(max_output_tokens, 0), 262_144) / 128.0
+    soft_limit = max(scale_soft_limit, token_soft_limit)
+    if purpose == "review":
+        soft_limit *= 0.6
+    reserve = min(300.0, max(30.0, remaining_seconds * 0.25))
+    available = (
+        remaining_seconds - reserve
+        if remaining_seconds > reserve
+        else remaining_seconds * 0.75
+    )
+    return max(0.001, min(soft_limit, available))
+
+
+def _tool_progress_step_deadline(
+    context: TaskContext,
+    *,
+    step_deadline: float,
+    run_deadline: float,
+) -> float:
+    scale = context.routing_decision.get("project_scale")
+    progress_credit = {
+        "medium": 120.0,
+        "large": 180.0,
+        "ultra": 300.0,
+    }.get(scale if type(scale) is str else "small", 60.0)
+    return min(run_deadline, step_deadline + progress_credit)
+
+
 def _crew_content_limits(
     context: TaskContext,
     *,
@@ -5364,6 +5405,7 @@ class CrewDispatchRuntime:
                     "tools": tuple(step.tools),
                 },
             )
+            remaining_timeout = self._remaining_timeout(run_state, step_deadline)
             request = ModelRequest(
                 logical_model=logical_model,
                 messages=self._response_contract_messages(
@@ -5372,7 +5414,12 @@ class CrewDispatchRuntime:
                     limits=content_limits,
                 ),
                 required_capabilities=frozenset(round_required_capabilities),
-                timeout_seconds=self._remaining_timeout(run_state, step_deadline),
+                timeout_seconds=_model_call_timeout_seconds(
+                    context,
+                    remaining_seconds=remaining_timeout,
+                    max_output_tokens=max_output_tokens,
+                    purpose="step",
+                ),
                 max_output_tokens=max_output_tokens,
                 response_schema=response_schema,
                 tools=round_tools,
@@ -6089,7 +6136,11 @@ class CrewDispatchRuntime:
                 return _generated_file_ready_completion(completion, response)
             force_result_synthesis = reused_result_count == len(response.tool_calls)
             if round_progressed and run_state.deadline is not None:
-                step_deadline = max(step_deadline, run_state.deadline)
+                step_deadline = _tool_progress_step_deadline(
+                    context,
+                    step_deadline=step_deadline,
+                    run_deadline=run_state.deadline,
+                )
             last_round_progressed = round_progressed
             messages.append(
                 ModelMessage(
@@ -6609,6 +6660,7 @@ class CrewDispatchRuntime:
                         "candidate_artifact_id": str(artifact.id),
                     },
                 )
+                remaining_timeout = runtime._remaining_timeout(run_state, step_deadline)
                 request = ModelRequest(
                     logical_model=reviewer.logical_model,
                     messages=runtime._response_contract_messages(
@@ -6623,7 +6675,12 @@ class CrewDispatchRuntime:
                     required_capabilities=frozenset(
                         {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
                     ),
-                    timeout_seconds=runtime._remaining_timeout(run_state, step_deadline),
+                    timeout_seconds=_model_call_timeout_seconds(
+                        context,
+                        remaining_seconds=remaining_timeout,
+                        max_output_tokens=max_output_tokens,
+                        purpose="review",
+                    ),
                     max_output_tokens=max_output_tokens,
                     response_schema=_REVIEW_RESPONSE_SCHEMA,
                 )

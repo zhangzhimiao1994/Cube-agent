@@ -827,7 +827,7 @@ def test_effective_execute_wait_seconds_reserves_capability_repair_budget() -> N
     )
 
 
-def test_repair_deadline_extends_by_one_actual_execution_and_validation_round(
+def test_repair_deadline_never_extends_past_case_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 50.0)
@@ -840,9 +840,84 @@ def test_repair_deadline_extends_by_one_actual_execution_and_validation_round(
             benchmark_kind="capability",
             generated_project_timeout_seconds=240.0,
             generated_project_command_count=3,
+            absolute_deadline=500.0,
         )
-        == 2860.0
+        == 500.0
     )
+
+
+def test_case_absolute_deadline_scales_from_case_id() -> None:
+    assert project_scale_runner_module._case_absolute_deadline(
+        50.0,
+        configured_wait_seconds=100.0,
+        case_id="small:direct",
+        benchmark_kind="capability",
+    ) == 200.0
+    assert project_scale_runner_module._case_absolute_deadline(
+        50.0,
+        configured_wait_seconds=100.0,
+        case_id="ultra:auto",
+        benchmark_kind="capability",
+    ) == 275.0
+
+
+def test_generated_project_validation_stops_at_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_calls: list[float] = []
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_run_generated_project_command",
+        lambda *args, **kwargs: command_calls.append(float(kwargs["timeout_seconds"])),
+    )
+    monkeypatch.setattr(
+        "agent_hub.harness.project_scale_runner.time.monotonic",
+        lambda: 50.0,
+    )
+
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}),
+        commands=((sys.executable, "-c", "pass"),),
+        timeout_seconds=120,
+        absolute_deadline=50.0,
+    )
+
+    assert result.passed is False
+    assert result.reasons == (
+        "generated_project_validation: absolute validation deadline exhausted",
+    )
+    assert command_calls == []
+
+
+def test_generated_project_validation_clamps_command_to_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_timeouts: list[float] = []
+
+    def run_command(*args: object, **kwargs: object) -> None:
+        command_timeout = kwargs["timeout_seconds"]
+        assert isinstance(command_timeout, int | float)
+        command_timeouts.append(float(command_timeout))
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_run_generated_project_command",
+        run_command,
+    )
+    monkeypatch.setattr(
+        "agent_hub.harness.project_scale_runner.time.monotonic",
+        lambda: 50.0,
+    )
+
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}),
+        commands=((sys.executable, "-c", "pass"),),
+        timeout_seconds=120,
+        absolute_deadline=55.0,
+    )
+
+    assert result.passed is True
+    assert command_timeouts == [5.0]
 
 
 def test_deliverable_repair_attempt_limit_rejects_unknown_scale() -> None:
@@ -901,7 +976,7 @@ def test_deliverable_repair_progress_ignores_volatile_failure_and_bundle_changes
     )
 
 
-def test_deliverable_repair_progress_stops_seen_ab_cycle() -> None:
+def test_deliverable_repair_progress_rejects_unseen_error_rotation() -> None:
     evidence = {
         "workspace_bundle": True,
         "deliverable_quality": False,
@@ -925,7 +1000,7 @@ def test_deliverable_repair_progress_stops_seen_ab_cycle() -> None:
         ),
     )
 
-    assert project_scale_runner_module._deliverable_repair_made_progress(
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
         state_a,
         state_b,
         seen_signatures={state_a.signature},
@@ -934,6 +1009,25 @@ def test_deliverable_repair_progress_stops_seen_ab_cycle() -> None:
         state_b,
         state_a,
         seen_signatures={state_a.signature, state_b.signature},
+    )
+
+
+def test_deliverable_repair_progress_rejects_same_stage_error_rotation() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("npm run build failed with ts2322",),
+        validation_stage=1,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=previous.deficits,
+        failure_fingerprints=("npm run build failed with ts2305",),
+        validation_stage=1,
+    )
+
+    assert not project_scale_runner_module._deliverable_repair_made_progress(
+        previous,
+        current,
+        seen_signatures={previous.signature},
     )
 
 
@@ -1066,7 +1160,7 @@ def test_soft_repair_limit_allows_unseen_actionable_regression() -> None:
     )
 
 
-def test_soft_repair_limit_allows_unseen_same_stage_build_failure() -> None:
+def test_soft_repair_limit_rejects_unseen_same_stage_build_failure() -> None:
     previous = project_scale_runner_module._DeliverableRepairProgress(
         deficits=(
             "deliverable_quality",
@@ -1086,12 +1180,36 @@ def test_soft_repair_limit_allows_unseen_same_stage_build_failure() -> None:
         validation_stage=1,
     )
 
-    assert project_scale_runner_module._deliverable_repair_followup_warranted(
+    assert not project_scale_runner_module._deliverable_repair_followup_warranted(
         previous,
         current,
         seen_signatures={previous.signature},
     )
     assert not project_scale_runner_module._deliverable_repair_followup_warranted(
+        previous,
+        current,
+        seen_signatures={previous.signature, current.signature},
+    )
+
+
+def test_same_stage_replacement_failure_gets_one_bounded_followup() -> None:
+    previous = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=("generated_project_validation",),
+        failure_fingerprints=("src/one.ts: error ts2322",),
+        validation_stage=1,
+    )
+    current = project_scale_runner_module._DeliverableRepairProgress(
+        deficits=previous.deficits,
+        failure_fingerprints=("src/two.ts: error ts2305",),
+        validation_stage=1,
+    )
+
+    assert project_scale_runner_module._deliverable_repair_exposes_new_same_stage_failure(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+    assert not project_scale_runner_module._deliverable_repair_exposes_new_same_stage_failure(
         previous,
         current,
         seen_signatures={previous.signature, current.signature},
@@ -5964,7 +6082,7 @@ def test_repeated_same_stage_failure_does_not_force_authoritative_recovery() -> 
     )
 
 
-def test_capability_repair_extends_past_scale_budget_while_validation_progresses(
+def test_capability_repair_stops_at_soft_limit_for_error_rotation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -6047,16 +6165,16 @@ def test_capability_repair_extends_past_scale_budget_while_validation_progresses
 
     report = execute_project_scale_plan(plan, client)
 
-    assert report.ok is True
+    assert report.ok is False
     assert project_scale_runner_module._deliverable_repair_attempt_limit(
         "small:direct", benchmark_kind="capability"
     ) == 5
-    assert len(client.submitted_bodies) == 7
-    assert validation_results == []
+    assert len(client.submitted_bodies) == 5
+    assert len(validation_results) == 2
     result = report.results[0]
-    assert result.evidence["generated_project_validation"] is True
+    assert result.evidence["generated_project_validation"] is False
     assert result.evidence["deliverable_repair_trace"] is True
-    assert result.errors == ()
+    assert any("src/repair-4.ts" in error for error in result.errors)
     repair_keys = [
         call[2]
         for call in client.calls
@@ -6070,8 +6188,6 @@ def test_capability_repair_extends_past_scale_budget_while_validation_progresses
         "project-scale-small-direct-0-deliverable-repair-2",
         "project-scale-small-direct-0-deliverable-repair-3",
         "project-scale-small-direct-0-deliverable-repair-4",
-        "project-scale-small-direct-0-deliverable-repair-5",
-        "project-scale-small-direct-0-deliverable-repair-6",
     ]
 
 
@@ -6368,8 +6484,8 @@ def test_capability_repair_stops_at_dynamic_safety_limit(
             passed=False,
             reasons=(
                 (
-                    "generated_project_validation: command failed exit=2 "
-                    f'command=npm run build output_tail="src/next-{attempt}.ts: error TS{2400 + attempt}"'
+                    "generated_project_validation: command failed exit=1 "
+                    f'command=npm test output_tail="concurrent creates: {attempt} !== 100"'
                 ),
             ),
         )

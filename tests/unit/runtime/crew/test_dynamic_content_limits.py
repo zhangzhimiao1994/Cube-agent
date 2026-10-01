@@ -83,6 +83,57 @@ def test_crew_content_limits_grow_with_token_budget_and_project_scale() -> None:
     assert ultra.output_bytes == adapter._ABSOLUTE_OUTPUT_BYTES
 
 
+def test_model_call_timeout_scales_and_reserves_recovery_budget() -> None:
+    small = adapter._model_call_timeout_seconds(
+        _context(token_budget=16_384, project_scale="small"),
+        remaining_seconds=3_600,
+        max_output_tokens=8_192,
+        purpose="step",
+    )
+    ultra = adapter._model_call_timeout_seconds(
+        _context(token_budget=1_000_000, project_scale="ultra"),
+        remaining_seconds=3_600,
+        max_output_tokens=131_072,
+        purpose="step",
+    )
+    constrained = adapter._model_call_timeout_seconds(
+        _context(token_budget=1_000_000, project_scale="ultra"),
+        remaining_seconds=120,
+        max_output_tokens=131_072,
+        purpose="step",
+    )
+    review = adapter._model_call_timeout_seconds(
+        _context(token_budget=1_000_000, project_scale="ultra"),
+        remaining_seconds=3_600,
+        max_output_tokens=131_072,
+        purpose="review",
+    )
+
+    assert 0 < small < ultra < 3_600
+    assert constrained <= 90
+    assert review < ultra
+
+
+def test_tool_progress_extends_step_deadline_without_consuming_run_deadline() -> None:
+    small = adapter._tool_progress_step_deadline(
+        _context(token_budget=16_384, project_scale="small"),
+        step_deadline=100,
+        run_deadline=3_600,
+    )
+    ultra = adapter._tool_progress_step_deadline(
+        _context(token_budget=1_000_000, project_scale="ultra"),
+        step_deadline=100,
+        run_deadline=3_600,
+    )
+
+    assert 100 < small < ultra < 3_600
+    assert adapter._tool_progress_step_deadline(
+        _context(token_budget=1_000_000, project_scale="ultra"),
+        step_deadline=3_500,
+        run_deadline=3_600,
+    ) == 3_600
+
+
 def test_history_and_final_synthesis_use_dynamic_per_source_budget() -> None:
     context = _context(token_budget=131_072, project_scale="large")
     limits = adapter._crew_content_limits(
