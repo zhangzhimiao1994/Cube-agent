@@ -180,7 +180,7 @@ async def test_partial_checkpoint_records_ordered_exact_input_refs() -> None:
     assert checkpoint.state.get("input_refs") == tuple(
         {"id": str(artifact.id), "sha256": artifact.content_sha256} for artifact in inputs
     )
-    assert checkpoint.runtime_version == "10"
+    assert checkpoint.runtime_version == "11"
     remaining = checkpoint.state.get("remaining_timeout_seconds")
     assert isinstance(remaining, float)
     assert 0 < remaining <= 60.0

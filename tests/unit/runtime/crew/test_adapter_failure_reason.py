@@ -48,7 +48,9 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
     _checkpoint_can_skip_forbidden_tool_placeholders,
+    _correctable_tool_argument_rejection,
     _crew_content_limits,
+    _has_matching_tool_argument_rejection,
     _scope_project_workspace_tool_call,
     _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
@@ -3707,6 +3709,228 @@ async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None
     await resumed.restore_checkpoint(checkpoint)
 
 
+async def test_workspace_path_rejection_is_returned_for_bounded_model_correction() -> None:
+    rejected_content = "TOP-SECRET-WORKFLOW-CONTENT"
+
+    class CorrectingWorkspaceGateway:
+        def __init__(self, correction_gate: asyncio.Event | None = None) -> None:
+            self.requests: list[ModelRequest] = []
+            self.correction_gate = correction_gate
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            has_argument_correction = any(
+                message.role == "system"
+                and isinstance(message.content, str)
+                and "CAPABILITY_ARGUMENT_CORRECTION" in message.content
+                for message in request.messages
+            )
+            has_successful_continuation = any(
+                message.role == "system"
+                and isinstance(message.content, str)
+                and "CAPABILITY_RESULT_CONTINUATION" in message.content
+                for message in request.messages
+            )
+            if has_successful_continuation:
+                response = ModelResponse(
+                    text="workspace updated",
+                    usage=TokenUsage(1, 1, 2),
+                )
+            elif has_argument_correction:
+                if self.correction_gate is not None:
+                    await self.correction_gate.wait()
+                response = ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="safe-path",
+                        name="workspace.write_text",
+                        arguments={
+                            "path": "docs/ci.yml",
+                            "content": "safe workflow guidance",
+                        },
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                )
+            else:
+                response = ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="hidden-path",
+                            name="workspace.write_text",
+                            arguments={
+                                "path": ".github/workflows/ci.yml",
+                                "content": rejected_content,
+                            },
+                        ),
+                        ToolCall(
+                            id="must-not-run-after-rejection",
+                            name="workspace.write_text",
+                            arguments={
+                                "path": "should-not-run.txt",
+                                "content": "must not run",
+                            },
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+                cost_usd=Decimal(0),
+            )
+
+    class WorkspacePathHarness:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            if request.arguments["path"] == ".github/workflows/ci.yml":
+                return HarnessToolCallResult(
+                    call_id=request.call_id,
+                    tool_name=request.tool_name,
+                    status="failed",
+                    payload={},
+                    failure_reason="workspace path must not contain hidden files",
+                )
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"path": request.arguments["path"]},
+            )
+
+    plan = DispatchPlan(
+        agents=(AgentSpec(
+            id="writer",
+            role="Writer",
+            goal="Write the requested workspace file.",
+            logical_model="general",
+            allowed_tools=("workspace.write_text",),
+        ),),
+        steps=(DispatchStep(
+            id="write_step",
+            agent="writer",
+            task="Write one workspace file.",
+            tools=("workspace.write_text",),
+            final_synthesizer=True,
+            token_budget=1_000,
+        ),),
+        allowed_tools=("workspace.write_text",),
+        total_token_budget=1_000,
+    )
+    gateway = CorrectingWorkspaceGateway(asyncio.Event())
+    harness = WorkspacePathHarness()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+
+    stream = runtime.run(_context())
+    events: list[RunEvent] = []
+    rejection_checkpoint: RuntimeCheckpoint | None = None
+    async for event in stream:
+        events.append(event)
+        if event.kind is not EventKind.CHECKPOINT_SAVED or event.checkpoint is None:
+            continue
+        checkpoint_tools = event.checkpoint.state["tools"]
+        if isinstance(checkpoint_tools, Mapping) and any(
+            isinstance(state, Mapping) and state.get("status") == "rejected"
+            for state in checkpoint_tools.values()
+        ):
+            rejection_checkpoint = event.checkpoint
+            break
+    await runtime.cancel()
+    assert rejection_checkpoint is not None
+
+    resumed_gateway = CorrectingWorkspaceGateway()
+    resumed_harness = WorkspacePathHarness()
+    resumed = CrewDispatchRuntime(
+        resumed_gateway,
+        plan,
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=resumed_harness,
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await resumed.restore_checkpoint(rejection_checkpoint)
+    resumed_events = [
+        event
+        async for event in resumed.run(_context(checkpoint=rejection_checkpoint))
+    ]
+
+    assert [call.arguments["path"] for call in (*harness.calls, *resumed_harness.calls)] == [
+        ".github/workflows/ci.yml",
+        "docs/ci.yml",
+    ]
+    assert len(gateway.requests) == 2
+    assert len(resumed_gateway.requests) == 2
+    correction_messages = resumed_gateway.requests[0].messages
+    serialized_messages = json.dumps(
+        [
+            {"role": message.role, "content": message.content}
+            for message in correction_messages
+        ],
+        ensure_ascii=False,
+    )
+    assert "CAPABILITY_ARGUMENT_CORRECTION" in serialized_messages
+    assert "invalid_workspace_path" in serialized_messages
+    assert "workspace path must not contain hidden files" in serialized_messages
+    assert rejected_content not in serialized_messages
+    assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [
+        "workspace path must not contain hidden files"
+    ]
+    rejected_event = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert rejected_event.payload["status"] == "rejected"
+    assert rejected_event.payload["failure_kind"] == "invalid_arguments"
+    assert resumed_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    checkpoint = await resumed.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    rejected_states = [
+        state
+        for state in tool_states.values()
+        if isinstance(state, Mapping) and state.get("status") == "rejected"
+    ]
+    assert len(rejected_states) == 1
+
+    completed_gateway = CorrectingWorkspaceGateway()
+    completed_harness = WorkspacePathHarness()
+    completed = CrewDispatchRuntime(
+        completed_gateway,
+        plan,
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=completed_harness,
+        artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await completed.restore_checkpoint(checkpoint)
+    completed_events = [
+        event
+        async for event in completed.run(_context(checkpoint=checkpoint))
+    ]
+    assert completed_harness.calls == []
+    assert completed_gateway.requests == []
+    assert [event.kind for event in completed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
 async def test_default_harness_wrapper_fails_closed_without_actor_identity() -> None:
     capabilities = FakeCapabilities()
     runtime = CrewDispatchRuntime(
@@ -3989,7 +4213,69 @@ def test_project_zip_tool_definition_exposes_required_file_schema() -> None:
     assert isinstance(files, Mapping)
     assert files["type"] == "object"
     assert files["additionalProperties"] == {"type": "string"}
+
+
+def test_workspace_write_tool_definition_documents_safe_relative_paths() -> None:
+    (definition,) = _tool_definitions(("workspace.write_text",))
+
+    assert "POSIX relative path" in definition.description
+    assert "hidden path segments" in definition.description
+    properties = definition.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    path = properties["path"]
+    assert isinstance(path, Mapping)
+    description = path["description"]
+    assert isinstance(description, str)
+    assert "Allowed root metadata files" in description
     assert definition.parameters["additionalProperties"] is False
+
+
+def test_workspace_argument_correction_guards_are_bounded_and_exact() -> None:
+    repeated_sha = "a" * 64
+    ledger = _ToolLedger(states={
+        "first": {
+            "status": "rejected",
+            "step_id": "write_step",
+            "name": "workspace.write_text",
+            "arguments_sha256": repeated_sha,
+        },
+        "second": {
+            "status": "rejected",
+            "step_id": "write_step",
+            "name": "workspace.write_text",
+            "arguments_sha256": "b" * 64,
+        },
+    })
+    call = ToolCall(
+        id="hidden-path",
+        name="workspace.write_text",
+        arguments={"path": ".github/workflows/ci.yml", "content": "secret"},
+    )
+
+    assert _has_matching_tool_argument_rejection(
+        ledger,
+        step_id="write_step",
+        name="workspace.write_text",
+        arguments_sha256=repeated_sha,
+    )
+    assert _correctable_tool_argument_rejection(
+        call,
+        "workspace path must not contain hidden files",
+        ledger,
+        step_id="write_step",
+        producer="writer",
+        source_id=str(uuid4()),
+        arguments_sha256="c" * 64,
+    ) is None
+    assert _correctable_tool_argument_rejection(
+        call,
+        "capability requires approval",
+        _ToolLedger(),
+        step_id="write_step",
+        producer="writer",
+        source_id=str(uuid4()),
+        arguments_sha256="d" * 64,
+    ) is None
 
 
 def test_project_zip_tool_call_gets_server_owned_workspace_scope() -> None:
