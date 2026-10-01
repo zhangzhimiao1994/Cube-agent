@@ -313,10 +313,12 @@ def verify_public_plugin_invocation(
         for item in items
         if isinstance(item, Mapping) and item.get("tool_name") == capability_id
     ]
-    requested = any(item.get("kind") == "tool.requested" for item in matching_events)
-    completed = any(item.get("kind") == "tool.completed" for item in matching_events)
+    requested_count = sum(item.get("kind") == "tool.requested" for item in matching_events)
+    completed_count = sum(item.get("kind") == "tool.completed" for item in matching_events)
     failed = any(item.get("kind") == "tool.failed" for item in matching_events)
-    if not requested or not completed or failed:
+    if requested_count != 1 or completed_count != 1:
+        raise RuntimeError("public run did not invoke the expected plugin capability exactly once")
+    if failed:
         raise RuntimeError("public run did not complete the expected plugin capability")
     audit_items = _list(audits, "plugin invocation audit")
     correlated = False
@@ -449,6 +451,21 @@ def run_real_user_plugin_acceptance(
         if registration != "ready":
             raise RuntimeError(f"plugin subprocess runtime is not ready: {registration}")
         phases.append("runtime_ready")
+        plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
+        signing_keys = _list(
+            client.request_json("GET", "/api/v1/admin/plugins/signing-keys"),
+            "plugin signing key list",
+        )
+        if any(
+            isinstance(item, Mapping) and item.get("id") == package.plugin_id
+            for item in plugins
+        ) or any(
+            isinstance(item, Mapping) and item.get("key_id") == package.key_id
+            for item in signing_keys
+        ):
+            raise RuntimeError("temporary plugin or signing key already exists")
+        phases.append("resource_names_available")
+        key_registered = True
         client.request_json(
             "POST",
             "/api/v1/admin/plugins/signing-keys",
@@ -458,8 +475,8 @@ def run_real_user_plugin_acceptance(
                 "public_key": package.public_key,
             },
         )
-        key_registered = True
         phases.append("signing_key_registered")
+        installed = True
         installed_plugin = _plugin_from_install(
             client.request_archive(
                 "POST",
@@ -468,7 +485,6 @@ def run_real_user_plugin_acceptance(
                 filename=package.archive_path.name,
             )
         )
-        installed = True
         if installed_plugin.get("id") != package.plugin_id:
             raise RuntimeError("installed plugin id does not match the signed package")
         if _activation_state(installed_plugin) != "blocked_pending_approval":
@@ -590,9 +606,9 @@ def run_real_user_plugin_acceptance(
         "cleanup": {"completed": cleanup_completed, "errors": cleanup_errors},
         "errors": errors,
         "success_basis": {
-            "logged_in_user_public_run": True,
+            "logged_in_user_public_run": "public_run_completed" in phases,
             "admin_internal_run_data": False,
-            "runtime_output_schema_nonce": True,
+            "runtime_output_schema_nonce": "unique_result_validated" in phases,
         },
     }
 

@@ -30,11 +30,15 @@ class FakePluginAcceptanceClient:
         capability_available: bool = True,
         availability_reason: str | None = None,
         run_status: str = "completed",
+        existing_resource: bool = False,
+        install_response_lost: bool = False,
     ) -> None:
         self.audit_matches = audit_matches
         self.capability_available = capability_available
         self.availability_reason = availability_reason
         self.run_status = run_status
+        self.existing_resource = existing_resource
+        self.install_response_lost = install_response_lost
         self.requests: list[tuple[str, str]] = []
         self.plugin_id = ""
         self.capability_id = ""
@@ -58,6 +62,8 @@ class FakePluginAcceptanceClient:
         capability = manifest["capabilities"][0]
         self.capability_id = capability["id"]
         self.nonce = capability["output_schema"]["properties"]["acceptance_nonce"]["const"]
+        if self.install_response_lost:
+            raise ConnectionError("install response was lost")
         return {
             "plugin": {
                 "id": self.plugin_id,
@@ -81,6 +87,8 @@ class FakePluginAcceptanceClient:
             return {"user_id": "user-real-1", "tenant_id": "tenant-1", "role": "admin"}
         if path == "/api/v1/admin/settings":
             return {"plugin_package_subprocess_registration_status": "ready"}
+        if path == "/api/v1/admin/plugins/signing-keys" and method == "GET":
+            return [{"key_id": "plugin-uat-key-flow-123"}] if self.existing_resource else []
         if path == "/api/v1/admin/plugins/signing-keys" and method == "POST":
             return {"key_id": body["key_id"] if body else ""}
         if path.endswith("/package/approve"):
@@ -156,6 +164,8 @@ class FakePluginAcceptanceClient:
         if path.startswith("/api/v1/admin/plugins/signing-keys/") and method == "DELETE":
             return {"status": "deleted"}
         if path == "/api/v1/admin/plugins" and method == "GET":
+            if self.existing_resource:
+                return [{"id": "plugin-uat-flow-123"}]
             return []
         raise AssertionError(f"unexpected request: {method} {path} {body}")
 
@@ -235,6 +245,39 @@ def test_verify_public_invocation_correlates_public_tool_event_and_user_audit() 
         )
 
 
+def test_verify_public_invocation_rejects_multiple_calls() -> None:
+    module = _load_script()
+    events = {
+        "items": [
+            {"kind": "tool.requested", "tool_name": "acceptance.stats_case"},
+            {"kind": "tool.completed", "tool_name": "acceptance.stats_case"},
+            {"kind": "tool.requested", "tool_name": "acceptance.stats_case"},
+            {"kind": "tool.completed", "tool_name": "acceptance.stats_case"},
+        ]
+    }
+    audits = [
+        {
+            "action": "plugin.invoke.succeeded",
+            "details": {
+                "run_id": "run-1",
+                "user_id": "user-1",
+                "plugin_id": "plugin-case",
+                "capability_id": "acceptance.stats_case",
+            },
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="exactly once"):
+        module.verify_public_plugin_invocation(
+            events=events,
+            audits=audits,
+            run_id="run-1",
+            user_id="user-1",
+            plugin_id="plugin-case",
+            capability_id="acceptance.stats_case",
+        )
+
+
 def test_real_user_plugin_acceptance_runs_public_flow_and_cleans_up(tmp_path: Path) -> None:
     module = _load_script()
     client = FakePluginAcceptanceClient()
@@ -283,6 +326,11 @@ def test_real_user_plugin_acceptance_cleans_up_after_evidence_failure(tmp_path: 
 
     assert report["status"] == "failed"
     assert report["acceptance_complete"] is False
+    assert report["success_basis"] == {
+        "logged_in_user_public_run": True,
+        "admin_internal_run_data": False,
+        "runtime_output_schema_nonce": False,
+    }
     assert any(path.endswith("/disable") for _, path in client.requests)
     assert any(path.endswith("/stop") for _, path in client.requests)
     assert any(path.endswith("/uninstall") for _, path in client.requests)
@@ -332,3 +380,40 @@ def test_real_user_plugin_acceptance_reports_manifest_unavailable_reason(tmp_pat
     assert report["errors"] == [
         "plugin capability is unavailable: plugin_package_adapter_unavailable"
     ]
+
+
+def test_real_user_plugin_acceptance_refuses_existing_plugin_or_key(tmp_path: Path) -> None:
+    module = _load_script()
+    client = FakePluginAcceptanceClient(existing_resource=True)
+
+    report = module.run_real_user_plugin_acceptance(
+        client,
+        execution_id="flow-123",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert report["status"] == "failed"
+    assert report["errors"] == ["temporary plugin or signing key already exists"]
+    assert ("POST", "/api/v1/admin/plugins/signing-keys") not in client.requests
+    assert ("POST", "/api/v1/admin/plugins/install") not in client.requests
+
+
+def test_real_user_plugin_acceptance_cleans_up_after_lost_install_response(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    client = FakePluginAcceptanceClient(install_response_lost=True)
+
+    report = module.run_real_user_plugin_acceptance(
+        client,
+        execution_id="ambiguous-install",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert report["status"] == "failed"
+    assert any(path.endswith("/uninstall") for _, path in client.requests)
+    assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
