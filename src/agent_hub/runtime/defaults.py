@@ -2218,7 +2218,10 @@ def _role_step_timeout(
         return post_product_step_timeout
     if (
         role.id == "implementer"
-        and PROJECT_SCALE_ARTIFACT_TOOL_NAME in tools
+        and (
+            PROJECT_SCALE_ARTIFACT_TOOL_NAME in tools
+            or "workspace.write_text" in tools
+        )
         and _is_project_scale_generated_project_request(context)
     ):
         scale = _project_scale_budget_tier(context)

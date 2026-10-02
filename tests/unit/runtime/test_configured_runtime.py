@@ -6822,6 +6822,84 @@ def test_project_scale_zip_implementer_gets_extended_step_timeout() -> None:
     assert steps["implementer"].timeout_seconds > steps["architect"].timeout_seconds
 
 
+def test_project_scale_workspace_writer_gets_extended_step_timeout() -> None:
+    roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.PLAN,
+            mission="Plan the requested project.",
+            must_answer=("What architecture is needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("workspace.write_text",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="tester",
+            role="Tester",
+            purpose=RolePurpose.VERIFY,
+            mission="Verify the generated project.",
+            must_answer=("What verification passed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="security_reviewer",
+            role="Security Reviewer",
+            purpose=RolePurpose.RISK_REVIEW,
+            mission="Review the generated project risks.",
+            must_answer=("What risks remain?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "Build a real large business project for flow=multi_agent. "
+                "Write the complete generated project into the workspace."
+            ),
+            timeout_seconds=1200,
+            token_budget=1_000_000,
+            routing_decision={
+                "project_scale": "large",
+                "project_delivery": "workspace",
+                "artifact_strategy": "workspace_bundle",
+            },
+        ),
+        capability_gateway=FakeCapabilityAvailability({"workspace.write_text"}),
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+    assert steps["implementer"].timeout_seconds == 800
+    assert steps["implementer"].timeout_seconds > steps["architect"].timeout_seconds
+
+
 @pytest.mark.parametrize(
     ("project_request", "expected_budget"),
     (

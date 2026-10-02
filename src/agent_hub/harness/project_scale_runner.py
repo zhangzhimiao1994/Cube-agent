@@ -3791,7 +3791,7 @@ def _deliverable_repair_body(
     repair_body = dict(body)
     if effective_mode in {"direct", "dispatch", "hybrid"}:
         repair_body["mode"] = effective_mode
-    if body.get("mode") == "auto" and effective_mode == "direct":
+    if effective_mode == "direct":
         repair_body["allow_scale_mode_upgrade"] = False
     original_message = body.get("message")
     if benchmark_kind == "capability":
@@ -3967,11 +3967,7 @@ def _deliverable_repair_mode(
 ) -> str | None:
     if effective_mode not in {"direct", "dispatch", "hybrid"}:
         return effective_mode
-    if body.get("mode") != "auto":
-        return effective_mode
-    if effective_mode == "dispatch" and status == "failed":
-        return "direct"
-    if effective_mode == "hybrid":
+    if effective_mode == "hybrid" and body.get("mode") in {"auto", "direct"}:
         for event in events or ():
             if not isinstance(event, Mapping):
                 continue
@@ -3980,6 +3976,10 @@ def _deliverable_repair_mode(
                 and event.get("reason") == "partial_hybrid_after_discussion_failure"
             ):
                 return "direct"
+    if body.get("mode") != "auto":
+        return effective_mode
+    if effective_mode == "dispatch" and status == "failed":
+        return "direct"
     return effective_mode
 
 
