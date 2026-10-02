@@ -35,6 +35,7 @@ RUN python -m venv --without-pip .venv \
 
 FROM ${PYTHON_IMAGE} AS skill-runner
 ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
+    PYTHONPATH=/opt/agent-hub \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOME=/workspace

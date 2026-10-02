@@ -109,6 +109,10 @@ def test_dockerfile_uses_builtin_frontend_for_offline_base_image_builds() -> Non
     assert not re.search(r"(?m)^#\s*syntax=", read("Dockerfile"))
 
 
+def test_skill_runner_module_remains_importable_when_sandbox_changes_workdir() -> None:
+    assert 'PYTHONPATH=/opt/agent-hub' in _docker_stage("skill-runner")
+
+
 def _docker_stage(name: str) -> str:
     stages = re.split(r"(?m)^FROM \S+ AS (\S+)\s*\n", read("Dockerfile"))
     by_name = dict(zip(stages[1::2], stages[2::2], strict=True))
