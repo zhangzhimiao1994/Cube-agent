@@ -10,6 +10,7 @@ import pytest
 from agent_hub.models.litellm_client import (
     LiteLLMClient,
     ModelClientError,
+    ModelResponseCancelled,
     ModelResponseError,
     ModelTransportError,
 )
@@ -19,6 +20,7 @@ from agent_hub.models.types import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RejectedOutputEvidence,
     StructuredResponseSchema,
     TokenUsage,
     ToolCall,
@@ -145,9 +147,7 @@ def malformed_sensitive_response() -> object:
 
 
 def captured_traceback(error: BaseException) -> str:
-    return "".join(
-        traceback.TracebackException.from_exception(error, capture_locals=True).format()
-    )
+    return "".join(traceback.TracebackException.from_exception(error, capture_locals=True).format())
 
 
 async def test_uses_exact_openai_compatible_chat_completions_surface() -> None:
@@ -201,9 +201,7 @@ async def test_normalizes_multimodal_parts_without_mutating_caller_data() -> Non
         },
     ]
     assert create.await_args is not None
-    assert create.await_args.kwargs["messages"] == [
-        {"role": "user", "content": caller_parts}
-    ]
+    assert create.await_args.kwargs["messages"] == [{"role": "user", "content": caller_parts}]
     assert create.await_args.kwargs["messages"][0]["content"] is not caller_parts
 
 
@@ -401,7 +399,9 @@ async def test_passes_strict_completion_budget_to_openai_compatible_transport() 
 
 
 async def test_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
-    provider_error = ModelTransportError("unknown parameter: max_completion_tokens", status_code=400)
+    provider_error = ModelTransportError(
+        "unknown parameter: max_completion_tokens", status_code=400
+    )
     create = AsyncMock(side_effect=[provider_error, sdk_response()])
     close = AsyncMock()
     sdk_client = SimpleNamespace(
@@ -521,7 +521,9 @@ async def test_stream_provider_error_closes_and_redacts_runtime_secrets() -> Non
 
 
 async def test_stream_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
-    provider_error = ModelTransportError("unknown parameter: max_completion_tokens", status_code=400)
+    provider_error = ModelTransportError(
+        "unknown parameter: max_completion_tokens", status_code=400
+    )
     stream = AsyncChunkStream(
         [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"))])]
     )
@@ -717,17 +719,21 @@ async def test_retries_root_relay_base_with_v1_suffix_when_route_is_missing() ->
 
 @pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/"])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_messages_schema_is_rejected_before_constructing_clients(
+async def test_messages_schema_uses_native_format_but_streaming_stays_unsupported(
     path: str, stream: bool
 ) -> None:
     post = AsyncMock(
         return_value=SimpleNamespace(
             status_code=200,
-            json=lambda: {"content": [{"type": "text", "text": "plain text"}]},
+            json=lambda: {
+                "content": [{"type": "text", "text": '{"answer":"ready"}'}],
+                "usage": {"input_tokens": 8, "output_tokens": 9},
+            },
         )
     )
     openai_factory = MagicMock()
-    http_factory = MagicMock(return_value=SimpleNamespace(post=post, aclose=AsyncMock()))
+    close = AsyncMock()
+    http_factory = MagicMock(return_value=SimpleNamespace(post=post, aclose=close))
     transport = LiteLLMClient(
         client_factory=openai_factory,
         http_client_factory=http_factory,
@@ -750,16 +756,97 @@ async def test_messages_schema_is_rejected_before_constructing_clients(
         capabilities={ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT},
     )
 
-    with pytest.raises(ValueError, match="messages endpoint response schemas are not supported"):
-        if stream:
+    if stream:
+        with pytest.raises(ValueError, match="messages endpoint streaming is not supported"):
             transport.stream_openai_compatible_chunks(target, structured_request, API_KEY)
-        else:
-            await transport.complete(target, structured_request, API_KEY)
+        http_factory.assert_not_called()
+        post.assert_not_awaited()
+        close.assert_not_awaited()
+    else:
+        result = await transport.complete(target, structured_request, API_KEY)
+        assert result.text == '{"answer":"ready"}'
+        assert result.usage is not None and result.usage.total_tokens == 17
+        post.assert_awaited_once()
+        assert post.await_args is not None
+        assert post.await_args.kwargs["json"]["output_config"] == {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        assert "response_format" not in post.await_args.kwargs["json"]
+        close.assert_awaited_once_with()
 
     openai_factory.assert_not_called()
-    http_factory.assert_not_called()
-    post.assert_not_awaited()
     assert structured_request.response_schema is schema
+    assert schema.schema["required"] == ("answer",)
+
+
+@pytest.mark.parametrize("structured_output_api", ["chat_completions", "responses"])
+async def test_native_schema_and_tools_are_combined_without_mutating_request(
+    structured_output_api: str,
+) -> None:
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {"content": [{"type": "text", "text": '{"answer":"ready"}'}]},
+        )
+    )
+    transport = LiteLLMClient(
+        http_client_factory=MagicMock(
+            return_value=SimpleNamespace(post=post, aclose=AsyncMock()),
+        )
+    )
+    capabilities = {
+        ModelCapability.TEXT,
+        ModelCapability.STRUCTURED_OUTPUT,
+        ModelCapability.TOOL_CALLING,
+    }
+    structured_request = request(
+        required_capabilities=capabilities,
+        response_schema=StructuredResponseSchema(
+            name="answer",
+            schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ("answer",),
+                "additionalProperties": False,
+            },
+        ),
+        tools=[
+            ToolDefinition(
+                name="lookup",
+                description="Look up context.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ("query",),
+                    "additionalProperties": False,
+                },
+            )
+        ],
+    )
+    await transport.complete(
+        deployment(
+            api_base="https://proxy.example.com/v1/messages",
+            capabilities=capabilities,
+            structured_output_api=structured_output_api,
+        ),
+        structured_request,
+        API_KEY,
+    )
+    assert post.await_args is not None
+    payload = post.await_args.kwargs["json"]
+    assert payload["output_config"]["format"]["type"] == "json_schema"
+    assert payload["tools"][0]["input_schema"]["required"] == ["query"]
+    payload["output_config"]["format"]["schema"]["properties"]["answer"]["type"] = "number"
+    assert structured_request.response_schema is not None
+    assert structured_request.response_schema.schema["properties"] == {"answer": {"type": "string"}}
 
 
 async def test_messages_endpoint_supports_tool_definitions_and_tool_use_responses() -> None:
@@ -769,6 +856,7 @@ async def test_messages_endpoint_supports_tool_definitions_and_tool_use_response
             json=lambda: {
                 "id": "msg_safe123",
                 "model": "claude-sonnet-4-6",
+                "stop_reason": "tool_use",
                 "content": [
                     {
                         "type": "tool_use",
@@ -842,6 +930,7 @@ async def test_messages_endpoint_supports_tool_definitions_and_tool_use_response
     )
     close.assert_awaited_once_with()
     assert result.text is None
+    assert result.provider_metadata["finish_reason"] == "tool_use"
     assert result.tool_calls == (
         ToolCall(
             id="toolu_safe123",
@@ -849,6 +938,93 @@ async def test_messages_endpoint_supports_tool_definitions_and_tool_use_response
             arguments={"query": "release status"},
         ),
     )
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "model_context_window_exceeded", "refusal"])
+@pytest.mark.parametrize("cancel_close", [False, True])
+async def test_messages_rejected_output_preserves_usage_without_correction(
+    stop_reason: str,
+    cancel_close: bool,
+) -> None:
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "stop_reason": stop_reason,
+                "content": [{"type": "text", "text": API_KEY + PROMPT}],
+                "usage": {"input_tokens": 8, "output_tokens": 9},
+            },
+        )
+    )
+    close = AsyncMock(side_effect=asyncio.CancelledError() if cancel_close else None)
+    transport = LiteLLMClient(
+        http_client_factory=MagicMock(
+            return_value=SimpleNamespace(post=post, aclose=close),
+        )
+    )
+    structured_request = request(
+        required_capabilities={ModelCapability.STRUCTURED_OUTPUT},
+        response_schema=StructuredResponseSchema(
+            name="answer",
+            schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ("answer",),
+                "additionalProperties": False,
+            },
+        ),
+    )
+    evidence: ModelResponse | RejectedOutputEvidence | None
+    if cancel_close:
+        with pytest.raises(ModelResponseCancelled) as cancelled:
+            await transport.complete(
+                deployment(
+                    api_base="https://proxy.example.com/v1/messages",
+                    capabilities={ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT},
+                ),
+                structured_request,
+                API_KEY,
+            )
+        evidence = cancelled.value.receipt
+        rendered = captured_traceback(cancelled.value)
+    else:
+        with pytest.raises(ModelResponseError) as rejected:
+            await transport.complete(
+                deployment(
+                    api_base="https://proxy.example.com/v1/messages",
+                    capabilities={ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT},
+                ),
+                structured_request,
+                API_KEY,
+            )
+        evidence = rejected.value.evidence
+        rendered = captured_traceback(rejected.value)
+    assert isinstance(evidence, RejectedOutputEvidence)
+    assert not evidence.correction_eligible
+    assert evidence.status == ("refused" if stop_reason == "refusal" else "incomplete")
+    assert evidence.reason == ("refusal" if stop_reason == "refusal" else "incomplete")
+    assert evidence.usage is not None and evidence.usage.total_tokens == 17
+    assert evidence.final_text is None
+    assert API_KEY not in rendered and PROMPT not in rendered
+    close.assert_awaited_once_with()
+
+
+async def test_messages_schema_requires_capability_before_client_construction() -> None:
+    factory = MagicMock()
+    transport = LiteLLMClient(http_client_factory=factory)
+    with pytest.raises(ValueError, match="deployment lacks structured_output capability"):
+        await transport.complete(
+            deployment(
+                api_base="https://proxy.example.com/v1/messages",
+                capabilities={ModelCapability.TEXT},
+            ),
+            request(
+                required_capabilities={ModelCapability.STRUCTURED_OUTPUT},
+                response_schema=StructuredResponseSchema(name="answer", schema={"type": "object"}),
+            ),
+            API_KEY,
+        )
+    factory.assert_not_called()
 
 
 @pytest.mark.parametrize("declares_structured", [False, True])
@@ -1245,9 +1421,7 @@ async def test_external_task_cancellation_during_error_cleanup_is_preserved(
         await close_blocker.wait()
 
     if failure_kind == "provider":
-        transport, _, _, close = mock_transport(
-            error=RuntimeError(RAW_ERROR + API_KEY + PROMPT)
-        )
+        transport, _, _, close = mock_transport(error=RuntimeError(RAW_ERROR + API_KEY + PROMPT))
     else:
         transport, _, _, close = mock_transport(result=malformed_sensitive_response())
     close.side_effect = blocking_close

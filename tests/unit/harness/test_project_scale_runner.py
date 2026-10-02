@@ -1941,7 +1941,7 @@ def test_explicit_direct_safe_upgrade_partial_discussion_falls_back_to_pinned_di
     assert repair["allow_scale_mode_upgrade"] is False
 
 
-def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(
+def test_auto_dispatch_runtime_failure_does_not_start_deliverable_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -1988,13 +1988,269 @@ def test_auto_dispatch_repair_falls_back_and_crosses_soft_limit_as_direct(
         ),
     )
 
-    execute_project_scale_plan(plan, client)
+    report = execute_project_scale_plan(plan, client)
 
-    assert [body["mode"] for body in client.submitted_bodies[:3]] == [
-        "auto",
-        "direct",
-        "direct",
+    result = report.results[0]
+    assert report.ok is False
+    assert result.run_id == "run-medium-auto-dispatch-recovery"
+    assert result.status == "failed"
+    assert result.evidence["deliverable_repair_trace"] is False
+    assert [body["mode"] for body in client.submitted_bodies] == ["auto"]
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+@pytest.mark.parametrize("status", ("failed", "cancelled", "timed_out", "running"))
+def test_capability_auto_runtime_failure_cannot_be_replaced_by_direct_success(
+    monkeypatch: pytest.MonkeyPatch,
+    scale: str,
+    status: str,
+) -> None:
+    plan = _auto_scale_plan(scale, benchmark_kind="capability")
+    validations = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=("generated_project_validation: command failed exit=1 command=npm test",),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
     ]
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: validations.pop(0),
+    )
+    run_id = f"run-{scale}-auto-runtime-failure"
+    client = FakeAcceptanceClient(
+        run_id=run_id,
+        session_id=f"project-scale-{scale}-auto",
+        statuses=(status, "completed"),
+        actual_mode="dispatch" if scale in {"small", "medium"} else "hybrid",
+        repair_actual_mode="direct",
+        create_status="waiting_approval" if scale in {"large", "ultra"} else None,
+        repair_create_status="completed",
+        decision_token="preflight-test-token",
+        decision_version=1,
+        artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is False
+    assert report.to_payload()["capability_verified"] is False
+    assert result.run_id == run_id
+    assert result.evidence["deliverable_repair_trace"] is False
+    assert len(client.submitted_bodies) == 1
+    assert any("runtime_mode_execution" in error and status in error for error in result.errors)
+    assert result.evidence["cleanup_cancel"] is True
+
+
+@pytest.mark.parametrize("mode", ("direct", "dispatch", "hybrid"))
+def test_capability_completed_auto_run_can_repair_failed_npm_test(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    plan = _auto_scale_plan("small", benchmark_kind="capability")
+    validations = [
+        project_scale_runner_module._EvidenceCheck(
+            passed=False,
+            reasons=(
+                (
+                    "generated_project_validation: command failed exit=1 command=npm test "
+                    "output_tail=TypeError: createApp is not a function"
+                ),
+            ),
+        ),
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=()),
+    ]
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: validations.pop(0),
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-small-auto-completed",
+        session_id="project-scale-small-auto",
+        status="completed",
+        actual_mode=mode,
+        artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert report.to_payload()["capability_verified"] is True
+    assert report.results[0].run_id == client.repair_run_id
+    assert report.results[0].evidence["generated_project_validation"] is True
+    assert report.results[0].evidence["deliverable_repair_trace"] is True
+    assert [body["mode"] for body in client.submitted_bodies] == ["auto", mode]
+    assert "createApp is not a function" in str(client.submitted_bodies[1]["message"])
+    assert validations == []
+
+
+@pytest.mark.parametrize("repair_mode", ("dispatch", "direct", "hybrid"))
+def test_capability_public_accept_repair_requires_original_auto_route(
+    monkeypatch: pytest.MonkeyPatch,
+    repair_mode: str,
+) -> None:
+    plan = _auto_scale_plan("medium", benchmark_kind="capability")
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True, reasons=()
+        ),
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-auto-public-recovery",
+        session_id="project-scale-medium-auto",
+        statuses=("failed", "completed"),
+        actual_mode="dispatch",
+        repair_actual_mode=repair_mode,
+        artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+        self_repair_decision_token="repair-token-12345678901234567890",
+        self_repair_decision_version=7,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is (repair_mode == "dispatch")
+    assert result.run_id == client.repair_run_id
+    assert result.observed_mode == "dispatch"
+    assert result.final_observed_mode == repair_mode
+    assert result.evidence["deliverable_repair_trace"] is True
+    assert len(client.submitted_bodies) == 1
+    assert (
+        "POST", f"/api/v1/runs/{client.run_id}/accept-repair", None
+    ) in client.calls
+    assert not any("/api/v1/admin/runs/" in path for _, path, _ in client.calls)
+    if repair_mode != "dispatch":
+        assert any("mode_recovery" in error for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("response_mode", "details_mode", "expected_ok", "expected_error"),
+    [
+        (response_mode, details_mode, False, "unknown")
+        for response_mode in (None, "", "auto", "invalid")
+        for details_mode in (None, "", "auto", "invalid")
+    ]
+    + [
+        ("direct", "dispatch", False, "conflicting"),
+        ("dispatch", "direct", False, "conflicting"),
+        ("dispatch", None, True, None),
+        (None, "dispatch", True, None),
+    ],
+)
+def test_capability_public_accept_repair_requires_consistent_route_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    response_mode: str | None,
+    details_mode: str | None,
+    expected_ok: bool,
+    expected_error: str | None,
+) -> None:
+    plan = _auto_scale_plan("medium", benchmark_kind="capability")
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True, reasons=()
+        ),
+    )
+
+    class RecoveryRouteClient(FakeAcceptanceClient):
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            response = super().request_json(
+                method, path, body=body, idempotency_key=idempotency_key
+            )
+            if isinstance(response, dict):
+                if path == f"/api/v1/runs/{self.run_id}/accept-repair":
+                    mode = response_mode
+                elif path == f"/api/v1/runs/{self.repair_run_id}/details":
+                    mode = details_mode
+                else:
+                    return response
+                if mode is None:
+                    response.pop("mode", None)
+                else:
+                    response["mode"] = mode
+            return response
+
+    client = RecoveryRouteClient(
+        run_id="run-medium-auto-unproven-recovery",
+        session_id="project-scale-medium-auto",
+        statuses=("failed", "completed"),
+        actual_mode="dispatch",
+        repair_actual_mode="direct",
+        artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+        self_repair_decision_token="repair-token-12345678901234567890",
+        self_repair_decision_version=7,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is expected_ok
+    assert report.to_payload()["capability_verified"] is expected_ok
+    assert result.run_id == client.repair_run_id
+    assert result.status == "completed"
+    assert result.observed_mode == "dispatch"
+    if expected_error is not None:
+        assert any(
+            "mode_recovery" in error and expected_error in error for error in result.errors
+        )
+    else:
+        assert result.final_observed_mode == "dispatch"
+    assert len(client.submitted_bodies) == 1
+    assert result.evidence["cleanup_cancel"] is True
+
+
+@pytest.mark.parametrize("mode", ("direct", "dispatch", "hybrid"))
+def test_capability_public_accept_repair_accepts_explicit_same_route(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    plan = _auto_scale_plan("medium", benchmark_kind="capability")
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        lambda bundle, **kwargs: project_scale_runner_module._EvidenceCheck(
+            passed=True, reasons=()
+        ),
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-auto-proven-recovery",
+        session_id="project-scale-medium-auto",
+        statuses=("failed", "completed"),
+        actual_mode=mode,
+        repair_actual_mode=mode,
+        artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+        self_repair_decision_token="repair-token-12345678901234567890",
+        self_repair_decision_version=7,
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    result = report.results[0]
+    assert report.ok is True
+    assert report.to_payload()["capability_verified"] is True
+    assert result.run_id == client.repair_run_id
+    assert result.status == "completed"
+    assert result.observed_mode == mode
+    assert result.final_observed_mode == mode
+    assert len(client.submitted_bodies) == 1
 
 
 def test_capability_repair_bounds_long_medium_request_without_blocking_repair() -> None:
@@ -8375,9 +8631,25 @@ class FakeAcceptanceClient:
         return self.current_execution_evidence
 
 
-def _auto_scale_plan(scale: str) -> ProjectScaleRunPlan:
+def _trusted_agent_standard_event() -> dict[str, object]:
+    return {
+        "kind": "artifact.created",
+        "payload": {
+            "agent_standard_verification": {
+                "constraints_read": True,
+                "plan_before_implementation": True,
+                "reproducible_verification": True,
+                "root_cause_repair": True,
+            }
+        },
+    }
+
+
+def _auto_scale_plan(
+    scale: str, *, benchmark_kind: ProjectScaleBenchmarkKind = "fixture"
+) -> ProjectScaleRunPlan:
     base = build_project_scale_run_plan(
-        benchmark_kind="fixture",
+        benchmark_kind=benchmark_kind,
         scales=(scale,),
         flows=("artifact_production",),
         execute=True,

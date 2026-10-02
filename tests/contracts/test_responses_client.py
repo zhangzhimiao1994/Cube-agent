@@ -263,9 +263,7 @@ def test_native_input_limit_has_absolute_fuse() -> None:
 def test_native_message_limit_scales_with_deployment_context() -> None:
     from agent_hub.models.responses import response_create_kwargs
 
-    messages = tuple(
-        ModelMessage(role="user", content=f"message-{index}") for index in range(96)
-    )
+    messages = tuple(ModelMessage(role="user", content=f"message-{index}") for index in range(96))
     kwargs = response_create_kwargs(
         deployment(context_window_tokens=128_000, max_output_tokens=8_192),
         request(messages=messages, max_output_tokens=8_192),
@@ -754,10 +752,37 @@ async def test_no_schema_tool_stream_still_uses_existing_chat_decoder() -> None:
     close.assert_awaited_once()
 
 
-async def test_messages_endpoint_does_not_bypass_existing_schema_rejection() -> None:
-    client, factory, _, _, _ = setup_client()
-    with pytest.raises(ValueError, match="messages endpoint response schemas"):
-        await client.complete(
-            deployment(api_base="https://provider.example/v1/messages"), request(), API_KEY
+async def test_messages_endpoint_uses_native_format_not_responses_surface() -> None:
+    factory = MagicMock()
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "content": [{"type": "text", "text": '{"verdict":"approve"}'}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 12, "output_tokens": 117},
+            },
         )
+    )
+    close = AsyncMock()
+    client = LiteLLMClient(
+        client_factory=factory,
+        http_client_factory=MagicMock(
+            return_value=SimpleNamespace(post=post, aclose=close),
+        ),
+    )
+    result = await client.complete(
+        deployment(api_base="https://provider.example/v1/messages"),
+        request(),
+        API_KEY,
+    )
     factory.assert_not_called()
+    assert post.await_args is not None
+    payload = post.await_args.kwargs["json"]
+    assert payload["output_config"]["format"]["schema"]["properties"]["verdict"]["enum"] == [
+        "approve"
+    ]
+    assert "text" not in payload and "response_format" not in payload
+    assert result.text == '{"verdict":"approve"}'
+    assert result.usage is not None and result.usage.total_tokens == 129
+    close.assert_awaited_once_with()

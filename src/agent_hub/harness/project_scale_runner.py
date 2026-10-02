@@ -907,6 +907,24 @@ def execute_project_scale_plan(
                                 validation_focus=run_request.validation_focus,
                             ),
                         )
+                        if plan.benchmark_kind == "capability":
+                            recovery_details_mode = _execution_mode(self_repair_observation.details)
+                            recovery_response_mode = _execution_mode(repair_response)
+                            if (
+                                recovery_details_mode is not None
+                                and recovery_response_mode is not None
+                                and recovery_details_mode != recovery_response_mode
+                            ):
+                                raise RuntimeError(
+                                    "mode_recovery: conflicting recovered routes "
+                                    f"response={recovery_response_mode} details={recovery_details_mode}"
+                                )
+                            recovered_mode = recovery_details_mode or recovery_response_mode
+                            if recovered_mode is None or recovered_mode != observed_mode:
+                                raise RuntimeError(
+                                    f"mode_recovery: requested route {observed_mode or 'unknown'} "
+                                    f"recovered as {recovered_mode or 'unknown'}"
+                                )
             evidence["self_repair_trace"] = initial_self_repair_trace or _has_self_repair_trace(
                 observation.events
             )
@@ -1048,6 +1066,13 @@ def execute_project_scale_plan(
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
             ):
+                max_deliverable_repair_attempts = 0
+            # Deliverable repairs cannot establish a failed route's capability.
+            if plan.benchmark_kind == "capability" and status != "completed":
+                errors.append(
+                    f"runtime_mode_execution: run {run_id} status={status or 'unknown'}; "
+                    "deliverable repair requires a completed original or same-route recovery run"
+                )
                 max_deliverable_repair_attempts = 0
             while (
                 deliverable_repair_attempts < max_deliverable_repair_attempts

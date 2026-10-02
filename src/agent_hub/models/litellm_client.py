@@ -294,8 +294,6 @@ def _validate_transport_request(
         return ValueError("deployment lacks structured_output capability")
     if request.tools and ModelCapability.TOOL_CALLING not in deployment.capabilities:
         return ValueError("deployment lacks tool_calling capability")
-    if request.response_schema is not None and _is_messages_endpoint(deployment.api_base):
-        return ValueError("messages endpoint response schemas are not supported")
     return None
 
 
@@ -1019,6 +1017,13 @@ def _messages_endpoint_payload(
     }
     if system_messages:
         payload["system"] = "\n\n".join(system_messages)
+    if request.response_schema is not None:
+        payload["output_config"] = {
+            "format": {
+                "type": "json_schema",
+                "schema": _json_mutable(cast(JsonValue, request.response_schema.schema)),
+            },
+        }
     if request.tools:
         payload["tools"] = [
             {
@@ -1053,13 +1058,31 @@ def _parse_messages_endpoint_response(
 ) -> ModelResponse:
     if not isinstance(payload, Mapping):
         raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
+    usage = _messages_endpoint_usage(payload.get("usage"))
+    stop_reason = payload.get("stop_reason")
+    if stop_reason in ("refusal", "max_tokens", "model_context_window_exceeded"):
+        raise ModelResponseError(
+            "messages output rejected",
+            evidence=RejectedOutputEvidence(
+                final_text=None,
+                usage=usage,
+                usage_status=(
+                    "known" if usage is not None
+                    else "missing" if payload.get("usage") is None else "invalid"
+                ),
+                status="refused" if stop_reason == "refusal" else "incomplete",
+                reason="refusal" if stop_reason == "refusal" else "incomplete",
+            ),
+        )
     content = payload.get("content")
     text = _messages_endpoint_text(content)
     tool_calls = _messages_endpoint_tool_calls(content, deployment_id)
     if text is None and not tool_calls:
         raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
-    usage = _messages_endpoint_usage(payload.get("usage"))
     metadata: dict[str, JsonScalar] = {}
+    finish_reason = _safe_provider_string(stop_reason, sensitive_values)
+    if finish_reason is not None:
+        metadata["finish_reason"] = finish_reason
     request_id = _safe_provider_string(payload.get("id"), sensitive_values)
     if request_id is not None:
         metadata["request_id"] = request_id
