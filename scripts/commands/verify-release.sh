@@ -87,6 +87,22 @@ wait_for_release_readiness() {
   done
 }
 
+verify_plugin_package_runtime() {
+  local payload=""
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required to verify plugin package runtime registration"
+  fi
+  payload="$(curl --noproxy '*' \
+    --connect-timeout 2 \
+    --max-time 5 \
+    -sS \
+    "$ready_base_url/health/plugin-package-runtime" 2>/dev/null || true)"
+  if [[ "$payload" != *'"registration_status":"ready"'* ]]; then
+    die "plugin package runtime registration is not ready"
+  fi
+  printf 'ok: plugin package runtime registration_status=ready\n'
+}
+
 while (($#)); do
   case "$1" in
     --install-root)
@@ -180,6 +196,7 @@ if [[ "$check_services" -eq 1 ]]; then
         die "service is not active: $service"
       fi
     done
+    verify_plugin_package_runtime
   else
     printf 'skip: systemctl unavailable\n'
   fi

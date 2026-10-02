@@ -115,6 +115,32 @@ def test_ready_reports_ok_when_dependencies_respond() -> None:
     assert database.calls == redis.calls == 1
 
 
+def test_plugin_package_runtime_status_reports_ready() -> None:
+    app = create_app(database_probe=Probe(), redis_probe=Probe())
+    app.state.plugin_package_subprocess_registration_status = "ready"
+
+    response = TestClient(app).get("/health/plugin-package-runtime")
+
+    assert response.status_code == 200
+    assert response.json() == {"registration_status": "ready"}
+
+
+def test_plugin_package_runtime_status_fails_when_launcher_is_missing() -> None:
+    app = create_app(database_probe=Probe(), redis_probe=Probe())
+    app.state.plugin_package_subprocess_registration_status = "launcher_not_found"
+
+    response = TestClient(app).get("/health/plugin-package-runtime")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "plugin_package_runtime_unavailable",
+            "message": "plugin package runtime unavailable",
+        },
+        "registration_status": "launcher_not_found",
+    }
+
+
 @pytest.mark.parametrize("hanging_side", ["database", "redis"])
 async def test_ready_fast_failure_cancels_and_reaps_hanging_sibling(
     hanging_side: str,

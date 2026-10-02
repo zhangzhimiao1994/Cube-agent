@@ -148,6 +148,20 @@ ensure_secret_default() {
   chmod 0600 "$SECRETS_FILE"
 }
 
+ensure_secret_value() {
+  local name="$1" value="$2" current tmp
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  current="$(grep "^${name}=" "$SECRETS_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  if [[ "$current" == "$value" ]]; then
+    return 0
+  fi
+  tmp="$(mktemp "$CONFIG_DIR/secrets.env.${name}.XXXXXX")"
+  grep -v "^${name}=" "$SECRETS_FILE" > "$tmp" || true
+  printf '%s=%s\n' "$name" "$value" >> "$tmp"
+  chmod 0600 "$tmp"
+  mv "$tmp" "$SECRETS_FILE"
+}
+
 ensure_numeric_secret_default() {
   local name="$1" value="$2" current
   [[ -f "$SECRETS_FILE" ]] || return 0
@@ -171,6 +185,16 @@ ensure_secret_defaults() {
   ensure_numeric_secret_default \
     AGENT_HUB_RUNTIME_TOKEN_BUDGET \
     "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
+  ensure_secret_value AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_RUNNER_ENABLED "true"
+  ensure_secret_value \
+    AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ADAPTER_IDS \
+    "'[\"python_subprocess_v1\"]'"
+  ensure_secret_value \
+    AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ISOLATION_BACKEND \
+    "bubblewrap"
+  ensure_secret_value \
+    AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_BUBBLEWRAP_EXECUTABLE \
+    "/usr/bin/bwrap"
 }
 
 generate_or_keep_secrets() {
@@ -211,6 +235,10 @@ generate_or_keep_secrets() {
     printf 'AGENT_HUB_LOG_LEVEL=%s\n' "${AGENT_HUB_LOG_LEVEL:-WARNING}"
     printf 'AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=%s\n' "${AGENT_HUB_RUNTIME_TIMEOUT_SECONDS:-300}"
     printf 'AGENT_HUB_RUNTIME_TOKEN_BUDGET=%s\n' "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
+    printf 'AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_RUNNER_ENABLED=true\n'
+    printf 'AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ADAPTER_IDS='"'"'["python_subprocess_v1"]'"'"'\n'
+    printf 'AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ISOLATION_BACKEND=bubblewrap\n'
+    printf 'AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_BUBBLEWRAP_EXECUTABLE=/usr/bin/bwrap\n'
   } > "$tmp"
   chmod 0600 "$tmp"
   mv "$tmp" "$SECRETS_FILE"

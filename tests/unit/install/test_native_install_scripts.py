@@ -1,3 +1,4 @@
+import re
 import tomllib
 from pathlib import Path
 
@@ -1010,6 +1011,44 @@ def test_verify_release_can_wait_for_readiness_boundary() -> None:
     assert "wait_for_release_readiness" in script
     assert '"$ready_base_url/health/ready"' in script
     assert "release readiness did not reach 200" in script
+
+
+def test_verify_release_requires_ready_plugin_package_runtime() -> None:
+    script = read("scripts/commands/verify-release.sh")
+
+    assert '"$ready_base_url/health/plugin-package-runtime"' in script
+    assert '"registration_status":"ready"' in script
+    assert "plugin package runtime registration is not ready" in script
+
+
+def test_native_installer_persists_plugin_package_runtime_defaults() -> None:
+    secrets = read("scripts/lib/secrets.sh")
+
+    expected = {
+        "AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_RUNNER_ENABLED": "true",
+        "AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ADAPTER_IDS": "'[\"python_subprocess_v1\"]'",
+        "AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_ISOLATION_BACKEND": "bubblewrap",
+        "AGENT_HUB_PLUGIN_PACKAGE_SUBPROCESS_BUBBLEWRAP_EXECUTABLE": "/usr/bin/bwrap",
+    }
+    for name, value in expected.items():
+        assert secrets.count(name) >= 2
+        assert value.strip("'") in secrets
+        assert re.search(rf"ensure_secret_value\s+(?:\\\s+)?{name}\s+", secrets)
+
+
+def test_native_installer_requires_ready_plugin_package_runtime() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "require_native_plugin_package_runtime" in script
+    assert '"$runtime_url"' in script
+    assert '"registration_status":"ready"' in script
+    assert "native plugin package runtime registration is not ready" in script
+    readiness = script.index("require_native_readiness", script.index("install_native_mode()"))
+    runtime = script.index(
+        "require_native_plugin_package_runtime", script.index("install_native_mode()")
+    )
+    mark = script.index('mark_stage "native-up"')
+    assert readiness < runtime < mark
 
 
 def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() -> None:

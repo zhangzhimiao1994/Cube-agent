@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, error_payload, error_responses
-from agent_hub.api.schemas import HealthResponse
+from agent_hub.api.schemas import HealthResponse, PluginPackageRuntimeHealthResponse
 from agent_hub.observability.metrics import MetricsRegistry
 
 router = APIRouter(tags=["system"], responses=BASE_ERROR_RESPONSES)
@@ -25,6 +25,49 @@ async def health() -> HealthResponse:
     """Compatibility liveness endpoint for installers and external monitors."""
 
     return HealthResponse()
+
+
+_PLUGIN_PACKAGE_RUNTIME_STATUSES = frozenset(
+    {
+        "disabled",
+        "no_adapter_ids",
+        "unsupported_isolation_backend",
+        "missing_isolation_launcher",
+        "launcher_path_not_absolute",
+        "launcher_not_found",
+        "launcher_not_executable",
+        "launcher_probe_failed",
+        "ready",
+    }
+)
+
+
+@router.get(
+    "/health/plugin-package-runtime",
+    response_model=PluginPackageRuntimeHealthResponse,
+    responses=error_responses(503),
+)
+async def plugin_package_runtime_health(
+    request: Request,
+) -> PluginPackageRuntimeHealthResponse | JSONResponse:
+    status = getattr(
+        request.app.state,
+        "plugin_package_subprocess_registration_status",
+        None,
+    )
+    if status == "ready":
+        return PluginPackageRuntimeHealthResponse()
+    safe_status = status if status in _PLUGIN_PACKAGE_RUNTIME_STATUSES else "unavailable"
+    return JSONResponse(
+        status_code=503,
+        content={
+            **error_payload(
+                "plugin_package_runtime_unavailable",
+                "plugin package runtime unavailable",
+            ),
+            "registration_status": safe_status,
+        },
+    )
 
 
 @router.get(

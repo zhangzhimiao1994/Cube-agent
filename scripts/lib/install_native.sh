@@ -723,6 +723,23 @@ require_native_readiness() {
   done
 }
 
+require_native_plugin_package_runtime() {
+  local runtime_url="http://127.0.0.1:${AGENT_HUB_API_PORT:-8000}/health/plugin-package-runtime"
+  local payload=""
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required to verify native plugin package runtime registration"
+  fi
+  payload="$(curl --noproxy '*' \
+    --connect-timeout 2 \
+    --max-time 5 \
+    -sS \
+    "$runtime_url" 2>/dev/null || true)"
+  if [[ "$payload" != *'"registration_status":"ready"'* ]]; then
+    die "native plugin package runtime registration is not ready"
+  fi
+  log "native plugin package runtime registration is ready"
+}
+
 run_native_migrations() {
   log "running native database migrations"
   (
@@ -788,5 +805,6 @@ install_native_mode() {
   require_native_service_active agent-hub-worker.service
   require_native_service_active agent-hub-litellm.service
   require_native_readiness
+  require_native_plugin_package_runtime
   mark_stage "native-up"
 }

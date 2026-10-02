@@ -19,6 +19,10 @@ class HealthResponse(APIModel):
     status: Literal["ok"] = "ok"
 
 
+class PluginPackageRuntimeHealthResponse(APIModel):
+    registration_status: Literal["ready"] = "ready"
+
+
 class SetupRequest(APIModel):
     code: SecretStr = Field(min_length=43, max_length=43, repr=False)
     username: str = Field(
