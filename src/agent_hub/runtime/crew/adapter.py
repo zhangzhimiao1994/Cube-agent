@@ -3576,6 +3576,7 @@ class CrewDispatchRuntime:
                     "unaccounted",
                     "audit_overflow",
                 }:
+                    self._publish_checkpoint(state, restored)
                     failure_reason = _accounting_terminal_reason(restored_phase)
                     await emit(
                         kind=EventKind.RUNTIME_FAILED,
@@ -5188,6 +5189,7 @@ class CrewDispatchRuntime:
         emit: EventEmitter, model_boundary: ModelStateBoundary, usage_boundary: UsageBoundary,
         run_state: _RunState, step_deadline: float,
         repair: Mapping[str, JsonValue] | None = None,
+        tool_ledger: _ToolLedger | None = None,
     ) -> tuple[GatewayCompletion, Artifact]:
         if request.response_schema is not None:
             _structured_validator(request.response_schema)
@@ -5198,6 +5200,7 @@ class CrewDispatchRuntime:
         request_sha = self._model_request_sha256(request)
         existing = ledger.states.get(key)
         rejected: GatewayRejectedOutput | None = None
+        policy_failure: str | None = None
         if existing is not None:
             if existing["request_sha256"] != request_sha:
                 _fail("model request changed after checkpoint")
@@ -5224,6 +5227,8 @@ class CrewDispatchRuntime:
                 if private["source_ids"] != tuple(str(source.id) for source in sources):
                     _fail("model sources changed after checkpoint")
                 rejected = self._rejected_from_private(private)
+                if existing["failure_reason"] != "structured output rejected":
+                    policy_failure = cast(str, existing["failure_reason"])
             elif existing["status"] != "prepared":
                 _fail("model ledger state is invalid")
         if rejected is None:
@@ -5266,17 +5271,6 @@ class CrewDispatchRuntime:
                         rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
                     self._valid_response(completion, max_output_bytes=output_limit)
-                if repair is not None and completion.response.tool_calls:
-                    rejected = GatewayRejectedOutput(
-                        evidence=RejectedOutputEvidence(
-                            final_text=None, usage=completion.response.usage,
-                            usage_status="known" if completion.response.usage is not None else "missing",
-                            status="completed", reason="invalid_tool",
-                        ),
-                        deployment_id=completion.deployment_id, logical_model=completion.logical_model,
-                        provider_id=completion.provider_id, provider_model=completion.provider_model,
-                        cost_usd=completion.cost_usd,
-                    )
             except GatewayRejectedOutput as error:
                 completion = (
                     _project_scale_rejected_zip_completion(context, step, error)
@@ -5357,6 +5351,36 @@ class CrewDispatchRuntime:
                 rejected = self._reject_invalid_structured(request, completion)
                 if rejected is None:
                     self._valid_response(completion, max_output_bytes=output_limit)
+            # Preserve paid receipts privately before rejecting any forbidden tool batch.
+            if completion is not None and completion.response.tool_calls and (
+                repair is not None or purpose == "review" or (
+                    any(call.name not in step.tools for call in completion.response.tool_calls)
+                    and not (
+                        tool_ledger is not None
+                        and _project_scale_can_skip_forbidden_tool_placeholders(
+                            step, tool_ledger, completion.response.tool_calls,
+                        )
+                    )
+                )
+            ):
+                if repair is None:
+                    policy_failure = (
+                        "reviewer returned tool calls instead of JSON" if purpose == "review"
+                        else "step requested a forbidden capability"
+                    )
+                rejected = GatewayRejectedOutput(
+                    evidence=RejectedOutputEvidence(
+                        final_text=None, usage=completion.response.usage,
+                        usage_status="known" if completion.response.usage is not None else "missing",
+                        status="completed", reason="invalid_tool",
+                    ),
+                    deployment_id=completion.deployment_id, logical_model=completion.logical_model,
+                    provider_id=completion.provider_id, provider_model=completion.provider_model,
+                    cost_usd=completion.cost_usd, fallback_used=completion.fallback_used,
+                    fallback_from_logical_model=completion.fallback_from_logical_model,
+                    fallback_reason=completion.fallback_reason,
+                    attempted_logical_models=completion.attempted_logical_models,
+                )
             if rejected is None:
                 assert completion is not None
                 artifact = self._model_artifact(
@@ -5381,12 +5405,14 @@ class CrewDispatchRuntime:
             rejected_state = dict(running)
             rejected_state.update(
                 status="rejected", sha256=private["text_sha256"], provenance=private["provenance"],
-                failure_reason="structured output rejected",
+                failure_reason=policy_failure or "structured output rejected",
             )
             await self._run_commit(usage_boundary(
                 rejected, actor, step.id, key, rejected_state, None, private_output=private,
             ), run_state)
         evidence = rejected.evidence
+        if policy_failure is not None:
+            raise _ModelContractFailed(policy_failure)
         if (
             repair is not None or evidence is None or not evidence.correction_eligible
             or request.response_schema is None
@@ -5480,6 +5506,7 @@ class CrewDispatchRuntime:
             cursor=cursor, ledger=ledger, sources=sources, emit=emit,
             model_boundary=model_boundary, usage_boundary=usage_boundary,
             run_state=run_state, step_deadline=step_deadline, repair=reservation,
+            tool_ledger=tool_ledger,
         )
 
     async def _complete_gateway_messages(
@@ -5608,6 +5635,7 @@ class CrewDispatchRuntime:
                 ),
                 emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
                 run_state=run_state, step_deadline=step_deadline,
+                tool_ledger=tool_ledger,
             )
             evidence.append(model_artifact)
             response = self._valid_response(
@@ -7422,7 +7450,8 @@ class CrewDispatchRuntime:
         )
 
     def _validate_checkpoint(
-        self, checkpoint: RuntimeCheckpoint, context: TaskContext, plan: DispatchPlan
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext, plan: DispatchPlan,
+        *, context_budget_known: bool = True,
     ) -> None:
         checkpoint_failure_reason = self._checkpoint_failure_reason(plan)
         if (
@@ -7914,9 +7943,15 @@ class CrewDispatchRuntime:
                 if failure_reason is not None:
                     _fail("runtime checkpoint is incompatible")
             elif status in {"rejected", "received_cancelled"}:
-                if value["artifact_id"] is not None or failure_reason != (
-                    "model response cancelled" if status == "received_cancelled" else "structured output rejected"
-                ):
+                allowed_reasons = (
+                    {"model response cancelled"} if status == "received_cancelled"
+                    else {
+                        "structured output rejected",
+                        "reviewer returned tool calls instead of JSON" if purpose == "review"
+                        else "step requested a forbidden capability",
+                    }
+                )
+                if value["artifact_id"] is not None or failure_reason not in allowed_reasons:
                     _fail("runtime checkpoint is incompatible")
             elif status == "failed":
                 if (
@@ -8013,7 +8048,7 @@ class CrewDispatchRuntime:
             frontier != expected_frontier
             or terminal_phase is not state["terminal"]
             or (state["phase"] == "completed" and len(completed_set) != len(steps))
-            or (state["phase"] == "budget_exhausted" and not budget_exceeded)
+            or (state["phase"] == "budget_exhausted" and not budget_exceeded and context_budget_known)
             or (state["phase"] == "audit_overflow") is not any_overflow
             or (
                 state["phase"] not in {"budget_exhausted", "unaccounted", "audit_overflow"}
@@ -8066,6 +8101,10 @@ class CrewDispatchRuntime:
                 or any(type(source) is not str or source not in registry for source in value["source_ids"])
                 or type(value["fallback_used"]) is not bool
                 or not isinstance(value["attempted_logical_models"], tuple)
+                or (
+                    state["failure_reason"] not in {"structured output rejected", "model response cancelled"}
+                    and value["reason"] != "invalid_tool"
+                )
             ):
                 _fail("runtime checkpoint rejected evidence is invalid")
             check_value = dict(value)
@@ -8224,6 +8263,11 @@ class CrewDispatchRuntime:
                 model_ids.add(str(artifact.id))
                 if state["purpose"] == "review" and artifact.source_ids:
                     candidate_ids.add(artifact.source_ids[0])
+            elif state["purpose"] == "review" and state["status"] == "rejected":
+                private = model_ledger.rejected_outputs[key]
+                source_ids = cast(tuple[str, ...], private["source_ids"])
+                if source_ids:
+                    candidate_ids.add(source_ids[0])
         tools: dict[
             tuple[str, int, int], dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]
         ] = {}
@@ -8721,6 +8765,14 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint model artifacts are unavailable")
                 self._completion_from_model_artifact(artifact)
                 model_ledger.artifacts[key] = artifact
+            elif model_state["status"] == "rejected" and (
+                model_ledger.rejected_outputs[key]["reason"] == "invalid_tool"
+                and not isinstance(outcome_error, ModelOutcomeUncertain)
+            ):
+                outcome_error = _ModelContractFailed(
+                    "structured output invalid" if model_state["failure_reason"] == "structured output rejected"
+                    else cast(str, model_state["failure_reason"])
+                )
             elif model_state["status"] in {"running", "received_cancelled"} or (
                 model_state["status"] == "failed"
                 and not _failed_model_state_can_compact_retry(
@@ -8754,7 +8806,7 @@ class CrewDispatchRuntime:
             elif state["status"] == "uncertain" or (
                 state["status"] == "running" and state["replay_safe"] is False
             ):
-                if outcome_error is None:
+                if outcome_error is None or isinstance(outcome_error, _ModelContractFailed):
                     outcome_error = CapabilityOutcomeUncertain(
                         "capability outcome requires confirmation"
                     )
@@ -8837,7 +8889,10 @@ class CrewDispatchRuntime:
             )),
             checkpoint.runtime_version,
         )
-        if outcome_error is not None:
+        if outcome_error is not None and not (
+            isinstance(outcome_error, _ModelContractFailed)
+            and usage_ledger.terminal_phase is not None
+        ):
             raise outcome_error
         return (
             completed,
@@ -8877,7 +8932,7 @@ class CrewDispatchRuntime:
                 token_budget=plan.total_token_budget,
                 timeout_seconds=3600.0,
             )
-            self._validate_checkpoint(validated, dummy, plan)
+            self._validate_checkpoint(validated, dummy, plan, context_budget_known=False)
         except RuntimeExecutionError as error:
             failure_reason = safe_runtime_failure_reason(error, fallback=failure_reason)
             error.__traceback__ = None
