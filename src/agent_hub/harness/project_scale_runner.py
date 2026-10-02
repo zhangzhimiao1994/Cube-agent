@@ -246,6 +246,10 @@ class ProjectScaleCaseResult:
     route_reason: str | None = None
     mode_source: str | None = None
     effective_scale: str | None = None
+    final_requested_mode: str | None = None
+    final_route_reason: str | None = None
+    final_mode_source: str | None = None
+    final_effective_scale: str | None = None
     artifact_origin: str | None = None
     workspace_bundle_source: str | None = None
     participant_agent_ids: tuple[str, ...] = ()
@@ -318,6 +322,10 @@ class ProjectScaleCaseResult:
             "route_reason": self.route_reason,
             "mode_source": self.mode_source,
             "effective_scale": self.effective_scale,
+            "final_requested_mode": self.final_requested_mode or self.requested_mode,
+            "final_route_reason": self.final_route_reason or self.route_reason,
+            "final_mode_source": self.final_mode_source or self.mode_source,
+            "final_effective_scale": self.final_effective_scale or self.effective_scale,
             "artifact_origin": self.artifact_origin,
             "workspace_bundle_source": self.workspace_bundle_source,
             "participant_agent_ids": list(self.participant_agent_ids),
@@ -622,6 +630,10 @@ def execute_project_scale_plan(
         route_reason: str | None = None
         mode_source: str | None = None
         effective_scale: str | None = None
+        final_requested_mode: str | None = None
+        final_route_reason: str | None = None
+        final_mode_source: str | None = None
+        final_effective_scale: str | None = None
         artifact_origin: str | None = None
         workspace_bundle_source: str | None = None
         participant_agent_ids: set[str] = set()
@@ -671,6 +683,10 @@ def execute_project_scale_plan(
             mode_source = response_source or mode_source
             effective_scale = response_scale or effective_scale
             requested_mode = response_requested or requested_mode
+            final_route_reason = response_reason or final_route_reason
+            final_mode_source = response_source or final_mode_source
+            final_effective_scale = response_scale or final_effective_scale
+            final_requested_mode = response_requested or final_requested_mode
             status = _string_value(response.get("status"))
             observed_mode = _execution_mode(response) or observed_mode
             final_observed_mode = _execution_mode(response) or final_observed_mode
@@ -729,10 +745,14 @@ def execute_project_scale_plan(
             observed_reason, observed_source, observed_scale, observed_requested = (
                 _public_route_evidence(observation.details, requested_body=request_body)
             )
-            route_reason = observed_reason or route_reason
-            mode_source = observed_source or mode_source
-            effective_scale = observed_scale or effective_scale
-            requested_mode = observed_requested or requested_mode
+            route_reason = route_reason or observed_reason
+            mode_source = mode_source or observed_source
+            effective_scale = effective_scale or observed_scale
+            requested_mode = requested_mode or observed_requested
+            final_route_reason = observed_reason or final_route_reason
+            final_mode_source = observed_source or final_mode_source
+            final_effective_scale = observed_scale or final_effective_scale
+            final_requested_mode = observed_requested or final_requested_mode
             initial_self_repair_trace = _has_self_repair_trace(observation.events)
             _extend_unique(
                 errors,
@@ -827,10 +847,14 @@ def execute_project_scale_plan(
                                 requested_body=request_body,
                             )
                         )
-                        route_reason = repaired_reason or route_reason
-                        mode_source = repaired_source or mode_source
-                        effective_scale = repaired_scale or effective_scale
-                        requested_mode = repaired_requested or requested_mode
+                        route_reason = route_reason or repaired_reason
+                        mode_source = mode_source or repaired_source
+                        effective_scale = effective_scale or repaired_scale
+                        requested_mode = requested_mode or repaired_requested
+                        final_route_reason = repaired_reason or final_route_reason
+                        final_mode_source = repaired_source or final_mode_source
+                        final_effective_scale = repaired_scale or final_effective_scale
+                        final_requested_mode = repaired_requested or final_requested_mode
                         _extend_unique(
                             errors,
                             _validate_mode_control(
@@ -1131,10 +1155,14 @@ def execute_project_scale_plan(
                         requested_body=request_body,
                     )
                 )
-                route_reason = repaired_reason or route_reason
-                mode_source = repaired_source or mode_source
-                effective_scale = repaired_scale or effective_scale
-                requested_mode = repaired_requested or requested_mode
+                route_reason = route_reason or repaired_reason
+                mode_source = mode_source or repaired_source
+                effective_scale = effective_scale or repaired_scale
+                requested_mode = requested_mode or repaired_requested
+                final_route_reason = repaired_reason or final_route_reason
+                final_mode_source = repaired_source or final_mode_source
+                final_effective_scale = repaired_scale or final_effective_scale
+                final_requested_mode = repaired_requested or final_requested_mode
                 _extend_unique(
                     errors,
                     _validate_mode_control(
@@ -1415,6 +1443,10 @@ def execute_project_scale_plan(
             route_reason=route_reason,
             mode_source=mode_source,
             effective_scale=effective_scale,
+            final_requested_mode=final_requested_mode or requested_mode,
+            final_route_reason=final_route_reason or route_reason,
+            final_mode_source=final_mode_source or mode_source,
+            final_effective_scale=final_effective_scale or effective_scale,
             artifact_origin=artifact_origin,
             workspace_bundle_source=workspace_bundle_source,
             participant_agent_ids=tuple(sorted(participant_agent_ids)),

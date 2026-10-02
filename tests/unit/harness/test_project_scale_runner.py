@@ -3195,6 +3195,60 @@ def test_execute_project_scale_plan_preserves_initial_mode_across_repair() -> No
     assert result.to_payload()["initial_observed_mode"] == "direct"
 
 
+def test_execute_project_scale_plan_preserves_initial_route_evidence_across_repair() -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture",
+        scales=("large",),
+        flows=("direct",),
+        execute=True,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-large-direct",
+        session_id="project-scale-large-direct",
+        create_status="waiting_approval",
+        decision_token="approve-large-route",
+        decision_version=4,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        actual_mode="hybrid",
+        repair_actual_mode="direct",
+        deliverable_quality_sequence=(False, True),
+        repair_create_status="waiting_approval",
+        repair_decision_token="approve-large-route-repair",
+        repair_decision_version=7,
+        initial_route_evidence={
+            "requested_mode": "direct",
+            "effective_mode": "hybrid",
+            "effective_scale": "large",
+            "route_reason": "project_scale_mode_upgrade",
+            "mode_source": "project_scale_assessment",
+        },
+        repair_route_evidence={
+            "requested_mode": "direct",
+            "effective_mode": "direct",
+            "effective_scale": "large",
+            "route_reason": "project_preflight_requires_user_approval",
+            "mode_source": "project_preflight",
+        },
+    )
+
+    result = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=5,
+        poll_interval_seconds=0,
+    ).results[0]
+    payload = result.to_payload()
+
+    assert result.run_id == "run-large-direct-repair"
+    assert result.route_reason == "project_scale_mode_upgrade"
+    assert result.mode_source == "project_scale_assessment"
+    assert result.effective_scale == "large"
+    assert payload["final_route_reason"] == "project_preflight_requires_user_approval"
+    assert payload["final_mode_source"] == "project_preflight"
+    assert payload["final_effective_scale"] == "large"
+
+
 def test_execute_auto_scale_repair_submits_the_observed_mode() -> None:
     plan = _auto_scale_plan("small")
     client = FakeAcceptanceClient(
@@ -7506,6 +7560,8 @@ class FakeAcceptanceClient:
         repair_workspace_bundle: bytes | None = None,
         workspace_bundle_sequence: tuple[bytes | None, ...] | None = None,
         artifact_downloads: Mapping[str, bytes] | None = None,
+        initial_route_evidence: Mapping[str, object] | None = None,
+        repair_route_evidence: Mapping[str, object] | None = None,
     ) -> None:
         self.fail_bundle = fail_bundle
         self.fail_bundle_once = fail_bundle_once
@@ -7553,6 +7609,8 @@ class FakeAcceptanceClient:
         self.repair_workspace_bundle = repair_workspace_bundle
         self.workspace_bundle_sequence = list(workspace_bundle_sequence or ())
         self.artifact_downloads = dict(artifact_downloads or {})
+        self.initial_route_evidence = dict(initial_route_evidence or {})
+        self.repair_route_evidence = dict(repair_route_evidence or {})
         self.repair_run_id = f"{run_id}-repair"
         self._collecting_repair_run = False
         self.calls: list[tuple[str, str, str | None]] = []
@@ -7590,6 +7648,9 @@ class FakeAcceptanceClient:
             }
             if "conversation_id" in body:
                 response["conversation_id"] = body["conversation_id"]
+            response.update(
+                self.repair_route_evidence if is_repair else self.initial_route_evidence
+            )
             decision_token = self.repair_decision_token if is_repair else self.decision_token
             decision_version = self.repair_decision_version if is_repair else self.decision_version
             if decision_token is not None:
@@ -7674,6 +7735,11 @@ class FakeAcceptanceClient:
                     else self.actual_mode or self.submitted_bodies[-1]["mode"]
                 ),
             }
+            details_response.update(
+                self.repair_route_evidence
+                if path == f"/api/v1/runs/{self.repair_run_id}/details"
+                else self.initial_route_evidence
+            )
             if deliverable_quality:
                 details_response["deliverable_quality"] = {
                     "requirements_satisfied": True,
