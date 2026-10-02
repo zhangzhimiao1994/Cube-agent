@@ -636,6 +636,8 @@ def run_real_user_plugin_acceptance(
     package_dir: Path,
     wait_seconds: float = 180,
     poll_interval_seconds: float = 2,
+    run_mode: str = "dispatch",
+    direct_model: str | None = None,
 ) -> dict[str, object]:
     """Run installation, public invocation, evidence checks, and unconditional cleanup."""
 
@@ -768,8 +770,12 @@ def run_real_user_plugin_acceptance(
             safe_reason = reason if isinstance(reason, str) and reason else "unknown_reason"
             raise RuntimeError(f"plugin capability is unavailable: {safe_reason}")
         phases.append("capability_available")
+        if run_mode not in {"direct", "dispatch"}:
+            raise ValueError("plugin acceptance run mode must be direct or dispatch")
+        if run_mode == "direct" and not direct_model:
+            raise ValueError("direct plugin acceptance requires a logical model")
         run_request = {
-            "mode": "dispatch",
+            "mode": run_mode,
             "skip_evolution_proposal": True,
             "message": (
                 f"请自动选择并实际调用 {package.capability_id}，只调用一次。"
@@ -777,6 +783,8 @@ def run_real_user_plugin_acceptance(
                 "完成后简要返回工具结果。"
             ),
         }
+        if direct_model:
+            run_request["direct_model"] = direct_model
         run_idempotency_key = f"plugin-uat-{package.runtime_nonce}"
         run_submission_attempted = True
         try:
@@ -1102,6 +1110,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--wait-seconds", type=float, default=180)
     parser.add_argument("--poll-interval", type=float, default=2)
+    parser.add_argument(
+        "--run-mode",
+        choices=("direct", "dispatch"),
+        default=os.environ.get("AGENT_HUB_ACCEPTANCE_PLUGIN_RUN_MODE", "dispatch"),
+    )
+    parser.add_argument(
+        "--direct-model",
+        default=os.environ.get("AGENT_HUB_ACCEPTANCE_DIRECT_MODEL"),
+    )
     parser.add_argument("--execution-id", default=f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}")
     parser.add_argument("--output")
     parser.add_argument(
@@ -1230,6 +1247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     package_dir=Path(temporary),
                     wait_seconds=args.wait_seconds,
                     poll_interval_seconds=args.poll_interval,
+                    run_mode=args.run_mode,
+                    direct_model=args.direct_model,
                 )
     finally:
         if operator_source == "temporary" and report.get("run_cleanup_blocked") is True:

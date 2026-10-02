@@ -43,6 +43,8 @@ class FakePluginAcceptanceClient:
         residual_plugin: bool = False,
         terminal_quiescent: bool = True,
         omit_quiescence_field: bool = False,
+        expected_mode: str = "dispatch",
+        expected_direct_model: str | None = None,
     ) -> None:
         self.audit_matches = audit_matches
         self.capability_available = capability_available
@@ -58,6 +60,8 @@ class FakePluginAcceptanceClient:
         self.residual_plugin = residual_plugin
         self.terminal_quiescent = terminal_quiescent
         self.omit_quiescence_field = omit_quiescence_field
+        self.expected_mode = expected_mode
+        self.expected_direct_model = expected_direct_model
         self.cancel_requested = False
         self.requests: list[tuple[str, str]] = []
         self.plugin_id = ""
@@ -175,7 +179,8 @@ class FakePluginAcceptanceClient:
             }
         if path == "/api/v1/runs" and method == "POST":
             assert body is not None
-            assert body["mode"] == "dispatch"
+            assert body["mode"] == self.expected_mode
+            assert body.get("direct_model") == self.expected_direct_model
             assert self.capability_id in str(body["message"])
             assert isinstance(idempotency_key, str)
             self.run_idempotency_keys.append(idempotency_key)
@@ -354,6 +359,29 @@ def test_real_user_plugin_acceptance_separates_admin_and_operator_paths(
     assert not any(path.startswith("/api/v1/admin/") for _, path in operator.requests)
     assert not any(path.startswith("/api/v1/runs") for _, path in admin.requests)
     assert any(path.startswith("/api/v1/admin/audit?") for _, path in admin.requests)
+
+
+def test_real_user_plugin_acceptance_can_pin_a_direct_model(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    backend = FakePluginAcceptanceClient(
+        expected_mode="direct",
+        expected_direct_model="deepseek",
+    )
+
+    report = module.run_real_user_plugin_acceptance(
+        PrincipalClient(backend, user_id=ADMIN_USER_ID, role="admin"),
+        operator_client=_operator(backend),
+        execution_id="direct-model",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+        run_mode="direct",
+        direct_model="deepseek",
+    )
+
+    assert report["status"] == "passed"
 
 
 def test_build_acceptance_plugin_is_signed_executable_and_nonce_bound(tmp_path: Path) -> None:
