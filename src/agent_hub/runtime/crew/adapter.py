@@ -2443,6 +2443,23 @@ _REVIEW_RESPONSE_SCHEMA = StructuredResponseSchema(
 )
 
 
+def _structured_correction_output_limit(
+    request: ModelRequest,
+    evidence: RejectedOutputEvidence,
+    remaining_tokens: int,
+) -> int:
+    output_limit = request.max_output_tokens
+    if (
+        evidence.correction_eligible
+        and evidence.reason == "invalid_json"
+        and evidence.usage is not None
+        and evidence.usage.completion_tokens >= output_limit - max(1, output_limit // 100)
+    ):
+        # Grow the existing format-only correction, not business/tool attempts.
+        output_limit *= 2
+    return min(output_limit, remaining_tokens, 1_000_000)
+
+
 def _can_compact_retry_subagent(
     diagnostic: Mapping[str, object],
     *,
@@ -5396,7 +5413,7 @@ class CrewDispatchRuntime:
             _fail("structured correction budget exhausted")
         output_limit = (
             cast(int, previous_repair["max_output_tokens"]) if previous_repair is not None
-            else min(request.max_output_tokens or remaining_tokens, remaining_tokens)
+            else _structured_correction_output_limit(request, evidence, remaining_tokens)
         )
         correction_limits = self._content_limits(
             context,
