@@ -37,6 +37,22 @@ scripts/agent-hub build-skill-runner --source /srv/cube-agent --image registry.e
 
 The command invokes Docker directly without evaluating shell text. The resulting target runs as UID/GID `65532:65532` and starts `python -m agent_hub.skills.runner`; the Docker sandbox still applies its read-only filesystem, dropped capabilities, network policy, resource limits, and package/workspace mounts at invocation time.
 
+The `skill-runner` target uses a separate `skill-runner-build` stage. It does not
+build the platform or web stages or copy their virtualenv. Its dependency manifest,
+`deploy/compose/skill-runner-requirements.txt`, contains only PyYAML, Pydantic, and
+Pydantic's runtime dependency closure, with every version taken from `uv.lock`.
+Installation uses wheels only, disables dependency resolution and caching, and
+keeps installer tooling out of the runner virtualenv. The image copies only the
+`agent_hub` and `skills` package initializers plus `runner.py`, `package.py`, and
+`manifest.py`; CrewAI, AutoGen, and the web/API stack are not installed.
+
+When updating these dependencies, refresh every pin from `uv.lock` and run
+`tests/unit/test_deployment_contracts.py` to check the dependency closure and
+minimal runner execution. Skills must remain self-contained: the runner still
+rejects runtime dependency installation. Measure image size and build cache usage
+on the intended build host before deployment; a Docker build is required to
+verify the actual image size and container isolation.
+
 ## Logs
 
 Runtime logs are JSON and are filtered before they are written. New installs default to:

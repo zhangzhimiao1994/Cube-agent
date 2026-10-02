@@ -361,7 +361,7 @@ def test_real_user_plugin_acceptance_separates_admin_and_operator_paths(
     assert any(path.startswith("/api/v1/admin/audit?") for _, path in admin.requests)
 
 
-def test_real_user_plugin_acceptance_can_pin_a_direct_model(
+def test_real_user_plugin_acceptance_rejects_text_only_mode_before_install(
     tmp_path: Path,
 ) -> None:
     module = _load_script()
@@ -370,18 +370,18 @@ def test_real_user_plugin_acceptance_can_pin_a_direct_model(
         expected_direct_model="deepseek",
     )
 
-    report = module.run_real_user_plugin_acceptance(
-        PrincipalClient(backend, user_id=ADMIN_USER_ID, role="admin"),
-        operator_client=_operator(backend),
-        execution_id="direct-model",
-        package_dir=tmp_path,
-        wait_seconds=1,
-        poll_interval_seconds=0,
-        run_mode="direct",
-        direct_model="deepseek",
-    )
-
-    assert report["status"] == "passed"
+    with pytest.raises(ValueError, match="tool-capable"):
+        module.run_real_user_plugin_acceptance(
+            PrincipalClient(backend, user_id=ADMIN_USER_ID, role="admin"),
+            operator_client=_operator(backend),
+            execution_id="direct-model",
+            package_dir=tmp_path,
+            wait_seconds=1,
+            poll_interval_seconds=0,
+            run_mode="direct",
+            direct_model="deepseek",
+        )
+    assert not backend.requests
 
 
 def test_build_acceptance_plugin_is_signed_executable_and_nonce_bound(tmp_path: Path) -> None:

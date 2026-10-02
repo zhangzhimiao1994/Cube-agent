@@ -1,0 +1,8 @@
+# Runtime closure of runner.py -> package.py -> manifest.py, pinned from uv.lock.
+# Keep the full closure explicit: Docker installs with --no-deps.
+annotated-types==0.8.0
+pydantic==2.12.5
+pydantic-core==2.41.5
+pyyaml==6.0.3
+typing-extensions==4.16.0
+typing-inspection==0.4.2

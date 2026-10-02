@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import io
 import json
 import zipfile
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from agent_hub.harness.project_scale_runner import (
+    AcceptanceHTTPError,
     ProjectScaleCaseResult,
     ProjectScaleExecutionReport,
+    _idempotency_key,
+    execute_project_scale_plan,
 )
 
 
@@ -70,8 +75,7 @@ class PublicArtifactClient:
                     },
                 ],
                 "bundle_download_url": (
-                    "/api/v1/workspaces/projects/project-small/sessions/"
-                    "conv-small/bundle/download"
+                    "/api/v1/workspaces/projects/project-small/sessions/conv-small/bundle/download"
                 ),
             }
         raise AssertionError(f"unexpected JSON request: {method} {path}")
@@ -143,9 +147,7 @@ def test_explicit_mode_capability_plans_use_the_requested_runtime_mode() -> None
     assert plans["dispatch"].requests[0].body["mode"] == "dispatch"
     assert plans["hybrid"].requests[0].body["mode"] == "hybrid"
     assert plans["multi_agent"].requests[0].body["mode"] == "dispatch"
-    assert {
-        plan.requests[0].case_id for plan in plans.values()
-    } == {
+    assert {plan.requests[0].case_id for plan in plans.values()} == {
         "small:direct",
         "small:dispatch",
         "small:hybrid",
@@ -175,27 +177,21 @@ def test_dynamic_preview_verification_uses_public_lifecycle_and_revokes_content(
                 return {
                     "id": "preview-small",
                     "status": "ready",
-                    "preview_url": (
-                        "/api/v1/web-previews/preview-small/content/"
-                    ),
+                    "preview_url": ("/api/v1/web-previews/preview-small/content/"),
                     "lease_expires_at": "2026-09-28T08:30:00Z",
                 }
             if method == "GET" and path == "/api/v1/web-previews/conversations/conv-small":
                 return {
                     "id": "preview-small",
                     "status": "ready",
-                    "preview_url": (
-                        "/api/v1/web-previews/preview-small/content/"
-                    ),
+                    "preview_url": ("/api/v1/web-previews/preview-small/content/"),
                     "lease_expires_at": "2026-09-28T08:30:00Z",
                 }
             if method == "POST" and path == "/api/v1/web-previews/preview-small/renew":
                 return {
                     "id": "preview-small",
                     "status": "ready",
-                    "preview_url": (
-                        "/api/v1/web-previews/preview-small/content/"
-                    ),
+                    "preview_url": ("/api/v1/web-previews/preview-small/content/"),
                     "lease_expires_at": "2026-09-28T09:00:00Z",
                 }
             if method == "DELETE" and path == "/api/v1/web-previews/preview-small":
@@ -215,8 +211,7 @@ def test_dynamic_preview_verification_uses_public_lifecycle_and_revokes_content(
             if path.endswith("/assets/app.js"):
                 return b"document.body.dataset.ready = 'true';"
             return (
-                b'<!doctype html><title>real preview</title>'
-                b'<script src="assets/app.js"></script>'
+                b'<!doctype html><title>real preview</title><script src="assets/app.js"></script>'
             )
 
     client = PreviewClient()
@@ -895,9 +890,10 @@ def test_main_accepts_bearer_token_without_password(
     assert run_kwargs["authentication_method"] == "bearer_token"
 
 
-def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scale(
+@pytest.fixture
+def matrix_harness(
     monkeypatch: Any,
-) -> None:
+) -> tuple[Any, Any, list[Any], list[str]]:
     module = load_script()
     bundle = workspace_zip()
 
@@ -908,6 +904,19 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
             self.project_workspace_paths: list[str] = []
             self.conversation_workspace_paths: list[str] = []
             self.stopped_previews: set[str] = set()
+            self.projects: dict[str, dict[str, object]] = {}
+            self.conversations: dict[str, dict[str, object]] = {}
+            self.runs: dict[str, dict[str, object]] = {}
+            self.run_bodies: dict[str, dict[str, object]] = {}
+            self.submissions: list[tuple[str, str]] = []
+            self.observed_runs: list[str] = []
+            self.requests: list[tuple[str, str]] = []
+            self.interrupt_after_commit: str | None = None
+
+        def _interrupt(self, path: str) -> None:
+            if self.interrupt_after_commit == path:
+                self.interrupt_after_commit = None
+                raise KeyboardInterrupt
 
         def request_json(
             self,
@@ -917,35 +926,83 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
             body: dict[str, object] | None = None,
             idempotency_key: str | None = None,
         ) -> dict[str, object] | list[object]:
-            del idempotency_key
+            self.requests.append((method, path))
             if method == "GET" and path == "/api/v1/auth/me":
                 return {"user_id": "user-test", "tenant_id": "tenant-test", "role": "operator"}
             if method == "POST" and path == "/api/v1/admin/project-workspaces":
                 assert body is not None
                 project_id = str(body["project_id"])
+                if project_id in self.projects:
+                    raise AcceptanceHTTPError(
+                        method=method,
+                        path=path,
+                        status_code=409,
+                        response_body='{"error":{"code":"project_workspace_conflict"}}',
+                    )
                 self.created_projects.append(project_id)
                 self.project_workspace_paths.append(str(body["workspace_path"]))
-                return dict(body)
+                self.projects[project_id] = {**body, "legacy_workspace_count": 1}
+                self._interrupt(path)
+                return copy.deepcopy(self.projects[project_id])
+            if method == "GET" and path == "/api/v1/admin/project-workspaces":
+                return cast(list[object], copy.deepcopy(list(self.projects.values())))
             if method == "POST" and path == "/api/v1/admin/conversations":
                 assert body is not None
                 conversation_id = str(body["conversation_id"])
+                if conversation_id in self.conversations:
+                    raise AcceptanceHTTPError(
+                        method=method,
+                        path=path,
+                        status_code=409,
+                        response_body='{"error":{"code":"conversation_conflict"}}',
+                    )
+                if body["project_id"] not in self.projects:
+                    raise AcceptanceHTTPError(
+                        method=method,
+                        path=path,
+                        status_code=409,
+                        response_body='{"error":{"code":"project_workspace_required"}}',
+                    )
                 self.created_conversations.append(conversation_id)
                 self.conversation_workspace_paths.append(str(body["workspace_path"]))
-                return dict(body)
+                self.conversations[conversation_id] = {**body, "archived_at": None, "runs": []}
+                self._interrupt(path)
+                return copy.deepcopy(self.conversations[conversation_id])
+            if method == "GET" and path.startswith("/api/v1/admin/conversations/"):
+                return copy.deepcopy(self.conversations[path.rsplit("/", 1)[-1]])
+            if method == "POST" and path == "/api/v1/runs":
+                assert body is not None and idempotency_key is not None
+                if idempotency_key not in self.runs:
+                    self.run_bodies[idempotency_key] = copy.deepcopy(body)
+                    self.runs[idempotency_key] = {
+                        **body,
+                        "id": f"run-{len(self.runs) + 1}",
+                        "status": "completed",
+                        "mode": "direct" if body["mode"] == "auto" else body["mode"],
+                        "requested_mode": body["mode"],
+                        "effective_scale": "small",
+                    }
+                assert self.run_bodies[idempotency_key] == body
+                run = self.runs[idempotency_key]
+                self.submissions.append((idempotency_key, str(run["id"])))
+                self._interrupt(path)
+                return copy.deepcopy(run)
+            if method == "GET" and path.startswith("/api/v1/runs/"):
+                if path.endswith(("/events", "/artifacts")):
+                    return []
+                run_id = path.split("/")[4]
+                self.observed_runs.append(run_id)
+                return copy.deepcopy(next(run for run in self.runs.values() if run["id"] == run_id))
             if method == "POST" and path == "/api/v1/web-previews/start":
                 assert body is not None
                 conversation_id = str(body["conversation_id"])
                 return {
                     "id": f"preview-{conversation_id}",
                     "status": "ready",
-                    "preview_url": (
-                        f"/api/v1/web-previews/preview-{conversation_id}/content/"
-                    ),
+                    "preview_url": (f"/api/v1/web-previews/preview-{conversation_id}/content/"),
                     "lease_expires_at": "2026-09-28T08:30:00Z",
                 }
-            if method == "GET" and path.startswith(
-                "/api/v1/web-previews/conversations/"
-            ):
+            if method == "GET" and path.startswith("/api/v1/web-previews/conversations/"):
                 conversation_id = path.rsplit("/", 1)[-1]
                 preview_id = f"preview-{conversation_id}"
                 return {
@@ -981,8 +1038,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
                             "mime_type": "text/markdown",
                             "size_bytes": 8,
                             "sha256": (
-                                "1285d7ebaa1def54aa12adb818c4ee1cb1782bf16237ffb86"
-                                "e768002b16e55f9"
+                                "1285d7ebaa1def54aa12adb818c4ee1cb1782bf16237ffb86e768002b16e55f9"
                             ),
                             "download_url": f"{root}/files/download?path=README.md",
                         },
@@ -992,8 +1048,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
                             "mime_type": "text/x-python",
                             "size_bytes": 12,
                             "sha256": (
-                                "ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f"
-                                "092b40393495b3d"
+                                "ad64355106bb158b020ecf9702be48f7730fc091dd4bb6a2f092b40393495b3d"
                             ),
                             "download_url": f"{root}/files/download?path=src%2Fapp.py",
                         },
@@ -1016,19 +1071,26 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
                     raise RuntimeError("HTTP 404 preview_not_found")
                 if path.endswith("/assets/app.js"):
                     return b"document.body.dataset.ready = 'true';"
-                return (
-                    b'<!doctype html><title>preview</title>'
-                    b'<script src="assets/app.js"></script>'
-                )
+                return b'<!doctype html><title>preview</title><script src="assets/app.js"></script>'
             raise AssertionError(f"unexpected bytes request: {method} {path}")
 
     plans: list[Any] = []
     scoped_workspace_paths: list[str] = []
 
     def execute(plan: Any, client: Any, **kwargs: object) -> ProjectScaleExecutionReport:
-        del client
         assert kwargs["auto_approve_capability_requests"] is True
         plans.append(plan)
+        submitted = client.request_json(
+            "POST",
+            "/api/v1/runs",
+            body=dict(plan.requests[0].body),
+            idempotency_key=_idempotency_key(
+                plan.requests[0].case_id,
+                0,
+                execution_id=str(kwargs["execution_id"]),
+            ),
+        )
+        observed = client.request_json("GET", f"/api/v1/runs/{submitted['id']}")
         scale, route_intent = plan.requests[0].case_id.split(":", 1)
         scoped_workspace_paths.append(
             module._safe_workspace_session_token(
@@ -1038,7 +1100,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
         )
         result = ProjectScaleCaseResult(
             case_id=plan.requests[0].case_id,
-            run_id=f"run-{scale}-{route_intent}",
+            run_id=str(observed["id"]),
             status="completed",
             observed_mode=(
                 "hybrid"
@@ -1101,6 +1163,13 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
 
     monkeypatch.setattr(module, "execute_project_scale_plan", execute)
     delegate = MatrixDelegate()
+    return module, delegate, plans, scoped_workspace_paths
+
+
+def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scale(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, plans, scoped_workspace_paths = matrix_harness
     client = module.RealUserAcceptanceClient(delegate)
 
     payload = module.run_real_user_four_scale_acceptance(
@@ -1115,12 +1184,8 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
 
     assert len(payload["cases"]) == 20
     assert [
-        (case["case_kind"], case["scale"], case["route_intent"])
-        for case in payload["cases"]
-    ] == [
-        ("auto_scale", scale, "auto")
-        for scale in ("small", "medium", "large", "ultra")
-    ] + [
+        (case["case_kind"], case["scale"], case["route_intent"]) for case in payload["cases"]
+    ] == [("auto_scale", scale, "auto") for scale in ("small", "medium", "large", "ultra")] + [
         ("mode_capability", scale, mode)
         for scale in ("small", "medium", "large", "ultra")
         for mode in ("direct", "dispatch", "hybrid", "multi_agent")
@@ -1173,3 +1238,576 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
     assert payload["real_device_acceptance"]["status"] == "pending_real_device"
     assert payload["real_device_acceptance"]["counted_as_complete"] is False
     assert payload["blocked_admin_run_requests"] == []
+
+
+def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
+    options = {
+        "username": "test",
+        "base_url": "http://example.test",
+        "execution_id": "matrix-123",
+        "wait_seconds": 1,
+        "poll_interval_seconds": 0,
+        "artifact_build_timeout_seconds": 1,
+        **kwargs,
+    }
+    return cast(
+        dict[str, Any],
+        module.run_real_user_four_scale_acceptance(
+            module.RealUserAcceptanceClient(delegate), **options
+        ),
+    )
+
+
+def test_checkpoint_survives_interrupt_and_resume_keeps_completed_case(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    output = tmp_path / "checkpoint.json"
+    execute = module.execute_project_scale_plan
+
+    def interrupt(plan: Any, client: Any, **kwargs: Any) -> Any:
+        if plans:
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            assert saved["case_count"] == 1
+            assert saved["core_passed_case_count"] == 1
+            assert saved["status"] == "in_progress"
+            assert saved["core_acceptance_ok"] is False
+            assert saved["automated_acceptance_complete"] is False
+            assert saved["acceptance_complete"] is False
+            assert saved["finished_at"] is None
+            raise KeyboardInterrupt
+        return execute(plan, client, **kwargs)
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    first = saved["cases"][0]
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    resumed = run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+
+    assert len(plans) == 20
+    assert resumed["cases"][0] == first
+    assert resumed["started_at"] == saved["started_at"]
+    assert resumed["case_count"] == 20
+    assert resumed["core_passed_case_count"] == 20
+    assert resumed["status"] == "pending_real_device"
+    assert resumed["acceptance_complete"] is False
+    assert json.loads(output.read_text(encoding="utf-8")) == resumed
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        (None, "status", "failed"),
+        (None, "automated_acceptance_complete", False),
+        ("run", "status", "running"),
+        ("run", "run_id", None),
+        ("run", "errors", ["failed"]),
+        ("run", "evidence", {}),
+        ("run", "effective_scale", "ultra"),
+        ("run", "artifact_origin", "fixture"),
+        ("run", "final_observed_mode", "unknown"),
+        ("build_and_test", "requirements_validation", False),
+        ("public_artifacts", "ok", 1),
+        ("public_artifacts", "downloaded_file_count", 0),
+        ("public_artifacts", "zip_crc_ok", False),
+        ("public_artifacts", "zip_sha256", None),
+        ("public_artifacts", "unsafe_member_count", False),
+        ("public_artifacts", "files_endpoint", "/another/workspace/files"),
+        ("dynamic_web_preview", "revoked_after_stop", False),
+        ("dynamic_web_preview", "referenced_assets_loaded", 0),
+        ("dynamic_web_preview", "counted_as_passed", "true"),
+        ("success_basis", "admin_internal_run_data", True),
+        ("project", "project_id", "another-project"),
+    ],
+)
+def test_resume_retests_incomplete_or_inconsistent_core_evidence(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    section: str | None,
+    key: str,
+    value: object,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    case = saved["cases"][0]
+    (case if section is None else case[section])[key] = value
+    original_project = delegate.created_projects[0]
+    plans.clear()
+    resumed = run_matrix(module, delegate, resume_report=saved)
+
+    assert len(plans) == 1
+    assert plans[0].requests[0].case_id == "small:auto"
+    assert delegate.created_projects[-1] != original_project
+    assert resumed["core_passed_case_count"] == 20
+    assert len({item["case_id"] for item in resumed["cases"]}) == 20
+    assert resumed["cases"][1:] == saved["cases"][1:]
+
+
+@pytest.mark.parametrize("field", ["execution_id", "base_url", "user_id", "tenant_id"])
+def test_resume_rejects_different_execution_identity_before_case_requests(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    field: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    if field in {"execution_id", "base_url"}:
+        saved[field] = "different"
+    else:
+        saved["actor"]["principal"][field] = "different"
+    plans.clear()
+    with pytest.raises(ValueError, match="identity"):
+        run_matrix(module, delegate, resume_report=saved)
+    assert plans == []
+    assert len(delegate.created_projects) == 20
+
+
+def test_resume_retests_exception_failure_with_new_attempt_scope(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def fail(plan: Any, client: Any, **kwargs: Any) -> Any:
+        if plan.requests[0].case_id == "small:auto":
+            raise RuntimeError("deployment unavailable")
+        return execute(plan, client, **kwargs)
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", fail)
+    saved = run_matrix(module, delegate)
+    assert saved["cases"][0]["case_id"] == "small:auto"
+    assert saved["failed_case_count"] == 1
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    plans.clear()
+    resumed = run_matrix(module, delegate, resume_report=saved)
+    assert len(plans) == 1
+    assert resumed["cases"][0]["attempt"] == 2
+    assert resumed["cases"][0]["project"] != saved["cases"][0]["project"]
+    assert resumed["cases"][0]["conversation"] != saved["cases"][0]["conversation"]
+    assert resumed["failed_case_count"] == 0
+
+
+def test_atomic_report_replace_failure_preserves_previous_checkpoint(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = load_script()
+    output = tmp_path / "report.json"
+    module._write_report(str(output), {"cases": ["completed"]})
+    before = output.read_bytes()
+
+    def fail_replace(source: object, target: object) -> None:
+        assert Path(str(source)).parent == output.parent
+        assert Path(str(target)) == output
+        assert json.loads(Path(str(source)).read_text(encoding="utf-8"))["cases"] == []
+        raise OSError("replace interrupted")
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace interrupted"):
+        module._write_report(str(output), {"cases": []})
+    assert output.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_resume_cli_uses_saved_execution_and_checkpoints_in_place(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    output = tmp_path / "resume.json"
+    module._write_report(str(output), saved)
+    plans.clear()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "new-token-same-user")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    exit_code = module.main(
+        [
+            "--base-url",
+            "http://example.test/",
+            "--resume-report",
+            str(output),
+        ]
+    )
+    assert exit_code == 2
+    assert plans == []
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["execution_id"] == "matrix-123"
+    assert report["cases"] == saved["cases"]
+    assert report["acceptance_complete"] is False
+
+
+def test_resume_rejects_duplicate_cases(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    saved["cases"].append(copy.deepcopy(saved["cases"][0]))
+    plans.clear()
+    with pytest.raises(ValueError, match="duplicate"):
+        run_matrix(module, delegate, resume_report=saved)
+    assert plans == []
+
+
+def test_repeated_failed_attempts_use_distinct_workspaces_with_long_execution_id(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def fail(plan: Any, client: Any, **kwargs: Any) -> Any:
+        if plan.requests[0].case_id == "small:multi_agent":
+            raise RuntimeError("provider unavailable")
+        return execute(plan, client, **kwargs)
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", fail)
+    saved = run_matrix(module, delegate, execution_id="matrix-" + "a" * 33)
+    retry = run_matrix(
+        module,
+        delegate,
+        execution_id="matrix-" + "a" * 33,
+        resume_report=saved,
+    )
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    resumed = run_matrix(
+        module,
+        delegate,
+        execution_id="matrix-" + "a" * 33,
+        resume_report=retry,
+    )
+    assert delegate.project_workspace_paths[-2] != delegate.project_workspace_paths[-1]
+    case = next(item for item in resumed["cases"] if item["case_id"] == "small:multi_agent")
+    assert case["attempt"] == 3
+    assert case["core_acceptance_ok"] is True
+
+
+@pytest.mark.parametrize("failure", ["identity", "checkpoint"])
+def test_resume_cli_failure_preserves_report(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+    failure: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    output = tmp_path / "resume.json"
+    module._write_report(str(output), saved)
+    before = output.read_bytes()
+    plans.clear()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    if failure == "checkpoint":
+
+        def fail_replace(*args: Any) -> None:
+            raise OSError("cannot save checkpoint")
+
+        monkeypatch.setattr(module.os, "replace", fail_replace)
+    exit_code = module.main(
+        [
+            "--base-url",
+            "http://different.test" if failure == "identity" else "http://example.test",
+            "--resume-report",
+            str(output),
+        ]
+    )
+    assert exit_code == 1
+    assert output.read_bytes() == before
+    assert plans == []
+
+
+def test_resuming_partial_report_preserves_later_passes_during_retry_interrupt(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    saved["cases"][0]["run"]["evidence"] = {}
+    output = tmp_path / "resume.json"
+
+    def interrupt(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["cases"][1:] == saved["cases"][1:]
+    assert report["cases"][0]["core_acceptance_ok"] is False
+    assert report["core_passed_case_count"] == 19
+    assert report["status"] == "in_progress"
+    assert report["automated_acceptance_complete"] is False
+
+
+@pytest.mark.parametrize("change", [{"case_id": "medium:auto"}, {"status": "running"}])
+def test_checkpoint_does_not_count_wrong_case_or_nonterminal_runner_result(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    change: dict[str, Any],
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def wrong_result(plan: Any, client: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(plan, client, **kwargs))
+        if plan.requests[0].case_id == "small:auto":
+            return replace(report, results=(replace(report.results[0], **change),))
+        return report
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", wrong_result)
+    payload = run_matrix(module, delegate)
+    assert payload["core_acceptance_ok"] is False
+    assert payload["cases"][0]["case_id"] == "small:auto"
+    assert payload["cases"][0]["core_acceptance_ok"] is False
+    assert payload["failed_case_count"] == 1
+
+
+def test_resume_interrupted_active_case_reuses_run_idempotency_scope(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+    submissions: list[tuple[str, object]] = []
+    output = tmp_path / "active.json"
+
+    def interrupt_after_submit(plan: Any, client: Any, **kwargs: Any) -> Any:
+        report = execute(plan, client, **kwargs)
+        if plan.requests[0].case_id == "small:auto":
+            submissions.append(
+                (
+                    _idempotency_key("small:auto", 0, execution_id=str(kwargs["execution_id"])),
+                    plan.requests[0].body["workspace_session_id"],
+                )
+            )
+            if len(submissions) == 1:
+                raise KeyboardInterrupt
+        return report
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", interrupt_after_submit)
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["cases"] == []
+    assert saved["status"] == "in_progress"
+    resumed = run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert submissions == [
+        ("project-scale-small-auto-0-matrix-123-auto-small", "conv-matrix-123-auto-small"),
+        ("project-scale-small-auto-0-matrix-123-auto-small", "conv-matrix-123-auto-small"),
+    ]
+    assert delegate.created_projects.count("uat-matrix-123-auto-small") == 1
+    assert delegate.created_conversations.count("conv-matrix-123-auto-small") == 1
+    assert delegate.submissions[0] == delegate.submissions[1]
+    assert delegate.observed_runs[0] == delegate.observed_runs[1]
+    assert resumed["cases"][0]["attempt"] == 1
+    assert resumed["core_passed_case_count"] == 20
+
+
+@pytest.mark.parametrize(
+    "interrupt_path",
+    ["/api/v1/admin/project-workspaces", "/api/v1/admin/conversations", "/api/v1/runs"],
+)
+def test_resume_recovers_resources_committed_before_response_was_saved(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+    interrupt_path: str,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    output = tmp_path / "active.json"
+    delegate.interrupt_after_commit = interrupt_path
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["cases"] == []
+
+    resumed = run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+
+    assert resumed["core_passed_case_count"] == 1
+    assert resumed["cases"][0]["attempt"] == 1
+    assert delegate.created_projects == ["uat-matrix-123-auto-small"]
+    assert delegate.created_conversations == ["conv-matrix-123-auto-small"]
+    assert ("GET", "/api/v1/admin/project-workspaces") in delegate.requests
+    if interrupt_path != "/api/v1/admin/project-workspaces":
+        assert (
+            "GET",
+            "/api/v1/admin/conversations/conv-matrix-123-auto-small",
+        ) in delegate.requests
+    assert len(delegate.runs) == 1
+    assert resumed["cases"][0]["run"]["run_id"] == "run-1"
+    if interrupt_path == "/api/v1/runs":
+        assert delegate.submissions == [
+            ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
+            ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
+        ]
+        assert delegate.observed_runs == ["run-1"]
+
+
+@pytest.mark.parametrize(
+    ("resource", "field", "value"),
+    [
+        ("projects", "project_id", "other-project"),
+        ("projects", "label", "another acceptance"),
+        ("projects", "workspace_path", "other-workspace"),
+        ("conversations", "conversation_id", "other-conversation"),
+        ("conversations", "project_id", "other-project"),
+        ("conversations", "project_label", "another acceptance"),
+        ("conversations", "workspace_path", "other-workspace"),
+        ("conversations", "title", "another acceptance"),
+        ("conversations", "archived_at", "2026-10-02T01:00:00Z"),
+    ],
+)
+def test_resume_rejects_conflicting_existing_resource_scope(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+    resource: str,
+    field: str,
+    value: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    output = tmp_path / "active.json"
+    delegate.interrupt_after_commit = (
+        "/api/v1/admin/project-workspaces"
+        if resource == "projects"
+        else "/api/v1/admin/conversations"
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    resources = getattr(delegate, resource)
+    next(iter(resources.values()))[field] = value
+    resumed = run_matrix(module, delegate, resume_report=saved)
+
+    assert resumed["failed_case_count"] == 1
+    assert resumed["cases"][0]["core_acceptance_ok"] is False
+    assert "scope" in resumed["cases"][0]["errors"][0]
+    assert plans == []
+    assert delegate.runs == {}
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (401, "invalid_token"),
+        (403, "forbidden"),
+        (500, "internal_error"),
+        (409, "project_workspace_required"),
+        (409, "unrelated_conflict"),
+    ],
+)
+def test_resource_recovery_does_not_swallow_other_http_errors(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    status: int,
+    code: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    request = delegate.request_json
+
+    def fail(method: str, path: str, **kwargs: Any) -> Any:
+        if method == "POST" and path == "/api/v1/admin/conversations":
+            raise AcceptanceHTTPError(
+                method=method,
+                path=path,
+                status_code=status,
+                response_body=json.dumps({"error": {"code": code}}),
+            )
+        return request(method, path, **kwargs)
+
+    monkeypatch.setattr(delegate, "request_json", fail)
+    report = run_matrix(module, delegate)
+
+    assert report["failed_case_count"] == 1
+    assert f"status={status}" in report["cases"][0]["errors"][0]
+    assert code in report["cases"][0]["errors"][0]
+    assert not any(
+        method == "GET" and "/admin/conversations/" in path for method, path in delegate.requests
+    )
+    assert plans == []
+
+
+@pytest.mark.parametrize("visibility", ["missing", "forbidden"])
+def test_resource_conflict_requires_authenticated_lookup_before_reuse(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+    visibility: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    output = tmp_path / "active.json"
+    delegate.interrupt_after_commit = "/api/v1/admin/project-workspaces"
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    request = delegate.request_json
+
+    def invisible(method: str, path: str, **kwargs: Any) -> Any:
+        if method == "GET" and path == "/api/v1/admin/project-workspaces":
+            if visibility == "missing":
+                return []
+            raise AcceptanceHTTPError(
+                method=method,
+                path=path,
+                status_code=403,
+                response_body='{"error":{"code":"forbidden"}}',
+            )
+        return request(method, path, **kwargs)
+
+    monkeypatch.setattr(delegate, "request_json", invisible)
+    resumed = run_matrix(module, delegate, resume_report=saved)
+    assert resumed["failed_case_count"] == 1
+    assert resumed["cases"][0]["core_acceptance_ok"] is False
+    assert plans == []
+    assert delegate.created_conversations == []
+    assert delegate.runs == {}
+
+
+def test_real_runner_reobserves_run_committed_before_interruption(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute_project_scale_plan)
+    output = tmp_path / "active.json"
+    delegate.interrupt_after_commit = "/api/v1/runs"
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    request = delegate.request_json
+
+    def stop_after_observation(method: str, path: str, **kwargs: Any) -> Any:
+        response = request(method, path, **kwargs)
+        if method == "GET" and path == "/api/v1/runs/run-1/details":
+            assert response["id"] == "run-1"
+            # Stop before unrelated deliverable validation and repair side effects.
+            raise KeyboardInterrupt
+        return response
+
+    monkeypatch.setattr(delegate, "request_json", stop_after_observation)
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+
+    assert len(delegate.runs) == 1
+    assert delegate.submissions == [
+        ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
+        ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
+    ]
+    assert "run-1" in delegate.observed_runs
+    checkpoint = json.loads(output.read_text(encoding="utf-8"))
+    assert checkpoint["cases"] == []
+    assert checkpoint["core_acceptance_ok"] is False

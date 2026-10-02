@@ -21,7 +21,8 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX
-CapabilityBoundingSet=
+# Create/clean probes under agent-hub-owned 0750 runtime directories and chown their workspace.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
 LockPersonality=yes
 ReadOnlyPaths=/opt/agent-hub/current
 ReadWritePaths=/run/agent-hub

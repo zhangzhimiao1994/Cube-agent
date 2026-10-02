@@ -1,3 +1,4 @@
+import configparser
 import re
 import tomllib
 from pathlib import Path
@@ -827,6 +828,27 @@ def test_native_install_deploys_minimal_privilege_skill_broker_units() -> None:
     assert 'rm -f /etc/systemd/system/agent-hub-skill@.service' in installer
     assert "systemctl enable --now agent-hub-skill-broker.socket" in installer
     assert "require_native_service_active agent-hub-skill-broker.socket" in installer
+
+
+def test_skill_broker_can_prepare_probes_in_service_owned_runtime_without_broad_caps() -> None:
+    unit = configparser.ConfigParser(interpolation=None)
+    unit.read_string(read("deploy/native/systemd/agent-hub-skill-broker.service"))
+    service = unit["Service"]
+    runtime_directories = {
+        fields[1]: fields[2:5]
+        for line in read("deploy/native/agent-hub.tmpfiles").splitlines()
+        if (fields := line.split()) and fields[0] == "d"
+    }
+
+    assert runtime_directories["/run/agent-hub"] == ["0750", "agent-hub", "agent-hub"]
+    assert service["User"] == "root"
+    assert service["Group"] == "root"
+    assert service["SupplementaryGroups"] == "agent-hub"
+    assert set(service["CapabilityBoundingSet"].split()) == {"CAP_DAC_OVERRIDE", "CAP_CHOWN"}
+    assert not service.get("AmbientCapabilities", "").strip()
+    assert service["NoNewPrivileges"] == "yes"
+    assert service["ProtectSystem"] == "strict"
+    assert service["ReadWritePaths"].split() == ["/run/agent-hub"]
 
 
 def test_native_upgrade_restarts_every_release_bound_process_after_switch() -> None:

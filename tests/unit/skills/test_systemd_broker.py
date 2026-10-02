@@ -134,6 +134,7 @@ def test_broker_builds_only_fixed_hardened_transient_unit(tmp_path: Path) -> Non
     assert "ProtectSystem=strict" in properties
     assert "PrivateNetwork=yes" in properties
     assert "IPAddressDeny=any" in properties
+    assert "CapabilityBoundingSet=" in properties
     assert "InaccessiblePaths=/var/lib/agent-hub" in properties
     assert any(item.startswith("BindReadOnlyPaths=") and item.endswith(":/run/agent-hub-skill/package.zip") for item in properties)
     assert any(item.startswith("BindPaths=") and item.endswith(":/run/agent-hub-skill/workspace") for item in properties)
@@ -179,9 +180,12 @@ async def test_broker_probe_returns_stable_reason_without_systemd_stderr(
     assert response.error == "systemd_transient_unit_unavailable"
 
 
+@pytest.mark.parametrize("allowed_uid,allowed_gid", [(10001, 10001), (4242, 4343)])
 async def test_broker_routes_docker_run_through_fixed_hardened_command(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    allowed_uid: int,
+    allowed_gid: int,
 ) -> None:
     skill_root = tmp_path / "skills"
     invocation = _invocation(skill_root)
@@ -202,12 +206,17 @@ async def test_broker_routes_docker_run_through_fixed_hardened_command(
         run_limited,
     )
     broker = SystemdBroker(
-        BrokerPolicy(skill_root=skill_root, allowed_uid=10001, docker="/snap/bin/docker")
+        BrokerPolicy(
+            skill_root=skill_root,
+            allowed_uid=allowed_uid,
+            allowed_gid=allowed_gid,
+            docker="/snap/bin/docker",
+        )
     )
 
     response = await broker.handle(
         BrokerRequest.run(invocation, backend="docker"),
-        peer_uid=10001,
+        peer_uid=allowed_uid,
     )
 
     assert response.ok is True
@@ -215,7 +224,7 @@ async def test_broker_routes_docker_run_through_fixed_hardened_command(
     assert response.result.stdout == "docker-ok\n"
     command = commands[0]
     assert command[:3] == ("/snap/bin/docker", "run", "--rm")
-    assert "10001:10001" in command
+    assert command[command.index("--user") + 1] == f"{allowed_uid}:{allowed_gid}"
     assert command[command.index("--network") + 1] == "none"
     assert all("docker.sock" not in item for item in command)
 
@@ -255,6 +264,61 @@ async def test_docker_broker_probe_executes_real_mounted_skill_contract(
     assert len(received) == 1
     assert received[0][1] == "docker"
     assert received[0][0].input == {"docker_probe": "ok"}
+
+
+@pytest.mark.parametrize("allowed_uid,allowed_gid", [(10001, 10001), (4242, 4343)])
+async def test_docker_probe_hands_off_private_workspace_to_installed_runner_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    allowed_uid: int,
+    allowed_gid: int,
+) -> None:
+    permissions: dict[Path, int] = {}
+    ownership: dict[Path, tuple[int, int]] = {}
+    original_chmod = Path.chmod
+
+    def chmod(path: Path, mode: int, **kwargs: object) -> None:
+        if path in ownership:
+            raise PermissionError("CAP_FOWNER is intentionally unavailable")
+        permissions[path] = mode
+        original_chmod(path, mode)
+
+    def chown(path: Path, uid: int, gid: int) -> None:
+        ownership[path] = (uid, gid)
+
+    monkeypatch.setattr(Path, "chmod", chmod)
+    monkeypatch.setattr("agent_hub.skills.sandbox.broker.os.chown", chown, raising=False)
+    runtime_root = tmp_path / "run"
+    broker = SystemdBroker(
+        BrokerPolicy(
+            allowed_uid=allowed_uid,
+            allowed_gid=allowed_gid,
+            runtime_root=runtime_root,
+            docker="/snap/bin/docker",
+        )
+    )
+
+    async def run_limited(
+        command: tuple[str, ...],
+        invocation: SkillInvocation,
+        **kwargs: object,
+    ) -> SkillResult:
+        assert command[command.index("--user") + 1] == f"{allowed_uid}:{allowed_gid}"
+        assert ownership[invocation.writable_tmp_path] == (allowed_uid, allowed_gid)
+        assert permissions.get(invocation.writable_tmp_path) == 0o700
+        assert permissions.get(invocation.package_path) == 0o644
+        with zipfile.ZipFile(invocation.package_path) as archive:
+            assert "probe-write.txt" in archive.read("main.py").decode("utf-8")
+        return SkillResult(exit_code=0, stdout='{"docker_probe":"ok"}', stderr="", timed_out=False)
+
+    monkeypatch.setattr(
+        "agent_hub.skills.sandbox.broker.run_subprocess_with_limits", run_limited
+    )
+
+    response = await broker.handle(BrokerRequest.probe(backend="docker"), peer_uid=allowed_uid)
+
+    assert response.ok is True
+    assert list(runtime_root.iterdir()) == []
 
 
 def test_broker_policy_resolves_installed_agent_hub_uid(

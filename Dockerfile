@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Release builds should update this digest with the exact approved Python base.
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
 
@@ -25,6 +23,16 @@ RUN uv sync --frozen --no-dev --no-editable \
     || (uv venv --clear .venv \
       && uv pip install --python .venv/bin/python --index-url "${AGENT_HUB_PYPI_MIRROR}" .)
 
+# Keep runner builds independent of the platform and web dependency graphs.
+FROM ${PYTHON_IMAGE} AS skill-runner-build
+ARG AGENT_HUB_PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+WORKDIR /opt/agent-hub
+COPY deploy/compose/skill-runner-requirements.txt ./skill-runner-requirements.txt
+RUN python -m venv --without-pip .venv \
+    && python -m pip --python .venv/bin/python install \
+        --no-cache-dir --no-deps --only-binary=:all: \
+        --index-url "${AGENT_HUB_PYPI_MIRROR}" -r skill-runner-requirements.txt
+
 FROM ${PYTHON_IMAGE} AS skill-runner
 ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -35,7 +43,9 @@ RUN groupadd --gid 65532 skill-runner \
     && useradd --uid 65532 --gid 65532 --home-dir /workspace --shell /usr/sbin/nologin skill-runner \
     && mkdir -p /package /workspace \
     && chown -R 65532:65532 /opt/agent-hub /package /workspace
-COPY --from=python-build --chown=65532:65532 /opt/agent-hub/.venv ./.venv
+COPY --from=skill-runner-build --chown=65532:65532 /opt/agent-hub/.venv ./.venv
+COPY --chown=65532:65532 src/agent_hub/__init__.py ./agent_hub/
+COPY --chown=65532:65532 src/agent_hub/skills/__init__.py src/agent_hub/skills/runner.py src/agent_hub/skills/package.py src/agent_hub/skills/manifest.py ./agent_hub/skills/
 USER 65532:65532
 CMD ["python", "-m", "agent_hub.skills.runner"]
 

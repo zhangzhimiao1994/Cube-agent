@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
@@ -30,6 +31,7 @@ from agent_hub.harness.project_scale import (
 )
 from agent_hub.harness.project_scale_runner import (
     AcceptanceClient,
+    AcceptanceHTTPError,
     ProjectScaleCaseResult,
     UrllibAcceptanceClient,
     _acceptance_credentials_from_env,
@@ -243,7 +245,9 @@ def verify_public_workspace_artifacts(
             raise RuntimeError("public workspace file list is empty")
         if listing.get("bundle_download_url") != bundle_path:
             errors.append("public bundle_download_url does not match the requested workspace")
-        file_items = [cast(Mapping[str, object], item) for item in raw_items if isinstance(item, Mapping)]
+        file_items = [
+            cast(Mapping[str, object], item) for item in raw_items if isinstance(item, Mapping)
+        ]
         if len(file_items) != len(raw_items):
             errors.append("public workspace file list contains invalid items")
         bundle = client.request_bytes("GET", bundle_path)
@@ -442,8 +446,7 @@ def verify_dynamic_web_preview(
         if not isinstance(renewed_payload, dict):
             raise TypeError("preview renew returned non-object JSON")
         renewed = (
-            renewed_payload.get("id") == preview_id
-            and renewed_payload.get("status") == "ready"
+            renewed_payload.get("id") == preview_id and renewed_payload.get("status") == "ready"
         )
         initial_expiry = _timestamp(started.get("lease_expires_at"))
         renewed_expiry = _timestamp(renewed_payload.get("lease_expires_at"))
@@ -543,9 +546,7 @@ def build_case_report(
     allowed_modes = expected_modes.get(route_intent)
     final_mode = result.final_observed_mode or result.observed_mode
     route_observed_mode = result.observed_mode if route_intent == "auto" else final_mode
-    exact_mode_coverage_ok = (
-        allowed_modes is None or route_observed_mode in allowed_modes
-    )
+    exact_mode_coverage_ok = allowed_modes is None or route_observed_mode in allowed_modes
     safe_upgrade = (
         route_intent == "direct"
         and result.requested_mode == "direct"
@@ -563,16 +564,15 @@ def build_case_report(
         "incremental_workspace_delivery",
     }
     required_multi_agent_ids = {"architect", "implementer", "tester", "synthesizer"}
-    multi_agent_evidence_ok = (
-        route_intent != "multi_agent"
-        or (
-            result.evidence.get("multi_agent_participation") is True
-            and required_multi_agent_ids <= set(result.participant_agent_ids)
-            and result.participant_event_count >= 8
-        )
+    multi_agent_evidence_ok = route_intent != "multi_agent" or (
+        result.evidence.get("multi_agent_participation") is True
+        and required_multi_agent_ids <= set(result.participant_agent_ids)
+        and result.participant_event_count >= 8
     )
     core_ok = (
-        result.ok
+        result.status == "completed"
+        and bool(result.run_id)
+        and result.ok
         and generated_project_ok
         and requirements_ok
         and public_artifacts_ok
@@ -644,6 +644,57 @@ def build_case_report(
     }
 
 
+def _create_or_recover_case_resource(
+    client: RealUserAcceptanceClient,
+    *,
+    path: str,
+    body: dict[str, object],
+    idempotency_key: str,
+) -> dict[str, object]:
+    is_project = path == "/api/v1/admin/project-workspaces"
+    expected_code = "project_workspace_conflict" if is_project else "conversation_conflict"
+    try:
+        resource = client.request_json("POST", path, body=body, idempotency_key=idempotency_key)
+    except AcceptanceHTTPError as error:
+        if error.status_code != 409 or error.method != "POST" or error.path != path:
+            raise
+        try:
+            payload = json.loads(error.response_body)
+        except json.JSONDecodeError:
+            raise error from None
+        details = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(details, dict) or details.get("code") != expected_code:
+            raise
+        # These authenticated reads enforce tenant ownership; the API exposes no user owner field.
+        if is_project:
+            existing = client.request_json("GET", path)
+            if not isinstance(existing, list):
+                raise TypeError("project resource scope lookup returned non-list JSON") from error
+            matches = [
+                item
+                for item in existing
+                if isinstance(item, dict) and item.get("project_id") == body["project_id"]
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "project resource scope is not uniquely visible to this actor"
+                ) from error
+            resource = matches[0]
+        else:
+            resource = client.request_json(
+                "GET",
+                f"{path}/{quote(str(body['conversation_id']), safe='')}",
+            )
+    if not isinstance(resource, dict):
+        raise TypeError("case resource scope lookup returned non-object JSON")
+    for key, expected in body.items():
+        if resource.get(key) != expected:
+            raise RuntimeError(f"case resource scope mismatch: {key}")
+    if not is_project and resource.get("archived_at") is not None:
+        raise RuntimeError("case resource scope mismatch: conversation is archived")
+    return resource
+
+
 def run_real_user_four_scale_acceptance(
     client: RealUserAcceptanceClient,
     *,
@@ -655,6 +706,8 @@ def run_real_user_four_scale_acceptance(
     artifact_build_timeout_seconds: float,
     progress: Callable[[str], None] | None = None,
     authentication_method: str = "password",
+    output_path: str | None = None,
+    resume_report: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     started_at = _utc_now()
     principal = client.request_json("GET", "/api/v1/auth/me")
@@ -662,11 +715,44 @@ def run_real_user_four_scale_acceptance(
         raise TypeError("GET /api/v1/auth/me returned non-object JSON")
     cases: list[dict[str, object]] = []
     safe_execution_id = _safe_identifier(execution_id)
+    identity = _execution_identity(execution_id, base_url, principal)
+    if resume_report is not None:
+        cases = _resume_cases(resume_report, identity)
+        previous_start = resume_report.get("started_at")
+        if isinstance(previous_start, str) and _timestamp(previous_start) is not None:
+            started_at = previous_start
+
+    def snapshot(*, finished: bool = False) -> dict[str, object]:
+        return _matrix_report(
+            client=client,
+            cases=cases,
+            username=username,
+            principal=principal,
+            base_url=base_url,
+            execution_id=execution_id,
+            identity=identity,
+            started_at=started_at,
+            authentication_method=authentication_method,
+            finished=finished,
+        )
+
+    if output_path:
+        _save_report(output_path, snapshot())
 
     for case_kind, scale, route_intent, case_key in _ACCEPTANCE_CASES:
-        project_id = _bounded_identifier(f"uat-{safe_execution_id}-{case_key}", 128)
+        case_id = f"{scale}:{route_intent}"
+        previous = next((case for case in cases if case.get("case_id") == case_id), None)
+        if previous is not None and _has_complete_core_evidence(
+            previous, safe_execution_id=safe_execution_id, case_key=case_key
+        ):
+            if progress is not None:
+                progress(f"{case_kind}/{scale}/{route_intent}: resuming completed core evidence")
+            continue
+        attempt = _case_attempt(previous) + 1 if previous is not None else 1
+        scope_token = _case_execution_token(safe_execution_id, case_key, attempt)
+        project_id = _bounded_identifier(f"uat-{scope_token}", 128)
         conversation_id = _bounded_identifier(
-            f"conv-{safe_execution_id}-{case_key}",
+            f"conv-{scope_token}",
             128,
         )
         project_label = (
@@ -674,7 +760,7 @@ def run_real_user_four_scale_acceptance(
             if case_kind == "auto_scale"
             else f"真实用户 {route_intent} 模式能力验收"
         )
-        runner_execution_id = f"{safe_execution_id}-{case_key}"
+        runner_execution_id = scope_token
         workspace_session_id = _safe_workspace_session_token(
             conversation_id,
             runner_execution_id,
@@ -682,21 +768,21 @@ def run_real_user_four_scale_acceptance(
         if progress is not None:
             progress(f"{case_kind}/{scale}/{route_intent}: creating project and conversation")
         try:
-            project = client.request_json(
-                "POST",
-                "/api/v1/admin/project-workspaces",
+            project = _create_or_recover_case_resource(
+                client,
+                path="/api/v1/admin/project-workspaces",
                 body={
                     "project_id": project_id,
                     "label": project_label,
                     "workspace_path": workspace_session_id,
                 },
-                idempotency_key=f"{safe_execution_id}-{case_key}-project",
+                idempotency_key=f"{scope_token}-project",
             )
             if not isinstance(project, dict) or project.get("project_id") != project_id:
                 raise RuntimeError("project workspace creation returned the wrong project")
-            conversation = client.request_json(
-                "POST",
-                "/api/v1/admin/conversations",
+            conversation = _create_or_recover_case_resource(
+                client,
+                path="/api/v1/admin/conversations",
                 body={
                     "conversation_id": conversation_id,
                     "title": f"{case_kind} {scale} {route_intent} 真实用户项目验收",
@@ -704,11 +790,12 @@ def run_real_user_four_scale_acceptance(
                     "project_label": project_label,
                     "workspace_path": workspace_session_id,
                 },
-                idempotency_key=f"{safe_execution_id}-{case_key}-conversation",
+                idempotency_key=f"{scope_token}-conversation",
             )
-            if not isinstance(conversation, dict) or conversation.get(
-                "conversation_id"
-            ) != conversation_id:
+            if (
+                not isinstance(conversation, dict)
+                or conversation.get("conversation_id") != conversation_id
+            ):
                 raise RuntimeError("conversation creation returned the wrong conversation")
 
             plan = build_real_user_scale_plan(
@@ -754,6 +841,8 @@ def run_real_user_four_scale_acceptance(
                 auto_approve_capability_requests=True,
             )
             result = runner_report.results[0]
+            if result.case_id != case_id:
+                raise RuntimeError("capability runner returned evidence for the wrong case")
             public_artifacts = verify_public_workspace_artifacts(
                 client,
                 project_id=project_id,
@@ -765,47 +854,74 @@ def run_real_user_four_scale_acceptance(
                 conversation_id=conversation_id,
                 workspace_session_id=workspace_session_id,
             )
-            cases.append(
-                build_case_report(
-                    scale=scale,
-                    project=project,
-                    conversation=conversation,
-                    result=result,
-                    public_artifacts=public_artifacts,
-                    dynamic_web_preview=dynamic_web_preview,
-                )
+            completed_case = build_case_report(
+                scale=scale,
+                project=project,
+                conversation=conversation,
+                result=result,
+                public_artifacts=public_artifacts,
+                dynamic_web_preview=dynamic_web_preview,
             )
         except Exception as error:  # noqa: BLE001 - every matrix case must be attempted.
-            cases.append(
-                {
-                    "scale": scale,
-                    "case_kind": case_kind,
-                    "route_intent": route_intent,
+            completed_case = {
+                "case_id": case_id,
+                "scale": scale,
+                "case_kind": case_kind,
+                "route_intent": route_intent,
+                "status": "failed",
+                "core_acceptance_ok": False,
+                "automated_acceptance_complete": False,
+                "real_device_acceptance_complete": False,
+                "acceptance_complete": False,
+                "project": {"project_id": project_id},
+                "conversation": {"conversation_id": conversation_id},
+                "errors": [str(error)],
+                "dynamic_web_preview": {
                     "status": "failed",
-                    "core_acceptance_ok": False,
-                    "automated_acceptance_complete": False,
-                    "real_device_acceptance_complete": False,
-                    "acceptance_complete": False,
-                    "project": {"project_id": project_id},
-                    "conversation": {"conversation_id": conversation_id},
-                    "errors": [str(error)],
-                    "dynamic_web_preview": {
-                        "status": "failed",
-                        "counted_as_passed": False,
-                        "browser_interaction": "pending_real_device",
-                    },
-                    "success_basis": {
-                        "logged_in_user_http_api": True,
-                        "admin_internal_run_data": False,
-                    },
-                }
-            )
+                    "counted_as_passed": False,
+                    "browser_interaction": "pending_real_device",
+                },
+                "success_basis": {
+                    "logged_in_user_http_api": True,
+                    "admin_internal_run_data": False,
+                },
+            }
+        completed_case["attempt"] = attempt
+        if previous is not None:
+            cases[cases.index(previous)] = completed_case
+        else:
+            cases.append(completed_case)
+        # Saving is outside the case exception handler: a failed checkpoint must stop execution.
+        if output_path:
+            _save_report(output_path, snapshot())
+
+    payload = snapshot(finished=True)
+    if output_path:
+        _save_report(output_path, payload)
+    return payload
+
+
+def _matrix_report(
+    *,
+    client: RealUserAcceptanceClient,
+    cases: list[dict[str, object]],
+    username: str,
+    principal: Mapping[str, object],
+    base_url: str,
+    execution_id: str,
+    identity: Mapping[str, object],
+    started_at: str,
+    authentication_method: str,
+    finished: bool,
+) -> dict[str, object]:
 
     expected_case_count = len(_ACCEPTANCE_CASES)
-    core_ok = len(cases) == expected_case_count and all(
-        case.get("core_acceptance_ok") is True for case in cases
+    core_ok = (
+        finished
+        and len(cases) == expected_case_count
+        and all(case.get("core_acceptance_ok") is True for case in cases)
     )
-    status = "pending_real_device" if core_ok else "failed"
+    status = "pending_real_device" if core_ok else "failed" if finished else "in_progress"
     return {
         "schema_version": 1,
         "kind": "real_user_four_scale_acceptance",
@@ -815,9 +931,10 @@ def run_real_user_four_scale_acceptance(
         "real_device_acceptance_complete": False,
         "acceptance_complete": False,
         "started_at": started_at,
-        "finished_at": _utc_now(),
+        "finished_at": _utc_now() if finished else None,
         "base_url": base_url.rstrip("/"),
         "execution_id": execution_id,
+        "execution_identity": dict(identity),
         "benchmark_kind": "capability",
         "run_mode": "mixed",
         "auto_scale_run_mode": "auto",
@@ -859,8 +976,273 @@ def run_real_user_four_scale_acceptance(
             "pending_preview_counts_as_complete": False,
         },
         "blocked_admin_run_requests": list(client.blocked_admin_run_requests),
-        "cases": cases,
+        "cases": copy.deepcopy(cases),
     }
+
+
+def _execution_identity(
+    execution_id: str, base_url: str, principal: Mapping[str, object]
+) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "execution_id": execution_id,
+        "base_url": base_url.rstrip("/"),
+    }
+    for key in ("user_id", "tenant_id"):
+        value = principal.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"execution identity requires authenticated {key}")
+        identity[key] = value
+    if not execution_id.strip() or not _SAFE_ID_RE.sub("-", execution_id.casefold()).strip("-"):
+        raise ValueError("execution identity requires a usable execution_id")
+    return identity
+
+
+def _resume_cases(
+    report: Mapping[str, object], identity: Mapping[str, object]
+) -> list[dict[str, object]]:
+    if (
+        report.get("kind") != "real_user_four_scale_acceptance"
+        or type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+        or report.get("benchmark_kind") != "capability"
+    ):
+        raise ValueError("resume report must be a supported capability acceptance report")
+    actor = report.get("actor")
+    principal = actor.get("principal") if isinstance(actor, Mapping) else None
+    execution_id, base_url = report.get("execution_id"), report.get("base_url")
+    if (
+        not isinstance(principal, Mapping)
+        or not isinstance(execution_id, str)
+        or not isinstance(base_url, str)
+    ):
+        raise TypeError("resume report execution identity is incomplete")
+    saved_identity = _execution_identity(execution_id, base_url, principal)
+    if saved_identity != identity or (
+        "execution_identity" in report and report["execution_identity"] != identity
+    ):
+        raise ValueError("resume report execution identity does not match this execution")
+    raw_cases = report.get("cases")
+    if not isinstance(raw_cases, list):
+        raise TypeError("resume report cases must be a list")
+    by_id: dict[str, dict[str, object]] = {}
+    expected_ids = {f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES}
+    for case in raw_cases:
+        if not isinstance(case, dict):
+            raise TypeError("resume report contains a non-object case")
+        case_id = case.get("case_id")
+        # Older exception reports have no case_id; derive only their canonical matrix key.
+        if case_id is None:
+            case_id = f"{case.get('scale')}:{case.get('route_intent')}"
+        if not isinstance(case_id, str) or case_id not in expected_ids:
+            raise ValueError("resume report contains an unknown case_id")
+        if case_id in by_id:
+            raise ValueError(f"resume report contains duplicate case_id: {case_id}")
+        by_id[case_id] = copy.deepcopy({**case, "case_id": case_id})
+    cases = []
+    for _, scale, route, case_key in _ACCEPTANCE_CASES:
+        case = by_id.get(f"{scale}:{route}")
+        if case is None:
+            continue
+        if not _has_complete_core_evidence(
+            case, safe_execution_id=_safe_identifier(execution_id), case_key=case_key
+        ):
+            case.update(
+                {
+                    "status": "failed",
+                    "core_acceptance_ok": False,
+                    "automated_acceptance_complete": False,
+                    "real_device_acceptance_complete": False,
+                    "acceptance_complete": False,
+                }
+            )
+        cases.append(case)
+    return cases
+
+
+def _case_attempt(case: Mapping[str, object] | None) -> int:
+    attempt = case.get("attempt", 1) if case is not None else 1
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError("resume case attempt must be a positive integer")
+    return attempt
+
+
+def _case_execution_token(execution_id: str, case_key: str, attempt: int) -> str:
+    if attempt == 1:
+        return f"{execution_id}-{case_key}"
+    # Keep retry identity within the runner's 64-character workspace limit.
+    digest = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:16]
+    return f"{case_key}-retry-{attempt}-{digest}"
+
+
+def _has_complete_core_evidence(
+    case: Mapping[str, object], *, safe_execution_id: str, case_key: str
+) -> bool:
+    if (
+        case.get("core_acceptance_ok") is not True
+        or case.get("automated_acceptance_complete") is not True
+        or case.get("status") not in ("passed", "pending_real_device")
+    ):
+        return False
+    sections = ("run", "project", "conversation", "public_artifacts", "dynamic_web_preview")
+    if any(not isinstance(case.get(key), Mapping) for key in sections):
+        return False
+    run, project, conversation, public, preview = (
+        cast(Mapping[str, object], case[key]) for key in sections
+    )
+    case_id, scale = case.get("case_id"), case.get("scale")
+    if not isinstance(case_id, str) or not isinstance(scale, str):
+        return False
+    attempt = _case_attempt(case)
+    scope_token = _case_execution_token(safe_execution_id, case_key, attempt)
+    project_id = _bounded_identifier(f"uat-{scope_token}", 128)
+    conversation_id = _bounded_identifier(f"conv-{scope_token}", 128)
+    session_id = _safe_workspace_session_token(conversation_id, scope_token)
+    root = (
+        f"/api/v1/workspaces/projects/{quote(project_id, safe='')}"
+        f"/sessions/{quote(session_id, safe='')}"
+    )
+    if (
+        project.get("project_id") != project_id
+        or conversation.get("conversation_id") != conversation_id
+        or project.get("workspace_path") != session_id
+        or conversation.get("workspace_path") != session_id
+        or conversation.get("project_id") != project_id
+        or public.get("files_endpoint") != f"{root}/files"
+        or public.get("bundle_endpoint") != f"{root}/bundle/download"
+        or run.get("case_id") != case_id
+        or run.get("status") != "completed"
+        or not isinstance(run.get("run_id"), str)
+        or not str(run["run_id"]).strip()
+        or run.get("ok") is not True
+        or run.get("errors") != []
+        or run.get("missing_evidence") != []
+    ):
+        return False
+    evidence = run.get("evidence")
+    if not isinstance(evidence, dict) or any(
+        type(value) is not bool for value in evidence.values()
+    ):
+        return False
+    string_fields = (
+        "observed_mode",
+        "final_observed_mode",
+        "requested_mode",
+        "route_reason",
+        "mode_source",
+        "effective_scale",
+        "artifact_origin",
+        "workspace_bundle_source",
+    )
+    if any(run.get(key) is not None and not isinstance(run.get(key), str) for key in string_fields):
+        return False
+    if run.get("final_observed_mode") not in ("direct", "dispatch", "hybrid"):
+        return False
+    participants, event_kinds = run.get("participant_agent_ids"), run.get("participant_event_kinds")
+    event_count = run.get("participant_event_count")
+    if (
+        not isinstance(participants, list)
+        or any(not isinstance(item, str) for item in participants)
+        or not isinstance(event_kinds, list)
+        or any(not isinstance(item, str) for item in event_kinds)
+        or type(event_count) is not int
+        or event_count < 0
+    ):
+        return False
+    result = ProjectScaleCaseResult(
+        case_id=case_id,
+        run_id=cast(str, run["run_id"]),
+        status="completed",
+        evidence=cast(dict[str, bool], evidence),
+        observed_mode=cast(str | None, run.get("observed_mode")),
+        final_observed_mode=cast(str | None, run.get("final_observed_mode")),
+        requested_mode=cast(str | None, run.get("requested_mode")),
+        route_reason=cast(str | None, run.get("route_reason")),
+        mode_source=cast(str | None, run.get("mode_source")),
+        effective_scale=cast(str | None, run.get("effective_scale")),
+        artifact_origin=cast(str | None, run.get("artifact_origin")),
+        workspace_bundle_source=cast(str | None, run.get("workspace_bundle_source")),
+        participant_agent_ids=tuple(cast(list[str], participants)),
+        participant_event_kinds=tuple(cast(list[str], event_kinds)),
+        participant_event_count=event_count,
+    )
+    if not result.ok or run.get("required_evidence") != list(result.required_evidence):
+        return False
+    if (
+        public.get("ok") is not True
+        or public.get("source") != "public_workspace_api"
+        or public.get("admin_internal_run_data_used") is not False
+        or public.get("zip_crc_ok") is not True
+        or public.get("metadata_matches_zip") is not True
+        or type(public.get("unsafe_member_count")) is not int
+        or public.get("unsafe_member_count") != 0
+        or public.get("errors") != []
+        or not isinstance(public.get("zip_sha256"), str)
+        or _SHA256_RE.fullmatch(cast(str, public["zip_sha256"])) is None
+    ):
+        return False
+    for key in ("file_count", "downloaded_file_count", "zip_member_count", "zip_size_bytes"):
+        value = public.get(key)
+        if type(value) is not int or value <= 0:
+            return False
+    if not public["file_count"] == public["downloaded_file_count"] == public["zip_member_count"]:
+        return False
+    if (
+        preview.get("status") != "passed"
+        or preview.get("errors") != []
+        or any(
+            preview.get(key) is not True
+            for key in (
+                "counted_as_passed",
+                "reachable_preview_url",
+                "current_preview_matches",
+                "renewed",
+                "lease_extended",
+                "stopped",
+                "revoked_after_stop",
+            )
+        )
+        or preview.get("capability_token_retained") is not False
+    ):
+        return False
+    for key in ("referenced_asset_count", "referenced_assets_loaded", "content_size_bytes"):
+        value = preview.get(key)
+        if type(value) is not int or value < (1 if key == "content_size_bytes" else 0):
+            return False
+    if preview["referenced_asset_count"] != preview["referenced_assets_loaded"]:
+        return False
+    rebuilt = build_case_report(
+        scale=scale,
+        project=project,
+        conversation=conversation,
+        result=result,
+        public_artifacts=public,
+        dynamic_web_preview=preview,
+    )
+    compared_fields = (
+        "case_kind",
+        "route_intent",
+        "scale_fidelity_ok",
+        "route_policy_ok",
+        "artifact_origin_ok",
+        "multi_agent_evidence_ok",
+        "build_and_test",
+        "success_basis",
+        "artifact_provenance",
+        "observed_mode",
+        "initial_observed_mode",
+        "final_observed_mode",
+        "route_observed_mode",
+        "requested_mode",
+        "route_reason",
+        "mode_source",
+        "effective_scale",
+        "observed_route_ok",
+        "exact_mode_coverage_ok",
+        "coverage_credit",
+    )
+    return rebuilt["core_acceptance_ok"] is True and json.dumps(
+        {key: case.get(key) for key in compared_fields}, sort_keys=True
+    ) == json.dumps({key: rebuilt[key] for key in compared_fields}, sort_keys=True)
 
 
 def _safe_identifier(value: str) -> str:
@@ -881,12 +1263,34 @@ def _default_execution_id() -> str:
     return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
 
 
-def _write_report(path: str | None, payload: Mapping[str, object]) -> None:
+def _save_report(path: str, payload: Mapping[str, object]) -> None:
     encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write_report(path: str | None, payload: Mapping[str, object]) -> None:
     if path:
-        output = Path(path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(encoded, encoding="utf-8")
+        _save_report(path, payload)
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     print(encoded, end="")
 
 
@@ -918,7 +1322,9 @@ def _validated_device_result(
         "preview_interaction",
         "preview_revoked",
     )
-    if not isinstance(checks, Mapping) or any(checks.get(name) is not True for name in required_checks):
+    if not isinstance(checks, Mapping) or any(
+        checks.get(name) is not True for name in required_checks
+    ):
         raise ValueError(f"{key}.checks must pass every required real-user interaction")
     return copy.deepcopy(dict(result))
 
@@ -953,7 +1359,9 @@ def _validated_case_device_result(
         raise ValueError(f"{label}.evidence_ref is required")
     checks = result.get("checks")
     required_checks = ("preview_rendered", "preview_interaction", "preview_revoked")
-    if not isinstance(checks, Mapping) or any(checks.get(name) is not True for name in required_checks):
+    if not isinstance(checks, Mapping) or any(
+        checks.get(name) is not True for name in required_checks
+    ):
         raise ValueError(f"{label}.checks must pass every required preview interaction")
     return copy.deepcopy(dict(result))
 
@@ -1056,9 +1464,7 @@ def finalize_real_device_acceptance(
                 case["real_device_evidence"] = case_evidence[case_id]
             preview = case.get("dynamic_web_preview")
             if isinstance(preview, dict):
-                preview["browser_interaction"] = (
-                    "verified_by_deployed_real_device_acceptance"
-                )
+                preview["browser_interaction"] = "verified_by_deployed_real_device_acceptance"
     return completed
 
 
@@ -1104,7 +1510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--execution-id",
-        default=os.environ.get("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID") or _default_execution_id(),
+        default=os.environ.get("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID"),
     )
     parser.add_argument(
         "--output",
@@ -1112,9 +1518,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--finalize-report")
     parser.add_argument("--real-device-evidence")
+    parser.add_argument(
+        "--resume-report",
+        "--resume",
+        dest="resume_report",
+        help="Resume matching core evidence and retry failed/incomplete cases from this JSON report.",
+    )
     args = parser.parse_args(argv)
 
     if args.finalize_report or args.real_device_evidence:
+        if args.resume_report:
+            parser.error("--resume-report cannot be combined with real-device finalization")
         if not args.finalize_report or not args.real_device_evidence:
             parser.error("--finalize-report and --real-device-evidence must be used together")
         try:
@@ -1132,6 +1546,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         _write_report(args.output, payload)
         return 0 if payload.get("acceptance_complete") is True else 1
+
+    resume_report = None
+    if args.resume_report:
+        try:
+            resume_report = _read_json_mapping(args.resume_report)
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"cannot read resume report: {error}")
+        saved_execution_id = resume_report.get("execution_id")
+        if not isinstance(saved_execution_id, str) or not saved_execution_id.strip():
+            parser.error("resume report execution identity requires execution_id")
+        if args.execution_id is not None and args.execution_id != saved_execution_id:
+            parser.error("resume report execution identity does not match --execution-id")
+        args.execution_id = saved_execution_id
+        args.output = args.output or args.resume_report
+    args.execution_id = args.execution_id or _default_execution_id()
 
     username, password, tenant_id = _acceptance_credentials_from_env()
     bearer_token = os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "").strip()
@@ -1163,6 +1592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             poll_interval_seconds=args.poll_interval,
             artifact_build_timeout_seconds=args.artifact_build_timeout,
             authentication_method="bearer_token" if bearer_token else "password",
+            output_path=args.output,
+            resume_report=resume_report,
             progress=lambda message: print(
                 f"real-user-four-scale progress: {message}",
                 file=sys.stderr,
@@ -1183,6 +1614,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "errors": [str(error)],
             "dynamic_web_preview": _dynamic_preview_pending(),
         }
+        # Authentication, identity, and save errors must not overwrite durable case evidence.
+        if args.output and Path(args.output).exists():
+            print(f"preserved checkpoint: {args.output}", file=sys.stderr, flush=True)
+            _write_report(None, payload)
+            return 1
     _write_report(args.output, payload)
     if payload.get("status") == "failed":
         return 1

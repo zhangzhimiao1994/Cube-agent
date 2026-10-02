@@ -2458,6 +2458,9 @@ def _can_compact_retry_subagent(
             "crew.step_timeout",
             "model.empty_response",
             "model.capacity_unavailable",
+            "model.provider_rate_limited",
+            "model.provider_unavailable",
+            "model.provider_transient_failed",
             "capability.transient_execution_failed",
         }
     )
@@ -2486,6 +2489,9 @@ def _recovery_status_after_attempts(
             "crew.step_timeout",
             "model.empty_response",
             "model.capacity_unavailable",
+            "model.provider_rate_limited",
+            "model.provider_unavailable",
+            "model.provider_transient_failed",
             "capability.transient_execution_failed",
         }
         and recovery_attempts >= max_recovery_attempts
@@ -5707,7 +5713,11 @@ class CrewDispatchRuntime:
                         }
                     )
                     evidence.append(semantic_artifact)
-                    reused_semantic_results += 1
+                    if semantic_artifact.source_ids == (str(trigger_model_artifact.id),):
+                        # Hydration must rebuild the original continuation, including its tools.
+                        round_progressed = True
+                    else:
+                        reused_semantic_results += 1
                     continue
                 idempotency_key = self._tool_call_key(
                     context.run_id,
@@ -8260,6 +8270,7 @@ class CrewDispatchRuntime:
             business_attempt: int,
             input_ids: tuple[str, ...],
         ) -> dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]:
+            selected: dict[int, tuple[Mapping[str, JsonValue], Artifact | None]] = {}
             for model_attempt in model_attempt_candidates(
                 business_attempt,
                 agents_by_id[step.agent],
@@ -8269,8 +8280,9 @@ class CrewDispatchRuntime:
                     continue
                 first = calls.get(0)
                 if first is None or first[1] is None or first[1].source_ids == input_ids:
-                    return calls
-            return {}
+                    for _, call in sorted(calls.items()):
+                        selected[len(selected)] = call
+            return selected
 
         def review_model_calls(
             step: DispatchStep,
@@ -8338,12 +8350,21 @@ class CrewDispatchRuntime:
                 last_model: Artifact | None = None
                 scope_fallback_completion: GatewayCompletion | None = None
                 incomplete = False
-                for call_index in range(len(step_calls)):
-                    state, model_artifact = step_calls[call_index]
+                active_model_attempt: int | None = None
+                for call_position in range(len(step_calls)):
+                    state, model_artifact = step_calls[call_position]
+                    model_attempt = cast(int, state["attempt"])
+                    call_index = cast(int, state["call_index"])
+                    if model_attempt != active_model_attempt:
+                        # Recovery restarts its evidence window, but earlier receipts remain audited.
+                        evidence_ids = []
+                        last_model = None
+                        scope_fallback_completion = None
+                        active_model_attempt = model_attempt
                     if state["status"] == "rejected":
                         continue
                     if model_artifact is None:
-                        if call_index != len(step_calls) - 1:
+                        if call_position != len(step_calls) - 1:
                             _fail("runtime checkpoint artifact graph is invalid")
                         incomplete = True
                         break
@@ -8365,8 +8386,8 @@ class CrewDispatchRuntime:
                     calls = completion.response.tool_calls
                     if len(round_tools) > len(calls):
                         _fail("runtime checkpoint capability artifact lineage is invalid")
-                    for tool_index in range(len(round_tools)):
-                        tool_state, tool_artifact = round_tools[tool_index]
+                    resolved_tool_count = 0
+                    for tool_index in range(len(calls)):
                         tool_call = _scope_project_workspace_tool_call(
                             context,
                             calls[tool_index],
@@ -8378,10 +8399,25 @@ class CrewDispatchRuntime:
                             sort_keys=True,
                             separators=(",", ":"),
                         )
+                        arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                        entry = round_tools.get(tool_index)
+                        if entry is None:
+                            reused = _succeeded_semantic_tool_result(
+                                tool_ledger,
+                                step_id=step.id,
+                                name=tool_call.name,
+                                arguments_sha256=arguments_sha256,
+                            )
+                            # Reuse must point to a receipt already validated in this graph.
+                            if reused is None or str(reused.id) not in consumed_tools:
+                                break
+                            evidence_ids.append(str(reused.id))
+                            resolved_tool_count += 1
+                            continue
+                        tool_state, tool_artifact = entry
                         if (
                             tool_state["name"] != tool_call.name
-                            or tool_state["arguments_sha256"]
-                            != hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                            or tool_state["arguments_sha256"] != arguments_sha256
                             or tool_state["trigger_model_artifact_id"] != str(model_artifact.id)
                         ):
                             _fail("runtime checkpoint capability artifact lineage is invalid")
@@ -8394,22 +8430,23 @@ class CrewDispatchRuntime:
                             _fail("runtime checkpoint capability artifact lineage is invalid")
                         consumed_tools.add(str(tool_artifact.id))
                         evidence_ids.append(str(tool_artifact.id))
+                        resolved_tool_count += 1
                     if incomplete:
                         break
                     skipped_forbidden_placeholders = (
-                        len(round_tools) != len(calls)
+                        resolved_tool_count != len(calls)
                         and _checkpoint_can_skip_forbidden_tool_placeholders(
                             step,
                             tool_ledger,
                             calls,
                             round_tools,
-                            is_last_model_call=call_index == len(step_calls) - 1,
+                            is_last_model_call=call_position == len(step_calls) - 1,
                         )
                     )
                     if skipped_forbidden_placeholders:
                         scope_fallback_completion = completion
                     skipped_rejected_placeholders = (
-                        len(round_tools) != len(calls)
+                        resolved_tool_count != len(calls)
                         and _checkpoint_can_skip_rejected_tool_placeholders(
                             calls,
                             round_tools,
@@ -8417,8 +8454,8 @@ class CrewDispatchRuntime:
                         )
                     )
                     if (
-                        call_index < len(step_calls) - 1
-                        and len(round_tools) != len(calls)
+                        call_position < len(step_calls) - 1
+                        and resolved_tool_count != len(calls)
                         and not skipped_forbidden_placeholders
                         and not skipped_rejected_placeholders
                     ):

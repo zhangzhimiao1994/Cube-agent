@@ -1,6 +1,14 @@
+import hashlib
+import importlib.metadata
+import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
+import sys
+import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -74,8 +82,8 @@ def test_dockerfile_builds_virtualenv_at_runtime_path_without_editable_install()
     assert "AGENT_HUB_PYPI_MIRROR" in dockerfile
     assert "AGENT_HUB_NPM_MIRROR" in dockerfile
     assert "uv pip install --python .venv/bin/python" in dockerfile
-    assert "--index-url \"${AGENT_HUB_PYPI_MIRROR}\"" in dockerfile
-    assert "--registry=\"${AGENT_HUB_NPM_MIRROR}\"" in dockerfile
+    assert '--index-url "${AGENT_HUB_PYPI_MIRROR}"' in dockerfile
+    assert '--registry="${AGENT_HUB_NPM_MIRROR}"' in dockerfile
     assert "ghcr.io/astral-sh/uv" not in dockerfile
     assert "-e ." not in dockerfile
     assert "AGENT_HUB_PYPI_MIRROR:" in compose
@@ -95,6 +103,173 @@ def test_dockerfile_defines_non_root_skill_runner_target() -> None:
     assert "USER 65532:65532" in runner
     assert "mkdir -p /package /workspace" in runner
     assert 'CMD ["python", "-m", "agent_hub.skills.runner"]' in runner
+
+
+def test_dockerfile_uses_builtin_frontend_for_offline_base_image_builds() -> None:
+    assert not re.search(r"(?m)^#\s*syntax=", read("Dockerfile"))
+
+
+def _docker_stage(name: str) -> str:
+    stages = re.split(r"(?m)^FROM \S+ AS (\S+)\s*\n", read("Dockerfile"))
+    by_name = dict(zip(stages[1::2], stages[2::2], strict=True))
+    assert name in by_name, f"Docker build stage {name} is missing"
+    return by_name[name]
+
+
+def _runner_requirements() -> dict[str, str]:
+    path = ROOT / "deploy/compose/skill-runner-requirements.txt"
+    assert path.is_file(), "the runner needs its own pinned dependency manifest"
+    requirements: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([a-z][a-z0-9-]*)==([^\s;]+)", line)
+        assert match, f"runner dependencies must be exact pins: {line}"
+        name, version = match.groups()
+        assert name not in requirements, f"duplicate runner dependency: {name}"
+        requirements[name] = version
+    return requirements
+
+
+def test_skill_runner_build_is_independent_of_platform_and_web() -> None:
+    assert "FROM ${PYTHON_IMAGE} AS skill-runner-build" in read("Dockerfile")
+    runner = _docker_stage("skill-runner")
+    assert "--from=python-build" not in runner, "runner must not copy the platform virtualenv"
+    builder = _docker_stage("skill-runner-build")
+    for stage in (runner, builder):
+        assert "--from=python-build" not in stage
+        assert "--from=web-build" not in stage
+        assert "uv sync" not in stage
+        assert "pyproject.toml" not in stage
+    assert "deploy/compose/skill-runner-requirements.txt" in builder
+    assert "--no-deps" in builder
+    assert "--no-cache-dir" in builder
+    assert "--only-binary=:all:" in builder
+    assert "--from=skill-runner-build" in runner
+    assert "PYTHONDONTWRITEBYTECODE=1" in runner
+    assert "HOME=/workspace" in runner
+
+
+def test_skill_runner_dependencies_are_only_the_lockfile_runtime_closure() -> None:
+    requirements = _runner_requirements()
+    lock = tomllib.loads(read("uv.lock"))
+    packages = {package["name"]: package for package in lock["package"]}
+    pending = ["pydantic", "pyyaml"]
+    expected: dict[str, str] = {}
+    while pending:
+        name = pending.pop()
+        if name in expected:
+            continue
+        package = packages[name]
+        expected[name] = package["version"]
+        pending.extend(dependency["name"] for dependency in package.get("dependencies", []))
+
+    assert requirements == expected
+
+
+@pytest.mark.parametrize("manifest_name", ["skill.json", "skill.yaml"])
+@pytest.mark.parametrize("scenario", ["success", "hash_mismatch", "dependencies"])
+def test_minimal_skill_runner_artifact_preserves_execution_contract(
+    tmp_path: Path,
+    manifest_name: str,
+    scenario: str,
+) -> None:
+    artifact = tmp_path / "runner"
+    artifact.mkdir()
+    copied: set[str] = set()
+    for line in _docker_stage("skill-runner").splitlines():
+        if not line.startswith("COPY ") or "--from=" in line:
+            continue
+        tokens = [token for token in shlex.split(line)[1:] if not token.startswith("--")]
+        destination = artifact / tokens[-1]
+        destination.mkdir(parents=True, exist_ok=True)
+        for source in tokens[:-1]:
+            assert (ROOT / source).is_file(), (
+                "runner must copy individual modules, not the full src"
+            )
+            shutil.copy2(ROOT / source, destination / Path(source).name)
+            copied.add(source)
+    assert copied == {
+        "src/agent_hub/__init__.py",
+        "src/agent_hub/skills/__init__.py",
+        "src/agent_hub/skills/runner.py",
+        "src/agent_hub/skills/package.py",
+        "src/agent_hub/skills/manifest.py",
+    }
+    # Run without site-packages so the platform installation cannot hide missing dependencies.
+    for name, version in _runner_requirements().items():
+        distribution = importlib.metadata.distribution(name)
+        assert distribution.version == version
+        for file in distribution.files or ():
+            if "__pycache__" in file.parts:
+                continue
+            assert not file.is_absolute() and ".." not in file.parts
+            destination = artifact / file
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(distribution.locate_file(file)), destination)
+
+    requirements = b"pydantic==2.12.5\n" if scenario == "dependencies" else b""
+    manifest = {
+        "name": "demo_skill",
+        "version": "1.0.0",
+        "entry_point": "main.py",
+        "compatible_runtime": "python3.12",
+        "dependency_lock_hash": hashlib.sha256(requirements).hexdigest(),
+    }
+    package = tmp_path / "skill.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        contents = (
+            json.dumps(manifest)
+            if manifest_name.endswith(".json")
+            else "\n".join(f"{key}: {json.dumps(value)}" for key, value in manifest.items())
+        )
+        archive.writestr(manifest_name, contents)
+        archive.writestr(
+            "main.py",
+            "import json, sys\n"
+            "print('hello ' + json.load(sys.stdin)['name'])\n"
+            "print('skill stderr', file=sys.stderr)\n",
+        )
+        if requirements:
+            archive.writestr("requirements.txt", requirements)
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=str(artifact),
+        PYTHONDONTWRITEBYTECODE="1",
+        AGENT_HUB_PACKAGE_PATH=str(package),
+        AGENT_HUB_PACKAGE_SHA256=(
+            "0" * 64
+            if scenario == "hash_mismatch"
+            else hashlib.sha256(package.read_bytes()).hexdigest()
+        ),
+        AGENT_HUB_WORKDIR=str(tmp_path / "workspace"),
+        AGENT_HUB_TIMEOUT_SECONDS="5",
+        AGENT_HUB_SANDBOX_PROFILE="workspace_write",
+    )
+    result = subprocess.run(
+        (sys.executable, "-S", "-m", "agent_hub.skills.runner"),
+        cwd=artifact,
+        env=env,
+        input='{"name":"agent"}',
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    if scenario == "success":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "hello agent\n"
+        assert result.stderr == "skill stderr\n"
+    else:
+        assert result.returncode == 78, result.stderr
+        assert result.stdout == ""
+        expected = (
+            "sha256 does not match"
+            if scenario == "hash_mismatch"
+            else "dependencies are not installed"
+        )
+        assert expected in result.stderr
 
 
 def test_skill_runner_builder_is_registered_and_uses_safe_docker_argv() -> None:
@@ -136,7 +311,7 @@ def test_skill_runner_builder_preserves_source_and_image_as_single_arguments(
     docker.write_text(
         "#!/usr/bin/env bash\n"
         "set -Eeuo pipefail\n"
-        "printf '%s\\0' \"$@\" > \"$AGENT_HUB_TEST_DOCKER_ARGS\"\n",
+        'printf \'%s\\0\' "$@" > "$AGENT_HUB_TEST_DOCKER_ARGS"\n',
         encoding="utf-8",
     )
     docker.chmod(0o755)
@@ -295,7 +470,7 @@ def test_compose_worker_does_not_inherit_api_http_healthcheck() -> None:
     compose = read("deploy/compose/docker-compose.yml")
     worker_block = compose.split("  worker:\n", 1)[1].split("\n  litellm:", 1)[0]
 
-    assert "command: [\"python\", \"-m\", \"agent_hub.runtime.worker\"]" in worker_block
+    assert 'command: ["python", "-m", "agent_hub.runtime.worker"]' in worker_block
     assert "healthcheck:" in worker_block
     assert "disable: true" in worker_block
     assert "agent-hub-healthcheck" not in worker_block

@@ -641,6 +641,8 @@ def run_real_user_plugin_acceptance(
 ) -> dict[str, object]:
     """Run installation, public invocation, evidence checks, and unconditional cleanup."""
 
+    if run_mode != "dispatch":
+        raise ValueError("plugin acceptance requires a tool-capable dispatch mode")
     package = build_acceptance_plugin(package_dir, execution_id=execution_id)
     errors: list[str] = []
     phases: list[str] = []
@@ -770,10 +772,6 @@ def run_real_user_plugin_acceptance(
             safe_reason = reason if isinstance(reason, str) and reason else "unknown_reason"
             raise RuntimeError(f"plugin capability is unavailable: {safe_reason}")
         phases.append("capability_available")
-        if run_mode not in {"direct", "dispatch"}:
-            raise ValueError("plugin acceptance run mode must be direct or dispatch")
-        if run_mode == "direct" and not direct_model:
-            raise ValueError("direct plugin acceptance requires a logical model")
         run_request = {
             "mode": run_mode,
             "skip_evolution_proposal": True,
@@ -1112,7 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=2)
     parser.add_argument(
         "--run-mode",
-        choices=("direct", "dispatch"),
+        choices=("dispatch",),
         default=os.environ.get("AGENT_HUB_ACCEPTANCE_PLUGIN_RUN_MODE", "dispatch"),
     )
     parser.add_argument(

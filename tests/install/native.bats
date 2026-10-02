@@ -19,9 +19,10 @@
   grep -q '^ReadWritePaths=/var/lib/agent-hub /run/agent-hub' deploy/native/systemd/agent-hub-api.service
 }
 
-@test "skill broker reads service-owned packages without ambient capabilities" {
+@test "skill broker has only probe directory and ownership capabilities" {
   grep -q '^SupplementaryGroups=agent-hub' deploy/native/systemd/agent-hub-skill-broker.service
-  grep -q '^CapabilityBoundingSet=$' deploy/native/systemd/agent-hub-skill-broker.service
+  grep -q '^CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN$' deploy/native/systemd/agent-hub-skill-broker.service
+  ! grep -Eq '^AmbientCapabilities=.+$' deploy/native/systemd/agent-hub-skill-broker.service
 }
 
 @test "python systemd services load the active release source tree" {

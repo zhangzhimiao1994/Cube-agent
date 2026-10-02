@@ -336,7 +336,10 @@ class SkillBroker:
 
             command = build_docker_command(
                 invocation,
-                DockerSandboxSettings(executable=self._policy.docker),
+                DockerSandboxSettings(
+                    executable=self._policy.docker,
+                    user=f"{self._policy.allowed_uid}:{self._policy.allowed_gid}",
+                ),
             )
         else:
             command = build_broker_systemd_command(invocation, self._policy)
@@ -384,10 +387,13 @@ class SkillBroker:
                 root = Path(temporary)
                 package = root / "probe.zip"
                 workdir = root / "workspace"
-                workdir.mkdir(mode=0o770)
+                workdir.mkdir(mode=0o700)
+                workdir.chmod(0o700)
                 if hasattr(os, "chown"):
                     os.chown(workdir, self._policy.allowed_uid, self._policy.allowed_gid)
                 _write_docker_probe_package(package)
+                # The read-only bind must be readable by the non-root container user.
+                package.chmod(0o644)
                 invocation = SkillInvocation(
                     execution_id=f"probe_{uuid.uuid4().hex[:12]}",
                     package_path=package,

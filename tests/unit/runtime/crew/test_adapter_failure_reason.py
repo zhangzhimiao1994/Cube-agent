@@ -5658,6 +5658,186 @@ async def test_agent_capacity_unavailable_compact_retries_before_completing() ->
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 
+@pytest.mark.parametrize("status_code", [408, 429, 503])
+async def test_agent_transient_provider_failure_uses_existing_fallback(status_code: int) -> None:
+    class ProviderFailureGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if request.logical_model == "primary":
+                self.requests.append(request)
+                raise ModelTransportError("model transport failed", status_code=status_code)
+            return await super().complete_with_context(request)
+
+    gateway = ProviderFailureGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan_with_model_fallback(),
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    events = await _collect(runtime)
+
+    assert [request.logical_model for request in gateway.requests] == ["primary", "backup"]
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.payload["model_fallback"] == "backup"
+    assert retrying.payload["error_code"] == {
+        408: "model.provider_transient_failed",
+        429: "model.provider_rate_limited",
+        503: "model.provider_unavailable",
+    }[status_code]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan_with_model_fallback(),
+        crew_factory=FastFactory(),
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize("status_code", [401, 402, 429])
+async def test_provider_failure_recovery_is_bounded_and_preserves_auth_errors(
+    status_code: int,
+) -> None:
+    class UnavailableGateway(RoleAwareGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise ModelTransportError("model transport failed", status_code=status_code)
+
+    gateway = UnavailableGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan_with_two_model_fallbacks(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="model transport failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert [request.logical_model for request in gateway.requests] == (
+        ["primary", "backup", "final"] if status_code == 429 else ["primary"]
+    )
+    failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
+    if status_code == 429:
+        assert failed.payload["recovery_status"] == "failed_after_compact_retry"
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 503])
+@pytest.mark.parametrize("checkpoint_phase", ["provider_failed", "running", "completed"])
+@pytest.mark.parametrize("repeat_tool", [False, True])
+@pytest.mark.parametrize("tamper_receipt", [False, True])
+async def test_provider_recovery_after_tool_success_checkpoint_hydration_preserves_receipts(
+    status_code: int, checkpoint_phase: str, repeat_tool: bool, tamper_receipt: bool,
+) -> None:
+    class ProviderFailureAfterToolGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            if len(self.requests) == 2:
+                raise ModelTransportError("model transport failed", status_code=status_code)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(id="provider-call", name="web_search", arguments={"q": "safe"}),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if len(self.requests) == 1 or (repeat_tool and len(self.requests) == 3)
+                else ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class SideEffectCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return False
+
+    base_plan = _tool_plan()
+    plan = base_plan.model_copy(update={
+        "agents": (base_plan.agents[0].model_copy(update={
+            "logical_model": "primary", "fallback_models": ("backup",),
+        }),),
+    })
+    repository = InMemoryArtifactRepository()
+    capabilities = SideEffectCapabilities()
+    gateway = ProviderFailureAfterToolGateway()
+    actor_id = uuid4()
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=capabilities,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    events = [event async for event in runtime.run(
+        _context(actor_id=actor_id, actor_role=Role.OPERATOR),
+    )]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [request.logical_model for request in gateway.requests] == [
+        "primary", "primary", "backup", *(["backup"] if repeat_tool else []),
+    ]
+    assert capabilities.calls == [("writer", "web.search")]
+    checkpoint = await runtime.save_checkpoint()
+    if checkpoint_phase != "completed":
+        expected_model_count = 2 if checkpoint_phase == "provider_failed" else 4 if repeat_tool else 3
+        expected_success_count = expected_model_count - 1
+        checkpoint = next(
+            event.checkpoint for event in events
+            if event.checkpoint is not None
+            and not event.checkpoint.state["completed"]
+            and isinstance(models := event.checkpoint.state["models"], Mapping)
+            and len(models) == expected_model_count
+            and sum(
+                isinstance(state, Mapping) and state["status"] == "succeeded"
+                for state in models.values()
+            ) == expected_success_count
+            and any(
+                isinstance(state, Mapping) and state["status"] == "failed"
+                for state in models.values()
+            )
+        )
+    if tamper_receipt:
+        payload = checkpoint.to_payload()
+        state = cast(dict[str, object], payload["state"])
+        tools = cast(dict[str, dict[str, object]], state["tools"])
+        key, receipt = next(iter(tools.items()))
+        arguments_sha256 = hashlib.sha256(b'{"q":"other"}').hexdigest()
+        receipt["arguments_sha256"] = arguments_sha256
+        tools.pop(key)
+        forged_key = hashlib.sha256(
+            f"{RUN_ID}:final:0:0:0:web.search:{arguments_sha256}".encode(),
+        ).hexdigest()
+        tools[forged_key] = receipt
+        # Recompute integrity hashes so graph validation, rather than stale hashes, rejects it.
+        payload["state_sha256"] = ""
+        checkpoint = RuntimeCheckpoint.from_payload(payload)
+    resumed_gateway = RoleAwareGateway()
+    resumed = CrewDispatchRuntime(
+        resumed_gateway, plan, capability_gateway=capabilities,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    if tamper_receipt:
+        with pytest.raises(RuntimeExecutionError, match="checkpoint capability artifact lineage"):
+            _ = [event async for event in resumed.run(
+                _context(checkpoint=checkpoint, actor_id=actor_id, actor_role=Role.OPERATOR),
+            )]
+        assert resumed_gateway.requests == []
+        assert capabilities.calls == [("writer", "web.search")]
+        return
+    resumed_events = [event async for event in resumed.run(
+        _context(checkpoint=checkpoint, actor_id=actor_id, actor_role=Role.OPERATOR),
+    )]
+    assert resumed_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [request.logical_model for request in resumed_gateway.requests] == (
+        ["backup"] if checkpoint_phase == "provider_failed" else []
+    )
+    assert capabilities.calls == [("writer", "web.search")]
+    assert not any(event.kind is EventKind.TOOL_STARTED for event in resumed_events)
+
+
 async def test_agent_capacity_recovery_gets_bounded_step_deadline_window() -> None:
     gateway = SlowCapacityRecoveryGateway()
     generation = RecordingGeneration()
