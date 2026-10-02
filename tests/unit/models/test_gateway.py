@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 from uuid import NAMESPACE_DNS, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
@@ -1613,6 +1614,16 @@ async def test_capacity_record_and_release_waits_share_request_deadline() -> Non
     capacity = CapacityStub([lease("selected")])
     capacity.record_block = asyncio.Event()
     capacity.release_block = asyncio.Event()
+    release_finished = asyncio.Event()
+    original_release = capacity.release
+
+    async def observed_release(lease: CapacityLease) -> bool:
+        try:
+            return await original_release(lease)
+        finally:
+            release_finished.set()
+
+    capacity.release = observed_release  # type: ignore[method-assign]
     gateway = ModelGateway(
         ModelRegistry([selected]),
         capacity,
@@ -1627,9 +1638,13 @@ async def test_capacity_record_and_release_waits_share_request_deadline() -> Non
         timeout_seconds=0.5,
     )
 
-    async with asyncio.timeout(2):
-        with pytest.raises(ModelGatewayError, match="outcome recording failed"):
-            await gateway.complete(short_request)
+    with patch("agent_hub.models.gateway.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for:
+        async with asyncio.timeout(2):
+            with pytest.raises(ModelGatewayError, match="outcome recording failed"):
+                await gateway.complete(short_request)
+            await release_finished.wait()
+        assert wait_for.call_args is not None
+        assert wait_for.call_args.kwargs["timeout"] == 0
     assert len(capacity.records) == 1
     assert capacity.records[0][3] is True
     assert capacity.release_started.is_set()

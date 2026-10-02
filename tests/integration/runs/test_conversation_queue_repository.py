@@ -14,6 +14,7 @@ from agent_hub.runs.conversation_queue import (
     ConversationQueueRepository,
     EnqueueConversationMessage,
 )
+from agent_hub.runs.repository import RunRepository
 
 
 async def _run(
@@ -23,6 +24,8 @@ async def _run(
     request: str,
     blocked_by_run_id: UUID | None = None,
     status: RunStatus = RunStatus.QUEUED,
+    worker_id: str | None = None,
+    worker_lease_token: UUID | None = None,
     worker_lease_expires_at: datetime | None = None,
 ) -> RunRow:
     row = RunRow(
@@ -37,6 +40,15 @@ async def _run(
         worker_lease_expires_at=worker_lease_expires_at,
         version=1,
     )
+    if worker_id is not None:
+        assert worker_lease_token is not None
+        assert worker_lease_expires_at is not None
+        RunRepository.record_worker_lease(
+            row,
+            worker_id=worker_id,
+            worker_lease_token=worker_lease_token,
+            worker_lease_expires_at=worker_lease_expires_at,
+        )
     async with session_factory() as session, session.begin():
         session.add(row)
         await session.flush()
@@ -187,11 +199,15 @@ async def test_redirect_promotes_selected_item_and_preserves_other_queue_items(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = uuid4()
+    worker_id = "queue-redirect-worker"
+    worker_lease_token = uuid4()
     active = await _run(
         auth_session_factory,
         tenant_id=tenant_id,
         request="active",
         status=RunStatus.RUNNING,
+        worker_id=worker_id,
+        worker_lease_token=worker_lease_token,
         worker_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
     )
     first_run = await _run(
@@ -263,10 +279,50 @@ async def test_redirect_promotes_selected_item_and_preserves_other_queue_items(
     assert queue[1].predecessor_run_id == selected_run.id
     assert queue[2].predecessor_run_id == first_run.id
 
+    with pytest.raises(ConversationQueueConflict, match="worker execution has not been released"):
+        await repository.release_next_for_terminal_run(tenant_id, active.id)
+    async with auth_session_factory() as session:
+        selected_row = await session.get(RunRow, selected_run.id)
+        assert selected_row is not None
+        assert selected_row.blocked_by_run_id == active.id
+        outbox_count = await session.scalar(
+            select(func.count()).select_from(RunOutboxRow).where(
+                RunOutboxRow.run_id == selected_run.id
+            )
+        )
+        assert outbox_count == 0
+
+    stopped = await RunRepository(auth_session_factory).release_worker_execution(
+        tenant_id,
+        active.id,
+        worker_id=worker_id,
+        worker_lease_token=worker_lease_token,
+    )
+    assert stopped.status is RunStatus.CANCELLED
+    assert stopped.worker_id is None
+    assert stopped.worker_lease_token is None
+    assert stopped.worker_lease_expires_at is None
     released = await repository.release_next_for_terminal_run(tenant_id, active.id)
     assert released is not None
     assert released.id == selected.id
     assert released.status is ConversationQueueStatus.RELEASED
+    assert await repository.release_next_for_terminal_run(tenant_id, active.id) is None
+    async with auth_session_factory() as session:
+        selected_row = await session.get(RunRow, selected_run.id)
+        first_row = await session.get(RunRow, first_run.id)
+        last_row = await session.get(RunRow, last_run.id)
+        assert selected_row is not None
+        assert selected_row.blocked_by_run_id is None
+        assert first_row is not None
+        assert first_row.blocked_by_run_id == selected_run.id
+        assert last_row is not None
+        assert last_row.blocked_by_run_id == first_run.id
+        outbox_count = await session.scalar(
+            select(func.count()).select_from(RunOutboxRow).where(
+                RunOutboxRow.run_id == selected_run.id
+            )
+        )
+        assert outbox_count == 1
 
 
 @pytest.mark.asyncio
