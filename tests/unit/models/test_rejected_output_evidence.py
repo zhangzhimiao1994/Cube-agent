@@ -688,7 +688,10 @@ async def test_direct_response_error_is_redacted_with_status_and_evidence_preser
     elif branch == "stream":
         chat.return_value = AsyncChunkStream([failure])
     elif branch == "legacy":
-        chat.side_effect = [RuntimeError("unsupported parameter max_completion_tokens"), failure]
+        chat.side_effect = [
+            ModelTransportError("unsupported parameter max_completion_tokens", status_code=400),
+            failure,
+        ]
     elif branch == "root":
         dep = deployment(api_base="https://provider.example")
         chat.side_effect = [ModelTransportError("not found", status_code=404), failure]
