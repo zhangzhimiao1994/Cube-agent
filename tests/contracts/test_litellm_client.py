@@ -9,6 +9,7 @@ import pytest
 
 from agent_hub.models.litellm_client import (
     LiteLLMClient,
+    ModelClientError,
     ModelResponseError,
     ModelTransportError,
 )
@@ -19,6 +20,7 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     StructuredResponseSchema,
+    TokenUsage,
     ToolCall,
     ToolDefinition,
 )
@@ -399,8 +401,7 @@ async def test_passes_strict_completion_budget_to_openai_compatible_transport() 
 
 
 async def test_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
-    provider_error = RuntimeError("unknown parameter: max_completion_tokens")
-    provider_error.status_code = 400  # type: ignore[attr-defined]
+    provider_error = ModelTransportError("unknown parameter: max_completion_tokens", status_code=400)
     create = AsyncMock(side_effect=[provider_error, sdk_response()])
     close = AsyncMock()
     sdk_client = SimpleNamespace(
@@ -483,8 +484,7 @@ async def test_streams_openai_compatible_chunks_with_existing_request_shape() ->
 
 
 async def test_stream_provider_error_closes_and_redacts_runtime_secrets() -> None:
-    class ProviderFailure(RuntimeError):
-        status_code = 503
+    class ProviderFailure(ModelTransportError):
         request_id = "req_stream_safe"
 
     class FailingStream:
@@ -492,7 +492,7 @@ async def test_stream_provider_error_closes_and_redacts_runtime_secrets() -> Non
             return self
 
         async def __anext__(self) -> object:
-            raise ProviderFailure(RAW_ERROR + API_KEY + PROMPT)
+            raise ProviderFailure(RAW_ERROR + API_KEY + PROMPT, status_code=503)
 
     create = AsyncMock(return_value=FailingStream())
     close = AsyncMock()
@@ -521,8 +521,7 @@ async def test_stream_provider_error_closes_and_redacts_runtime_secrets() -> Non
 
 
 async def test_stream_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
-    provider_error = RuntimeError("unknown parameter: max_completion_tokens")
-    provider_error.status_code = 400  # type: ignore[attr-defined]
+    provider_error = ModelTransportError("unknown parameter: max_completion_tokens", status_code=400)
     stream = AsyncChunkStream(
         [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"))])]
     )
@@ -556,8 +555,7 @@ async def test_stream_retries_with_legacy_max_tokens_for_openai_compatible_relay
 
 
 async def test_stream_retries_root_relay_base_with_v1_suffix_when_route_is_missing() -> None:
-    not_found = RuntimeError("not found")
-    not_found.status_code = 404  # type: ignore[attr-defined]
+    not_found = ModelTransportError("not found", status_code=404)
     first_create = AsyncMock(side_effect=not_found)
     second_create = AsyncMock(
         return_value=AsyncChunkStream(
@@ -623,8 +621,7 @@ async def test_stream_closes_client_when_consumer_stops_early() -> None:
 
 
 async def test_stream_early_close_failure_maps_to_safe_transport_error() -> None:
-    class CloseFailure(RuntimeError):
-        status_code = 503
+    class CloseFailure(ModelTransportError):
         request_id = "req-stream-close-safe"
 
     first_chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))])
@@ -636,7 +633,7 @@ async def test_stream_early_close_failure_maps_to_safe_transport_error() -> None
             ]
         )
     )
-    close = AsyncMock(side_effect=CloseFailure(RAW_ERROR + API_KEY + PROMPT))
+    close = AsyncMock(side_effect=CloseFailure(RAW_ERROR + API_KEY + PROMPT, status_code=503))
     sdk_client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
         close=close,
@@ -683,8 +680,7 @@ async def test_stream_rejects_messages_endpoint_before_constructing_clients() ->
 
 
 async def test_retries_root_relay_base_with_v1_suffix_when_route_is_missing() -> None:
-    not_found = RuntimeError("not found")
-    not_found.status_code = 404  # type: ignore[attr-defined]
+    not_found = ModelTransportError("not found", status_code=404)
     first_create = AsyncMock(side_effect=not_found)
     second_create = AsyncMock(return_value=sdk_response())
     first_close = AsyncMock()
@@ -958,9 +954,11 @@ async def test_drops_error_request_id_that_is_a_fragment_of_sensitive_input(
 
     transport, _, _, _ = mock_transport(error=ProviderFailure(RAW_ERROR))
 
-    with pytest.raises(ModelTransportError) as caught:
+    with pytest.raises(ModelClientError) as caught:
         await transport.complete(deployment(), sensitive_request(), API_KEY)
 
+    assert not isinstance(caught.value, ModelTransportError)
+    assert str(caught.value) == "model client internal failure"
     rendered = "".join(
         traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
     )
@@ -973,11 +971,12 @@ async def test_drops_error_request_id_that_is_a_fragment_of_sensitive_input(
 async def test_drops_sensitive_provider_error_request_id_without_retaining_context(
     leaked_value: str,
 ) -> None:
-    class ProviderFailure(RuntimeError):
-        status_code = 429
+    class ProviderFailure(ModelTransportError):
         request_id = "req-" + leaked_value
 
-    transport, _, _, close = mock_transport(error=ProviderFailure(RAW_ERROR + leaked_value))
+    transport, _, _, close = mock_transport(
+        error=ProviderFailure(RAW_ERROR + leaked_value, status_code=429)
+    )
 
     with pytest.raises(ModelTransportError) as caught:
         await transport.complete(deployment(), sensitive_request(), API_KEY)
@@ -1008,9 +1007,11 @@ async def test_provider_failure_traceback_locals_do_not_retain_sensitive_values(
         error=ProviderFailure(RAW_ERROR + API_KEY + PROMPT + MULTIMODAL_TEXT + IMAGE_URL)
     )
 
-    with pytest.raises(ModelTransportError) as caught:
+    with pytest.raises(ModelClientError) as caught:
         await transport.complete(deployment(), sensitive_request(), API_KEY)
 
+    assert not isinstance(caught.value, ModelTransportError)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     rendered = captured_traceback(caught.value)
     for sensitive in (API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL, RAW_ERROR):
         assert sensitive not in rendered
@@ -1131,11 +1132,12 @@ async def test_rejects_nonfinite_tool_argument_json_constants(constant: str) -> 
 
 
 async def test_closes_on_provider_error_and_redacts_runtime_secrets() -> None:
-    class ProviderFailure(RuntimeError):
-        status_code = 429
+    class ProviderFailure(ModelTransportError):
         request_id = "req_safe429"
 
-    transport, _, _, close = mock_transport(error=ProviderFailure(RAW_ERROR + API_KEY + PROMPT))
+    transport, _, _, close = mock_transport(
+        error=ProviderFailure(RAW_ERROR + API_KEY + PROMPT, status_code=429)
+    )
 
     with pytest.raises(ModelTransportError) as caught:
         await transport.complete(deployment(), request(), API_KEY)
@@ -1160,34 +1162,33 @@ async def test_propagates_cancellation_and_still_closes() -> None:
     close.assert_awaited_once_with()
 
 
-async def test_successful_call_close_failure_maps_to_safe_transport_error() -> None:
+async def test_successful_call_close_failure_preserves_response_and_usage() -> None:
     class CloseFailure(RuntimeError):
         status_code = 503
         request_id = "req-close-safe"
 
-    transport, _, _, close = mock_transport(
+    transport, _, create, close = mock_transport(
         close_error=CloseFailure(RAW_ERROR + API_KEY + PROMPT)
     )
 
-    with pytest.raises(ModelTransportError) as caught:
-        await transport.complete(deployment(), sensitive_request(), API_KEY)
+    result = await transport.complete(deployment(), sensitive_request(), API_KEY)
 
     close.assert_awaited_once_with()
-    assert "status=503" in str(caught.value)
-    assert "request_id=req-close-safe" in str(caught.value)
-    assert caught.value.__context__ is None
-    rendered = captured_traceback(caught.value)
+    create.assert_awaited_once()
+    assert result.text == "hello"
+    assert result.usage == TokenUsage(2, 3, 5)
+    rendered = repr(result) + repr(dict(result.provider_metadata))
+    assert "req-close-safe" not in rendered
     for sensitive in (RAW_ERROR, API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL):
         assert sensitive not in rendered
 
 
 async def test_provider_error_close_failure_keeps_primary_safe_error() -> None:
-    class ProviderFailure(RuntimeError):
-        status_code = 429
+    class ProviderFailure(ModelTransportError):
         request_id = "req-primary-safe"
 
     transport, _, _, close = mock_transport(
-        error=ProviderFailure(RAW_ERROR + API_KEY),
+        error=ProviderFailure(RAW_ERROR + API_KEY, status_code=429),
         close_error=RuntimeError("close-" + RAW_ERROR + PROMPT),
     )
 

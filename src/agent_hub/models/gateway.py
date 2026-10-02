@@ -30,6 +30,7 @@ from agent_hub.models.litellm_client import (
     ModelResponseCancelled,
     ModelResponseError,
     ModelTransportError,
+    safe_model_client_error,
 )
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
@@ -1054,7 +1055,14 @@ class ModelGateway:
                     stream_primary_error = error
                     primary_error = error
                 except Exception as error:  # noqa: BLE001 - redact arbitrary stream failures
-                    stream_primary_error = error
+                    safe_error = safe_model_client_error(deployment.id, error, (api_key,))
+                    if isinstance(safe_error, ModelTransportError) and not isinstance(
+                        safe_error, ModelResponseError,
+                    ):
+                        safe_error = ModelTransportError(
+                            "model transport failed", status_code=safe_error.status_code,
+                        )
+                    stream_primary_error = safe_error
                     _LOGGER.error(
                         "model_stream_unexpected_failure deployment_id=%s error_type=%s",
                         deployment.id,
@@ -1062,7 +1070,16 @@ class ModelGateway:
                     )
                     error.__traceback__ = None
                     del error
-                    primary_error = ModelGatewayError("model transport failed")
+                    if isinstance(safe_error, ModelResponseError):
+                        status_code = safe_error.status_code
+                        primary_error = safe_error
+                    elif isinstance(safe_error, ModelTransportError):
+                        status_code = safe_error.status_code
+                        primary_error = ModelTransportError(
+                            "model transport failed", status_code=status_code,
+                        )
+                    else:
+                        primary_error = ModelGatewayError("model client internal failure")
                 finally:
                     close_error = await self._stream_close_cleanup(
                         events, deadline=deadline
@@ -1305,7 +1322,7 @@ class ModelGateway:
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
                     should_record = True
-                    primary_error = ModelGatewayError("model transport failed")
+                    primary_error = ModelGatewayError("model client internal failure")
                 finally:
                     del invocation
 
@@ -1442,7 +1459,7 @@ class ModelGateway:
             error.__cause__ = None
             del error
         except ModelTransportError as error:
-            _LOGGER.exception(
+            _LOGGER.warning(
                 "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
                 deployment.id,
                 error.status_code,
@@ -1454,6 +1471,13 @@ class ModelGateway:
             error.__traceback__ = None
             del error
         except Exception as error:  # noqa: BLE001 - consume and redact injected failures
+            safe_error = safe_model_client_error(deployment.id, error, (api_key,))
+            if isinstance(safe_error, ModelTransportError) and not isinstance(
+                safe_error, ModelResponseError,
+            ):
+                safe_error = ModelTransportError(
+                    "model transport failed", status_code=safe_error.status_code,
+                )
             _LOGGER.error(
                 "model_transport_unexpected_failure deployment_id=%s error_type=%s",
                 deployment.id,
@@ -1461,7 +1485,14 @@ class ModelGateway:
             )
             error.__traceback__ = None
             del error
-            outcome = _SafeTransportFailure(ModelGatewayError("model transport failed"))
+            if isinstance(safe_error, ModelResponseError):
+                outcome = _SafeTransportFailure(safe_error)
+            elif isinstance(safe_error, ModelTransportError):
+                outcome = _SafeTransportFailure(
+                    ModelTransportError("model transport failed", status_code=safe_error.status_code)
+                )
+            else:
+                outcome = _SafeTransportFailure(ModelGatewayError("model client internal failure"))
         del api_key, request
         return outcome
 

@@ -2,12 +2,19 @@ import asyncio
 import json
 import logging
 import re
+import socket
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APIStatusError,
+    AsyncOpenAI,
+    AsyncStream,
+)
 
 from agent_hub.models.responses import (
     ResponsesContractError,
@@ -43,6 +50,15 @@ _UNSUPPORTED_PARAMETER_MARKERS = (
     "not supported",
 )
 _LOGGER = logging.getLogger(__name__)
+_NETWORK_ERRORS = (
+    httpx.NetworkError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+    httpx.ProxyError,
+    TimeoutError,
+    ConnectionError,
+    socket.gaierror,
+)
 
 
 class _Completions(Protocol):
@@ -98,6 +114,10 @@ class ModelTransportError(RuntimeError):
             raise ValueError("status_code must be None or between 100 and 599")
         super().__init__(message)
         self.status_code = status_code
+
+
+class ModelClientError(RuntimeError):
+    """Stable, non-network failure without internal exception details."""
 
 
 class ModelResponseError(ModelTransportError):
@@ -444,15 +464,31 @@ def _parse_response(
     )
 
 
-def _transport_error(
+def safe_model_client_error(
     deployment_id: str,
     error: Exception,
     sensitive_values: Sequence[str],
-) -> ModelTransportError:
+) -> ModelTransportError | ModelClientError:
+    """Classify provider failures without retaining raw exception text or context."""
     if isinstance(error, ModelResponseError):
         return _safe_response_error(error)
+    if isinstance(error, APIResponseValidationError):
+        return ModelResponseError("model response rejected", status_code=error.status_code)
+    if (
+        isinstance(error, APIConnectionError)
+        and error.__cause__ is not None
+        and not isinstance(error.__cause__, _NETWORK_ERRORS)
+    ):
+        return ModelClientError("model client internal failure")
     details: list[str] = []
     status = _attribute(error, "status_code")
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+    if not isinstance(
+        error,
+        _NETWORK_ERRORS + (ModelTransportError, APIConnectionError, APIStatusError, httpx.HTTPStatusError),
+    ):
+        return ModelClientError("model client internal failure")
     if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
         details.append(f"status={status}")
     request_id = _safe_provider_string(_attribute(error, "request_id"), sensitive_values)
@@ -492,6 +528,27 @@ async def _async_chunks(stream: object) -> AsyncIterator[object]:
         yield chunk
 
 
+class _StreamResponseBody(httpx.AsyncByteStream):
+    """Keep SDK iteration failures separate from its automatic response cleanup."""
+
+    def __init__(self, body: httpx.AsyncByteStream, cleanup_timeout: Callable[[], float]) -> None:
+        self._body = body
+        self._cleanup_timeout = cleanup_timeout
+        self.automatic_cleanup = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._body:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if not self.automatic_cleanup:
+            await self._body.aclose()
+            return
+        close_error = await _close_received_client(self._body.aclose, self._cleanup_timeout())
+        if isinstance(close_error, asyncio.CancelledError):
+            raise asyncio.CancelledError from None
+
+
 class _OpenAICompatibleChunkStream:
     def __init__(
         self,
@@ -499,12 +556,17 @@ class _OpenAICompatibleChunkStream:
         *,
         deployment_id: str,
         sensitive_values: Sequence[str],
+        timeout: float,
     ) -> None:
         self._start: Callable[[], Awaitable[tuple[_OpenAIClient, object]]] | None = start
         self._deployment_id = deployment_id
         self._sensitive_values = tuple(sensitive_values)
+        self._timeout = timeout
+        self._deadline: float | None = None
         self._client: _OpenAIClient | None = None
         self._iterator: AsyncIterator[object] | None = None
+        self._sdk_stream: AsyncStream[object] | None = None
+        self._response_body: _StreamResponseBody | None = None
         self._closed = False
 
     def __aiter__(self) -> "_OpenAICompatibleChunkStream":
@@ -513,6 +575,9 @@ class _OpenAICompatibleChunkStream:
     async def __anext__(self) -> object:
         if self._closed:
             raise StopAsyncIteration
+        if self._deadline is None:
+            self._deadline = asyncio.get_running_loop().time() + self._timeout
+        exhausted = False
         try:
             if self._iterator is None:
                 if self._start is None:  # pragma: no cover - defensive invariant
@@ -520,62 +585,92 @@ class _OpenAICompatibleChunkStream:
                 client, stream = await self._start()
                 self._start = None
                 self._client = client
+                if isinstance(stream, AsyncStream):
+                    self._sdk_stream = cast(AsyncStream[object], stream)
+                    body = stream.response.stream
+                    if isinstance(body, httpx.AsyncByteStream):
+                        self._response_body = _StreamResponseBody(body, self._cleanup_timeout)
+                        stream.response.stream = self._response_body
                 self._iterator = _async_chunks(stream).__aiter__()
+            if self._response_body is not None:
+                self._response_body.automatic_cleanup = True
             return await self._iterator.__anext__()
         except StopAsyncIteration:
-            await self.aclose()
-            raise
+            exhausted = True
         except asyncio.CancelledError:
             if await self._close_client_ignoring_failure():
                 raise
             raise
-        except ModelTransportError as error:
-            await self._close_client_ignoring_failure()
-            if isinstance(error, ModelResponseError):
-                raise _safe_response_error(error) from None
-            raise error from None
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
-            safe_error = _transport_error(
+            safe_error = safe_model_client_error(
                 self._deployment_id,
                 error,
                 self._sensitive_values,
             )
-            await self._close_client_ignoring_failure()
-            raise safe_error from None
+        finally:
+            if self._response_body is not None:
+                self._response_body.automatic_cleanup = False
+        if exhausted:
+            try:
+                await self.aclose()
+            except Exception as error:  # noqa: BLE001 - EOF cleanup preserves received chunks
+                _LOGGER.warning("litellm_stream_eof_cleanup_failed error_type=%s", type(error).__name__)
+            raise StopAsyncIteration
+        if await self._close_client_ignoring_failure():
+            raise asyncio.CancelledError
+        raise safe_error from None
 
     async def aclose(self) -> None:
         if self._closed:
             return
-        close_failure: ModelTransportError | None = None
+        close_failure: ModelTransportError | ModelClientError | asyncio.CancelledError | None = None
         try:
+            closers: list[Callable[[], Awaitable[None]]] = []
             if self._iterator is not None:
-                await cast(Any, self._iterator).aclose()
+                closers.append(cast(Any, self._iterator).aclose)
+            if self._sdk_stream is not None:
+                closers.append(self._sdk_stream.close)
             if self._client is not None:
-                await self._client.close()
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - close failures are provider failures
-            close_failure = _transport_error(
-                self._deployment_id,
-                error,
-                self._sensitive_values,
-            )
+                closers.append(self._client.close)
+            for close in closers:
+                close_error = await _close_received_client(close, self._cleanup_timeout())
+                if isinstance(close_error, asyncio.CancelledError):
+                    close_failure = asyncio.CancelledError()
+                elif isinstance(close_error, Exception) and close_failure is None:
+                    close_failure = safe_model_client_error(
+                        self._deployment_id, close_error, self._sensitive_values,
+                    )
+                del close_error
         finally:
             self._closed = True
             self._start = None
             self._client = None
             self._iterator = None
+            self._sdk_stream = None
+            self._response_body = None
         if close_failure is not None:
             raise close_failure from None
 
+    def _cleanup_timeout(self) -> float:
+        remaining = self._timeout if self._deadline is None else max(
+            0.0, self._deadline - asyncio.get_running_loop().time(),
+        )
+        # Leave time to deliver buffered tool events and settle the gateway lease.
+        return min(2.0, remaining / 2)
+
     async def _close_client_ignoring_failure(self) -> bool:
         try:
-            return await _close_ignoring_failures(self._client)
+            if self._client is None:
+                return False
+            close_error = await _close_received_client(self._client.close, self._cleanup_timeout())
+            return isinstance(close_error, asyncio.CancelledError)
         finally:
             self._closed = True
             self._start = None
             self._client = None
             self._iterator = None
+            self._sdk_stream = None
+            self._response_body = None
 
 
 async def _aclose_ignoring_failures(client: _HTTPClient | None) -> bool:
@@ -615,7 +710,10 @@ class LiteLLMClient:
         request: ModelRequest,
         api_key: str,
     ) -> ModelResponse:
-        outcome = await self._complete_outcome(deployment, request, api_key)
+        try:
+            outcome = await self._complete_outcome(deployment, request, api_key)
+        except Exception as error:  # noqa: BLE001 - include client construction and retry setup
+            outcome = safe_model_client_error(deployment.id, error, _sensitive_values(request, api_key))
         del deployment, request, api_key
         if isinstance(outcome, _CancelledOutcome):
             if outcome.receipt is not None:
@@ -643,6 +741,7 @@ class LiteLLMClient:
             lambda: self._start_stream(deployment, request, api_key, sensitive_values),
             deployment_id=deployment.id,
             sensitive_values=sensitive_values,
+            timeout=request.timeout_seconds,
         )
 
     async def _complete_outcome(
@@ -664,7 +763,7 @@ class LiteLLMClient:
         parsed: ModelResponse | None = None
         create_kwargs: dict[str, object] | None = None
         response: object | None = None
-        safe_failure: ModelTransportError | None = None
+        safe_failure: ModelTransportError | ModelClientError | None = None
         try:
             client = self._client_factory(
                 api_key=api_key,
@@ -700,7 +799,7 @@ class LiteLLMClient:
                 except ModelResponseError as retry_error:
                     safe_failure = _safe_response_error(retry_error)
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
-                    safe_failure = _transport_error(
+                    safe_failure = safe_model_client_error(
                         deployment.id,
                         retry_error,
                         sensitive_values,
@@ -726,13 +825,13 @@ class LiteLLMClient:
                 except ModelResponseError as retry_error:
                     safe_failure = _safe_response_error(retry_error)
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
-                    safe_failure = _transport_error(
+                    safe_failure = safe_model_client_error(
                         deployment.id,
                         retry_error,
                         sensitive_values,
                     )
             else:
-                safe_failure = _transport_error(deployment.id, error, sensitive_values)
+                safe_failure = safe_model_client_error(deployment.id, error, sensitive_values)
 
         if safe_failure is not None:
             if client is not None:
@@ -741,15 +840,12 @@ class LiteLLMClient:
                     return _cancelled_outcome(safe_failure)
             return safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
-            return ModelTransportError(
-                f"model transport failed for deployment {deployment.id!r}"
-            )
+            return ModelClientError("model client internal failure")
 
         close_error = await _close_received_client(client.close, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
             return _cancelled_outcome(parsed)
-        if isinstance(close_error, Exception):
-            return _transport_error(deployment.id, close_error, sensitive_values)
+        # Cleanup failure cannot discard an already received response or its usage.
         return parsed
 
     async def _responses_outcome(
@@ -779,13 +875,11 @@ class LiteLLMClient:
         except ResponsesContractError as error:
             outcome = ModelResponseError("model response rejected", evidence=error.evidence)
         except Exception as error:  # noqa: BLE001 - preserve the safe transport boundary
-            outcome = _transport_error(deployment.id, error, sensitive_values)
+            outcome = safe_model_client_error(deployment.id, error, sensitive_values)
         if client is not None:
             close_error = await _close_received_client(client.close, request.timeout_seconds)
             if isinstance(close_error, asyncio.CancelledError):
                 outcome = _cancelled_outcome(outcome)
-            elif isinstance(close_error, Exception) and isinstance(outcome, ModelResponse):
-                outcome = _transport_error(deployment.id, close_error, sensitive_values)
         return outcome
 
     async def _start_stream(
@@ -820,7 +914,7 @@ class LiteLLMClient:
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
                     if await _close_ignoring_failures(client):
                         raise asyncio.CancelledError
-                    raise _transport_error(
+                    raise safe_model_client_error(
                         deployment.id,
                         retry_error,
                         sensitive_values,
@@ -844,14 +938,14 @@ class LiteLLMClient:
                 except Exception as retry_error:  # noqa: BLE001 - redact retry failure
                     if await _close_ignoring_failures(client):
                         raise asyncio.CancelledError
-                    raise _transport_error(
+                    raise safe_model_client_error(
                         deployment.id,
                         retry_error,
                         sensitive_values,
                     ) from None
             if await _close_ignoring_failures(client):
                 raise asyncio.CancelledError
-            raise _transport_error(deployment.id, error, sensitive_values) from None
+            raise safe_model_client_error(deployment.id, error, sensitive_values) from None
 
     async def _messages_outcome(
         self,
@@ -877,8 +971,12 @@ class LiteLLMClient:
                     status_code=response.status_code,
                 )
             else:
+                try:
+                    payload = response.json()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    raise ModelResponseError("model response rejected") from None
                 outcome = _parse_messages_endpoint_response(
-                    response.json(),
+                    payload,
                     deployment.id,
                     sensitive_values,
                 )
@@ -887,7 +985,7 @@ class LiteLLMClient:
         except ModelResponseError as error:
             outcome = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact direct HTTP/provider failures
-            outcome = _transport_error(deployment.id, error, sensitive_values)
+            outcome = safe_model_client_error(deployment.id, error, sensitive_values)
         close_error = await _close_received_client(client.aclose, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
             return _cancelled_outcome(outcome)
@@ -1031,15 +1129,20 @@ def _messages_endpoint_usage(usage: object) -> TokenUsage | None:
     output_tokens = usage.get("output_tokens")
     if type(input_tokens) is not int or type(output_tokens) is not int:
         return None
-    return TokenUsage(
-        prompt_tokens=input_tokens,
-        completion_tokens=output_tokens,
-        total_tokens=input_tokens + output_tokens,
-    )
+    try:
+        return TokenUsage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+    except (TypeError, ValueError):
+        raise ModelResponseError("model response rejected") from None
 
 
 def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
-    if isinstance(error, ModelResponseError):
+    if isinstance(error, ModelResponseError) or not isinstance(
+        error, (ModelTransportError, APIStatusError, httpx.HTTPStatusError)
+    ):
         return False
     message = str(error).lower()
     return any(marker in message for marker in _LEGACY_MAX_TOKENS_MARKERS) and any(
@@ -1048,12 +1151,16 @@ def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
 
 
 def _should_retry_root_base_with_v1(error: Exception, api_base: str) -> bool:
-    if isinstance(error, ModelResponseError):
+    if isinstance(error, ModelResponseError) or not isinstance(
+        error, (ModelTransportError, APIStatusError, httpx.HTTPStatusError)
+    ):
         return False
     return _safe_status_code(error) in {404, 405} and _api_base_with_v1(api_base) is not None
 
 
 def _safe_status_code(error: Exception) -> int | None:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int) and not isinstance(status_code, bool):
         return status_code

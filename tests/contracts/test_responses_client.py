@@ -9,13 +9,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent_hub.models.litellm_client import LiteLLMClient, ModelResponseError, ModelTransportError
+from agent_hub.models.litellm_client import (
+    LiteLLMClient,
+    ModelClientError,
+    ModelResponseError,
+    ModelTransportError,
+)
 from agent_hub.models.types import (
     Deployment,
     ModelCapability,
     ModelMessage,
     ModelRequest,
     StructuredResponseSchema,
+    TokenUsage,
     ToolDefinition,
 )
 from tests.contracts.test_litellm_client import (
@@ -480,8 +486,7 @@ async def test_native_rejects_nonfinal_malformed_refusal_and_unmetered_output(
 
 async def test_400_never_switches_protocol_or_exposes_provider_body() -> None:
     client, _, native, chat, close = setup_client()
-    error = RuntimeError(RAW_ERROR + API_KEY + PROMPT)
-    error.status_code = 400  # type: ignore[attr-defined]
+    error = ModelTransportError(RAW_ERROR + API_KEY + PROMPT, status_code=400)
     native.side_effect = error
     with pytest.raises(ModelTransportError) as caught:
         await client.complete(deployment(), request(), API_KEY)
@@ -626,9 +631,11 @@ async def test_timeout_and_close_failure_are_bounded_and_redacted() -> None:
     chat.assert_not_called()
     native.side_effect = None
     close.side_effect = RuntimeError(RAW_ERROR + API_KEY)
-    with pytest.raises(ModelTransportError) as caught:
-        await client.complete(deployment(), request(), API_KEY)
-    assert RAW_ERROR not in str(caught.value) and API_KEY not in str(caught.value)
+    result = await client.complete(deployment(), request(), API_KEY)
+    assert result.text == '{"verdict":"approve"}'
+    assert result.usage == TokenUsage(12, 117, 129)
+    assert native.await_count == 2 and close.await_count == 2
+    assert RAW_ERROR not in repr(result) and API_KEY not in repr(result)
 
 
 def test_native_encoder_disables_server_storage_explicitly() -> None:
@@ -716,8 +723,11 @@ async def test_close_timeout_is_bounded_and_does_not_replace_primary_error() -> 
     close.side_effect = block
     native.side_effect = RuntimeError(RAW_ERROR)
     async with asyncio.timeout(1):
-        with pytest.raises(ModelTransportError) as caught:
+        with pytest.raises(ModelClientError) as caught:
             await client.complete(deployment(), request(timeout_seconds=0.01), API_KEY)
+    assert not isinstance(caught.value, ModelTransportError)
+    assert str(caught.value) == "model client internal failure"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert RAW_ERROR not in str(caught.value)
     close.assert_awaited_once()
 
