@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
 import math
@@ -8,6 +9,9 @@ import socket
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -86,7 +90,9 @@ const server = http.createServer(async (req, res) => {
 
 def _validate(root: Path, timeout: float = 20) -> tuple[str, ...]:
     module = importlib.import_module('agent_hub.harness.project_requirements')
-    result = module.validate_small_task_api(root, timeout_seconds=timeout)
+    # This trusted built-in fixture tests business logic; public Linux execution
+    # is separately verified through actual bwrap in test_project_validation_sandbox.
+    result = module._validate_small_task_api(root, timeout_seconds=timeout)
     assert isinstance(result, tuple)
     assert all(isinstance(reason, str) and reason for reason in result)
     return result
@@ -268,3 +274,291 @@ def test_unsupported_platform_is_failure(application: Path, monkeypatch: pytest.
     failures = _validate(application)
     assert failures
     assert 'unsupported' in ' '.join(failures).lower()
+
+
+class _WindowsCleanupKernel:
+    def __init__(self) -> None:
+        self.parents = {2: 1, 3: 2, 4: 1}
+        self.current_parents = self.parents.copy()
+        self.created = {1: 10, 2: 20, 3: 30, 4: 5}
+        self.alive = dict.fromkeys(self.created, True)
+        self.denied: set[int] = set()
+        self.exit_on_denial: set[int] = set()
+        self.closed: list[int] = []
+        self.waits: list[int] = []
+        self.last_error = 0
+        self.snapshots = 0
+        self.entries: Any = iter(())
+        self.CreateToolhelp32Snapshot = Mock(side_effect=self.snapshot)
+        self.Process32First = Mock(side_effect=self.entry)
+        self.Process32Next = Mock(side_effect=self.entry)
+        self.OpenProcess = Mock(side_effect=lambda access, inherit, pid: pid + 100)
+        self.GetProcessTimes = Mock(side_effect=self.times)
+        self.TerminateProcess = Mock(side_effect=self.terminate)
+        self.WaitForSingleObject = Mock(side_effect=self.wait)
+        self.CloseHandle = Mock(side_effect=self.close)
+
+    def close(self, handle: int) -> int:
+        self.closed.append(handle)
+        return 1
+
+    def snapshot(self, flags: int, pid: int) -> int:
+        self.snapshots += 1
+        parents = self.parents if self.snapshots == 1 else self.current_parents
+        self.entries = iter(parents.items())
+        return 1000 + self.snapshots
+
+    def entry(self, handle: int, pointer: Any) -> int:
+        pair = next(self.entries, None)
+        if pair is None:
+            self.last_error = 18  # ERROR_NO_MORE_FILES
+            return 0
+        pointer._obj.th32ProcessID, pointer._obj.th32ParentProcessID = pair
+        return 1
+
+    def times(self, handle: int, created: Any, *unused: Any) -> int:
+        created._obj.dwLowDateTime = self.created[handle - 100]
+        created._obj.dwHighDateTime = 0
+        return 1
+
+    def terminate(self, handle: int, code: int) -> int:
+        pid = handle - 100
+        if pid in self.denied:
+            if pid in self.exit_on_denial:
+                self.alive[pid] = False
+            self.last_error = 5
+            return 0
+        self.alive[pid] = False
+        return 1
+
+    def wait(self, handle: int, milliseconds: int) -> int:
+        self.waits.append(milliseconds)
+        return 258 if self.alive[handle - 100] else 0
+
+
+def _windows_cleanup_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, _WindowsCleanupKernel, Any]:
+    module = importlib.import_module('agent_hub.harness.project_requirements')
+    kernel = _WindowsCleanupKernel()
+    monkeypatch.setattr(module.sys, 'platform', 'win32')
+    monkeypatch.setattr(ctypes, 'WinDLL', Mock(return_value=kernel), raising=False)
+    monkeypatch.setattr(ctypes, 'windll', SimpleNamespace(kernel32=kernel), raising=False)
+    monkeypatch.setattr(ctypes, 'get_last_error', lambda: kernel.last_error, raising=False)
+
+    def error(code: int | None = None) -> OSError:
+        exc = PermissionError(13, 'Access denied')
+        cast(Any, exc).winerror = kernel.last_error if code is None else code
+        return exc
+
+    monkeypatch.setattr(ctypes, 'WinError', error, raising=False)
+
+    def legacy_kill(pid: int, signal: int) -> None:
+        if not kernel.terminate(pid + 100, signal):
+            raise error()
+
+    monkeypatch.setattr(module.os, 'kill', legacy_kill)
+    monkeypatch.setattr(module.subprocess, 'run', Mock(return_value=SimpleNamespace(
+        returncode=1, stderr=b'Access denied', stdout=b'',
+    )))
+    process = SimpleNamespace(
+        pid=1, _handle=101, poll=lambda: None if kernel.alive[1] else 0,
+        wait=Mock(return_value=0),
+    )
+    return module, kernel, process
+
+
+@pytest.mark.parametrize('race_pid', [1, 2])
+def test_windows_cleanup_accepts_error5_only_after_exit(
+    monkeypatch: pytest.MonkeyPatch, race_pid: int,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.denied.add(race_pid)
+    kernel.exit_on_denial.add(race_pid)
+
+    module._stop_tree(process, 'taskkill')
+
+    assert not any(kernel.alive[pid] for pid in (1, 2, 3))
+    assert kernel.alive[4], 'older orphan must not be attributed to the new parent PID'
+
+
+@pytest.mark.parametrize('denied_pid', [1, 2])
+def test_windows_cleanup_keeps_live_error5_as_failure(
+    monkeypatch: pytest.MonkeyPatch, denied_pid: int,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.denied.add(denied_pid)
+
+    with pytest.raises(module._ValidationFailure, match=f'pid {denied_pid}'):
+        module._stop_tree(process, 'taskkill')
+
+    assert kernel.alive[denied_pid]
+    assert kernel.alive[4]
+    assert 102 in kernel.closed and 103 in kernel.closed
+    assert 101 not in kernel.closed, 'Popen owns the root handle'
+
+
+def test_windows_cleanup_rechecks_identity_with_handles_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.current_parents[2] = 99
+
+    module._stop_tree(process, 'taskkill')
+
+    assert not kernel.alive[1]
+    assert all(kernel.alive[pid] for pid in (2, 3, 4)), 'reused PID subtree must survive'
+    assert 102 in kernel.closed and 103 in kernel.closed
+
+
+def test_windows_cleanup_retains_exited_parent_identity_for_live_descendant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.alive[2] = False
+    del kernel.current_parents[2]
+
+    module._stop_tree(process, 'taskkill')
+
+    assert not any(kernel.alive[pid] for pid in (1, 2, 3))
+    assert kernel.alive[4]
+
+
+def test_windows_cleanup_wait_has_a_shared_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.TerminateProcess.side_effect = lambda handle, code: 1
+    now = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+
+    def wait(handle: int, milliseconds: int) -> int:
+        now[0] += milliseconds / 1000
+        return kernel.wait(handle, milliseconds)
+
+    kernel.WaitForSingleObject.side_effect = wait
+
+    with pytest.raises(module._ValidationFailure, match='cleanup'):
+        module._stop_tree(process, 'taskkill')
+
+    assert all(0 <= wait <= 3000 for wait in kernel.waits)
+    assert sum(wait for wait in kernel.waits) <= 3000
+    assert 101 not in kernel.closed
+
+
+def test_windows_cleanup_declares_pointer_sized_handles(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    module._stop_tree(process, 'taskkill')
+    assert kernel.CreateToolhelp32Snapshot.restype is ctypes.c_void_p
+    assert kernel.OpenProcess.restype is ctypes.c_void_p
+    assert kernel.CloseHandle.argtypes == (ctypes.c_void_p,)
+
+
+def test_windows_cleanup_collects_new_confirmed_descendant(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.current_parents[5] = 2
+    kernel.created[5] = 40
+    kernel.alive[5] = True
+
+    module._stop_tree(process, None)
+
+    assert not any(kernel.alive[pid] for pid in (1, 2, 3, 5))
+    assert kernel.alive[4]
+
+
+def test_windows_cleanup_missing_parent_cannot_claim_subtree_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.alive[2] = False
+    del kernel.current_parents[2]
+
+    def open_process(access: int, inherit: bool, pid: int) -> int | None:
+        if pid == 2:
+            kernel.last_error = 87
+            return None
+        return pid + 100
+
+    kernel.OpenProcess.side_effect = open_process
+    with pytest.raises(module._ValidationFailure, match='identity'):
+        module._stop_tree(process, None)
+
+    assert not kernel.alive[1], 'confirmed root must still be cleaned'
+    assert kernel.alive[3], 'unconfirmed orphan must not be killed'
+    assert kernel.alive[4]
+
+
+@pytest.mark.parametrize('failed_pid', [1, 2])
+def test_windows_cleanup_query_failure_still_cleans_known_root(
+    monkeypatch: pytest.MonkeyPatch, failed_pid: int,
+) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    original = kernel.times
+
+    def times(handle: int, *args: Any) -> int:
+        if handle == failed_pid + 100:
+            kernel.last_error = 5
+            return 0
+        return original(handle, *args)
+
+    kernel.GetProcessTimes.side_effect = times
+    with pytest.raises(module._ValidationFailure, match='query'):
+        module._stop_tree(process, None)
+
+    assert not kernel.alive[1]
+    assert kernel.alive[2] and kernel.alive[3] and kernel.alive[4]
+
+
+def test_windows_cleanup_continuous_spawn_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    now = [10.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    original = kernel.snapshot
+
+    def snapshot(flags: int, pid: int) -> int:
+        now[0] += 0.2
+        child = 5 + kernel.snapshots
+        kernel.current_parents[child] = 1
+        kernel.created[child] = 40 + child
+        kernel.alive[child] = True
+        return original(flags, pid)
+
+    kernel.CreateToolhelp32Snapshot.side_effect = snapshot
+    with pytest.raises(module._ValidationFailure, match='deadline'):
+        module._stop_tree(process, None)
+
+    assert not kernel.alive[1]
+    assert now[0] <= 13.3
+    assert kernel.snapshots < 20
+    assert 101 not in kernel.closed
+
+
+def test_windows_cleanup_snapshot_failure_still_cleans_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    kernel.last_error = 5
+    kernel.CreateToolhelp32Snapshot.side_effect = None
+    kernel.CreateToolhelp32Snapshot.return_value = ctypes.c_void_p(-1).value
+
+    with pytest.raises(module._ValidationFailure, match='snapshot query'):
+        module._stop_tree(process, None)
+
+    assert not kernel.alive[1]
+    assert kernel.alive[2] and kernel.alive[3] and kernel.alive[4]
+
+
+def test_windows_cleanup_missing_leaf_cannot_hide_late_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, kernel, process = _windows_cleanup_case(monkeypatch)
+    del kernel.parents[3]
+    kernel.alive[2] = False
+    del kernel.current_parents[2]
+
+    def open_process(access: int, inherit: bool, pid: int) -> int | None:
+        if pid == 2:
+            kernel.last_error = 87
+            return None
+        return pid + 100
+
+    kernel.OpenProcess.side_effect = open_process
+    with pytest.raises(module._ValidationFailure, match='identity'):
+        module._stop_tree(process, None)
+
+    assert not kernel.alive[1]
+    assert kernel.alive[3]

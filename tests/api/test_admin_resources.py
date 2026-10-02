@@ -19052,6 +19052,17 @@ def test_hermes_journey_is_paginated_filterable_and_tracks_changes() -> None:
     assert [change["version"] for change in history.json()] == [1, 2, 3]
 
 
+def test_audit_event_ids_preserve_order_when_monotonic_clock_ticks_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_hub.api.routers.admin.time.monotonic_ns", lambda: 1)
+    suffixes = iter(f"{number:032x}" for number in range(20, 0, -1))
+    monkeypatch.setattr(admin_router, "uuid4", lambda: UUID(next(suffixes)))
+    event_ids = [admin_router._new_audit_event_id() for _ in range(20)]
+    assert event_ids == sorted(event_ids)
+    assert len(set(event_ids)) == 20
+
+
 def test_hermes_rollback_reopens_review_and_revokes_promoted_memory() -> None:
     api = client()
     created = api.post(
@@ -19067,6 +19078,11 @@ def test_hermes_rollback_reopens_review_and_revokes_promoted_memory() -> None:
 
     rolled_back = api.post(f"/api/v1/admin/hermes/{created['id']}/rollback", headers=headers())
     memories = api.get("/api/v1/admin/memory", headers=headers()).json()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    same_timestamp = datetime(2026, 10, 3, tzinfo=UTC)
+    service.audit_events[:] = [
+        event.model_copy(update={"created_at": same_timestamp}) for event in service.audit_events
+    ]
     history = api.get(f"/api/v1/admin/hermes/{created['id']}/history", headers=headers()).json()
 
     assert rolled_back.status_code == 200

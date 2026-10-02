@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -46,6 +46,9 @@ from agent_hub.harness.project_scale_runner import (
     execute_project_scale_plan,
     format_project_scale_result_line,
 )
+from agent_hub.harness.project_validation_sandbox import (
+    generated_command as sandbox_generated_command,
+)
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from agent_hub.runtime.role_planner import RolePlanningRequest
 
@@ -56,6 +59,21 @@ _AGENT_STANDARD_IMPLEMENTATION_PLAN = (
     "applicable SKILL.md inventory, and no project-specific SKILL.md required for this fixture.\n"
     "- Build project\n"
 )
+
+
+@pytest.fixture
+def trusted_python_fixture_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run only test-authored commands; production never permits this host backend."""
+    original = sandbox_generated_command
+
+    def fixture_command(
+        command: Sequence[str], *, cwd: Path, config: Mapping[str, str],
+    ) -> list[str]:
+        if command[0] == sys.executable:
+            return [sys.executable, "-I", *command[1:]]
+        return original(command, cwd=cwd, config=config)
+
+    monkeypatch.setattr(project_scale_runner_module, "generated_command", fixture_command)
 
 
 def test_default_generated_project_install_disables_dependency_lifecycle_scripts() -> None:
@@ -723,22 +741,20 @@ def test_generated_project_npm_commands_fail_closed_without_isolated_validator(
     )
 
     assert invoked is False
-    assert reason == (
-        "generated_project_validation: isolated systemd validator is required "
-        "for generated npm/node commands"
-    )
+    assert reason is not None and "bwrap sandbox required" in reason
 
 
-def test_generated_project_command_uses_writable_sandbox_home(
+def test_generated_python_commands_cannot_bypass_isolation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured_env: dict[str, str] = {}
+    invoked = False
 
     def record_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del args
-        captured_env.update(cast(Mapping[str, str], kwargs["env"]))
-        return subprocess.CompletedProcess(("npm", "test"), 0, "", "")
+        del args, kwargs
+        nonlocal invoked
+        invoked = True
+        return subprocess.CompletedProcess(("python", "-c", "pass"), 0, "", "")
 
     monkeypatch.setattr(
         project_scale_runner_module,
@@ -748,17 +764,72 @@ def test_generated_project_command_uses_writable_sandbox_home(
     monkeypatch.setattr(subprocess, "run", record_run)
 
     reason = project_scale_runner_module._run_generated_project_command(
-        ("npm", "test"),
+        (sys.executable, "-c", "pass"),
         cwd=tmp_path,
         timeout_seconds=30,
     )
 
-    sandbox_home = tmp_path / ".agent-hub-validation-home"
-    assert reason is None
-    assert captured_env["HOME"] == str(sandbox_home)
-    assert captured_env["USERPROFILE"] == str(sandbox_home)
-    assert captured_env["NPM_CONFIG_CACHE"] == str(sandbox_home / ".npm")
-    assert sandbox_home.is_dir()
+    assert invoked is False
+    assert reason is not None and "unsupported generated executable" in reason
+
+
+def test_isolation_marker_never_authorizes_host_node_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.harness import project_validation_sandbox
+
+    monkeypatch.setenv("AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX", "systemd")
+    monkeypatch.setattr(project_validation_sandbox, "_BWRAP", tmp_path / "missing-bwrap")
+    monkeypatch.setattr(
+        project_scale_runner_module, "_generated_project_validation_is_isolated", lambda: True,
+    )
+    invocations: list[object] = []
+
+    def record_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        invocations.append(args[0])
+        return subprocess.CompletedProcess(args[0], 0, "", "")  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", record_run)
+    reason = project_scale_runner_module._run_generated_project_command(
+        ("/usr/bin/node", "-e", "process.exit(0)"), cwd=tmp_path, timeout_seconds=2,
+    )
+    assert reason is not None
+    assert invocations == [], "an env/cgroup marker cannot authorize host Node"
+
+
+def test_requirements_fail_closed_before_host_npm_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.harness import project_requirements
+
+    monkeypatch.delenv("AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX", raising=False)
+    monkeypatch.setattr(project_requirements, "_PLATFORM", "posix")
+    monkeypatch.setattr(shutil, "which", lambda value: "/usr/bin/" + value)
+    (tmp_path / "package.json").write_text('{"scripts":{"start":"node server.js"}}')
+    invocations: list[object] = []
+
+    def unexpected_start(*args: object, **kwargs: object) -> object:
+        invocations.append(args[0])
+        raise OSError("host npm start reached")
+
+    monkeypatch.setattr(subprocess, "Popen", unexpected_start)
+    failures = project_requirements.validate_small_task_api(tmp_path, timeout_seconds=2)
+    assert invocations == [], "business validation must not launch generated npm on host"
+    assert failures and "sandbox" in failures[0]
+
+
+@pytest.mark.parametrize("reason", (
+    "generated_project_validation: command failed exit=1 command=npm test",
+    "requirements: timeout: bwrap sandbox requirements validation deadline exceeded",
+    (
+        'generated_project_validation: command failed exit=1 command=npm install '
+        'output_tail="generated dependency source rejected: unsupported dependency source git"'
+    ),
+))
+def test_sandbox_project_failure_and_timeout_remain_repairable(reason: str) -> None:
+    assert project_scale_runner_module._generated_project_validation_is_repairable(
+        project_scale_runner_module._EvidenceCheck(passed=False, reasons=(reason,))
+    )
 
 
 @pytest.mark.parametrize(
@@ -2017,6 +2088,7 @@ def test_non_preview_request_does_not_require_html_entrypoint() -> None:
     assert result.passed is True
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_capability_build_success_cannot_replace_independent_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2035,6 +2107,7 @@ def test_capability_build_success_cannot_replace_independent_requirements(
     assert "requirements: task API missing" in result.reasons
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_capability_medium_uses_independent_crm_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2054,6 +2127,7 @@ def test_capability_medium_uses_independent_crm_requirements(
     assert "requirements: tenant isolation missing" in result.reasons
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_capability_large_uses_independent_order_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2078,6 +2152,7 @@ def test_capability_large_uses_independent_order_requirements(
     assert project_scale_runner_module._generated_project_validation_stage(result) == 3
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_capability_ultra_uses_independent_portfolio_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5487,6 +5562,7 @@ def test_execute_project_scale_plan_accepts_small_functional_source_bundle() -> 
     assert report.ok is True
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_execute_project_scale_plan_can_validate_generated_project_bundle() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
@@ -5531,6 +5607,7 @@ def test_execute_project_scale_plan_can_validate_generated_project_bundle() -> N
     assert result.errors == ()
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_execute_project_scale_plan_fails_when_generated_project_validation_fails() -> None:
     plan = build_project_scale_run_plan(benchmark_kind="fixture", scales=("small",), flows=("direct",), execute=True)
     client = FakeAcceptanceClient(
@@ -5580,6 +5657,7 @@ def test_execute_project_scale_plan_fails_when_generated_project_validation_fail
     )
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_execute_project_scale_plan_repairs_generated_project_validation_failure(
     tmp_path: Path,
 ) -> None:
@@ -5723,6 +5801,7 @@ def test_execute_project_scale_plan_merges_partial_repair_bundle(
     assert len(seen) == 2
 
 
+@pytest.mark.usefixtures("trusted_python_fixture_commands")
 def test_execute_project_scale_plan_repairs_running_run_with_invalid_generated_project(
     tmp_path: Path,
 ) -> None:

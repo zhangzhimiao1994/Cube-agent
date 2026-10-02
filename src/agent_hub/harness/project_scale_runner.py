@@ -6,7 +6,6 @@ import json
 import os
 import posixpath
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +32,7 @@ from agent_hub.harness.project_scale import (
     ProjectScaleRunPlan,
     build_project_scale_run_plan,
 )
+from agent_hub.harness.project_validation_sandbox import generated_command, sandbox_available
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _QUALITY_KEYS = frozenset(
@@ -2330,30 +2330,19 @@ def _run_generated_project_command(
 ) -> str | None:
     if not command or any(not isinstance(part, str) or not part for part in command):
         return "generated_project_validation: invalid validation command"
-    if command[0].casefold() in {"node", "npm", "npm.cmd", "npx", "npx.cmd"} and not (
-        _generated_project_validation_is_isolated()
-    ):
-        return (
-            "generated_project_validation: isolated systemd validator is required "
-            "for generated npm/node commands"
+    try:
+        resolved_command = generated_command(
+            command, cwd=cwd, config=_generated_project_command_env(),
         )
-    validation_home = cwd / ".agent-hub-validation-home"
-    validation_home.mkdir(parents=True, exist_ok=True)
-    safe_env = _generated_project_command_env()
-    safe_env.update(
-        {
-            "HOME": str(validation_home),
-            "USERPROFILE": str(validation_home),
-            "NPM_CONFIG_CACHE": str(validation_home / ".npm"),
-        }
-    )
-    executable = shutil.which(command[0], path=safe_env.get("PATH")) or command[0]
-    resolved_command = [executable, *command[1:]]
+    except (OSError, RuntimeError) as error:
+        return f"generated_project_validation: {error}"
+    safe_env = {"PATH": "/usr/bin:/bin"}
     try:
         completed = subprocess.run(
             resolved_command,
             cwd=cwd,
             env=safe_env,
+            stdin=subprocess.DEVNULL,
             check=False,
             capture_output=True,
             text=True,
@@ -2376,6 +2365,8 @@ def _run_generated_project_command(
             f"{completed.stdout or ''}\n{completed.stderr or ''}"
         )
         output_note = f" output_tail={output_tail}" if output_tail else ""
+        if (completed.stderr or "").lstrip().startswith("bwrap:"):
+            return f"generated_project_validation: bwrap sandbox launch failed{output_note}"
         return (
             "generated_project_validation: command failed "
             f"exit={completed.returncode} command={_format_command(command)}{output_note}"
@@ -2384,21 +2375,21 @@ def _run_generated_project_command(
 
 
 def _generated_project_validation_is_isolated() -> bool:
-    if os.name != "posix":
-        return False
-    if os.environ.get("AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX") != "systemd":
-        return False
-    try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return "agent-hub-acceptance-" in cgroup
+    return sandbox_available()
 
 
 def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
     if result.passed:
         return True
     infrastructure_markers = (
+        "bwrap sandbox required",
+        "bwrap sandbox requirements unavailable",
+        "bwrap sandbox validator failed",
+        "bwrap sandbox validator returned an invalid result",
+        "bwrap sandbox launch failed",
+        "bwrap sandbox: unsupported",
+        "bwrap sandbox: only fixed npm install",
+        "bwrap sandbox: registry must be",
         "isolated systemd validator is required",
         "npm executable unavailable",
         "unsupported platform for process-tree cleanup",

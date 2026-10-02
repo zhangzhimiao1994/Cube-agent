@@ -15,14 +15,44 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
 
 _PLATFORM = os.name
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _TH32CS_SNAPPROCESS = 0x00000002
+
+
+def _dispatch_validation(
+    root: Path, timeout_seconds: float, scale: str,
+    fixture_validator: Callable[[Path, float], tuple[str, ...]],
+) -> tuple[str, ...]:
+    if _PLATFORM == "posix":
+        from agent_hub.harness.project_validation_sandbox import validate_requirements
+
+        return validate_requirements(root, scale, timeout_seconds)
+    # Windows compatibility is for trusted local fixtures, never Linux production.
+    return fixture_validator(root, timeout_seconds)
+
+
+def validate_small_task_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    return _dispatch_validation(root, timeout_seconds, "small", _validate_small_task_api)
+
+
+def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    return _dispatch_validation(root, timeout_seconds, "medium", _validate_medium_crm_api)
+
+
+def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    return _dispatch_validation(root, timeout_seconds, "large", _validate_large_order_ops_api)
+
+
+def validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+    return _dispatch_validation(root, timeout_seconds, "ultra", _validate_ultra_portfolio_api)
 
 
 class _ValidationFailure(Exception):
@@ -89,44 +119,190 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _windows_descendant_pids(root_pid: int) -> list[int]:
+def _windows_kernel32() -> Any:
     if sys.platform != "win32":
-        return []
-    kernel32 = ctypes.windll.kernel32
-    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        raise _ValidationFailure("Windows cleanup is unavailable on this platform")
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateToolhelp32Snapshot": ((wintypes.DWORD, wintypes.DWORD), wintypes.HANDLE),
+        "Process32First": (
+            (wintypes.HANDLE, ctypes.POINTER(_WindowsProcessEntry32)), wintypes.BOOL,
+        ),
+        "Process32Next": (
+            (wintypes.HANDLE, ctypes.POINTER(_WindowsProcessEntry32)), wintypes.BOOL,
+        ),
+        "OpenProcess": ((wintypes.DWORD, wintypes.BOOL, wintypes.DWORD), wintypes.HANDLE),
+        "GetProcessTimes": (
+            (wintypes.HANDLE, *(ctypes.POINTER(wintypes.FILETIME),) * 4), wintypes.BOOL,
+        ),
+        "TerminateProcess": ((wintypes.HANDLE, wintypes.UINT), wintypes.BOOL),
+        "WaitForSingleObject": ((wintypes.HANDLE, wintypes.DWORD), wintypes.DWORD),
+        "CloseHandle": ((wintypes.HANDLE,), wintypes.BOOL),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes = arguments
+        function.restype = result
+    return kernel
+
+
+def _windows_process_parents(kernel: Any) -> dict[int, int]:
+    if sys.platform != "win32":
+        raise _ValidationFailure("Windows cleanup is unavailable on this platform")
+    snapshot = kernel.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
     if snapshot == ctypes.c_void_p(-1).value:
-        return []
-    children: dict[int, list[int]] = {}
+        raise ctypes.WinError(ctypes.get_last_error())
+    parents: dict[int, int] = {}
     entry = _WindowsProcessEntry32()
     entry.dwSize = ctypes.sizeof(_WindowsProcessEntry32)
     try:
-        has_entry = kernel32.Process32First(snapshot, ctypes.byref(entry))
+        has_entry = kernel.Process32First(snapshot, ctypes.byref(entry))
         while has_entry:
-            parent = int(entry.th32ParentProcessID)
-            pid = int(entry.th32ProcessID)
-            children.setdefault(parent, []).append(pid)
-            has_entry = kernel32.Process32Next(snapshot, ctypes.byref(entry))
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            has_entry = kernel.Process32Next(snapshot, ctypes.byref(entry))
+        error = ctypes.get_last_error()
+        if error != 18:  # ERROR_NO_MORE_FILES
+            raise ctypes.WinError(error)
     finally:
-        kernel32.CloseHandle(snapshot)
-
-    descendants: list[int] = []
-    pending = list(children.get(root_pid, ()))
-    while pending:
-        pid = pending.pop()
-        descendants.append(pid)
-        pending.extend(children.get(pid, ()))
-    return descendants
+        kernel.CloseHandle(snapshot)
+    return parents
 
 
-def _kill_windows_process_tree(root_pid: int) -> tuple[str, ...]:
+def _windows_creation_time(kernel: Any, handle: int) -> int:
+    if sys.platform != "win32":
+        raise _ValidationFailure("Windows cleanup is unavailable on this platform")
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
+def _kill_windows_process_tree(process: subprocess.Popen[bytes]) -> tuple[str, ...]:
+    if sys.platform != "win32":
+        raise _ValidationFailure("Windows cleanup is unavailable on this platform")
+    kernel = _windows_kernel32()
+    deadline = time.monotonic() + 3
     errors: list[str] = []
-    for pid in (*reversed(_windows_descendant_pids(root_pid)), root_pid):
+    root_pid = process.pid
+    root_handle = int(cast(Any, process)._handle)
+    with ExitStack() as stack:
+        root_created: int | None = None
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
+            root_created = _windows_creation_time(kernel, root_handle)
         except OSError as exc:
-            errors.append(f"pid {pid}: {exc}")
+            errors.append(f"pid {root_pid}: identity query failed: {exc}")
+        identities: dict[int, tuple[int, int | None]] = {root_pid: (root_handle, root_created)}
+        seen = {root_pid}
+        try:
+            parents = _windows_process_parents(kernel)
+        except OSError as exc:
+            errors.append(f"process snapshot query failed: {exc}")
+            parents = {}
+        while True:
+            children: dict[int, list[int]] = {}
+            for pid, parent in parents.items():
+                children.setdefault(parent, []).append(pid)
+            candidates = identities.copy()
+            ordered = list(identities)
+            for parent in ordered:
+                for pid in children.get(parent, ()):
+                    if pid in seen:
+                        continue
+                    if time.monotonic() >= deadline:
+                        errors.append("identity discovery exceeded 3s deadline")
+                        break
+                    seen.add(pid)
+                    parent_created = candidates[parent][1]
+                    if parent_created is None:
+                        errors.append(f"pid {pid}: parent identity query unavailable")
+                        continue
+                    # Hold identity handles across every snapshot and termination.
+                    handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
+                    if not handle:
+                        error = ctypes.get_last_error()
+                        errors.append(f"pid {pid}: subtree identity unavailable: {ctypes.WinError(error)}")
+                        continue
+                    handle = cast(int, handle)
+                    stack.callback(kernel.CloseHandle, handle)
+                    try:
+                        created = _windows_creation_time(kernel, handle)
+                    except OSError as exc:
+                        errors.append(f"pid {pid}: identity query failed: {exc}")
+                        continue
+                    if created < parent_created:
+                        continue
+                    candidates[pid] = (handle, created)
+                    ordered.append(pid)
+            if time.monotonic() >= deadline:
+                errors.append("identity confirmation exceeded 3s deadline")
+                current_parents = {}
+            else:
+                try:
+                    current_parents = _windows_process_parents(kernel)
+                except OSError as exc:
+                    errors.append(f"process snapshot query failed: {exc}")
+                    current_parents = {}
+            accepted = set(identities)
+            for pid in ordered:
+                if pid in identities:
+                    continue
+                parent = parents[pid]
+                same_parent = current_parents.get(pid) == parent
+                exited = (
+                    pid not in current_parents
+                    and kernel.WaitForSingleObject(candidates[pid][0], 0) == 0
+                )
+                if parent in accepted and (same_parent or exited):
+                    accepted.add(pid)
+                    identities[pid] = candidates[pid]
+            waiting: list[tuple[int, int]] = []
+            for pid in reversed(identities):
+                handle = identities[pid][0]
+                state = kernel.WaitForSingleObject(handle, 0)
+                if state == 0:
+                    continue
+                if state != 258:
+                    errors.append(f"pid {pid}: process state query failed")
+                    continue
+                terminate_handle = handle if pid == root_pid else kernel.OpenProcess(1, False, pid)
+                if terminate_handle and pid != root_pid:
+                    stack.callback(kernel.CloseHandle, terminate_handle)
+                if not terminate_handle or not kernel.TerminateProcess(terminate_handle, 1):
+                    error = ctypes.get_last_error()
+                    if error == 5 and kernel.WaitForSingleObject(handle, 0) == 0:
+                        continue
+                    errors.append(f"pid {pid}: {ctypes.WinError(error)}")
+                    continue
+                waiting.append((pid, handle))
+            for pid, handle in waiting:
+                milliseconds = max(0, int((deadline - time.monotonic()) * 1000))
+                if kernel.WaitForSingleObject(handle, milliseconds) != 0:
+                    errors.append(f"pid {pid}: cleanup wait failed or exceeded 3s deadline")
+            # Check after termination too: a confirmed parent may have spawned
+            # another child between the identity snapshot and TerminateProcess.
+            if time.monotonic() >= deadline:
+                errors.append("descendant cleanup exceeded 3s deadline")
+                break
+            try:
+                parents = _windows_process_parents(kernel)
+            except OSError as exc:
+                errors.append(f"process snapshot query failed: {exc}")
+                break
+            new_children = any(
+                pid not in seen and parent in identities for pid, parent in parents.items()
+            )
+            known_live = any(kernel.WaitForSingleObject(handle, 0) != 0 for handle, _ in identities.values())
+            if not new_children:
+                if known_live and not errors:
+                    errors.append("known process remains alive after cleanup")
+                break
+            if time.monotonic() >= deadline:
+                errors.append("descendant cleanup exceeded 3s deadline")
+                break
     return tuple(errors)
 
 
@@ -143,30 +319,9 @@ def _stop_tree(process: subprocess.Popen[bytes], taskkill: str | None) -> None:
         except ProcessLookupError:
             pass
     else:
-        taskkill_error = ""
-        if process.poll() is None and taskkill is not None:
-            result = subprocess.run(
-                [taskkill, "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-            if result.returncode == 0:
-                process.wait(timeout=3)
-                return
-            taskkill_error = (
-                result.stderr.decode("utf-8", errors="replace")
-                or result.stdout.decode("utf-8", errors="replace")
-            ).strip()
-        elif taskkill is None:
-            taskkill_error = "taskkill unavailable"
-        kill_errors = _kill_windows_process_tree(process.pid)
+        kill_errors = _kill_windows_process_tree(process)
         if kill_errors:
-            detail = f": {taskkill_error}" if taskkill_error else ""
-            kill_detail = "; ".join(kill_errors)
-            raise _ValidationFailure(
-                f"cleanup: taskkill failed and process tree kill failed{detail}; {kill_detail}"
-            )
+            raise _ValidationFailure(f"cleanup: process tree kill failed; {'; '.join(kill_errors)}")
     process.wait(timeout=3)
 
 
@@ -546,7 +701,7 @@ def _environment(data: str) -> dict[str, str]:
     return env
 
 
-def validate_small_task_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+def _validate_small_task_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     """Check an installed/built project's CRUD, 404s and persistence through npm start.
 
     The caller must supply an isolated execution environment: this executes project
@@ -647,7 +802,7 @@ def validate_small_task_api(root: Path, timeout_seconds: float) -> tuple[str, ..
     return tuple(failures)
 
 
-def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+def _validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     """Check the medium CRM-lite contract with tenant isolation and persistence."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         return ("timeout_seconds must be finite and positive",)
@@ -813,7 +968,7 @@ def validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, ..
     return tuple(failures)
 
 
-def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     """Check the large order-operations contract with failure paths and persistence."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         return ("timeout_seconds must be finite and positive",)
@@ -967,7 +1122,7 @@ def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[st
     return tuple(failures)
 
 
-def validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     """Check the ultra portfolio-OS contract with RBAC, analytics and persistence."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         return ("timeout_seconds must be finite and positive",)

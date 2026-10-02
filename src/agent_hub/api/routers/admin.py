@@ -30,6 +30,7 @@ from collections.abc import (
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast, get_args
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -14317,9 +14318,17 @@ def _safe_audit_details(details: Mapping[str, object] | None) -> dict[str, str]:
     return _safe_log_details({str(key): str(value) for key, value in details.items()})
 
 
+_audit_event_id_lock = Lock()
+_last_audit_event_tick = 0
+
+
 def _new_audit_event_id() -> str:
     """Keep same-timestamp audit events in their real creation order."""
-    return f"audit_{time.monotonic_ns():020d}_{uuid4().hex}"
+    global _last_audit_event_tick
+    with _audit_event_id_lock:
+        tick = max(time.monotonic_ns(), _last_audit_event_tick + 1)
+        _last_audit_event_tick = tick
+    return f"audit_{tick:020d}_{uuid4().hex}"
 
 
 def _audit_event_matches(
@@ -15936,7 +15945,7 @@ def _hermes_change_history(
             for event in audit_events
             if event.resource == resource and event.action.startswith("hermes.")
         ),
-        key=lambda event: event.created_at,
+        key=lambda event: (event.created_at, event.id),
     )
     changes.extend(
         HermesJourneyChangeResponse(

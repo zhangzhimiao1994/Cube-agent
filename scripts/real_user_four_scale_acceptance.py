@@ -1338,7 +1338,7 @@ def _case_scope_value(
     if not isinstance(value, Mapping):
         raise TypeError(f"case evidence scope is missing {section}.{key}")
     scoped = value.get(key)
-    if not isinstance(scoped, str) or not scoped:
+    if not isinstance(scoped, str) or not scoped.strip():
         raise ValueError(f"case evidence scope is missing {section}.{key}")
     return scoped
 
@@ -1373,18 +1373,33 @@ def _validated_case_evidence(
     raw_cases = automated_report.get("cases")
     if not isinstance(raw_cases, list) or not raw_cases:
         raise ValueError("automated report must contain case evidence scopes")
+    expected_ids = {f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES}
+    case_ids: set[str] = set()
+    for case in raw_cases:
+        if not isinstance(case, Mapping):
+            raise TypeError("automated report case evidence must be an object")
+        case_id = case.get("case_id")
+        if not isinstance(case_id, str) or case_id not in expected_ids:
+            raise ValueError("automated report case evidence has an invalid canonical case_id")
+        if case_id in case_ids:
+            raise ValueError(f"automated report case evidence has duplicate case_id: {case_id}")
+        if case.get("core_acceptance_ok") is not True or case.get("status") == "failed":
+            raise ValueError(f"automated report case evidence must pass core acceptance: {case_id}")
+        case_ids.add(case_id)
+    if case_ids != expected_ids:
+        raise ValueError(
+            "automated report case evidence must contain every canonical case exactly once"
+        )
     raw_evidence = evidence.get("cases")
     if raw_evidence is None:
         raise ValueError("real-device case evidence is required")
     if not isinstance(raw_evidence, Mapping):
         raise TypeError("real-device case evidence must be an object")
+    if set(raw_evidence) != expected_ids:
+        raise ValueError("real-device case evidence must match the canonical case set exactly")
     validated: dict[str, dict[str, object]] = {}
     for case in raw_cases:
-        if not isinstance(case, Mapping) or case.get("core_acceptance_ok") is not True:
-            continue
-        case_id = case.get("case_id")
-        if not isinstance(case_id, str) or not case_id:
-            raise ValueError("automated report case evidence is missing case_id")
+        case_id = cast(str, case["case_id"])
         item = raw_evidence.get(case_id)
         if item is None:
             raise ValueError(f"case evidence is missing for {case_id}")
@@ -1411,8 +1426,6 @@ def _validated_case_evidence(
                 device="mobile",
             ),
         }
-    if not validated:
-        raise ValueError("real-device case evidence is empty")
     return validated
 
 
@@ -1468,8 +1481,19 @@ def finalize_real_device_acceptance(
     return completed
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _read_json_mapping(path: str) -> dict[str, object]:
-    parsed = json.loads(Path(path).read_text(encoding="utf-8"))
+    parsed = json.loads(
+        Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object,
+    )
     if not isinstance(parsed, dict):
         raise TypeError(f"JSON file must contain an object: {path}")
     return cast(dict[str, object], parsed)

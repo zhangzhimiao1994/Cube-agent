@@ -33,6 +33,19 @@ def load_script() -> Any:
     return module
 
 
+@pytest.mark.parametrize("raw", (
+    '{"cases":{"small:auto":{"passed":false},"small:auto":{"passed":true}}}',
+    '{"execution_id":"old","execution_id":"new"}',
+    '{"cases":{"small:auto":{"desktop":{"passed":false,"passed":true}}}}',
+))
+def test_evidence_json_rejects_duplicate_keys(tmp_path: Path, raw: str) -> None:
+    module = load_script()
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        module._read_json_mapping(str(evidence))
+
+
 class PublicArtifactClient:
     def __init__(self, bundle: bytes) -> None:
         self.bundle = bundle
@@ -623,7 +636,45 @@ def _passing_evidence() -> dict[str, bool]:
     }
 
 
-def _real_device_evidence(execution_id: str) -> dict[str, object]:
+_FINALIZER_CASE_IDS = tuple(
+    f"{scale}:{route}"
+    for scale in ("small", "medium", "large", "ultra")
+    for route in ("auto", "direct", "dispatch", "hybrid", "multi_agent")
+)
+
+
+def _pending_automated_report() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "real_user_four_scale_acceptance",
+        "execution_id": "matrix-123",
+        "status": "pending_real_device",
+        "core_acceptance_ok": True,
+        "automated_acceptance_complete": True,
+        "real_device_acceptance_complete": False,
+        "acceptance_complete": False,
+        "case_count": 20,
+        "core_passed_case_count": 20,
+        "failed_case_count": 0,
+        "dynamic_web_preview": {"status": "pending_real_device"},
+        "cases": [
+            {
+                "case_id": case_id,
+                "status": "pending_real_device",
+                "core_acceptance_ok": True,
+                "real_device_acceptance_complete": False,
+                "acceptance_complete": False,
+                "project": {"project_id": f"project-{case_id}"},
+                "conversation": {"conversation_id": f"conv-{case_id}"},
+                "run": {"run_id": f"run-{case_id}"},
+                "dynamic_web_preview": {"browser_interaction": "pending_real_device"},
+            }
+            for case_id in _FINALIZER_CASE_IDS
+        ],
+    }
+
+
+def _real_device_evidence(execution_id: str) -> dict[str, Any]:
     checks = {
         "login": True,
         "project_navigation": True,
@@ -647,14 +698,14 @@ def _real_device_evidence(execution_id: str) -> dict[str, object]:
             "checks": checks,
         },
         "cases": {
-            "small:direct": {
-                "project_id": "project-small",
-                "conversation_id": "conv-small",
-                "run_id": "run-small-direct",
+            case_id: {
+                "project_id": f"project-{case_id}",
+                "conversation_id": f"conv-{case_id}",
+                "run_id": f"run-{case_id}",
                 "desktop": {
                     "passed": True,
                     "observed_at": "2026-09-28T12:01:00+00:00",
-                    "evidence_ref": "desktop-trace-small-direct",
+                    "evidence_ref": f"desktop-trace-{case_id}",
                     "checks": {
                         "preview_rendered": True,
                         "preview_interaction": True,
@@ -664,7 +715,7 @@ def _real_device_evidence(execution_id: str) -> dict[str, object]:
                 "mobile": {
                     "passed": True,
                     "observed_at": "2026-09-28T12:06:00+00:00",
-                    "evidence_ref": "mobile-trace-small-direct",
+                    "evidence_ref": f"mobile-trace-{case_id}",
                     "checks": {
                         "preview_rendered": True,
                         "preview_interaction": True,
@@ -672,62 +723,45 @@ def _real_device_evidence(execution_id: str) -> dict[str, object]:
                     },
                 },
             }
+            for case_id in _FINALIZER_CASE_IDS
         },
     }
 
 
 def test_finalize_real_device_acceptance_requires_and_merges_both_viewports() -> None:
     module = load_script()
-    pending = {
-        "schema_version": 1,
-        "kind": "real_user_four_scale_acceptance",
-        "execution_id": "matrix-123",
-        "status": "pending_real_device",
-        "core_acceptance_ok": True,
-        "automated_acceptance_complete": True,
-        "real_device_acceptance_complete": False,
-        "acceptance_complete": False,
-        "dynamic_web_preview": {"status": "pending_real_device"},
-        "cases": [
-            {
-                "case_id": "small:direct",
-                "status": "pending_real_device",
-                "core_acceptance_ok": True,
-                "real_device_acceptance_complete": False,
-                "acceptance_complete": False,
-                "project": {"project_id": "project-small"},
-                "conversation": {"conversation_id": "conv-small"},
-                "run": {"run_id": "run-small-direct"},
-                "dynamic_web_preview": {"browser_interaction": "pending_real_device"},
-            }
-        ],
-    }
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    pending["cases"].reverse()
+    pending_before = copy.deepcopy(pending)
+    evidence_before = copy.deepcopy(evidence)
 
     completed = module.finalize_real_device_acceptance(
         pending,
-        _real_device_evidence("matrix-123"),
+        evidence,
     )
 
     assert completed["status"] == "passed"
     assert completed["real_device_acceptance_complete"] is True
     assert completed["acceptance_complete"] is True
     assert completed["real_device_acceptance"]["counted_as_complete"] is True
-    assert completed["cases"][0]["status"] == "passed"
-    assert completed["cases"][0]["dynamic_web_preview"]["browser_interaction"] == (
-        "verified_by_deployed_real_device_acceptance"
-    )
-    assert pending["status"] == "pending_real_device"
+    assert len(completed["cases"]) == 20
+    assert set(completed["real_device_acceptance"]["cases"]) == set(_FINALIZER_CASE_IDS)
+    for case in completed["cases"]:
+        assert case["status"] == "passed"
+        assert case["acceptance_complete"] is True
+        assert case["real_device_acceptance_complete"] is True
+        assert case["real_device_evidence"] == evidence["cases"][case["case_id"]]
+        assert case["dynamic_web_preview"]["browser_interaction"] == (
+            "verified_by_deployed_real_device_acceptance"
+        )
+    assert pending == pending_before
+    assert evidence == evidence_before
 
 
 def test_finalize_real_device_acceptance_rejects_mismatched_execution() -> None:
     module = load_script()
-    pending = {
-        "kind": "real_user_four_scale_acceptance",
-        "execution_id": "matrix-123",
-        "core_acceptance_ok": True,
-        "automated_acceptance_complete": True,
-        "cases": [],
-    }
+    pending = _pending_automated_report()
 
     try:
         module.finalize_real_device_acceptance(
@@ -742,34 +776,159 @@ def test_finalize_real_device_acceptance_rejects_mismatched_execution() -> None:
 
 def test_finalize_real_device_acceptance_rejects_missing_case_evidence() -> None:
     module = load_script()
-    pending = {
-        "kind": "real_user_four_scale_acceptance",
-        "execution_id": "matrix-123",
-        "core_acceptance_ok": True,
-        "automated_acceptance_complete": True,
-        "cases": [
-            {
-                "case_id": "small:direct",
-                "core_acceptance_ok": True,
-                "project": {"project_id": "project-small"},
-                "conversation": {"conversation_id": "conv-small"},
-                "run": {"run_id": "run-small-direct"},
-            },
-            {
-                "case_id": "medium:hybrid",
-                "core_acceptance_ok": True,
-                "project": {"project_id": "project-medium"},
-                "conversation": {"conversation_id": "conv-medium"},
-                "run": {"run_id": "run-medium-hybrid"},
-            },
-        ],
-    }
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    del evidence["cases"]["medium:hybrid"]
 
     with pytest.raises(ValueError, match="case evidence"):
         module.finalize_real_device_acceptance(
             pending,
-            _real_device_evidence("matrix-123"),
+            evidence,
         )
+
+
+@pytest.mark.parametrize("case_id", _FINALIZER_CASE_IDS)
+def test_finalize_rejects_any_missing_canonical_case_despite_success_flags(case_id: str) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    pending["cases"] = [case for case in pending["cases"] if case["case_id"] != case_id]
+    del evidence["cases"][case_id]
+
+    with pytest.raises(ValueError):
+        module.finalize_real_device_acceptance(pending, evidence)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "one_case",
+        "empty",
+        "missing_cases",
+        "cases_object",
+        "cases_string",
+        "duplicate",
+        "duplicate_replaces_case",
+        "unknown",
+        "unknown_replaces_case",
+        "non_object",
+        "missing_id",
+        "empty_id",
+        "non_string_id",
+        "list_id",
+        "failed",
+        "failed_status",
+        "missing_core",
+        "integer_core",
+        "string_core",
+    ],
+)
+def test_finalize_rejects_invalid_automated_cases(change: str) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    first = pending["cases"][0]
+    if change == "one_case":
+        pending["cases"] = [first]
+        evidence["cases"] = {first["case_id"]: evidence["cases"][first["case_id"]]}
+    elif change == "empty":
+        pending["cases"] = []
+    elif change == "missing_cases":
+        del pending["cases"]
+    elif change == "cases_object":
+        pending["cases"] = {first["case_id"]: first}
+    elif change == "cases_string":
+        pending["cases"] = "small:auto"
+    elif change == "duplicate":
+        pending["cases"].append(copy.deepcopy(first))
+    elif change == "duplicate_replaces_case":
+        pending["cases"][-1] = copy.deepcopy(first)
+    elif change in {"unknown", "unknown_replaces_case"}:
+        unknown = {**first, "case_id": "small:unknown"}
+        evidence["cases"]["small:unknown"] = copy.deepcopy(evidence["cases"][first["case_id"]])
+        if change == "unknown":
+            pending["cases"].append(unknown)
+        else:
+            evidence["cases"].pop(pending["cases"][-1]["case_id"])
+            pending["cases"][-1] = unknown
+    elif change == "non_object":
+        pending["cases"][0] = None
+    elif change == "missing_id":
+        del first["case_id"]
+    elif change == "empty_id":
+        first["case_id"] = ""
+    elif change == "non_string_id":
+        first["case_id"] = 1
+    elif change == "list_id":
+        first["case_id"] = ["small:auto"]
+    elif change == "failed":
+        first["core_acceptance_ok"] = False
+        first["status"] = "failed"
+    elif change == "failed_status":
+        first["status"] = "failed"
+    elif change == "missing_core":
+        del first["core_acceptance_ok"]
+    elif change == "integer_core":
+        first["core_acceptance_ok"] = 1
+    elif change == "string_core":
+        first["core_acceptance_ok"] = "true"
+    pending_before = copy.deepcopy(pending)
+    evidence_before = copy.deepcopy(evidence)
+
+    with pytest.raises((TypeError, ValueError)):
+        module.finalize_real_device_acceptance(pending, evidence)
+    assert pending == pending_before
+    assert evidence == evidence_before
+
+
+@pytest.mark.parametrize("change", ["extra", "missing", "missing_cases", "non_object", "bad_item"])
+def test_finalize_rejects_invalid_evidence_case_set(change: str) -> None:
+    module = load_script()
+    evidence = _real_device_evidence("matrix-123")
+    if change == "extra":
+        evidence["cases"]["unknown:direct"] = copy.deepcopy(evidence["cases"]["small:auto"])
+    elif change == "missing":
+        del evidence["cases"]["ultra:multi_agent"]
+    elif change == "missing_cases":
+        del evidence["cases"]
+    elif change == "non_object":
+        evidence["cases"] = []
+    elif change == "bad_item":
+        evidence["cases"]["small:auto"] = []
+
+    with pytest.raises((TypeError, ValueError)):
+        module.finalize_real_device_acceptance(_pending_automated_report(), evidence)
+
+
+@pytest.mark.parametrize("field", ["project_id", "conversation_id", "run_id"])
+@pytest.mark.parametrize("value", [None, "", "wrong-scope", 1])
+def test_finalize_rejects_case_evidence_scope_mismatch(field: str, value: object) -> None:
+    module = load_script()
+    evidence = _real_device_evidence("matrix-123")
+    evidence["cases"]["ultra:multi_agent"][field] = value
+
+    with pytest.raises(ValueError, match="does not match"):
+        module.finalize_real_device_acceptance(_pending_automated_report(), evidence)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [("project", "project_id"), ("conversation", "conversation_id"), ("run", "run_id")],
+)
+@pytest.mark.parametrize("value", [None, "", "   ", 1])
+def test_finalize_rejects_malformed_automated_scope(
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    pending["cases"][-1][section][field] = value
+    evidence["cases"]["ultra:multi_agent"][field] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        module.finalize_real_device_acceptance(pending, evidence)
 
 
 def test_finalize_cli_writes_complete_report_without_logging_in(
@@ -781,23 +940,7 @@ def test_finalize_cli_writes_complete_report_without_logging_in(
     evidence_path = tmp_path / "real-device.json"
     output_path = tmp_path / "complete.json"
     report_path.write_text(
-        json.dumps(
-            {
-                "kind": "real_user_four_scale_acceptance",
-                "execution_id": "matrix-123",
-                "core_acceptance_ok": True,
-                "automated_acceptance_complete": True,
-                "cases": [
-                    {
-                        "case_id": "small:direct",
-                        "core_acceptance_ok": True,
-                        "project": {"project_id": "project-small"},
-                        "conversation": {"conversation_id": "conv-small"},
-                        "run": {"run_id": "run-small-direct"},
-                    }
-                ],
-            }
-        ),
+        json.dumps(_pending_automated_report()),
         encoding="utf-8",
     )
     evidence_path.write_text(
