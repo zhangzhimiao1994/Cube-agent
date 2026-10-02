@@ -1262,6 +1262,65 @@ describe("slashCommandsForQuery", () => {
   });
 });
 
+describe("composer settings light surface CSS contract", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+
+  function rule(selector: string) {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return Array.from(
+      stylesCss.matchAll(new RegExp(`${escaped}(?:\\s*,[^{}]+)?\\s*\\{([^}]*)\\}`, "g")),
+      (match) => match[1],
+    ).join("\n");
+  }
+
+  it("keeps inherited titles, paths and helper text readable only inside the light dialog", () => {
+    const dialog = rule(".composer-settings-dialog");
+    expect(dialog).toContain("--text: #1f2937;");
+    expect(dialog).toContain("--ink: #1f2937;");
+    expect(dialog).toContain("--muted: #475569;");
+    expect(dialog).toContain("--accent: #0e7490;");
+    expect(rule(":root")).toContain("--text: #e8fbff;");
+    expect(rule(":root")).toContain("--accent: #55d7ff;");
+  });
+
+  it("gives sandbox choices and secondary actions light backgrounds and visible boundaries", () => {
+    const controls = rule(".composer-settings-dialog .secondary-action");
+    expect(controls).toContain("background: #ffffff;");
+    expect(controls).toContain("border-color: #64748b;");
+    expect(controls).toContain("box-shadow: none;");
+    expect(controls).toContain("color: var(--text);");
+    expect(rule(".composer-settings-dialog .sandbox-choice")).toBe(controls);
+    expect(rule(".composer-settings-dialog .sandbox-choice strong")).toContain("color: inherit;");
+    const selected = rule(".composer-settings-dialog .sandbox-choice.selected");
+    expect(selected).toContain("background: #ecfdf5;");
+    expect(selected).toContain("border-color: #0f766e;");
+  });
+
+  it("keeps hover, keyboard focus, disabled controls and the details summary readable", () => {
+    const hover = rule(".composer-settings-dialog .secondary-action:focus-visible:not(:disabled)");
+    expect(hover).toContain("background: #f1f5f9;");
+    expect(hover).toContain("border-color: var(--accent);");
+    expect(rule(".composer-settings-dialog .sandbox-choice:hover:not(:disabled)")).toBe(hover);
+    expect(rule(".composer-settings-dialog .sandbox-choice:focus-visible:not(:disabled)")).toBe(hover);
+    expect(rule(".composer-settings-dialog .secondary-action:hover:not(:disabled)")).toBe(hover);
+    const selectedHover = rule(".composer-settings-dialog .sandbox-choice.selected:focus-visible:not(:disabled)");
+    expect(selectedHover).toContain("background: #d1fae5;");
+    expect(selectedHover).toContain("border-color: #0f766e;");
+    expect(rule(".composer-settings-dialog .sandbox-choice.selected:hover:not(:disabled)")).toBe(selectedHover);
+    const disabled = rule(".composer-settings-dialog .secondary-action:disabled");
+    expect(disabled).toContain("background: #f1f5f9;");
+    expect(disabled).toContain("color: var(--muted);");
+    expect(disabled).toContain("opacity: 1;");
+    expect(disabled).toContain("box-shadow: none;");
+    expect(disabled).toContain("transform: none;");
+    expect(rule(".composer-settings-dialog .sandbox-choice:disabled")).toBe(disabled);
+    expect(rule(".composer-settings-dialog .run-settings-panel > summary")).toContain("background: #f1f5f9;");
+    expect(rule(".composer-settings-dialog .run-settings-panel > summary::after")).toContain("color: var(--muted);");
+    expect(rule(".composer-settings-dialog .run-settings-panel > summary:hover")).toContain("background: #e2e8f0;");
+    expect(rule(".composer-settings-dialog .run-settings-panel > summary:focus-visible")).toContain("outline: 2px solid var(--accent);");
+  });
+});
+
 describe("agentInlineSummary", () => {
   it("does not disable touch scrolling while the workbench owns nested mobile drawers", () => {
     const source = readFileSync("src/pages/RunsPage.tsx", "utf8");

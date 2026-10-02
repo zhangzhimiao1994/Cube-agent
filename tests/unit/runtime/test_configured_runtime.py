@@ -5711,6 +5711,84 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
     assert initialized_scope_ids == [("main_1",)]
 
 
+@pytest.mark.parametrize("multi_agent_chain", [False, True])
+@pytest.mark.parametrize("fallback_policy", ["configured", "disabled"])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_dispatch_final_synthesizer_has_eligible_recovery_models(
+    multi_agent_chain: bool,
+    fallback_policy: str,
+    pinned: bool,
+) -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                name: {
+                    "deployments": [
+                        {
+                            "provider": "openai",
+                            "model": name,
+                            "api_base": "https://models.example/v1",
+                            "credential_ref": f"secret://{name}",
+                            "quota_scope_id": name,
+                            "capabilities": capabilities,
+                        }
+                    ]
+                }
+                for name, capabilities in (
+                    ("main", ["text"]),
+                    ("backup", ["text"]),
+                    ("image_only", ["vision"]),
+                )
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="writer",
+        role="Writer",
+        purpose=RolePurpose.EXECUTE,
+        mission="Write the requested answer.",
+        must_answer=("What is the answer?",),
+        allowed_tools=(),
+        forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="backup",
+    )
+    roles = (
+        tuple(replace(role, id=role_id) for role_id in ("architect", "implementer", "tester"))
+        if multi_agent_chain
+        else (role,)
+    )
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Summarize the verified answer.",
+            routing_decision={
+                "main_agent_model": "main",
+                "flow": "multi_agent" if multi_agent_chain else "dispatch",
+                "harness_policy": {"fallback_policy": fallback_policy},
+            },
+        ),
+        config=config,
+        deployment_constraint=(
+            DeploymentRoutingConstraint(logical_model="main", provider="openai", model="main")
+            if pinned
+            else None
+        ),
+    )
+
+    final = plan.agents[-1]
+    assert final.logical_model == "main"
+    assert final.allowed_tools == ()
+    assert final.fallback_models == (
+        ("backup",) if fallback_policy == "configured" and not pinned else ()
+    )
+
+
 def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids() -> None:
     plan = _dispatch_plan(
         (

@@ -1912,6 +1912,10 @@ article:hover {
 }
 
 .composer-settings-dialog {
+  --text: #1f2937;
+  --ink: #1f2937;
+  --muted: #475569;
+  --accent: #0e7490;
   background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.34);
   border-radius: 8px;
@@ -1976,7 +1980,69 @@ article:hover {
 .composer-settings-dialog .field-help,
 .composer-settings-dialog small,
 .composer-settings-dialog .mode-help p {
-  color: #64748b;
+  color: var(--muted);
+}
+
+.composer-settings-dialog .sandbox-choice,
+.composer-settings-dialog .secondary-action {
+  background: #ffffff;
+  border-color: #64748b;
+  box-shadow: none;
+  color: var(--text);
+}
+
+.composer-settings-dialog .sandbox-choice strong {
+  color: inherit;
+}
+
+.composer-settings-dialog .sandbox-choice.selected {
+  background: #ecfdf5;
+  border-color: #0f766e;
+  box-shadow: inset 0 0 0 1px #0f766e;
+}
+
+.composer-settings-dialog .sandbox-choice:hover:not(:disabled),
+.composer-settings-dialog .sandbox-choice:focus-visible:not(:disabled),
+.composer-settings-dialog .secondary-action:hover:not(:disabled),
+.composer-settings-dialog .secondary-action:focus-visible:not(:disabled) {
+  background: #f1f5f9;
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+.composer-settings-dialog .sandbox-choice.selected:hover:not(:disabled),
+.composer-settings-dialog .sandbox-choice.selected:focus-visible:not(:disabled) {
+  background: #d1fae5;
+  border-color: #0f766e;
+  box-shadow: inset 0 0 0 1px #0f766e;
+}
+
+.composer-settings-dialog .sandbox-choice:disabled,
+.composer-settings-dialog .secondary-action:disabled {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+  box-shadow: none;
+  color: var(--muted);
+  opacity: 1;
+  transform: none;
+}
+
+.composer-settings-dialog .run-settings-panel > summary {
+  background: #f1f5f9;
+}
+
+.composer-settings-dialog .run-settings-panel > summary::after {
+  color: var(--muted);
+}
+
+.composer-settings-dialog .run-settings-panel > summary:hover {
+  background: #e2e8f0;
+}
+
+.composer-settings-dialog button:focus-visible,
+.composer-settings-dialog .run-settings-panel > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
 }
 
 @media (max-width: 640px) {

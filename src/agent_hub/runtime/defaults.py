@@ -1854,13 +1854,40 @@ def _dispatch_plan(
         )
     final_agent_id = "synthesizer" if multi_agent_chain else "final_synthesizer"
     if not any(agent.id == final_agent_id for agent in agents):
+        final_role = RoleAssignment(
+            id=final_agent_id,
+            role="Synthesizer" if multi_agent_chain else "Final Synthesizer",
+            purpose=RolePurpose.RECORD_DECISION,
+            mission="Merge role outputs into one concise, evidence-aware final answer.",
+            must_answer=("What is the verified final result?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform new tool actions during synthesis.",),
+            skills=(),
+            output_schema={},
+            model=_dispatch_final_synthesizer_model(context, selected_roles[0].model),
+        )
+        final_fallbacks = (
+            _role_model_fallbacks_by_id(
+                (final_role,),
+                (final_role,),
+                config,
+                default_model=final_role.model,
+                task=context.request,
+                deployment_constraint=deployment_constraint,
+            ).get(final_agent_id, ())
+            if config is not None
+            and deployment_constraint is None
+            and fallback_execution_policy_from_decision(context.routing_decision) != "disabled"
+            else ()
+        )
         agents.append(
             AgentSpec(
                 id=final_agent_id,
-                role="Synthesizer" if multi_agent_chain else "Final Synthesizer",
-                goal="Merge role outputs into one concise, evidence-aware final answer.",
-                logical_model=_dispatch_final_synthesizer_model(context, selected_roles[0].model),
+                role=final_role.role,
+                goal=final_role.mission,
+                logical_model=final_role.model,
                 allowed_tools=(),
+                fallback_models=final_fallbacks,
             )
     )
     request_text = str(context.request)
