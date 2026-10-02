@@ -1623,12 +1623,15 @@ async def test_capacity_record_and_release_waits_share_request_deadline() -> Non
     short_request = ModelRequest(
         logical_model="primary",
         messages=(ModelMessage(role="user", content="private prompt"),),
-        timeout_seconds=0.03,
+        # Leave time for provider/heartbeat setup before testing blocked cleanup.
+        timeout_seconds=0.5,
     )
 
-    async with asyncio.timeout(0.5):
+    async with asyncio.timeout(2):
         with pytest.raises(ModelGatewayError, match="outcome recording failed"):
             await gateway.complete(short_request)
+    assert len(capacity.records) == 1
+    assert capacity.records[0][3] is True
     assert capacity.release_started.is_set()
 
 

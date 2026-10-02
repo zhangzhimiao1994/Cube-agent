@@ -12,12 +12,22 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
+
+
+def test_quality_checks_types_for_both_supported_platforms() -> None:
+    workflow = yaml.safe_load(read(".github/workflows/quality.yml"))
+    commands = {
+        step.get("run") for step in workflow["jobs"]["python-web-shell"]["steps"]
+    }
+    for platform in ("linux", "win32"):
+        assert f"uv run mypy --strict --platform {platform} src tests" in commands
 
 
 def test_generated_secrets_use_agent_hub_prefixed_application_environment() -> None:

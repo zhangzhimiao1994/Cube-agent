@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import stat
+import sys
 import tarfile
 import time
 import zipfile
@@ -5384,7 +5385,7 @@ def _plugin_package_uninstall_stage_lock(
             lock_file.write(b"\0")
             lock_file.flush()
         lock_file.seek(0)
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
