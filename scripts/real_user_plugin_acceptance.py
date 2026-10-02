@@ -124,6 +124,7 @@ class AcceptancePluginPackage:
     plugin_id: str
     capability_id: str
     key_id: str
+    runtime_nonce: str
     nonce: str
     input_text: str
     archive_path: Path
@@ -138,12 +139,14 @@ def _safe_suffix(value: str) -> str:
 def build_acceptance_plugin(package_dir: Path, *, execution_id: str) -> AcceptancePluginPackage:
     """Build a unique signed package whose output schema proves the exact adapter result."""
 
-    suffix = _safe_suffix(execution_id)
+    execution_suffix = _safe_suffix(execution_id)
+    runtime_nonce = uuid4().hex
+    suffix = f"{execution_suffix}-{runtime_nonce}"
     plugin_id = f"plugin-uat-{suffix}"
     capability_id = f"acceptance.stats_{suffix.replace('-', '_')}"
     key_id = f"plugin-uat-key-{suffix}"
-    nonce = f"plugin-uat-result-{suffix}-{uuid4().hex[:12]}"
-    input_text = f"真实插件验收 {suffix}"
+    nonce = runtime_nonce
+    input_text = f"真实插件验收 {execution_suffix}"
     source_dir = package_dir / f"source-{suffix}"
     adapter_dir = source_dir / "adapter"
     adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -245,6 +248,7 @@ if __name__ == "__main__":
         plugin_id=plugin_id,
         capability_id=capability_id,
         key_id=key_id,
+        runtime_nonce=runtime_nonce,
         nonce=nonce,
         input_text=input_text,
         archive_path=archive_path,
@@ -293,6 +297,15 @@ def _manifest_capability(
     )
 
 
+def _runtime_nonce_from_identifier(identifier: object, separator: str) -> str:
+    if not isinstance(identifier, str):
+        raise TypeError("runtime evidence identifier is missing")
+    prefix, found, runtime_nonce = identifier.rpartition(separator)
+    if not found or not prefix or not runtime_nonce:
+        raise RuntimeError("runtime evidence identifier does not contain a nonce")
+    return runtime_nonce
+
+
 def verify_public_plugin_invocation(
     *,
     events: object,
@@ -301,6 +314,7 @@ def verify_public_plugin_invocation(
     user_id: str,
     plugin_id: str,
     capability_id: str,
+    runtime_nonce: str,
 ) -> dict[str, object]:
     """Require public tool completion and the exact runtime invocation audit."""
 
@@ -321,7 +335,7 @@ def verify_public_plugin_invocation(
     if failed:
         raise RuntimeError("public run did not complete the expected plugin capability")
     audit_items = _list(audits, "plugin invocation audit")
-    correlated = False
+    correlated_details: Mapping[str, object] | None = None
     for item in audit_items:
         if not isinstance(item, Mapping) or item.get("action") != "plugin.invoke.succeeded":
             continue
@@ -337,14 +351,25 @@ def verify_public_plugin_invocation(
                 "capability_id": capability_id,
             }.items()
         ):
-            correlated = True
+            correlated_details = details
             break
-    if not correlated:
+    if correlated_details is None:
         raise RuntimeError("correlated plugin invocation audit was not found")
+    completed_event = next(
+        item for item in matching_events if item.get("kind") == "tool.completed"
+    )
+    observed_nonces = {
+        _runtime_nonce_from_identifier(completed_event.get("tool_name"), "_"),
+        _runtime_nonce_from_identifier(correlated_details.get("capability_id"), "_"),
+        _runtime_nonce_from_identifier(correlated_details.get("plugin_id"), "-"),
+    }
+    if observed_nonces != {runtime_nonce}:
+        raise RuntimeError("runtime nonce evidence does not match this acceptance invocation")
     return {
         "public_tool_requested": True,
         "public_tool_completed": True,
         "correlated_runtime_audit": True,
+        "runtime_output_schema_nonce": observed_nonces.pop(),
     }
 
 
@@ -405,6 +430,19 @@ def _cleanup(
             completed.append("delete_signing_key")
         except Exception as error:  # noqa: BLE001 - report cleanup failures without hiding the run.
             errors.append(f"delete_signing_key: {error}")
+        try:
+            signing_keys = _list(
+                client.request_json("GET", "/api/v1/admin/plugins/signing-keys"),
+                "plugin signing key list",
+            )
+            if any(
+                isinstance(item, Mapping) and item.get("key_id") == package.key_id
+                for item in signing_keys
+            ):
+                raise RuntimeError("temporary signing key remains registered")
+            completed.append("verify_signing_key_removed")
+        except Exception as error:  # noqa: BLE001 - cleanup verification is acceptance evidence.
+            errors.append(f"verify_signing_key_removed: {error}")
     if installed:
         try:
             plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
@@ -531,7 +569,7 @@ def run_real_user_plugin_acceptance(
                         "完成后简要返回工具结果。"
                     ),
                 },
-                idempotency_key=f"plugin-uat-{_safe_suffix(execution_id)}",
+                idempotency_key=f"plugin-uat-{package.runtime_nonce}",
             ),
             "public run submission",
         )
@@ -553,8 +591,16 @@ def run_real_user_plugin_acceptance(
         events = client.request_json(
             "GET", f"/api/v1/runs/{quote(run_id, safe='')}/events"
         )
+        audit_resource = f"plugin:{package.plugin_id}:{package.capability_id}"
         audits = client.request_json(
-            "GET", "/api/v1/admin/audit?action=plugin.invoke.succeeded"
+            "GET",
+            (
+                "/api/v1/admin/audit?action=plugin.invoke.succeeded"
+                f"&run_id={quote(run_id, safe='')}"
+                f"&user_id={quote(user_id, safe='')}"
+                f"&resource={quote(audit_resource, safe='')}"
+                "&limit=1"
+            ),
         )
         evidence.update(
             verify_public_plugin_invocation(
@@ -564,9 +610,9 @@ def run_real_user_plugin_acceptance(
                 user_id=user_id,
                 plugin_id=package.plugin_id,
                 capability_id=package.capability_id,
+                runtime_nonce=package.runtime_nonce,
             )
         )
-        evidence["runtime_output_schema_nonce"] = package.nonce
         phases.append("unique_result_validated")
     except Exception as error:  # noqa: BLE001 - always clean up and return machine-readable evidence.
         errors.append(str(error))
@@ -591,7 +637,11 @@ def run_real_user_plugin_acceptance(
         cleanup_completed = [*run_cleanup_completed, *cleanup_completed]
         cleanup_errors = [*run_cleanup_errors, *cleanup_errors]
         errors.extend(cleanup_errors)
-    passed = not errors and "verify_removed" in cleanup_completed
+    passed = (
+        not errors
+        and "verify_removed" in cleanup_completed
+        and "verify_signing_key_removed" in cleanup_completed
+    )
     return {
         "schema_version": 1,
         "kind": "real_user_plugin_acceptance",

@@ -24,6 +24,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql import Select
 
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers import admin as admin_router
@@ -4003,6 +4005,204 @@ def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
 
 
+def _audit_event(
+    event_id: str,
+    *,
+    action: str = "plugin.invoke.succeeded",
+    resource: str = "plugin:calendar:calendar.create_event",
+    run_id: UUID,
+    user_id: UUID,
+    created_at: datetime,
+) -> AuditEventResponse:
+    return AuditEventResponse(
+        id=event_id,
+        actor=str(user_id),
+        action=action,
+        resource=resource,
+        details={"run_id": str(run_id), "user_id": str(user_id)},
+        created_at=created_at,
+    )
+
+
+def test_admin_audit_query_filters_exact_invocation_and_limits_latest_result() -> None:
+    api = client()
+    service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    target_run_id = UUID("33333333-3333-4333-8333-333333333333")
+    other_run_id = UUID("44444444-4444-4444-8444-444444444444")
+    other_user_id = UUID("55555555-5555-4555-8555-555555555555")
+    now = datetime.now(UTC)
+    service.audit_events = [
+        _audit_event(
+            "target-old",
+            run_id=target_run_id,
+            user_id=USER_ID,
+            created_at=now - timedelta(seconds=2),
+        ),
+        _audit_event(
+            "other-run",
+            run_id=other_run_id,
+            user_id=USER_ID,
+            created_at=now,
+        ),
+        _audit_event(
+            "other-user",
+            run_id=target_run_id,
+            user_id=other_user_id,
+            created_at=now,
+        ),
+        _audit_event(
+            "target-new",
+            run_id=target_run_id,
+            user_id=USER_ID,
+            created_at=now - timedelta(seconds=1),
+        ),
+    ]
+
+    response = api.get(
+        "/api/v1/admin/audit",
+        headers=headers(),
+        params={
+            "action": "plugin.invoke.succeeded",
+            "run_id": str(target_run_id),
+            "resource": "plugin:calendar:calendar.create_event",
+            "user_id": str(USER_ID),
+            "limit": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert [event["id"] for event in response.json()] == ["target-new"]
+
+
+def test_admin_audit_action_only_query_remains_compatible() -> None:
+    api = client()
+    service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    now = datetime.now(UTC)
+    service.audit_events = [
+        _audit_event("matching", run_id=TENANT_ID, user_id=USER_ID, created_at=now),
+        _audit_event(
+            "different",
+            action="plugin.invoke.failed",
+            run_id=TENANT_ID,
+            user_id=USER_ID,
+            created_at=now,
+        ),
+    ]
+
+    response = api.get(
+        "/api/v1/admin/audit?action=plugin.invoke.succeeded",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert [event["id"] for event in response.json()] == ["matching"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "action=",
+        "action=plugin%20invoke",
+        "run_id=not-a-uuid",
+        "resource=",
+        f"resource={'x' * 513}",
+        "user_id=not-a-uuid",
+        "limit=0",
+        "limit=101",
+    ],
+)
+def test_admin_audit_query_rejects_unsafe_or_out_of_bounds_parameters(query: str) -> None:
+    response = client().get(f"/api/v1/admin/audit?{query}", headers=headers())
+
+    assert response.status_code == 422
+
+
+def test_admin_audit_query_accepts_maximum_plugin_resource_length() -> None:
+    plugin_id = "p" * 128
+    capability_id = "c" * 128
+    resource = f"plugin:{plugin_id}:{capability_id}"
+
+    response = client().get(
+        "/api/v1/admin/audit",
+        headers=headers(),
+        params={"resource": resource, "limit": 1},
+    )
+
+    assert len(resource) == 264
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_persistent_audit_query_pushes_filters_and_limit_into_postgresql() -> None:
+    target_run_id = UUID("33333333-3333-4333-8333-333333333333")
+    target_user_id = UUID("55555555-5555-4555-8555-555555555555")
+    resource = "plugin:calendar:calendar.create_event"
+    now = datetime.now(UTC)
+    payload = _audit_event(
+        "target",
+        run_id=target_run_id,
+        user_id=target_user_id,
+        resource=resource,
+        created_at=now,
+    ).model_dump(mode="json")
+
+    class ScalarRows:
+        def scalars(self) -> tuple[SimpleNamespace, ...]:
+            return (SimpleNamespace(payload=payload),)
+
+    class CapturingSession:
+        statement: Select[Any] | None = None
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def execute(self, statement: Select[Any]) -> ScalarRows:
+            self.statement = statement
+            return ScalarRows()
+
+    session = CapturingSession()
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        session_factory=cast(Any, lambda: session),
+    )
+
+    events = await service.list_audit_events(
+        "plugin.invoke.succeeded",
+        run_id=str(target_run_id),
+        resource=resource,
+        user_id=str(target_user_id),
+        limit=1,
+    )
+
+    assert [event.id for event in events] == ["target"]
+    assert session.statement is not None
+    compiled = session.statement.compile(
+        dialect=postgresql.dialect(),  # type: ignore[no-untyped-call]
+        compile_kwargs={"literal_binds": True},
+    )
+    sql = str(compiled)
+    assert "agent_hub_admin_resources.tenant_id" in sql
+    assert "agent_hub_admin_resources.kind" in sql
+    assert "agent_hub_admin_resources.payload ->> 'action'" in sql
+    assert "(agent_hub_admin_resources.payload['details']) ->> 'run_id'" in sql
+    assert "agent_hub_admin_resources.payload ->> 'resource'" in sql
+    assert "(agent_hub_admin_resources.payload['details']) ->> 'user_id'" in sql
+    assert "ORDER BY agent_hub_admin_resources.created_at DESC" in sql
+    assert "LIMIT 1" in sql
+
+
 class TenantScopedAdminResourceService(InMemoryAdminResourceService):
     def __init__(
         self,
@@ -4106,9 +4306,23 @@ class TenantScopedAdminResourceService(InMemoryAdminResourceService):
             tenant_id=tenant_id,
         )
 
-    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
+    async def list_audit_events(
+        self,
+        action: str | None = None,
+        *,
+        run_id: str | None = None,
+        resource: str | None = None,
+        user_id: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[AuditEventResponse, ...]:
         self.root.calls.append(("list_audit", action or "", self.tenant_id, self.actor_id))
-        return await super().list_audit_events(action)
+        return await super().list_audit_events(
+            action,
+            run_id=run_id,
+            resource=resource,
+            user_id=user_id,
+            limit=limit,
+        )
 
     async def get_settings(self) -> SystemSettingsResponse:
         self.root.calls.append(("get_settings", "", self.tenant_id, self.actor_id))

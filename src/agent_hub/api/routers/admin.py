@@ -3594,7 +3594,13 @@ class AdminResourceService(Protocol):
     async def forget_memory(self, memory_id: str) -> None: ...
 
     async def list_audit_events(
-        self, action: str | None = None
+        self,
+        action: str | None = None,
+        *,
+        run_id: str | None = None,
+        resource: str | None = None,
+        user_id: str | None = None,
+        limit: int | None = None,
     ) -> tuple[AuditEventResponse, ...]: ...
 
     async def record_audit_event(
@@ -7693,11 +7699,23 @@ class InMemoryAdminResourceService:
                 }
             )
 
-    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
-        events = self.audit_events
-        if action is not None:
-            events = [event for event in events if event.action == action]
-        return tuple(events)
+    async def list_audit_events(
+        self,
+        action: str | None = None,
+        *,
+        run_id: str | None = None,
+        resource: str | None = None,
+        user_id: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[AuditEventResponse, ...]:
+        return _filter_audit_events(
+            self.audit_events,
+            action=action,
+            run_id=run_id,
+            resource=resource,
+            user_id=user_id,
+            limit=limit,
+        )
 
     async def record_audit_event(
         self,
@@ -12231,14 +12249,64 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 {"id": memory_id},
             )
 
-    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
-        resources = await self._list_admin_payloads("audit")
-        if resources is None:
-            return await super().list_audit_events(action)
-        events = tuple(_audit_response_from_payload(payload) for payload in resources)
+    async def list_audit_events(
+        self,
+        action: str | None = None,
+        *,
+        run_id: str | None = None,
+        resource: str | None = None,
+        user_id: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[AuditEventResponse, ...]:
+        if self._session_factory is None:
+            return await super().list_audit_events(
+                action,
+                run_id=run_id,
+                resource=resource,
+                user_id=user_id,
+                limit=limit,
+            )
+        if not callable(self._session_factory):
+            resources = await self._list_admin_payloads("audit")
+            if resources is None:
+                return await super().list_audit_events(
+                    action,
+                    run_id=run_id,
+                    resource=resource,
+                    user_id=user_id,
+                    limit=limit,
+                )
+            return _filter_audit_events(
+                (_audit_response_from_payload(payload) for payload in resources),
+                action=action,
+                run_id=run_id,
+                resource=resource,
+                user_id=user_id,
+                limit=limit,
+            )
+        statement = (
+            select(AdminResourceRow)
+            .where(AdminResourceRow.tenant_id == self._tenant_id)
+            .where(AdminResourceRow.kind == "audit")
+        )
         if action is not None:
-            events = tuple(event for event in events if event.action == action)
-        return tuple(sorted(events, key=lambda event: event.created_at, reverse=True))
+            statement = statement.where(AdminResourceRow.payload["action"].astext == action)
+        if run_id is not None:
+            statement = statement.where(
+                AdminResourceRow.payload["details"]["run_id"].astext == run_id
+            )
+        if resource is not None:
+            statement = statement.where(AdminResourceRow.payload["resource"].astext == resource)
+        if user_id is not None:
+            statement = statement.where(
+                AdminResourceRow.payload["details"]["user_id"].astext == user_id
+            )
+        statement = statement.order_by(AdminResourceRow.created_at.desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).scalars()
+            return tuple(_audit_response_from_payload(dict(row.payload)) for row in rows)
 
     async def record_log(
         self,
@@ -13704,6 +13772,46 @@ def _safe_audit_details(details: Mapping[str, object] | None) -> dict[str, str]:
     if not details:
         return {}
     return _safe_log_details({str(key): str(value) for key, value in details.items()})
+
+
+def _audit_event_matches(
+    event: AuditEventResponse,
+    *,
+    action: str | None,
+    run_id: str | None,
+    resource: str | None,
+    user_id: str | None,
+) -> bool:
+    return (
+        (action is None or event.action == action)
+        and (run_id is None or event.details.get("run_id") == run_id)
+        and (resource is None or event.resource == resource)
+        and (user_id is None or event.details.get("user_id") == user_id)
+    )
+
+
+def _filter_audit_events(
+    events: Iterable[AuditEventResponse],
+    *,
+    action: str | None,
+    run_id: str | None,
+    resource: str | None,
+    user_id: str | None,
+    limit: int | None,
+) -> tuple[AuditEventResponse, ...]:
+    ordered = sorted(events, key=lambda event: event.created_at, reverse=True)
+    filtered = tuple(
+        event
+        for event in ordered
+        if _audit_event_matches(
+            event,
+            action=action,
+            run_id=run_id,
+            resource=resource,
+            user_id=user_id,
+        )
+    )
+    return filtered if limit is None else filtered[:limit]
 
 
 def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
@@ -19587,10 +19695,38 @@ def _memory_request_from_response(
 async def list_audit_events(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-    action: str | None = None,
+    action: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+        ),
+    ] = None,
+    run_id: Annotated[UUID | None, Query()] = None,
+    resource: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=512,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$",
+        ),
+    ] = None,
+    user_id: Annotated[UUID | None, Query()] = None,
+    limit: Annotated[int | None, Query(ge=1, le=100)] = None,
 ) -> list[AuditEventResponse]:
     _require(principal, "audit:read")
-    return list(await service.list_audit_events(action))
+    if run_id is None and resource is None and user_id is None and limit is None:
+        return list(await service.list_audit_events(action))
+    return list(
+        await service.list_audit_events(
+            action,
+            run_id=None if run_id is None else str(run_id),
+            resource=resource,
+            user_id=None if user_id is None else str(user_id),
+            limit=limit,
+        )
+    )
 
 
 @router.get(

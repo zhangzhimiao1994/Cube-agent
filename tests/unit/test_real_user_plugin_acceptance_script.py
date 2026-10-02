@@ -7,10 +7,13 @@ import sys
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 SCRIPT_PATH = Path("scripts/real_user_plugin_acceptance.py")
+USER_ID = "11111111-1111-4111-8111-111111111111"
+RUN_ID = "22222222-2222-4222-8222-222222222222"
 
 
 def _load_script() -> Any:
@@ -32,6 +35,7 @@ class FakePluginAcceptanceClient:
         run_status: str = "completed",
         existing_resource: bool = False,
         install_response_lost: bool = False,
+        residual_signing_key: bool = False,
     ) -> None:
         self.audit_matches = audit_matches
         self.capability_available = capability_available
@@ -39,10 +43,15 @@ class FakePluginAcceptanceClient:
         self.run_status = run_status
         self.existing_resource = existing_resource
         self.install_response_lost = install_response_lost
+        self.residual_signing_key = residual_signing_key
         self.requests: list[tuple[str, str]] = []
         self.plugin_id = ""
         self.capability_id = ""
         self.nonce = ""
+        self.run_idempotency_keys: list[str] = []
+        self.signing_keys = (
+            {"plugin-uat-key-flow-123"} if existing_resource else set()
+        )
 
     def request_archive(
         self,
@@ -81,16 +90,18 @@ class FakePluginAcceptanceClient:
         body: dict[str, object] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, object] | list[object]:
-        del idempotency_key
         self.requests.append((method, path))
         if path == "/api/v1/auth/me":
-            return {"user_id": "user-real-1", "tenant_id": "tenant-1", "role": "admin"}
+            return {"user_id": USER_ID, "tenant_id": "tenant-1", "role": "admin"}
         if path == "/api/v1/admin/settings":
             return {"plugin_package_subprocess_registration_status": "ready"}
         if path == "/api/v1/admin/plugins/signing-keys" and method == "GET":
-            return [{"key_id": "plugin-uat-key-flow-123"}] if self.existing_resource else []
+            return [{"key_id": key_id} for key_id in sorted(self.signing_keys)]
         if path == "/api/v1/admin/plugins/signing-keys" and method == "POST":
-            return {"key_id": body["key_id"] if body else ""}
+            key_id = body["key_id"] if body else ""
+            assert isinstance(key_id, str)
+            self.signing_keys.add(key_id)
+            return {"key_id": key_id}
         if path.endswith("/package/approve"):
             return {
                 "id": self.plugin_id,
@@ -125,12 +136,14 @@ class FakePluginAcceptanceClient:
             assert body is not None
             assert body["mode"] == "dispatch"
             assert self.capability_id in str(body["message"])
-            return {"id": "run-public-1", "status": "queued", "version": 1}
-        if path == "/api/v1/runs/run-public-1/details":
-            return {"id": "run-public-1", "status": self.run_status, "version": 2}
-        if path == "/api/v1/runs/run-public-1/cancel" and method == "POST":
-            return {"id": "run-public-1", "status": "cancelled", "version": 3}
-        if path == "/api/v1/runs/run-public-1/events":
+            assert isinstance(idempotency_key, str)
+            self.run_idempotency_keys.append(idempotency_key)
+            return {"id": RUN_ID, "status": "queued", "version": 1}
+        if path == f"/api/v1/runs/{RUN_ID}/details":
+            return {"id": RUN_ID, "status": self.run_status, "version": 2}
+        if path == f"/api/v1/runs/{RUN_ID}/cancel" and method == "POST":
+            return {"id": RUN_ID, "status": "cancelled", "version": 3}
+        if path == f"/api/v1/runs/{RUN_ID}/events":
             return {
                 "items": [
                     {"kind": "tool.requested", "tool_name": self.capability_id},
@@ -141,15 +154,24 @@ class FakePluginAcceptanceClient:
                     },
                 ]
             }
-        if path == "/api/v1/admin/audit?action=plugin.invoke.succeeded":
+        parsed = urlsplit(path)
+        if parsed.path == "/api/v1/admin/audit":
+            query = parse_qs(parsed.query)
+            assert query == {
+                "action": ["plugin.invoke.succeeded"],
+                "run_id": [RUN_ID],
+                "user_id": [USER_ID],
+                "resource": [f"plugin:{self.plugin_id}:{self.capability_id}"],
+                "limit": ["1"],
+            }
             if not self.audit_matches:
                 return []
             return [
                 {
                     "action": "plugin.invoke.succeeded",
                     "details": {
-                        "run_id": "run-public-1",
-                        "user_id": "user-real-1",
+                        "run_id": RUN_ID,
+                        "user_id": USER_ID,
                         "plugin_id": self.plugin_id,
                         "capability_id": self.capability_id,
                     },
@@ -162,6 +184,9 @@ class FakePluginAcceptanceClient:
         if path.endswith("/uninstall"):
             return {"status": "uninstalled"}
         if path.startswith("/api/v1/admin/plugins/signing-keys/") and method == "DELETE":
+            key_id = path.rsplit("/", 1)[-1]
+            if not self.residual_signing_key:
+                self.signing_keys.discard(key_id)
             return {"status": "deleted"}
         if path == "/api/v1/admin/plugins" and method == "GET":
             if self.existing_resource:
@@ -203,6 +228,42 @@ def test_build_acceptance_plugin_is_signed_executable_and_nonce_bound(tmp_path: 
     assert result["character_count"] == len(package.input_text)
 
 
+def test_build_acceptance_plugin_uses_fresh_runtime_nonce_for_same_execution_id(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+
+    first = module.build_acceptance_plugin(tmp_path / "first", execution_id="repeat-run")
+    second = module.build_acceptance_plugin(tmp_path / "second", execution_id="repeat-run")
+
+    assert first.runtime_nonce != second.runtime_nonce
+    assert first.plugin_id != second.plugin_id
+    assert first.capability_id != second.capability_id
+    assert first.key_id != second.key_id
+    assert first.runtime_nonce in first.plugin_id
+    assert first.runtime_nonce in first.capability_id
+
+
+def test_build_acceptance_plugin_avoids_long_execution_id_prefix_collisions(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    shared_prefix = "same-prefix-that-is-longer-than-twenty-four-characters"
+
+    first = module.build_acceptance_plugin(
+        tmp_path / "first",
+        execution_id=f"{shared_prefix}-first",
+    )
+    second = module.build_acceptance_plugin(
+        tmp_path / "second",
+        execution_id=f"{shared_prefix}-second",
+    )
+
+    assert first.plugin_id != second.plugin_id
+    assert first.capability_id != second.capability_id
+    assert first.key_id != second.key_id
+
+
 def test_verify_public_invocation_correlates_public_tool_event_and_user_audit() -> None:
     module = _load_script()
     events = {
@@ -230,10 +291,12 @@ def test_verify_public_invocation_correlates_public_tool_event_and_user_audit() 
         user_id="user-1",
         plugin_id="plugin-case",
         capability_id="acceptance.stats_case",
+        runtime_nonce="case",
     )
 
     assert evidence["public_tool_completed"] is True
     assert evidence["correlated_runtime_audit"] is True
+    assert evidence["runtime_output_schema_nonce"] == "case"
     with pytest.raises(RuntimeError, match="correlated plugin invocation audit"):
         module.verify_public_plugin_invocation(
             events=events,
@@ -242,6 +305,7 @@ def test_verify_public_invocation_correlates_public_tool_event_and_user_audit() 
             user_id="user-1",
             plugin_id="plugin-case",
             capability_id="acceptance.stats_case",
+            runtime_nonce="case",
         )
 
 
@@ -275,6 +339,43 @@ def test_verify_public_invocation_rejects_multiple_calls() -> None:
             user_id="user-1",
             plugin_id="plugin-case",
             capability_id="acceptance.stats_case",
+            runtime_nonce="case",
+        )
+
+
+def test_verify_public_invocation_rejects_old_run_evidence_for_fresh_nonce(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    old = module.build_acceptance_plugin(tmp_path / "old", execution_id="same-execution")
+    fresh = module.build_acceptance_plugin(tmp_path / "fresh", execution_id="same-execution")
+    old_events = {
+        "items": [
+            {"kind": "tool.requested", "tool_name": old.capability_id},
+            {"kind": "tool.completed", "tool_name": old.capability_id},
+        ]
+    }
+    old_audits = [
+        {
+            "action": "plugin.invoke.succeeded",
+            "details": {
+                "run_id": "run-old",
+                "user_id": "user-1",
+                "plugin_id": old.plugin_id,
+                "capability_id": old.capability_id,
+            },
+        }
+    ]
+
+    with pytest.raises(RuntimeError):
+        module.verify_public_plugin_invocation(
+            events=old_events,
+            audits=old_audits,
+            run_id="run-old",
+            user_id="user-1",
+            plugin_id=fresh.plugin_id,
+            capability_id=fresh.capability_id,
+            runtime_nonce=fresh.runtime_nonce,
         )
 
 
@@ -310,6 +411,33 @@ def test_real_user_plugin_acceptance_runs_public_flow_and_cleans_up(tmp_path: Pa
     assert any(path.endswith("/stop") for _, path in client.requests)
     assert any(path.endswith("/uninstall") for _, path in client.requests)
     assert ("GET", "/api/v1/admin/plugins") in client.requests
+
+
+def test_real_user_plugin_acceptance_reuses_execution_id_with_fresh_run_nonce(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    first_client = FakePluginAcceptanceClient()
+    second_client = FakePluginAcceptanceClient()
+
+    first = module.run_real_user_plugin_acceptance(
+        first_client,
+        execution_id="same-execution",
+        package_dir=tmp_path / "first",
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+    second = module.run_real_user_plugin_acceptance(
+        second_client,
+        execution_id="same-execution",
+        package_dir=tmp_path / "second",
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert first["status"] == "passed"
+    assert second["status"] == "passed"
+    assert first_client.run_idempotency_keys != second_client.run_idempotency_keys
 
 
 def test_real_user_plugin_acceptance_cleans_up_after_evidence_failure(tmp_path: Path) -> None:
@@ -352,9 +480,9 @@ def test_real_user_plugin_acceptance_cancels_nonterminal_run_before_cleanup(
     )
 
     assert report["status"] == "failed"
-    assert ("POST", "/api/v1/runs/run-public-1/cancel") in client.requests
+    assert ("POST", f"/api/v1/runs/{RUN_ID}/cancel") in client.requests
     assert "cancel_run" in report["cleanup"]["completed"]
-    cancel_index = client.requests.index(("POST", "/api/v1/runs/run-public-1/cancel"))
+    cancel_index = client.requests.index(("POST", f"/api/v1/runs/{RUN_ID}/cancel"))
     uninstall_index = next(
         index for index, request in enumerate(client.requests) if request[1].endswith("/uninstall")
     )
@@ -382,9 +510,15 @@ def test_real_user_plugin_acceptance_reports_manifest_unavailable_reason(tmp_pat
     ]
 
 
-def test_real_user_plugin_acceptance_refuses_existing_plugin_or_key(tmp_path: Path) -> None:
+def test_real_user_plugin_acceptance_refuses_existing_plugin_or_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_script()
-    client = FakePluginAcceptanceClient(existing_resource=True)
+    package = module.build_acceptance_plugin(tmp_path, execution_id="flow-123")
+    client = FakePluginAcceptanceClient()
+    client.signing_keys.add(package.key_id)
+    monkeypatch.setattr(module, "build_acceptance_plugin", lambda *_args, **_kwargs: package)
 
     report = module.run_real_user_plugin_acceptance(
         client,
@@ -417,3 +551,22 @@ def test_real_user_plugin_acceptance_cleans_up_after_lost_install_response(
     assert report["status"] == "failed"
     assert any(path.endswith("/uninstall") for _, path in client.requests)
     assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
+
+
+def test_real_user_plugin_acceptance_fails_when_signing_key_remains(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    client = FakePluginAcceptanceClient(residual_signing_key=True)
+
+    report = module.run_real_user_plugin_acceptance(
+        client,
+        execution_id="residual-key",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert report["status"] == "failed"
+    assert report["acceptance_complete"] is False
+    assert any("signing key remains registered" in error for error in report["errors"])
