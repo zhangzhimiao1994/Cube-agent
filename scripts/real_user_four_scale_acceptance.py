@@ -714,10 +714,20 @@ def run_real_user_four_scale_acceptance(
     if not isinstance(principal, dict):
         raise TypeError("GET /api/v1/auth/me returned non-object JSON")
     cases: list[dict[str, object]] = []
+    attempt_history: list[dict[str, object]] = []
     safe_execution_id = _safe_identifier(execution_id)
     identity = _execution_identity(execution_id, base_url, principal)
     if resume_report is not None:
-        cases = _resume_cases(resume_report, identity)
+        cases = _resume_cases(resume_report, identity, attempt_history)
+        device = resume_report.get("real_device_acceptance")
+        if (
+            resume_report.get("status") == "passed"
+            or resume_report.get("acceptance_complete") is True
+            or resume_report.get("real_device_acceptance_complete") is True
+            or isinstance(device, Mapping)
+            and (device.get("status") == "passed" or device.get("counted_as_complete") is True)
+        ):
+            return _validated_finalized_report(resume_report)
         previous_start = resume_report.get("started_at")
         if isinstance(previous_start, str) and _timestamp(previous_start) is not None:
             started_at = previous_start
@@ -726,6 +736,7 @@ def run_real_user_four_scale_acceptance(
         return _matrix_report(
             client=client,
             cases=cases,
+            attempt_history=attempt_history,
             username=username,
             principal=principal,
             base_url=base_url,
@@ -905,6 +916,7 @@ def _matrix_report(
     *,
     client: RealUserAcceptanceClient,
     cases: list[dict[str, object]],
+    attempt_history: list[dict[str, object]],
     username: str,
     principal: Mapping[str, object],
     base_url: str,
@@ -977,6 +989,7 @@ def _matrix_report(
         },
         "blocked_admin_run_requests": list(client.blocked_admin_run_requests),
         "cases": copy.deepcopy(cases),
+        "attempt_history": copy.deepcopy(attempt_history),
     }
 
 
@@ -998,7 +1011,9 @@ def _execution_identity(
 
 
 def _resume_cases(
-    report: Mapping[str, object], identity: Mapping[str, object]
+    report: Mapping[str, object],
+    identity: Mapping[str, object],
+    attempt_history: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     if (
         report.get("kind") != "real_user_four_scale_acceptance"
@@ -1026,6 +1041,21 @@ def _resume_cases(
         raise TypeError("resume report cases must be a list")
     by_id: dict[str, dict[str, object]] = {}
     expected_ids = {f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES}
+    raw_history = report.get("attempt_history", [])
+    if not isinstance(raw_history, list):
+        raise TypeError("resume attempt_history must be a list")
+    archived_attempts: set[tuple[str, int]] = set()
+    for item in raw_history:
+        if not isinstance(item, dict) or "attempt_history" in item or "cases" in item:
+            raise ValueError("resume attempt_history must contain flat case evidence")
+        case_id = item.get("case_id")
+        if not isinstance(case_id, str) or case_id not in expected_ids:
+            raise ValueError("resume attempt_history contains an unknown case_id")
+        key = (case_id, _case_attempt(item))
+        if key in archived_attempts:
+            raise ValueError("resume attempt_history contains a duplicate attempt")
+        archived_attempts.add(key)
+        attempt_history.append(copy.deepcopy(item))
     for case in raw_cases:
         if not isinstance(case, dict):
             raise TypeError("resume report contains a non-object case")
@@ -1046,6 +1076,11 @@ def _resume_cases(
         if not _has_complete_core_evidence(
             case, safe_execution_id=_safe_identifier(execution_id), case_key=case_key
         ):
+            # Archive before normalizing flags or saving the pre-retry checkpoint.
+            key = (cast(str, case["case_id"]), _case_attempt(case))
+            if key not in archived_attempts:
+                attempt_history.append(copy.deepcopy(case))
+                archived_attempts.add(key)
             case.update(
                 {
                     "status": "failed",
@@ -1081,6 +1116,7 @@ def _has_complete_core_evidence(
         case.get("core_acceptance_ok") is not True
         or case.get("automated_acceptance_complete") is not True
         or case.get("status") not in ("passed", "pending_real_device")
+        or case.get("errors", []) != []
     ):
         return False
     sections = ("run", "project", "conversation", "public_artifacts", "dynamic_web_preview")
@@ -1090,7 +1126,11 @@ def _has_complete_core_evidence(
         cast(Mapping[str, object], case[key]) for key in sections
     )
     case_id, scale = case.get("case_id"), case.get("scale")
-    if not isinstance(case_id, str) or not isinstance(scale, str):
+    if (
+        not isinstance(case_id, str)
+        or not isinstance(scale, str)
+        or case_id != f"{scale}:{case.get('route_intent')}"
+    ):
         return False
     attempt = _case_attempt(case)
     scope_token = _case_execution_token(safe_execution_id, case_key, attempt)
@@ -1373,7 +1413,11 @@ def _validated_case_evidence(
     raw_cases = automated_report.get("cases")
     if not isinstance(raw_cases, list) or not raw_cases:
         raise ValueError("automated report must contain case evidence scopes")
-    expected_ids = {f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES}
+    case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
+    expected_ids = set(case_keys)
+    execution_id = automated_report.get("execution_id")
+    if not isinstance(execution_id, str):
+        raise TypeError("automated report core evidence requires execution_id")
     case_ids: set[str] = set()
     for case in raw_cases:
         if not isinstance(case, Mapping):
@@ -1383,7 +1427,9 @@ def _validated_case_evidence(
             raise ValueError("automated report case evidence has an invalid canonical case_id")
         if case_id in case_ids:
             raise ValueError(f"automated report case evidence has duplicate case_id: {case_id}")
-        if case.get("core_acceptance_ok") is not True or case.get("status") == "failed":
+        if not _has_complete_core_evidence(
+            case, safe_execution_id=_safe_identifier(execution_id), case_key=case_keys[case_id]
+        ):
             raise ValueError(f"automated report case evidence must pass core acceptance: {case_id}")
         case_ids.add(case_id)
     if case_ids != expected_ids:
@@ -1435,8 +1481,15 @@ def finalize_real_device_acceptance(
 ) -> dict[str, object]:
     """Merge deployed desktop/mobile evidence into a completed acceptance report."""
 
-    if automated_report.get("kind") != "real_user_four_scale_acceptance":
-        raise ValueError("automated report kind is invalid")
+    if (
+        automated_report.get("kind") != "real_user_four_scale_acceptance"
+        or type(automated_report.get("schema_version")) is not int
+        or automated_report.get("schema_version") != 1
+        or automated_report.get("benchmark_kind") != "capability"
+    ):
+        raise ValueError("automated report must be a supported capability acceptance report")
+    if automated_report.get("errors", []) != []:
+        raise ValueError("automated report errors must be empty before finalization")
     if (
         automated_report.get("core_acceptance_ok") is not True
         or automated_report.get("automated_acceptance_complete") is not True
@@ -1445,6 +1498,16 @@ def finalize_real_device_acceptance(
     execution_id = automated_report.get("execution_id")
     if not isinstance(execution_id, str) or evidence.get("execution_id") != execution_id:
         raise ValueError("real-device evidence execution_id does not match the automated report")
+    actor, base_url = automated_report.get("actor"), automated_report.get("base_url")
+    principal = actor.get("principal") if isinstance(actor, Mapping) else None
+    if not isinstance(principal, Mapping) or not isinstance(base_url, str):
+        raise TypeError("automated report execution identity is incomplete")
+    identity = _execution_identity(execution_id, base_url, principal)
+    if (
+        "execution_identity" in automated_report
+        and automated_report["execution_identity"] != identity
+    ):
+        raise ValueError("automated report execution identity is inconsistent")
     desktop = _validated_device_result(evidence, "desktop_browser_interaction")
     mobile = _validated_device_result(evidence, "mobile_browser_interaction")
     case_evidence = _validated_case_evidence(automated_report, evidence)
@@ -1481,6 +1544,18 @@ def finalize_real_device_acceptance(
     return completed
 
 
+def _validated_finalized_report(report: Mapping[str, object]) -> dict[str, object]:
+    device = report.get("real_device_acceptance")
+    if not isinstance(device, Mapping) or report.get("errors", []) != []:
+        raise ValueError("finalized report requires complete real-device evidence")
+    rebuilt = finalize_real_device_acceptance(
+        report, {**device, "execution_id": report.get("execution_id")}
+    )
+    if json.dumps(rebuilt, sort_keys=True) != json.dumps(dict(report), sort_keys=True):
+        raise ValueError("finalized report contradicts its complete acceptance evidence")
+    return copy.deepcopy(dict(report))
+
+
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1492,7 +1567,8 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _read_json_mapping(path: str) -> dict[str, object]:
     parsed = json.loads(
-        Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object,
+        Path(path).read_text(encoding="utf-8"),
+        object_pairs_hook=_unique_json_object,
     )
     if not isinstance(parsed, dict):
         raise TypeError(f"JSON file must contain an object: {path}")
@@ -1643,7 +1719,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"preserved checkpoint: {args.output}", file=sys.stderr, flush=True)
             _write_report(None, payload)
             return 1
-    _write_report(args.output, payload)
+    finalized_resume = resume_report is not None and payload.get("acceptance_complete") is True
+    _write_report(None if finalized_resume else args.output, payload)
     if payload.get("status") == "failed":
         return 1
     if payload.get("acceptance_complete") is not True:

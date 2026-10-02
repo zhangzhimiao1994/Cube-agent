@@ -33,11 +33,14 @@ def load_script() -> Any:
     return module
 
 
-@pytest.mark.parametrize("raw", (
-    '{"cases":{"small:auto":{"passed":false},"small:auto":{"passed":true}}}',
-    '{"execution_id":"old","execution_id":"new"}',
-    '{"cases":{"small:auto":{"desktop":{"passed":false,"passed":true}}}}',
-))
+@pytest.mark.parametrize(
+    "raw",
+    (
+        '{"cases":{"small:auto":{"passed":false},"small:auto":{"passed":true}}}',
+        '{"execution_id":"old","execution_id":"new"}',
+        '{"cases":{"small:auto":{"desktop":{"passed":false,"passed":true}}}}',
+    ),
+)
 def test_evidence_json_rejects_duplicate_keys(tmp_path: Path, raw: str) -> None:
     module = load_script()
     evidence = tmp_path / "evidence.json"
@@ -644,10 +647,99 @@ _FINALIZER_CASE_IDS = tuple(
 
 
 def _pending_automated_report() -> dict[str, Any]:
+    module = load_script()
+    cases = []
+    for case_id in _FINALIZER_CASE_IDS:
+        scale, route = case_id.split(":")
+        case_key = f"auto-{scale}" if route == "auto" else f"mode-{scale}-{route.replace('_', '-')}"
+        scope = f"matrix-123-{case_key}"
+        project_id, conversation_id = f"uat-{scope}", f"conv-{scope}"
+        root = f"/api/v1/workspaces/projects/{project_id}/sessions/{conversation_id}"
+        mode = (
+            "hybrid"
+            if route == "auto" and scale in {"large", "ultra"}
+            else "direct"
+            if route == "auto"
+            else "dispatch"
+            if route == "multi_agent"
+            else route
+        )
+        result = ProjectScaleCaseResult(
+            case_id=case_id,
+            run_id=f"run-{case_id}",
+            status="completed",
+            observed_mode=mode,
+            final_observed_mode=mode,
+            requested_mode="dispatch" if route == "multi_agent" else route,
+            effective_scale=scale,
+            artifact_origin="tool_workspace_write",
+            workspace_bundle_source="public_workspace_api",
+            participant_agent_ids=("architect", "implementer", "tester", "synthesizer")
+            if route == "multi_agent"
+            else (),
+            participant_event_kinds=("step.started", "step.completed") * 4
+            if route == "multi_agent"
+            else (),
+            participant_event_count=8 if route == "multi_agent" else 0,
+            evidence={**_passing_evidence(), "multi_agent_participation": route == "multi_agent"},
+        )
+        cases.append(
+            module.build_case_report(
+                scale=scale,
+                project={"project_id": project_id, "workspace_path": conversation_id},
+                conversation={
+                    "conversation_id": conversation_id,
+                    "project_id": project_id,
+                    "workspace_path": conversation_id,
+                },
+                result=result,
+                public_artifacts={
+                    "ok": True,
+                    "source": "public_workspace_api",
+                    "admin_internal_run_data_used": False,
+                    "files_endpoint": f"{root}/files",
+                    "bundle_endpoint": f"{root}/bundle/download",
+                    "file_count": 2,
+                    "downloaded_file_count": 2,
+                    "zip_member_count": 2,
+                    "zip_size_bytes": 200,
+                    "zip_crc_ok": True,
+                    "metadata_matches_zip": True,
+                    "unsafe_member_count": 0,
+                    "zip_sha256": "a" * 64,
+                    "errors": [],
+                },
+                dynamic_web_preview={
+                    "status": "passed",
+                    "counted_as_passed": True,
+                    "reachable_preview_url": True,
+                    "current_preview_matches": True,
+                    "renewed": True,
+                    "lease_extended": True,
+                    "stopped": True,
+                    "revoked_after_stop": True,
+                    "referenced_asset_count": 1,
+                    "referenced_assets_loaded": 1,
+                    "content_size_bytes": 100,
+                    "capability_token_retained": False,
+                    "browser_interaction": "pending_real_device",
+                    "errors": [],
+                },
+            )
+        )
     return {
         "schema_version": 1,
         "kind": "real_user_four_scale_acceptance",
         "execution_id": "matrix-123",
+        "base_url": "http://example.test",
+        "benchmark_kind": "capability",
+        "actor": {"principal": {"user_id": "user-test", "tenant_id": "tenant-test"}},
+        "execution_identity": {
+            "execution_id": "matrix-123",
+            "base_url": "http://example.test",
+            "user_id": "user-test",
+            "tenant_id": "tenant-test",
+        },
         "status": "pending_real_device",
         "core_acceptance_ok": True,
         "automated_acceptance_complete": True,
@@ -657,24 +749,12 @@ def _pending_automated_report() -> dict[str, Any]:
         "core_passed_case_count": 20,
         "failed_case_count": 0,
         "dynamic_web_preview": {"status": "pending_real_device"},
-        "cases": [
-            {
-                "case_id": case_id,
-                "status": "pending_real_device",
-                "core_acceptance_ok": True,
-                "real_device_acceptance_complete": False,
-                "acceptance_complete": False,
-                "project": {"project_id": f"project-{case_id}"},
-                "conversation": {"conversation_id": f"conv-{case_id}"},
-                "run": {"run_id": f"run-{case_id}"},
-                "dynamic_web_preview": {"browser_interaction": "pending_real_device"},
-            }
-            for case_id in _FINALIZER_CASE_IDS
-        ],
+        "cases": cases,
     }
 
 
 def _real_device_evidence(execution_id: str) -> dict[str, Any]:
+    scopes = {case["case_id"]: case for case in _pending_automated_report()["cases"]}
     checks = {
         "login": True,
         "project_navigation": True,
@@ -699,8 +779,8 @@ def _real_device_evidence(execution_id: str) -> dict[str, Any]:
         },
         "cases": {
             case_id: {
-                "project_id": f"project-{case_id}",
-                "conversation_id": f"conv-{case_id}",
+                "project_id": scopes[case_id]["project"]["project_id"],
+                "conversation_id": scopes[case_id]["conversation"]["conversation_id"],
                 "run_id": f"run-{case_id}",
                 "desktop": {
                     "passed": True,
@@ -785,6 +865,103 @@ def test_finalize_real_device_acceptance_rejects_missing_case_evidence() -> None
             pending,
             evidence,
         )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        (None, "errors", ["case failed"]),
+        (None, "automated_acceptance_complete", False),
+        (None, "route_policy_ok", False),
+        (None, "coverage_credit", "safe_upgrade"),
+        ("run", "status", "failed"),
+        ("run", "ok", False),
+        ("run", "errors", ["provider unavailable"]),
+        ("run", "missing_evidence", ["run_events"]),
+        ("run", "evidence", {}),
+        ("run", "effective_scale", "ultra"),
+        ("run", "final_observed_mode", "unknown"),
+        ("run", "artifact_origin", "builtin_fixture"),
+        ("build_and_test", "status", "failed"),
+        ("build_and_test", "requirements_validation", False),
+        ("public_artifacts", "zip_crc_ok", False),
+        ("dynamic_web_preview", "revoked_after_stop", False),
+        ("success_basis", "admin_internal_run_data", True),
+        ("conversation", "workspace_path", "wrong-session"),
+    ],
+)
+def test_finalize_rejects_contradictory_core_evidence(
+    section: str | None,
+    field: str,
+    value: object,
+) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    case = pending["cases"][0]
+    (case if section is None else case[section])[field] = value
+    before = copy.deepcopy(pending)
+    with pytest.raises(ValueError, match="core"):
+        module.finalize_real_device_acceptance(pending, evidence)
+    assert pending == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "version",
+        "boolean_version",
+        "kind",
+        "benchmark",
+        "execution",
+        "attempt",
+        "identity",
+        "principal",
+        "scale",
+    ],
+)
+def test_finalize_rejects_wrong_version_or_execution_scope(change: str) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    if change == "version":
+        pending["schema_version"] = 2
+    elif change == "boolean_version":
+        pending["schema_version"] = True
+    elif change == "kind":
+        pending["kind"] = "other_acceptance"
+    elif change == "benchmark":
+        pending["benchmark_kind"] = "other"
+    elif change == "execution":
+        pending["execution_id"] = "other-execution"
+        evidence["execution_id"] = "other-execution"
+    elif change == "attempt":
+        pending["cases"][0]["attempt"] = 2
+    elif change == "identity":
+        pending["execution_identity"]["tenant_id"] = "other-tenant"
+    elif change == "principal":
+        pending["actor"]["principal"]["user_id"] = "other-user"
+    elif change == "scale":
+        case = pending["cases"][0]
+        case["scale"] = "medium"
+        case["effective_scale"] = "medium"
+        case["run"]["effective_scale"] = "medium"
+        case["run"]["final_effective_scale"] = "medium"
+    before = copy.deepcopy(pending)
+    with pytest.raises(ValueError):
+        module.finalize_real_device_acceptance(pending, evidence)
+    assert pending == before
+
+
+@pytest.mark.parametrize("errors", [["setup failed"], None, "setup failed", False])
+def test_finalize_rejects_top_level_errors(errors: object) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    pending["errors"] = errors
+    before = copy.deepcopy(pending)
+    with pytest.raises(ValueError, match="errors"):
+        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"))
+    assert pending == before
 
 
 @pytest.mark.parametrize("case_id", _FINALIZER_CASE_IDS)
@@ -1399,6 +1576,245 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
             module.RealUserAcceptanceClient(delegate), **options
         ),
     )
+
+
+def test_retry_preserves_flat_attempt_history_and_does_not_mutate_saved_evidence(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+
+    def fail(plan: Any, client: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(plan, client, **kwargs))
+        return replace(report, results=(replace(report.results[0], errors=("provider blocked",)),))
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", fail)
+    output = tmp_path / "history.json"
+    first = run_matrix(module, delegate, output_path=str(output))
+    before = copy.deepcopy(first)
+    second = run_matrix(module, delegate, output_path=str(output), resume_report=first)
+    assert second["attempt_history"] == [first["cases"][0]]
+    assert first == before
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    third = run_matrix(module, delegate, output_path=str(output), resume_report=second)
+    assert third["attempt_history"] == [first["cases"][0], second["cases"][0]]
+    assert third["cases"][0]["attempt"] == 3
+    assert third["cases"][0]["core_acceptance_ok"] is True
+    assert third["failed_case_count"] == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == third
+    third["cases"][0]["run"]["errors"].append("changed current evidence")
+    assert third["attempt_history"][0]["run"]["errors"] == ["provider blocked"]
+    third["attempt_history"][0]["run"]["errors"].clear()
+    assert second["attempt_history"][0]["run"]["errors"] == ["provider blocked"]
+
+
+def test_retry_checkpoint_retains_original_evidence_before_interrupt(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    saved["cases"][0]["run"]["errors"] = ["original failure"]
+    original = copy.deepcopy(saved["cases"][0])
+    output = tmp_path / "history.json"
+
+    def interrupt(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", interrupt)
+    for _ in range(2):
+        with pytest.raises(KeyboardInterrupt):
+            run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+        saved = json.loads(output.read_text(encoding="utf-8"))
+        assert saved["attempt_history"] == [original]
+        assert saved["core_passed_case_count"] == 19
+
+
+def test_failed_retry_checkpoint_stops_before_next_case_and_preserves_disk_history(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    for case in saved["cases"][:2]:
+        case["run"]["errors"] = ["original failure"]
+    output = tmp_path / "history.json"
+    module._write_report(str(output), saved)
+    plans.clear()
+    replace_file = module.os.replace
+    writes = 0
+
+    def fail_after_initial_checkpoint(source: object, target: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("cannot save retry")
+        replace_file(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_after_initial_checkpoint)
+    with pytest.raises(OSError, match="cannot save retry"):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert len(plans) == 1
+    durable = json.loads(output.read_text(encoding="utf-8"))
+    assert durable["attempt_history"] == saved["cases"][:2]
+    assert durable["cases"][0]["attempt"] == 1
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_resume_finalized_report_returns_exact_evidence_without_tasks_or_writes(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123")
+    )
+    saved["cases"].reverse()
+    saved["finished_at"] = "2026-10-02T13:00:00Z"
+    saved["attempt_history"] = [{"case_id": "small:auto", "attempt": 1, "status": "failed"}]
+    before = copy.deepcopy(saved)
+    output = tmp_path / "finalized.json"
+    module._write_report(str(output), saved)
+    original_bytes = output.read_bytes()
+
+    def forbidden_write(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("finalized resume must not save a snapshot")
+
+    monkeypatch.setattr(module, "_save_report", forbidden_write)
+    resumed = run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert resumed == before
+    assert saved == before
+    assert output.read_bytes() == original_bytes
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+    resumed["cases"][0]["real_device_evidence"]["mobile"]["passed"] = False
+    assert saved == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "run_failed",
+        "case_errors",
+        "route",
+        "missing_case",
+        "identity",
+        "desktop",
+        "mobile",
+        "device_scope",
+        "case_device",
+        "case_complete",
+        "case_browser",
+        "preview",
+        "aggregate",
+        "device_complete",
+        "integer_complete",
+        "integer_device_complete",
+        "integer_case_complete",
+    ],
+)
+def test_resume_rejects_invalid_finalized_report_before_tasks_or_writes(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    change: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123")
+    )
+    case = saved["cases"][0]
+    device = saved["real_device_acceptance"]
+    if change == "run_failed":
+        case["run"]["status"] = "failed"
+    elif change == "case_errors":
+        case["errors"] = ["failure"]
+    elif change == "route":
+        case["route_policy_ok"] = False
+    elif change == "missing_case":
+        saved["cases"].pop()
+    elif change == "identity":
+        saved["execution_identity"]["tenant_id"] = "another-tenant"
+    elif change in {"desktop", "mobile"}:
+        device[f"{change}_browser_interaction"]["checks"]["preview_interaction"] = False
+    elif change == "device_scope":
+        device["cases"][case["case_id"]]["run_id"] = "other-run"
+    elif change == "case_device":
+        case["real_device_evidence"]["mobile"]["passed"] = False
+    elif change == "case_complete":
+        case["acceptance_complete"] = False
+    elif change == "case_browser":
+        case["dynamic_web_preview"]["browser_interaction"] = "pending_real_device"
+    elif change == "preview":
+        saved["dynamic_web_preview"]["counted_as_passed"] = False
+    elif change == "aggregate":
+        saved["status"] = "pending_real_device"
+    elif change == "device_complete":
+        device["counted_as_complete"] = False
+    elif change == "integer_complete":
+        saved["acceptance_complete"] = 1
+    elif change == "integer_device_complete":
+        device["counted_as_complete"] = 1
+    elif change == "integer_case_complete":
+        case["real_device_acceptance_complete"] = 1
+    before = copy.deepcopy(saved)
+    output = tmp_path / "finalized.json"
+    module._write_report(str(output), saved)
+    original_bytes = output.read_bytes()
+    with pytest.raises((TypeError, ValueError)):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert output.read_bytes() == original_bytes
+    assert saved == before
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_resume_finalized_cli_preserves_file_and_uses_only_authenticated_identity(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+    invalid: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123")
+    )
+    if invalid:
+        saved["real_device_acceptance"]["mobile_browser_interaction"]["passed"] = False
+    output = tmp_path / "finalized.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    before = output.read_bytes()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-secret-token")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_USERNAME", "synthetic-user")
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_PASSWORD", "synthetic-secret-password")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_REPORT_PATH", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+
+    def forbidden_write(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("finalized CLI resume must preserve file bytes")
+
+    monkeypatch.setattr(module, "_save_report", forbidden_write)
+    exit_code = module.main(
+        [
+            "--base-url",
+            "http://example.test",
+            "--resume-report",
+            str(output),
+        ]
+    )
+    assert exit_code == (1 if invalid else 0)
+    assert output.read_bytes() == before
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+    assert "synthetic-secret-token" not in before.decode("utf-8")
+    assert "synthetic-secret-password" not in before.decode("utf-8")
 
 
 def test_checkpoint_survives_interrupt_and_resume_keeps_completed_case(
