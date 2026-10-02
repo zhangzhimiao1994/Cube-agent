@@ -6449,6 +6449,13 @@ def test_dispatch_plan_does_not_add_mcp_tool_for_partial_task_text_match() -> No
     assert researcher.allowed_tools == ("read_context",)
 
 
+@pytest.mark.parametrize("suffix", [".", ".details", "_extended"])
+def test_plugin_capability_token_respects_namespace_boundary(suffix: str) -> None:
+    assert defaults_module._capability_token_mentioned(
+        f"Use calendar.create_event{suffix}", "calendar.create_event",
+    ) is (suffix == ".")
+
+
 def test_dispatch_plan_adds_explicitly_mentioned_available_plugin_tool() -> None:
     roles = (
         RoleAssignment(
@@ -6481,6 +6488,42 @@ def test_dispatch_plan_adds_explicitly_mentioned_available_plugin_tool() -> None
     assert scheduler.allowed_tools == ("read_context", "calendar.create_event")
     assert scheduler_step.tools == ("read_context", "calendar.create_event")
     assert "calendar.create_event" in plan.allowed_tools
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [RolePurpose.CRITIQUE, RolePurpose.RISK_REVIEW, RolePurpose.VERIFY, RolePurpose.RECORD_DECISION, RolePurpose.RELEASE],
+)
+@pytest.mark.parametrize("assignment", ["none", "tools", "mission"])
+def test_review_plugin_tools_require_role_specific_assignment(
+    purpose: RolePurpose, assignment: str,
+) -> None:
+    producer = RoleAssignment(
+        id="producer", role="Producer", purpose=RolePurpose.EXECUTE,
+        mission="Create the requested event.", must_answer=("What was created?",),
+        allowed_tools=("read_context",), forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(), output_schema={"summary": "string"}, model="main",
+    )
+    reviewer = replace(
+        producer, id="reviewer", role="Reviewer", purpose=purpose,
+        mission=("Verify using calendar.create_event." if assignment == "mission" else "Review producer evidence."),
+        allowed_tools=(("read_context", "calendar.create_event") if assignment == "tools" else ("read_context",)),
+    )
+    plan = _dispatch_plan(
+        (producer, reviewer),
+        TaskContext(
+            run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+            request="Use calendar.create_event exactly once, then review its recorded result.",
+        ),
+        capability_gateway=AvailablePluginManifestCapabilityGateway(),
+    )
+    agents = {agent.id: agent for agent in plan.agents}
+    steps = {step.agent: step for step in plan.steps}
+    assert agents["producer"].allowed_tools == ("read_context", "calendar.create_event")
+    expected = ("read_context",) if assignment == "none" else ("read_context", "calendar.create_event")
+    assert agents["reviewer"].allowed_tools == expected
+    assert steps["reviewer"].tools == expected
+    assert steps["reviewer"].depends_on == ("producer_step",)
 
 
 @pytest.mark.asyncio

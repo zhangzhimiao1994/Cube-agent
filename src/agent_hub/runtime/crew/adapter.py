@@ -2453,16 +2453,22 @@ def _can_compact_retry_subagent(
     error_code = diagnostic.get("error_code")
     retryable_compact_error = (
         diagnostic.get("retryable") is True
-        and error_code
-        in {
-            "crew.step_timeout",
-            "model.empty_response",
-            "model.capacity_unavailable",
-            "model.provider_rate_limited",
-            "model.provider_unavailable",
-            "model.provider_transient_failed",
-            "capability.transient_execution_failed",
-        }
+        and (
+            error_code
+            in {
+                "crew.step_timeout",
+                "model.empty_response",
+                "model.capacity_unavailable",
+                "model.provider_rate_limited",
+                "model.provider_unavailable",
+                "model.provider_transient_failed",
+                "capability.transient_execution_failed",
+            }
+            or (
+                error_code == "model.provider_transport_failed"
+                and diagnostic.get("status_code") is None
+            )
+        )
     )
     fallback_model_rejected = (
         error_code == "model.provider_bad_request"
@@ -2492,21 +2498,30 @@ def _recovery_status_after_attempts(
             "model.provider_rate_limited",
             "model.provider_unavailable",
             "model.provider_transient_failed",
+            "model.provider_transport_failed",
             "capability.transient_execution_failed",
         }
+        and (
+            diagnostic.get("error_code") != "model.provider_transport_failed"
+            or diagnostic.get("status_code") is None
+        )
         and recovery_attempts >= max_recovery_attempts
         else "failed_without_compact_retry"
     )
 
 
-def _failed_model_state_can_compact_retry(model_state: Mapping[str, JsonValue]) -> bool:
+def _failed_model_state_can_compact_retry(
+    model_state: Mapping[str, JsonValue], *, recovery_limit: int,
+) -> bool:
     failure_reason = model_state.get("failure_reason")
     if type(failure_reason) is not str or not failure_reason.strip():
         return False
     return _can_compact_retry_subagent(
         runtime_failure_diagnostic_from_reason(failure_reason),
-        recovery_attempt=0,
+        recovery_attempt=cast(int, model_state["attempt"]) % (recovery_limit + 1),
         remaining_seconds=float("inf"),
+        # Consuming a definite cached failure is safe even when no new retry remains.
+        max_recovery_attempts=recovery_limit + 1,
     )
 
 
@@ -5177,7 +5192,12 @@ class CrewDispatchRuntime:
             if existing["status"] in {"running", "received_cancelled"}:
                 raise ModelOutcomeUncertain("model outcome requires confirmation")
             if existing["status"] == "failed":
-                if not _failed_model_state_can_compact_retry(existing):
+                if repair is not None:
+                    raise _ModelContractFailed("structured correction failed") from None
+                agent = next(item for item in self._plan.agents if item.id == actor)
+                if not _failed_model_state_can_compact_retry(
+                    existing, recovery_limit=_subagent_recovery_attempt_limit(agent),
+                ):
                     raise ModelOutcomeUncertain("model outcome requires confirmation")
                 _fail(cast(str, existing.get("failure_reason") or "model gateway failed"))
             if existing["status"] == "rejected":
@@ -8686,7 +8706,12 @@ class CrewDispatchRuntime:
                 model_ledger.artifacts[key] = artifact
             elif model_state["status"] in {"running", "received_cancelled"} or (
                 model_state["status"] == "failed"
-                and not _failed_model_state_can_compact_retry(model_state)
+                and not _failed_model_state_can_compact_retry(
+                    model_state,
+                    recovery_limit=_checkpoint_recovery_attempt_limit(
+                        agents[cast(str, model_state["actor"])], checkpoint.runtime_version,
+                    ),
+                )
             ):
                 outcome_error = ModelOutcomeUncertain("model outcome requires confirmation")
         tool_ledger = _ToolLedger()

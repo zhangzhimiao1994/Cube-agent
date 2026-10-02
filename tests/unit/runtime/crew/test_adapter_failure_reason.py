@@ -51,6 +51,7 @@ from agent_hub.runtime.crew.adapter import (
     _correctable_tool_argument_rejection,
     _crew_content_limits,
     _has_matching_tool_argument_rejection,
+    _recovery_status_after_attempts,
     _scope_project_workspace_tool_call,
     _should_check_framework_raw,
     _step_timeout_recovery_window_seconds,
@@ -63,6 +64,19 @@ from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 RUN_ID = UUID("00000000-0000-4000-8000-000000000002")
+
+
+@pytest.mark.parametrize("status_code", [None, 405, 422])
+def test_network_recovery_closure_does_not_mislabel_unknown_http_status(
+    status_code: int | None,
+) -> None:
+    status = _recovery_status_after_attempts(
+        {"error_code": "model.provider_transport_failed", "status_code": status_code},
+        recovery_attempts=1, max_recovery_attempts=1,
+    )
+    assert status == (
+        "failed_after_compact_retry" if status_code is None else "failed_without_compact_retry"
+    )
 
 
 class UnusedGateway:
@@ -5628,6 +5642,38 @@ async def test_agent_fallback_provider_bad_request_retries_next_fallback_model()
     await restored.restore_checkpoint(checkpoint)
 
 
+async def test_failed_fallback_bad_request_checkpoint_resumes_next_candidate() -> None:
+    repository = InMemoryArtifactRepository()
+    plan = _one_step_plan_with_two_model_fallbacks()
+    gateway = CapacityThenBadRequestThenRoleAwareGateway(
+        unavailable_logical_model="primary", bad_request_logical_model="backup",
+    )
+    runtime = CrewDispatchRuntime(
+        gateway, plan, artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    checkpoints = [
+        event.checkpoint async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    failed_checkpoint = next(
+        checkpoint for checkpoint in checkpoints
+        if any(
+            state["status"] == "failed" and state["attempt"] == 1
+            for state in cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"]).values()
+        )
+    )
+    restored_gateway = RoleAwareGateway()
+    restored = CrewDispatchRuntime(
+        restored_gateway, plan, artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(failed_checkpoint)
+    events = [event async for event in restored.run(_context(checkpoint=failed_checkpoint))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [request.logical_model for request in restored_gateway.requests] == ["final"]
+
+
 async def test_agent_capacity_unavailable_compact_retries_before_completing() -> None:
     gateway = CapacityUnavailableThenRoleAwareGateway(unavailable_logical_model="general")
     generation = RecordingGeneration()
@@ -5658,8 +5704,8 @@ async def test_agent_capacity_unavailable_compact_retries_before_completing() ->
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 
-@pytest.mark.parametrize("status_code", [408, 429, 503])
-async def test_agent_transient_provider_failure_uses_existing_fallback(status_code: int) -> None:
+@pytest.mark.parametrize("status_code", [None, 408, 429, 503])
+async def test_agent_transient_provider_failure_uses_existing_fallback(status_code: int | None) -> None:
     class ProviderFailureGateway(RoleAwareGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             if request.logical_model == "primary":
@@ -5679,6 +5725,7 @@ async def test_agent_transient_provider_failure_uses_existing_fallback(status_co
     retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
     assert retrying.payload["model_fallback"] == "backup"
     assert retrying.payload["error_code"] == {
+        None: "model.provider_transport_failed",
         408: "model.provider_transient_failed",
         429: "model.provider_rate_limited",
         503: "model.provider_unavailable",
@@ -5693,9 +5740,9 @@ async def test_agent_transient_provider_failure_uses_existing_fallback(status_co
     await restored.restore_checkpoint(checkpoint)
 
 
-@pytest.mark.parametrize("status_code", [401, 402, 429])
+@pytest.mark.parametrize("status_code", [None, 400, 401, 402, 403, 404, 405, 413, 422, 429])
 async def test_provider_failure_recovery_is_bounded_and_preserves_auth_errors(
-    status_code: int,
+    status_code: int | None,
 ) -> None:
     class UnavailableGateway(RoleAwareGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
@@ -5714,19 +5761,19 @@ async def test_provider_failure_recovery_is_bounded_and_preserves_auth_errors(
             events.append(event)
 
     assert [request.logical_model for request in gateway.requests] == (
-        ["primary", "backup", "final"] if status_code == 429 else ["primary"]
+        ["primary", "backup", "final"] if status_code in {None, 429} else ["primary"]
     )
     failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
-    if status_code == 429:
+    if status_code in {None, 429}:
         assert failed.payload["recovery_status"] == "failed_after_compact_retry"
 
 
-@pytest.mark.parametrize("status_code", [408, 429, 503])
+@pytest.mark.parametrize("status_code", [None, 408, 429, 503])
 @pytest.mark.parametrize("checkpoint_phase", ["provider_failed", "running", "completed"])
 @pytest.mark.parametrize("repeat_tool", [False, True])
 @pytest.mark.parametrize("tamper_receipt", [False, True])
 async def test_provider_recovery_after_tool_success_checkpoint_hydration_preserves_receipts(
-    status_code: int, checkpoint_phase: str, repeat_tool: bool, tamper_receipt: bool,
+    status_code: int | None, checkpoint_phase: str, repeat_tool: bool, tamper_receipt: bool,
 ) -> None:
     class ProviderFailureAfterToolGateway(ToolGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:

@@ -443,6 +443,15 @@ def test_runtime_failure_diagnostic_classifies_common_provider_statuses(
     assert diagnostic["status_code"] == status_code
 
 
+@pytest.mark.parametrize("status_code", [405, 410, 415, 422])
+def test_unknown_provider_client_errors_are_not_network_retries(status_code: int) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        f"model gateway failed: model transport failed (status={status_code})"
+    )
+    assert diagnostic["retryable"] is False
+    assert diagnostic["status_code"] == status_code
+
+
 @pytest.mark.parametrize(
     ("reason", "error_stage", "error_code"),
     [

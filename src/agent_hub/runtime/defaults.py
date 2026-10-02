@@ -2496,7 +2496,8 @@ def _available_inventory_tools_for_role(
 def _role_capability_match_text(role: RoleAssignment, context: TaskContext) -> str:
     return "\n".join(
         (
-            str(context.request),
+            # Reviewers consume producer evidence unless their own assignment needs a tool.
+            "" if _is_post_product_role(role) else str(context.request),
             role.id,
             role.role,
             role.mission,
@@ -2509,7 +2510,7 @@ def _role_capability_match_text(role: RoleAssignment, context: TaskContext) -> s
 def _capability_token_mentioned(text: str, token: str) -> bool:
     if not _is_safe_inventory_token(token, max_length=128):
         return False
-    pattern = rf"(?<![a-z0-9_.-]){re.escape(token.casefold())}(?![a-z0-9_.-])"
+    pattern = rf"(?<![a-z0-9_.-]){re.escape(token.casefold())}(?![a-z0-9_-]|\.[a-z0-9_.-])"
     return re.search(pattern, text) is not None
 
 

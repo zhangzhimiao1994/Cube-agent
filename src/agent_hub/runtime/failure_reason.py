@@ -774,7 +774,7 @@ def _provider_diagnostic(
         error_stage="model_provider",
         error_category=category,
         error_code=code,
-        retryable=response is False,
+        retryable=response is False and status_code is None,
         suggested_action=action,
         status_code=status_code,
     )
