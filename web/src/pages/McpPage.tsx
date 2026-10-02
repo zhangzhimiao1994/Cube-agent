@@ -784,7 +784,7 @@ export function McpPage() {
       if (action === "disable") return api.disablePlugin(id);
       if (action === "stop") return api.stopPlugin(id);
       if (action === "reload") return api.reloadPlugin(id);
-      return api.deletePlugin(id);
+      return api.uninstallPlugin(id);
     },
     onSuccess: async (_result, variables) => {
       const messages = {

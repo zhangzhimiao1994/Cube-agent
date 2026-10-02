@@ -73,6 +73,10 @@ class RunRecord:
     routing_decision: dict[str, object] | None
     blocked_by_run_id: UUID | None = None
     actor_role: Role | None = None
+    worker_id: str | None = None
+    worker_lease_token: UUID | None = None
+    worker_lease_expires_at: datetime | None = None
+    worker_heartbeat_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +479,8 @@ class RunRepository:
             status = RunStatus(row.status)
             if status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
                 raise RunConflict("run must be completed, failed, or cancelled before deletion")
+            if self.has_worker_execution(row):
+                raise RunConflict("run worker execution has not been released")
 
             blocked_successor = await session.scalar(
                 select(RunRow.id)
@@ -529,8 +535,6 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             row.status = status.value
-            if status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
-                self.clear_worker_lease(row)
             if mode is not None:
                 row.mode = mode.value
             row.version += 1
@@ -856,6 +860,8 @@ class RunRepository:
                 return self._record(row)
             if current_status is not from_status:
                 raise RunConflict("run state conflict")
+            if from_status is RunStatus.PAUSED and self.has_worker_execution(row):
+                raise RunConflict("run worker execution has not been released")
             row.status = to_status.value
             row.version += 1
             await session.flush()
@@ -952,6 +958,20 @@ class RunRepository:
             )
             return tuple(rows.all())
 
+    async def terminal_worker_executions_for_recovery(
+        self,
+        limit: int,
+        *,
+        now: datetime,
+    ) -> tuple[RunRecord, ...]:
+        if limit <= 0:
+            return ()
+        async with self._session_factory() as session:
+            rows = await session.scalars(
+                self._terminal_worker_executions_for_recovery_select(limit=limit, now=now)
+            )
+            return tuple(self._record(row) for row in rows.all())
+
     async def renew_active_worker_lease(
         self,
         *,
@@ -975,12 +995,111 @@ class RunRepository:
             await session.flush()
             return True
 
+    async def release_worker_execution(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        complete_if_running: bool = False,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if row.worker_id != worker_id or row.worker_lease_token != worker_lease_token:
+                raise RunConflict("run worker execution ownership changed")
+            if complete_if_running and RunStatus(row.status) is RunStatus.RUNNING:
+                row.status = RunStatus.COMPLETED.value
+            self.clear_worker_lease(row)
+            row.version += 1
+            await session.flush()
+            return self._record(row)
+
+    async def release_expired_worker_execution(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        now: datetime,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if row.worker_id != worker_id or row.worker_lease_token != worker_lease_token:
+                raise RunConflict("run worker execution ownership changed")
+            if RunStatus(row.status) not in {
+                RunStatus.PAUSED,
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }:
+                raise RunConflict("run worker execution is not releasable")
+            if row.worker_lease_expires_at is None or row.worker_lease_expires_at > now:
+                return self._record(row)
+            self.clear_worker_lease(row)
+            row.version += 1
+            await session.flush()
+            return self._record(row)
+
+    async def mark_worker_execution_exited(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        exited_at: datetime,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if row.worker_id != worker_id or row.worker_lease_token != worker_lease_token:
+                raise RunConflict("run worker execution ownership changed")
+            row.worker_lease_expires_at = exited_at
+            row.worker_heartbeat_at = None
+            row.version += 1
+            await session.flush()
+            return self._record(row)
+
     def _running_for_recovery_select(self, *, limit: int, now: datetime) -> Select[tuple[UUID]]:
         return (
             select(RunRow.id)
             .where(
                 RunRow.status == RunStatus.RUNNING.value,
                 RunRow.mode.is_not(None),
+                RunRow.worker_lease_expires_at.is_not(None),
+                RunRow.worker_lease_expires_at <= now,
+            )
+            .order_by(RunRow.worker_lease_expires_at, RunRow.updated_at, RunRow.id)
+            .limit(limit)
+        )
+
+    def _terminal_worker_executions_for_recovery_select(
+        self,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> Select[tuple[RunRow]]:
+        return (
+            select(RunRow)
+            .where(
+                RunRow.status.in_(
+                    (
+                        RunStatus.PAUSED.value,
+                        RunStatus.COMPLETED.value,
+                        RunStatus.FAILED.value,
+                        RunStatus.CANCELLED.value,
+                    )
+                ),
+                RunRow.mode.is_not(None),
+                RunRow.worker_id.is_not(None),
+                RunRow.worker_lease_token.is_not(None),
                 RunRow.worker_lease_expires_at.is_not(None),
                 RunRow.worker_lease_expires_at <= now,
             )
@@ -1038,8 +1157,6 @@ class RunRepository:
             if status is RunStatus.CANCELLED and current is RunStatus.CANCELLED:
                 raise RunConflict("run state conflict")
             row.status = status.value
-            if status in {RunStatus.PAUSED, RunStatus.CANCELLED}:
-                self.clear_worker_lease(row)
             row.version += 1
             await session.flush()
             return self._record(row)
@@ -1384,14 +1501,27 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
-    async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
+    async def fail_run(
+        self,
+        run_id: UUID,
+        *,
+        reason: str,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+    ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
+            if (
+                (worker_id is not None or worker_lease_token is not None)
+                and (row.worker_id != worker_id or row.worker_lease_token != worker_lease_token)
+            ):
+                raise RunConflict("run worker execution ownership changed")
             current = RunStatus(row.status)
             if current in {
                 RunStatus.COMPLETED,
                 RunStatus.FAILED,
                 RunStatus.CANCELLED,
+                RunStatus.PAUSED,
                 RunStatus.WAITING_APPROVAL,
             }:
                 return self._record(row)
@@ -1413,7 +1543,6 @@ class RunRepository:
                 ),
             )
             row.status = RunStatus.FAILED.value
-            self.clear_worker_lease(row)
             row.version += 1
             await session.flush()
             return self._record(row)
@@ -1810,6 +1939,18 @@ class RunRepository:
         row.worker_heartbeat_at = None
 
     @staticmethod
+    def has_worker_execution(row: RunRow) -> bool:
+        return any(
+            value is not None
+            for value in (
+                row.worker_id,
+                row.worker_lease_token,
+                row.worker_lease_expires_at,
+                row.worker_heartbeat_at,
+            )
+        )
+
+    @staticmethod
     def _record(row: RunRow) -> RunRecord:
         return RunRecord(
             id=row.id,
@@ -1823,6 +1964,10 @@ class RunRepository:
             created_at=row.created_at,
             routing_decision=None if row.routing_decision is None else dict(row.routing_decision),
             blocked_by_run_id=getattr(row, "blocked_by_run_id", None),
+            worker_id=getattr(row, "worker_id", None),
+            worker_lease_token=getattr(row, "worker_lease_token", None),
+            worker_lease_expires_at=getattr(row, "worker_lease_expires_at", None),
+            worker_heartbeat_at=getattr(row, "worker_heartbeat_at", None),
         )
 
     @staticmethod

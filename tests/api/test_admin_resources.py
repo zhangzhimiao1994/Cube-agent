@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -4054,7 +4055,13 @@ def test_admin_audit_query_filters_exact_invocation_and_limits_latest_result() -
             created_at=now,
         ),
         _audit_event(
-            "target-new",
+            "target-tie-a",
+            run_id=target_run_id,
+            user_id=USER_ID,
+            created_at=now - timedelta(seconds=1),
+        ),
+        _audit_event(
+            "target-tie-b",
             run_id=target_run_id,
             user_id=USER_ID,
             created_at=now - timedelta(seconds=1),
@@ -4074,7 +4081,7 @@ def test_admin_audit_query_filters_exact_invocation_and_limits_latest_result() -
     )
 
     assert response.status_code == 200
-    assert [event["id"] for event in response.json()] == ["target-new"]
+    assert [event["id"] for event in response.json()] == ["target-tie-b"]
 
 
 def test_admin_audit_action_only_query_remains_compatible() -> None:
@@ -4199,7 +4206,10 @@ async def test_persistent_audit_query_pushes_filters_and_limit_into_postgresql()
     assert "(agent_hub_admin_resources.payload['details']) ->> 'run_id'" in sql
     assert "agent_hub_admin_resources.payload ->> 'resource'" in sql
     assert "(agent_hub_admin_resources.payload['details']) ->> 'user_id'" in sql
-    assert "ORDER BY agent_hub_admin_resources.created_at DESC" in sql
+    assert (
+        "ORDER BY CAST(agent_hub_admin_resources.payload ->> 'created_at' AS TIMESTAMP WITH TIME ZONE) DESC, "
+        "agent_hub_admin_resources.payload ->> 'id' DESC"
+    ) in sql
     assert "LIMIT 1" in sql
 
 
@@ -5333,7 +5343,9 @@ def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> Non
     assert "bootstrap_search.web" not in capabilities
 
 
-def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor() -> None:
+def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor(
+    tmp_path: Path,
+) -> None:
     class OtherTenantAuthService:
         def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
             if token != "valid-token":
@@ -5421,8 +5433,15 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             self.calls.append(("delete", plugin_id, tenant_id, actor_id))
             await super().delete_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
 
-    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    api = create_app(
+        settings=Settings.model_construct(plugin_package_store_dir=tmp_path),
+        auth_service=OtherTenantAuthService(),
+        rate_limiter=object(),
+    )
     service = RecordingPluginWriteService()
+    cast(Any, api).state.settings = Settings.model_construct(
+        plugin_package_store_dir=tmp_path
+    )
     cast(Any, api).state.admin_resource_service = service
     cast(Any, api).state.plugin_service = AcceptingRuntimePluginService()
     test_client = TestClient(api)
@@ -5441,7 +5460,7 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
     assert started.status_code == 200
     assert stopped.status_code == 200
     assert reloaded.status_code == 200
-    assert deleted.status_code == 200
+    assert deleted.status_code == 200, deleted.text
     assert service.calls == [
         ("upsert", "search", OTHER_TENANT_ID, USER_ID),
         ("start", "search", OTHER_TENANT_ID, USER_ID),
@@ -5639,7 +5658,15 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
     assert stopped.status_code == 200
     assert reloaded_response.status_code == 200
     assert uninstalled.status_code == 200
-    assert uninstalled.json() == {"status": "uninstalled"}
+    assert uninstalled.json() == {
+        "status": "uninstalled",
+        "cleanup": {
+            "package_artifact_removed": True,
+            "registration_removed": True,
+            "retry_completed": False,
+            "runtime_capabilities_removed": True,
+        },
+    }
     assert deleted.status_code == 200
     assert reloaded == [
         TENANT_ID,
@@ -6806,6 +6833,921 @@ def test_plugin_delete_removes_verified_adapter_package_artifact(
 
     assert delete_response.status_code == 200
     assert not artifact_root.exists()
+
+
+def _install_verified_calendar_package(
+    api: TestClient,
+    *,
+    private_key: ed25519.Ed25519PrivateKey,
+) -> tuple[str, dict[str, str]]:
+    signing_key = api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    archive_bytes = signed_plugin_archive(private_key)
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=archive_bytes,
+    )
+
+    assert signing_key.status_code == 200
+    assert install.status_code == 200
+    return content_sha256, cast(dict[str, str], install.json()["plugin"]["package_metadata"]["artifact"])
+
+
+def test_plugin_uninstall_package_cleanup_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    real_rmtree = shutil.rmtree
+
+    def fail_pending_cleanup(path: str | Path) -> None:
+        if pending_root == Path(path):
+            raise OSError("simulated package cleanup failure")
+        real_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_pending_cleanup)
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert failed.status_code == 503
+    assert failed.json() == {
+        "error": {
+            "code": "plugin_uninstall_cleanup_pending",
+            "message": "plugin uninstall cleanup is pending and can be retried",
+            "details": {
+                "package_artifact_removed": "false",
+                "registration_removed": "true",
+                "runtime_capabilities_removed": "true",
+            },
+        }
+    }
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not artifact_root.exists()
+    assert pending_root.exists()
+
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200
+    assert retried.json() == {
+        "status": "uninstalled",
+        "cleanup": {
+            "package_artifact_removed": True,
+            "registration_removed": True,
+            "retry_completed": True,
+            "runtime_capabilities_removed": True,
+        },
+    }
+    assert not pending_root.exists()
+    assert not (tmp_path / str(TENANT_ID) / "calendar").exists()
+
+
+def test_plugin_uninstall_treats_rmtree_error_after_complete_removal_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    real_rmtree = shutil.rmtree
+
+    def remove_then_raise(path: str | Path) -> None:
+        real_rmtree(path)
+        if pending_root == Path(path):
+            raise OSError("simulated late filesystem error")
+
+    monkeypatch.setattr(shutil, "rmtree", remove_then_raise)
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json()["cleanup"] == {
+        "package_artifact_removed": True,
+        "registration_removed": True,
+        "retry_completed": False,
+        "runtime_capabilities_removed": True,
+    }
+    assert not artifact_root.exists()
+    assert not pending_root.exists()
+
+
+def test_plugin_uninstall_rejects_unbound_pending_state_with_registration_present(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    pending_root.mkdir(parents=True)
+    assert artifact_root.exists()
+    assert not (pending_root / "artifact").exists()
+    assert [item["id"] for item in api.get("/api/v1/admin/plugins", headers=headers()).json()] == [
+        "calendar"
+    ]
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "plugin_uninstall_cleanup_unavailable"
+    assert [item["id"] for item in api.get("/api/v1/admin/plugins", headers=headers()).json()] == [
+        "calendar"
+    ]
+    assert artifact_root.exists()
+    assert pending_root.exists()
+
+
+def test_plugin_uninstall_success_reports_cleanup_and_leaves_no_package_residue(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "uninstalled",
+        "cleanup": {
+            "package_artifact_removed": True,
+            "registration_removed": True,
+            "retry_completed": False,
+            "runtime_capabilities_removed": True,
+        },
+    }
+    assert not artifact_root.exists()
+    assert not pending_root.exists()
+    assert not (tmp_path / str(TENANT_ID) / "calendar").exists()
+
+
+def test_plugin_uninstall_removes_every_installed_package_version(tmp_path: Path) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    first_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=private_key,
+    )
+    second_archive = signed_plugin_archive(
+        private_key,
+        files={"adapter/main.py": "def invoke():\n    return {'version': 2}\n"},
+        package_overrides={"package_version": "2.0.0"},
+    )
+    second_sha256 = hashlib.sha256(second_archive).hexdigest()
+    second_install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin-v2.zip",
+        },
+        content=second_archive,
+    )
+    package_root = tmp_path / str(TENANT_ID) / "calendar"
+
+    assert second_install.status_code == 200, second_install.text
+    assert first_sha256 != second_sha256
+    assert (package_root / first_sha256).is_dir()
+    assert (package_root / second_sha256).is_dir()
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cleanup"]["package_artifact_removed"] is True
+    assert not package_root.exists()
+    assert not (tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar").exists()
+
+
+def test_plugin_uninstall_runtime_reload_failure_is_retryable(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    reload_fails = True
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        if reload_fails:
+            raise RuntimeError("simulated runtime reload failure")
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar Plugin",
+            "capabilities": [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "http_json",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                }
+            ],
+        },
+    )
+    assert created.status_code == 200
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert failed.status_code == 503
+    assert failed.json()["error"] == {
+        "code": "plugin_uninstall_cleanup_pending",
+        "message": "plugin uninstall cleanup is pending and can be retried",
+        "details": {
+            "package_artifact_removed": "true",
+            "registration_removed": "true",
+            "runtime_capabilities_removed": "false",
+        },
+    }
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert (tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar").exists()
+
+    reload_fails = False
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200
+    assert retried.json()["cleanup"] == {
+        "package_artifact_removed": True,
+        "registration_removed": True,
+        "retry_completed": True,
+        "runtime_capabilities_removed": True,
+    }
+    assert not (tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar").exists()
+
+
+@pytest.mark.asyncio
+async def test_plugin_uninstall_observes_real_runtime_reload_failure(
+    tmp_path: Path,
+) -> None:
+    class RuntimeReloadFailingService(InMemoryAdminResourceService):
+        fail_runtime_reload = False
+
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            if self.fail_runtime_reload:
+                raise RuntimeError("production runtime reload failed")
+            return await super().list_plugins(tenant_id=tenant_id)
+
+        async def uninstall_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            await super().uninstall_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+            self.fail_runtime_reload = True
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = RuntimeReloadFailingService()
+    cast(Any, api.app).state.admin_resource_service = service
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar Plugin",
+            "capabilities": [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "http_json",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                }
+            ],
+        },
+    )
+    runtime = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=service,
+    )
+    cast(Any, api.app).state.plugin_service = runtime
+    cast(Any, api.app).state.reload_plugin_runtime_config = runtime.reload
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert created.status_code == 200
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "plugin_uninstall_cleanup_pending"
+    assert response.json()["error"]["details"]["runtime_capabilities_removed"] == "false"
+
+
+def test_plugin_uninstall_other_tenant_cannot_remove_package_artifact(
+    tmp_path: Path,
+) -> None:
+    class TenantScopedPluginService(InMemoryAdminResourceService):
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            if tenant_id != TENANT_ID:
+                return ()
+            return await super().list_plugins(tenant_id=tenant_id)
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = TenantScopedPluginService()
+    cast(Any, api.app).state.admin_resource_service = service
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+
+    other_app = create_app(
+        settings=settings,
+        auth_service=OtherTenantAuthService(),
+        rate_limiter=object(),
+    )
+    other_app.state.admin_resource_service = service
+    other_app.state.plugin_service = AcceptingRuntimePluginService()
+    other_app.state.settings = settings
+    response = TestClient(other_app).post(
+        "/api/v1/admin/plugins/calendar/uninstall",
+        headers=headers(),
+    )
+
+    assert response.status_code == 404
+    assert artifact_root.exists()
+    assert not (tmp_path / ".uninstalling" / str(OTHER_TENANT_ID)).exists()
+
+
+def test_plugin_uninstall_rejects_cross_tenant_backslash_path(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    other_pending_root = (
+        tmp_path / ".uninstalling" / str(OTHER_TENANT_ID) / "calendar"
+    )
+    staged_artifact = other_pending_root / "artifact" / ("a" * 64)
+    staged_artifact.mkdir(parents=True)
+    sentinel = staged_artifact / "adapter.py"
+    sentinel.write_text("SENTINEL", encoding="utf-8")
+
+    response = api.post(
+        f"/api/v1/admin/plugins/..%5C{OTHER_TENANT_ID}%5Ccalendar/uninstall",
+        headers=headers(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+    assert sentinel.read_text(encoding="utf-8") == "SENTINEL"
+    assert other_pending_root.exists()
+
+
+def test_plugin_uninstall_retry_does_not_remove_reinstalled_generation(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    reload_fails = True
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        if reload_fails:
+            raise RuntimeError("simulated runtime reload failure")
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar v1", "version": "1.0.0"},
+    )
+    assert created.status_code == 200
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+    assert failed.status_code == 503
+
+    reinstalled = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar v2", "version": "2.0.0"},
+    )
+    assert reinstalled.status_code == 200
+    reload_fails = False
+
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 503
+    assert retried.json()["error"]["code"] == "plugin_uninstall_cleanup_unavailable"
+    plugins = api.get("/api/v1/admin/plugins", headers=headers()).json()
+    assert [(item["id"], item["version"]) for item in plugins] == [
+        ("calendar", "2.0.0")
+    ]
+    assert (tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar").exists()
+
+
+def test_plugin_uninstall_retry_resumes_staged_same_generation_after_process_crash(
+    tmp_path: Path,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    class CrashAfterStageService(InMemoryAdminResourceService):
+        crash = True
+
+        async def uninstall_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            if self.crash:
+                raise SimulatedProcessCrash("simulated process exit after package staging")
+            await super().uninstall_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = CrashAfterStageService()
+    cast(Any, api.app).state.admin_resource_service = service
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+
+    with pytest.raises(SimulatedProcessCrash, match="simulated process exit"):
+        api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert not artifact_root.exists()
+    assert (pending_root / "artifact" / content_sha256).exists()
+    assert [item["id"] for item in api.get("/api/v1/admin/plugins", headers=headers()).json()] == [
+        "calendar"
+    ]
+
+    service.crash = False
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200
+    assert retried.json()["cleanup"]["retry_completed"] is True
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not pending_root.exists()
+
+
+def test_plugin_uninstall_retry_recovers_crash_before_state_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    state_path = pending_root / "state.json"
+    real_write_text = Path.write_text
+
+    def crash_before_state_write(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        if path == state_path:
+            raise SimulatedProcessCrash("simulated process exit before state write")
+        return real_write_text(
+            path,
+            data,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(Path, "write_text", crash_before_state_write)
+        with pytest.raises(SimulatedProcessCrash, match="before state write"):
+            api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert artifact_root.exists()
+    assert pending_root.is_dir()
+    assert not state_path.exists()
+
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["cleanup"]["retry_completed"] is True
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not artifact_root.exists()
+    assert not pending_root.exists()
+
+
+def test_plugin_uninstall_retry_recovers_crash_after_state_before_package_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    package_root = tmp_path / str(TENANT_ID) / "calendar"
+    artifact_root = package_root / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    staged_artifact_root = pending_root / "artifact"
+    real_replace = Path.replace
+
+    def crash_before_package_move(path: Path, target: str | Path) -> Path:
+        if path == package_root and Path(target) == staged_artifact_root:
+            raise SimulatedProcessCrash("simulated process exit before package move")
+        return real_replace(path, target)
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(Path, "replace", crash_before_package_move)
+        with pytest.raises(SimulatedProcessCrash, match="before package move"):
+            api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert artifact_root.exists()
+    assert (pending_root / "state.json").is_file()
+    assert not staged_artifact_root.exists()
+
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["cleanup"]["retry_completed"] is True
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not package_root.exists()
+    assert not pending_root.exists()
+
+
+def test_plugin_uninstall_mkdir_race_does_not_delete_competing_owner_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+    competing_marker = pending_root / "competing-owner"
+    real_mkdir = Path.mkdir
+
+    def lose_directory_claim(
+        path: Path,
+        mode: int = 0o777,
+        parents: bool = False,
+        exist_ok: bool = False,
+    ) -> None:
+        if path == pending_root:
+            real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+            competing_marker.write_text("owned by another api process", encoding="utf-8")
+            raise FileExistsError("simulated concurrent staging owner")
+        real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    with monkeypatch.context() as race_patch:
+        race_patch.setattr(Path, "mkdir", lose_directory_claim)
+        response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "plugin_uninstall_cleanup_unavailable"
+    assert competing_marker.read_text(encoding="utf-8") == "owned by another api process"
+    assert pending_root.is_dir()
+    assert [item["id"] for item in api.get("/api/v1/admin/plugins", headers=headers()).json()] == [
+        "calendar"
+    ]
+
+
+def test_legacy_plugin_delete_uses_fail_closed_uninstall_lifecycle(tmp_path: Path) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+
+    async def fail_strict_reload(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        raise RuntimeError("simulated strict reload failure")
+
+    cast(Any, api.app).state.reload_plugin_runtime_config_strict = fail_strict_reload
+
+    response = api.delete("/api/v1/admin/plugins/calendar", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "plugin_uninstall_cleanup_pending"
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not (tmp_path / str(TENANT_ID) / "calendar" / content_sha256).exists()
+    assert (
+        tmp_path
+        / ".uninstalling"
+        / str(TENANT_ID)
+        / "calendar"
+        / "artifact"
+        / content_sha256
+    ).exists()
+
+
+def test_plugin_uninstall_uses_strict_invalidation_callback_and_propagates_failure(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar"},
+    )
+    assert created.status_code == 200
+    calls: list[str] = []
+
+    class DirectRuntime:
+        async def reload_strict(self, tenant_id: UUID) -> None:
+            assert tenant_id == TENANT_ID
+            calls.append("direct")
+
+    async def strict_reload_with_invalidation(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        calls.append("strict-invalidation")
+        raise RuntimeError("invalidation publish failed")
+
+    cast(Any, api.app).state.plugin_service = DirectRuntime()
+    cast(Any, api.app).state.reload_plugin_runtime_config_strict = (
+        strict_reload_with_invalidation
+    )
+
+    response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "plugin_uninstall_cleanup_pending"
+    assert calls == ["strict-invalidation"]
+
+
+def test_plugin_uninstall_registration_failure_restores_package_and_can_retry(
+    tmp_path: Path,
+) -> None:
+    class FailingUninstallService(InMemoryAdminResourceService):
+        fail_uninstall = True
+
+        async def uninstall_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            if self.fail_uninstall:
+                raise RuntimeError("simulated registration delete failure")
+            await super().uninstall_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = FailingUninstallService()
+    cast(Any, api.app).state.admin_resource_service = service
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert failed.status_code == 500
+    assert [item["id"] for item in api.get("/api/v1/admin/plugins", headers=headers()).json()] == [
+        "calendar"
+    ]
+    assert artifact_root.exists()
+    assert not pending_root.exists()
+
+    service.fail_uninstall = False
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200
+    assert not artifact_root.exists()
+    assert not pending_root.exists()
+
+
+def test_plugin_uninstall_audit_failure_after_registration_delete_keeps_retryable_pending(
+    tmp_path: Path,
+) -> None:
+    class AuditFailingUninstallService(InMemoryAdminResourceService):
+        fail_audit = True
+
+        async def uninstall_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            await super().uninstall_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+            if self.fail_audit:
+                raise RuntimeError("simulated uninstall audit write failure")
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = AuditFailingUninstallService()
+    cast(Any, api.app).state.admin_resource_service = service
+    content_sha256, _artifact = _install_verified_calendar_package(
+        api,
+        private_key=ed25519.Ed25519PrivateKey.generate(),
+    )
+    artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    pending_root = tmp_path / ".uninstalling" / str(TENANT_ID) / "calendar"
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert failed.status_code == 503
+    assert failed.json() == {
+        "error": {
+            "code": "plugin_uninstall_cleanup_pending",
+            "message": "plugin uninstall cleanup is pending and can be retried",
+            "details": {
+                "package_artifact_removed": "false",
+                "registration_removed": "true",
+                "runtime_capabilities_removed": "false",
+            },
+        }
+    }
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert not artifact_root.exists()
+    assert (pending_root / "artifact").exists()
+
+    service.fail_audit = False
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert retried.status_code == 200
+    assert retried.json() == {
+        "status": "uninstalled",
+        "cleanup": {
+            "package_artifact_removed": True,
+            "registration_removed": True,
+            "retry_completed": True,
+            "runtime_capabilities_removed": True,
+        },
+    }
+    assert not artifact_root.exists()
+    assert not pending_root.exists()
+    audit = api.get(
+        "/api/v1/admin/audit",
+        headers=headers(),
+        params={
+            "action": "plugin.uninstall",
+            "resource": "plugin:calendar",
+        },
+    )
+    assert audit.status_code == 200
+    assert len(audit.json()) == 1
+    assert audit.json()[0]["details"]["id"] == "calendar"
+
+
+def test_plugin_uninstall_retry_reuses_audit_when_marker_write_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AuditingUninstallService(InMemoryAdminResourceService):
+        async def uninstall_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            await super().uninstall_plugin(
+                plugin_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+            assert actor_id is not None
+            await self.record_audit_event(
+                actor=str(actor_id),
+                action="plugin.uninstall",
+                resource=f"plugin:{plugin_id}",
+                details={"id": plugin_id},
+                tenant_id=tenant_id,
+            )
+
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    service = AuditingUninstallService()
+    cast(Any, api.app).state.admin_resource_service = service
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar"},
+    )
+    assert created.status_code == 200
+    real_mark = admin_router._mark_plugin_uninstall_audit_confirmed
+    failures_remaining = 1
+
+    def fail_once(state: object) -> None:
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise OSError("simulated audit marker failure")
+        real_mark(cast(Any, state))
+
+    monkeypatch.setattr(admin_router, "_mark_plugin_uninstall_audit_confirmed", fail_once)
+
+    failed = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert failed.status_code == 503
+    assert retried.status_code == 200
+    audit = api.get(
+        "/api/v1/admin/audit",
+        headers=headers(),
+        params={"action": "plugin.uninstall", "resource": "plugin:calendar"},
+    )
+    assert audit.status_code == 200
+    assert len(audit.json()) == 1
+
+
+def test_plugin_uninstall_completed_retry_is_idempotent(tmp_path: Path) -> None:
+    settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
+    api = client_with_settings(settings)
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar"},
+    )
+    assert created.status_code == 200
+
+    first = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+    retried = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+
+    assert first.status_code == 200
+    assert retried.status_code == 200
+    assert retried.json() == {
+        "status": "uninstalled",
+        "cleanup": {
+            "package_artifact_removed": True,
+            "registration_removed": True,
+            "retry_completed": True,
+            "runtime_capabilities_removed": True,
+        },
+    }
 
 
 def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
@@ -11748,6 +12690,80 @@ async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_serv
             idempotency_key="after-delete",
         )
     assert [call["idempotency_key"] for call in adapter_calls] == ["before-delete"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_uninstall_removes_runtime_capability_before_success() -> None:
+    class InProcessAdapter:
+        async def invoke(
+            self,
+            *,
+            plugin: PluginResourceResponse,
+            capability: PluginCapabilityRequest,
+            arguments: Mapping[str, JsonValue],
+            context: PluginInvocationContext,
+        ) -> Mapping[str, JsonValue]:
+            del plugin, capability, arguments, context
+            return {"ok": True}
+
+        def descriptor(self) -> Mapping[str, JsonValue]:
+            return {
+                "id": "local_tool",
+                "name": "Local Tool",
+                "description": "Runs a trusted local test adapter.",
+                "resource_schema": {"type": "object", "additionalProperties": False},
+                "capability_schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "sandbox_profile": {"type": "string", "enum": ("in_process",)},
+                    },
+                    "additionalProperties": True,
+                },
+                "argument_schema": {"type": "object", "additionalProperties": True},
+            }
+
+    api = client()
+    admin_service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    runtime_plugin_service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"local_tool": InProcessAdapter()},
+    )
+    cast(Any, api.app).state.plugin_service = runtime_plugin_service
+    cast(Any, api.app).state.reload_plugin_runtime_config = runtime_plugin_service.reload
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar Plugin",
+            "capabilities": [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "local_tool",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+    assert created.status_code == 200
+    assert started.status_code == 200, started.text
+    assert runtime_plugin_service.is_available(TENANT_ID, "calendar.create_event") is True
+
+    uninstalled = api.post(
+        "/api/v1/admin/plugins/calendar/uninstall",
+        headers=headers(),
+    )
+
+    assert uninstalled.status_code == 200
+    assert uninstalled.json()["cleanup"]["runtime_capabilities_removed"] is True
+    assert runtime_plugin_service.is_available(TENANT_ID, "calendar.create_event") is False
 
 
 @pytest.mark.asyncio

@@ -144,6 +144,8 @@ class StubRunService:
     summary_effective_scale: str | None = "large"
     summary_route_reason: str | None = "project_scale_mode_upgrade"
     summary_mode_source: str | None = "project_scale_assessment"
+    summary_execution_quiescent: bool = False
+    summary_execution_lease_expires_at: datetime | None = None
 
     async def submit(
         self,
@@ -505,6 +507,8 @@ class StubRunService:
             effective_scale=self.summary_effective_scale,
             route_reason=self.summary_route_reason,
             mode_source=self.summary_mode_source,
+            execution_quiescent=self.summary_execution_quiescent,
+            execution_lease_expires_at=self.summary_execution_lease_expires_at,
         )
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
@@ -2073,6 +2077,24 @@ def test_run_details_include_version_for_capability_approval() -> None:
     assert details.status_code == 200
     assert summary.json()["version"] == 7
     assert details.json()["version"] == 7
+
+
+def test_run_details_expose_execution_quiescence_without_worker_identity() -> None:
+    client, service, _ = _client()
+    run_id = uuid4()
+    service.summary_status = RunStatus.CANCELLED
+    service.summary_execution_quiescent = False
+    service.summary_execution_lease_expires_at = datetime(
+        2026, 10, 2, 12, 0, tzinfo=UTC
+    )
+
+    details = client.get(f"/api/v1/runs/{run_id}/details", headers=bearer())
+
+    assert details.status_code == 200
+    assert details.json()["execution_quiescent"] is False
+    assert details.json()["execution_lease_expires_at"] == "2026-10-02T12:00:00Z"
+    assert "worker_id" not in details.json()
+    assert "worker_lease_token" not in details.json()
 
 
 def test_run_details_expose_persisted_server_routing_decision() -> None:

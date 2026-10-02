@@ -44,7 +44,7 @@ from agent_hub.runs.conversation_queue import (
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
-from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
+from agent_hub.runs.repository import RunAlreadyActive, RunConflict, RunRecord, RunRepository
 from agent_hub.runs.self_repair import (
     SelfRepairDecision,
     SelfRepairPolicy,
@@ -98,7 +98,12 @@ _TERMINAL_HOOK_NOTIFIED_KIND = "terminal.notified"
 def _runtime_cancel_for_run(
     runtime: ExecutionRuntime,
     run_id: UUID,
+    execution_token: UUID,
 ) -> Callable[[], Awaitable[None]]:
+    cancel_run_owned = getattr(runtime, "cancel_run_owned", None)
+    if cancel_run_owned is not None:
+        owned_cancel = cast(Callable[[UUID, UUID], Awaitable[None]], cancel_run_owned)
+        return lambda: owned_cancel(run_id, execution_token)
     cancel_run = getattr(runtime, "cancel_run", None)
     if cancel_run is not None:
         run_scoped_cancel = cast(Callable[[UUID], Awaitable[None]], cancel_run)
@@ -158,6 +163,8 @@ class RunSummary:
     effective_scale: str | None = None
     route_reason: str | None = None
     mode_source: str | None = None
+    execution_quiescent: bool = False
+    execution_lease_expires_at: datetime | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -1490,6 +1497,7 @@ class RunService:
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.update_control_status(tenant_id, run_id, RunStatus.PAUSED)
+        record = await self._stop_worker_for_control(record)
         return await self._summary(record)
 
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
@@ -1506,8 +1514,36 @@ class RunService:
         record = await self._repository.update_control_status(
             tenant_id, run_id, RunStatus.CANCELLED
         )
-        await self._release_conversation_successor(tenant_id, run_id)
+        record = await self._stop_worker_for_control(record)
+        if not _record_has_worker_execution(record):
+            await self._release_conversation_successor(tenant_id, run_id)
         return await self._summary(record)
+
+    async def _stop_worker_for_control(self, record: RunRecord) -> RunRecord:
+        if not _record_has_worker_execution(record):
+            return record
+        if record.mode is None:
+            raise RuntimeError("active run worker has no executable mode")
+        if record.worker_id is None or record.worker_lease_token is None:
+            raise RuntimeError("active run worker ownership is incomplete")
+        if record.worker_id != self._worker_id:
+            return record
+        runtime = self._runtime_registry.get(record.mode)
+        await _runtime_cancel_for_run(
+            runtime,
+            record.id,
+            record.worker_lease_token,
+        )()
+        try:
+            return await self._repository.release_expired_worker_execution(
+                record.tenant_id,
+                record.id,
+                worker_id=record.worker_id,
+                worker_lease_token=record.worker_lease_token,
+                now=datetime.now(UTC),
+            )
+        except RunConflict:
+            return await self._repository.get(record.tenant_id, record.id)
 
     async def queue_message(
         self,
@@ -1707,16 +1743,18 @@ class RunService:
                 )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
-                await self._release_conversation_successor(
-                    claimed_record.tenant_id,
-                    claimed_record.id,
-                )
+                if not _record_has_worker_execution(claimed_record):
+                    await self._release_conversation_successor(
+                        claimed_record.tenant_id,
+                        claimed_record.id,
+                    )
                 return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
             if claimed_record.status in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
-                await self._release_conversation_successor(
-                    claimed_record.tenant_id,
-                    claimed_record.id,
-                )
+                if not _record_has_worker_execution(claimed_record):
+                    await self._release_conversation_successor(
+                        claimed_record.tenant_id,
+                        claimed_record.id,
+                    )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
             return _submitted(claimed_record)
@@ -1727,6 +1765,7 @@ class RunService:
         observed_events: list[RunEvent] = []
         scheduler_notice_payloads: list[dict[str, object]] = []
         lease_lost = False
+        runtime_cancel_failed = False
         heartbeat_stop = asyncio.Event()
         heartbeat_task: asyncio.Task[None] | None = None
         try:
@@ -1774,6 +1813,7 @@ class RunService:
                 instructions = await self._instruction_context_loader.load(
                     tenant_id=tenant_id, run_id=run_id,
                 )
+                pre_runtime_exit: RunRecord | None = None
                 async with await self._repository.run_transaction() as session, session.begin():
                     locked = await self._repository.get_for_update(session, run_id)
                     if (
@@ -1784,18 +1824,41 @@ class RunService:
                         or locked.worker_lease_expires_at is None
                         or locked.worker_lease_expires_at <= datetime.now(UTC)
                     ):
-                        return _submitted(RunRepository._record(locked))
-                    sequence = await self._repository.next_event_sequence(session, run_id)
-                    await self._repository.persist_event(
-                        session, tenant_id=tenant_id, run_id=run_id,
-                        event=RunEvent(kind="context.loaded", sequence=sequence, run_id=run_id,
-                                       payload=cast(dict[str, JsonValue], instructions.metadata())),
-                    )
-                    if not instructions.authorized_for(locked):
-                        instructions = None
+                        pre_runtime_exit = RunRepository._record(locked)
+                    else:
+                        RunRepository.renew_worker_lease(
+                            locked,
+                            worker_id=self._worker_id,
+                            worker_lease_token=worker_lease_token,
+                            worker_lease_expires_at=self._worker_lease_expires_at(),
+                        )
+                        sequence = await self._repository.next_event_sequence(session, run_id)
+                        await self._repository.persist_event(
+                            session, tenant_id=tenant_id, run_id=run_id,
+                            event=RunEvent(kind="context.loaded", sequence=sequence, run_id=run_id,
+                                           payload=cast(dict[str, JsonValue], instructions.metadata())),
+                        )
+                        if not instructions.authorized_for(locked):
+                            instructions = None
+                if pre_runtime_exit is not None:
+                    if (
+                        pre_runtime_exit.worker_id == self._worker_id
+                        and pre_runtime_exit.worker_lease_token == worker_lease_token
+                    ):
+                        try:
+                            pre_runtime_exit = await self._repository.release_worker_execution(
+                                tenant_id,
+                                run_id,
+                                worker_id=self._worker_id,
+                                worker_lease_token=worker_lease_token,
+                            )
+                        except RunConflict:
+                            pre_runtime_exit = await self._repository.get(tenant_id, run_id)
+                    return _submitted(pre_runtime_exit)
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
+                execution_token=worker_lease_token,
                 actor_id=actor_id,
                 actor_role=actor_role,
                 mode=mode,
@@ -1844,7 +1907,7 @@ class RunService:
                         run_id=run_id,
                         event=_event_at_sequence(started_event, run_id=run_id, sequence=sequence),
                     )
-            runtime_cancel = _runtime_cancel_for_run(runtime, run_id)
+            runtime_cancel = _runtime_cancel_for_run(runtime, run_id, worker_lease_token)
             heartbeat_task = asyncio.create_task(
                 self._heartbeat_worker_lease(
                     tenant_id=tenant_id,
@@ -1873,6 +1936,7 @@ class RunService:
                             terminal = RunStatus.CANCELLED
                             stop_runtime_loop = True
                         if current_status is RunStatus.PAUSED:
+                            cancel_runtime = True
                             terminal = RunStatus.PAUSED
                             stop_runtime_loop = True
                         if current_status is RunStatus.WAITING_APPROVAL:
@@ -1926,10 +1990,13 @@ class RunService:
                                 terminal = RunStatus.FAILED
                             if terminal is not RunStatus.RUNNING:
                                 locked.status = terminal.value
-                                RunRepository.clear_worker_lease(locked)
                                 locked.version += 1
                     if cancel_runtime:
-                        await runtime_cancel()
+                        try:
+                            await runtime_cancel()
+                        except Exception:
+                            runtime_cancel_failed = True
+                            raise
                     if stop_runtime_loop:
                         break
                     if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
@@ -1939,17 +2006,60 @@ class RunService:
                 await self._await_worker_lease_heartbeat(heartbeat_task)
             if lease_lost:
                 return await self._submitted_by_run_id(tenant_id, run_id)
+            try:
+                released_record = await self._repository.release_worker_execution(
+                    tenant_id,
+                    run_id,
+                    worker_id=self._worker_id,
+                    worker_lease_token=worker_lease_token,
+                    complete_if_running=True,
+                )
+            except RunConflict:
+                return await self._submitted_by_run_id(tenant_id, run_id)
+            terminal = released_record.status
         except Exception as error:
             _LOGGER.exception(
                 "run_execute_failed run_id=%s error_type=%s",
                 run_id,
                 type(error).__name__,
             )
-            failed = await self._repository.fail_run(
-                run_id,
-                reason=_runtime_failure_reason(error),
-            )
+            try:
+                failed = await self._repository.fail_run(
+                    run_id,
+                    reason=_runtime_failure_reason(error),
+                    worker_id=self._worker_id,
+                    worker_lease_token=worker_lease_token,
+                )
+            except RunConflict:
+                return await self._submitted_by_run_id(tenant_id, run_id)
+            if not runtime_cancel_failed:
+                try:
+                    failed = await self._repository.release_worker_execution(
+                        failed.tenant_id,
+                        run_id,
+                        worker_id=self._worker_id,
+                        worker_lease_token=worker_lease_token,
+                    )
+                except RunConflict:
+                    return await self._submitted_by_run_id(tenant_id, run_id)
+            else:
+                try:
+                    failed = await self._repository.mark_worker_execution_exited(
+                        failed.tenant_id,
+                        run_id,
+                        worker_id=self._worker_id,
+                        worker_lease_token=worker_lease_token,
+                        exited_at=datetime.now(UTC),
+                    )
+                except RunConflict:
+                    return await self._submitted_by_run_id(tenant_id, run_id)
             if failed.status is RunStatus.WAITING_APPROVAL:
+                return _submitted(failed)
+            if failed.status in {
+                RunStatus.PAUSED,
+                RunStatus.COMPLETED,
+                RunStatus.CANCELLED,
+            }:
                 return _submitted(failed)
             if _routing_source(failed.routing_decision) == "self_repair":
                 await self._safe_record_self_repair_execution_event(
@@ -2010,11 +2120,9 @@ class RunService:
                 mode=failed.mode,
                 routing_decision=failed.routing_decision,
             )
-            await self._release_conversation_successor(failed.tenant_id, run_id)
+            if not _record_has_worker_execution(failed):
+                await self._release_conversation_successor(failed.tenant_id, run_id)
             return await self._submitted_by_run_id(failed.tenant_id, run_id)
-        if terminal is RunStatus.RUNNING:
-            terminal = RunStatus.COMPLETED
-            await self._repository.update_status(tenant_id, run_id, terminal)
         if observer_decisions:
             async with await self._repository.run_transaction() as session, session.begin():
                 sequence = await self._repository.next_event_sequence(session, run_id)
@@ -2087,7 +2195,9 @@ class RunService:
                 mode=mode,
                 routing_decision=routing_decision,
             )
-            await self._release_conversation_successor(tenant_id, run_id)
+            released = await self._repository.get(tenant_id, run_id)
+            if not _record_has_worker_execution(released):
+                await self._release_conversation_successor(tenant_id, run_id)
         return await self._submitted_by_run_id(tenant_id, run_id)
 
     async def _safe_record_self_repair_execution_event(
@@ -2320,10 +2430,11 @@ class RunService:
 
     async def recover_running(self, limit: int = 100) -> int:
         recovered = 0
-        for run_id in await self._repository.running_for_recovery(
+        candidates = await self._repository.running_for_recovery(
             limit,
             now=datetime.now(UTC),
-        ):
+        )
+        for run_id in candidates:
             try:
                 recovered_run = await self.recover(run_id)
             except Exception as error:
@@ -2335,6 +2446,74 @@ class RunService:
                 continue
             if recovered_run.status is RunStatus.RUNNING:
                 continue
+            recovered += 1
+        recovered += await self.recover_terminal_worker_executions(limit=limit)
+        recovered += await self.recover_conversation_queue_releases(limit=limit)
+        return recovered
+
+    async def recover_conversation_queue_releases(self, limit: int = 100) -> int:
+        if self._conversation_queue_repository is None or limit <= 0:
+            return 0
+        recovered = 0
+        candidates = (
+            await self._conversation_queue_repository.terminal_predecessors_for_recovery(limit)
+        )
+        for tenant_id, run_id in candidates:
+            try:
+                await self._release_conversation_successor(tenant_id, run_id)
+            except Exception as error:
+                _LOGGER.exception(
+                    "conversation_queue_release_recovery_failed run_id=%s error_type=%s",
+                    run_id,
+                    type(error).__name__,
+                )
+                continue
+            recovered += 1
+        return recovered
+
+    async def recover_terminal_worker_executions(self, limit: int = 100) -> int:
+        recovered = 0
+        records = await self._repository.terminal_worker_executions_for_recovery(
+            limit,
+            now=datetime.now(UTC),
+        )
+        for record in records:
+            if (
+                record.mode is None
+                or record.worker_id is None
+                or record.worker_lease_token is None
+            ):
+                continue
+            try:
+                if record.worker_id == self._worker_id:
+                    runtime = self._runtime_registry.get(record.mode)
+                    await _runtime_cancel_for_run(
+                        runtime,
+                        record.id,
+                        record.worker_lease_token,
+                    )()
+                released = await self._repository.release_expired_worker_execution(
+                    record.tenant_id,
+                    record.id,
+                    worker_id=record.worker_id,
+                    worker_lease_token=record.worker_lease_token,
+                    now=datetime.now(UTC),
+                )
+            except Exception as error:
+                _LOGGER.exception(
+                    "run_terminal_worker_recovery_failed run_id=%s error_type=%s",
+                    record.id,
+                    type(error).__name__,
+                )
+                continue
+            if _record_has_worker_execution(released):
+                continue
+            if released.status in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+            }:
+                await self._release_conversation_successor(record.tenant_id, record.id)
             recovered += 1
         return recovered
 
@@ -2416,6 +2595,10 @@ class RunService:
 
     async def _summary(self, record: RunRecord) -> RunSummary:
         routing_decision = _public_record_routing_decision(record)
+        execution_quiescent, lease_expires_at = _execution_quiescence(
+            record,
+            now=datetime.now(UTC),
+        )
         waiting_for_decision = record.status in {
             RunStatus.WAITING_USER_MODE,
             RunStatus.WAITING_APPROVAL,
@@ -2455,6 +2638,8 @@ class RunService:
             effective_scale=_project_scale_or_none(routing_decision.get("effective_scale")),
             route_reason=_string_or_none(routing_decision.get("route_reason")),
             mode_source=_string_or_none(routing_decision.get("mode_source")),
+            execution_quiescent=execution_quiescent,
+            execution_lease_expires_at=lease_expires_at,
         )
 
     async def _safe_notify_terminal_hooks(
@@ -4788,6 +4973,35 @@ def _run_worker_lease_seconds(configured_seconds: float) -> float:
     ):
         return 60.0
     return max(1.0, min(float(configured_seconds), 3600.0))
+
+
+def _execution_quiescence(
+    record: RunRecord,
+    *,
+    now: datetime,
+) -> tuple[bool, datetime | None]:
+    if record.status not in {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }:
+        return False, None
+    del now
+    if _record_has_worker_execution(record):
+        return False, record.worker_lease_expires_at
+    return True, None
+
+
+def _record_has_worker_execution(record: RunRecord) -> bool:
+    return any(
+        value is not None
+        for value in (
+            record.worker_id,
+            record.worker_lease_token,
+            record.worker_lease_expires_at,
+            record.worker_heartbeat_at,
+        )
+    )
 
 
 def _conversation_history_token_budget(

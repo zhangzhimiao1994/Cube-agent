@@ -129,6 +129,7 @@ from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.invalidation import (
     RuntimeConfigInvalidationBus,
     RuntimeConfigInvalidationTarget,
+    StrictReloadRuntimeAdapter,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.scheduler.service import (
@@ -783,11 +784,12 @@ async def _run_runtime_config_invalidation_listener(
     retry_delay_seconds: float = 1.0,
 ) -> None:
     stream_consumer_id = f"api-{uuid4()}"
+    strict_plugin_runtime = StrictReloadRuntimeAdapter(plugin_runtime)
     while True:
         try:
             await bus.listen(
                 mcp_runtime=cast(Any, mcp_runtime),
-                plugin_runtime=cast(Any, plugin_runtime),
+                plugin_runtime=cast(Any, strict_plugin_runtime),
                 stream_consumer_group=stream_consumer_id,
                 stream_consumer_name=stream_consumer_id,
                 reload_on_empty_stream_replay=True,
@@ -1275,6 +1277,28 @@ def create_app(
                         application.state.reload_plugin_runtime_config = (
                             _runtime_reload_with_invalidation(
                                 cast(RuntimeReloadCallback, reload_plugin_runtime_config),
+                                runtime_config_invalidation_bus,
+                                RuntimeConfigInvalidationTarget.PLUGIN,
+                                cast(
+                                    CurrentConfigService,
+                                    config_service
+                                    if config_service is not None
+                                    else application.state.config_service,
+                                ),
+                            )
+                        )
+                    reload_plugin_runtime_config_strict = getattr(
+                        runtime_plugin_service,
+                        "reload_strict",
+                        None,
+                    )
+                    if callable(reload_plugin_runtime_config_strict):
+                        application.state.reload_plugin_runtime_config_strict = (
+                            _runtime_reload_with_invalidation(
+                                cast(
+                                    RuntimeReloadCallback,
+                                    reload_plugin_runtime_config_strict,
+                                ),
                                 runtime_config_invalidation_bus,
                                 RuntimeConfigInvalidationTarget.PLUGIN,
                                 cast(

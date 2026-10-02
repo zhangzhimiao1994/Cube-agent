@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
-from typing import Protocol, Self, cast
+from typing import Any, Protocol, Self, cast
 from urllib.error import HTTPError
 
 import pytest
@@ -1213,6 +1213,94 @@ def test_same_stage_replacement_failure_gets_one_bounded_followup() -> None:
         previous,
         current,
         seen_signatures={previous.signature, current.signature},
+    )
+
+
+def _typescript_build_validation(output: str) -> project_scale_runner_module._EvidenceCheck:
+    output_tail = project_scale_runner_module._generated_project_output_tail(output)
+    reason = (
+        f"generated_project_validation: command failed exit=2 command=npm run build "
+        f"output_tail={output_tail}"
+    )
+    return project_scale_runner_module._EvidenceCheck(
+        passed=False,
+        reasons=(reason,),
+    )
+
+
+class _ControlledMonotonicClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _typescript_build_progress_state(output: str) -> project_scale_runner_module._DeliverableRepairProgress:
+    validation = _typescript_build_validation(output)
+    return project_scale_runner_module._deliverable_repair_progress_state(
+        {
+            "workspace_bundle": True,
+            "deliverable_quality": False,
+            "agent_standard_verification": True,
+            "generated_project_validation": False,
+            "requirements_validation": False,
+        },
+        case_id="medium:direct",
+        generated_project_validation=validation,
+        failure_reasons=validation.reasons,
+    )
+
+
+def test_typescript_build_progress_accepts_overlapping_real_tsc_error_sets() -> None:
+    previous = _typescript_build_progress_state(
+        """src/store.ts(11,7): error TS2322: incompatible store type
+src/handlers.ts:22:5 - error TS2345: incompatible handler argument
+Found 2 errors in 2 files.
+npm error Lifecycle script `build` failed with error"""
+    )
+    current = _typescript_build_progress_state(
+        """src/handlers.ts:22:5 - error TS2345: incompatible handler argument
+error TS18003: No inputs were found in config file 'tsconfig.json'
+Found 2 errors in 1 file.
+npm error Lifecycle script `build` failed with error"""
+    )
+
+    previous_failures = project_scale_runner_module._typescript_failure_fingerprints(previous)
+    current_failures = project_scale_runner_module._typescript_failure_fingerprints(current)
+
+    assert project_scale_runner_module._deliverable_repair_exposes_new_typescript_build_failure(
+        previous,
+        current,
+        seen_signatures={previous.signature},
+    )
+    assert any("src/handlers.ts" in failure for failure in previous_failures)
+    assert any("ts18003" in failure for failure in current_failures)
+    assert all("found 2 errors" not in failure for failure in previous_failures)
+    assert all("npm error" not in failure for failure in current_failures)
+
+
+def test_typescript_build_progress_rejects_real_tsc_error_accumulation() -> None:
+    previous = _typescript_build_progress_state(
+        """src/store.ts(11,7): error TS2322: incompatible store type
+Found 1 error in src/store.ts:11"""
+    )
+    current = _typescript_build_progress_state(
+        """src/store.ts(11,7): error TS2322: incompatible store type
+src/router.ts:47:3 - error TS2769: no overload matches this call
+Found 2 errors in 2 files.
+Build failed in 1.2s"""
+    )
+
+    assert not (
+        project_scale_runner_module._deliverable_repair_exposes_new_typescript_build_failure(
+            previous,
+            current,
+            seen_signatures={previous.signature},
+        )
     )
 
 
@@ -2819,6 +2907,38 @@ def test_urllib_acceptance_client_reauthenticates_once_on_expired_token(
         None,
         "Bearer fresh-token",
     ]
+
+
+@pytest.mark.parametrize("status_code", [404, 410])
+def test_urllib_acceptance_client_preserves_http_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    def fake_urlopen(request: object, *, timeout: float) -> object:
+        del timeout
+        url = cast(Any, request).full_url
+        raise HTTPError(
+            url,
+            status_code,
+            "Gone",
+            hdrs=Message(),
+            fp=BytesIO(b'{"error":{"code":"run_not_found"}}'),
+        )
+
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.urlopen", fake_urlopen)
+    client = UrllibAcceptanceClient(
+        base_url="http://agent-hub.local",
+        bearer_token="valid-token",
+    )
+
+    with pytest.raises(
+        project_scale_runner_module.AcceptanceHTTPError
+    ) as captured:
+        client.request_json("GET", "/api/v1/runs/run-1/details")
+
+    assert captured.value.status_code == status_code
+    assert captured.value.method == "GET"
+    assert captured.value.path == "/api/v1/runs/run-1/details"
 
 
 def test_urllib_acceptance_client_retries_busy_acceptance_login(
@@ -6162,7 +6282,7 @@ def test_repeated_same_stage_failure_does_not_force_authoritative_recovery() -> 
     )
 
 
-def test_capability_repair_stops_at_soft_limit_for_error_rotation(
+def test_capability_repair_stops_at_soft_limit_for_non_typescript_error_rotation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -6177,7 +6297,7 @@ def test_capability_repair_stops_at_soft_limit_for_error_rotation(
             reasons=(
                 (
                     "generated_project_validation: command failed exit=2 "
-                    f'command=npm run build output_tail="src/repair-{attempt}.ts: error TS{2300 + attempt}"'
+                    f'command=npm run build output_tail="unclassified build failure {attempt}"'
                 ),
             ),
         )
@@ -6254,7 +6374,7 @@ def test_capability_repair_stops_at_soft_limit_for_error_rotation(
     result = report.results[0]
     assert result.evidence["generated_project_validation"] is False
     assert result.evidence["deliverable_repair_trace"] is True
-    assert any("src/repair-4.ts" in error for error in result.errors)
+    assert any("unclassified build failure 4" in error for error in result.errors)
     repair_keys = [
         call[2]
         for call in client.calls
@@ -6385,6 +6505,239 @@ def test_capability_repair_extends_past_scale_budget_for_repeated_actionable_reg
     assert report.ok is True
     assert len(client.submitted_bodies) == 9
     assert validation_results == []
+
+
+def test_medium_capability_repair_extends_after_six_distinct_typescript_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=("medium",),
+        flows=("direct",),
+        execute=True,
+    )
+    typescript_failures = (
+        "src/scripts.ts(4,7): error TS2305: Module has no exported member 'startServer'",
+        "src/router.ts:18:9 - error TS2322: Type 'string | undefined' is not assignable to type 'string'",
+        "src/store.ts(31,14): error TS2345: Argument of type 'Store' is not assignable to parameter of type 'Repository'",
+        "src/handlers.ts:22:5 - error TS2739: Type 'Handler' is missing properties from type 'Router'",
+        "src/router.ts(47,3): error TS2769: No overload matches this call",
+        "src/seed.ts:11:17 - error TS7053: Element implicitly has an 'any' type",
+        (
+            "src/handlers.ts(63,7): error TS2322: Type "
+            "'Request<{tenant_id:string}>' is not assignable to type "
+            "'Handler<Record<string,string>>'"
+        ),
+        "error TS18003: No inputs were found in config file 'tsconfig.json'",
+    )
+    validation_results = [
+        _typescript_build_validation(
+            "\n".join(
+                (
+                    typescript_failures[index],
+                    typescript_failures[index + 1],
+                    "Found 2 errors in 2 files.",
+                    "npm error Lifecycle script `build` failed with error",
+                )
+            )
+        )
+        for index in range(len(typescript_failures) - 1)
+    ]
+    validation_results.append(
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+    )
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        assert bundle is not None
+        return validation_results.pop(0)
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    client = FakeAcceptanceClient(
+        run_id="run-medium-direct-progressive-typescript-repair",
+        session_id="project-scale-medium-direct",
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            {
+                "README.md": "# CRM API\n\nImplements the requested project scope.\n",
+                "PROJECT_REQUIREMENTS.md": "- Multi-tenant CRM requirements satisfied\n",
+                "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+                "VERIFICATION.md": (
+                    "- npm run build: passed exit 0\n"
+                    "- npm test: passed exit 0\n"
+                    "- interaction smoke: passed by real HTTP checks\n"
+                ),
+                "constraints_reading_evidence.json": json.dumps(
+                    {
+                        "read_before_implementation": True,
+                        "constraints": [
+                            "AGENTS.md workspace rules",
+                            "HANDOFF",
+                            "PROJECT_REQUIREMENTS.md",
+                        ],
+                        "skills": ["applicable SKILL.md or agent-standard rules"],
+                    }
+                ),
+                "package.json": json.dumps(
+                    {
+                        "scripts": {
+                            "build": "tsc",
+                            "test": "node --test",
+                            "start": "node dist/app.js",
+                        }
+                    }
+                ),
+                "src/app.ts": _functional_ts_source(),
+                "tests/unit.test.ts": _functional_ts_test(),
+            }
+        ),
+    )
+
+    report = execute_project_scale_plan(plan, client)
+
+    assert report.ok is True
+    assert len(client.submitted_bodies) == 8
+    assert client.submitted_bodies[-1]["replace_workspace_files"] is True
+    assert "Replace the entire workspace with one coherent implementation" in str(
+        client.submitted_bodies[-1]["message"]
+    )
+    assert validation_results == []
+
+
+@pytest.mark.parametrize(
+    ("scale", "seconds_per_validation", "failed_validations"),
+    (
+        ("large", 22.0, 10),
+        ("ultra", 20.0, 12),
+    ),
+)
+def test_large_capability_progress_extends_absolute_wall_clock_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    scale: str,
+    seconds_per_validation: float,
+    failed_validations: int,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability",
+        scales=(scale,),
+        flows=("direct",),
+        execute=True,
+    )
+    clock = _ControlledMonotonicClock()
+    initial_absolute_deadline = project_scale_runner_module._case_absolute_deadline(
+        0.0,
+        configured_wait_seconds=100.0,
+        case_id=f"{scale}:direct",
+        benchmark_kind="capability",
+    )
+    observed_absolute_deadlines: list[float] = []
+    diagnostics = tuple(
+        f"src/repair-{index}.ts({index + 1},1): error TS2322: repair failure {index}"
+        for index in range(failed_validations + 1)
+    )
+    validation_results = [
+        _typescript_build_validation(
+            "\n".join(
+                (
+                    diagnostics[index],
+                    diagnostics[index + 1],
+                    "Found 2 errors in 2 files.",
+                )
+            )
+        )
+        for index in range(failed_validations)
+    ]
+    validation_results.append(
+        project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+    )
+    validation_index = 0
+
+    def validate_generated_project_bundle(
+        bundle: bytes | None, **kwargs: object
+    ) -> project_scale_runner_module._EvidenceCheck:
+        nonlocal validation_index
+        assert bundle is not None
+        absolute_deadline = kwargs["absolute_deadline"]
+        assert isinstance(absolute_deadline, int | float)
+        observed_absolute_deadlines.append(float(absolute_deadline))
+        clock.advance(seconds_per_validation)
+        result = validation_results[min(validation_index, len(validation_results) - 1)]
+        validation_index += 1
+        return result
+
+    monkeypatch.setattr(
+        project_scale_runner_module,
+        "_validate_generated_project_bundle",
+        validate_generated_project_bundle,
+    )
+    monkeypatch.setattr(
+        "agent_hub.harness.project_scale_runner.time.monotonic",
+        clock,
+    )
+    client = FakeAcceptanceClient(
+        run_id=f"run-{scale}-direct-wall-clock-budget",
+        session_id=f"project-scale-{scale}-direct",
+        create_status="waiting_approval",
+        decision_token=f"approve-{scale}",
+        decision_version=2,
+        repair_create_status="waiting_approval",
+        repair_decision_token=f"approve-{scale}-repair",
+        repair_decision_version=3,
+        status="completed",
+        artifacts=[{"id": "artifact-1"}],
+        events=[
+            {
+                "kind": "artifact.created",
+                "payload": {
+                    "agent_standard_verification": {
+                        "constraints_read": True,
+                        "plan_before_implementation": True,
+                        "reproducible_verification": True,
+                        "root_cause_repair": True,
+                    }
+                },
+            }
+        ],
+        workspace_bundle=_project_bundle(
+            dict(
+                project_scale_artifact_zip_files(
+                    str(plan.requests[0].body["message"])
+                )
+            )
+        ),
+    )
+
+    report = execute_project_scale_plan(
+        plan,
+        client,
+        wait_seconds=100.0,
+        poll_interval_seconds=0,
+    )
+
+    assert report.ok is True, report.results[0].errors
+    assert validation_index == failed_validations + 1
+    assert len(client.submitted_bodies) == failed_validations + 1
+    assert max(observed_absolute_deadlines) > initial_absolute_deadline
+    assert observed_absolute_deadlines == sorted(observed_absolute_deadlines)
 
 
 def test_capability_repair_retries_transient_failed_run_at_soft_limit(
@@ -6550,7 +6903,7 @@ def test_capability_repair_escalates_stalled_failure_to_authoritative_recovery(
     assert validation_results == []
 
 
-def test_capability_repair_stops_at_dynamic_safety_limit(
+def test_typescript_overlap_repair_stops_at_dynamic_safety_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = build_project_scale_run_plan(
@@ -6559,17 +6912,25 @@ def test_capability_repair_stops_at_dynamic_safety_limit(
         flows=("direct",),
         execute=True,
     )
-    validation_results = [
-        project_scale_runner_module._EvidenceCheck(
-            passed=False,
-            reasons=(
-                (
-                    "generated_project_validation: command failed exit=1 "
-                    f'command=npm test output_tail="concurrent creates: {attempt} !== 100"'
-                ),
-            ),
+    typescript_failures = tuple(
+        (
+            f"src/repair-{index}.ts({index + 1},1): error TS2322: repair failure {index}"
+            if index % 2 == 0
+            else f"src/repair-{index}.ts:{index + 1}:1 - error TS2345: repair failure {index}"
         )
-        for attempt in range(15)
+        for index in range(16)
+    )
+    validation_results = [
+        _typescript_build_validation(
+            "\n".join(
+                (
+                    typescript_failures[index],
+                    typescript_failures[index + 1],
+                    "Found 2 errors in 2 files.",
+                )
+            )
+        )
+        for index in range(15)
     ] + [project_scale_runner_module._EvidenceCheck(passed=True, reasons=())]
 
     def validate_generated_project_bundle(

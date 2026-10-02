@@ -22,6 +22,24 @@ class ReloadableRuntime(Protocol):
     async def reload(self, tenant_id: UUID | None = None) -> None: ...
 
 
+class StrictReloadRuntimeAdapter:
+    """Expose invalidation reloads as generation-forcing plugin reloads."""
+
+    def __init__(self, runtime: object) -> None:
+        self._runtime = runtime
+
+    async def reload(self, tenant_id: UUID | None = None) -> None:
+        callback = getattr(self._runtime, "reload_strict", None)
+        if not callable(callback):
+            callback = getattr(self._runtime, "reload", None)
+        if not callable(callback):
+            raise TypeError("plugin runtime reload is unavailable")
+        await callback(tenant_id)
+
+    async def reload_strict(self, tenant_id: UUID | None = None) -> None:
+        await self.reload(tenant_id)
+
+
 class RedisInvalidationClient(Protocol):
     async def xgroup_create(
         self,
@@ -374,7 +392,12 @@ class RuntimeConfigInvalidationBus:
         if target in {RuntimeConfigInvalidationTarget.MCP, RuntimeConfigInvalidationTarget.ALL}:
             reloaded = await _reload_runtime(mcp_runtime, tenant_id, "mcp") and reloaded
         if target in {RuntimeConfigInvalidationTarget.PLUGIN, RuntimeConfigInvalidationTarget.ALL}:
-            reloaded = await _reload_runtime(plugin_runtime, tenant_id, "plugin") and reloaded
+            reloaded = await _reload_runtime(
+                plugin_runtime,
+                tenant_id,
+                "plugin",
+                strict=True,
+            ) and reloaded
         return reloaded
 
 
@@ -466,11 +489,16 @@ async def _reload_runtime(
     runtime: ReloadableRuntime | None,
     tenant_id: UUID | None,
     runtime_name: str,
+    *,
+    strict: bool = False,
 ) -> bool:
     if runtime is None:
         return True
     try:
-        await runtime.reload(tenant_id)
+        reload_callback = getattr(runtime, "reload_strict", None) if strict else None
+        if not callable(reload_callback):
+            reload_callback = runtime.reload
+        await reload_callback(tenant_id)
         return True
     except Exception as error:  # noqa: BLE001 - invalidation listeners must keep running.
         _LOGGER.warning(

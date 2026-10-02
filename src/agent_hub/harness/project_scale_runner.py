@@ -109,6 +109,25 @@ _REPAIR_CONTEXT_EXTENSIONS = frozenset(
 _REPAIR_CONTEXT_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_./\\-])([A-Za-z0-9_.@+:/\\-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|mts|ts|tsx|yaml|yml))(?![A-Za-z0-9_./\\-])"
 )
+_TYPESCRIPT_DIAGNOSTIC_MARKER_RE = re.compile(
+    r"(?:(?P<path>(?:[a-z]:)?[a-z0-9_.@+:/\\<>-]+\.(?:[cm]?tsx?))"
+    r"(?:(?:\((?:<line>|\d+),(?:<column>|\d+)\):)"
+    r"|(?::(?:<line>|\d+):(?:<column>|\d+)\s*-\s*)))?"
+    r"error\s+(?P<code>ts\d{4})\s*:",
+    re.IGNORECASE,
+)
+_TYPESCRIPT_DIAGNOSTIC_TRAILER_RE = re.compile(
+    r"(?:\s+|\s*\|\s*)(?:"
+    r"found\s+\d+\s+errors?\b"
+    r"|errors?\s+files?\b"
+    r"|(?:npm|pnpm|yarn)\s+(?:err!|error)\b"
+    r"|(?:build|compilation)\s+failed\b"
+    r"|error\s+command\s+failed\b"
+    r"|(?:process|command)\s+(?:exited|failed)\b"
+    r"|elifecycle\b"
+    r")",
+    re.IGNORECASE,
+)
 _PLUGIN_CONTRACT_PAYLOAD_KEYS = (
     "plugin_contract",
     "plugin_capability_contract",
@@ -388,6 +407,26 @@ class ProjectScaleExecutionReport:
         }
 
 
+class AcceptanceHTTPError(RuntimeError):
+    """HTTP failure that preserves status for bounded acceptance recovery."""
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        path: str,
+        status_code: int,
+        response_body: str,
+    ) -> None:
+        self.method = method.upper()
+        self.path = path
+        self.status_code = status_code
+        self.response_body = response_body
+        super().__init__(
+            f"{self.method} {path} failed status={status_code} body={response_body[:240]}"
+        )
+
+
 class UrllibAcceptanceClient:
     def __init__(
         self,
@@ -477,7 +516,12 @@ class UrllibAcceptanceClient:
                     retry_auth=False,
                     include_bearer=include_bearer,
                 )
-            raise RuntimeError(f"{method} {path} failed status={error.code} body={body[:240]}") from error
+            raise AcceptanceHTTPError(
+                method=method,
+                path=path,
+                status_code=error.code,
+                response_body=body,
+            ) from error
         except URLError as error:
             raise RuntimeError(f"{method} {path} failed: {error.reason}") from error
 
@@ -952,6 +996,22 @@ def execute_project_scale_plan(
                     run_request.case_id,
                     evidence=evidence,
                 )
+            initial_deliverable_repair_attempt_limit = max_deliverable_repair_attempts
+            case_absolute_deadline_safety_limit = _repair_absolute_deadline_safety_limit(
+                case_absolute_deadline,
+                configured_wait_seconds=wait_seconds,
+                request_body=request_body,
+                benchmark_kind=plan.benchmark_kind,
+                generated_project_timeout_seconds=generated_project_timeout_seconds,
+                generated_project_command_count=len(
+                    generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS
+                ),
+                additional_repair_attempts=max(
+                    0,
+                    deliverable_repair_safety_limit
+                    - initial_deliverable_repair_attempt_limit,
+                ),
+            )
             seen_repair_progress_signatures = {repair_progress_state.signature}
             repair_progress_observed = True
             repair_followup_warranted = False
@@ -983,6 +1043,8 @@ def execute_project_scale_plan(
                 ),
             )
             force_authoritative_repair = False
+            authoritative_repair_active = False
+            consecutive_typescript_build_failures = 0
             if not _generated_project_validation_is_repairable(
                 generated_project_validation
             ):
@@ -1052,7 +1114,9 @@ def execute_project_scale_plan(
                     benchmark_kind=plan.benchmark_kind,
                     effective_mode=repair_mode,
                     source_workspace_bundle=current_workspace_bundle,
-                    force_workspace_replacement=force_authoritative_repair,
+                    force_workspace_replacement=(
+                        force_authoritative_repair or authoritative_repair_active
+                    ),
                     failed_reasons=(
                         *deliverable_quality.reasons,
                         *agent_standard_verification.reasons,
@@ -1277,6 +1341,21 @@ def execute_project_scale_plan(
                     next_progress_state,
                     seen_signatures=seen_repair_progress_signatures,
                 )
+                new_typescript_build_failure = (
+                    _deliverable_repair_exposes_new_typescript_build_failure(
+                        repair_progress_state,
+                        next_progress_state,
+                        seen_signatures=seen_repair_progress_signatures,
+                    )
+                )
+                if new_typescript_build_failure:
+                    repair_followup_warranted = True
+                    consecutive_typescript_build_failures += 1
+                    if consecutive_typescript_build_failures >= 2:
+                        authoritative_repair_active = True
+                else:
+                    consecutive_typescript_build_failures = 0
+                    authoritative_repair_active = False
                 if (
                     deliverable_repair_attempts >= soft_deliverable_repair_attempts
                     and same_stage_repair_followups_remaining > 0
@@ -1304,6 +1383,7 @@ def execute_project_scale_plan(
                 stalled_repair = (
                     status == "completed"
                     and deliverable_repair_attempts >= soft_deliverable_repair_attempts
+                    and not authoritative_repair_active
                     and next_progress_state.signature in seen_repair_progress_signatures
                     and not repair_progress_observed
                     and not repair_followup_warranted
@@ -1337,6 +1417,20 @@ def execute_project_scale_plan(
                     and max_deliverable_repair_attempts < deliverable_repair_safety_limit
                 ):
                     max_deliverable_repair_attempts += 1
+                    case_absolute_deadline = _extend_repair_absolute_deadline(
+                        case_absolute_deadline,
+                        configured_wait_seconds=wait_seconds,
+                        request_body=request_body,
+                        benchmark_kind=plan.benchmark_kind,
+                        generated_project_timeout_seconds=(
+                            generated_project_timeout_seconds
+                        ),
+                        generated_project_command_count=len(
+                            generated_project_commands
+                            or _DEFAULT_GENERATED_PROJECT_COMMANDS
+                        ),
+                        safety_limit=case_absolute_deadline_safety_limit,
+                    )
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
             if (
@@ -1517,8 +1611,31 @@ def _extend_repair_deadline(
     generated_project_command_count: int,
     absolute_deadline: float,
 ) -> float:
-    if configured_wait_seconds <= 0:
+    repair_budget = _repair_wall_clock_budget_seconds(
+        configured_wait_seconds=configured_wait_seconds,
+        request_body=request_body,
+        benchmark_kind=benchmark_kind,
+        generated_project_timeout_seconds=generated_project_timeout_seconds,
+        generated_project_command_count=generated_project_command_count,
+    )
+    if repair_budget <= 0:
         return deadline
+    return min(
+        absolute_deadline,
+        max(deadline, time.monotonic()) + repair_budget,
+    )
+
+
+def _repair_wall_clock_budget_seconds(
+    *,
+    configured_wait_seconds: float,
+    request_body: Mapping[str, object],
+    benchmark_kind: ProjectScaleBenchmarkKind,
+    generated_project_timeout_seconds: float,
+    generated_project_command_count: int,
+) -> float:
+    if configured_wait_seconds <= 0:
+        return 0.0
     runtime_timeout = request_body.get("runtime_timeout_seconds")
     runtime_budget = (
         float(runtime_timeout)
@@ -1531,15 +1648,51 @@ def _extend_repair_deadline(
         1 if benchmark_kind == "capability" else 0
     )
     validation_budget = max(generated_project_timeout_seconds, 0.0) * validation_count
-    return min(
-        absolute_deadline,
-        (
-            max(deadline, time.monotonic())
-            + _EXECUTE_QUEUE_GRACE_SECONDS
-            + runtime_budget
-            + validation_budget
-        ),
+    return (
+        _EXECUTE_QUEUE_GRACE_SECONDS
+        + runtime_budget
+        + validation_budget
     )
+
+
+def _repair_absolute_deadline_safety_limit(
+    deadline: float,
+    *,
+    configured_wait_seconds: float,
+    request_body: Mapping[str, object],
+    benchmark_kind: ProjectScaleBenchmarkKind,
+    generated_project_timeout_seconds: float,
+    generated_project_command_count: int,
+    additional_repair_attempts: int,
+) -> float:
+    repair_budget = _repair_wall_clock_budget_seconds(
+        configured_wait_seconds=configured_wait_seconds,
+        request_body=request_body,
+        benchmark_kind=benchmark_kind,
+        generated_project_timeout_seconds=generated_project_timeout_seconds,
+        generated_project_command_count=generated_project_command_count,
+    )
+    return deadline + repair_budget * max(additional_repair_attempts, 0)
+
+
+def _extend_repair_absolute_deadline(
+    deadline: float,
+    *,
+    configured_wait_seconds: float,
+    request_body: Mapping[str, object],
+    benchmark_kind: ProjectScaleBenchmarkKind,
+    generated_project_timeout_seconds: float,
+    generated_project_command_count: int,
+    safety_limit: float,
+) -> float:
+    repair_budget = _repair_wall_clock_budget_seconds(
+        configured_wait_seconds=configured_wait_seconds,
+        request_body=request_body,
+        benchmark_kind=benchmark_kind,
+        generated_project_timeout_seconds=generated_project_timeout_seconds,
+        generated_project_command_count=generated_project_command_count,
+    )
+    return min(safety_limit, deadline + repair_budget)
 
 
 def _case_absolute_deadline(
@@ -3770,6 +3923,62 @@ def _deliverable_repair_exposes_new_same_stage_failure(
         and current_failures
         and previous_failures.isdisjoint(current_failures)
     )
+
+
+def _deliverable_repair_exposes_new_typescript_build_failure(
+    previous: _DeliverableRepairProgress,
+    current: _DeliverableRepairProgress,
+    *,
+    seen_signatures: set[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            int,
+            tuple[tuple[str, int, int], ...],
+        ]
+    ],
+) -> bool:
+    if current.signature in seen_signatures:
+        return False
+    if previous.validation_stage != 1 or current.validation_stage != 1:
+        return False
+    if set(current.deficits) != set(previous.deficits):
+        return False
+    previous_failures = _typescript_failure_fingerprints(previous)
+    current_failures = _typescript_failure_fingerprints(current)
+    return bool(
+        previous_failures
+        and current_failures
+        and previous_failures - current_failures
+        and current_failures - previous_failures
+    )
+
+
+def _typescript_failure_fingerprints(
+    progress: _DeliverableRepairProgress,
+) -> frozenset[str]:
+    diagnostics: set[str] = set()
+    for fingerprint in progress.failure_fingerprints:
+        matches = list(_TYPESCRIPT_DIAGNOSTIC_MARKER_RE.finditer(fingerprint))
+        if not matches:
+            if re.search(r"\berror\s+ts\d{4}\b", fingerprint) is not None:
+                diagnostics.add(fingerprint)
+            continue
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(fingerprint)
+            message = fingerprint[match.end() : end]
+            trailer = _TYPESCRIPT_DIAGNOSTIC_TRAILER_RE.search(message)
+            if trailer is not None:
+                message = message[: trailer.start()]
+            path = match.group("path") or "<global>"
+            code = match.group("code")
+            normalized_message = " ".join(message.strip(" \\\"'|").split())
+            normalized_path = path.replace("\\", "/")
+            diagnostic = f"{normalized_path} error {code}"
+            if normalized_message:
+                diagnostic = f"{diagnostic}: {normalized_message}"
+            diagnostics.add(diagnostic)
+    return frozenset(diagnostics)
 
 
 def _deliverable_repair_requires_authoritative_recovery(

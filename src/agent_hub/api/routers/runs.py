@@ -495,6 +495,8 @@ class RunSummaryResponse(BaseModel):
     effective_scale: str | None = None
     route_reason: str | None = None
     mode_source: str | None = None
+    execution_quiescent: bool = False
+    execution_lease_expires_at: datetime | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -516,6 +518,8 @@ class RunSummaryResponse(BaseModel):
             effective_scale=run.effective_scale,
             route_reason=run.route_reason,
             mode_source=run.mode_source,
+            execution_quiescent=run.execution_quiescent,
+            execution_lease_expires_at=run.execution_lease_expires_at,
         )
 
 

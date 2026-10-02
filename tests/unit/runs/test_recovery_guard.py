@@ -18,6 +18,7 @@ from agent_hub.runs.repository import (
     _is_recovery_replayable_event_kind,
     _is_self_repair_recovery_baseline_event_kind,
 )
+from agent_hub.runs.service import _execution_quiescence
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
 
 
@@ -723,6 +724,75 @@ async def test_repeated_pause_returns_paused_record_without_version_bump() -> No
 
 
 @pytest.mark.asyncio
+async def test_pause_preserves_active_worker_ownership() -> None:
+    repository = RunRepository(cast(Any, None))
+    lease_token = uuid4()
+    lease_expires_at = datetime.now(UTC) + timedelta(seconds=60)
+    heartbeat_at = datetime.now(UTC)
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="pause active worker",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.RUNNING.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+        worker_lease_expires_at=lease_expires_at,
+        worker_heartbeat_at=heartbeat_at,
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.update_control_status(row.tenant_id, row.id, RunStatus.PAUSED)
+
+    assert record.status is RunStatus.PAUSED
+    assert record.worker_id == "worker-1"
+    assert record.worker_lease_token == lease_token
+    assert record.worker_lease_expires_at == lease_expires_at
+    assert row.worker_heartbeat_at == heartbeat_at
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_paused_run_until_old_worker_releases() -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="resume active worker",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.PAUSED.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+        worker_id="worker-1",
+        worker_lease_token=uuid4(),
+        worker_lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        worker_heartbeat_at=None,
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="worker execution has not been released"):
+        await repository.enqueue_existing_run(
+            tenant_id=row.tenant_id,
+            run_id=row.id,
+            from_status=RunStatus.PAUSED,
+            to_status=RunStatus.QUEUED,
+            idempotency_suffix="resume",
+        )
+
+    assert row.status == RunStatus.PAUSED.value
+    assert session.added == []
+
+
+@pytest.mark.asyncio
 async def test_repeated_cancel_returns_cancelled_record_without_version_bump() -> None:
     repository = RunRepository(cast(Any, None))
     row = _FakeRunRow(
@@ -745,6 +815,266 @@ async def test_repeated_cancel_returns_cancelled_record_without_version_bump() -
     assert record.status is RunStatus.CANCELLED
     assert record.version == 8
     assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_preserves_active_worker_lease_until_worker_is_quiescent() -> None:
+    repository = RunRepository(cast(Any, None))
+    lease_token = uuid4()
+    lease_expires_at = datetime.now(UTC) + timedelta(seconds=60)
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="cancel active worker",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.RUNNING.value,
+        version=8,
+        created_at=datetime.now(UTC),
+        routing_decision={"source": "manual"},
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+        worker_lease_expires_at=lease_expires_at,
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.update_control_status(row.tenant_id, row.id, RunStatus.CANCELLED)
+
+    assert record.status is RunStatus.CANCELLED
+    assert record.worker_lease_expires_at == lease_expires_at
+    assert row.worker_id == "worker-1"
+    assert row.worker_lease_token == lease_token
+    assert row.worker_lease_expires_at == lease_expires_at
+
+
+def test_execution_quiescence_requires_terminal_status_and_explicit_worker_release() -> None:
+    now = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+    record = RunRecord(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        request="cancelled run",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.CANCELLED,
+        version=1,
+        created_at=now,
+        routing_decision=None,
+        worker_id="worker-1",
+        worker_lease_token=uuid4(),
+        worker_lease_expires_at=now + timedelta(seconds=60),
+    )
+
+    assert _execution_quiescence(record, now=now) == (
+        False,
+        now + timedelta(seconds=60),
+    )
+    assert _execution_quiescence(record, now=now + timedelta(seconds=61)) == (
+        False,
+        now + timedelta(seconds=60),
+    )
+    released = RunRecord(
+        id=record.id,
+        tenant_id=record.tenant_id,
+        actor_id=record.actor_id,
+        request=record.request,
+        mode=record.mode,
+        status=record.status,
+        version=record.version,
+        created_at=record.created_at,
+        routing_decision=None,
+    )
+    assert _execution_quiescence(released, now=now) == (True, None)
+    assert _execution_quiescence(
+        RunRecord(
+            id=record.id,
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            request=record.request,
+            mode=record.mode,
+            status=RunStatus.RUNNING,
+            version=record.version,
+            created_at=record.created_at,
+            routing_decision=None,
+        ),
+        now=now,
+    ) == (False, None)
+
+
+def test_execution_quiescence_rejects_orphan_worker_heartbeat() -> None:
+    now = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+    record = RunRecord(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        request="partial worker lease",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.CANCELLED,
+        version=1,
+        created_at=now,
+        routing_decision=None,
+        worker_heartbeat_at=now,
+    )
+
+    assert _execution_quiescence(record, now=now) == (False, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lease_expires_at",
+    [
+        datetime(2026, 10, 2, 12, 1, tzinfo=UTC),
+        datetime(2026, 10, 2, 11, 59, tzinfo=UTC),
+    ],
+)
+async def test_delete_run_refuses_worker_that_has_not_explicitly_released_lease(
+    lease_expires_at: datetime,
+) -> None:
+    repository = RunRepository(cast(Any, None))
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="terminal but worker still owns execution",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=2,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-1",
+        worker_lease_token=uuid4(),
+        worker_lease_expires_at=lease_expires_at,
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="worker execution has not been released"):
+        await repository.delete_run(row.tenant_id, row.id)
+
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_explicit_release_requires_matching_owner_and_clears_every_lease_field() -> None:
+    repository = RunRepository(cast(Any, None))
+    lease_token = uuid4()
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="worker finished",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=2,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+        worker_lease_expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="worker execution ownership changed"):
+        await repository.release_worker_execution(
+            row.tenant_id,
+            row.id,
+            worker_id="another-worker",
+            worker_lease_token=lease_token,
+        )
+
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    released = await repository.release_worker_execution(
+        row.tenant_id,
+        row.id,
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+    )
+
+    assert released.worker_id is None
+    assert released.worker_lease_token is None
+    assert released.worker_lease_expires_at is None
+    assert row.worker_heartbeat_at is None
+
+
+@pytest.mark.asyncio
+async def test_worker_release_preserves_cancel_that_won_before_atomic_completion() -> None:
+    repository = RunRepository(cast(Any, None))
+    lease_token = uuid4()
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="cancel won before worker completion",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.CANCELLED.value,
+        version=3,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+        worker_lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    released = await repository.release_worker_execution(
+        row.tenant_id,
+        row.id,
+        worker_id="worker-1",
+        worker_lease_token=lease_token,
+        complete_if_running=True,
+    )
+
+    assert released.status is RunStatus.CANCELLED
+    assert released.worker_id is None
+    assert row.status == RunStatus.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_fail_run_refuses_to_fail_a_new_worker_owner() -> None:
+    repository = RunRepository(cast(Any, None))
+    active_token = uuid4()
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="new owner is active",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.RUNNING.value,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-new",
+        worker_lease_token=active_token,
+        worker_lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="worker execution ownership changed"):
+        await repository.fail_run(
+            row.id,
+            reason="stale worker crashed",
+            worker_id="worker-old",
+            worker_lease_token=uuid4(),
+        )
+
+    assert row.status == RunStatus.RUNNING.value
+    assert row.worker_id == "worker-new"
+    assert row.worker_lease_token == active_token
 
 
 @pytest.mark.asyncio
@@ -1052,6 +1382,80 @@ async def test_renew_worker_lease_refuses_non_running_status() -> None:
     assert repository.row.worker_lease_expires_at == current_expiry
 
 
+@pytest.mark.asyncio
+async def test_expired_worker_release_refuses_changed_owner_token() -> None:
+    repository = RunRepository(cast(Any, None))
+    stale_token = uuid4()
+    active_token = uuid4()
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="ownership changed before stale cleanup",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.PAUSED.value,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-new",
+        worker_lease_token=active_token,
+        worker_lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    with pytest.raises(RunConflict, match="worker execution ownership changed"):
+        await repository.release_expired_worker_execution(
+            row.tenant_id,
+            row.id,
+            worker_id="worker-old",
+            worker_lease_token=stale_token,
+            now=datetime.now(UTC),
+        )
+
+    assert row.worker_id == "worker-new"
+    assert row.worker_lease_token == active_token
+
+
+@pytest.mark.asyncio
+async def test_expired_worker_release_rechecks_expiry_before_clearing() -> None:
+    repository = RunRepository(cast(Any, None))
+    lease_token = uuid4()
+    future_expiry = datetime.now(UTC) + timedelta(seconds=30)
+    row = _FakeRunRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=None,
+        request="lease renewed before stale cleanup",
+        mode=TaskMode.DISPATCH.value,
+        status=RunStatus.PAUSED.value,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision=None,
+        worker_id="worker-old",
+        worker_lease_token=lease_token,
+        worker_lease_expires_at=future_expiry,
+        worker_heartbeat_at=datetime.now(UTC),
+    )
+    session = _CapabilityApprovalSession(row, approved=True)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.release_expired_worker_execution(
+        row.tenant_id,
+        row.id,
+        worker_id="worker-old",
+        worker_lease_token=lease_token,
+        now=datetime.now(UTC),
+    )
+
+    assert record.worker_id == "worker-old"
+    assert record.worker_lease_token == lease_token
+    assert record.worker_lease_expires_at == future_expiry
+
+
 def test_running_for_recovery_requires_expired_worker_lease() -> None:
     repository = RunRepository(cast(Any, None))
     now = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
@@ -1063,6 +1467,38 @@ def test_running_for_recovery_requires_expired_worker_lease() -> None:
     assert "agent_hub_runs.worker_lease_expires_at <=" in compiled
     assert "agent_hub_runs.worker_lease_expires_at IS NULL" not in compiled
     assert statement.compile(dialect=postgresql.dialect()).params["worker_lease_expires_at_1"] == now  # type: ignore[no-untyped-call]
+
+
+def test_stale_worker_recovery_includes_paused_and_terminal_statuses_with_expired_lease() -> None:
+    repository = RunRepository(cast(Any, None))
+    now = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
+
+    statement = repository._terminal_worker_executions_for_recovery_select(
+        limit=5,
+        now=now,
+    )
+
+    compiled_statement = statement.compile(
+        dialect=postgresql.dialect()  # type: ignore[no-untyped-call]
+    )
+    compiled = str(compiled_statement)
+    statuses = next(
+        value
+        for value in compiled_statement.params.values()
+        if isinstance(value, list)
+    )
+    assert "agent_hub_runs.status IN" in compiled
+    assert statuses == [
+        RunStatus.PAUSED.value,
+        RunStatus.COMPLETED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    ]
+    assert "agent_hub_runs.worker_id IS NOT NULL" in compiled
+    assert "agent_hub_runs.worker_lease_token IS NOT NULL" in compiled
+    assert "agent_hub_runs.worker_lease_expires_at IS NOT NULL" in compiled
+    assert "agent_hub_runs.worker_lease_expires_at <=" in compiled
+    assert now in compiled_statement.params.values()
 
 
 @pytest.mark.asyncio

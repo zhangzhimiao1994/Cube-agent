@@ -133,7 +133,10 @@ async def test_control_change_during_load_prevents_evidence_and_model(
         assert gateway.requests == []
         assert repository.event_log == []
         assert result.status is expected_status
-        assert repository.row.worker_lease_token == expected_token
+        if change in {'lease_token', 'worker_id'}:
+            assert repository.row.worker_lease_token == expected_token
+        else:
+            assert repository.row.worker_lease_token is None
     finally:
         release.set()
         if not execution.done():

@@ -756,7 +756,8 @@ class RuntimePluginService:
         self._cache_ttl_seconds = max(0.0, cache_ttl_seconds)
         self._monotonic = default_monotonic if monotonic is None else monotonic
         self._reload_lock = asyncio.Lock()
-        self._reload_tasks_by_tenant: dict[UUID, asyncio.Task[None]] = {}
+        self._reload_tasks_by_tenant: dict[UUID, asyncio.Task[Exception | None]] = {}
+        self._reload_generations_by_tenant: dict[UUID, int] = {}
 
     async def start(self) -> None:
         await self.reload(self._tenant_id)
@@ -769,35 +770,74 @@ class RuntimePluginService:
         async with self._reload_lock:
             task = self._reload_tasks_by_tenant.get(tenant_id)
             if task is None or task.done():
-                task = asyncio.create_task(self._reload_tenant(tenant_id))
+                generation = self._next_reload_generation(tenant_id)
+                task = asyncio.create_task(self._reload_tenant(tenant_id, generation))
                 self._reload_tasks_by_tenant[tenant_id] = task
                 target_tenant_id = tenant_id
 
-                def discard_completed_task(completed_task: asyncio.Future[None]) -> None:
+                def discard_completed_task(
+                    completed_task: asyncio.Future[Exception | None],
+                ) -> None:
                     self._discard_reload_task(target_tenant_id, completed_task)
 
                 task.add_done_callback(discard_completed_task)
         await asyncio.shield(task)
 
+    async def reload_strict(self, tenant_id: UUID | None = None) -> None:
+        if tenant_id is None:
+            for target_tenant_id in self._loaded_tenant_ids():
+                await self.reload_strict(target_tenant_id)
+            return
+        async with self._reload_lock:
+            generation = self._next_reload_generation(tenant_id)
+            self._plugins_by_tenant.pop(tenant_id, None)
+            self._plugins_loaded_at.pop(tenant_id, None)
+            task = asyncio.create_task(self._reload_tenant(tenant_id, generation))
+            self._reload_tasks_by_tenant[tenant_id] = task
+            target_tenant_id = tenant_id
+
+            def discard_completed_task(
+                completed_task: asyncio.Future[Exception | None],
+            ) -> None:
+                self._discard_reload_task(target_tenant_id, completed_task)
+
+            task.add_done_callback(discard_completed_task)
+        error = await asyncio.shield(task)
+        if error is not None:
+            raise error
+
+    def _next_reload_generation(self, tenant_id: UUID) -> int:
+        generation = self._reload_generations_by_tenant.get(tenant_id, 0) + 1
+        self._reload_generations_by_tenant[tenant_id] = generation
+        return generation
+
     def _discard_reload_task(
         self,
         tenant_id: UUID,
-        completed_task: asyncio.Future[None],
+        completed_task: asyncio.Future[Exception | None],
     ) -> None:
         if self._reload_tasks_by_tenant.get(tenant_id) is completed_task:
             del self._reload_tasks_by_tenant[tenant_id]
 
-    async def _reload_tenant(self, target_tenant_id: UUID) -> None:
+    async def _reload_tenant(
+        self,
+        target_tenant_id: UUID,
+        generation: int,
+    ) -> Exception | None:
         try:
-            self._plugins_by_tenant[target_tenant_id] = tuple(
+            plugins = tuple(
                 PluginResourceResponse.model_validate(plugin)
                 for plugin in await self._admin_service.list_plugins(
                     tenant_id=target_tenant_id,
                 )
             )
-        except Exception:  # noqa: BLE001 - plugin runtime context must fail closed.
-            return
+        except Exception as error:  # noqa: BLE001 - plugin runtime context must fail closed.
+            return error
+        if self._reload_generations_by_tenant.get(target_tenant_id) != generation:
+            return None
+        self._plugins_by_tenant[target_tenant_id] = plugins
         self._plugins_loaded_at[target_tenant_id] = self._monotonic()
+        return None
 
     async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
         if tenant_id not in self._plugins_by_tenant or self._tenant_cache_is_stale(tenant_id):

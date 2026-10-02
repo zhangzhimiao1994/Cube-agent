@@ -965,6 +965,7 @@ class TaskContext(_RuntimeContractModel):
 
     run_id: UUID
     tenant_id: UUID
+    execution_token: UUID | None = Field(default=None, repr=False, exclude=True)
     actor_id: UUID | None = None
     actor_role: Role | None = None
     mode: TaskMode
@@ -1043,6 +1044,7 @@ class TaskContext(_RuntimeContractModel):
         public = TaskContext.from_payload(self.to_payload())
         values = {name: getattr(public, name) for name in TaskContext.model_fields}
         values["instruction_context"] = self.instruction_context
+        values["execution_token"] = self.execution_token
         return TaskContext.model_validate(values, strict=True)
 
     def to_payload(self) -> dict[str, object]:

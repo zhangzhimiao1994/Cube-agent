@@ -221,6 +221,15 @@ vi.mock("../api/client", () => ({
     stopPlugin: vi.fn(),
     reloadPlugin: vi.fn(),
     deletePlugin: vi.fn(),
+    uninstallPlugin: vi.fn(async () => ({
+      status: "uninstalled",
+      cleanup: {
+        registration_removed: true,
+        runtime_capabilities_removed: true,
+        package_artifact_removed: true,
+        retry_completed: false,
+      },
+    })),
     approvePluginPackage: vi.fn(async () => ({})),
     rejectPluginPackage: vi.fn(async () => ({})),
     upsertPluginSigningKey: vi.fn(),
@@ -293,6 +302,18 @@ describe("McpPage plugin approval permissions", () => {
 
     expect(api.approvePluginPackage).toHaveBeenCalledWith("calendar", { reason: "reviewed by security" });
     expect(api.rejectPluginPackage).toHaveBeenCalledWith("calendar", { reason: "requires isolation review" });
+  });
+
+  it("uninstalls plugins through the safe lifecycle endpoint", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    renderMcpPage();
+
+    await user.click(await screen.findByRole("button", { name: "删除插件 Calendar HTTP" }));
+
+    await waitFor(() => expect(api.uninstallPlugin).toHaveBeenCalledWith("calendar"));
+    expect(api.deletePlugin).not.toHaveBeenCalled();
+    confirm.mockRestore();
   });
 
   it("searches, plans, and confirms trusted capability installs from the MCP page", async () => {

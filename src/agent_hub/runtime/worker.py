@@ -32,7 +32,10 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
 from agent_hub.runtime.instruction_context import InstructionContextLoader
-from agent_hub.runtime.invalidation import RuntimeConfigInvalidationBus
+from agent_hub.runtime.invalidation import (
+    RuntimeConfigInvalidationBus,
+    StrictReloadRuntimeAdapter,
+)
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
@@ -104,11 +107,12 @@ async def _run_runtime_config_invalidation_listener(
     retry_delay_seconds: float = 1.0,
 ) -> None:
     stream_consumer_id = f"worker-{uuid4()}"
+    strict_plugin_runtime = StrictReloadRuntimeAdapter(plugin_runtime)
     while True:
         try:
             await bus.listen(
                 mcp_runtime=cast(Any, mcp_runtime),
-                plugin_runtime=cast(Any, plugin_runtime),
+                plugin_runtime=cast(Any, strict_plugin_runtime),
                 stream_consumer_group=stream_consumer_id,
                 stream_consumer_name=stream_consumer_id,
                 reload_on_empty_stream_replay=True,

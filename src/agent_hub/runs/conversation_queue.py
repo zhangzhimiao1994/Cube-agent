@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, select
@@ -12,6 +12,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import ConversationQueueItemRow, RunOutboxRow, RunRow
 from agent_hub.domain.runs import ConversationQueueStatus, RunStatus
+
+
+def _has_worker_execution(row: RunRow) -> bool:
+    return any(
+        value is not None
+        for value in (
+            row.worker_id,
+            row.worker_lease_token,
+            row.worker_lease_expires_at,
+            row.worker_heartbeat_at,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,7 +325,6 @@ class ConversationQueueRepository:
                 earlier_rows[0].predecessor_run_id if earlier_rows else original_predecessor_id
             )
             predecessor = await self._tenant_run(session, tenant_id, active_predecessor_id)
-            predecessor_status = RunStatus(predecessor.status)
             routing = (
                 {} if predecessor.routing_decision is None else dict(predecessor.routing_decision)
             )
@@ -368,11 +379,7 @@ class ConversationQueueRepository:
                     earlier.position = promoted_position + index
                 row.position = promoted_position
 
-            has_live_worker = (
-                predecessor_status is RunStatus.RUNNING
-                and predecessor.worker_lease_expires_at is not None
-                and predecessor.worker_lease_expires_at > datetime.now(UTC)
-            )
+            has_live_worker = _has_worker_execution(predecessor)
             if not has_live_worker:
                 await session.execute(
                     delete(RunOutboxRow).where(
@@ -408,6 +415,10 @@ class ConversationQueueRepository:
                 RunStatus.CANCELLED,
             }:
                 raise ConversationQueueConflict("predecessor run is not terminal")
+            if _has_worker_execution(predecessor):
+                raise ConversationQueueConflict(
+                    "predecessor worker execution has not been released"
+                )
             completed_item = await session.scalar(
                 select(ConversationQueueItemRow)
                 .where(
@@ -455,6 +466,55 @@ class ConversationQueueRepository:
             await session.flush()
             await session.refresh(next_item)
             return self._item(next_item)
+
+    async def terminal_predecessors_for_recovery(
+        self,
+        limit: int,
+    ) -> tuple[tuple[UUID, UUID], ...]:
+        if limit <= 0:
+            return ()
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(
+                    ConversationQueueItemRow.tenant_id,
+                    ConversationQueueItemRow.predecessor_run_id,
+                )
+                .join(
+                    RunRow,
+                    (RunRow.tenant_id == ConversationQueueItemRow.tenant_id)
+                    & (RunRow.id == ConversationQueueItemRow.predecessor_run_id),
+                )
+                .where(
+                    ConversationQueueItemRow.status.in_(
+                        (
+                            ConversationQueueStatus.QUEUED.value,
+                            ConversationQueueStatus.REDIRECTING.value,
+                        )
+                    ),
+                    RunRow.status.in_(
+                        (
+                            RunStatus.COMPLETED.value,
+                            RunStatus.FAILED.value,
+                            RunStatus.CANCELLED.value,
+                        )
+                    ),
+                    RunRow.worker_id.is_(None),
+                    RunRow.worker_lease_token.is_(None),
+                    RunRow.worker_lease_expires_at.is_(None),
+                    RunRow.worker_heartbeat_at.is_(None),
+                )
+                .group_by(
+                    ConversationQueueItemRow.tenant_id,
+                    ConversationQueueItemRow.predecessor_run_id,
+                )
+                .order_by(
+                    func.min(ConversationQueueItemRow.position),
+                    ConversationQueueItemRow.tenant_id,
+                    ConversationQueueItemRow.predecessor_run_id,
+                )
+                .limit(limit)
+            )
+            return tuple((tenant_id, run_id) for tenant_id, run_id in rows.all())
 
     @staticmethod
     async def _release_item(

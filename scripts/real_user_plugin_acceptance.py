@@ -20,6 +20,7 @@ from uuid import uuid4
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from agent_hub.harness.project_scale_runner import (
+    AcceptanceHTTPError,
     UrllibAcceptanceClient,
     _acceptance_credentials_from_env,
 )
@@ -27,6 +28,17 @@ from agent_hub.plugins.package_builder import build_signed_plugin_archive
 
 _ADMIN_RUN_PREFIX = "/api/v1/admin/runs"
 _TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+_SIDE_EFFECT_FREE_RUN_SUBMISSION_REJECTIONS = frozenset(
+    {
+        (401, "invalid_token"),
+        (403, "permission_denied"),
+        (409, "vibe_coding_disabled"),
+        (409, "execution_backend_unavailable"),
+        (409, "vibe_coding_unavailable"),
+        (409, "conversation_archived"),
+        (422, "request_validation"),
+    }
+)
 
 
 class PluginAcceptanceClient(Protocol):
@@ -81,6 +93,20 @@ class UrllibPluginAcceptanceClient(UrllibAcceptanceClient):
         idempotency_key: str | None = None,
     ) -> dict[str, object] | list[object]:
         self._record(method, path)
+        normalized = urlsplit(path).path.rstrip("/")
+        if method.upper() == "DELETE" and normalized.startswith("/api/v1/users/"):
+            raw = self._request(
+                method,
+                path,
+                headers={"Accept": "application/json"},
+                data=None,
+            )
+            if not raw:
+                return {}
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict | list):
+                raise TypeError(f"{method} {path} returned non-object JSON")
+            return parsed
         return super().request_json(
             method,
             path,
@@ -404,6 +430,151 @@ def _poll_run(
             time.sleep(poll_interval_seconds)
 
 
+def _wait_for_run_quiescence(
+    client: PluginAcceptanceClient,
+    run_id: str,
+    *,
+    wait_seconds: float,
+    poll_interval_seconds: float,
+) -> str:
+    deadline = time.monotonic() + max(wait_seconds, 0)
+    attempts = 0
+    last_status: object = None
+    last_quiescent: object = None
+    last_lease_expiry: object = None
+    while True:
+        attempts += 1
+        details = _mapping(
+            client.request_json(
+                "GET",
+                f"/api/v1/runs/{quote(run_id, safe='')}/details",
+            ),
+            "cancelled public run details",
+        )
+        last_status = details.get("status")
+        last_quiescent = details.get("execution_quiescent")
+        last_lease_expiry = details.get("execution_lease_expires_at")
+        if last_status in _TERMINAL_RUN_STATUSES and last_quiescent is True:
+            return "quiescent"
+        if time.monotonic() >= deadline and attempts >= 3:
+            raise RuntimeError(
+                "cancelled public run is not execution-quiescent: "
+                f"status={last_status!r} execution_quiescent={last_quiescent!r} "
+                f"execution_lease_expires_at={last_lease_expiry!r}"
+            )
+        if poll_interval_seconds > 0:
+            time.sleep(poll_interval_seconds)
+
+
+def _cleanup_recovery(
+    package: AcceptancePluginPackage,
+    *,
+    run_id: str,
+    retry_after_seconds: float,
+) -> dict[str, object]:
+    plugin_path = f"/api/v1/admin/plugins/{quote(package.plugin_id, safe='')}"
+    return {
+        "required": True,
+        "reason": "run_execution_not_quiescent",
+        "run_id": run_id,
+        "plugin_id": package.plugin_id,
+        "key_id": package.key_id,
+        "retry_after_seconds": max(1, int(retry_after_seconds or 1)),
+        "steps": [
+            {
+                "method": "GET",
+                "path": f"/api/v1/runs/{quote(run_id, safe='')}/details",
+                "require": {"execution_quiescent": True},
+            },
+            *_resource_cleanup_recovery_steps(package, plugin_path=plugin_path),
+        ],
+    }
+
+
+def _unknown_run_cleanup_recovery(
+    package: AcceptancePluginPackage,
+    *,
+    run_request: dict[str, object],
+    run_idempotency_key: str,
+    retry_after_seconds: float,
+) -> dict[str, object]:
+    plugin_path = f"/api/v1/admin/plugins/{quote(package.plugin_id, safe='')}"
+    return {
+        "required": True,
+        "reason": "run_submission_result_unknown",
+        "run_id": None,
+        "plugin_id": package.plugin_id,
+        "key_id": package.key_id,
+        "retry_after_seconds": max(1, int(retry_after_seconds or 1)),
+        "steps": [
+            {
+                "method": "POST",
+                "path": "/api/v1/runs",
+                "body": run_request,
+                "idempotency_key": run_idempotency_key,
+                "capture": {"run_id": "id"},
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/runs/{run_id}/details",
+                "require": {"execution_quiescent": True},
+            },
+            *_resource_cleanup_recovery_steps(package, plugin_path=plugin_path),
+        ],
+    }
+
+
+def _is_side_effect_free_run_submission_rejection(error: AcceptanceHTTPError) -> bool:
+    try:
+        payload = json.loads(error.response_body)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    error_payload = payload.get("error")
+    if not isinstance(error_payload, Mapping):
+        return False
+    error_code = error_payload.get("code")
+    return isinstance(error_code, str) and (
+        error.status_code,
+        error_code,
+    ) in _SIDE_EFFECT_FREE_RUN_SUBMISSION_REJECTIONS
+
+
+def _resource_cleanup_recovery_steps(
+    package: AcceptancePluginPackage,
+    *,
+    plugin_path: str,
+) -> list[dict[str, object]]:
+    return [
+        {"method": "POST", "path": f"{plugin_path}/disable", "body": {}},
+        {"method": "POST", "path": f"{plugin_path}/stop", "body": {}},
+        {"method": "POST", "path": f"{plugin_path}/uninstall", "body": {}},
+        {
+            "method": "DELETE",
+            "path": (
+                "/api/v1/admin/plugins/signing-keys/"
+                f"{quote(package.key_id, safe='')}"
+            ),
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/admin/plugins",
+            "require_absent": {"id": package.plugin_id},
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/admin/capabilities/manifest",
+            "require_absent": {"capability_id": package.capability_id},
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/admin/plugins/signing-keys",
+            "require_absent": {"key_id": package.key_id},
+        },
+    ]
+
+
 def _cleanup(
     client: PluginAcceptanceClient,
     package: AcceptancePluginPackage,
@@ -458,8 +629,9 @@ def _cleanup(
 
 
 def run_real_user_plugin_acceptance(
-    client: PluginAcceptanceClient,
+    admin_client: PluginAcceptanceClient,
     *,
+    operator_client: PluginAcceptanceClient,
     execution_id: str,
     package_dir: Path,
     wait_seconds: float = 180,
@@ -475,23 +647,57 @@ def run_real_user_plugin_acceptance(
     installed = False
     run_id = ""
     run_terminal = False
+    run_cleanup_blocked = False
+    run_submission_attempted = False
+    run_submission_rejected = False
+    run_submission_unknown = False
+    run_request: dict[str, object] | None = None
+    run_idempotency_key: str | None = None
+    recovery: dict[str, object] = {"required": False}
     try:
-        principal = _mapping(client.request_json("GET", "/api/v1/auth/me"), "principal")
-        user_id = principal.get("user_id")
-        if not isinstance(user_id, str) or not user_id:
-            raise RuntimeError("authenticated principal did not expose user_id")
+        admin_principal = _mapping(
+            admin_client.request_json("GET", "/api/v1/auth/me"),
+            "admin principal",
+        )
+        operator_principal = _mapping(
+            operator_client.request_json("GET", "/api/v1/auth/me"),
+            "operator principal",
+        )
+        admin_user_id = admin_principal.get("user_id")
+        operator_user_id = operator_principal.get("user_id")
+        admin_tenant_id = admin_principal.get("tenant_id")
+        operator_tenant_id = operator_principal.get("tenant_id")
+        if not isinstance(admin_user_id, str) or not admin_user_id:
+            raise RuntimeError("authenticated admin principal did not expose user_id")
+        if not isinstance(operator_user_id, str) or not operator_user_id:
+            raise RuntimeError("authenticated operator principal did not expose user_id")
+        if admin_principal.get("role") not in {"admin", "super_admin"}:
+            raise RuntimeError("plugin installation principal is not an administrator")
+        if operator_principal.get("role") != "operator":
+            raise RuntimeError("public invocation principal is not an operator")
+        if admin_user_id == operator_user_id:
+            raise RuntimeError("admin and operator principals must be distinct users")
+        if (
+            not isinstance(admin_tenant_id, str)
+            or not admin_tenant_id
+            or admin_tenant_id != operator_tenant_id
+        ):
+            raise RuntimeError("admin and operator principals must belong to the same tenant")
         phases.append("authenticated")
         settings = _mapping(
-            client.request_json("GET", "/api/v1/admin/settings"),
+            admin_client.request_json("GET", "/api/v1/admin/settings"),
             "system settings",
         )
         registration = settings.get("plugin_package_subprocess_registration_status")
         if registration != "ready":
             raise RuntimeError(f"plugin subprocess runtime is not ready: {registration}")
         phases.append("runtime_ready")
-        plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
+        plugins = _list(
+            admin_client.request_json("GET", "/api/v1/admin/plugins"),
+            "plugin list",
+        )
         signing_keys = _list(
-            client.request_json("GET", "/api/v1/admin/plugins/signing-keys"),
+            admin_client.request_json("GET", "/api/v1/admin/plugins/signing-keys"),
             "plugin signing key list",
         )
         if any(
@@ -504,7 +710,7 @@ def run_real_user_plugin_acceptance(
             raise RuntimeError("temporary plugin or signing key already exists")
         phases.append("resource_names_available")
         key_registered = True
-        client.request_json(
+        admin_client.request_json(
             "POST",
             "/api/v1/admin/plugins/signing-keys",
             body={
@@ -516,7 +722,7 @@ def run_real_user_plugin_acceptance(
         phases.append("signing_key_registered")
         installed = True
         installed_plugin = _plugin_from_install(
-            client.request_archive(
+            admin_client.request_archive(
                 "POST",
                 "/api/v1/admin/plugins/install",
                 archive=package.archive_path.read_bytes(),
@@ -530,7 +736,7 @@ def run_real_user_plugin_acceptance(
         phases.append("package_installed")
         plugin_path = f"/api/v1/admin/plugins/{quote(package.plugin_id, safe='')}"
         approved = _mapping(
-            client.request_json(
+            admin_client.request_json(
                 "POST",
                 f"{plugin_path}/package/approve",
                 body={"reason": "real-user production acceptance"},
@@ -540,13 +746,19 @@ def run_real_user_plugin_acceptance(
         if _activation_state(approved) != "eligible":
             raise RuntimeError("approved plugin package is not eligible")
         phases.append("package_approved")
-        enabled = _mapping(client.request_json("POST", f"{plugin_path}/enable", body={}), "enable")
-        started = _mapping(client.request_json("POST", f"{plugin_path}/start", body={}), "start")
+        enabled = _mapping(
+            admin_client.request_json("POST", f"{plugin_path}/enable", body={}),
+            "enable",
+        )
+        started = _mapping(
+            admin_client.request_json("POST", f"{plugin_path}/start", body={}),
+            "start",
+        )
         if started.get("status") != "running" or enabled.get("enabled") is not True:
             raise RuntimeError("plugin did not become running and enabled")
         phases.append("plugin_enabled")
         capability = _manifest_capability(
-            client.request_json("GET", "/api/v1/admin/capabilities/manifest"),
+            admin_client.request_json("GET", "/api/v1/admin/capabilities/manifest"),
             package.capability_id,
         )
         if capability is None:
@@ -556,29 +768,35 @@ def run_real_user_plugin_acceptance(
             safe_reason = reason if isinstance(reason, str) and reason else "unknown_reason"
             raise RuntimeError(f"plugin capability is unavailable: {safe_reason}")
         phases.append("capability_available")
-        submitted = _mapping(
-            client.request_json(
+        run_request = {
+            "mode": "dispatch",
+            "skip_evolution_proposal": True,
+            "message": (
+                f"请自动选择并实际调用 {package.capability_id}，只调用一次。"
+                f"参数必须是 {{\"text\": {json.dumps(package.input_text, ensure_ascii=False)}}}。"
+                "完成后简要返回工具结果。"
+            ),
+        }
+        run_idempotency_key = f"plugin-uat-{package.runtime_nonce}"
+        run_submission_attempted = True
+        try:
+            submitted_payload = operator_client.request_json(
                 "POST",
                 "/api/v1/runs",
-                body={
-                    "mode": "dispatch",
-                    "skip_evolution_proposal": True,
-                    "message": (
-                        f"请自动选择并实际调用 {package.capability_id}，只调用一次。"
-                        f"参数必须是 {{\"text\": {json.dumps(package.input_text, ensure_ascii=False)}}}。"
-                        "完成后简要返回工具结果。"
-                    ),
-                },
-                idempotency_key=f"plugin-uat-{package.runtime_nonce}",
-            ),
-            "public run submission",
-        )
+                body=run_request,
+                idempotency_key=run_idempotency_key,
+            )
+        except AcceptanceHTTPError as error:
+            if _is_side_effect_free_run_submission_rejection(error):
+                run_submission_rejected = True
+            raise
+        submitted = _mapping(submitted_payload, "public run submission")
         raw_run_id = submitted.get("id")
         if not isinstance(raw_run_id, str) or not raw_run_id:
             raise RuntimeError("public run submission did not return an id")
         run_id = raw_run_id
         details = _poll_run(
-            client,
+            operator_client,
             run_id,
             wait_seconds=wait_seconds,
             poll_interval_seconds=poll_interval_seconds,
@@ -588,16 +806,16 @@ def run_real_user_plugin_acceptance(
         if run_status != "completed":
             raise RuntimeError(f"public plugin run ended with status {run_status}")
         phases.append("public_run_completed")
-        events = client.request_json(
+        events = operator_client.request_json(
             "GET", f"/api/v1/runs/{quote(run_id, safe='')}/events"
         )
         audit_resource = f"plugin:{package.plugin_id}:{package.capability_id}"
-        audits = client.request_json(
+        audits = admin_client.request_json(
             "GET",
             (
                 "/api/v1/admin/audit?action=plugin.invoke.succeeded"
                 f"&run_id={quote(run_id, safe='')}"
-                f"&user_id={quote(user_id, safe='')}"
+                f"&user_id={quote(operator_user_id, safe='')}"
                 f"&resource={quote(audit_resource, safe='')}"
                 "&limit=1"
             ),
@@ -607,7 +825,7 @@ def run_real_user_plugin_acceptance(
                 events=events,
                 audits=audits,
                 run_id=run_id,
-                user_id=user_id,
+                user_id=operator_user_id,
                 plugin_id=package.plugin_id,
                 capability_id=package.capability_id,
                 runtime_nonce=package.runtime_nonce,
@@ -619,21 +837,60 @@ def run_real_user_plugin_acceptance(
     finally:
         run_cleanup_completed: list[str] = []
         run_cleanup_errors: list[str] = []
-        if run_id and not run_terminal:
+        cleanup_completed: list[str]
+        cleanup_errors: list[str]
+        if run_id:
+            if not run_terminal:
+                try:
+                    operator_client.request_json(
+                        "POST",
+                        f"/api/v1/runs/{quote(run_id, safe='')}/cancel",
+                    )
+                    run_cleanup_completed.append("cancel_run")
+                except Exception as error:  # noqa: BLE001 - quiescence check still follows.
+                    run_cleanup_errors.append(f"cancel_run: {error}")
             try:
-                client.request_json(
-                    "POST",
-                    f"/api/v1/runs/{quote(run_id, safe='')}/cancel",
+                quiescence = _wait_for_run_quiescence(
+                    operator_client,
+                    run_id,
+                    wait_seconds=wait_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
                 )
-                run_cleanup_completed.append("cancel_run")
-            except Exception as error:  # noqa: BLE001 - plugin cleanup must still continue.
+                run_terminal = True
+                run_cleanup_completed.append(f"verify_run_{quiescence}")
+            except Exception as error:  # noqa: BLE001 - unsafe cleanup must remain deferred.
                 run_cleanup_errors.append(f"cancel_run: {error}")
-        cleanup_completed, cleanup_errors = _cleanup(
-            client,
-            package,
-            installed=installed,
-            key_registered=key_registered,
-        )
+                run_cleanup_blocked = True
+                recovery = _cleanup_recovery(
+                    package,
+                    run_id=run_id,
+                    retry_after_seconds=max(poll_interval_seconds, 1),
+                )
+        elif run_submission_attempted and not run_submission_rejected:
+            run_submission_unknown = True
+            run_cleanup_blocked = True
+            assert run_request is not None
+            assert run_idempotency_key is not None
+            recovery = _unknown_run_cleanup_recovery(
+                package,
+                run_request=run_request,
+                run_idempotency_key=run_idempotency_key,
+                retry_after_seconds=max(poll_interval_seconds, 1),
+            )
+        if run_cleanup_blocked:
+            cleanup_completed = []
+            cleanup_errors = [
+                "plugin cleanup deferred because the public run submission result is unknown"
+                if run_submission_unknown
+                else "plugin cleanup deferred because the public run is not confirmed execution-quiescent"
+            ]
+        else:
+            cleanup_completed, cleanup_errors = _cleanup(
+                admin_client,
+                package,
+                installed=installed,
+                key_registered=key_registered,
+            )
         cleanup_completed = [*run_cleanup_completed, *cleanup_completed]
         cleanup_errors = [*run_cleanup_errors, *cleanup_errors]
         errors.extend(cleanup_errors)
@@ -641,6 +898,15 @@ def run_real_user_plugin_acceptance(
         not errors
         and "verify_removed" in cleanup_completed
         and "verify_signing_key_removed" in cleanup_completed
+    )
+    cleanup_state = (
+        "deferred_waiting_for_run_identity"
+        if run_submission_unknown
+        else "deferred_waiting_for_execution_quiescence"
+        if run_cleanup_blocked
+        else "failed"
+        if cleanup_errors
+        else "complete"
     )
     return {
         "schema_version": 1,
@@ -651,6 +917,10 @@ def run_real_user_plugin_acceptance(
         "plugin_id": package.plugin_id,
         "capability_id": package.capability_id,
         "run_id": run_id or None,
+        "run_cleanup_blocked": run_cleanup_blocked,
+        "cleanup_state": cleanup_state,
+        "recovery": recovery,
+        "operator_user_id": operator_user_id if "operator_user_id" in locals() else None,
         "phases": phases,
         "evidence": evidence,
         "cleanup": {"completed": cleanup_completed, "errors": cleanup_errors},
@@ -672,6 +942,155 @@ def _write_report(path: str | None, payload: Mapping[str, object]) -> None:
     print(encoded, end="")
 
 
+def _validate_temporary_operator(
+    value: object,
+    *,
+    username: str,
+    tenant_id: str,
+    require_id: bool,
+) -> str | None:
+    operator = _mapping(value, "temporary operator")
+    if operator.get("username") != username:
+        raise RuntimeError("temporary operator username does not match the requested identity")
+    if operator.get("role") != "operator":
+        raise RuntimeError("temporary operator role is not operator")
+    observed_tenant = operator.get("tenant_id")
+    if observed_tenant is not None and observed_tenant != tenant_id:
+        raise RuntimeError("temporary operator tenant does not match the admin tenant")
+    user_id = operator.get("id")
+    if require_id and (not isinstance(user_id, str) or not user_id):
+        raise RuntimeError("temporary operator creation did not return an id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+def _find_temporary_operator(
+    admin_client: PluginAcceptanceClient,
+    *,
+    username: str,
+    tenant_id: str,
+    expected_user_id: str | None,
+) -> str | None:
+    principal = _mapping(
+        admin_client.request_json("GET", "/api/v1/auth/me"),
+        "admin principal before temporary operator cleanup",
+    )
+    if principal.get("tenant_id") != tenant_id:
+        raise RuntimeError("admin tenant changed before temporary operator cleanup")
+    if principal.get("role") not in {"admin", "super_admin"}:
+        raise RuntimeError("temporary operator cleanup principal is not an administrator")
+    users = _list(admin_client.request_json("GET", "/api/v1/users"), "user list")
+    matches = [
+        item
+        for item in users
+        if isinstance(item, Mapping) and item.get("username") == username
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError("temporary operator username did not resolve to one user")
+    resolved_id = _validate_temporary_operator(
+        matches[0],
+        username=username,
+        tenant_id=tenant_id,
+        require_id=True,
+    )
+    if expected_user_id is not None and resolved_id != expected_user_id:
+        raise RuntimeError("temporary operator id changed before cleanup")
+    return resolved_id
+
+
+def _remove_temporary_operator(
+    admin_client: PluginAcceptanceClient,
+    *,
+    username: str,
+    tenant_id: str,
+    expected_user_id: str | None,
+) -> tuple[list[str], list[str]]:
+    completed: list[str] = []
+    errors: list[str] = []
+    try:
+        user_id = _find_temporary_operator(
+            admin_client,
+            username=username,
+            tenant_id=tenant_id,
+            expected_user_id=expected_user_id,
+        )
+        if user_id is None:
+            completed.append("verify_user_absent")
+            return completed, errors
+        admin_client.request_json(
+            "DELETE",
+            f"/api/v1/users/{quote(user_id, safe='')}",
+        )
+        completed.append("delete_user")
+    except Exception as error:  # noqa: BLE001 - verification still runs after deletion failure.
+        errors.append(f"delete_user: {error}")
+    try:
+        users = _list(admin_client.request_json("GET", "/api/v1/users"), "user list")
+        if any(
+            isinstance(item, Mapping)
+            and (item.get("id") == expected_user_id or item.get("username") == username)
+            for item in users
+        ):
+            raise RuntimeError("temporary operator remains registered")
+        completed.append("verify_user_removed")
+    except Exception as error:  # noqa: BLE001 - cleanup verification is acceptance evidence.
+        errors.append(f"verify_user_removed: {error}")
+    return completed, errors
+
+
+def _record_temporary_operator_cleanup(
+    report: dict[str, object],
+    *,
+    completed: list[str],
+    errors: list[str],
+) -> None:
+    report["temporary_operator_cleanup"] = {
+        "completed": completed,
+        "errors": errors,
+    }
+    if not errors:
+        return
+    existing_errors = report.get("errors")
+    report["errors"] = [
+        *(existing_errors if isinstance(existing_errors, list) else []),
+        *(f"temporary_operator_cleanup: {error}" for error in errors),
+    ]
+    report["status"] = "failed"
+    report["acceptance_complete"] = False
+    if report.get("cleanup_state") not in {
+        "deferred_waiting_for_execution_quiescence",
+        "deferred_waiting_for_run_identity",
+    }:
+        report["cleanup_state"] = "failed"
+
+
+def _setup_failure_report(execution_id: str, errors: list[str]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "real_user_plugin_acceptance",
+        "status": "failed",
+        "acceptance_complete": False,
+        "execution_id": execution_id,
+        "plugin_id": None,
+        "capability_id": None,
+        "run_id": None,
+        "run_cleanup_blocked": False,
+        "cleanup_state": "not_started",
+        "recovery": {"required": False},
+        "operator_user_id": None,
+        "phases": [],
+        "evidence": {},
+        "cleanup": {"completed": [], "errors": []},
+        "errors": errors,
+        "success_basis": {
+            "logged_in_user_public_run": False,
+            "admin_internal_run_data": False,
+            "runtime_output_schema_nonce": False,
+        },
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Verify a real signed plugin through a logged-in public run, then remove it."
@@ -685,27 +1104,190 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=2)
     parser.add_argument("--execution-id", default=f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}")
     parser.add_argument("--output")
+    parser.add_argument(
+        "--operator-username",
+        default=os.environ.get("AGENT_HUB_ACCEPTANCE_OPERATOR_USERNAME"),
+    )
+    parser.add_argument(
+        "--operator-password",
+        default=os.environ.get("AGENT_HUB_ACCEPTANCE_OPERATOR_PASSWORD"),
+    )
+    parser.add_argument(
+        "--operator-tenant-id",
+        default=os.environ.get("AGENT_HUB_ACCEPTANCE_OPERATOR_TENANT_ID"),
+    )
     args = parser.parse_args(argv)
     username, password, tenant_id = _acceptance_credentials_from_env()
     if not username or not password:
         parser.error("AGENT_HUB_ACCEPTANCE_USERNAME/PASSWORD is required")
-    client = UrllibPluginAcceptanceClient(
+    if bool(args.operator_username) != bool(args.operator_password):
+        parser.error("operator username and password must be provided together")
+    admin_client = UrllibPluginAcceptanceClient(
         base_url=args.base_url,
         timeout=args.timeout,
         username=username,
         password=password,
         tenant_id=tenant_id,
     )
-    with TemporaryDirectory(prefix="agent-hub-plugin-uat-") as temporary:
-        report = run_real_user_plugin_acceptance(
-            client,
-            execution_id=args.execution_id,
-            package_dir=Path(temporary),
-            wait_seconds=args.wait_seconds,
-            poll_interval_seconds=args.poll_interval,
+    operator_source = "provided"
+    temporary_operator_id: str | None = None
+    temporary_operator_tenant: str | None = None
+    operator_client: PluginAcceptanceClient | None = None
+    setup_errors: list[str] = []
+    cleanup_completed: list[str]
+    cleanup_errors: list[str]
+    report = _setup_failure_report(args.execution_id, setup_errors)
+    if args.operator_username and args.operator_password:
+        operator_username = args.operator_username
+        operator_password = args.operator_password
+    else:
+        operator_source = "temporary"
+        operator_username = f"plugin-uat-operator-{uuid4().hex[:16]}"
+        operator_password = f"Uat-{uuid4().hex}-9aA!"
+    try:
+        if operator_source == "temporary":
+            try:
+                admin_principal = _mapping(
+                    admin_client.request_json("GET", "/api/v1/auth/me"),
+                    "admin principal before temporary operator creation",
+                )
+                raw_tenant_id = admin_principal.get("tenant_id")
+                if not isinstance(raw_tenant_id, str) or not raw_tenant_id:
+                    raise RuntimeError("admin principal did not expose tenant_id")
+                if admin_principal.get("role") not in {"admin", "super_admin"}:
+                    raise RuntimeError("temporary operator creator is not an administrator")
+                if args.operator_tenant_id and args.operator_tenant_id != raw_tenant_id:
+                    raise RuntimeError("temporary operator tenant differs from the admin tenant")
+                temporary_operator_tenant = raw_tenant_id
+                existing_id = _find_temporary_operator(
+                    admin_client,
+                    username=operator_username,
+                    tenant_id=temporary_operator_tenant,
+                    expected_user_id=None,
+                )
+                if existing_id is not None:
+                    raise RuntimeError("temporary operator username already exists")
+            except Exception as error:  # noqa: BLE001 - setup failure is reported and cleaned.
+                setup_errors.append(f"temporary operator preflight: {error}")
+            if not setup_errors and temporary_operator_tenant is not None:
+                try:
+                    created_operator = admin_client.request_json(
+                        "POST",
+                        "/api/v1/users",
+                        body={
+                            "username": operator_username,
+                            "password": operator_password,
+                            "role": "operator",
+                        },
+                    )
+                    temporary_operator_id = _validate_temporary_operator(
+                        created_operator,
+                        username=operator_username,
+                        tenant_id=temporary_operator_tenant,
+                        require_id=True,
+                    )
+                except Exception as error:  # noqa: BLE001 - ambiguous creation still needs cleanup.
+                    setup_errors.append(f"temporary operator creation: {error}")
+        operator_client = UrllibPluginAcceptanceClient(
+            base_url=args.base_url,
+            timeout=args.timeout,
+            username=operator_username,
+            password=operator_password,
+            tenant_id=args.operator_tenant_id or temporary_operator_tenant or tenant_id,
         )
+        if operator_source == "temporary" and temporary_operator_tenant is not None:
+            try:
+                operator_principal = _mapping(
+                    operator_client.request_json("GET", "/api/v1/auth/me"),
+                    "temporary operator principal",
+                )
+                operator_user_id = operator_principal.get("user_id")
+                if not isinstance(operator_user_id, str) or not operator_user_id:
+                    raise RuntimeError("temporary operator principal did not expose user_id")
+                if operator_principal.get("role") != "operator":
+                    raise RuntimeError("temporary operator login role is not operator")
+                if operator_principal.get("tenant_id") != temporary_operator_tenant:
+                    raise RuntimeError("temporary operator login tenant does not match")
+                if (
+                    temporary_operator_id is not None
+                    and temporary_operator_id != operator_user_id
+                ):
+                    raise RuntimeError(
+                        "temporary operator user id differs from the creation response"
+                    )
+                if temporary_operator_id is None:
+                    temporary_operator_id = operator_user_id
+            except Exception as error:  # noqa: BLE001 - identity failure is reported and cleaned.
+                setup_errors.append(f"temporary operator login: {error}")
+        if setup_errors:
+            report = _setup_failure_report(args.execution_id, setup_errors)
+        else:
+            with TemporaryDirectory(prefix="agent-hub-plugin-uat-") as temporary:
+                report = run_real_user_plugin_acceptance(
+                    admin_client,
+                    operator_client=operator_client,
+                    execution_id=args.execution_id,
+                    package_dir=Path(temporary),
+                    wait_seconds=args.wait_seconds,
+                    poll_interval_seconds=args.poll_interval,
+                )
+    finally:
+        if operator_source == "temporary" and report.get("run_cleanup_blocked") is True:
+            cleanup_completed = []
+            cleanup_errors = [
+                "temporary operator cleanup deferred because the public run identity is unknown"
+                if report.get("cleanup_state") == "deferred_waiting_for_run_identity"
+                else "temporary operator cleanup deferred because its run is not execution-quiescent"
+            ]
+            recovery = report.get("recovery")
+            if isinstance(recovery, dict):
+                raw_steps = recovery.get("steps")
+                if isinstance(raw_steps, list):
+                    raw_steps.extend(
+                        [
+                            {
+                                "method": "GET",
+                                "path": "/api/v1/users",
+                                "require": {
+                                    "username": operator_username,
+                                    "id": temporary_operator_id,
+                                    "role": "operator",
+                                    "tenant_id": temporary_operator_tenant,
+                                },
+                            },
+                            {
+                                "method": "DELETE",
+                                "path": (
+                                    f"/api/v1/users/{quote(temporary_operator_id, safe='')}"
+                                    if temporary_operator_id
+                                    else "/api/v1/users/{id-resolved-by-validated-username}"
+                                ),
+                            },
+                            {
+                                "method": "GET",
+                                "path": "/api/v1/users",
+                                "require_absent": {"username": operator_username},
+                            },
+                        ]
+                    )
+        elif operator_source == "temporary" and temporary_operator_tenant is not None:
+            cleanup_completed, cleanup_errors = _remove_temporary_operator(
+                admin_client,
+                username=operator_username,
+                tenant_id=temporary_operator_tenant,
+                expected_user_id=temporary_operator_id,
+            )
+        else:
+            cleanup_completed, cleanup_errors = [], []
+    report["operator_source"] = operator_source
+    _record_temporary_operator_cleanup(
+        report,
+        completed=cleanup_completed,
+        errors=cleanup_errors,
+    )
     report["base_url"] = args.base_url.rstrip("/")
-    report["request_log"] = client.request_log
+    report["admin_request_log"] = getattr(admin_client, "request_log", [])
+    report["operator_request_log"] = getattr(operator_client, "request_log", [])
     _write_report(args.output, report)
     return 0 if report["acceptance_complete"] is True else 1
 

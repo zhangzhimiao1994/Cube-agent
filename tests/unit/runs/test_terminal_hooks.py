@@ -11,7 +11,7 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.repository import RunConflict, RunRecord
 from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
     classify_terminal_run,
@@ -140,6 +140,28 @@ class ExecutableFakeRepository:
         self.lease_renewed.set()
         return True
 
+    async def release_worker_execution(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        complete_if_running: bool = False,
+    ) -> RunRecord:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        if self.row.worker_id != worker_id or self.row.worker_lease_token != worker_lease_token:
+            raise RuntimeError("worker execution ownership changed")
+        if complete_if_running and self.row.status == RunStatus.RUNNING.value:
+            self.row.status = RunStatus.COMPLETED.value
+        self.row.worker_id = None
+        self.row.worker_lease_token = None
+        self.row.worker_lease_expires_at = None
+        self.row.worker_heartbeat_at = None
+        self.row.version += 1
+        return self._record()
+
     async def persist_event(
         self,
         session: FakeTransaction,
@@ -175,9 +197,21 @@ class ExecutableFakeRepository:
         self.row.version += 1
         return self._record()
 
-    async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
+    async def fail_run(
+        self,
+        run_id: UUID,
+        *,
+        reason: str,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+    ) -> RunRecord:
+        del worker_id, worker_lease_token
         assert run_id == self.run_id
-        if self.row.status == RunStatus.WAITING_APPROVAL.value:
+        if self.row.status in {
+            RunStatus.WAITING_APPROVAL.value,
+            RunStatus.PAUSED.value,
+            RunStatus.CANCELLED.value,
+        }:
             return self._record()
         sequence = max((event.sequence for event in self.event_log), default=0) + 1
         self.event_log.append(
@@ -189,6 +223,24 @@ class ExecutableFakeRepository:
             )
         )
         self.row.status = RunStatus.FAILED.value
+        self.row.version += 1
+        return self._record()
+
+    async def mark_worker_execution_exited(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        exited_at: datetime,
+    ) -> RunRecord:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        if self.row.worker_id != worker_id or self.row.worker_lease_token != worker_lease_token:
+            raise RunConflict("run worker execution ownership changed")
+        self.row.worker_lease_expires_at = exited_at
+        self.row.worker_heartbeat_at = None
         self.row.version += 1
         return self._record()
 
@@ -316,6 +368,9 @@ class ExecutableFakeRepository:
             routing_decision=None
             if self.row.routing_decision is None
             else dict(self.row.routing_decision),
+            worker_id=self.row.worker_id,
+            worker_lease_token=self.row.worker_lease_token,
+            worker_lease_expires_at=self.row.worker_lease_expires_at,
         )
 
 
@@ -449,6 +504,33 @@ class CancelledBeforeRuntimeEventRepository(ExecutableFakeRepository):
         return row
 
 
+class PausedBeforeRuntimeEventRepository(ExecutableFakeRepository):
+    async def get_for_update(self, session: FakeTransaction, run_id: UUID) -> FakeRunRow:
+        row = await super().get_for_update(session, run_id)
+        if row.status == RunStatus.RUNNING.value:
+            row.status = RunStatus.PAUSED.value
+            row.version += 1
+        return row
+
+
+class OwnershipTransferredBeforeFailureRepository(ExecutableFakeRepository):
+    async def fail_run(
+        self,
+        run_id: UUID,
+        *,
+        reason: str,
+        worker_id: str | None = None,
+        worker_lease_token: UUID | None = None,
+    ) -> RunRecord:
+        del reason, worker_lease_token
+        assert run_id == self.run_id
+        assert worker_id == "worker-old"
+        self.row.status = RunStatus.RUNNING.value
+        self.row.worker_id = "worker-new"
+        self.row.worker_lease_token = uuid4()
+        raise RunConflict("run worker execution ownership changed")
+
+
 class HeartbeatLeaseLostRepository(ExecutableFakeRepository):
     def __init__(self, *, routing_decision: dict[str, object]) -> None:
         super().__init__(routing_decision=routing_decision)
@@ -470,11 +552,94 @@ class HeartbeatLeaseLostRepository(ExecutableFakeRepository):
         return False
 
 
+class BlockingInstructionContextLoader:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def load(self, *, tenant_id: UUID, run_id: UUID) -> object:
+        assert tenant_id == TENANT_ID
+        self.started.set()
+        await self.release.wait()
+        return object()
+
+
+class CoordinatedWorkerReleaseRepository(ExecutableFakeRepository):
+    def __init__(self, *, routing_decision: dict[str, object]) -> None:
+        super().__init__(routing_decision=routing_decision)
+        self.release_committed = asyncio.Event()
+        self.continue_return = asyncio.Event()
+        self.completed_atomically = False
+
+    async def release_worker_execution(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        complete_if_running: bool = False,
+    ) -> RunRecord:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        assert self.row.worker_id == worker_id
+        assert self.row.worker_lease_token == worker_lease_token
+        if complete_if_running and self.row.status == RunStatus.RUNNING.value:
+            self.row.status = RunStatus.COMPLETED.value
+            self.completed_atomically = True
+        self.row.worker_id = None
+        self.row.worker_lease_token = None
+        self.row.worker_lease_expires_at = None
+        self.row.worker_heartbeat_at = None
+        self.row.version += 1
+        released = self._record()
+        self.release_committed.set()
+        await self.continue_return.wait()
+        return released
+
+
+class OwnershipTransferredBeforeReleaseRepository(ExecutableFakeRepository):
+    async def release_worker_execution(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        worker_id: str,
+        worker_lease_token: UUID,
+        complete_if_running: bool = False,
+    ) -> RunRecord:
+        del complete_if_running
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        assert worker_id != "worker-new"
+        self.row.worker_id = "worker-new"
+        self.row.worker_lease_token = uuid4()
+        raise RunConflict("run worker execution ownership changed")
+
+
 class RuntimeCompletes:
     mode = TaskMode.DISPATCH
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeStopsWithoutTerminalEvent:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        del context
+        if False:
+            yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise AssertionError("not used")
@@ -564,6 +729,12 @@ class RuntimeRequiresRunScopedCancel(RuntimeYieldsStaleToolEvent):
         self.cancelled_run_ids.append(run_id)
 
 
+class RuntimeRunScopedCancelFails(RuntimeRequiresRunScopedCancel):
+    async def cancel_run(self, run_id: UUID) -> None:
+        await super().cancel_run(run_id)
+        raise RuntimeError("runtime cancel failed")
+
+
 class RuntimeBlocksUntilRunScopedCancel(RuntimeRequiresRunScopedCancel):
     def __init__(self) -> None:
         super().__init__()
@@ -574,6 +745,24 @@ class RuntimeBlocksUntilRunScopedCancel(RuntimeRequiresRunScopedCancel):
         self.started.set()
         await self.release.wait()
         yield RunEvent(kind=EventKind.RUNTIME_CANCELLED, sequence=1, run_id=context.run_id)
+
+    async def cancel_run(self, run_id: UUID) -> None:
+        await super().cancel_run(run_id)
+        self.release.set()
+
+
+class RuntimeStopsWithoutTerminalEventOnCancel(RuntimeRequiresRunScopedCancel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        del context
+        self.started.set()
+        await self.release.wait()
+        if False:
+            yield RunEvent(kind=EventKind.RUNTIME_CANCELLED, sequence=1)
 
     async def cancel_run(self, run_id: UUID) -> None:
         await super().cancel_run(run_id)
@@ -1096,6 +1285,155 @@ async def test_execute_cancelled_status_uses_run_scoped_runtime_cancel() -> None
     assert submitted.status is RunStatus.CANCELLED
     assert runtime.cancelled_run_ids == [repository.run_id]
     assert repository.event_log == []
+
+
+@pytest.mark.asyncio
+async def test_execute_paused_status_uses_run_scoped_runtime_cancel_before_release() -> None:
+    repository = PausedBeforeRuntimeEventRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeRequiresRunScopedCancel()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.PAUSED
+    assert runtime.cancelled_run_ids == [repository.run_id]
+    assert repository.row.worker_id is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancel_failure_marks_worker_exited_but_keeps_nonquiescent_lease() -> None:
+    repository = CancelledBeforeRuntimeEventRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeRunScopedCancelFails()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.CANCELLED
+    assert runtime.cancelled_run_ids == [repository.run_id]
+    assert repository.row.worker_id is not None
+    assert repository.row.worker_lease_token is not None
+    assert repository.row.worker_lease_expires_at is not None
+    assert repository.row.worker_lease_expires_at <= datetime.now(UTC)
+    assert repository.row.worker_heartbeat_at is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_failure_after_owner_transfer_never_fails_new_owner() -> None:
+    repository = OwnershipTransferredBeforeFailureRepository(
+        routing_decision={"source": "manual"}
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeRaises(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        worker_id="worker-old",
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.RUNNING
+    assert repository.row.status == RunStatus.RUNNING.value
+    assert repository.row.worker_id == "worker-new"
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_that_stops_without_terminal_event_stays_cancelled() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    runtime = RuntimeStopsWithoutTerminalEventOnCancel()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    execute_task = asyncio.create_task(service.execute(repository.run_id))
+    await asyncio.wait_for(runtime.started.wait(), timeout=1)
+
+    repository.row.status = RunStatus.CANCELLED.value
+    await runtime.cancel_run(repository.run_id)
+    submitted = await asyncio.wait_for(execute_task, timeout=1)
+
+    assert submitted.status is RunStatus.CANCELLED
+    assert repository.row.worker_id is None
+    assert repository.row.worker_lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_instruction_context_load_releases_claimed_worker() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    loader = BlockingInstructionContextLoader()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeStopsWithoutTerminalEvent(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        instruction_context_loader=loader,  # type: ignore[arg-type]
+    )
+    execute_task = asyncio.create_task(service.execute(repository.run_id))
+    await asyncio.wait_for(loader.started.wait(), timeout=1)
+
+    repository.row.status = RunStatus.CANCELLED.value
+    loader.release.set()
+    submitted = await asyncio.wait_for(execute_task, timeout=1)
+
+    assert submitted.status is RunStatus.CANCELLED
+    assert repository.row.worker_id is None
+    assert repository.row.worker_lease_token is None
+    assert repository.row.worker_lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_silent_runtime_finishes_status_before_releasing_worker_ownership() -> None:
+    repository = CoordinatedWorkerReleaseRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeStopsWithoutTerminalEvent(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    execute_task = asyncio.create_task(service.execute(repository.run_id))
+    await asyncio.wait_for(repository.release_committed.wait(), timeout=1)
+
+    cancel_could_commit = repository.row.status == RunStatus.RUNNING.value
+    if cancel_could_commit:
+        repository.row.status = RunStatus.CANCELLED.value
+    repository.continue_return.set()
+    submitted = await asyncio.wait_for(execute_task, timeout=1)
+
+    assert cancel_could_commit is False
+    assert repository.completed_atomically is True
+    assert submitted.status is RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_release_conflict_does_not_fail_new_owner() -> None:
+    repository = OwnershipTransferredBeforeReleaseRepository(
+        routing_decision={"source": "manual"}
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeStopsWithoutTerminalEvent(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        worker_id="worker-old",
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.RUNNING
+    assert repository.row.status == RunStatus.RUNNING.value
+    assert repository.row.worker_id == "worker-new"
 
 
 @pytest.mark.asyncio

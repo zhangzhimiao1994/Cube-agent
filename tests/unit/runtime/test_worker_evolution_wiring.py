@@ -360,8 +360,15 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
             raise asyncio.CancelledError
 
     class Runtime:
+        def __init__(self) -> None:
+            self.reloads: list[UUID | None] = []
+            self.strict_reloads: list[UUID | None] = []
+
         async def reload(self, tenant_id: UUID | None = None) -> None:
-            del tenant_id
+            self.reloads.append(tenant_id)
+
+        async def reload_strict(self, tenant_id: UUID | None = None) -> None:
+            self.strict_reloads.append(tenant_id)
 
     bus = FakeBus()
     mcp_runtime = Runtime()
@@ -378,7 +385,10 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
 
     assert bus.kwargs is not None
     assert bus.kwargs["mcp_runtime"] is mcp_runtime
-    assert bus.kwargs["plugin_runtime"] is plugin_runtime
+    listener_plugin_runtime = cast(Any, bus.kwargs["plugin_runtime"])
+    asyncio.run(listener_plugin_runtime.reload(OTHER_TENANT_ID))
+    assert plugin_runtime.reloads == []
+    assert plugin_runtime.strict_reloads == [OTHER_TENANT_ID]
     assert str(bus.kwargs["stream_consumer_group"]).startswith("worker-")
     assert str(bus.kwargs["stream_consumer_name"]).startswith("worker-")
     assert bus.kwargs["reload_on_empty_stream_replay"] is True
@@ -432,7 +442,7 @@ def test_worker_runtime_invalidation_listener_restarts_after_listen_failure(
     first_kwargs, second_kwargs = bus.kwargs
     assert first_kwargs == second_kwargs
     assert first_kwargs["mcp_runtime"] is mcp_runtime
-    assert first_kwargs["plugin_runtime"] is plugin_runtime
+    assert first_kwargs["plugin_runtime"] is not plugin_runtime
     assert str(first_kwargs["stream_consumer_group"]).startswith("worker-")
     assert str(first_kwargs["stream_consumer_name"]).startswith("worker-")
     assert sleep_delays == [0.0]

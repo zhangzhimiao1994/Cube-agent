@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -111,6 +111,126 @@ async def test_migrated_admin_resource_constraint_allows_capability_installs(
     )
 
     await db_session.commit()
+
+
+@pytest.mark.integration
+async def test_persistent_audit_query_filters_and_limits_in_postgresql(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    other_tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    user_id = uuid4()
+    action = "plugin.invoke.succeeded"
+    resource = "plugin:test-plugin:capability:test-capability"
+    base_time = datetime(2026, 10, 2, 8, 0, tzinfo=UTC)
+
+    def audit_row(
+        *,
+        event_id: str,
+        tenant: UUID = tenant_id,
+        event_action: str = action,
+        event_run_id: UUID = run_id,
+        event_resource: str = resource,
+        event_user_id: UUID = user_id,
+        event_seconds: int,
+        row_seconds: int,
+    ) -> AdminResourceRow:
+        event_created_at = base_time + timedelta(seconds=event_seconds)
+        row_created_at = base_time + timedelta(seconds=row_seconds)
+        return AdminResourceRow(
+            tenant_id=tenant,
+            kind="audit",
+            resource_id=event_id,
+            payload={
+                "id": event_id,
+                "actor": str(actor_id),
+                "action": event_action,
+                "resource": event_resource,
+                "details": {
+                    "run_id": str(event_run_id),
+                    "user_id": str(event_user_id),
+                },
+                "created_at": event_created_at.isoformat(),
+            },
+            created_at=row_created_at,
+            updated_at=row_created_at,
+        )
+
+    async with auth_session_factory() as session, session.begin():
+        session.add_all(
+            [
+                TenantRow(id=tenant_id, slug=f"audit-filter-{uuid4()}", name="Audit filter"),
+                TenantRow(
+                    id=other_tenant_id,
+                    slug=f"audit-filter-other-{uuid4()}",
+                    name="Other audit filter",
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                audit_row(event_id="audit_match_old", event_seconds=1, row_seconds=30),
+                audit_row(event_id="audit_match_tie_a", event_seconds=3, row_seconds=20),
+                audit_row(event_id="audit_match_tie_b", event_seconds=3, row_seconds=10),
+                audit_row(
+                    event_id="audit_wrong_action",
+                    event_action="plugin.invoke.failed",
+                    event_seconds=4,
+                    row_seconds=40,
+                ),
+                audit_row(
+                    event_id="audit_wrong_run",
+                    event_run_id=uuid4(),
+                    event_seconds=5,
+                    row_seconds=50,
+                ),
+                audit_row(
+                    event_id="audit_wrong_resource",
+                    event_resource="plugin:other:capability:other",
+                    event_seconds=6,
+                    row_seconds=60,
+                ),
+                audit_row(
+                    event_id="audit_wrong_user",
+                    event_user_id=uuid4(),
+                    event_seconds=7,
+                    row_seconds=70,
+                ),
+                audit_row(
+                    event_id="audit_other_tenant",
+                    tenant=other_tenant_id,
+                    event_seconds=8,
+                    row_seconds=80,
+                ),
+            ]
+        )
+
+    service = PersistentAdminResourceService(
+        config_service=cast(Any, object()),
+        secret_service=cast(Any, object()),
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        session_factory=auth_session_factory,
+    )
+
+    events = await service.list_audit_events(
+        action,
+        run_id=str(run_id),
+        resource=resource,
+        user_id=str(user_id),
+        limit=2,
+    )
+
+    assert [event.id for event in events] == ["audit_match_tie_b", "audit_match_tie_a"]
+    assert [event.created_at for event in events] == sorted(
+        (event.created_at for event in events), reverse=True
+    )
+    assert all(event.action == action for event in events)
+    assert all(event.resource == resource for event in events)
+    assert all(event.details["run_id"] == str(run_id) for event in events)
+    assert all(event.details["user_id"] == str(user_id) for event in events)
 
 
 @pytest.mark.integration

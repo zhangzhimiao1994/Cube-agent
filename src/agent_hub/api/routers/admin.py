@@ -15,8 +15,17 @@ import shlex
 import shutil
 import stat
 import tarfile
+import time
 import zipfile
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -40,7 +49,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
-from sqlalchemy import delete, select, text
+from sqlalchemy import DateTime, delete, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -329,6 +338,22 @@ class OperationStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: str
+
+
+class PluginUninstallCleanupResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    registration_removed: bool
+    runtime_capabilities_removed: bool
+    package_artifact_removed: bool
+    retry_completed: bool
+
+
+class PluginUninstallResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    cleanup: PluginUninstallCleanupResponse
 
 
 class NamedResourceRequest(BaseModel):
@@ -5271,6 +5296,520 @@ def _cleanup_plugin_package_metadata_artifact(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _PluginPackageUninstallState:
+    pending_root: Path
+    package_root: Path
+    staged_artifact_root: Path | None
+    audit_confirmed_path: Path
+    operation_id: UUID
+    plugin_snapshot_sha256: str
+    created_at: datetime
+    retry: bool
+
+    @property
+    def package_artifact_removed(self) -> bool:
+        staged = self.staged_artifact_root
+        return (staged is None or not staged.exists()) and not self.package_root.exists()
+
+
+def _validated_plugin_path_segment(plugin_id: str) -> str:
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", plugin_id) is None:
+        raise PublicAPIError(422, "request_validation", "plugin id is invalid")
+    return plugin_id
+
+
+def _plugin_package_tenant_root(request: Request, *, tenant_id: UUID) -> Path:
+    store_root = _plugin_package_store_root(request)
+    tenant_root = store_root / str(tenant_id)
+    _ensure_path_inside(store_root, tenant_root)
+    return tenant_root
+
+
+def _plugin_package_uninstall_tenant_root(request: Request, *, tenant_id: UUID) -> Path:
+    store_root = _plugin_package_store_root(request)
+    tenant_root = store_root / ".uninstalling" / str(tenant_id)
+    _ensure_path_inside(store_root, tenant_root)
+    return tenant_root
+
+
+def _plugin_package_uninstall_pending_root(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> Path:
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    tenant_root = _plugin_package_uninstall_tenant_root(request, tenant_id=tenant_id)
+    pending_root = tenant_root / plugin_id
+    _ensure_path_inside(tenant_root, pending_root)
+    return pending_root
+
+
+def _plugin_package_uninstall_lock_root(request: Request, *, tenant_id: UUID) -> Path:
+    store_root = _plugin_package_store_root(request)
+    lock_root = store_root / ".uninstall-locks" / str(tenant_id)
+    _ensure_path_inside(store_root, lock_root)
+    return lock_root
+
+
+def _plugin_package_uninstall_claim_path(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> Path:
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    lock_root = _plugin_package_uninstall_lock_root(request, tenant_id=tenant_id)
+    claim_path = lock_root / f"{plugin_id}.claim.json"
+    _ensure_path_inside(lock_root, claim_path)
+    return claim_path
+
+
+@contextlib.contextmanager
+def _plugin_package_uninstall_stage_lock(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> Iterator[None]:
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    lock_root = _plugin_package_uninstall_lock_root(request, tenant_id=tenant_id)
+    lock_path = lock_root / f"{plugin_id}.lock"
+    _ensure_path_inside(lock_root, lock_path)
+    lock_root.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl = cast(Any, __import__("fcntl"))
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _plugin_package_root(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> Path:
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    tenant_root = _plugin_package_tenant_root(request, tenant_id=tenant_id)
+    package_root = tenant_root / plugin_id
+    _ensure_path_inside(tenant_root, package_root)
+    return package_root
+
+
+def _plugin_uninstall_state_payload(
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+    operation_id: UUID,
+    plugin_snapshot_sha256: str,
+    created_at: datetime,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "tenant_id": str(tenant_id),
+        "plugin_id": plugin_id,
+        "operation_id": str(operation_id),
+        "plugin_snapshot_sha256": plugin_snapshot_sha256,
+        "created_at": created_at.isoformat(),
+    }
+
+
+def _read_plugin_uninstall_state(
+    path: Path,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> tuple[UUID, str, datetime]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("tenant_id") != str(tenant_id)
+        or payload.get("plugin_id") != plugin_id
+    ):
+        raise ValueError("plugin uninstall state identity mismatch")
+    operation_id = UUID(str(payload.get("operation_id")))
+    plugin_snapshot_sha256 = payload.get("plugin_snapshot_sha256")
+    if (
+        not isinstance(plugin_snapshot_sha256, str)
+        or re.fullmatch(r"[a-f0-9]{64}", plugin_snapshot_sha256) is None
+    ):
+        raise ValueError("plugin uninstall state snapshot is invalid")
+    created_at = datetime.fromisoformat(str(payload.get("created_at")))
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("plugin uninstall state timestamp is invalid")
+    return operation_id, plugin_snapshot_sha256, created_at.astimezone(UTC)
+
+
+def _pending_plugin_package_uninstall_state(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+) -> _PluginPackageUninstallState | None:
+    try:
+        pending_root = _plugin_package_uninstall_pending_root(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin_id,
+        )
+        package_root = _plugin_package_root(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin_id,
+        )
+        if not pending_root.is_dir():
+            return None
+        staged_artifact_root = pending_root / "artifact"
+        audit_confirmed_path = pending_root / "audit-confirmed"
+        state_path = pending_root / "state.json"
+        _ensure_path_inside(pending_root, staged_artifact_root)
+        _ensure_path_inside(pending_root, audit_confirmed_path)
+        _ensure_path_inside(pending_root, state_path)
+        operation_id, plugin_snapshot_sha256, created_at = _read_plugin_uninstall_state(
+            state_path,
+            tenant_id=tenant_id,
+            plugin_id=plugin_id,
+        )
+    except (InvalidSkillPackage, OSError, ValueError, json.JSONDecodeError) as error:
+        raise PublicAPIError(
+            503,
+            "plugin_uninstall_cleanup_unavailable",
+            "plugin uninstall cleanup state is unavailable",
+        ) from error
+    return _PluginPackageUninstallState(
+        pending_root=pending_root,
+        package_root=package_root,
+        staged_artifact_root=(
+            staged_artifact_root if staged_artifact_root.exists() else None
+        ),
+        audit_confirmed_path=audit_confirmed_path,
+        operation_id=operation_id,
+        plugin_snapshot_sha256=plugin_snapshot_sha256,
+        created_at=created_at,
+        retry=True,
+    )
+
+
+def _stage_plugin_package_uninstall(
+    request: Request,
+    plugin: PluginResourceResponse,
+    *,
+    tenant_id: UUID,
+) -> _PluginPackageUninstallState:
+    package = plugin.package_metadata
+    artifact = package.artifact if package is not None else None
+    owns_pending_root = False
+    owns_claim = False
+    try:
+        package_root = _plugin_package_root(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin.id,
+        )
+        pending_root = _plugin_package_uninstall_pending_root(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin.id,
+        )
+        claim_path = _plugin_package_uninstall_claim_path(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin.id,
+        )
+        if artifact is not None:
+            expected_storage_key = f"{tenant_id}/{plugin.id}/{artifact.content_sha256}"
+            if artifact.storage_key != expected_storage_key:
+                raise InvalidSkillPackage("plugin package storage key does not match tenant")
+        with _plugin_package_uninstall_stage_lock(
+            request,
+            tenant_id=tenant_id,
+            plugin_id=plugin.id,
+        ):
+            current_snapshot_sha256 = _plugin_activation_snapshot_sha256(plugin)
+            try:
+                existing = _pending_plugin_package_uninstall_state(
+                    request,
+                    tenant_id=tenant_id,
+                    plugin_id=plugin.id,
+                )
+            except PublicAPIError as error:
+                state_path = pending_root / "state.json"
+                recoverable_entries = {state_path}
+                entries = set(pending_root.iterdir()) if pending_root.is_dir() else set()
+                try:
+                    operation_id, claim_snapshot_sha256, created_at = (
+                        _read_plugin_uninstall_state(
+                            claim_path,
+                            tenant_id=tenant_id,
+                            plugin_id=plugin.id,
+                        )
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    raise error
+                if (
+                    error.code != "plugin_uninstall_cleanup_unavailable"
+                    or claim_snapshot_sha256 != current_snapshot_sha256
+                    or not package_root.exists()
+                    or not entries.issubset(recoverable_entries)
+                ):
+                    raise
+                state_path.write_text(
+                    json.dumps(
+                        _plugin_uninstall_state_payload(
+                            tenant_id=tenant_id,
+                            plugin_id=plugin.id,
+                            operation_id=operation_id,
+                            plugin_snapshot_sha256=claim_snapshot_sha256,
+                            created_at=created_at,
+                        ),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                claim_path.unlink()
+                existing = _pending_plugin_package_uninstall_state(
+                    request,
+                    tenant_id=tenant_id,
+                    plugin_id=plugin.id,
+                )
+
+            if existing is not None:
+                if existing.plugin_snapshot_sha256 != current_snapshot_sha256:
+                    raise PublicAPIError(
+                        503,
+                        "plugin_uninstall_cleanup_unavailable",
+                        "plugin uninstall cleanup state belongs to an earlier registration",
+                    )
+                staged_artifact_root = existing.pending_root / "artifact"
+                if package_root.exists():
+                    if staged_artifact_root.exists():
+                        raise OSError("active and staged plugin package directories both exist")
+                    package_root.replace(staged_artifact_root)
+                with contextlib.suppress(FileNotFoundError):
+                    claim_path.unlink()
+                return _PluginPackageUninstallState(
+                    pending_root=existing.pending_root,
+                    package_root=existing.package_root,
+                    staged_artifact_root=(
+                        staged_artifact_root if staged_artifact_root.exists() else None
+                    ),
+                    audit_confirmed_path=existing.audit_confirmed_path,
+                    operation_id=existing.operation_id,
+                    plugin_snapshot_sha256=existing.plugin_snapshot_sha256,
+                    created_at=existing.created_at,
+                    retry=True,
+                )
+
+            operation_id = uuid4()
+            plugin_snapshot_sha256 = current_snapshot_sha256
+            created_at = datetime.now(UTC)
+            state_payload = json.dumps(
+                _plugin_uninstall_state_payload(
+                    tenant_id=tenant_id,
+                    plugin_id=plugin.id,
+                    operation_id=operation_id,
+                    plugin_snapshot_sha256=plugin_snapshot_sha256,
+                    created_at=created_at,
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            claim_path.write_text(state_payload, encoding="utf-8")
+            owns_claim = True
+            pending_root.parent.mkdir(parents=True, exist_ok=True)
+            pending_root.mkdir()
+            owns_pending_root = True
+            staged_artifact_root = pending_root / "artifact"
+            audit_confirmed_path = pending_root / "audit-confirmed"
+            state_path = pending_root / "state.json"
+            _ensure_path_inside(pending_root, staged_artifact_root)
+            _ensure_path_inside(pending_root, audit_confirmed_path)
+            _ensure_path_inside(pending_root, state_path)
+            state_path.write_text(state_payload, encoding="utf-8")
+            claim_path.unlink()
+            owns_claim = False
+            if package_root.exists():
+                package_root.replace(staged_artifact_root)
+            return _PluginPackageUninstallState(
+                pending_root=pending_root,
+                package_root=package_root,
+                staged_artifact_root=(
+                    staged_artifact_root if staged_artifact_root.exists() else None
+                ),
+                audit_confirmed_path=audit_confirmed_path,
+                operation_id=operation_id,
+                plugin_snapshot_sha256=plugin_snapshot_sha256,
+                created_at=created_at,
+                retry=False,
+            )
+    except (InvalidSkillPackage, OSError) as error:
+        with contextlib.suppress(OSError):
+            if owns_pending_root and pending_root.exists():
+                shutil.rmtree(pending_root)
+        with contextlib.suppress(OSError):
+            if owns_claim and claim_path.exists():
+                claim_path.unlink()
+        raise PublicAPIError(
+            503,
+            "plugin_uninstall_cleanup_unavailable",
+            "plugin package could not be staged for safe uninstall",
+        ) from error
+
+
+def _restore_staged_plugin_package_uninstall(
+    state: _PluginPackageUninstallState,
+) -> None:
+    try:
+        if state.staged_artifact_root is not None and state.staged_artifact_root.exists():
+            if state.package_root.exists():
+                raise OSError("plugin package restore target already exists")
+            state.package_root.parent.mkdir(parents=True, exist_ok=True)
+            state.staged_artifact_root.replace(state.package_root)
+        if state.pending_root.exists():
+            shutil.rmtree(state.pending_root)
+    except OSError as error:
+        raise PublicAPIError(
+            503,
+            "plugin_uninstall_cleanup_pending",
+            "plugin uninstall cleanup is pending and can be retried",
+            details={
+                "registration_removed": "false",
+                "runtime_capabilities_removed": "false",
+                "package_artifact_removed": "false",
+            },
+        ) from error
+
+
+def _remove_empty_plugin_package_parents(path: Path, *, stop: Path) -> None:
+    current = path
+    while current != stop:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def _finish_plugin_package_uninstall(
+    request: Request,
+    state: _PluginPackageUninstallState,
+) -> None:
+    try:
+        if state.package_root.exists():
+            raise OSError("active plugin package directory still exists")
+        if state.pending_root.exists():
+            shutil.rmtree(state.pending_root)
+        if state.pending_root.exists():
+            raise OSError("plugin uninstall cleanup directory still exists")
+    except OSError as error:
+        if state.pending_root.exists():
+            raise PublicAPIError(
+                503,
+                "plugin_uninstall_cleanup_pending",
+                "plugin uninstall cleanup is pending and can be retried",
+                details={
+                    "registration_removed": "true",
+                    "runtime_capabilities_removed": "true",
+                    "package_artifact_removed": str(
+                        state.package_artifact_removed
+                    ).lower(),
+                },
+            ) from error
+
+    store_root = _plugin_package_store_root(request)
+    _remove_empty_plugin_package_parents(state.package_root, stop=store_root)
+    _remove_empty_plugin_package_parents(state.pending_root.parent, stop=store_root)
+
+
+def _mark_plugin_uninstall_audit_confirmed(state: _PluginPackageUninstallState) -> None:
+    try:
+        state.audit_confirmed_path.touch(exist_ok=True)
+    except OSError as error:
+        raise PublicAPIError(
+            503,
+            "plugin_uninstall_cleanup_pending",
+            "plugin uninstall cleanup is pending and can be retried",
+            details={
+                "registration_removed": "true",
+                "runtime_capabilities_removed": "false",
+                "package_artifact_removed": str(state.package_artifact_removed).lower(),
+            },
+        ) from error
+
+
+async def _ensure_plugin_uninstall_audit(
+    service: AdminResourceService,
+    state: _PluginPackageUninstallState,
+    *,
+    plugin_id: str,
+    tenant_id: UUID,
+    actor_id: UUID,
+) -> None:
+    if state.audit_confirmed_path.exists():
+        return
+    if await _plugin_uninstall_audit_exists(
+        service,
+        plugin_id=plugin_id,
+        actor_id=actor_id,
+        not_before=state.created_at,
+    ):
+        _mark_plugin_uninstall_audit_confirmed(state)
+        return
+    await service.record_audit_event(
+        actor=str(actor_id),
+        action="plugin.uninstall",
+        resource=f"plugin:{plugin_id}",
+        details={
+            "id": plugin_id,
+            "operation_id": str(state.operation_id),
+            "plugin_snapshot_sha256": state.plugin_snapshot_sha256,
+            "recovered": "true",
+        },
+        tenant_id=tenant_id,
+    )
+    _mark_plugin_uninstall_audit_confirmed(state)
+
+
+async def _plugin_uninstall_audit_exists(
+    service: AdminResourceService,
+    *,
+    plugin_id: str,
+    actor_id: UUID,
+    not_before: datetime | None = None,
+) -> bool:
+    events = await service.list_audit_events(
+        "plugin.uninstall",
+        resource=f"plugin:{plugin_id}",
+    )
+    return any(
+        event.actor == str(actor_id)
+        and event.details.get("id") == plugin_id
+        and (not_before is None or event.created_at >= not_before)
+        for event in events
+    )
+
+
 def _plugin_archive_signature_files_from_zip(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
@@ -7728,7 +8267,7 @@ class InMemoryAdminResourceService:
     ) -> AuditEventResponse:
         del tenant_id
         event = AuditEventResponse(
-            id=f"audit_{uuid4().hex}",
+            id=_new_audit_event_id(),
             actor=actor,
             action=action,
             resource=resource,
@@ -9931,7 +10470,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 )
                 source_row.payload = _skill_source_storage_payload(succeeded)
                 event = AuditEventResponse(
-                    id=f"audit_{uuid4().hex}",
+                    id=_new_audit_event_id(),
                     actor=str(self._actor_id),
                     action=_audit_action,
                     resource=f"skill_source:{source_id}",
@@ -10113,7 +10652,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     )
                     source_row.payload = _skill_source_storage_payload(failed)
                 event = AuditEventResponse(
-                    id=f"audit_{uuid4().hex}",
+                    id=_new_audit_event_id(),
                     actor=str(self._actor_id),
                     action="skill_source.snapshot.import.failed",
                     resource=f"skill_source:{source_id}",
@@ -12301,7 +12840,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             statement = statement.where(
                 AdminResourceRow.payload["details"]["user_id"].astext == user_id
             )
-        statement = statement.order_by(AdminResourceRow.created_at.desc())
+        statement = statement.order_by(
+            AdminResourceRow.payload["created_at"].astext.cast(DateTime(timezone=True)).desc(),
+            AdminResourceRow.payload["id"].astext.desc(),
+        )
         if limit is not None:
             statement = statement.limit(limit)
         async with self._session_factory() as session:
@@ -12575,7 +13117,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         payload: dict[str, object] | None = None,
     ) -> None:
         event = AuditEventResponse(
-            id=f"audit_{uuid4().hex}",
+            id=_new_audit_event_id(),
             actor=str(self._actor_id),
             action=action,
             resource=resource,
@@ -12953,7 +13495,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return
         target_actor_id = self._actor_id if actor_id is None else actor_id
         event = AuditEventResponse(
-            id=f"audit_{uuid4().hex}",
+            id=_new_audit_event_id(),
             actor=str(target_actor_id),
             action=action,
             resource=resource,
@@ -12977,7 +13519,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         tenant_id: UUID | None = None,
     ) -> AuditEventResponse:
         event = AuditEventResponse(
-            id=f"audit_{uuid4().hex}",
+            id=_new_audit_event_id(),
             actor=actor,
             action=action,
             resource=resource,
@@ -13774,6 +14316,11 @@ def _safe_audit_details(details: Mapping[str, object] | None) -> dict[str, str]:
     return _safe_log_details({str(key): str(value) for key, value in details.items()})
 
 
+def _new_audit_event_id() -> str:
+    """Keep same-timestamp audit events in their real creation order."""
+    return f"audit_{time.monotonic_ns():020d}_{uuid4().hex}"
+
+
 def _audit_event_matches(
     event: AuditEventResponse,
     *,
@@ -13799,7 +14346,7 @@ def _filter_audit_events(
     user_id: str | None,
     limit: int | None,
 ) -> tuple[AuditEventResponse, ...]:
-    ordered = sorted(events, key=lambda event: event.created_at, reverse=True)
+    ordered = sorted(events, key=lambda event: (event.created_at, event.id), reverse=True)
     filtered = tuple(
         event
         for event in ordered
@@ -19289,32 +19836,163 @@ async def reload_plugin(
 
 @router.post(
     "/plugins/{plugin_id}/uninstall",
-    response_model=OperationStatusResponse,
-    responses=error_responses(401, 403, 404, 422),
+    response_model=PluginUninstallResponse,
+    responses=error_responses(401, 403, 404, 422, 503),
 )
 async def uninstall_plugin(
     plugin_id: str,
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> OperationStatusResponse:
+) -> PluginUninstallResponse:
     _require(principal, "plugin:write")
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    state: _PluginPackageUninstallState | None = None
+    current: PluginResourceResponse | None = None
     try:
         current = await _current_plugin_for_activation_check(
             service,
             plugin_id,
             tenant_id=principal.tenant_id,
         )
-        await service.uninstall_plugin(
-            plugin_id,
-            tenant_id=principal.tenant_id,
-            actor_id=principal.user_id,
-        )
     except KeyError:
-        raise PublicAPIError(404, "not_found", "not found") from None
-    _cleanup_plugin_package_artifact(request, current, tenant_id=principal.tenant_id)
-    await _reload_plugin_runtime_config(request, principal.tenant_id)
-    return OperationStatusResponse(status="uninstalled")
+        state = _pending_plugin_package_uninstall_state(
+            request,
+            tenant_id=principal.tenant_id,
+            plugin_id=plugin_id,
+        )
+        if state is None:
+            if await _plugin_uninstall_audit_exists(
+                service,
+                plugin_id=plugin_id,
+                actor_id=principal.user_id,
+            ):
+                return PluginUninstallResponse(
+                    status="uninstalled",
+                    cleanup=PluginUninstallCleanupResponse(
+                        registration_removed=True,
+                        runtime_capabilities_removed=True,
+                        package_artifact_removed=True,
+                        retry_completed=True,
+                    ),
+                )
+            raise PublicAPIError(404, "not_found", "not found") from None
+
+    if current is not None:
+        state = _stage_plugin_package_uninstall(
+            request,
+            current,
+            tenant_id=principal.tenant_id,
+        )
+        try:
+            await service.uninstall_plugin(
+                plugin_id,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.user_id,
+            )
+            await _ensure_plugin_uninstall_audit(
+                service,
+                state,
+                plugin_id=plugin_id,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.user_id,
+            )
+        except Exception as error:
+            registration_still_exists: bool | None
+            try:
+                await _current_plugin_for_activation_check(
+                    service,
+                    plugin_id,
+                    tenant_id=principal.tenant_id,
+                )
+            except KeyError:
+                registration_still_exists = False
+            except Exception as probe_error:  # noqa: BLE001 - preserve retryable state.
+                registration_still_exists = None
+                _LOGGER.warning(
+                    "plugin uninstall registration state unknown tenant_id=%s plugin_id=%s error_type=%s",
+                    principal.tenant_id,
+                    plugin_id,
+                    type(probe_error).__name__,
+                )
+            else:
+                registration_still_exists = True
+
+            if registration_still_exists is True:
+                _restore_staged_plugin_package_uninstall(state)
+                raise
+            raise PublicAPIError(
+                503,
+                "plugin_uninstall_cleanup_pending",
+                "plugin uninstall cleanup is pending and can be retried",
+                details={
+                    "registration_removed": (
+                        "true" if registration_still_exists is False else "unknown"
+                    ),
+                    "runtime_capabilities_removed": "false",
+                    "package_artifact_removed": str(
+                        state.package_artifact_removed
+                    ).lower(),
+                },
+            ) from error
+
+    if current is None:
+        assert state is not None
+        try:
+            await _ensure_plugin_uninstall_audit(
+                service,
+                state,
+                plugin_id=plugin_id,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.user_id,
+            )
+        except Exception as error:
+            raise PublicAPIError(
+                503,
+                "plugin_uninstall_cleanup_pending",
+                "plugin uninstall cleanup is pending and can be retried",
+                details={
+                    "registration_removed": "true",
+                    "runtime_capabilities_removed": "false",
+                    "package_artifact_removed": str(
+                        state.package_artifact_removed
+                    ).lower(),
+                },
+            ) from error
+
+    assert state is not None
+    try:
+        await _reload_plugin_runtime_config_strict(request, principal.tenant_id)
+    except Exception as error:
+        _LOGGER.warning(
+            "plugin uninstall runtime cleanup pending tenant_id=%s plugin_id=%s error_type=%s",
+            principal.tenant_id,
+            plugin_id,
+            type(error).__name__,
+        )
+        raise PublicAPIError(
+            503,
+            "plugin_uninstall_cleanup_pending",
+            "plugin uninstall cleanup is pending and can be retried",
+            details={
+                "registration_removed": "true",
+                "runtime_capabilities_removed": "false",
+                "package_artifact_removed": str(
+                    state.package_artifact_removed
+                ).lower(),
+            },
+        ) from error
+
+    _finish_plugin_package_uninstall(request, state)
+    return PluginUninstallResponse(
+        status="uninstalled",
+        cleanup=PluginUninstallCleanupResponse(
+            registration_removed=True,
+            runtime_capabilities_removed=True,
+            package_artifact_removed=True,
+            retry_completed=state.retry,
+        ),
+    )
 
 
 @router.delete(
@@ -19328,22 +20006,7 @@ async def delete_plugin(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OperationStatusResponse:
-    _require(principal, "plugin:write")
-    try:
-        current = await _current_plugin_for_activation_check(
-            service,
-            plugin_id,
-            tenant_id=principal.tenant_id,
-        )
-        await service.delete_plugin(
-            plugin_id,
-            tenant_id=principal.tenant_id,
-            actor_id=principal.user_id,
-        )
-    except KeyError:
-        raise PublicAPIError(404, "not_found", "not found") from None
-    _cleanup_plugin_package_artifact(request, current, tenant_id=principal.tenant_id)
-    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    await uninstall_plugin(plugin_id, request, principal, service)
     return OperationStatusResponse(status="deleted")
 
 
@@ -19456,6 +20119,28 @@ async def _reload_plugin_runtime_config(request: Request, tenant_id: UUID) -> No
             tenant_id,
             type(error).__name__,
         )
+
+
+async def _reload_plugin_runtime_config_strict(request: Request, tenant_id: UUID) -> None:
+    callback = getattr(request.app.state, "reload_plugin_runtime_config_strict", None)
+    if callable(callback):
+        result = callback(tenant_id)
+        if inspect.isawaitable(result):
+            await result
+        return
+    runtime_service = getattr(request.app.state, "plugin_service", None)
+    strict_reload = getattr(runtime_service, "reload_strict", None)
+    if callable(strict_reload):
+        result = strict_reload(tenant_id)
+        if inspect.isawaitable(result):
+            await result
+        return
+    callback = getattr(request.app.state, "reload_plugin_runtime_config", None)
+    if not callable(callback):
+        return
+    result = callback(tenant_id)
+    if inspect.isawaitable(result):
+        await result
 
 
 def _channels_with_runtime_status(

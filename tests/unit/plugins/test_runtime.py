@@ -3634,6 +3634,109 @@ async def test_runtime_plugin_reload_failure_does_not_block_later_retry() -> Non
     assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
 
 
+async def test_runtime_plugin_reload_propagates_load_failure_to_strict_callers() -> None:
+    admin_service = FailingOnceTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    with pytest.raises(RuntimeError, match="temporary plugin reload failure"):
+        await service.reload_strict(OTHER_TENANT_ID)
+
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is False
+
+
+async def test_runtime_plugin_strict_reload_failure_clears_loaded_tenant_plugins() -> None:
+    admin_service = FailingOnceTenantMappedPluginAdminService(
+        {
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    admin_service.failures_remaining = 0
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+    await service.reload(OTHER_TENANT_ID)
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
+
+    admin_service.failures_remaining = 1
+    with pytest.raises(RuntimeError, match="temporary plugin reload failure"):
+        await service.reload_strict(OTHER_TENANT_ID)
+
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is False
+    assert service.manifests_for_tenant(OTHER_TENANT_ID) == {
+        "schema_version": 1,
+        "capabilities": (),
+    }
+
+
+async def test_runtime_plugin_strict_reload_starts_new_generation_and_discards_older_result() -> None:
+    class DelayedSnapshotAdminService(TenantMappedPluginAdminService):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    OTHER_TENANT_ID: (
+                        plugin(
+                            "tenant-calendar",
+                            capability_id="tenant_calendar.create_event",
+                        ),
+                    )
+                }
+            )
+            self.stale_reload_entered = asyncio.Event()
+            self.release_stale_reload = asyncio.Event()
+            self.calls = 0
+
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            assert tenant_id is not None
+            self.calls += 1
+            snapshot = self.plugins_by_tenant.get(tenant_id, ())
+            if self.calls == 2:
+                self.stale_reload_entered.set()
+                await self.release_stale_reload.wait()
+            return snapshot
+
+    admin_service = DelayedSnapshotAdminService()
+    service = RuntimePluginService(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+    await service.reload(OTHER_TENANT_ID)
+    stale_reload = asyncio.create_task(service.reload(OTHER_TENANT_ID))
+    await admin_service.stale_reload_entered.wait()
+    admin_service.plugins_by_tenant[OTHER_TENANT_ID] = ()
+
+    strict_reload = asyncio.create_task(service.reload_strict(OTHER_TENANT_ID))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    strict_started_new_generation = admin_service.calls == 3
+    admin_service.release_stale_reload.set()
+    await asyncio.gather(stale_reload, strict_reload)
+
+    assert strict_started_new_generation is True
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is False
+
+
 async def test_runtime_plugin_reload_failure_preserves_loaded_tenant_plugins() -> None:
     admin_service = FailingOnceTenantMappedPluginAdminService(
         {

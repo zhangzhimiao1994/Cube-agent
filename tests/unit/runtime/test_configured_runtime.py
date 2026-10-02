@@ -5488,25 +5488,38 @@ async def _immediate_capacity(
 
 async def _assert_cancel_run_targets_only_matching_active_child(
     *,
-    active: dict[UUID, ExecutionRuntime],
+    active: dict[tuple[UUID, UUID], ExecutionRuntime],
     cancel_run: Callable[[UUID], Awaitable[None]],
+    cancel_owned: Callable[[UUID, UUID], Awaitable[None]],
     cancel_all: Callable[[], Awaitable[None]],
 ) -> None:
     selected_run_id, unrelated_run_id = uuid4(), uuid4()
+    selected_token, replacement_token, unrelated_token = uuid4(), uuid4(), uuid4()
     selected = CancellableProbeRuntime()
+    replacement = CancellableProbeRuntime()
     unrelated = CancellableProbeRuntime()
-    active[selected_run_id] = selected
-    active[unrelated_run_id] = unrelated
+    active[(selected_run_id, selected_token)] = selected
+    active[(selected_run_id, replacement_token)] = replacement
+    active[(unrelated_run_id, unrelated_token)] = unrelated
+
+    await cancel_owned(selected_run_id, selected_token)
+    await cancel_owned(selected_run_id, uuid4())
+
+    assert selected.cancel_count == 1
+    assert replacement.cancel_count == 0
+    assert unrelated.cancel_count == 0
 
     await cancel_run(selected_run_id)
     await cancel_run(uuid4())
 
-    assert selected.cancel_count == 1
+    assert selected.cancel_count == 2
+    assert replacement.cancel_count == 1
     assert unrelated.cancel_count == 0
 
     await cancel_all()
 
-    assert selected.cancel_count == 2
+    assert selected.cancel_count == 3
+    assert replacement.cancel_count == 2
     assert unrelated.cancel_count == 1
 
 
@@ -5522,6 +5535,7 @@ async def test_config_backed_direct_runtime_cancel_run_cancels_only_matching_chi
     await _assert_cancel_run_targets_only_matching_active_child(
         active=runtime._active,
         cancel_run=runtime.cancel_run,
+        cancel_owned=runtime.cancel_run_owned,
         cancel_all=runtime.cancel,
     )
 
@@ -5538,6 +5552,7 @@ async def test_config_backed_dispatch_runtime_cancel_run_cancels_only_matching_c
     await _assert_cancel_run_targets_only_matching_active_child(
         active=runtime._active,
         cancel_run=runtime.cancel_run,
+        cancel_owned=runtime.cancel_run_owned,
         cancel_all=runtime.cancel,
     )
 
@@ -5554,6 +5569,7 @@ async def test_config_backed_discussion_runtime_cancel_run_cancels_only_matching
     await _assert_cancel_run_targets_only_matching_active_child(
         active=runtime._active,
         cancel_run=runtime.cancel_run,
+        cancel_owned=runtime.cancel_run_owned,
         cancel_all=runtime.cancel,
     )
 
@@ -5570,6 +5586,7 @@ async def test_config_backed_hybrid_runtime_cancel_run_cancels_only_matching_chi
     await _assert_cancel_run_targets_only_matching_active_child(
         active=runtime._active,
         cancel_run=runtime.cancel_run,
+        cancel_owned=runtime.cancel_run_owned,
         cancel_all=runtime.cancel,
     )
 

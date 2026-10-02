@@ -784,7 +784,11 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    captured: dict[str, object] = {"mcp_reloads": [], "plugin_reloads": []}
+    captured: dict[str, object] = {
+        "mcp_reloads": [],
+        "plugin_reloads": [],
+        "plugin_strict_reloads": [],
+    }
 
     class VersionedConfigService:
         async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
@@ -826,6 +830,7 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
             self.redis_client = redis_client
             self.published: list[tuple[UUID, str, int | None]] = []
             self.listen_kwargs: dict[str, object] | None = None
+            self.fail_publish = False
             FakeInvalidationBus.instances.append(self)
 
         async def publish(
@@ -835,6 +840,8 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
             *,
             config_version: int | None = None,
         ) -> None:
+            if self.fail_publish:
+                raise RuntimeError("invalidation publish failed")
             self.published.append((tenant_id, str(target), config_version))
 
         async def listen(self, **kwargs: object) -> None:
@@ -851,6 +858,9 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     class FakePluginService:
         async def reload(self, tenant_id: UUID | None = None) -> None:
             cast(list[UUID | None], captured["plugin_reloads"]).append(tenant_id)
+
+        async def reload_strict(self, tenant_id: UUID | None = None) -> None:
+            cast(list[UUID | None], captured["plugin_strict_reloads"]).append(tenant_id)
 
         def capability_manifest_source(self) -> object:
             return object()
@@ -899,17 +909,32 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     with TestClient(application):
         asyncio.run(application.state.reload_mcp_runtime_config(OTHER_TENANT_ID))
         asyncio.run(application.state.reload_plugin_runtime_config(OTHER_TENANT_ID))
+        asyncio.run(application.state.reload_plugin_runtime_config_strict(OTHER_TENANT_ID))
+
+        bus = FakeInvalidationBus.instances[0]
+        assert bus.listen_kwargs is not None
+        listener_plugin_runtime = cast(Any, bus.listen_kwargs["plugin_runtime"])
+        asyncio.run(listener_plugin_runtime.reload(OTHER_TENANT_ID))
+        bus.fail_publish = True
+        with pytest.raises(RuntimeError, match="invalidation publish failed"):
+            asyncio.run(application.state.reload_plugin_runtime_config_strict(OTHER_TENANT_ID))
 
     bus = FakeInvalidationBus.instances[0]
     assert captured["mcp_reloads"] == [OTHER_TENANT_ID]
     assert captured["plugin_reloads"] == [OTHER_TENANT_ID]
+    assert captured["plugin_strict_reloads"] == [
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+    ]
     assert bus.published == [
         (OTHER_TENANT_ID, "mcp", 3),
+        (OTHER_TENANT_ID, "plugin", 3),
         (OTHER_TENANT_ID, "plugin", 3),
     ]
     assert bus.listen_kwargs is not None
     assert bus.listen_kwargs["mcp_runtime"] is application.state.mcp_service
-    assert bus.listen_kwargs["plugin_runtime"] is application.state.plugin_service
+    assert bus.listen_kwargs["plugin_runtime"] is not application.state.plugin_service
     assert str(bus.listen_kwargs["stream_consumer_group"]).startswith("api-")
     assert str(bus.listen_kwargs["stream_consumer_name"]).startswith("api-")
     assert bus.listen_kwargs["reload_on_empty_stream_replay"] is True
@@ -963,7 +988,7 @@ def test_runtime_config_invalidation_listener_restarts_after_listen_failure(
     first_kwargs, second_kwargs = bus.kwargs
     assert first_kwargs == second_kwargs
     assert first_kwargs["mcp_runtime"] is mcp_runtime
-    assert first_kwargs["plugin_runtime"] is plugin_runtime
+    assert first_kwargs["plugin_runtime"] is not plugin_runtime
     assert str(first_kwargs["stream_consumer_group"]).startswith("api-")
     assert str(first_kwargs["stream_consumer_name"]).startswith("api-")
     assert sleep_delays == [0.0]

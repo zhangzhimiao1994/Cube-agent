@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import RLock
 from typing import Literal, Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
 from agent_hub.config.schema import AgentDefinition, LogicalModelDefinition, PlatformConfig
@@ -793,10 +793,20 @@ def _renumber_event(event: RunEvent, offset: int, *, run_id: UUID) -> RunEvent:
 
 
 async def _cancel_active_run(
-    active: Mapping[UUID, ExecutionRuntime],
+    active: Mapping[tuple[UUID, UUID], ExecutionRuntime],
     run_id: UUID,
 ) -> None:
-    runtime = active.get(run_id)
+    for (active_run_id, _), runtime in tuple(active.items()):
+        if active_run_id == run_id:
+            await runtime.cancel()
+
+
+async def _cancel_owned_active_run(
+    active: Mapping[tuple[UUID, UUID], ExecutionRuntime],
+    run_id: UUID,
+    execution_token: UUID,
+) -> None:
+    runtime = active.get((run_id, execution_token))
     if runtime is not None:
         await runtime.cancel()
 
@@ -821,7 +831,7 @@ class ConfigBackedDirectRuntime:
         self._transport = transport or LiteLLMClient()
         self._capability_gateway = capability_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
-        self._active: dict[UUID, ExecutionRuntime] = {}
+        self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         try:
@@ -831,12 +841,14 @@ class ConfigBackedDirectRuntime:
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
-        self._active[context.run_id] = runtime
+        execution_token = context.execution_token or uuid4()
+        execution_key = (context.run_id, execution_token)
+        self._active[execution_key] = runtime
         try:
             async for event in runtime.run(context):
                 yield event
         finally:
-            self._active.pop(context.run_id, None)
+            self._active.pop(execution_key, None)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise RuntimeError("runtime checkpoint unavailable outside an active run")
@@ -851,6 +863,9 @@ class ConfigBackedDirectRuntime:
 
     async def cancel_run(self, run_id: UUID) -> None:
         await _cancel_active_run(self._active, run_id)
+
+    async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
+        await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         current = await self._config_service.get_current(context.tenant_id)
@@ -909,7 +924,7 @@ class ConfigBackedDispatchRuntime:
         self._harness_tool_gateway = harness_tool_gateway
         self._artifact_repository = artifact_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
-        self._active: dict[UUID, ExecutionRuntime] = {}
+        self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         try:
@@ -919,12 +934,14 @@ class ConfigBackedDispatchRuntime:
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
-        self._active[context.run_id] = runtime
+        execution_token = context.execution_token or uuid4()
+        execution_key = (context.run_id, execution_token)
+        self._active[execution_key] = runtime
         try:
             async for event in runtime.run(context):
                 yield event
         finally:
-            self._active.pop(context.run_id, None)
+            self._active.pop(execution_key, None)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise RuntimeError("runtime checkpoint unavailable outside an active run")
@@ -938,6 +955,9 @@ class ConfigBackedDispatchRuntime:
 
     async def cancel_run(self, run_id: UUID) -> None:
         await _cancel_active_run(self._active, run_id)
+
+    async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
+        await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
@@ -1095,7 +1115,7 @@ class ConfigBackedDiscussionRuntime:
         self._capability_gateway = capability_gateway
         self._harness_tool_gateway = harness_tool_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
-        self._active: dict[UUID, ExecutionRuntime] = {}
+        self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         try:
@@ -1105,12 +1125,14 @@ class ConfigBackedDiscussionRuntime:
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
-        self._active[context.run_id] = runtime
+        execution_token = context.execution_token or uuid4()
+        execution_key = (context.run_id, execution_token)
+        self._active[execution_key] = runtime
         try:
             async for event in runtime.run(context):
                 yield event
         finally:
-            self._active.pop(context.run_id, None)
+            self._active.pop(execution_key, None)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise RuntimeError("runtime checkpoint unavailable outside an active run")
@@ -1124,6 +1146,9 @@ class ConfigBackedDiscussionRuntime:
 
     async def cancel_run(self, run_id: UUID) -> None:
         await _cancel_active_run(self._active, run_id)
+
+    async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
+        await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
@@ -1254,7 +1279,7 @@ class ConfigBackedHybridRuntime:
         self._harness_tool_gateway = harness_tool_gateway
         self._artifact_repository = artifact_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
-        self._active: dict[UUID, ExecutionRuntime] = {}
+        self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         try:
@@ -1264,12 +1289,14 @@ class ConfigBackedHybridRuntime:
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
-        self._active[context.run_id] = runtime
+        execution_token = context.execution_token or uuid4()
+        execution_key = (context.run_id, execution_token)
+        self._active[execution_key] = runtime
         try:
             async for event in runtime.run(context):
                 yield event
         finally:
-            self._active.pop(context.run_id, None)
+            self._active.pop(execution_key, None)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise RuntimeError("runtime checkpoint unavailable outside an active run")
@@ -1283,6 +1310,9 @@ class ConfigBackedHybridRuntime:
 
     async def cancel_run(self, run_id: UUID) -> None:
         await _cancel_active_run(self._active, run_id)
+
+    async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
+        await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
