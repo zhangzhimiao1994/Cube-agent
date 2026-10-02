@@ -68,6 +68,7 @@ def build_docker_command(
         settings.executable,
         "run",
         "--rm",
+        "--interactive",
         "--name",
         f"agent-hub-skill-{invocation.execution_id}",
         "--user",

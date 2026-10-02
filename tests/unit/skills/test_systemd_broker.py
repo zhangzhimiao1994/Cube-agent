@@ -224,6 +224,8 @@ async def test_broker_routes_docker_run_through_fixed_hardened_command(
     assert response.result.stdout == "docker-ok\n"
     command = commands[0]
     assert command[:3] == ("/snap/bin/docker", "run", "--rm")
+    assert "--interactive" in command
+    assert "--tty" not in command and "-t" not in command
     assert command[command.index("--user") + 1] == f"{allowed_uid}:{allowed_gid}"
     assert command[command.index("--network") + 1] == "none"
     assert all("docker.sock" not in item for item in command)
