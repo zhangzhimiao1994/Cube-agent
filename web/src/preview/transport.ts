@@ -43,13 +43,18 @@ export function validatePreviewRequest(value: unknown): PreviewAppRequest {
   onlyKeys(data, ["method", "target", "headers", "body_base64"]);
   if (typeof data.method !== "string" || !METHODS.has(data.method)) throw new TypeError("Unsupported preview method");
   if (typeof data.target !== "string" || data.target.length > 4096 || !data.target.startsWith("/") || data.target.startsWith("//") || data.target.includes("#")) throw new TypeError("Invalid preview target");
-  let decoded = data.target;
-  for (let i = 0; i < 5; i++) {
-    if (CONTROL.test(decoded) || decoded.includes("\\") || decoded.startsWith("//") || decoded.split("?", 1)[0].split("/").some((part) => part === "." || part === "..")) throw new TypeError("Invalid preview target");
-    const next = decodeURIComponent(decoded);
-    if (next === decoded) break;
-    if (i === 4) throw new TypeError("Excessive preview encoding");
-    decoded = next;
+  if (/[^\u0021-\u007e]/.test(data.target) || data.target.includes("\\")) throw new TypeError("Invalid preview target");
+  const queryIndex = data.target.indexOf("?");
+  let path = queryIndex === -1 ? data.target : data.target.slice(0, queryIndex);
+  // Query values are data: only paths undergo recursive traversal checks.
+  if (queryIndex !== -1 && CONTROL.test(decodeURIComponent(data.target.slice(queryIndex + 1)))) throw new TypeError("Invalid preview target");
+  for (let i = 0; i < 4; i++) {
+    if (CONTROL.test(path) || path.split("/").some((part) => part === "." || part === "..")) throw new TypeError("Invalid preview target");
+    const decoded = decodeURIComponent(path);
+    if (decoded === path) break;
+    if (decoded.split("/").length !== path.split("/").length || decoded.includes("\\")) throw new TypeError("Invalid preview target");
+    if (i === 3) throw new TypeError("Excessive preview encoding");
+    path = decoded;
   }
   const body = base64(data.body_base64, 1024 * 1024);
   if ((data.method === "GET" || data.method === "HEAD") && body) throw new TypeError("Unexpected preview body");

@@ -9,6 +9,51 @@ describe("owned application transport", () => {
     expect(validatePreviewRequest(request)).toEqual(request);
     expect(validatePreviewRequest({ ...request, target: "/api/v1/runs" }).target).toBe("/api/v1/runs");
   });
+  it.each([
+    "/tasks?include_deleted=true",
+    "/tasks?q=100%25",
+    "/tasks?q=a%5Cb",
+    "/tasks?q=%2525&literal=%250A",
+    "/tasks?tag=one&tag=two&empty=&bare",
+    "/tasks?plus=a+b&space=a%20b&slash=a%2Fb",
+    "/tasks?q=..%2F..%2F&hash=%23&question=%3F",
+    "/tasks?q=%25252525252525",
+    "/tasks?",
+  ])("preserves the original GET query in %s", (target) => {
+    const payload = { method: "GET", target, headers: [], body_base64: "" };
+    expect(validatePreviewRequest(payload)).toEqual(payload);
+  });
+  it.each([
+    "/tasks%2Fprivate?q=allowed", "/tasks%2fprivate", "/tasks%252Fprivate",
+    "/%2Ftasks", "/%252Ftasks", "/tasks%5Cprivate", "/tasks%255cprivate",
+    "/./tasks", "/tasks/../private", "/%25252e%25252e/tasks",
+    "/prefix%3F/../tasks", "/prefix%3F/%252e%252e/tasks",
+    "/tasks%", "/tasks%2", "/tasks%GG", "/tasks%2525252541",
+    "/tasks?q=raw\\value", "/tasks?q=raw value", "/tasks?q=\u00e9",
+    "http://evil.test/tasks?q=one", "//evil.test/tasks?q=one",
+  ])("rejects unsafe paths or raw targets despite query support: %s", (target) => {
+    expect(() => validatePreviewRequest({ method: "GET", target, headers: [], body_base64: "" })).toThrow();
+  });
+  it.each(["%00", "%09", "%0a", "%0D", "%1F", "%7f", "\0", "\t", "\n", "\r", "\x1f", "\x7f"])("rejects control bytes in paths and queries: %j", (control) => {
+    for (const target of [`/tasks${control}`, `/tasks?q=${control}`]) {
+      expect(() => validatePreviewRequest({ method: "GET", target, headers: [], body_base64: "" })).toThrow();
+    }
+  });
+  it("keeps nested path controls forbidden while query values are decoded only once", () => {
+    expect(() => validatePreviewRequest({ ...request, target: "/tasks%250A?q=one" })).toThrow();
+  });
+  it("enforces the original target length boundary including the query", () => {
+    const target = "/tasks?q=" + "x".repeat(4087);
+    expect(validatePreviewRequest({ ...request, target }).target).toBe(target);
+    expect(() => validatePreviewRequest({ ...request, target: target + "x" })).toThrow();
+  });
+  it.each(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])("preserves query values for allowed method %s", (method) => {
+    const payload = { method, target: "/tasks?q=100%25", headers: [], body_base64: "" };
+    expect(validatePreviewRequest(payload)).toEqual(payload);
+  });
+  it.each(["GET", "HEAD"])("still rejects a body for %s", (method) => {
+    expect(() => validatePreviewRequest({ ...request, method, target: "/tasks?q=100%25" })).toThrow();
+  });
   it.each(["https://evil.test/tasks", "//evil.test/tasks", "/../tasks", "/%2e%2e/tasks", "/%252e%252e/tasks", "/tasks#fragment", "/x\\tasks", "/tasks\n"])("rejects target %s", (target) => {
     expect(() => validatePreviewRequest({ ...request, target })).toThrow();
   });

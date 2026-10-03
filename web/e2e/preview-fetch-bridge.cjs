@@ -12,6 +12,13 @@ const esbuild = require(require.resolve('esbuild', { paths: [path.dirname(requir
 const root = path.resolve(__dirname, '../..');
 const python = process.env.PREVIEW_TEST_PYTHON || path.join(root, process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python');
 const previewId = '12345678-1234-4234-9234-123456789abc';
+const queryTargets = [
+  '/tasks?q=100%25',
+  '/tasks?q=a%5Cb',
+  '/tasks?tag=one&tag=two&empty=&bare&plus=a+b&space=a%20b&slash=a%2Fb',
+  '/tasks?q=%2525&literal=%250A',
+  '/tasks?q=..%2F..%2F&hash=%23&question=%3F',
+];
 
 for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 }]) {
   test(`opaque fetch actual HTTP CRUD ${viewport.width}x${viewport.height}`, { timeout: 45000 }, async () => {
@@ -27,6 +34,7 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
         const envelope = JSON.parse(bytes.toString()); actualRequests.push(envelope);
         let status = 200; let result;
         if (envelope.target === '/tasks?q=one' && envelope.method === 'GET') result = task ? [task] : [];
+        else if (queryTargets.includes(envelope.target) && envelope.method === 'GET') result = { target: envelope.target };
         else if (envelope.target === '/tasks' && envelope.method === 'POST') { task = { id: 1, ...JSON.parse(Buffer.from(envelope.body_base64, 'base64')) }; status = 201; result = task; }
         else if (envelope.target === '/tasks/1' && envelope.method === 'PATCH') { task = { ...task, ...JSON.parse(Buffer.from(envelope.body_base64, 'base64')) }; result = task; }
         else if (envelope.target === '/tasks/1' && envelope.method === 'DELETE') { task = null; status = 204; result = null; }
@@ -79,10 +87,31 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       });
       assert.deepEqual(data, { items: [], conflict: 409, cookiesBlocked: true, externalRejected: true, token: 'undefined' });
       assert.deepEqual(actualRequests.map(r => r.method), ['GET', 'POST', 'PATCH', 'DELETE', 'GET', 'GET']);
+      const queryStart = actualRequests.length;
+      for (const inputKind of ['root', 'content-prefix', 'request']) {
+        const results = await child.evaluate(async ({ targets, previewId, inputKind }) => {
+          const results = [];
+          for (const target of targets) {
+            const input = inputKind === 'content-prefix' ? '/api/v1/web-previews/' + previewId + '/content' + target
+              : inputKind === 'request' ? new Request(location.origin + target) : target;
+            try {
+              const response = await fetch(input);
+              results.push({ status: response.status, body: await response.json() });
+            } catch (error) {
+              results.push({ error: error.message });
+            }
+          }
+          return results;
+        }, { targets: queryTargets, previewId, inputKind });
+        assert.deepEqual(results, queryTargets.map(target => ({ status: 200, body: { target } })), inputKind);
+      }
+      assert.deepEqual(actualRequests.slice(queryStart).map(({ method, target, body_base64 }) => ({ method, target, body_base64 })),
+        Array.from({ length: 3 }, () => queryTargets.map(target => ({ method: 'GET', target, body_base64: '' }))).flat());
       assert(actualRequests.every(r => !r.headers.some(([name]) => /authorization|cookie|origin|host/i.test(name))));
+      const requestCount = actualRequests.length;
       await page.evaluate(() => window.bridge.dispose());
       const revoked = await child.evaluate(async () => { const c=new AbortController();setTimeout(()=>c.abort(),100);try{await fetch('/tasks',{signal:c.signal});return false;}catch{return true;} });
-      assert.equal(revoked, true); assert.equal(actualRequests.length, 6);
+      assert.equal(revoked, true); assert.equal(actualRequests.length, requestCount);
     } finally {
       if (browser) await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     }

@@ -3521,6 +3521,11 @@ article:hover {
   border-bottom: 1px solid #d8dfe5;
 }
 
+.website-preview-page > header > strong {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .website-preview-page > .agent-workbench-web-preview {
   flex: 1;
   width: 100%;
@@ -3531,6 +3536,9 @@ article:hover {
 }
 
 .website-preview-page .secondary-action {
+  flex: 0 0 auto;
+  width: auto;
+  white-space: nowrap;
   color: #17212b;
   background: #f5f7f9;
   border: 1px solid #cdd6de;

@@ -73,8 +73,8 @@ jobs:
       - name: Install browser for opaque preview contract
         run: npx playwright install --with-deps chromium
         working-directory: web
-      - name: Verify opaque preview HTTP interaction on desktop and mobile
-        run: node --test e2e/preview-fetch-bridge.cjs
+      - name: Verify preview HTTP interaction and responsive layout
+        run: node --test e2e/preview-fetch-bridge.cjs e2e/website-preview-layout.cjs
         working-directory: web
       - name: Install shell test tools
         shell: bash
