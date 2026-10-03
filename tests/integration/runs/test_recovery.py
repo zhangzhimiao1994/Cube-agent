@@ -1335,8 +1335,9 @@ async def test_completed_run_records_bounded_hermes_outcome(
     outcomes: list[HermesRunOutcome] = []
     advisor = RecordingHermesAdvisor(outcomes=outcomes)
     runtime = FakeRuntime()
+    repository = RunRepository(run_session_factory)
     service = RunService(
-        RunRepository(run_session_factory),
+        repository,
         runtime_registry=RuntimeRegistry((runtime,)),
         router=None,
         task_queue=RecordingQueue([]),
@@ -1358,8 +1359,16 @@ async def test_completed_run_records_bounded_hermes_outcome(
         producer="researcher",
         content={"text": "research complete"},
     )
+    expected_public_artifact = {
+        **expected_artifact.to_payload(),
+        "public_content_sha256": expected_artifact.content_sha256,
+        "content_redacted": False,
+    }
 
     assert completed.status is RunStatus.COMPLETED
+    assert await repository.raw_artifacts(tenant_id, submitted.id) == (
+        expected_artifact.to_payload(),
+    )
     assert outcomes == [
         HermesRunOutcome(
             tenant_id=tenant_id,
@@ -1370,9 +1379,10 @@ async def test_completed_run_records_bounded_hermes_outcome(
             workflow_id="short-video-dispatch",
             conversation_id=submitted.conversation_id,
             agent_ids=("director", "copywriter"),
-            artifacts=(expected_artifact.to_payload(),),
+            artifacts=(expected_public_artifact,),
         )
     ]
+    assert outcomes[0].artifacts[0]["content_redacted"] is False
 
 
 async def test_continued_conversation_records_visible_hermes_ledger_after_clear(

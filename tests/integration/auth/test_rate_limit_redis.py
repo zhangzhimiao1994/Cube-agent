@@ -146,11 +146,16 @@ async def _database_ready() -> None:
     return None
 
 
+class EmptyConfigService:
+    async def get_current(self, tenant_id: UUID) -> None:
+        del tenant_id
+
+
 @pytest.mark.integration
 async def test_real_redis_readiness_success_and_failure(redis_client: Redis) -> None:
     healthy = create_app(
         auth_service=object(),
-        config_service=object(),
+        config_service=EmptyConfigService(),
         rate_limiter=object(),
         redis_client=redis_client,
         database_probe=_database_ready,
@@ -165,7 +170,7 @@ async def test_real_redis_readiness_success_and_failure(redis_client: Redis) -> 
     try:
         unhealthy = create_app(
             auth_service=object(),
-            config_service=object(),
+            config_service=EmptyConfigService(),
             rate_limiter=object(),
             redis_client=unavailable_redis,
             database_probe=_database_ready,
