@@ -680,7 +680,12 @@ class CapacityPool:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise CapacityWaitTimeout("model capacity queue timeout")
-                await asyncio.sleep(min(self._poll_interval, remaining))
+                if remaining <= self._poll_interval:
+                    # Timer callbacks can wake slightly early; the final poll
+                    # must not start another RPC with a near-zero budget.
+                    await asyncio.sleep(remaining)
+                    raise CapacityWaitTimeout("model capacity queue timeout")
+                await asyncio.sleep(self._poll_interval)
         finally:
             async with self._waiter_lock:
                 self._waiters -= 1
@@ -1121,7 +1126,10 @@ class _CapacityScopeView:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise CapacityWaitTimeout("model capacity queue timeout")
-                await asyncio.sleep(min(root._poll_interval, remaining))
+                if remaining <= root._poll_interval:
+                    await asyncio.sleep(remaining)
+                    raise CapacityWaitTimeout("model capacity queue timeout")
+                await asyncio.sleep(root._poll_interval)
         finally:
             async with root._waiter_lock:
                 root._waiters -= 1

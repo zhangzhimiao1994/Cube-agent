@@ -101,6 +101,42 @@ async def test_acknowledged_congestion_stops_scanning_at_shared_window(
     assert root._waiters == 0
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("reason", [1, 2])
+async def test_terminal_poll_does_not_restart_admission_when_timer_wakes_early(
+    monkeypatch: pytest.MonkeyPatch, scoped: bool, reason: int,
+) -> None:
+    redis = DeadlineRedis()
+    selected = deployment("selected")
+    root = pool(redis, [selected])
+    capacity = root.scoped([selected]) if scoped else root
+    await capacity.initialize()
+    redis.busy_keys = {root._keys(selected.quota_scope_id)["leases"]}
+    redis.busy_reason = reason
+    loop = asyncio.get_running_loop()
+    real_sleep = asyncio.sleep
+    now = loop.time()
+    sleeps: list[float] = []
+
+    async def early_sleep(delay: float) -> None:
+        nonlocal now
+        if delay > 0:
+            sleeps.append(delay)
+            # An event-loop timer may run just before its nominal deadline.
+            now += delay + (-0.000001 if len(sleeps) == 1 else 0.000001)
+        await real_sleep(0)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(loop, "time", lambda: now)
+        patch.setattr(asyncio, "sleep", early_sleep)
+        with pytest.raises(CapacityWaitTimeout):
+            await capacity.acquire([selected], wait_timeout=0.004, estimated_tokens=11)
+
+    assert len(redis.attempted_keys) == 1, "terminal polling must not issue a near-zero-budget RPC"
+    assert len(sleeps) == 1
+    assert not redis.leases and root._waiters == 0
+
+
 class RegistrationDeadlineRedis(DeadlineRedis):
     """Delay a metadata commit and retain owner-specific rollback side effects."""
 
