@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,25 @@ import pytest
 def broker() -> Any:
     assert importlib.util.find_spec("agent_hub.previews.dynamic_broker"), "Task1 broker missing"
     return importlib.import_module("agent_hub.previews.dynamic_broker")
+
+
+def linux_metadata(monkeypatch: pytest.MonkeyPatch, metadata: dict[Path, tuple[int, int]]) -> None:
+    """Model only listed inode ownership/modes; keep real guards and file I/O."""
+    from types import SimpleNamespace
+    original_lstat = Path.lstat
+
+    def lstat(path: Path) -> os.stat_result:
+        actual = original_lstat(path)
+        if path not in metadata:
+            return actual
+        uid, mode = metadata[path]
+        values = list(actual)
+        values[0], values[4] = mode, uid
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(broker(), "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(broker(), "_PLATFORM", "linux")
 
 
 def prepared(tmp_path: Path) -> tuple[Path, Any]:
@@ -232,6 +252,7 @@ def test_restart_reclaims_only_fixed_owned_units(
     service = mod.PreviewBroker(replace(policy, runtime_root=runtime_root))
     stopped: list[str] = []
     monkeypatch.setattr(service, "_stop_unit", stopped.append)
+    linux_metadata(monkeypatch, {owned: (0, stat.S_IFDIR | 0o755)})
     service.recover()
     assert set(stopped) == {f"agent-hub-preview-{handle}-{stage}.service"
                             for stage in ("install", "build", "start", "probe")}
@@ -297,17 +318,71 @@ def test_prepared_runtime_source_has_no_writable_mount_alias(tmp_path: Path) -> 
                for part in command)
 
 
-def test_broker_root_disk_is_private_before_reserving(tmp_path: Path) -> None:
+def test_broker_root_disk_is_private_before_reserving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
     mod = broker()
     _, policy = prepared(tmp_path)
     runtime_root = tmp_path / "broker-owned"
     runtime_root.mkdir()
     service = mod.PreviewBroker(replace(policy, runtime_root=runtime_root))
+    metadata = dict.fromkeys(runtime_root.parents, (0, stat.S_IFDIR | 0o755))
+    metadata[runtime_root] = (0, stat.S_IFDIR | 0o755)
+    linux_metadata(monkeypatch, metadata)
     service._initialize_runtime_root()
     if os.name != "nt":
         assert runtime_root.stat().st_mode & 0o777 == 0o700
     assert service.policy.runtime_root == runtime_root
+
+
+@pytest.mark.parametrize("ancestor,uid,mode", [
+    (False, 1001, stat.S_IFDIR | 0o700),
+    (True, 1001, stat.S_IFDIR | 0o755),
+    (True, 0, stat.S_IFDIR | 0o775),
+    (True, 0, stat.S_IFDIR | 0o757),
+    (True, 0, stat.S_IFLNK | 0o755),
+])
+def test_runtime_initialization_rejects_nonroot_or_unsafe_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ancestor: bool, uid: int, mode: int,
+) -> None:
+    from dataclasses import replace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    root = tmp_path / "broker-owned"
+    root.mkdir()
+    metadata = dict.fromkeys(root.parents, (0, stat.S_IFDIR | 0o755))
+    metadata[root] = (0, stat.S_IFDIR | 0o700)
+    metadata[root.parent if ancestor else root] = (uid, mode)
+    linux_metadata(monkeypatch, metadata)
+    service = mod.PreviewBroker(replace(policy, runtime_root=root))
+    with pytest.raises(ValueError, match="immutable root-owned"):
+        service._initialize_runtime_root()
+    assert not (root / ".recovery-key").exists()
+
+
+@pytest.mark.parametrize("uid,mode,error", [
+    (1001, stat.S_IFDIR | 0o755, "unrecognized preview recovery state"),
+    (0, stat.S_IFDIR | 0o777, "unsafe preview recovery directory"),
+])
+def test_recovery_rejects_untrusted_directory_before_stopping_units(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uid: int, mode: int, error: str,
+) -> None:
+    from dataclasses import replace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    root = tmp_path / "broker-owned"
+    owned = root / ("a" * 32)
+    owned.mkdir(parents=True)
+    linux_metadata(monkeypatch, {owned: (uid, mode)})
+    service = mod.PreviewBroker(replace(policy, runtime_root=root))
+    stopped: list[str] = []
+    monkeypatch.setattr(service, "_stop_unit", stopped.append)
+    with pytest.raises(RuntimeError, match=error):
+        service.recover()
+    assert stopped == []
+    assert owned.exists()
+    assert not service._sessions
 
 
 def test_manager_two_hour_lifetime_is_supported(tmp_path: Path) -> None:
@@ -528,11 +603,17 @@ def test_disconnect_recovery_requires_signed_stop_only_proof(
         service.handle(request, peer_uid=policy.allowed_uid, owner=object())
 
 
-def test_recovery_key_survives_restart_without_unbounded_tombstones(tmp_path: Path) -> None:
+def test_recovery_key_survives_restart_without_unbounded_tombstones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
     mod = broker()
     _, policy = prepared(tmp_path)
     policy = replace(policy, runtime_root=tmp_path / "broker-owned")
+    metadata = dict.fromkeys(policy.runtime_root.parents, (0, stat.S_IFDIR | 0o755))
+    metadata[policy.runtime_root] = (0, stat.S_IFDIR | 0o700)
+    metadata[policy.runtime_root / ".recovery-key"] = (0, stat.S_IFREG | 0o600)
+    linux_metadata(monkeypatch, metadata)
     first = mod.PreviewBroker(policy)
     first._initialize_runtime_root()
     token = first._recovery_token("a" * 32)
