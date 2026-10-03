@@ -99,7 +99,7 @@ run_npm_with_mirror_fallback() {
 
 native_node_version_ok() {
   local version major minor
-  version="$(node -v 2>/dev/null || true)"
+  version="$("${1:-node}" -v 2>/dev/null || true)"
   version="${version#v}"
   major="${version%%.*}"
   minor="${version#*.}"
@@ -126,11 +126,44 @@ native_node_env() {
   env PATH="$node_home/bin:$PATH" "$@"
 }
 
+native_node_home() {
+  local configured resolved protected
+  configured="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
+  [[ "$configured" == /* && ! -L "$configured" ]] \
+    || die "dedicated Node home must be an absolute directory, not a symlink"
+  resolved="$(realpath -m -- "$configured")" || return 1
+  case "$resolved" in
+    /|/usr|/usr/local|/usr/bin|/usr/sbin|/usr/lib|/usr/lib64|/usr/local/bin|/usr/local/sbin|/usr/local/lib|/usr/local/lib64|/bin|/sbin|/lib|/lib64|/opt|/var|/var/lib|/srv|/home|/root|/tmp|/run)
+      die "refusing shared system directory as dedicated Node home"
+      ;;
+  esac
+  for protected in "$INSTALL_ROOT" "${STATE_DIR:-/var/lib/agent-hub}" "${CONFIG_DIR:-/etc/agent-hub}"; do
+    protected="$(realpath -m -- "$protected")" || return 1
+    case "$protected/" in
+      "$resolved/"*) die "dedicated Node home must not contain installation, state or config roots" ;;
+    esac
+  done
+  printf '%s\n' "$resolved"
+}
+
+normalize_native_node_ownership() {
+  local node_home hardlinks
+  node_home="$(native_node_home)" || return 1
+  [[ -d "$node_home" ]] || die "dedicated Node home is not a directory"
+  # Do not follow npm's symlinks, including links outside the dedicated tree.
+  hardlinks="$(find -P "$node_home" -xdev -type f -links +1 -print -quit)" \
+    || die "cannot inspect dedicated Node home"
+  [[ -z "$hardlinks" ]] \
+    || die "dedicated Node home contains hardlinked files"
+  chown -hR -P root:root -- "$node_home" \
+    || die "cannot normalize dedicated Node ownership"
+}
+
 download_native_node() {
   local version arch node_home archive tmp_dir url mirror_url
   version="${AGENT_HUB_NODE_VERSION:-22.12.0}"
   arch="$(native_node_arch)"
-  node_home="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
+  node_home="$(native_node_home)" || return 1
   tmp_dir="$(mktemp -d)"
   archive="$tmp_dir/node.tar.xz"
   url="https://nodejs.org/dist/v${version}/node-v${version}-linux-${arch}.tar.xz"
@@ -146,27 +179,35 @@ download_native_node() {
   fi
 
   rm -rf "${node_home:?}/"*
-  tar -xJf "$archive" -C "$node_home" --strip-components=1
+  tar -xJf "$archive" -C "$node_home" --strip-components=1 --no-same-owner
   rm -rf "$tmp_dir"
+  normalize_native_node_ownership
   chmod -R a+rX "$node_home"
+}
+
+native_node_runtime_ok() {
+  local node_home="$1"
+  [[ -x "$node_home/bin/node" && -x "$node_home/bin/npm" \
+    && -f "$node_home/lib/node_modules/npm/bin/npm-cli.js" ]] || return 1
+  native_node_version_ok "$node_home/bin/node" \
+    && "$node_home/bin/node" "$node_home/lib/node_modules/npm/bin/npm-cli.js" --version >/dev/null
 }
 
 ensure_native_nodejs() {
   local node_home
-  node_home="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && native_node_version_ok; then
+  node_home="$(native_node_home)" || return 1
+  if [[ -d "$node_home" ]]; then
+    normalize_native_node_ownership || return 1
+  fi
+  if native_node_runtime_ok "$node_home"; then
+    export PATH="$node_home/bin:$PATH"
     return 0
   fi
-  if [[ -x "$node_home/bin/node" && -x "$node_home/bin/npm" ]] && native_node_env bash -lc 'node -v >/dev/null && npm -v >/dev/null'; then
-    export PATH="$node_home/bin:$PATH"
-    if native_node_version_ok; then
-      return 0
-    fi
-  fi
-  warn "Node.js 20.19+ is required for the Web UI build; installing bundled Node.js"
-  download_native_node
+  warn "dedicated Node.js 20.19+ is required for previews and the Web UI; installing bundled Node.js"
+  download_native_node || return 1
+  native_node_runtime_ok "$node_home" \
+    || die "dedicated Node.js runtime is missing or does not satisfy version requirements"
   export PATH="$node_home/bin:$PATH"
-  native_node_version_ok || die "bundled Node.js still does not satisfy version requirement"
 }
 
 run_uv_python_install_with_mirror_fallback() {
@@ -441,11 +482,12 @@ remove_legacy_native_skill_unit() {
 }
 
 write_native_preview_broker_config() {
-  local allowed_uid temporary workspace_root
+  local allowed_uid temporary workspace_root node_home
   allowed_uid="$(id -u agent-hub)" \
     || die "cannot resolve agent-hub UID for preview broker"
   [[ "$allowed_uid" =~ ^[1-9][0-9]*$ ]] \
     || die "preview broker requires a non-root agent-hub UID"
+  node_home="$(native_node_home)" || return 1
   workspace_root="${AGENT_HUB_PROJECT_WORKSPACE_DIR-$STATE_DIR/workspaces}"
   # Match the API EnvironmentFile override without evaluating or loading secrets.
   if [[ -f "${SECRETS_FILE:-}" ]] \
@@ -456,7 +498,7 @@ write_native_preview_broker_config() {
   temporary="$(mktemp "$CONFIG_DIR/.preview-broker.json.XXXXXX")" || return 1
   if ! env -i PATH=/usr/bin:/bin "$INSTALL_ROOT/current/.venv/bin/python" - \
     "$allowed_uid" "$workspace_root" \
-    "$INSTALL_ROOT/current/src/agent_hub" "$INSTALL_ROOT/node" > "$temporary" <<'PY'
+    "$INSTALL_ROOT/current/src/agent_hub" "$node_home" > "$temporary" <<'PY'
 import json
 import shlex
 import sys

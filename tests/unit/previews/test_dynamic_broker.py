@@ -338,6 +338,65 @@ def test_application_units_die_with_broker_and_own_private_disk(tmp_path: Path) 
     assert any("/bin:/bin" in part for part in command if part.startswith("BindReadOnlyPaths="))
 
 
+@pytest.mark.parametrize("action", ["probe", "start"])
+def test_fixed_trusted_copies_are_readable_before_any_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    from dataclasses import replace
+    mod = broker()
+    source, policy = prepared(tmp_path)
+    release = tmp_path / "release"
+    fixed = ("previews/dynamic_runner.py", "harness/project_validation_sandbox.py")
+    for name in fixed:
+        path = release / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"trusted fixture, not generated code")
+        path.chmod(0o640)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    service = mod.PreviewBroker(replace(policy, runtime_root=runtime, trusted_source_root=release))
+    validated: list[Path] = []
+    modes: dict[Path, int] = {}
+    chmod = Path.chmod
+
+    def record_chmod(path: Path, mode: int) -> None:
+        modes[path] = mode
+        chmod(path, mode)
+
+    def storage(session: Any) -> None:
+        trusted = session.owned / "trusted"
+        assert modes[trusted] == 0o755
+        assert modes[trusted / "harness"] == 0o755
+        for origin, target in zip(fixed, ("dynamic_runner.py", "harness/project_validation_sandbox.py"), strict=True):
+            assert (trusted / target).read_bytes() == (release / origin).read_bytes()
+            assert modes[trusted / target] == 0o444
+        assert validated == [release / name for name in fixed]
+        raise RuntimeError("fixture stops before OS execution")
+
+    monkeypatch.setattr(mod, "_PLATFORM", "linux")
+    monkeypatch.setattr(mod, "_require_root_path", validated.append)
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+    monkeypatch.setattr(service, "_prepare_storage", storage)
+    monkeypatch.setattr(service, "_stop", lambda session: None)
+    payload: dict[str, object] = {"version": 1, "action": action}
+    if action == "start":
+        payload.update(source_root=str(source), preview_id="fixture", lifetime_seconds=30)
+    with pytest.raises(RuntimeError, match="fixture stops before OS execution"):
+        service.handle(payload, peer_uid=policy.allowed_uid, owner=object())
+
+
+@pytest.mark.parametrize("stage", ["probe", "install", "build", "start"])
+def test_units_bind_only_owned_trusted_copies(tmp_path: Path, stage: str) -> None:
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    owned = Path("/run/preview/owned")
+    command = mod.build_systemd_command(policy, "a" * 32, stage, owned, 30)
+    assert "BindReadOnlyPaths=/run/preview/owned/trusted/dynamic_runner.py:/preview/trusted/dynamic_runner.py" in command
+    assert "BindReadOnlyPaths=/run/preview/owned/trusted/harness/project_validation_sandbox.py:/preview/trusted/harness/project_validation_sandbox.py" in command
+    assert not any(str(policy.trusted_source_root) in item for item in command)
+    assert "SupplementaryGroups=" in command
+
+
 def test_stage_work_permissions_are_handed_off_by_root_broker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

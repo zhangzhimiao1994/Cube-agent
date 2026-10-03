@@ -269,7 +269,7 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
     if not _HANDLE.fullmatch(handle) or stage not in _STAGES:
         raise ValueError("invalid internal unit identity")
     root, work, source = (_systemd_path(owned / name) for name in ("root", "work", "source"))
-    trusted = _systemd_path(policy.trusted_source_root)
+    trusted = _systemd_path(owned / "trusted")
     node = _systemd_path(policy.node_root)
     properties = [
         "BindsTo=agent-hub-preview-broker.service", "After=agent-hub-preview-broker.service",
@@ -287,7 +287,7 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
         f"RootDirectory={root}",
         "InaccessiblePaths=-/home -/root -/var/lib/agent-hub -/run/agent-hub -/run/docker.sock -/etc/agent-hub -/opt/agent-hub -/usr/local",
         "BindReadOnlyPaths=/usr:/usr /bin:/bin /lib:/lib -/lib64:/lib64",
-        f"BindReadOnlyPaths={trusted}/previews/dynamic_runner.py:/preview/trusted/dynamic_runner.py",
+        f"BindReadOnlyPaths={trusted}/dynamic_runner.py:/preview/trusted/dynamic_runner.py",
         f"BindReadOnlyPaths={trusted}/harness/project_validation_sandbox.py:/preview/trusted/harness/project_validation_sandbox.py",
         f"BindReadOnlyPaths={node}:/preview/node",
         "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=16M,nr_inodes=4096 /var/tmp:rw,nosuid,nodev,noexec,size=16M,nr_inodes=4096 /run:rw,nosuid,nodev,noexec,size=4M,nr_inodes=1024",
@@ -486,6 +486,31 @@ class PreviewBroker:
         marker.write_bytes(b"preview-storage-v1")
         marker.chmod(0o444)
 
+    def _prepare_trusted(self, session: _Session) -> None:
+        # Release files may be 0640 root:agent-hub. Copy only these fixed trusted
+        # scripts; generated units must never gain the production reader group.
+        trusted = session.owned / "trusted"
+        trusted.mkdir(mode=0o755)
+        trusted.chmod(0o755)
+        (trusted / "harness").mkdir(mode=0o755)
+        (trusted / "harness").chmod(0o755)
+        for source_name, target_name in (
+            ("previews/dynamic_runner.py", "dynamic_runner.py"),
+            ("harness/project_validation_sandbox.py", "harness/project_validation_sandbox.py"),
+        ):
+            source = self.policy.trusted_source_root / source_name
+            _require_root_path(source)
+            if not stat.S_ISREG(source.lstat().st_mode):
+                raise ValueError("trusted preview script must be a regular file")
+            with source.open("rb") as stream:
+                content = stream.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise ValueError("trusted preview script size exceeded")
+            target = trusted / target_name
+            with target.open("xb") as stream:
+                stream.write(content)
+            target.chmod(0o444)
+
     def _stop_storage(self, session: _Session) -> None:
         unit = session.mount_unit or self._mount_unit_name(session.owned)
         stopped = self._command(("/usr/bin/systemctl", "stop", unit))
@@ -590,6 +615,7 @@ class PreviewBroker:
                     (session.owned / name).chmod(0o755)
                 # Bounded tmpfs backs *all* generated files, npm cache, data and
                 # build output. No generated write touches the root filesystem.
+                self._prepare_trusted(session)
                 self._prepare_storage(session)
                 digest = _snapshot(source, self.policy, session.owned / "source")
                 if digest != initial_digest or inspect_source(source, self.policy) != digest:
@@ -660,6 +686,7 @@ class PreviewBroker:
                 (probe_session.owned / "root").mkdir(mode=0o755)
                 (probe_session.owned / "root").chmod(0o755)
                 (probe_session.owned / "work").mkdir(mode=0o755)
+                self._prepare_trusted(probe_session)
                 self._prepare_storage(probe_session)
                 self._launch(probe_session, "probe")
                 if (probe_session.owned / "work/.runner-storage-probe").read_bytes() != b"preview-storage-v1":

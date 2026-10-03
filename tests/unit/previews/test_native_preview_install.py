@@ -39,6 +39,31 @@ def python_body(name: str) -> str:
     return match[1]
 
 
+def test_node_archive_does_not_restore_publisher_ownership() -> None:
+    body = function("download_native_node")
+    extraction = next(line for line in body.splitlines() if "tar -xJf" in line)
+    assert "--no-same-owner" in extraction
+    assert 'node_home="$(native_node_home)"' in body
+    assert "normalize_native_node_ownership" in body
+
+
+def test_dedicated_node_is_required_and_repaired_before_execution() -> None:
+    body = function("ensure_native_nodejs")
+    assert "command -v node" not in body
+    assert "bash -lc" not in body
+    assert body.index("normalize_native_node_ownership") < body.index("native_node_runtime_ok")
+    ownership = function("normalize_native_node_ownership")
+    assert "chown -hR -P root:root" in ownership
+    assert 'node_home="$(native_node_home)"' in ownership
+    assert "command -v node" not in ownership
+
+
+def test_preview_policy_uses_the_same_resolved_custom_node_home() -> None:
+    body = function("write_native_preview_broker_config")
+    assert 'node_home="$(native_node_home)"' in body
+    assert '"$INSTALL_ROOT/current/src/agent_hub" "$node_home"' in body
+
+
 def test_preview_socket_is_independent_and_only_service_group_can_connect() -> None:
     config = unit("socket")
     assert dict(config["Socket"]) == {

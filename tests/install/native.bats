@@ -112,11 +112,14 @@ if os.name == "posix":
 assert not list(path.parent.glob(".preview-broker.json.*"))
 PY
     export AGENT_HUB_PROJECT_WORKSPACE_DIR=/srv/exported-workspaces
+    AGENT_HUB_NODE_HOME=/srv/agent-preview-node
     write_native_preview_broker_config
     python - "$CONFIG_DIR/preview-broker.json" <<"PY"
 import json, sys
 from pathlib import Path
-assert json.loads(Path(sys.argv[1]).read_text())["workspace_root"] == "/srv/exported-workspaces"
+data = json.loads(Path(sys.argv[1]).read_text())
+assert data["workspace_root"] == "/srv/exported-workspaces"
+assert data["node_root"] == "/srv/agent-preview-node"
 PY
     SECRETS_FILE="$CONFIG_DIR/secrets.env"
     printf "%s\n" "AGENT_HUB_PROJECT_WORKSPACE_DIR=\"/srv/configured-workspaces\"" \
@@ -158,4 +161,156 @@ PY
   '
   [ "$status" -eq 1 ]
   [[ "$output" == *"native preview broker isolation probe failed"* ]]
+}
+
+@test "dedicated Node reuse repairs only resolved custom home before execution" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    AGENT_HUB_NODE_HOME="$1/custom-node"
+    mkdir -p "$AGENT_HUB_NODE_HOME/bin" "$AGENT_HUB_NODE_HOME/lib/node_modules/npm/bin"
+    printf "#!/bin/sh\necho v22.12.0\n" > "$AGENT_HUB_NODE_HOME/bin/node"
+    cp "$AGENT_HUB_NODE_HOME/bin/node" "$AGENT_HUB_NODE_HOME/bin/npm"
+    touch "$AGENT_HUB_NODE_HOME/lib/node_modules/npm/bin/npm-cli.js"
+    chmod +x "$AGENT_HUB_NODE_HOME/bin/"*
+    expected="$(realpath -e "$AGENT_HUB_NODE_HOME")"
+    node() { exit 93; }
+    npm() { exit 94; }
+    chown() { [[ "$*" == "-hR -P root:root -- $expected" ]] || exit 91; printf repaired; }
+    download_native_node() { exit 92; }
+    die() { printf "%s\n" "$*" >&2; exit 1; }
+    ensure_native_nodejs
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == repaired ]]
+}
+
+@test "dedicated Node normalization refuses shared system roots and root symlinks" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    mkdir -p "$INSTALL_ROOT"
+    chown() { exit 91; }
+    die() { exit 1; }
+    for target in / /usr /usr/local /bin /opt "$INSTALL_ROOT"; do
+      AGENT_HUB_NODE_HOME="$target"
+      if (normalize_native_node_ownership); then exit 92; else [[ "$?" -eq 1 ]]; fi
+    done
+    AGENT_HUB_NODE_HOME="$1/link"
+    ln -s "$INSTALL_ROOT" "$AGENT_HUB_NODE_HOME"
+    if [[ -L "$AGENT_HUB_NODE_HOME" ]]; then
+      if (normalize_native_node_ownership); then exit 93; else [[ "$?" -eq 1 ]]; fi
+    fi
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+}
+
+@test "system Node 22 still prepares missing dedicated preview runtime at custom home" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    AGENT_HUB_NODE_HOME="$1/custom-node"
+    node() { printf "v22.12.0\n"; }
+    npm() { :; }
+    chown() { exit 91; }
+    download_native_node() {
+      mkdir -p "$AGENT_HUB_NODE_HOME/bin" "$AGENT_HUB_NODE_HOME/lib/node_modules/npm/bin"
+      printf "#!/bin/sh\necho v22.12.0\n" > "$AGENT_HUB_NODE_HOME/bin/node"
+      cp "$AGENT_HUB_NODE_HOME/bin/node" "$AGENT_HUB_NODE_HOME/bin/npm"
+      touch "$AGENT_HUB_NODE_HOME/lib/node_modules/npm/bin/npm-cli.js"
+      chmod +x "$AGENT_HUB_NODE_HOME/bin/"*
+      printf prepared
+    }
+    warn() { :; }
+    die() { exit 1; }
+    ensure_native_nodejs
+    [[ -x "$AGENT_HUB_NODE_HOME/bin/node" && ! -e "$INSTALL_ROOT/node" ]]
+    [[ "$PATH" == "$(realpath -e "$AGENT_HUB_NODE_HOME")/bin:"* ]]
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == prepared ]]
+}
+
+@test "dedicated Node download discards tar publisher UID and normalizes custom home" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    AGENT_HUB_NODE_HOME="$1/custom-node"
+    fixture="$1/fixture"
+    archive_fixture="$1/publisher.tar.xz"
+    mkdir -p "$fixture/node-runtime/bin"
+    printf "node fixture\n" > "$fixture/node-runtime/bin/node"
+    command tar --owner=23456 --group=23456 -cJf "$archive_fixture" -C "$fixture" node-runtime
+    curl() { cp "$archive_fixture" "${@: -1}"; }
+    tar() { [[ "$*" == *"--no-same-owner"* ]] || exit 91; command tar "$@"; }
+    chown() { [[ "$*" == "-hR -P root:root -- $(realpath -e "$AGENT_HUB_NODE_HOME")" ]] || exit 92; printf repaired; }
+    die() { printf "%s\n" "$*" >&2; exit 1; }
+    download_native_node
+    [[ "$(cat "$AGENT_HUB_NODE_HOME/bin/node")" == "node fixture" ]]
+    [[ ! -e "$INSTALL_ROOT/node" ]]
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == repaired ]]
+}
+
+@test "system Node 22 cannot mask failed or incomplete dedicated preparation" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    node() { printf "v22.12.0\n"; }
+    npm() { :; }
+    chown() { exit 91; }
+    warn() { :; }
+    die() { exit 1; }
+    for result in 1 0; do
+      download_native_node() { return "$result"; }
+      if (ensure_native_nodejs); then exit 92; else [[ "$?" -eq 1 ]]; fi
+    done
+    [[ ! -e "$INSTALL_ROOT/node" ]]
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+}
+
+@test "dedicated Node normalization rejects hardlinks before changing ownership" {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    AGENT_HUB_NODE_HOME="$1/custom-node"
+    mkdir -p "$AGENT_HUB_NODE_HOME"
+    printf sentinel > "$1/outside"
+    ln "$1/outside" "$AGENT_HUB_NODE_HOME/linked"
+    chown() { exit 91; }
+    die() { exit 1; }
+    if (normalize_native_node_ownership); then exit 92; else [[ "$?" -eq 1 ]]; fi
+    [[ "$(cat "$1/outside")" == sentinel ]]
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+}
+
+@test "dedicated Node ownership repair leaves external symlink targets untouched on Linux" {
+  [[ "$(uname -s)" == Linux && "$(id -u)" == 0 ]] || skip "requires Linux root for real ownership checks"
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    INSTALL_ROOT="$1/install"
+    AGENT_HUB_NODE_HOME="$1/custom-node"
+    mkdir -p "$AGENT_HUB_NODE_HOME/bin" "$1/outside"
+    printf sentinel > "$1/outside/file"
+    printf node > "$AGENT_HUB_NODE_HOME/bin/node"
+    ln -s "$1/outside" "$AGENT_HUB_NODE_HOME/external"
+    ln -s node "$AGENT_HUB_NODE_HOME/bin/npm"
+    command chown -R 23456:23456 "$1/outside" "$AGENT_HUB_NODE_HOME"
+    die() { exit 1; }
+    normalize_native_node_ownership
+    [[ "$(stat -c %u:%g "$AGENT_HUB_NODE_HOME/bin/node")" == 0:0 ]]
+    [[ "$(stat -c %u:%g "$AGENT_HUB_NODE_HOME/bin/npm")" == 0:0 ]]
+    [[ "$(stat -c %u:%g "$1/outside/file")" == 23456:23456 ]]
+  ' _ "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
 }
