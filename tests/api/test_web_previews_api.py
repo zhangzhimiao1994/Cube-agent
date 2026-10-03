@@ -774,6 +774,49 @@ def test_stop_cleanup_failure_remains_revoked_and_retryable(dynamic_client: Dyna
     assert client.delete(endpoint, headers=_bearer()).status_code == 200
 
 
+@pytest.mark.parametrize("phase,reason", [
+    ("install", "nonzero_exit"), ("install_validate", "unsafe_tree"),
+    ("install_handoff", "permission_denied"), ("build", "timeout"),
+])
+def test_start_failure_returns_safe_stage_not_missing_broker(
+    dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch, phase: str, reason: str,
+) -> None:
+    from agent_hub.previews import dynamic_runtime
+
+    client, _, _, backend, started = dynamic_client
+    assert client.delete(f"/api/v1/web-previews/{started['id']}", headers=_bearer()).status_code == 200
+
+    def fail_start(source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+        del source_root, preview_id, lifetime_seconds
+        dynamic_runtime._check_result({"ok": False, "error": "preview startup failed",
+                                       "phase": phase, "reason": reason})
+        raise AssertionError("a failed broker response must not start a preview")
+
+    monkeypatch.setattr(backend, "start", fail_start)
+    response = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    })
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "dynamic_preview_start_failed",
+        "message": "generated website preview preparation failed",
+        "details": {"phase": phase, "reason": reason},
+    }
+    assert "set-cookie" not in response.headers
+    assert client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer()).status_code == 404
+
+
+def test_unclassified_preview_failure_does_not_invent_configuration_cause() -> None:
+    from agent_hub.api.routers.previews import _preview_error
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewUnavailable
+
+    error = _preview_error(DynamicPreviewUnavailable("private-path Bearer secret"))
+    assert error.code == "dynamic_preview_unavailable"
+    assert error.public_message == "isolated website preview is currently unavailable"
+    assert error.details is None
+
+
 def test_slow_dynamic_start_does_not_block_other_owned_preview(tmp_path: Path) -> None:
     principal = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
     display = _workspace(tmp_path, principal)

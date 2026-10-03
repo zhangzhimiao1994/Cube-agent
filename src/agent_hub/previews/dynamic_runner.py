@@ -82,6 +82,55 @@ def probe_phase(phase: str) -> Iterator[None]:
         raise ProbeFailure(phase, reason) from None
 
 
+class PreviewStartupFailure(RuntimeError):
+    def __init__(self, phase: str, reason: str) -> None:
+        if type(phase) is not str or type(reason) is not str or phase not in {
+            "source_validate", "trusted_prepare", "storage_prepare", "source_copy",
+            "install", "install_validate", "install_handoff",
+            "build", "build_validate", "build_handoff", "start",
+        } or reason not in {
+            "permission_denied", "not_found", "read_only", "timeout", "nonzero_exit",
+            "invalid_result", "unsafe_tree", "failed", "log_limit",
+        }:
+            raise ValueError("invalid startup diagnostic")
+        self.phase = phase
+        self.reason = reason
+        super().__init__(f"preview startup failed: {phase}/{reason}")
+
+    def response(self) -> dict[str, object]:
+        return {"ok": False, "error": "preview startup failed",
+                "phase": self.phase, "reason": self.reason}
+
+
+@contextlib.contextmanager
+def preview_startup_phase(phase: str) -> Iterator[None]:
+    try:
+        yield
+    except PreviewStartupFailure:
+        raise
+    except (OSError, ValueError, RuntimeError, EOFError, subprocess.SubprocessError) as error:
+        if isinstance(error, PermissionError):
+            reason = "permission_denied"
+        elif isinstance(error, FileNotFoundError):
+            reason = "not_found"
+        elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+            reason = "timeout"
+        elif isinstance(error, subprocess.CalledProcessError):
+            reason = "nonzero_exit"
+        elif isinstance(error, OSError):
+            reason = "read_only" if error.errno == 30 else "failed"
+        elif isinstance(error, ValueError) and phase in {
+            "source_validate", "install_validate", "build_validate",
+            "install_handoff", "build_handoff",
+        }:
+            reason = "unsafe_tree"
+        elif isinstance(error, (ValueError, EOFError)):
+            reason = "invalid_result"
+        else:
+            reason = "failed"
+        raise PreviewStartupFailure(phase, reason) from None
+
+
 class FrameStream(Protocol):
     def read(self, size: int = -1) -> bytes | None: ...
     def write(self, data: bytes) -> int | None: ...
@@ -320,11 +369,13 @@ def _run_stage(stage: str) -> None:
     if sys.platform != "linux":
         raise RuntimeError("preview runner requires isolated Linux")
     work = Path("/preview/work")
-    for name in ("home", "tmp", "cache", "data"):
-        _ensure_work_directory(work / name)
-    if stage == "install":
-        _copy_source(Path("/preview/source"), work)
-    child = _spawn_application(stage)
+    with preview_startup_phase(stage):
+        for name in ("home", "tmp", "cache", "data"):
+            _ensure_work_directory(work / name)
+        if stage == "install":
+            with preview_startup_phase("source_copy"):
+                _copy_source(Path("/preview/source"), work)
+        child = _spawn_application(stage)
     log_bytes = 0
     log_lock = threading.Lock()
     log_overflow = threading.Event()
@@ -350,27 +401,35 @@ def _run_stage(stage: str) -> None:
         thread.start()
         threads.append(thread)
     try:
-        if stage != "start":
-            exit_code = child.wait(timeout=120)
-            for thread in threads:
-                thread.join(timeout=1)
-            if exit_code != 0 or log_overflow.is_set():
-                raise RuntimeError(f"preview {stage} failed")
-            write_frame(sys.stdout.buffer, {"ok": True, "state": "prepared"})
-            return
-        ready_deadline = time.monotonic() + READY_TIMEOUT
-        while True:
-            if child.poll() is not None or log_overflow.is_set():
-                raise RuntimeError("preview application exited before ready")
-            if time.monotonic() >= ready_deadline:
-                raise TimeoutError("preview application readiness timeout")
-            try:
-                relay_http(validate_http_request("GET", "/", (), b""))
-                if child.poll() is None:
-                    break
-            except (OSError, http.client.HTTPException):
-                time.sleep(0.1)
-        write_frame(sys.stdout.buffer, {"ok": True, "state": "ready"})
+        with preview_startup_phase(stage):
+            if stage != "start":
+                exit_code = child.wait(timeout=120)
+                for thread in threads:
+                    thread.join(timeout=1)
+                if log_overflow.is_set():
+                    raise PreviewStartupFailure(stage, "log_limit")
+                if exit_code != 0:
+                    raise PreviewStartupFailure(stage, "nonzero_exit")
+                write_frame(sys.stdout.buffer, {"ok": True, "state": "prepared"})
+                return
+            ready_deadline = time.monotonic() + READY_TIMEOUT
+            while True:
+                if log_overflow.is_set():
+                    raise PreviewStartupFailure(stage, "log_limit")
+                poll_code = child.poll()
+                if poll_code is not None:
+                    raise PreviewStartupFailure(
+                        stage, "nonzero_exit" if poll_code != 0 else "invalid_result",
+                    )
+                if time.monotonic() >= ready_deadline:
+                    raise PreviewStartupFailure(stage, "timeout")
+                try:
+                    relay_http(validate_http_request("GET", "/", (), b""))
+                    if child.poll() is None:
+                        break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.1)
+            write_frame(sys.stdout.buffer, {"ok": True, "state": "ready"})
         while True:
             payload = _wait_request(child, log_overflow)
             if child.poll() is not None or log_overflow.is_set():
@@ -482,7 +541,7 @@ def main() -> None:
             _probe()
         else:
             _run_stage(sys.argv[1])
-    except ProbeFailure as error:
+    except (ProbeFailure, PreviewStartupFailure) as error:
         write_frame(sys.stdout.buffer, error.response())
         raise SystemExit(1) from None
     except (EOFError, ValueError, OSError, RuntimeError, TimeoutError, subprocess.SubprocessError):

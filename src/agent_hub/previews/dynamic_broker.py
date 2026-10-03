@@ -34,8 +34,10 @@ from agent_hub.previews.dynamic_runner import (
     READY_TIMEOUT,
     REQUEST_TIMEOUT,
     FrameStream,
+    PreviewStartupFailure,
     ProbeFailure,
     json_object,
+    preview_startup_phase,
     probe_phase,
     read_frame,
     validate_wire_http,
@@ -574,16 +576,25 @@ class PreviewBroker:
                 raise ProbeFailure("runner_protocol", "invalid_result")
         else:
             result = _pipe_read(process, min(remaining, READY_TIMEOUT + 2 if stage == "start" else 125))
+            if (set(result) == {"ok", "error", "phase", "reason"}
+                    and result["ok"] is False and result["error"] == "preview startup failed"):
+                try:
+                    startup_failure = PreviewStartupFailure(
+                        cast(str, result["phase"]), cast(str, result["reason"]),
+                    )
+                except ValueError:
+                    startup_failure = PreviewStartupFailure(stage, "invalid_result")
+                raise startup_failure
         expected = "ready" if stage == "start" else "probe" if stage == "probe" else "prepared"
         if result != {"ok": True, "state": expected}:
             if stage == "probe":
                 raise ProbeFailure("runner_protocol", "invalid_result")
-            raise RuntimeError(f"preview {stage} failed")
+            raise PreviewStartupFailure(stage, "invalid_result")
         if stage != "start":
             if process.wait(timeout=5) != 0:
                 if stage == "probe":
                     raise ProbeFailure("runner_exit", "nonzero_exit")
-                raise RuntimeError(f"preview {stage} failed")
+                raise PreviewStartupFailure(stage, "nonzero_exit")
             self._stop_unit(unit)
             session.units.remove(unit)
             self._close_process(process)
@@ -647,32 +658,46 @@ class PreviewBroker:
                 self._sessions.pop(session.handle, None)
 
     def _start(self, payload: dict[str, object], owner: object) -> dict[str, object]:
-        session = self._reserve(cast(str, payload["preview_id"]), owner,
-                                cast(int, payload["lifetime_seconds"]))
+        with preview_startup_phase("storage_prepare"):
+            session = self._reserve(cast(str, payload["preview_id"]), owner,
+                                    cast(int, payload["lifetime_seconds"]))
         try:
             with session.lock:
                 source = Path(cast(str, payload["source_root"]))
-                initial_digest = inspect_source(source, self.policy)
-                for name in ("root", "source", "work"):
-                    (session.owned / name).mkdir(mode=0o755)
-                    (session.owned / name).chmod(0o755)
+                with preview_startup_phase("source_validate"):
+                    initial_digest = inspect_source(source, self.policy)
+                with preview_startup_phase("storage_prepare"):
+                    for name in ("root", "source", "work"):
+                        (session.owned / name).mkdir(mode=0o755)
+                        (session.owned / name).chmod(0o755)
                 # Bounded tmpfs backs *all* generated files, npm cache, data and
                 # build output. No generated write touches the root filesystem.
-                self._prepare_trusted(session)
-                self._prepare_storage(session)
-                digest = _snapshot(source, self.policy, session.owned / "source")
-                if digest != initial_digest or inspect_source(source, self.policy) != digest:
-                    raise ValueError("source changed during preparation")
+                with preview_startup_phase("trusted_prepare"):
+                    self._prepare_trusted(session)
+                with preview_startup_phase("storage_prepare"):
+                    self._prepare_storage(session)
+                with preview_startup_phase("source_copy"):
+                    digest = _snapshot(source, self.policy, session.owned / "source")
+                with preview_startup_phase("source_validate"):
+                    if digest != initial_digest or inspect_source(source, self.policy) != digest:
+                        raise ValueError("source changed during preparation")
                 session.digest = digest
-                self._launch(session, "install")
-                self._validate_prepared_tree(session.owned / "work/app")
-                self._handoff_work(session.owned / "work")
-                self._launch(session, "build")
-                self._validate_prepared_tree(session.owned / "work/app")
-                self._handoff_work(session.owned / "work")
-                self._launch(session, "start")
-                if session.expires_at <= time.monotonic():
-                    raise TimeoutError("preview lease expired during startup")
+                with preview_startup_phase("install"):
+                    self._launch(session, "install")
+                with preview_startup_phase("install_validate"):
+                    self._validate_prepared_tree(session.owned / "work/app")
+                with preview_startup_phase("install_handoff"):
+                    self._handoff_work(session.owned / "work")
+                with preview_startup_phase("build"):
+                    self._launch(session, "build")
+                with preview_startup_phase("build_validate"):
+                    self._validate_prepared_tree(session.owned / "work/app")
+                with preview_startup_phase("build_handoff"):
+                    self._handoff_work(session.owned / "work")
+                with preview_startup_phase("start"):
+                    self._launch(session, "start")
+                    if session.expires_at <= time.monotonic():
+                        raise TimeoutError("preview lease expired during startup")
                 session.ready = True
                 return {"ok": True, "state": "ready", "handle": session.handle,
                         "source_sha256": session.digest,
@@ -876,6 +901,9 @@ def serve_broker(listener: socket.socket, broker: PreviewBroker,
                 try:
                     result = broker.handle(payload, peer_uid=uid, owner=owner)
                 except ProbeFailure as error:
+                    print(str(error), file=sys.stderr, flush=True)
+                    result = error.response()
+                except PreviewStartupFailure as error:
                     print(str(error), file=sys.stderr, flush=True)
                     result = error.response()
                 except (ValueError, OSError, RuntimeError, EOFError, subprocess.SubprocessError):

@@ -15,6 +15,7 @@ from agent_hub.previews.dynamic_runner import (
     MAX_REQUEST_BODY,
     MAX_RESPONSE_BODY,
     FrameStream,
+    PreviewStartupFailure,
     bounded_body,
     filtered_headers,
     read_frame,
@@ -25,12 +26,21 @@ from agent_hub.previews.dynamic_runner import (
 BROKER_SOCKET_PATH = Path("/run/agent-hub/preview-broker.sock")
 __all__ = [
     "MAX_REQUEST_BODY", "MAX_RESPONSE_BODY", "DynamicPreviewBackend", "DynamicPreviewCleanupError",
-    "DynamicPreviewResponse", "DynamicPreviewRuntime", "DynamicPreviewUnavailable",
+    "DynamicPreviewResponse", "DynamicPreviewRuntime", "DynamicPreviewStartupFailed",
+    "DynamicPreviewUnavailable",
 ]
 
 
 class DynamicPreviewUnavailable(RuntimeError):
     pass
+
+
+class DynamicPreviewStartupFailed(DynamicPreviewUnavailable):
+    def __init__(self, phase: str, reason: str) -> None:
+        diagnostic = PreviewStartupFailure(phase, reason)
+        self.phase = diagnostic.phase
+        self.reason = diagnostic.reason
+        super().__init__(str(diagnostic))
 
 
 class DynamicPreviewCleanupError(RuntimeError):
@@ -57,6 +67,19 @@ def decode_response(payload: dict[str, object]) -> DynamicPreviewResponse:
 
 def _check_result(payload: dict[str, object]) -> None:
     if type(payload.get("ok")) is not bool or payload["ok"] is not True:
+        if (
+            set(payload) == {"ok", "error", "phase", "reason"}
+            and payload["ok"] is False
+            and payload["error"] == "preview startup failed"
+            and isinstance(payload["phase"], str)
+            and isinstance(payload["reason"], str)
+        ):
+            try:
+                diagnostic = DynamicPreviewStartupFailed(payload["phase"], payload["reason"])
+            except ValueError:
+                pass
+            else:
+                raise diagnostic
         raise DynamicPreviewUnavailable("preview broker operation failed")
 
 

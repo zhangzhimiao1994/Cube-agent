@@ -456,8 +456,8 @@ def test_fixed_trusted_copies_are_readable_before_any_unit(
     payload: dict[str, object] = {"version": 1, "action": action}
     if action == "start":
         payload.update(source_root=str(source), preview_id="fixture", lifetime_seconds=30)
-    expected = "storage_prepare/failed" if action == "probe" else "fixture stops before OS execution"
-    with pytest.raises(RuntimeError, match=expected):
+    expected_type = mod.ProbeFailure if action == "probe" else mod.PreviewStartupFailure
+    with pytest.raises(expected_type, match="storage_prepare/failed"):
         service.handle(payload, peer_uid=policy.allowed_uid, owner=object())
 
 
@@ -691,3 +691,183 @@ def test_reaper_reclaims_crashed_ready_runner_without_waiting_for_lease(
     assert session.handle not in service._sessions
     assert session.handle in service._completed
     assert not session.owned.exists()
+
+
+@pytest.mark.parametrize("stage", ["install", "build", "start"])
+def test_launch_preserves_whitelisted_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    from types import SimpleNamespace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    session = mod._Session("a" * 32, "fixture", object(), Path("/run/preview/owned"), 1e20)
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mod, "_pipe_read", lambda *args: {
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": "nonzero_exit",
+    })
+    with pytest.raises(RuntimeError) as failure:
+        service._launch(session, stage)
+    assert getattr(failure.value, "phase", None) == stage
+    assert getattr(failure.value, "reason", None) == "nonzero_exit"
+    assert session.units == {f"agent-hub-preview-{'a' * 32}-{stage}.service"}
+
+
+@pytest.mark.parametrize("payload", [
+    {"ok": False, "error": "preview startup failed", "phase": "install", "reason": "sentinel"},
+    {"ok": False, "error": "preview startup failed", "phase": [], "reason": "failed"},
+    {"ok": False, "error": "sentinel", "phase": "install", "reason": "failed"},
+    {"ok": False, "error": "preview startup failed", "phase": "install", "reason": "failed", "stderr": "sentinel"},
+    {"ok": 0, "error": "preview startup failed", "phase": "install", "reason": "failed"},
+])
+def test_launch_rejects_untrusted_startup_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object],
+) -> None:
+    from types import SimpleNamespace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    session = mod._Session("a" * 32, "fixture", object(), Path("/run/preview/owned"), 1e20)
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mod, "_pipe_read", lambda *args: payload)
+    with pytest.raises(RuntimeError) as failure:
+        service._launch(session, "install")
+    assert getattr(failure.value, "phase", None) == "install"
+    assert getattr(failure.value, "reason", None) == "invalid_result"
+    assert "sentinel" not in str(failure.value)
+
+
+@pytest.mark.parametrize("boundary,reason", [
+    ("install_validate", "unsafe_tree"), ("install_handoff", "permission_denied"),
+    ("build_validate", "unsafe_tree"), ("build_handoff", "permission_denied"),
+])
+def test_startup_transition_failure_preserves_phase_and_cleans_owned_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str, reason: str,
+) -> None:
+    from dataclasses import replace
+    mod = broker()
+    source, policy = prepared(tmp_path)
+    runtime_root = tmp_path / "broker-owned"
+    runtime_root.mkdir()
+    service = mod.PreviewBroker(replace(policy, runtime_root=runtime_root))
+    stages: list[str] = []
+    monkeypatch.setattr(service, "_prepare_trusted", lambda session: None)
+    monkeypatch.setattr(service, "_prepare_storage", lambda session: None)
+    if os.name == "nt":
+        # Windows cannot unlink the read-only snapshots; Linux root can.
+        remove_tree = mod.shutil.rmtree
+
+        def remove_readonly_tree(path: Path) -> None:
+            for child in path.rglob("*"):
+                child.chmod(0o777)
+            remove_tree(path)
+
+        monkeypatch.setattr(mod.shutil, "rmtree", remove_readonly_tree)
+
+    def chown(*args: object, **kwargs: object) -> None:
+        if boundary == stages[-1] + "_handoff":
+            raise PermissionError("/private/cache token=sentinel")
+
+    monkeypatch.setattr(os, "chown", chown, raising=False)
+
+    def launch(session: Any, stage: str) -> dict[str, object]:
+        stages.append(stage)
+        app = session.owned / "work/app"
+        app.mkdir(exist_ok=True)
+        (app / "package.json").write_text("fixture")
+        if boundary == stage + "_validate":
+            os.link(app / "package.json", app / "linked.json")
+        return {"ok": True, "state": "prepared"}
+
+    monkeypatch.setattr(service, "_launch", launch)
+    with pytest.raises((RuntimeError, ValueError, OSError)) as failure:
+        service._start({"preview_id": "fixture", "source_root": str(source),
+                        "lifetime_seconds": 30}, object())
+    assert getattr(failure.value, "phase", None) == boundary
+    assert getattr(failure.value, "reason", None) == reason
+    assert stages == (["install"] if boundary.startswith("install") else ["install", "build"])
+    assert not service._sessions
+    assert not list(runtime_root.iterdir())
+    assert "sentinel" not in str(failure.value)
+
+
+@pytest.mark.parametrize("kind", ["startup", "probe", "unclassified"])
+def test_broker_serves_only_safe_diagnostics_and_fixed_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], kind: str,
+) -> None:
+    import io
+    import struct
+    import threading
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    stopping = threading.Event()
+    incoming, outgoing = io.BytesIO(), io.BytesIO()
+    mod.write_frame(incoming, {"version": 1, "action": "start"})
+    incoming.seek(0)
+
+    class Stream:
+        def read(self, size: int = -1) -> bytes:
+            return incoming.read(size)
+
+        def write(self, data: bytes) -> int:
+            return outgoing.write(data)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class Connection:
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, policy.allowed_uid, 123)
+
+        def settimeout(self, timeout: float) -> None:
+            pass
+
+        def makefile(self, mode: str, *, buffering: int) -> Stream:
+            return Stream()
+
+        def close(self) -> None:
+            stopping.set()
+
+        def shutdown(self, how: int) -> None:
+            pass
+
+    class Listener:
+        accepted = False
+
+        def settimeout(self, timeout: float) -> None:
+            pass
+
+        def accept(self) -> tuple[Connection, None]:
+            if not self.accepted:
+                self.accepted = True
+                return Connection(), None
+            assert stopping.wait(2), "fixture worker did not finish"
+            raise TimeoutError
+
+    def fail(*args: object, **kwargs: object) -> None:
+        try:
+            raise PermissionError("source /private/path stderr token=sentinel")
+        except PermissionError:
+            if kind == "startup":
+                raise mod.PreviewStartupFailure("install_handoff", "permission_denied") from None
+            if kind == "probe":
+                raise mod.ProbeFailure("storage_prepare", "permission_denied") from None
+            raise
+
+    monkeypatch.setattr(service, "handle", fail)
+    mod.serve_broker(Listener(), service, stopping)
+    outgoing.seek(0)
+    expected: dict[str, object] = {"ok": False, "error": "preview broker operation failed"}
+    journal = ""
+    if kind != "unclassified":
+        phase = "install_handoff" if kind == "startup" else "storage_prepare"
+        expected = {"ok": False, "error": f"preview {kind} failed",
+                    "phase": phase, "reason": "permission_denied"}
+        journal = f"preview {kind} failed: {phase}/permission_denied\n"
+    assert mod.read_frame(outgoing) == expected
+    assert capsys.readouterr().err == journal
+    assert b"sentinel" not in outgoing.getvalue()

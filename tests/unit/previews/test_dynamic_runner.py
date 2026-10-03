@@ -257,3 +257,132 @@ def test_actual_trusted_http_relay_preserves_patch_query_status_and_body(
     assert result["status_code"] == 422
     assert result["headers"] == [["content-type", "application/json"]]
     assert base64.b64decode(result["body"]) == b'{"fixture":"actual HTTP error"}'
+
+
+@pytest.mark.parametrize("stage,mode,reason", [
+    ("install", "exit", "nonzero_exit"),
+    ("build", "exit", "nonzero_exit"),
+    ("build", "timeout", "timeout"),
+    ("start", "exit", "nonzero_exit"),
+    ("start", "clean_exit", "invalid_result"),
+    ("start", "timeout", "timeout"),
+    ("install", "logs", "log_limit"),
+    ("start", "logs", "log_limit"),
+])
+def test_startup_runner_emits_only_fixed_failure_fields(
+    monkeypatch: pytest.MonkeyPatch, stage: str, mode: str, reason: str,
+) -> None:
+    import io
+    import subprocess
+    from types import SimpleNamespace
+    mod = runner()
+    output = io.BytesIO()
+    cleaned: list[object] = []
+
+    def wait(timeout: float) -> int:
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired("/private/source token=sentinel", timeout)
+        return 9
+
+    class ImmediateThread:
+        def __init__(self, *, target: Any, args: tuple[object, ...], daemon: bool) -> None:
+            self.target, self.args = target, args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+        def join(self, timeout: float) -> None:
+            pass
+
+    child = SimpleNamespace(
+        pid=123, wait=wait,
+        poll=lambda: None if mode == "timeout" else 0 if mode == "clean_exit" else 9,
+        stdout=io.BytesIO(b"/private/source token=sentinel"), stderr=io.BytesIO(b"stderr-sentinel"),
+    )
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(
+        platform="linux", argv=["runner", stage], stdout=SimpleNamespace(buffer=output),
+    ))
+    monkeypatch.setattr(mod, "_ensure_work_directory", lambda path: None)
+    monkeypatch.setattr(mod, "_copy_source", lambda source, work: None)
+    monkeypatch.setattr(mod, "_spawn_application", lambda selected: child)
+    monkeypatch.setattr(mod, "_kill_child", cleaned.append)
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: None)
+    monkeypatch.setattr(mod.threading, "Thread", ImmediateThread)
+    if mode == "logs":
+        monkeypatch.setattr(mod, "MAX_LOG", 1)
+    if stage == "start" and mode == "timeout":
+        times = iter([0.0, mod.READY_TIMEOUT + 1])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(times))
+    with pytest.raises(SystemExit) as failure:
+        mod.main()
+    assert failure.value.code == 1
+    output.seek(0)
+    assert mod.read_frame(output) == {
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": reason,
+    }
+    assert cleaned == [child]
+    assert b"sentinel" not in output.getvalue()
+
+
+@pytest.mark.parametrize("error,reason", [
+    (PermissionError("/private sentinel"), "permission_denied"),
+    (FileNotFoundError("/private sentinel"), "not_found"),
+    (OSError(30, "/private sentinel"), "read_only"),
+    (TimeoutError("/private sentinel"), "timeout"),
+    (ValueError("/private sentinel"), "unsafe_tree"),
+    (RuntimeError("/private sentinel"), "failed"),
+])
+def test_startup_phase_sanitizes_errors_and_preserves_inner_phase(
+    error: Exception, reason: str,
+) -> None:
+    mod = runner()
+    with (
+        pytest.raises(mod.PreviewStartupFailure) as failure,
+        mod.preview_startup_phase("install"),
+        mod.preview_startup_phase("install_validate"),
+    ):
+        raise error
+    assert failure.value.response() == {
+        "ok": False, "error": "preview startup failed",
+        "phase": "install_validate", "reason": reason,
+    }
+    assert "sentinel" not in str(failure.value)
+    assert failure.value.__suppress_context__
+
+
+@pytest.mark.parametrize("phase,reason", [
+    ("/private/source", "failed"), ("install", "token=sentinel"),
+    ([], "failed"), ("install", {}), (True, "failed"), ("probe", "failed"),
+])
+def test_startup_diagnostic_rejects_non_whitelisted_values(phase: Any, reason: Any) -> None:
+    mod = runner()
+    with pytest.raises(ValueError, match="invalid startup diagnostic"):
+        mod.PreviewStartupFailure(phase, reason)
+
+
+def test_running_application_failure_does_not_become_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    output = io.BytesIO()
+    child = SimpleNamespace(pid=123, poll=lambda: None,
+                            stdout=io.BytesIO(), stderr=io.BytesIO())
+
+    def fail(*args: object) -> None:
+        raise RuntimeError("business failure sentinel")
+
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(
+        platform="linux", argv=["runner", "start"], stdout=SimpleNamespace(buffer=output),
+    ))
+    monkeypatch.setattr(mod, "_ensure_work_directory", lambda path: None)
+    monkeypatch.setattr(mod, "_spawn_application", lambda stage: child)
+    monkeypatch.setattr(mod, "_kill_child", lambda process: None)
+    monkeypatch.setattr(mod, "relay_http", lambda request: {})
+    monkeypatch.setattr(mod, "_wait_request", fail)
+    with pytest.raises(SystemExit):
+        mod.main()
+    output.seek(0)
+    assert mod.read_frame(output) == {"ok": True, "state": "ready"}
+    assert mod.read_frame(output) == {"ok": False, "error": "preview stage failed"}

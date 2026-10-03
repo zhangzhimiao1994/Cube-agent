@@ -30,7 +30,11 @@ from agent_hub.previews import (
     PreviewTokenRejected,
 )
 from agent_hub.previews.dynamic_runner import json_object
-from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError, DynamicPreviewUnavailable
+from agent_hub.previews.dynamic_runtime import (
+    DynamicPreviewCleanupError,
+    DynamicPreviewStartupFailed,
+    DynamicPreviewUnavailable,
+)
 
 _MAX_REQUEST_BODY = 1024 * 1024
 _MAX_REQUEST_WIRE = 1536 * 1024
@@ -490,11 +494,18 @@ def _public_response(state: PreviewState) -> WebPreviewResponse:
 
 
 def _preview_error(error: Exception) -> PublicAPIError:
+    if isinstance(error, DynamicPreviewStartupFailed):
+        return PublicAPIError(
+            503,
+            "dynamic_preview_start_failed",
+            "generated website preview preparation failed",
+            details={"phase": error.phase, "reason": error.reason},
+        )
     if isinstance(error, DynamicPreviewUnavailable):
         return PublicAPIError(
             503,
             "dynamic_preview_unavailable",
-            "dynamic preview requires a configured isolated preview broker",
+            "isolated website preview is currently unavailable",
         )
     if isinstance(error, DynamicPreviewCleanupError):
         return PublicAPIError(

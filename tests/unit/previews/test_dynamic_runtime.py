@@ -69,6 +69,36 @@ def test_frames_are_length_bounded_and_strict() -> None:
         mod.read_frame(io.BytesIO(struct.pack("!I", 0xFFFFFFFF)))
 
 
+@pytest.mark.parametrize("phase,reason", [
+    ("install", "nonzero_exit"), ("install_validate", "unsafe_tree"),
+    ("install_handoff", "permission_denied"), ("build", "timeout"),
+    ("start", "not_found"),
+])
+def test_startup_failure_preserves_only_validated_diagnostic(phase: str, reason: str) -> None:
+    mod = runtime()
+    with pytest.raises(mod.DynamicPreviewUnavailable) as caught:
+        mod._check_result({"ok": False, "error": "preview startup failed",
+                           "phase": phase, "reason": reason})
+    assert getattr(caught.value, "phase", None) == phase
+    assert getattr(caught.value, "reason", None) == reason
+    assert str(caught.value) == f"preview startup failed: {phase}/{reason}"
+
+
+@pytest.mark.parametrize("patch", [
+    {"phase": "/private/source-token"}, {"reason": "Bearer private-token"},
+    {"error": "private-token"}, {"extra": "private-token"},
+    {"phase": ["install"]}, {"reason": None},
+])
+def test_invalid_startup_diagnostics_are_not_exposed(patch: dict[str, object]) -> None:
+    mod = runtime()
+    payload = {"ok": False, "error": "preview startup failed",
+               "phase": "install", "reason": "nonzero_exit", **patch}
+    with pytest.raises(mod.DynamicPreviewUnavailable) as caught:
+        mod._check_result(payload)
+    assert str(caught.value) == "preview broker operation failed"
+    assert getattr(caught.value, "phase", None) is None
+
+
 def test_frame_writes_handle_short_socket_sends() -> None:
     mod = runtime()
 
