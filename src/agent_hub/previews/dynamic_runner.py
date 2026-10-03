@@ -41,6 +41,22 @@ _RESPONSE_HEADERS = {
     "content-type", "content-language", "cache-control", "etag", "last-modified",
     "location", "content-range", "accept-ranges",
 }
+_MAX_INSTALL_DIAGNOSTIC_LINE = 512
+_NPM_INSTALL_REASONS = {
+    b"EACCES": "permission_denied", b"EPERM": "permission_denied",
+    b"ENOENT": "not_found", b"ENOSPC": "storage_full", b"EROFS": "read_only",
+    b"ENOMEM": "resource_limit", b"EMFILE": "resource_limit", b"ENFILE": "resource_limit",
+    b"ENOTFOUND": "registry_unavailable", b"EAI_AGAIN": "registry_unavailable",
+    b"ECONNREFUSED": "registry_unavailable", b"ECONNRESET": "registry_unavailable",
+    b"ETIMEDOUT": "registry_unavailable", b"ERR_SOCKET_TIMEOUT": "registry_unavailable",
+    b"E404": "dependency_unavailable", b"ETARGET": "dependency_unavailable",
+    b"ERESOLVE": "dependency_conflict", b"EJSONPARSE": "package_invalid",
+    b"ENOLOCK": "package_invalid", b"EPACKAGEJSON": "package_invalid",
+    b"CERT_HAS_EXPIRED": "certificate_error",
+    b"UNABLE_TO_VERIFY_LEAF_SIGNATURE": "certificate_error",
+    b"SELF_SIGNED_CERT_IN_CHAIN": "certificate_error",
+    b"DEPTH_ZERO_SELF_SIGNED_CERT": "certificate_error",
+}
 
 
 class ProbeFailure(RuntimeError):
@@ -91,6 +107,9 @@ class PreviewStartupFailure(RuntimeError):
         } or reason not in {
             "permission_denied", "not_found", "read_only", "timeout", "nonzero_exit",
             "invalid_result", "unsafe_tree", "failed", "log_limit",
+            "storage_full", "resource_limit", "registry_unavailable", "dependency_unavailable",
+            "dependency_conflict", "package_invalid", "certificate_error", "dependency_rejected",
+            "supervisor_exit",
         }:
             raise ValueError("invalid startup diagnostic")
         self.phase = phase
@@ -365,6 +384,13 @@ def _copy_source(source: Path, work: Path) -> None:
             path.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
 
 
+def _install_failure_reason(line: bytearray) -> str | None:
+    if line.startswith(b"generated dependency source rejected: "):
+        return "dependency_rejected"
+    match = re.fullmatch(rb"npm (?:ERR!|error) code ([A-Z0-9_]+)\r?", line)
+    return _NPM_INSTALL_REASONS.get(match[1]) if match else None
+
+
 def _run_stage(stage: str) -> None:
     if sys.platform != "linux":
         raise RuntimeError("preview runner requires isolated Linux")
@@ -379,9 +405,13 @@ def _run_stage(stage: str) -> None:
     log_bytes = 0
     log_lock = threading.Lock()
     log_overflow = threading.Event()
+    install_reason: str | None = None
 
     def drain(pipe: BinaryIO) -> None:
-        nonlocal log_bytes
+        nonlocal log_bytes, install_reason
+        classify = stage == "install" and pipe is child.stderr
+        line = bytearray()
+        discard_line = False
         try:
             while chunk := pipe.read(4096):
                 with log_lock:
@@ -391,7 +421,26 @@ def _run_stage(stage: str) -> None:
                         with contextlib.suppress(ProcessLookupError):
                             _kill_group(child.pid)
                         return
+                if classify and install_reason is None:
+                    for byte in chunk:
+                        if byte == 10:
+                            if not discard_line:
+                                install_reason = _install_failure_reason(line)
+                            line.clear()
+                            discard_line = False
+                            if install_reason is not None:
+                                break
+                        elif not discard_line:
+                            if len(line) < _MAX_INSTALL_DIAGNOSTIC_LINE:
+                                line.append(byte)
+                            else:
+                                # Never classify a truncated line or its later chunks.
+                                line.clear()
+                                discard_line = True
+            if classify and install_reason is None and not discard_line and line:
+                install_reason = _install_failure_reason(line)
         finally:
+            line.clear()
             pipe.close()
 
     threads: list[threading.Thread] = []
@@ -409,7 +458,7 @@ def _run_stage(stage: str) -> None:
                 if log_overflow.is_set():
                     raise PreviewStartupFailure(stage, "log_limit")
                 if exit_code != 0:
-                    raise PreviewStartupFailure(stage, "nonzero_exit")
+                    raise PreviewStartupFailure(stage, install_reason or "nonzero_exit")
                 write_frame(sys.stdout.buffer, {"ok": True, "state": "prepared"})
                 return
             ready_deadline = time.monotonic() + READY_TIMEOUT

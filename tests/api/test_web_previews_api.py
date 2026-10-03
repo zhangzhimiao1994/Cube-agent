@@ -777,6 +777,11 @@ def test_stop_cleanup_failure_remains_revoked_and_retryable(dynamic_client: Dyna
 @pytest.mark.parametrize("phase,reason", [
     ("install", "nonzero_exit"), ("install_validate", "unsafe_tree"),
     ("install_handoff", "permission_denied"), ("build", "timeout"),
+    ("install", "storage_full"), ("install", "resource_limit"),
+    ("install", "registry_unavailable"), ("install", "dependency_unavailable"),
+    ("install", "dependency_conflict"), ("install", "package_invalid"),
+    ("install", "certificate_error"), ("install", "dependency_rejected"),
+    ("install", "supervisor_exit"),
 ])
 def test_start_failure_returns_safe_stage_not_missing_broker(
     dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch, phase: str, reason: str,

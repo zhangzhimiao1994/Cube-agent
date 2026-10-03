@@ -694,8 +694,13 @@ def test_reaper_reclaims_crashed_ready_runner_without_waiting_for_lease(
 
 
 @pytest.mark.parametrize("stage", ["install", "build", "start"])
+@pytest.mark.parametrize("reason", [
+    "nonzero_exit", "permission_denied", "storage_full", "read_only", "resource_limit",
+    "registry_unavailable", "dependency_unavailable", "dependency_conflict", "package_invalid",
+    "certificate_error", "dependency_rejected", "supervisor_exit",
+])
 def test_launch_preserves_whitelisted_startup_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, reason: str,
 ) -> None:
     from types import SimpleNamespace
     mod = broker()
@@ -704,13 +709,49 @@ def test_launch_preserves_whitelisted_startup_failure(
     session = mod._Session("a" * 32, "fixture", object(), Path("/run/preview/owned"), 1e20)
     monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(mod, "_pipe_read", lambda *args: {
-        "ok": False, "error": "preview startup failed", "phase": stage, "reason": "nonzero_exit",
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": reason,
     })
     with pytest.raises(RuntimeError) as failure:
         service._launch(session, stage)
     assert getattr(failure.value, "phase", None) == stage
-    assert getattr(failure.value, "reason", None) == "nonzero_exit"
+    assert getattr(failure.value, "reason", None) == reason
     assert session.units == {f"agent-hub-preview-{'a' * 32}-{stage}.service"}
+
+
+@pytest.mark.parametrize("stage", ["install", "build", "probe"])
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_launch_distinguishes_supervisor_exit_after_success_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, exit_code: int,
+) -> None:
+    from types import SimpleNamespace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    session = mod._Session("a" * 32, "fixture", object(), Path("/run/preview/owned"), 1e20)
+    process = SimpleNamespace(wait=lambda timeout: exit_code)
+    result = {"ok": True, "state": "probe" if stage == "probe" else "prepared"}
+    stopped: list[str] = []
+    closed: list[object] = []
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(mod, "_pipe_read", lambda *args: result)
+    monkeypatch.setattr(service, "_stop_unit", stopped.append)
+    monkeypatch.setattr(service, "_close_process", closed.append)
+    unit = f"agent-hub-preview-{'a' * 32}-{stage}.service"
+    if exit_code:
+        failure_type = mod.ProbeFailure if stage == "probe" else mod.PreviewStartupFailure
+        with pytest.raises(failure_type) as failure:
+            service._launch(session, stage)
+        assert failure.value.phase == ("runner_exit" if stage == "probe" else stage)
+        assert failure.value.reason == ("nonzero_exit" if stage == "probe" else "supervisor_exit")
+        assert session.units == {unit}
+        assert session.process is process
+        assert stopped == closed == []
+    else:
+        assert service._launch(session, stage) == result
+        assert stopped == [unit]
+        assert closed == [process]
+        assert not session.units
+        assert session.process is None
 
 
 @pytest.mark.parametrize("payload", [

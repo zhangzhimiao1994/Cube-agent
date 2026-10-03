@@ -594,7 +594,7 @@ class PreviewBroker:
             if process.wait(timeout=5) != 0:
                 if stage == "probe":
                     raise ProbeFailure("runner_exit", "nonzero_exit")
-                raise PreviewStartupFailure(stage, "nonzero_exit")
+                raise PreviewStartupFailure(stage, "supervisor_exit")
             self._stop_unit(unit)
             session.units.remove(unit)
             self._close_process(process)

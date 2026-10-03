@@ -73,6 +73,11 @@ def test_frames_are_length_bounded_and_strict() -> None:
     ("install", "nonzero_exit"), ("install_validate", "unsafe_tree"),
     ("install_handoff", "permission_denied"), ("build", "timeout"),
     ("start", "not_found"),
+    ("install", "storage_full"), ("install", "resource_limit"),
+    ("install", "registry_unavailable"), ("install", "dependency_unavailable"),
+    ("install", "dependency_conflict"), ("install", "package_invalid"),
+    ("install", "certificate_error"), ("install", "dependency_rejected"),
+    ("install", "supervisor_exit"),
 ])
 def test_startup_failure_preserves_only_validated_diagnostic(phase: str, reason: str) -> None:
     mod = runtime()

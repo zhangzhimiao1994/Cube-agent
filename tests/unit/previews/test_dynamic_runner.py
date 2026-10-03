@@ -324,6 +324,200 @@ def test_startup_runner_emits_only_fixed_failure_fields(
     assert b"sentinel" not in output.getvalue()
 
 
+def run_stage_with_logs(
+    monkeypatch: pytest.MonkeyPatch, stderr: tuple[bytes, ...], *,
+    stdout: tuple[bytes, ...] = (), stage: str = "install", exit_code: int = 1,
+    log_limit: int | None = None,
+) -> dict[str, object]:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    output = io.BytesIO()
+    cleaned: list[object] = []
+    killed: list[int] = []
+
+    class ChunkedPipe:
+        def __init__(self, chunks: tuple[bytes, ...]) -> None:
+            self.chunks = iter(chunks)
+            self.closed = False
+
+        def read(self, size: int) -> bytes:
+            chunk = next(self.chunks, b"")
+            assert len(chunk) <= size
+            return chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ImmediateThread:
+        def __init__(self, *, target: Any, args: tuple[object, ...], daemon: bool) -> None:
+            self.target, self.args = target, args
+
+        def start(self) -> None:
+            self.target(*self.args)
+
+        def join(self, timeout: float) -> None:
+            pass
+
+    child = SimpleNamespace(
+        pid=123, wait=lambda timeout: exit_code, poll=lambda: exit_code,
+        stdout=ChunkedPipe(stdout), stderr=ChunkedPipe(stderr),
+    )
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(
+        platform="linux", argv=["runner", stage], stdout=SimpleNamespace(buffer=output),
+    ))
+    monkeypatch.setattr(mod, "_ensure_work_directory", lambda path: None)
+    monkeypatch.setattr(mod, "_copy_source", lambda source, work: None)
+    monkeypatch.setattr(mod, "_spawn_application", lambda selected: child)
+    monkeypatch.setattr(mod, "_kill_child", cleaned.append)
+    monkeypatch.setattr(mod, "_kill_group", killed.append)
+    monkeypatch.setattr(mod.threading, "Thread", ImmediateThread)
+    if log_limit is not None:
+        monkeypatch.setattr(mod, "MAX_LOG", log_limit)
+    if exit_code == 0 and log_limit is None:
+        mod.main()
+    else:
+        with pytest.raises(SystemExit) as failure:
+            mod.main()
+        assert failure.value.code == 1
+    assert cleaned == [child]
+    assert child.stdout.closed and child.stderr.closed
+    assert bool(killed) is (log_limit is not None)
+    output.seek(0)
+    result: dict[str, object] = mod.read_frame(output)
+    assert not output.read(), "only one sanitized frame may leave the runner"
+    return result
+
+
+@pytest.mark.parametrize("prefix", [b"npm ERR! code ", b"npm error code "])
+@pytest.mark.parametrize("code,reason", [
+    (b"EACCES", "permission_denied"), (b"EPERM", "permission_denied"),
+    (b"ENOENT", "not_found"),
+    (b"ENOSPC", "storage_full"), (b"EROFS", "read_only"),
+    (b"ENOMEM", "resource_limit"), (b"EMFILE", "resource_limit"),
+    (b"ENFILE", "resource_limit"), (b"ENOTFOUND", "registry_unavailable"),
+    (b"EAI_AGAIN", "registry_unavailable"), (b"ECONNREFUSED", "registry_unavailable"),
+    (b"ECONNRESET", "registry_unavailable"), (b"ETIMEDOUT", "registry_unavailable"),
+    (b"ERR_SOCKET_TIMEOUT", "registry_unavailable"),
+    (b"E404", "dependency_unavailable"), (b"ETARGET", "dependency_unavailable"),
+    (b"ERESOLVE", "dependency_conflict"), (b"EJSONPARSE", "package_invalid"),
+    (b"ENOLOCK", "package_invalid"), (b"EPACKAGEJSON", "package_invalid"),
+    (b"CERT_HAS_EXPIRED", "certificate_error"),
+    (b"UNABLE_TO_VERIFY_LEAF_SIGNATURE", "certificate_error"),
+    (b"SELF_SIGNED_CERT_IN_CHAIN", "certificate_error"),
+    (b"DEPTH_ZERO_SELF_SIGNED_CERT", "certificate_error"),
+])
+def test_install_stderr_reports_only_fixed_npm_category(
+    monkeypatch: pytest.MonkeyPatch, prefix: bytes, code: bytes, reason: str,
+) -> None:
+    result = run_stage_with_logs(monkeypatch, (
+        b"/private/source token=sentinel\n", prefix + code + b"\n",
+        b"npm error path /private/cache token=sentinel\n",
+    ))
+    assert result == {
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": reason,
+    }
+
+
+@pytest.mark.parametrize("line,reason", [
+    (b"npm ERR! code ENOSPC\n", "storage_full"),
+    (b"npm error code ERESOLVE\r\n", "dependency_conflict"),
+    (b"npm error code ENOLOCK", "package_invalid"),
+    (b"generated dependency source rejected: /private/token=sentinel\n", "dependency_rejected"),
+    (b"generated dependency source rejected: /private/token=sentinel", "dependency_rejected"),
+])
+def test_install_diagnostic_handles_single_byte_chunks(
+    monkeypatch: pytest.MonkeyPatch, line: bytes, reason: str,
+) -> None:
+    result = run_stage_with_logs(monkeypatch, tuple(line[i:i + 1] for i in range(len(line))))
+    assert result == {
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": reason,
+    }
+
+
+@pytest.mark.parametrize("line", [
+    b"", b"unknown /private/path token=sentinel\n", b"npm error code EUNKNOWN\n",
+    b"npm error code /private/EACCES\n", b"npm error code EACCES token=sentinel\n",
+    b"npm error code EACCES/sentinel\n", b"prefix npm error code EACCES\n",
+    b"\x1b[31mnpm error code EACCES\x1b[0m\n", b"npm error code EACCES\x1b[0m\n",
+    b"npm error code \x1b[31mEACCES\n", b"npm error code EACCES\x00\n",
+    b"npm error code EACCES\rhidden\n", b"npm error code EACCES\xff\n",
+    b"generated dependency source rejected:/private/token=sentinel\n",
+    b"prefix generated dependency source rejected: sentinel\n",
+])
+def test_unknown_install_stderr_does_not_classify_or_leak(
+    monkeypatch: pytest.MonkeyPatch, line: bytes,
+) -> None:
+    assert run_stage_with_logs(monkeypatch, (line,) if line else ()) == {
+        "ok": False, "error": "preview startup failed", "phase": "install",
+        "reason": "nonzero_exit",
+    }
+
+
+@pytest.mark.parametrize("tail,reason", [
+    (b"npm error code EACCES\n", "nonzero_exit"),
+    (b"npm error code EACCES", "nonzero_exit"),
+    (b"npm error code EACCES\nnpm error code ENOSPC\n", "storage_full"),
+])
+def test_install_discards_entire_overlong_line_until_newline(
+    monkeypatch: pytest.MonkeyPatch, tail: bytes, reason: str,
+) -> None:
+    result = run_stage_with_logs(monkeypatch, (
+        b"generated dependency source rejected: " + b"x" * 1000,
+        b"x" * 4096, tail,
+    ))
+    assert result["reason"] == reason
+
+
+@pytest.mark.parametrize("length,reason", [(512, "dependency_rejected"), (513, "nonzero_exit")])
+def test_install_diagnostic_line_buffer_has_fixed_boundary(
+    monkeypatch: pytest.MonkeyPatch, length: int, reason: str,
+) -> None:
+    line = b"generated dependency source rejected: ".ljust(length, b"x")
+    result = run_stage_with_logs(monkeypatch, (line[:500], line[500:], b"\n"))
+    assert result["reason"] == reason
+
+
+@pytest.mark.parametrize("stage,stream", [
+    ("install", "stdout"), ("build", "stderr"), ("start", "stderr"),
+])
+@pytest.mark.parametrize("line", [
+    b"npm error code EACCES\n", b"generated dependency source rejected: sentinel\n",
+])
+def test_install_classification_is_restricted_to_install_stderr(
+    monkeypatch: pytest.MonkeyPatch, stage: str, stream: str, line: bytes,
+) -> None:
+    result = run_stage_with_logs(
+        monkeypatch, (line,) if stream == "stderr" else (),
+        stdout=(line,) if stream == "stdout" else (), stage=stage,
+    )
+    assert result["reason"] == "nonzero_exit"
+
+
+@pytest.mark.parametrize("line", [
+    b"npm error code EACCES\n", b"generated dependency source rejected: sentinel\n",
+])
+def test_successful_install_ignores_error_looking_stderr(
+    monkeypatch: pytest.MonkeyPatch, line: bytes,
+) -> None:
+    assert run_stage_with_logs(monkeypatch, (line,), exit_code=0) == {
+        "ok": True, "state": "prepared",
+    }
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("chunks", [
+    (b"npm error code EACCES\n", b"x" * 65),
+    (b"x" * 65 + b"\nnpm error code EACCES\n",),
+])
+def test_log_limit_takes_priority_over_install_classification(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, chunks: tuple[bytes, ...],
+) -> None:
+    assert run_stage_with_logs(monkeypatch, chunks, exit_code=exit_code, log_limit=64) == {
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": "log_limit",
+    }
+
+
 @pytest.mark.parametrize("error,reason", [
     (PermissionError("/private sentinel"), "permission_denied"),
     (FileNotFoundError("/private sentinel"), "not_found"),
