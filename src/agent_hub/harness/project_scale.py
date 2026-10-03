@@ -19,6 +19,11 @@ ProjectScaleRunMode = Literal["direct", "dispatch", "hybrid"]
 ProjectScaleBenchmarkKind = Literal["fixture", "capability"]
 
 PROJECT_SCALE_TIERS: tuple[ProjectScaleTier, ...] = ("small", "medium", "large", "ultra")
+PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE = (
+    "Include root-level VERIFICATION.md with reproducible build, test, and interaction commands; "
+    "mark checks not executed when they were not run. "
+    "Do not prefill pass records or fabricate execution. "
+)
 PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
     "direct",
     "dispatch",
@@ -451,6 +456,7 @@ def _capability_message(case: ProjectScaleCase) -> str:
     return (
         f"Build a real {case.scale} business project for flow={case.flow}. {requirements} "
         "Include npm run build, npm test, source, tests, README, plan and verification instructions. "
+        f"{PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE}"
         "The test runner, test API imports, and test configuration must agree: test APIs must "
         "either be imported explicitly or supplied by a verified runner globals setting. "
         "Project-local build and test executables referenced by npm scripts, such as tsc, "
@@ -472,6 +478,7 @@ __all__ = [
     "PROJECT_SCALE_FLOW_KINDS",
     "PROJECT_SCALE_REQUIRED_EVIDENCE",
     "PROJECT_SCALE_TIERS",
+    "PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE",
     "ProjectScaleBenchmarkKind",
     "ProjectScaleCase",
     "ProjectScaleFlow",

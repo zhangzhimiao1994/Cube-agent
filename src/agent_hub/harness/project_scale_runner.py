@@ -28,6 +28,7 @@ from agent_hub.harness.project_requirements import (
     validate_ultra_portfolio_api,
 )
 from agent_hub.harness.project_scale import (
+    PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE,
     ProjectScaleBenchmarkKind,
     ProjectScaleRunPlan,
     build_project_scale_run_plan,
@@ -4071,40 +4072,39 @@ def _deliverable_repair_body(
             "Return only complete changed files as workspace_bundle.files or ### `path` fences. "
             "Unchanged workspace files remain authoritative and will be merged with this patch; "
             "preserve their imports, exports, scripts, and public contracts. "
+            "If only the report is missing, return only VERIFICATION.md; do not rewrite source. "
             if incremental_repair
             else (
                 "Replace the entire workspace with one coherent implementation. Return full "
                 "workspace_bundle.files or ### `path` fences and omit obsolete files: "
-                "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md/"
-                "VERIFICATION.md/constraints_reading_evidence.json. "
+                "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md. "
                 f"{authoritative_preview_guidance}"
             )
         )
         guidance = (
             f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
             f"preserve requirements. {delivery_guidance}"
-            "File keys must be safe relative paths, not endpoints/URLs/HTTP methods. "
+            "File keys: safe relative paths, not endpoints/URLs/methods. "
             "JSON files must use strict JSON syntax with double-quoted keys and strings; "
-            "never return Python or JavaScript object-literal syntax in a .json file. "
-            "constraints_reading_evidence.json must include read_before_implementation:true, "
-            "constraints naming AGENTS.md workspace rules, HANDOFF, and PROJECT_REQUIREMENTS.md, "
-            "and skills/rules naming applicable SKILL.md or agent-standard rules. "
+            "no object literals. "
+            "constraints_reading_evidence.json: read_before_implementation:true; "
+            "constraints: AGENTS.md workspace rules, HANDOFF, PROJECT_REQUIREMENTS.md; "
+            "skills/rules: applicable SKILL.md or agent-standard rules. "
         )
         medium_guidance = (
-            "For medium CRM repairs, include GET /tenants/:tenant_id/opportunities returning "
-            "{items:[...]}; verify created/patched opportunities persist after restart. "
-            "POST and PATCH responses require the object itself with top-level id, "
-            "never {item:...}, {data:...}, or any wrapper. Medium CRM body fields are exact: "
+            "GET /tenants/:tenant_id/opportunities returns "
+            "{items:[...]}; created/patched opportunities persist after restart. "
+            "POST/PATCH: object with top-level id, "
+            "never {item:...}, {data:...}, or any wrapper. Bodies: "
             "accounts {name}; contacts {account_id,name,email}; opportunities "
             "{account_id,name,amount,stage}; PATCH opportunities {stage}; reminders "
             "{contact_id,due_at,note}; stages exactly open, won, lost. "
-            "Reference validation order is frozen: resolve account_id/contact_id inside "
-            "the URL tenant before validating unrelated fields; a missing or foreign "
+            "Reference validation order is frozen: resolve tenant-scoped account_id/contact_id "
+            "before validating unrelated fields; a missing or foreign "
             "reference returns 404 NOT_FOUND even if email, due_at, note, amount, or stage "
             "is absent or invalid. "
-            "Strict TypeScript: type Express route params with Request<{tenant_id:string,...}> "
-            "or an equivalent explicit type, not default {} params. Generated tests: validator "
-            "helpers that require a field argument must receive it or define safe defaults. "
+            "Route params: Request<{tenant_id:string,...}> or equivalent; not default {}. "
+            "Tests: validator helpers that require a field argument need it or defaults. "
         )
         small_guidance = (
             "For small file-backed task API repairs, use single-flight initialization and "
@@ -4159,7 +4159,7 @@ def _deliverable_repair_body(
         )
         guidance += (
             "package.json scripts: build, test, start. No ellipses or summaries in files. "
-            "Report executed checks only.\n"
+            f"{PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE}\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
         max_chars = 6_000 if context or scale == "ultra" else 2_000
@@ -5545,7 +5545,11 @@ def _workspace_bundle_text(archive: zipfile.ZipFile, names: Sequence[str]) -> st
 def _workspace_bundle_verification_text(archive: zipfile.ZipFile, names: Sequence[str]) -> str:
     chunks: list[str] = []
     for name in names:
-        if name.lower().rsplit("/", 1)[-1] not in _VERIFICATION_REPORT_BASENAMES:
+        lowered = name.lower()
+        if (
+            lowered.rsplit("/", 1)[-1] not in _VERIFICATION_REPORT_BASENAMES
+            and lowered not in _VERIFICATION_REPORT_PATHS
+        ):
             continue
         try:
             chunks.append(archive.read(name, pwd=None).decode("utf-8", errors="ignore")[:120_000])

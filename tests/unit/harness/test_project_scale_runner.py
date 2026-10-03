@@ -2691,6 +2691,159 @@ def test_capability_standard_accepts_completed_direct_runtime_trace_with_workspa
     assert check.reasons == ()
 
 
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+@pytest.mark.parametrize("delivery", ("incremental", "replacement", "forced_replacement"))
+def test_capability_repair_requires_canonical_report_without_changing_delivery(
+    scale: str, delivery: str,
+) -> None:
+    body: dict[str, object] = {
+        "message": f"Build a real {scale} business API.",
+        "mode": "hybrid",
+        "project_id": "report-contract",
+        "workspace_session_id": "report-contract-session",
+    }
+    bundle = _project_bundle({"src/main.ts": "export const value = 1;\n"})
+
+    repair = _deliverable_repair_body(
+        body,
+        f"{scale}:hybrid",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle if delivery != "replacement" else None,
+        force_workspace_replacement=delivery == "forced_replacement",
+        failed_reasons=("workspace_bundle: missing verification report artifact",),
+    )
+
+    message = str(repair["message"])
+    assert repair["mode"] == "hybrid"
+    assert repair["project_id"] == "report-contract"
+    assert repair["workspace_session_id"] == "report-contract-session"
+    assert repair["replace_workspace_files"] is (delivery != "incremental")
+    assert f"case_id={scale}:hybrid project_scale={scale} flow=hybrid" in message
+    assert "workspace_bundle.files" in message
+    assert "### `path` fences" in message
+    assert "root-level VERIFICATION.md" in message
+    assert "build, test, and interaction commands" in message
+    assert "package.json scripts: build, test, start" in message
+    if delivery == "incremental":
+        assert "Return only complete changed files" in message
+        assert "Unchanged workspace files remain authoritative" in message
+        assert "If only the report is missing, return only VERIFICATION.md" in message
+    else:
+        assert "Replace the entire workspace" in message
+    assert len(message) <= (6_000 if delivery != "replacement" or scale == "ultra" else 2_000)
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+@pytest.mark.parametrize("delivery", ("incremental", "replacement", "forced_replacement"))
+def test_capability_repair_requires_honest_unexecuted_checks(scale: str, delivery: str) -> None:
+    bundle = _project_bundle({"src/main.ts": "export const value = 1;\n"})
+
+    repair = _deliverable_repair_body(
+        {"message": f"Build a real {scale} business API.", "mode": "direct"},
+        f"{scale}:direct",
+        benchmark_kind="capability",
+        source_workspace_bundle=bundle if delivery != "replacement" else None,
+        force_workspace_replacement=delivery == "forced_replacement",
+        failed_reasons=("workspace_bundle: missing verification report artifact",),
+    )
+
+    message = str(repair["message"])
+    assert "mark checks not executed when they were not run" in message
+    assert "Do not prefill pass records or fabricate execution" in message
+    assert "all true" not in message
+
+
+@pytest.mark.parametrize("saturated_evidence", (False, True))
+def test_medium_compact_report_repair_preserves_complete_business_guidance(
+    saturated_evidence: bool,
+) -> None:
+    plan = build_project_scale_run_plan(
+        scales=("medium",), flows=("direct",), benchmark_kind="capability",
+    )
+    reasons = ["workspace_bundle: missing verification report artifact"]
+    if saturated_evidence:
+        reasons.insert(0, "generated_project_validation: " + "compile evidence " * 100)
+
+    repair = _deliverable_repair_body(
+        dict(plan.requests[0].body), "medium:direct", benchmark_kind="capability",
+        failed_reasons=tuple(reasons),
+    )
+
+    message = str(repair["message"])
+    assert len(message) <= 2_000
+    assert "Reference validation order is frozen" in message
+    assert "before validating unrelated fields" in message
+    assert "even if email, due_at, note, amount, or stage is absent or invalid" in message
+    assert "Request<{tenant_id:string,...}>" in message
+    assert "root-level VERIFICATION.md" in message
+    assert "mark checks not executed when they were not run" in message
+    assert "Do not prefill pass records or fabricate execution" in message
+    assert "constraints_reading_evidence.json" in message
+    assert "read_before_implementation:true" in message
+    assert "AGENTS.md workspace rules, HANDOFF, PROJECT_REQUIREMENTS.md" in message
+    assert "applicable SKILL.md or agent-standard rules" in message
+
+
+def test_report_only_incremental_patch_preserves_source_and_package() -> None:
+    source = "export const value = 1;\n"
+    package = '{"scripts":{"build":"tsc","test":"node --test","start":"node dist/main.js"}}'
+    report = "Build, test, and interaction checks not executed; run npm run build and npm test.\n"
+    base = _project_bundle({"src/main.ts": source, "package.json": package})
+
+    merged = project_scale_runner_module._merged_workspace_bundle(
+        base, _project_bundle({"VERIFICATION.md": report})
+    )
+
+    assert merged is not None
+    with zipfile.ZipFile(BytesIO(merged)) as archive:
+        assert set(archive.namelist()) == {"src/main.ts", "package.json", "VERIFICATION.md"}
+        assert archive.read("src/main.ts").decode("utf-8") == source
+        assert archive.read("package.json").decode("utf-8") == package
+        assert archive.read("VERIFICATION.md").decode("utf-8") == report
+
+
+@pytest.mark.parametrize("report_path", (
+    "VERIFICATION.md", "docs/verification-report.md", "VERIFICATION_REPORT.md",
+    "test-report.md", "test_report.md", "acceptance-report.md", "acceptance_report.md",
+    "validation.md", "verification/report.md", "Verification/REPORT.md",
+))
+def test_recognized_verification_report_body_supplies_execution_evidence(report_path: str) -> None:
+    bundle = _project_bundle({
+        "README.md": "# Task API\n",
+        "src/main.js": _functional_js_source(),
+        "tests/main.test.js": _functional_js_test(),
+        "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+        report_path: "- npm run build: passed exit 0\n- npm test: passed exit 0\n"
+        "- interaction smoke: passed\n",
+    })
+
+    assert _workspace_bundle_agent_standard_reasons(bundle) == ()
+    assert project_scale_runner_module._workspace_bundle_project_quality_reasons(bundle) == ()
+
+
+@pytest.mark.parametrize("report_path", (
+    "report.md", "docs/report.md", "other/report.md", "docs/verification/report.md", "README.md",
+))
+def test_unrecognized_report_body_cannot_supply_execution_evidence(report_path: str) -> None:
+    files = {
+        "README.md": "# Task API\n",
+        "src/main.js": _functional_js_source(),
+        "tests/main.test.js": _functional_js_test(),
+        "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+    }
+    files[report_path] = (
+        "- npm run build: passed exit 0\n- npm test: passed exit 0\n- interaction smoke: passed\n"
+    )
+    bundle = _project_bundle(files)
+
+    assert "workspace_bundle: missing verification report artifact" in (
+        _workspace_bundle_agent_standard_reasons(bundle)
+    )
+    reasons = project_scale_runner_module._workspace_bundle_project_quality_reasons(bundle)
+    assert "workspace_bundle: missing build/test execution evidence" in reasons
+    assert "workspace_bundle: missing interaction execution evidence" in reasons
+
+
 def test_workspace_bundle_accepts_report_inside_verification_directory() -> None:
     bundle = _project_bundle(
         {

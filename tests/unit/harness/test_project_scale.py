@@ -1,4 +1,30 @@
+import pytest
+
 from agent_hub.harness.project_scale import build_project_scale_run_plan
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+def test_capability_request_requires_canonical_verification_report(scale: str) -> None:
+    plan = build_project_scale_run_plan(
+        scales=(scale,), flows=("direct",), benchmark_kind="capability"
+    )
+
+    message = str(plan.requests[0].body["message"])
+
+    assert "root-level VERIFICATION.md" in message
+    assert "build, test, and interaction commands" in message
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+def test_capability_request_requires_honest_unexecuted_checks(scale: str) -> None:
+    plan = build_project_scale_run_plan(
+        scales=(scale,), flows=("direct",), benchmark_kind="capability"
+    )
+
+    message = str(plan.requests[0].body["message"])
+
+    assert "mark checks not executed when they were not run" in message
+    assert "Do not prefill pass records or fabricate execution" in message
 
 
 def test_project_scale_plan_defaults_to_fixture_benchmark_payload() -> None:
