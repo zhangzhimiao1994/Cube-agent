@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -215,6 +216,16 @@ class CapacityStub:
             await self.record_block.wait()
         if self.record_error is not None:
             raise self.record_error
+
+
+class CongestedCapacityStub(CapacityStub):
+    async def acquire(
+        self, candidates: Sequence[Deployment], wait_timeout: float, *,
+        estimated_tokens: int | Mapping[str, int],
+    ) -> CapacityLease:
+        if not self.outcomes:
+            self.outcomes.append(CapacityWaitTimeout("busy"))
+        return await super().acquire(candidates, wait_timeout, estimated_tokens=estimated_tokens)
 
 
 class FingerprintSensitiveCapacity(CapacityStub):
@@ -856,7 +867,10 @@ async def test_streaming_gateway_reports_capacity_fallback_before_backup_output(
     ]
 
 
-async def test_streaming_gateway_early_close_records_failure_and_releases_capacity() -> None:
+@pytest.mark.parametrize("latency", [0.25, 239.483])
+async def test_streaming_gateway_early_close_is_health_neutral_and_releases_capacity(
+    latency: float,
+) -> None:
     selected = deployment("selected", provider_model="deepseek/deepseek-chat")
     selected_lease = lease("selected")
     capacity = CapacityStub([selected_lease])
@@ -872,7 +886,7 @@ async def test_streaming_gateway_early_close_records_failure_and_releases_capaci
         capacity,
         SecretStub(capacity.events),
         transport,
-        monotonic=monotonic([50.0, 50.25]),
+        monotonic=monotonic([50.0, 50.0 + latency]),
     )
     stream = gateway.stream_openai_compatible_events(request())
 
@@ -881,7 +895,7 @@ async def test_streaming_gateway_early_close_records_failure_and_releases_capaci
 
     assert first.kind == "model.text_delta"
     assert first.payload == {"text": "first"}
-    assert capacity.records == [("scope-selected", None, 0.25, False)]
+    assert capacity.records == []
     assert capacity.releases == [selected_lease]
     assert transport.stream.closed is True
 
@@ -915,7 +929,10 @@ async def test_streaming_gateway_close_failure_does_not_replace_transport_error(
     assert len(capacity.releases) == 1
 
 
-async def test_streaming_gateway_cancellation_while_waiting_cleans_pending_chunk_task() -> None:
+@pytest.mark.parametrize("latency", [0.4, 239.483])
+async def test_streaming_gateway_cancellation_while_waiting_cleans_pending_chunk_task(
+    latency: float,
+) -> None:
     selected = deployment("selected", provider_model="deepseek/deepseek-chat")
     selected_lease = lease("selected")
     capacity = CapacityStub([selected_lease])
@@ -931,7 +948,7 @@ async def test_streaming_gateway_cancellation_while_waiting_cleans_pending_chunk
         capacity,
         SecretStub(capacity.events),
         transport,
-        monotonic=monotonic([70.0, 70.4]),
+        monotonic=monotonic([70.0, 70.0 + latency]),
     )
 
     async def consume() -> None:
@@ -946,10 +963,7 @@ async def test_streaming_gateway_cancellation_while_waiting_cleans_pending_chunk
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
-        ("scope-selected", None, False)
-    ]
-    assert capacity.records[0][2] == pytest.approx(0.4)
+    assert capacity.records == []
     assert capacity.releases == [selected_lease]
     assert transport.stream.closed is True
     assert transport.stream.cancelled.is_set()
@@ -1930,18 +1944,23 @@ async def test_completion_cost_uses_pricing_from_deployment_configuration() -> N
 async def test_no_fallback_when_request_disallows_it() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([CapacityWaitTimeout("busy")])
+    capacity = CongestedCapacityStub([])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
         SecretStub(capacity.events),
         TransportStub(capacity.events),
         fallbacks={"primary": "backup"},
+        capacity_wait_timeout=0.05,
     )
 
     with pytest.raises(CapacityUnavailable, match="model capacity unavailable"):
-        await gateway.complete(request(allow_fallback=False))
-    assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
+        await gateway.complete(replace(request(allow_fallback=False), timeout_seconds=0.2))
+    attempts = [
+        event for event in capacity.events if isinstance(event, tuple) and event[0] == "acquire"
+    ]
+    assert attempts
+    assert all(event[1] == ("primary-key",) for event in attempts)
 
 
 async def test_fallback_must_satisfy_request_capabilities() -> None:
@@ -1949,18 +1968,25 @@ async def test_fallback_must_satisfy_request_capabilities() -> None:
         "primary-key", capabilities=frozenset({ModelCapability.TEXT, ModelCapability.VISION})
     )
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([CapacityWaitTimeout("busy")])
+    capacity = CongestedCapacityStub([])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
         SecretStub(capacity.events),
         TransportStub(capacity.events),
         fallbacks={"primary": "backup"},
+        capacity_wait_timeout=0.05,
     )
 
     with pytest.raises(CapacityUnavailable, match="model capacity unavailable"):
-        await gateway.complete(request(required=frozenset({ModelCapability.VISION})))
-    assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
+        await gateway.complete(replace(
+            request(required=frozenset({ModelCapability.VISION})), timeout_seconds=0.2,
+        ))
+    attempts = [
+        event for event in capacity.events if isinstance(event, tuple) and event[0] == "acquire"
+    ]
+    assert attempts
+    assert all(event[1] == ("primary-key",) for event in attempts)
 
 
 async def test_capability_unavailable_primary_uses_capable_fallback_model() -> None:

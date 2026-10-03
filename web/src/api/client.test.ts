@@ -1936,6 +1936,23 @@ describe("api client transport", () => {
 });
 
 describe("web preview transport", () => {
+  it.each([new TypeError("terminated"), new DOMException("aborted", "AbortError")])(
+    "classifies an interrupted response body as a network error",
+    async (error) => {
+      const response = new Response("", { status: 201 });
+      vi.spyOn(response, "json").mockRejectedValue(error);
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+      await expect(api.startWebPreview({ conversation_id: "conv", project_id: "project",
+        workspace_session_id: "session" })).rejects.toMatchObject({ status: 0, code: "network_error" });
+    },
+  );
+
+  it("does not misclassify invalid JSON as a network interruption", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not json", { status: 201 })));
+    await expect(api.startWebPreview({ conversation_id: "conv", project_id: "project",
+      workspace_session_id: "session" })).rejects.toBeInstanceOf(SyntaxError);
+  });
+
   it("supports starting, reading, renewing, and stopping a conversation preview", async () => {
     const preview = {
       id: "preview-1",

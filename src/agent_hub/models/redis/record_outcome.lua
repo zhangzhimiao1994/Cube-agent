@@ -32,7 +32,9 @@ local p95 = numeric[p95_index] or 0
 local current = tonumber(redis.call('HGET', KEYS[1], 'effective')) or base_limit
 current = math.max(1, math.min(current, base_limit))
 local cooldown_until = tonumber(redis.call('HGET', KEYS[1], 'cooldown_until_ms')) or 0
-local unhealthy = status == 429 or status == 503 or p95 > latency_threshold_ms
+-- Full successful generation time is not provider queue latency. Keep p95 observational.
+local unhealthy = status == 429 or status == 503
+    or (succeeded == 0 and latency_ms > latency_threshold_ms)
 if unhealthy then
     current = math.max(1, math.floor(current / 2))
     cooldown_until = math.max(cooldown_until, now_ms + cooldown_ms)

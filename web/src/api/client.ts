@@ -1940,7 +1940,15 @@ async function request<T>(
   if (!response.ok) {
     throw await errorFromResponse(response);
   }
-  const payload = await response.json();
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    if (error instanceof TypeError || (error instanceof DOMException && error.name === "AbortError")) {
+      throw new ApiError("network response interrupted", 0, "network_error");
+    }
+    throw error;
+  }
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     throw new ApiError(

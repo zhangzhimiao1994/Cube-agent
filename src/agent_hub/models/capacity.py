@@ -19,6 +19,8 @@ _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9:_-]{1,128}$")
 _SAFE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _STATE_TTL_MS = 3_600_000
 _MAX_OWNER_RECORDS = 4096
+_LEASE_CLEANUP_TIMEOUT = 1.0
+_REGISTRATION_CLEANUP_TIMEOUT = 5.0
 
 
 def _deployment_token_estimates(
@@ -304,6 +306,7 @@ class CapacityPool:
         self._owner_id = configured_owner
         self._waiters = 0
         self._waiter_lock = asyncio.Lock()
+        self._lease_cleanups: set[asyncio.Task[None]] = set()
         self._registration_lock = asyncio.Lock()
         self._scope_policies: dict[str, _ScopePolicy] = {}
         self._catalog_by_id: dict[str, Deployment] = {}
@@ -563,7 +566,10 @@ class CapacityPool:
     async def _registration_eval(
         self, script: str, key_count: int, *args: object
     ) -> tuple[object, asyncio.CancelledError | None]:
-        task = asyncio.create_task(self._redis.eval(script, key_count, *args))
+        task = asyncio.create_task(asyncio.wait_for(
+            self._redis.eval(script, key_count, *args),
+            timeout=min(_REGISTRATION_CLEANUP_TIMEOUT, self._lease_ms / 1000),
+        ))
         try:
             return await asyncio.shield(task), None
         except asyncio.CancelledError as cancellation:
@@ -586,7 +592,7 @@ class CapacityPool:
                     await self._redis.eval(
                         _ROLLBACK_FINGERPRINT_SCRIPT, 2, *claim_keys, owner
                     )
-                except BaseException as cleanup_error:  # noqa: BLE001 - best effort rollback
+                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
                     del cleanup_error
             for keys in reversed(policies):
                 try:
@@ -596,10 +602,12 @@ class CapacityPool:
                         *self._policy_registration_keys(keys),
                         owner,
                     )
-                except BaseException as cleanup_error:  # noqa: BLE001 - best effort rollback
+                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
                     del cleanup_error
 
-        task = asyncio.create_task(cleanup())
+        task = asyncio.create_task(asyncio.wait_for(
+            cleanup(), timeout=min(_REGISTRATION_CLEANUP_TIMEOUT, self._lease_ms / 1000),
+        ))
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -607,6 +615,8 @@ class CapacityPool:
                 await asyncio.shield(task)
             except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary outcome
                 del cleanup_error
+        except Exception as cleanup_error:  # noqa: BLE001 - preserve primary outcome
+            del cleanup_error
 
     def _clock_now(self) -> float:
         value = self._monotonic()
@@ -652,11 +662,18 @@ class CapacityPool:
                 raise CapacityQueueFull("model capacity queue is full")
             self._waiters += 1
         try:
-            deadline = asyncio.get_running_loop().time() + float(wait_timeout)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(wait_timeout)
+            # Zero wait still permits one bounded, non-polling admission scan.
+            rpc_deadline = deadline if wait_timeout else loop.time() + self._poll_interval
             while True:
                 for deployment in self._ordered_candidates(ordered):
+                    remaining = rpc_deadline - loop.time()
+                    if remaining <= 0:
+                        raise CapacityWaitTimeout("model capacity queue timeout")
                     lease = await self._try_acquire(
-                        deployment, token_estimates[deployment.id]
+                        deployment, token_estimates[deployment.id],
+                        timeout=remaining,
                     )
                     if lease is not None:
                         return lease
@@ -696,29 +713,37 @@ class CapacityPool:
         return selected
 
     async def _try_acquire(
-        self, deployment: Deployment, estimated_tokens: int
+        self, deployment: Deployment, estimated_tokens: int, *, timeout: float,
     ) -> CapacityLease | None:
         lease_id = str(uuid4())
         keys = self._keys(deployment.quota_scope_id)
         started = self._clock_now()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         try:
-            result = await self._redis.eval(
-                _ACQUIRE_SCRIPT,
-                5,
-                keys["leases"],
-                keys["rpm"],
-                keys["tpm"],
-                keys["health"],
-                keys["policy"],
-                lease_id,
-                self._lease_ms,
-                estimated_tokens,
-                _STATE_TTL_MS,
+            result = await asyncio.wait_for(
+                self._redis.eval(
+                    _ACQUIRE_SCRIPT,
+                    5,
+                    keys["leases"],
+                    keys["rpm"],
+                    keys["tpm"],
+                    keys["health"],
+                    keys["policy"],
+                    lease_id,
+                    self._lease_ms,
+                    estimated_tokens,
+                    _STATE_TTL_MS,
+                ),
+                timeout=timeout,
             )
         except asyncio.CancelledError:
-            await self._release_id_ignoring_errors(keys["leases"], lease_id)
+            await self._release_id_ignoring_errors(keys["leases"], lease_id, timeout=0)
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
+            await self._release_id_ignoring_errors(
+                keys["leases"], lease_id, timeout=max(0, deadline - loop.time()),
+            )
             raise CapacityBackendError("model capacity backend unavailable") from None
         try:
             acquired, active, _effective, final_value = self._integer_result(result, 4)
@@ -732,12 +757,16 @@ class CapacityPool:
             if acquired != 1 or final_value <= 0:
                 raise CapacityBackendError("model capacity backend returned invalid state")
         except CapacityBackendError:
-            await self._release_id_ignoring_errors(keys["leases"], lease_id)
+            await self._release_id_ignoring_errors(
+                keys["leases"], lease_id, timeout=max(0, deadline - loop.time()),
+            )
             raise
         try:
             renewal_delay = self._safe_renewal_delay(started)
         except CapacityConfigurationError:
-            await self._release_id_ignoring_errors(keys["leases"], lease_id)
+            await self._release_id_ignoring_errors(
+                keys["leases"], lease_id, timeout=max(0, deadline - loop.time()),
+            )
             raise
         return CapacityLease(
             id=lease_id,
@@ -757,7 +786,7 @@ class CapacityPool:
             )
             removed = self._strict_redis_int(result)
         except asyncio.CancelledError:
-            await self._release_id_ignoring_errors(key, lease.id)
+            await self._release_id_ignoring_errors(key, lease.id, timeout=0)
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
             raise CapacityBackendError("model capacity backend unavailable") from None
@@ -769,19 +798,24 @@ class CapacityPool:
             )
         return bool(removed)
 
-    async def _release_id_ignoring_errors(self, key: str, lease_id: str) -> None:
-        cleanup = asyncio.create_task(
-            self._redis.eval(_RELEASE_SCRIPT, 1, key, lease_id, _STATE_TTL_MS)
-        )
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
+    async def _release_id_ignoring_errors(
+        self, key: str, lease_id: str, *, timeout: float,
+    ) -> None:
+        async def release() -> None:
             try:
-                await cleanup
+                await asyncio.wait_for(
+                    self._redis.eval(_RELEASE_SCRIPT, 1, key, lease_id, _STATE_TTL_MS),
+                    timeout=min(_LEASE_CLEANUP_TIMEOUT, self._lease_ms / 1000),
+                )
             except Exception as cleanup_error:  # noqa: BLE001 - best effort cleanup
                 del cleanup_error
-        except Exception as cleanup_error:  # noqa: BLE001 - preserve primary outcome
-            del cleanup_error
+
+        # Retain bounded cleanup after the caller's budget/cancellation, without
+        # prolonging admission. The lease TTL still fences an unreachable Redis.
+        cleanup = asyncio.create_task(release())
+        self._lease_cleanups.add(cleanup)
+        cleanup.add_done_callback(self._lease_cleanups.discard)
+        await asyncio.wait({cleanup}, timeout=timeout)
 
     async def renew(self, lease: CapacityLease) -> CapacityLease | None:
         if not isinstance(lease, CapacityLease):
@@ -1070,11 +1104,17 @@ class _CapacityScopeView:
                 raise CapacityQueueFull("model capacity queue is full")
             root._waiters += 1
         try:
-            deadline = asyncio.get_running_loop().time() + float(wait_timeout)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(wait_timeout)
+            rpc_deadline = deadline if wait_timeout else loop.time() + root._poll_interval
             while True:
                 for deployment in root._ordered_candidates(ordered):
+                    remaining = rpc_deadline - loop.time()
+                    if remaining <= 0:
+                        raise CapacityWaitTimeout("model capacity queue timeout")
                     lease = await root._try_acquire(
-                        deployment, token_estimates[deployment.id]
+                        deployment, token_estimates[deployment.id],
+                        timeout=remaining,
                     )
                     if lease is not None:
                         return lease

@@ -46,11 +46,12 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       if (req.url === '/child') {
         res.setHeader('Content-Type', 'text/html');
         res.setHeader('Content-Security-Policy', "sandbox allow-scripts allow-forms; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'");
-        res.end(`<!doctype html><head>${shim}</head><body><button id="create">Create</button><button id="modify">Modify</button><button id="delete">Delete</button><output id="result"></output><script>
-          document.querySelector('#create').onclick=async()=>{const r=await fetch(location.origin+'/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'Actual fixture task'})});document.querySelector('#result').textContent=(await r.json()).title;};
-          document.querySelector('#modify').onclick=async()=>{const r=await fetch('/tasks/1',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({done:true})});document.querySelector('#result').textContent=String((await r.json()).done);};
-          document.querySelector('#delete').onclick=async()=>{const r=await fetch('/tasks/1',{method:'DELETE'});document.querySelector('#result').textContent=String(r.status);};
-          fetch('/tasks?q=one').then(r=>r.json()).then(()=>{document.body.dataset.initial='ready';}).catch(()=>{document.body.dataset.initial='failed';});
+        res.end(`<!doctype html><head>${shim}</head><body><input id="apiBase" type="url" aria-label="API Base" value=""><button id="create">Create</button><button id="modify">Modify</button><button id="delete">Delete</button><output id="result"></output><script>
+          const api=(path,init)=>fetch(document.querySelector('#apiBase').value.trim()+path,init);
+          document.querySelector('#create').onclick=async()=>{const r=await api('/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'Actual fixture task'})});document.querySelector('#result').textContent=(await r.json()).title;};
+          document.querySelector('#modify').onclick=async()=>{const r=await api('/tasks/1',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({done:true})});document.querySelector('#result').textContent=String((await r.json()).done);};
+          document.querySelector('#delete').onclick=async()=>{const r=await api('/tasks/1',{method:'DELETE'});document.querySelector('#result').textContent=String(r.status);};
+          api('/tasks?q=one').then(r=>r.json()).then(()=>{document.body.dataset.initial='ready';}).catch(()=>{document.body.dataset.initial='failed';});
         </script><script src="/slow.js"></script></body>`); return;
       }
       if (req.url === '/slow.js') {
@@ -74,18 +75,26 @@ for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 
       const page = await browser.newPage({ viewport });
       await page.goto(`http://127.0.0.1:${server.address().port}/parent`);
       const frame = page.frameLocator('#frame');
+      assert.equal(await frame.locator('#apiBase').count(), 1);
+      assert.equal(await frame.locator('#apiBase').inputValue(), '');
+      assert.equal(await frame.locator('#apiBase').evaluate(input => input.checkValidity()), true);
       await frame.locator('body[data-initial="ready"]').waitFor({ timeout: 3000 });
       await frame.locator('#create').click(); await frame.locator('#result').filter({ hasText: 'Actual fixture task' }).waitFor();
       await frame.locator('#modify').click(); await frame.locator('#result').filter({ hasText: 'true' }).waitFor();
       await frame.locator('#delete').click(); await frame.locator('#result').filter({ hasText: '204' }).waitFor();
       const child = page.frames()[1];
       const data = await child.evaluate(async () => {
-        const get = await fetch('/tasks?q=one'); const conflict = await fetch('/fail');
+        const get = await fetch(location.origin + '/tasks?q=one'); const conflict = await fetch('/fail');
         let externalRejected = false; try { await fetch('https://external.invalid/'); } catch { externalRejected = true; }
+        const loopbackErrors = [];
+        for (const base of ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000']) {
+          try { await fetch(base + '/tasks'); loopbackErrors.push('unexpected success'); }
+          catch (error) { loopbackErrors.push(error.message); }
+        }
         let cookiesBlocked = false; try { document.cookie; } catch { cookiesBlocked = true; }
-        return { items: await get.json(), conflict: conflict.status, cookiesBlocked, externalRejected, token: typeof window.agent_hub_access_token };
+        return { items: await get.json(), conflict: conflict.status, cookiesBlocked, externalRejected, loopbackErrors, token: typeof window.agent_hub_access_token };
       });
-      assert.deepEqual(data, { items: [], conflict: 409, cookiesBlocked: true, externalRejected: true, token: 'undefined' });
+      assert.deepEqual(data, { items: [], conflict: 409, cookiesBlocked: true, externalRejected: true, loopbackErrors: Array(3).fill('Only this preview application is accessible'), token: 'undefined' });
       assert.deepEqual(actualRequests.map(r => r.method), ['GET', 'POST', 'PATCH', 'DELETE', 'GET', 'GET']);
       const queryStart = actualRequests.length;
       for (const inputKind of ['root', 'content-prefix', 'request']) {

@@ -3650,6 +3650,12 @@ function isActiveWebPreview(preview: WebPreview | null): preview is WebPreview {
   return preview?.status === "starting" || preview?.status === "ready" || preview?.status === "stopping";
 }
 
+function isUncertainWebPreviewError(error: unknown): boolean {
+  return error instanceof ApiError
+    && !["dynamic_preview_unavailable", "preview_cleanup_pending"].includes(error.code)
+    && (error.code === "network_error" || error.status >= 500);
+}
+
 function webPreviewStatusText(status: WebPreview["status"]): string {
   const labels: Record<WebPreview["status"], string> = {
     starting: "网站服务正在启动",
@@ -3677,9 +3683,20 @@ export function WebsiteServicePreview({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const previewRef = useRef<WebPreview | null>(null);
+  const [recovery, setRecovery] = useState<"checking" | "unknown" | null>(null);
+  const generationRef = useRef(0);
+  const recoveryGenerationRef = useRef<number | null>(null);
+  const startRequestedRef = useRef(false);
+  const pendingQueryRef = useRef<{ generation: number; promise: Promise<WebPreview | null> } | null>(null);
   const stopRequestedRef = useRef(new Set<string>());
   const mountedRef = useRef(true);
   const conversationRef = useRef("");
+  const scopeKey = JSON.stringify([scope?.conversationId, scope?.projectId, scope?.workspaceSessionId, root]);
+  const isCurrent = (generation: number) => mountedRef.current && generationRef.current === generation;
+  const updatePreview = (current: WebPreview | null) => {
+    previewRef.current = current;
+    setPreview(current);
+  };
 
   const stopPreview = (current: WebPreview, keepalive = false) => {
     if (stopRequestedRef.current.has(current.id)) return Promise.resolve(current);
@@ -3695,7 +3712,10 @@ export function WebsiteServicePreview({
   }, [preview]);
 
   useEffect(() => {
-    let active = true;
+    const generation = ++generationRef.current;
+    recoveryGenerationRef.current = null;
+    startRequestedRef.current = false;
+    pendingQueryRef.current = null;
     const conversationId = scope?.conversationId.trim() ?? "";
     const previousConversationId = conversationRef.current;
     conversationRef.current = conversationId;
@@ -3707,47 +3727,99 @@ export function WebsiteServicePreview({
     ) {
       void stopPreview(previousPreview).catch(() => undefined);
     }
-    setPreview(null);
+    updatePreview(null);
+    setRecovery(null);
     setError(null);
+    setLoading(false);
     if (!conversationId) return () => {
-      active = false;
+      generationRef.current++;
     };
     setLoading(true);
     void api
       .webPreviewForConversation(conversationId)
       .then((current) => {
-        if (active) setPreview(current);
+        if (isCurrent(generation)) updatePreview(current);
       })
       .catch((caught) => {
-        if (active) setError(formatApiError(caught, "网站预览状态读取失败"));
+        if (isCurrent(generation)) setError(formatApiError(caught, "网站预览状态读取失败"));
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (isCurrent(generation)) setLoading(false);
       });
     return () => {
-      active = false;
+      generationRef.current++;
     };
-  }, [scope?.conversationId]);
+  }, [scopeKey]);
 
+  const checking = recovery === "checking" || (recovery === null && preview?.status === "starting");
   useEffect(() => {
-    if (preview?.status !== "starting" || !scope?.conversationId.trim()) return undefined;
-    const timer = window.setTimeout(() => {
-      void api
-        .webPreviewForConversation(scope.conversationId)
-        .then((current) => setPreview(current))
-        .catch((caught) => setError(formatApiError(caught, "网站预览状态刷新失败")));
-    }, 1500);
-    return () => window.clearTimeout(timer);
-  }, [preview?.status, scope?.conversationId]);
+    if (!checking || !scope?.conversationId.trim()) return undefined;
+    const generation = generationRef.current;
+    if (recovery ? recoveryGenerationRef.current !== generation : previewRef.current?.status !== "starting") return undefined;
+    recoveryGenerationRef.current = generation;
+    const conversationId = scope.conversationId;
+    let active = true;
+    let timer: number | undefined;
+    const deadline = window.setTimeout(() => {
+      if (!active || !isCurrent(generation)) return;
+      active = false;
+      window.clearTimeout(timer);
+      setRecovery("unknown");
+    }, 300_000);
+    const poll = async () => {
+      if (!active || !isCurrent(generation)) return;
+      // A timed-out round may still have a GET in flight. Continuing reuses it.
+      const pending = pendingQueryRef.current?.generation === generation
+        ? pendingQueryRef.current
+        : { generation, promise: api.webPreviewForConversation(conversationId) };
+      pendingQueryRef.current = pending;
+      try {
+        const current = await pending.promise;
+        if (!active || !isCurrent(generation)) return;
+        if (current && current.status !== "starting") {
+          active = false;
+          window.clearTimeout(deadline);
+          startRequestedRef.current = false;
+          updatePreview(current);
+          setRecovery(null);
+          setError(current.status === "failed" ? "网站服务启动失败，已保留静态预览" : null);
+          return;
+        }
+        if (current) updatePreview(current);
+      } catch (caught) {
+        if (!active || !isCurrent(generation)) return;
+        if (!isUncertainWebPreviewError(caught)) {
+          active = false;
+          window.clearTimeout(deadline);
+          startRequestedRef.current = false;
+          updatePreview(null);
+          setRecovery(null);
+          setError(formatApiError(caught, "网站预览状态确认失败"));
+          return;
+        }
+      } finally {
+        if (pendingQueryRef.current === pending) pendingQueryRef.current = null;
+      }
+      if (active && isCurrent(generation)) timer = window.setTimeout(() => void poll(), 1500);
+    };
+    void poll();
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      window.clearTimeout(deadline);
+    };
+  }, [checking, scopeKey]);
 
   useEffect(() => {
     if (preview?.status !== "ready") return undefined;
+    const generation = generationRef.current;
     const timer = window.setInterval(() => {
       void api
         .renewWebPreview(preview.id)
-        .then((renewed) => setPreview(renewed))
+        .then((renewed) => { if (isCurrent(generation)) updatePreview(renewed); })
         .catch((caught) => {
-          setPreview(null);
+          if (!isCurrent(generation)) return;
+          updatePreview(null);
           setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
         });
     }, 60_000);
@@ -3772,7 +3844,9 @@ export function WebsiteServicePreview({
   }, []);
 
   const start = async () => {
-    if (!scope) return;
+    if (!scope || loading || recovery || startRequestedRef.current) return;
+    startRequestedRef.current = true;
+    const generation = ++generationRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -3782,41 +3856,63 @@ export function WebsiteServicePreview({
         workspace_session_id: scope.workspaceSessionId,
         ...(root ? { root } : {}),
       });
-      if (!mountedRef.current) {
+      if (!isCurrent(generation)) {
         await stopPreview(started).catch(() => undefined);
         return;
       }
       stopRequestedRef.current.delete(started.id);
-      setPreview(started);
+      startRequestedRef.current = false;
+      updatePreview(started);
     } catch (caught) {
-      if (mountedRef.current) {
-        setError(formatApiError(caught, "网站服务启动失败，已保留静态预览"));
+      if (isCurrent(generation)) {
+        if (isUncertainWebPreviewError(caught)) {
+          recoveryGenerationRef.current = generation;
+          setRecovery("checking");
+        } else {
+          startRequestedRef.current = false;
+          setError(formatApiError(caught, "网站服务启动失败，已保留静态预览"));
+        }
       }
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (isCurrent(generation)) setLoading(false);
     }
   };
 
   const stop = async () => {
     if (!preview || !isActiveWebPreview(preview)) return;
+    const generation = ++generationRef.current;
+    setRecovery(null);
+    startRequestedRef.current = false;
+    updatePreview({ ...preview, status: "stopping" });
     setLoading(true);
     setError(null);
     try {
-      setPreview(await stopPreview(preview));
+      const stopped = await stopPreview(preview);
+      if (isCurrent(generation)) updatePreview(stopped);
     } catch (caught) {
-      setPreview(null);
-      setError(formatApiError(caught, "网站预览停止失败"));
+      if (isCurrent(generation)) {
+        updatePreview(null);
+        setError(formatApiError(caught, "网站预览停止失败"));
+      }
     } finally {
-      setLoading(false);
+      if (isCurrent(generation)) setLoading(false);
     }
+  };
+
+  const renewPreview = (current: WebPreview) => {
+    const generation = generationRef.current;
+    void api.renewWebPreview(current.id).then((renewed) => {
+      if (isCurrent(generation)) updatePreview(renewed);
+    }).catch((caught) => {
+      if (!isCurrent(generation)) return;
+      updatePreview(null);
+      setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
+    });
   };
 
   const openInNewWindow = () => {
     if (!preview?.preview_url) return;
-    void api.renewWebPreview(preview.id).then(setPreview).catch((caught) => {
-      setPreview(null);
-      setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
-    });
+    renewPreview(preview);
     if (preview.application_transport && scope) {
       const opened = window.open(`/website-preview/${encodeURIComponent(preview.id)}?conversation=${encodeURIComponent(scope.conversationId)}`, "_blank");
       if (opened) opened.opener = null;
@@ -3830,7 +3926,12 @@ export function WebsiteServicePreview({
     <div className="agent-workbench-web-preview-shell">
       {scope ? (
         <div className="agent-workbench-web-preview-actions" role="group" aria-label="网站服务预览">
-          {!isActiveWebPreview(preview) ? (
+          {recovery ? (
+            <button type="button" className="secondary-action" disabled={recovery === "checking"}
+              onClick={() => setRecovery("checking")}>
+              {recovery === "unknown" ? "继续查询" : "正在确认..."}
+            </button>
+          ) : !isActiveWebPreview(preview) ? (
             <button type="button" className="secondary-action" disabled={loading} onClick={() => void start()}>
               {loading ? "正在启动..." : "运行网站"}
             </button>
@@ -3851,10 +3952,7 @@ export function WebsiteServicePreview({
         <PreviewFrame
           preview={preview}
           title={`${title} 网站预览`}
-          onLoad={() => void api.renewWebPreview(preview.id).then(setPreview).catch((caught) => {
-            setPreview(null);
-            setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
-          })}
+          onLoad={() => renewPreview(preview)}
         />
       ) : preview?.status === "starting" ? (
         <div className="agent-workbench-web-preview-loading" role="status">网站服务启动后会在这里显示。</div>
@@ -3864,6 +3962,7 @@ export function WebsiteServicePreview({
       {serviceVisible && preview?.lease_expires_at ? (
         <small className="agent-workbench-web-preview-lease">预览租约至 {new Date(preview.lease_expires_at).toLocaleString()}</small>
       ) : null}
+      {recovery ? <p role="status">{recovery === "unknown" ? "启动结果尚未确认" : "正在确认网站服务启动结果..."}</p> : null}
       {error ? <p role="alert" className="form-error">{error}</p> : null}
     </div>
   );

@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
+    CapacityLease,
     CapacityPool,
     CapacityUnavailable,
     CredentialDescriptor,
@@ -853,7 +854,7 @@ async def test_health_restores_only_after_explicit_success(
 
 
 @pytest.mark.integration
-async def test_p95_and_503_share_health_and_keys_have_ttls(
+async def test_successful_generation_p95_is_observational_and_503_still_reduces_health(
     redis_client: Redis, prefix: str
 ) -> None:
     wide = deployment("wide", "shared-health", max_concurrency=5, target_utilization=0.8)
@@ -870,15 +871,75 @@ async def test_p95_and_503_share_health_and_keys_have_ttls(
     await pool.record_outcome(
         "shared-health", status_code=200, latency_seconds=0.1, succeeded=True
     )
-    assert await pool.effective_limit("shared-health") == 2
+    assert await pool.effective_limit("shared-health") == 4
     await pool.record_outcome(
         "shared-health", status_code=503, latency_seconds=0.001, succeeded=False
     )
-    assert await pool.effective_limit("shared-health") == 1
+    assert await pool.effective_limit("shared-health") == 2
     keys = [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
     assert keys
     ttls = [await redis_client.ttl(key) for key in keys]
     assert all(0 < ttl <= 3600 for ttl in ttls)
+
+
+@pytest.mark.integration
+async def test_long_successes_do_not_reduce_health_and_old_p95_does_not_block_recovery(
+    redis_client: Redis, prefix: str
+) -> None:
+    wide = deployment("long", "long-health", max_concurrency=50)
+    pool = CapacityPool(
+        redis_client, deployments=[wide], credentials=credentials("long"), key_prefix=prefix,
+    )
+    await pool.initialize()
+    keys = pool._keys("long-health")
+    for latency in [1.0] * 5 + [239.483] * 11:
+        await pool.record_outcome(
+            "long-health", status_code=200, latency_seconds=latency, succeeded=True,
+        )
+        assert await pool.effective_limit("long-health") == 40
+    samples = await cast(Awaitable[list[bytes]], redis_client.lrange(keys["latency"], 0, -1))
+    assert len(samples) == 16
+    assert max(map(int, samples)) == 239483
+
+    await cast(Awaitable[int], redis_client.hset(
+        keys["health"], mapping={"effective": 1, "cooldown_until_ms": 0},
+    ))
+    for expected in range(2, 6):
+        await pool.record_outcome(
+            "long-health", status_code=200, latency_seconds=239.483, succeeded=True,
+        )
+        assert await pool.effective_limit("long-health") == expected
+    assert await cast(Awaitable[int], redis_client.llen(keys["latency"])) == 20
+    for status in (None, 500):
+        await pool.record_outcome(
+            "long-health", status_code=status, latency_seconds=0.01, succeeded=False,
+        )
+        assert await pool.effective_limit("long-health") == 5
+    assert await cast(Awaitable[int], redis_client.llen(keys["latency"])) == 20
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("status,latency", [(429, 0.001), (503, 0.001), (None, 31), (500, 31)])
+async def test_overload_and_slow_failure_guards_survive_long_success_history(
+    redis_client: Redis, prefix: str, status: int | None, latency: float,
+) -> None:
+    wide = deployment("guard", "guard-health", max_concurrency=50)
+    pool = CapacityPool(
+        redis_client, deployments=[wide], credentials=credentials("guard"), key_prefix=prefix,
+    )
+    await pool.initialize()
+    for expected in (20, 10, 5, 2, 1, 1):
+        await pool.record_outcome(
+            "guard-health", status_code=status, latency_seconds=latency, succeeded=False,
+        )
+        assert await pool.effective_limit("guard-health") == expected
+        await pool.record_outcome(
+            "guard-health", status_code=200, latency_seconds=239.483, succeeded=True,
+        )
+        assert await pool.effective_limit("guard-health") == expected
+    keys = pool._keys("guard-health")
+    cooldown = await cast(Awaitable[bytes], redis_client.hget(keys["health"], "cooldown_until_ms"))
+    assert int(cooldown) > 0
 
 
 @pytest.mark.integration
@@ -1642,3 +1703,110 @@ async def test_conservative_payload_estimate_is_rejected_by_tpm(
     assert estimate > 500
     with pytest.raises(CapacityUnavailable):
         await pool.acquire([limited], wait_timeout=0, estimated_tokens=estimate)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_acquire_rpc_timeout_releases_a_committed_lease(
+    redis_client: Redis, prefix: str, scoped: bool,
+) -> None:
+    selected = deployment("slow-rpc", "slow-rpc-scope")
+    root = CapacityPool(
+        DelayedAcquireRedis(redis_client, 0.5), deployments=[selected],
+        credentials=credentials("slow-rpc"), key_prefix=prefix,
+    )
+    capacity = root.scoped([selected]) if scoped else root
+    await capacity.initialize()
+    with pytest.raises(CapacityBackendError, match="backend unavailable"):
+        await asyncio.wait_for(
+            capacity.acquire([selected], wait_timeout=0.05, estimated_tokens=1), timeout=2,
+        )
+    assert await redis_client.zcard(root._keys(selected.quota_scope_id)["leases"]) == 0
+    assert root._waiters == 0
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("constraint", ["concurrency", "rpm", "tpm"])
+async def test_gateway_soft_wait_preserves_real_pool_admission_contract(
+    redis_client: Redis, prefix: str, monkeypatch: pytest.MonkeyPatch,
+    streaming: bool, constraint: str,
+) -> None:
+    from tests.unit.models.test_gateway import SecretStub, StreamingTransportStub
+
+    request = ModelRequest(
+        logical_model="chat", messages=(ModelMessage(role="user", content="hi"),),
+        max_output_tokens=1, timeout_seconds=5 if constraint == "concurrency" else 0.5,
+        allow_fallback=False,
+    )
+    estimate = ConservativeTokenEstimator().estimate(request)
+    selected = deployment(
+        "soft-wait", "soft-wait-scope",
+        rpm=1 if constraint == "rpm" else None,
+        tpm=estimate if constraint == "tpm" else None,
+    )
+    pool = CapacityPool(
+        redis_client, deployments=[selected], credentials=credentials("soft-wait"),
+        key_prefix=prefix, poll_interval=0.005,
+    )
+    capacity = pool.scoped([selected])
+    await capacity.initialize()
+    held = await capacity.acquire([selected], wait_timeout=0.1, estimated_tokens=estimate)
+    if constraint != "concurrency":
+        await capacity.release(held)
+    keys = pool._keys(selected.quota_scope_id)
+    async def state(name: str) -> dict[bytes, bytes]:
+        return await cast(Awaitable[dict[bytes, bytes]], redis_client.hgetall(keys[name]))
+
+    policy_before = await state("policy")
+    buckets_before = [await state(name) for name in ("rpm", "tpm")]
+    retrying = asyncio.Event()
+    windows: list[float] = []
+    acquire = capacity.acquire
+
+    async def observed_acquire(
+        candidates: Sequence[Deployment], wait_timeout: float, *,
+        estimated_tokens: int | Mapping[str, int],
+    ) -> CapacityLease:
+        windows.append(wait_timeout)
+        if len(windows) == 2:
+            retrying.set()
+        return await acquire(candidates, wait_timeout, estimated_tokens=estimated_tokens)
+
+    monkeypatch.setattr(capacity, "acquire", observed_acquire)
+    monkeypatch.setattr(pool, "scoped", lambda _: capacity)
+    secrets = SecretStub([])
+    transport = StreamingTransportStub([], [{"choices": [{"delta": {"content": "ok"}}]}])
+    gateway = ModelGateway(
+        ModelRegistry([selected]), pool, secrets, transport, capacity_wait_timeout=0.05,
+    )
+
+    async def run() -> None:
+        if streaming:
+            assert [event async for event in gateway.stream_openai_compatible_events(request)]
+        else:
+            assert (await gateway.complete(request)).text == "ok"
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(retrying.wait(), timeout=2)
+        assert not task.done()
+        assert not secrets.references and not transport.calls and not transport.stream_calls
+        if constraint == "concurrency":
+            await capacity.release(held)
+            await asyncio.wait_for(task, timeout=2)
+            assert secrets.references == [selected.secret_ref]
+            assert len(transport.stream_calls if streaming else transport.calls) == 1
+        else:
+            with pytest.raises(CapacityUnavailable):
+                await asyncio.wait_for(task, timeout=2)
+            assert not secrets.references and not transport.calls and not transport.stream_calls
+            assert [await state(name) for name in ("rpm", "tpm")] == buckets_before
+        assert len(windows) >= 2 and all(0 < window <= 0.05 for window in windows)
+        assert await state("policy") == policy_before
+        assert await redis_client.zcard(keys["leases"]) == 0
+        assert pool._waiters == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await capacity.release(held)

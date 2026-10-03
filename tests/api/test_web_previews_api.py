@@ -608,6 +608,119 @@ def test_current_requires_creator_and_reauthorizes_conversation(dynamic_client: 
     assert client.get(path, headers=_bearer()).status_code == 409
 
 
+@pytest.mark.parametrize("https", [False, True])
+def test_current_recovers_lost_cookie_without_renewing_lease(
+    dynamic_client: DynamicClient, https: bool,
+) -> None:
+    client, principal, _, _, started = dynamic_client
+    if https:
+        client.base_url = "https://testserver"
+    service = cast(FastAPI, client.app).state.preview_manager
+    before = service.current(principal.tenant_id, "conv-preview", principal.user_id)
+    cookie_name = f"agent_preview_{started['id'].replace('-', '_')}"
+    original_token = client.cookies.get(cookie_name)
+    client.cookies.clear()
+    assert client.get(started["preview_url"]).status_code == 404
+
+    response = client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer())
+
+    assert response.status_code == 200
+    cookie = response.headers.get("set-cookie", "")
+    assert "httponly" in cookie.lower()
+    assert "samesite=strict" in cookie.lower()
+    assert ("; secure" in cookie.lower()) is https
+    assert f"Path=/api/v1/web-previews/{started['id']}/content" in cookie
+    assert client.cookies.get(cookie_name) == original_token
+    assert original_token and original_token not in response.text
+    assert "token" not in response.text
+    assert response.json()["lease_expires_at"] == before.lease_expires_at.isoformat().replace("+00:00", "Z")
+    assert service.current(principal.tenant_id, "conv-preview", principal.user_id) == before
+    content = client.get(started["preview_url"])
+    assert content.status_code == 200
+    assert original_token not in content.text
+
+
+@pytest.mark.parametrize("different_tenant", [False, True])
+def test_current_never_issues_cookie_to_foreign_user(
+    dynamic_client: DynamicClient, different_tenant: bool,
+) -> None:
+    client, principal, _, _, started = dynamic_client
+    client.cookies.clear()
+    cast(FastAPI, client.app).state.auth_service.principal = AuthenticatedPrincipal(
+        uuid4(), uuid4() if different_tenant else principal.tenant_id, Role.OPERATOR,
+    )
+    for _ in range(2):
+        response = client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer())
+        assert response.status_code == 404
+        assert "set-cookie" not in response.headers
+        assert client.get(started["preview_url"]).status_code == 404
+
+
+@pytest.mark.parametrize("state", ["stopped", "expired", "archived", "active"])
+def test_current_denied_scope_or_finished_preview_never_issues_cookie(
+    dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    client, principal, conversations, _, started = dynamic_client
+    service = cast(FastAPI, client.app).state.preview_manager
+    if state == "stopped":
+        service.stop(principal.tenant_id, started["id"], principal.user_id)
+    elif state == "expired":
+        expiry = service.current(principal.tenant_id, "conv-preview", principal.user_id).lease_expires_at
+        monkeypatch.setattr(service._manager, "_clock", lambda: expiry)
+    elif state == "archived":
+        conversations.archived_at = datetime.now(UTC)
+    else:
+        conversations.run_statuses = ("running",)
+    client.cookies.clear()
+    response = client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer())
+    assert response.status_code == (404 if state in {"stopped", "expired"} else 409)
+    assert "set-cookie" not in response.headers
+    assert client.get(started["preview_url"]).status_code == 404
+
+
+def test_current_handles_revocation_before_access_lookup(
+    dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, principal, _, _, started = dynamic_client
+    service = cast(FastAPI, client.app).state.preview_manager
+    original_current = service.current
+
+    def revoke_after_read(*args: object) -> object:
+        current = original_current(*args)
+        service.stop(principal.tenant_id, started["id"], principal.user_id)
+        return current
+
+    monkeypatch.setattr(service, "current", revoke_after_read)
+    client.cookies.clear()
+    response = client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer())
+    assert response.status_code == 404
+    assert "set-cookie" not in response.headers
+    assert client.get(started["preview_url"]).status_code == 404
+
+
+@pytest.mark.parametrize("state", ["stopped", "expired"])
+def test_current_rechecks_liveness_after_conversation_authorization(
+    dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    client, principal, conversations, _, started = dynamic_client
+    service = cast(FastAPI, client.app).state.preview_manager
+    expiry = service.current(principal.tenant_id, "conv-preview", principal.user_id).lease_expires_at
+    original_lookup = conversations.get_conversation
+
+    async def lookup(conversation_id: str) -> object:
+        if state == "stopped":
+            service.stop(principal.tenant_id, started["id"], principal.user_id)
+        else:
+            monkeypatch.setattr(service._manager, "_clock", lambda: expiry)
+        return await original_lookup(conversation_id)
+
+    monkeypatch.setattr(conversations, "get_conversation", lookup)
+    client.cookies.clear()
+    response = client.get("/api/v1/web-previews/conversations/conv-preview", headers=_bearer())
+    assert response.status_code == 404
+    assert "set-cookie" not in response.headers
+
+
 def test_dynamic_shim_is_before_even_scripts_outside_head(dynamic_client: DynamicClient) -> None:
     client, _, _, backend, started = dynamic_client
     from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse

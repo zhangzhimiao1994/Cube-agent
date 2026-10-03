@@ -1566,7 +1566,10 @@ def test_direct_capability_repair_request_uses_project_sized_output_budget() -> 
     assert model_request.max_output_tokens > 8_192
 
 
-def test_direct_natural_website_request_receives_workspace_preview_contract() -> None:
+@pytest.mark.parametrize("incremental", (False, True))
+def test_direct_natural_website_request_receives_workspace_preview_contract(
+    incremental: bool,
+) -> None:
     context = TaskContext(
         run_id=uuid4(),
         tenant_id=uuid4(),
@@ -1581,16 +1584,40 @@ def test_direct_natural_website_request_receives_workspace_preview_contract() ->
             "website_preview_required": True,
         },
     )
-    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+    runtime = DirectRuntime(
+        UnusedGateway(),  # type: ignore[arg-type]
+        logical_model="main",
+        capability_gateway=RecordingCapabilityGateway() if incremental else None,
+    )
 
     model_request = runtime._build_request(context).request
 
     assert model_request is not None
     assert model_request.max_output_tokens > 8_192
     serialized = "\n".join(cast(str, message.content) for message in model_request.messages)
-    assert "workspace_bundle.files" in serialized
+    assert ("workspace_batch.files" if incremental else "workspace_bundle.files") in serialized
     assert "preview.html" in serialized
     assert "self-contained" in serialized
+    for requirement in (
+        "same-origin", "actual backend", "root-relative", "empty string", "allow empty",
+        "localhost", "external API", "static previews offline",
+    ):
+        assert requirement in serialized
+
+
+def test_direct_non_web_delivery_does_not_receive_preview_api_contract() -> None:
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a command-line task manager.", token_budget=100_000,
+        routing_decision={
+            "project_scale": "small", "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle", "website_preview_required": False,
+        },
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+    request = runtime._build_request(context).request
+    assert request is not None
+    assert "Preview API contract:" not in "\n".join(str(item.content) for item in request.messages)
 
 
 @pytest.mark.asyncio

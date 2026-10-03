@@ -1722,6 +1722,16 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
                 lines.append(
                     "Include a self-contained preview.html (or index.html) that demonstrates the main user flow without external network dependencies so the UI can run it in a sandboxed preview."
                 )
+    if context.routing_decision.get("website_preview_required") is True and (
+        _INCREMENTAL_WORKSPACE_TOOLS.issubset(tools)
+        or (
+            "project.generate_zip" in tools
+            and _is_project_scale_generated_project_request(context)
+        )
+    ):
+        from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
+
+        lines.append(WEBSITE_PREVIEW_API_GUIDANCE)
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -2777,14 +2787,9 @@ def _assign_models_to_roles(
     required_capabilities_by_role: Mapping[str, frozenset[ModelCapability]] | None = None,
 ) -> tuple[RoleAssignment, ...]:
     assigned_counts: dict[str, int] = {}
-    capacities = {
-        logical_model: _logical_model_capacity(
-            config,
-            logical_model,
-            deployment_constraint=deployment_constraint,
-        )
-        for logical_model in config.models
-    }
+    capacities = _logical_model_capacities(
+        config, deployment_constraint=deployment_constraint,
+    )
     assigned: list[RoleAssignment] = []
     for role in roles:
         ranked = _rank_logical_models_for_role(
@@ -2854,29 +2859,55 @@ def _logical_model_capacity(
     *,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> int:
-    definition = config.models.get(logical_model)
-    if definition is None:
-        return 1
-    deployments = tuple(definition.deployments)
-    if deployment_constraint is not None and deployment_constraint.logical_model == logical_model:
-        deployments = tuple(
-            deployment
-            for deployment in deployments
-            if _deployment_definition_matches_constraint(
-                logical_model,
-                deployment,
-                deployment_constraint,
+    return _logical_model_capacities(
+        config, deployment_constraint=deployment_constraint,
+    ).get(logical_model, 1)
+
+
+def _logical_model_capacities(
+    config: PlatformConfig,
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
+) -> dict[str, int]:
+    return {
+        logical_model: max(1, sum(limits.values()))
+        for logical_model, limits in _model_scope_limits(
+            config, deployment_constraint=deployment_constraint,
+        ).items()
+    }
+
+
+def _model_scope_limits(
+    config: PlatformConfig,
+    *,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
+) -> dict[str, dict[str, int]]:
+    limits: dict[str, int] = {}
+    model_scopes: dict[str, set[str]] = {}
+    # Match CapacityPool's most restrictive policy across the gateway catalog.
+    for logical_model, definition in config.models.items():
+        scopes = model_scopes[logical_model] = set()
+        for deployment in definition.deployments:
+            if (
+                deployment_constraint is not None
+                and deployment_constraint.logical_model == logical_model
+                and not _deployment_definition_matches_constraint(
+                    logical_model, deployment, deployment_constraint,
+                )
+            ):
+                continue
+            scope = deployment.quota_scope_id
+            limit = safe_operational_limit(
+                deployment.max_concurrency,
+                deployment.target_utilization,
+                deployment.reserved_slots,
             )
-        )
-    slots = sum(
-        safe_operational_limit(
-            deployment.max_concurrency,
-            deployment.target_utilization,
-            deployment.reserved_slots,
-        )
-        for deployment in deployments
-    )
-    return max(1, slots)
+            limits[scope] = min(limits.get(scope, limit), limit)
+            scopes.add(scope)
+    return {
+        logical_model: {scope: limits[scope] for scope in scopes}
+        for logical_model, scopes in model_scopes.items()
+    }
 
 
 def _string_or_default(value: object, default: str) -> str:
@@ -3984,14 +4015,9 @@ def _role_model_routing_matrix_payload(
 ) -> tuple[tuple[Mapping[str, JsonValue], ...], bool]:
     payload: list[Mapping[str, JsonValue]] = []
     truncated = len(source_roles) > _MAX_MODEL_ROUTING_MATRIX_ROLES
-    capacities = {
-        logical_model: _logical_model_capacity(
-            config,
-            logical_model,
-            deployment_constraint=deployment_constraint,
-        )
-        for logical_model in config.models
-    }
+    capacities = _logical_model_capacities(
+        config, deployment_constraint=deployment_constraint,
+    )
     assigned_counts: dict[str, int] = {}
     for index, role in enumerate(source_roles[:_MAX_MODEL_ROUTING_MATRIX_ROLES]):
         role_tools = _routing_tools_for_role(role, role_tools_by_id)
@@ -4642,14 +4668,15 @@ def _dispatch_parallelism(
     )
     if not logical_models:
         logical_models = {logical_model}
-    slots = sum(
-        _logical_model_capacity(
-            config,
-            item,
-            deployment_constraint=deployment_constraint,
-        )
-        for item in logical_models
+    model_scope_limits = _model_scope_limits(
+        config, deployment_constraint=deployment_constraint,
     )
+    selected_limits = {
+        scope: limit
+        for logical_model in logical_models
+        for scope, limit in model_scope_limits.get(logical_model, {}).items()
+    }
+    slots = sum(selected_limits.values())
     return max(1, min(slots, 16))
 
 

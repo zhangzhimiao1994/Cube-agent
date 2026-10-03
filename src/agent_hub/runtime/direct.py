@@ -51,6 +51,7 @@ from agent_hub.runtime.project_scale_artifact import (
     project_scale_artifact_zip_files,
 )
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
 
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
@@ -2272,6 +2273,7 @@ class DirectRuntime:
                         "Include a self-contained preview.html (or index.html) that demonstrates "
                         "the main user flow without external network dependencies. "
                     )
+                    project_delivery_context += WEBSITE_PREVIEW_API_GUIDANCE + " "
                 project_delivery_context += _WORKSPACE_PATH_POLICY
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"

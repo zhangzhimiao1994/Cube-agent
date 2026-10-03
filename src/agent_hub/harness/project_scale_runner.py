@@ -13,12 +13,14 @@ import time
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 from io import BytesIO
+from ipaddress import ip_address
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from agent_hub.harness.project_requirements import (
@@ -34,6 +36,7 @@ from agent_hub.harness.project_scale import (
     build_project_scale_run_plan,
 )
 from agent_hub.harness.project_validation_sandbox import generated_command, sandbox_available
+from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _QUALITY_KEYS = frozenset(
@@ -2165,6 +2168,101 @@ def _merge_evidence_checks(*checks: _EvidenceCheck) -> _EvidenceCheck:
     )
 
 
+def _is_preview_api_base_name(value: str) -> bool:
+    normalized = "".join(char for char in value.casefold() if char.isalnum())
+    return normalized in {"apibase", "apibaseurl", "apiurl", "apiendpoint", "visibleapibase"}
+
+
+def _is_loopback_preview_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in {"", "http", "https"} or not parsed.hostname:
+            return False
+        host = parsed.hostname.casefold().rstrip(".")
+        if host == "localhost" or host.endswith(".localhost"):
+            return True
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _inline_script_has_loopback_default(script: str) -> bool:
+    # Only recognize a plain literal in the first statement. Do not tokenize JS,
+    # strip comments, evaluate expressions, or search inside strings/examples.
+    literal = r"(?P<quote>['\"])(?P<url>[^'\"\\\r\n]*)(?P=quote)"
+    declaration = re.match(
+        r"\A\s*(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*"
+        + literal + r"\s*(?:;|\Z)",
+        script,
+    )
+    if declaration is not None and _is_preview_api_base_name(declaration["name"]):
+        return _is_loopback_preview_url(declaration["url"])
+    request = re.match(r"\A\s*(?:window\.)?fetch\s*\(\s*" + literal + r"\s*[,)]", script)
+    return request is not None and _is_loopback_preview_url(request["url"])
+
+
+class _PreviewAPIDefaultParser(HTMLParser):
+    """Bounded lint for an entry HTML document, not proof of browser usability."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.inputs: list[dict[str, str]] = []
+        self.labels: dict[str, str] = {}
+        self.loopback_script = False
+        self._ignored: list[str] = []
+        self._script: list[str] | None = None
+        self._label_for: str | None = None
+        self._label_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"pre", "code", "template", "noscript", "textarea", "title"}:
+            self._ignored.append(tag)
+        if self._ignored:
+            return
+        attributes = {name: value or "" for name, value in attrs}
+        if tag == "input" and attributes.get("type", "text").casefold() in {"text", "url"}:
+            self.inputs.append(attributes)
+        elif tag == "label":
+            self._label_for = attributes.get("for")
+            self._label_text = []
+        elif tag == "script":
+            mime = attributes.get("type", "").split(";", 1)[0].strip().casefold()
+            if "src" not in attributes and mime in {
+                "", "module", "text/javascript", "application/javascript",
+            }:
+                self._script = []
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored:
+            return
+        if self._script is not None:
+            self._script.append(data)
+        elif self._label_for is not None:
+            self._label_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._ignored:
+            if tag == self._ignored[-1]:
+                self._ignored.pop()
+            return
+        if tag == "script" and self._script is not None:
+            self.loopback_script |= _inline_script_has_loopback_default("".join(self._script))
+            self._script = None
+        elif tag == "label" and self._label_for is not None:
+            self.labels[self._label_for] = "".join(self._label_text)
+            self._label_for = None
+
+    def has_loopback_default(self) -> bool:
+        return self.loopback_script or any(
+            _is_loopback_preview_url(attrs.get("value", ""))
+            and any(_is_preview_api_base_name(name) for name in (
+                attrs.get("id", ""), attrs.get("name", ""), attrs.get("aria-label", ""),
+                self.labels.get(attrs.get("id", ""), ""),
+            ))
+            for attrs in self.inputs
+        )
+
+
 def _validate_requested_web_preview(
     workspace_bundle: bytes | None,
     request_body: Mapping[str, object],
@@ -2198,6 +2296,19 @@ def _validate_requested_web_preview(
             continue
         prefix = content[:4096].lstrip().lower()
         if b"<html" in prefix or b"<!doctype html" in prefix:
+            parser = _PreviewAPIDefaultParser()
+            parser.feed(content.decode("utf-8", errors="replace"))
+            parser.close()
+            if parser.has_loopback_default():
+                return _EvidenceCheck(
+                    passed=False,
+                    reasons=(
+                        (
+                            f"requirements: preview API default uses loopback in {path}; "
+                            "use empty API Base and actual backend root-relative routes"
+                        ),
+                    ),
+                )
             return _EvidenceCheck(passed=True, reasons=())
         return _EvidenceCheck(
             passed=False,
@@ -4052,6 +4163,11 @@ def _deliverable_repair_body(
     if effective_mode == "direct":
         repair_body["allow_scale_mode_upgrade"] = False
     original_message = body.get("message")
+    preview_api_guidance = (
+        WEBSITE_PREVIEW_API_GUIDANCE + " "
+        if isinstance(original_message, str) and _web_preview_requested(original_message)
+        else ""
+    )
     if benchmark_kind == "capability":
         source_files = (
             _workspace_bundle_file_bytes(source_workspace_bundle)
@@ -4083,6 +4199,7 @@ def _deliverable_repair_body(
         )
         guidance = (
             f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
+            f"{preview_api_guidance}"
             f"preserve requirements. {delivery_guidance}"
             "File keys: safe relative paths, not endpoints/URLs/methods. "
             "JSON files must use strict JSON syntax with double-quoted keys and strings; "
@@ -4187,6 +4304,7 @@ def _deliverable_repair_body(
         else ""
     )
     repair_message = (
+        f"{preview_api_guidance}"
         f"Project-scale deliverable repair for {case_id}: the previous generated project "
         "failed acceptance quality. Diagnose the mismatches against the original request, "
         "repair the implementation in the same workspace, rerun build/test/interaction checks, "
@@ -4209,7 +4327,7 @@ def _deliverable_repair_body(
     context = _workspace_repair_context(source_workspace_bundle, failed_reasons=failed_reasons)
     repair_body["message"] = _bounded_role_planning_task_text(
         f"{repair_message}\n{context}" if context else repair_message,
-        max_chars=2_600 if context else 2_000,
+        max_chars=min(6_000, (2_600 if context else 2_000) + len(preview_api_guidance)),
     )
     repair_body["skip_evolution_proposal"] = True
     return repair_body

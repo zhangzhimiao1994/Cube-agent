@@ -541,15 +541,7 @@ async def start_web_preview(
             await asyncio.to_thread(service.stop, principal.tenant_id, result.id)
             raise
         access = service._owned_access(principal.tenant_id, result.id)
-        response.set_cookie(
-            _preview_cookie_name(result.id),
-            access.token,
-            httponly=True,
-            secure=request.url.scheme == "https",
-            samesite="strict",
-            path=f"/api/v1/web-previews/{result.id}/content",
-            max_age=7200,
-        )
+        _set_preview_cookie(response, request, result.id, access.token)
         return result
     except (
         InvalidPreviewPath,
@@ -572,6 +564,7 @@ async def start_web_preview(
 async def current_web_preview(
     conversation_id: str,
     request: Request,
+    response: Response,
     service: Annotated[WebPreviewService, Depends(_preview_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
 ) -> WebPreviewResponse:
@@ -579,11 +572,11 @@ async def current_web_preview(
         result = await asyncio.to_thread(
             service.current, principal.tenant_id, conversation_id, principal.user_id
         )
-    except (InvalidPreviewPath, DynamicPreviewCleanupError, ValueError) as error:
+        if result is None:
+            raise PreviewNotFound("preview was not found")
+        access = service._owned_access(principal.tenant_id, result.id, principal.user_id)
+    except (PreviewNotFound, InvalidPreviewPath, DynamicPreviewCleanupError, ValueError) as error:
         raise _preview_error(error) from error
-    if result is None:
-        raise PublicAPIError(404, "preview_not_found", "preview was not found")
-    access = service._owned_access(principal.tenant_id, result.id, principal.user_id)
     await _authorize_preview_scope(
         request,
         principal,
@@ -593,7 +586,18 @@ async def current_web_preview(
             workspace_session_id=access.session_id,
         ),
     )
-    return result
+    # Authorization can await storage while the runtime is stopped, replaced or expires.
+    try:
+        confirmed = await asyncio.to_thread(
+            service.current, principal.tenant_id, conversation_id, principal.user_id
+        )
+        if confirmed is None or confirmed.id != result.id:
+            raise PreviewNotFound("preview was revoked during authorization")
+        access = service._owned_access(principal.tenant_id, confirmed.id, principal.user_id)
+    except (PreviewNotFound, InvalidPreviewPath, DynamicPreviewCleanupError, ValueError) as error:
+        raise _preview_error(error) from error
+    _set_preview_cookie(response, request, confirmed.id, access.token)
+    return confirmed
 
 
 @router.post(
@@ -720,6 +724,20 @@ async def _preview_content(
 
 def _preview_cookie_name(preview_id: str) -> str:
     return f"agent_preview_{preview_id.replace('-', '_')}"
+
+
+def _set_preview_cookie(
+    response: Response, request: Request, preview_id: str, token: str,
+) -> None:
+    response.set_cookie(
+        _preview_cookie_name(preview_id),
+        token,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path=f"/api/v1/web-previews/{preview_id}/content",
+        max_age=7200,
+    )
 
 
 @router.get("/{preview_id}/content", response_model=None, include_in_schema=False)

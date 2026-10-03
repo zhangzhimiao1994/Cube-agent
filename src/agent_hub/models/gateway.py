@@ -28,6 +28,7 @@ from agent_hub.models.capacity import (
     CapacityQueueFull,
     CapacityUnavailable,
     CapacityWaitTimeout,
+    _CapacityScopeView,
 )
 from agent_hub.models.failure_receipt import (
     MAX_GATEWAY_FAILURE_ATTEMPTS,
@@ -603,6 +604,7 @@ class ModelGateway:
         capacity_pool.validate_configuration(registry.deployments)
         self._registry = registry
         self._capacity = capacity_pool
+        self._capacity_initializers: set[asyncio.Task[None]] = set()
         self._secret_resolver = secret_resolver
         self._transport = transport
         self._fallbacks = MappingProxyType(configured_fallbacks)
@@ -715,7 +717,7 @@ class ModelGateway:
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         last_retryable_error: BaseException | None = None
-        for logical_model, candidates in candidate_groups:
+        for group_index, (logical_model, candidates) in enumerate(candidate_groups):
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
                 failure_history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
@@ -734,25 +736,14 @@ class ModelGateway:
                 request, compatible_candidates, input_tokens
             )
             try:
-                await asyncio.wait_for(
-                    capacity.initialize(),
-                    timeout=min(self._capacity_wait_timeout, remaining_seconds),
-                )
-                remaining_seconds = request_deadline - asyncio.get_running_loop().time()
-                if remaining_seconds <= 0:
-                    raise TimeoutError
-                acquire_timeout = min(
-                    self._capacity_wait_timeout,
-                    request.timeout_seconds,
-                    remaining_seconds,
-                )
-                lease = await asyncio.wait_for(
-                    capacity.acquire(
-                        compatible_candidates,
-                        acquire_timeout,
-                        estimated_tokens=estimated_tokens,
+                lease = await self._acquire_capacity(
+                    capacity, compatible_candidates, estimated_tokens,
+                    deadline=request_deadline,
+                    wait_timeout=min(self._capacity_wait_timeout, request.timeout_seconds),
+                    has_fallback=any(
+                        self._context_compatible_candidates(items, input_tokens)
+                        for _, items in candidate_groups[group_index + 1:]
                     ),
-                    timeout=acquire_timeout,
                 )
             except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
@@ -858,7 +849,7 @@ class ModelGateway:
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         input_tokens = self._estimated_input_tokens(request, relevant_deployments)
-        for logical_model, candidates in candidate_groups:
+        for group_index, (logical_model, candidates) in enumerate(candidate_groups):
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
                 break
@@ -889,25 +880,14 @@ class ModelGateway:
             if remaining_seconds <= 0:
                 break
             try:
-                await asyncio.wait_for(
-                    capacity.initialize(),
-                    timeout=min(self._capacity_wait_timeout, remaining_seconds),
-                )
-                remaining_seconds = request_deadline - asyncio.get_running_loop().time()
-                if remaining_seconds <= 0:
-                    raise TimeoutError
-                acquire_timeout = min(
-                    self._capacity_wait_timeout,
-                    request.timeout_seconds,
-                    remaining_seconds,
-                )
-                lease = await asyncio.wait_for(
-                    capacity.acquire(
-                        compatible_candidates,
-                        acquire_timeout,
-                        estimated_tokens=estimated_tokens,
+                lease = await self._acquire_capacity(
+                    capacity, compatible_candidates, estimated_tokens,
+                    deadline=request_deadline,
+                    wait_timeout=min(self._capacity_wait_timeout, request.timeout_seconds),
+                    has_fallback=any(
+                        self._context_compatible_candidates(items, input_tokens)
+                        for _, items in candidate_groups[group_index + 1:]
                     ),
-                    timeout=acquire_timeout,
                 )
             except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
                 fallback_from_logical_model = logical_model
@@ -979,6 +959,70 @@ class ModelGateway:
         if last_retryable_error is not None:
             raise last_retryable_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
+
+    async def _acquire_capacity(
+        self,
+        capacity: CapacityController | CapacityPool,
+        candidates: Sequence[Deployment],
+        estimated_tokens: int | Mapping[str, int],
+        *,
+        deadline: float,
+        wait_timeout: float,
+        has_fallback: bool,
+    ) -> CapacityLease:
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise CapacityWaitTimeout("model capacity queue timeout")
+            await self._initialize_capacity(capacity, timeout=min(wait_timeout, remaining))
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise CapacityWaitTimeout("model capacity queue timeout")
+            window = min(wait_timeout, remaining)
+            started = loop.time()
+            try:
+                # Native pools bound every RPC themselves; an outer timer would
+                # race their last window and misclassify an unknown Redis outcome.
+                if isinstance(capacity, CapacityPool | _CapacityScopeView):
+                    return await capacity.acquire(
+                        candidates, window, estimated_tokens=estimated_tokens,
+                    )
+                return await asyncio.wait_for(
+                    capacity.acquire(candidates, window, estimated_tokens=estimated_tokens),
+                    timeout=remaining,
+                )
+            except CapacityWaitTimeout:
+                if has_fallback or loop.time() >= deadline:
+                    raise
+                # Custom controllers may report congestion before the window elapses.
+                await asyncio.sleep(max(0, min(started + window, deadline) - loop.time()))
+
+    async def _initialize_capacity(
+        self, capacity: CapacityController | CapacityPool, *, timeout: float,
+    ) -> None:
+        task = asyncio.create_task(capacity.initialize())
+        self._capacity_initializers.add(task)
+
+        def finished(initializer: asyncio.Task[None]) -> None:
+            self._capacity_initializers.discard(initializer)
+            if not initializer.cancelled():
+                initializer.exception()
+
+        task.add_done_callback(finished)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                task.result()
+                return
+            if isinstance(capacity, CapacityPool | _CapacityScopeView):
+                raise CapacityBackendError("model capacity initialization timed out")
+            raise TimeoutError
+        finally:
+            if not task.done():
+                # Native registration finishes its bounded owner-specific rollback
+                # in the background; it must not extend the caller's deadline.
+                task.cancel()
 
     def _estimate_tokens(self, request: ModelRequest) -> int:
         estimated_tokens = self._token_estimator.estimate(request)
@@ -1275,10 +1319,13 @@ class ModelGateway:
                     )
                     primary_error = stream_primary_error
                 except GeneratorExit as error:
+                    # Caller-controlled closure is not evidence of provider overload.
+                    should_record = False
                     stream_primary_error = error
                     primary_error = error
                     raise
                 except asyncio.CancelledError as error:
+                    should_record = False
                     stream_primary_error = error
                     primary_error = error
                 except ModelResponseError as error:

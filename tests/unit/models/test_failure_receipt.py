@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.models.capacity import CapacityBackendError, CapacityWaitTimeout
+from agent_hub.models.capacity import CapacityBackendError
 from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayResponseCancelled,
@@ -21,6 +21,7 @@ from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import ModelCapability, ModelResponse, TokenUsage
 from tests.unit.models.test_gateway import (
     CapacityStub,
+    CongestedCapacityStub,
     SecretStub,
     StreamingTransportStub,
     TransportStub,
@@ -232,10 +233,12 @@ async def test_unknown_or_pretransport_failures_never_supply_complete_evidence(s
 
 async def test_later_capacity_failure_does_not_hide_an_incomplete_fallback_history() -> None:
     api = receipt_api()
-    capacity = CapacityStub([lease("primary"), CapacityWaitTimeout("busy")])
+    capacity = CongestedCapacityStub([lease("primary")])
     transport = OutcomesTransport([ModelTransportError("failed", status_code=408)])
     with pytest.raises(ModelTransportError) as caught:
-        await make_gateway(transport, capacity, models=("primary", "backup")).complete_with_context(request())
+        await make_gateway(transport, capacity, models=("primary", "backup")).complete_with_context(
+            replace(request(), timeout_seconds=0.5),
+        )
     receipt = api.get_gateway_failure_receipt(caught.value)
     assert receipt is not None and receipt.history_complete is False
     assert receipt.to_payload()["attempted_logical_models"] == ["primary", "backup"]

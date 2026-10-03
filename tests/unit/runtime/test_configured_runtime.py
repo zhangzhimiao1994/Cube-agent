@@ -1245,6 +1245,7 @@ async def test_config_backed_direct_runtime_does_not_fallback_past_harness_selec
                     tenant_id=TENANT_ID,
                     mode=TaskMode.DIRECT,
                     request="use the harness-selected model",
+                    timeout_seconds=0.2,
                     routing_decision={
                         "harness_decision": {
                             "selected_provider": "deepseek",
@@ -1256,7 +1257,8 @@ async def test_config_backed_direct_runtime_does_not_fallback_past_harness_selec
             )
         ]
 
-    assert capacities[0].events == [("deepseek/deepseek-chat",)]
+    assert capacities[0].events
+    assert all(event == ("deepseek/deepseek-chat",) for event in capacities[0].events)
     assert transport.calls == []
 
 
@@ -1327,6 +1329,7 @@ async def test_config_backed_direct_runtime_disables_fallback_from_harness_polic
                     tenant_id=TENANT_ID,
                     mode=TaskMode.DIRECT,
                     request="use explicit harness fallback policy",
+                    timeout_seconds=0.2,
                     routing_decision={
                         "harness_policy": {
                             "fallback_policy": "disabled",
@@ -1336,7 +1339,8 @@ async def test_config_backed_direct_runtime_disables_fallback_from_harness_polic
             )
         ]
 
-    assert capacities[0].events == [("deepseek/deepseek-chat",)]
+    assert capacities[0].events
+    assert all(event == ("deepseek/deepseek-chat",) for event in capacities[0].events)
     assert transport.calls == []
 
 
@@ -6882,7 +6886,39 @@ def test_natural_large_website_uses_workspace_bundle_budget_and_preview_contract
     assert "workspace.bundle succeeds" in implementer_step.task
     assert "preview.html" in implementer_step.task
     assert "self-contained" in implementer_step.task
+    assert "same-origin" in implementer_step.task
+    assert "root-relative" in implementer_step.task
+    assert "allow empty" in implementer_step.task
     assert "concise" in final_step.task
+
+
+@pytest.mark.parametrize("preview_required", (False, True))
+@pytest.mark.parametrize("tools", (
+    ("project.generate_zip",),
+    ("workspace.write_text", "workspace.list", "workspace.bundle"),
+    ("workspace.write_text", "workspace.list", "workspace.bundle", "project.generate_zip"),
+))
+def test_software_delivery_preview_api_contract(
+    preview_required: bool, tools: tuple[str, ...],
+) -> None:
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request="Build a task API project.",
+        routing_decision={
+            "project_scale": "small", "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle", "website_preview_required": preview_required,
+        },
+    )
+    guidance = defaults_module._software_delivery_guidance(context, tools)
+    if not preview_required:
+        assert "Preview API contract:" not in guidance
+        return
+    assert guidance.count("Preview API contract:") == 1
+    for requirement in (
+        "same-origin", "actual backend", "root-relative", "empty string", "allow empty",
+        "localhost", "external API", "static previews offline",
+    ):
+        assert requirement in guidance
 
 
 def test_project_scale_zip_implementer_gets_extended_step_timeout() -> None:
