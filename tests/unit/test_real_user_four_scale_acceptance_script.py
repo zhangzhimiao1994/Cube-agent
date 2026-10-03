@@ -1888,6 +1888,642 @@ def test_model_profile_cli_mismatch_preserves_existing_report_before_client_crea
     assert report.read_bytes() == before
 
 
+@pytest.fixture
+async def direct_public_model_events() -> list[dict[str, Any]]:
+    from uuid import uuid4
+
+    from agent_hub.config.service import ConfigService
+    from agent_hub.domain.runs import TaskMode
+    from agent_hub.runs.repository import _public_event_payload
+    from agent_hub.runtime.contracts import TaskContext
+    from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
+    from agent_hub.security.secrets import SecretService
+    from tests.unit.runtime.test_configured_runtime import (
+        TENANT_ID,
+        FakeConfigService,
+        FakeSecretService,
+        FakeTransport,
+        _immediate_capacity,
+    )
+    from tests.unit.runtime.test_run_model_scope import _document
+
+    runtime = ConfigBackedDirectRuntime(
+        config_service=cast(ConfigService, FakeConfigService(_document())),
+        secret_service=cast(SecretService, FakeSecretService()),
+        capacity_factory=_immediate_capacity,
+        transport=FakeTransport(),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        request="Answer briefly in plain text.",
+        routing_decision={"direct_model": "deepseek", "allowed_models": ("deepseek",)},
+    )
+    return [_public_event_payload(event.to_payload()) async for event in runtime.run(context)]
+
+
+@pytest.fixture
+async def crew_public_model_events() -> list[dict[str, Any]]:
+    from agent_hub.models.gateway import GatewayCompletion
+    from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
+    from agent_hub.runs.repository import _public_event_payload
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
+    from tests.unit.runtime.crew.test_adapter_failure_reason import (
+        FastFactory,
+        _context,
+        _one_step_plan,
+    )
+
+    class Gateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            return GatewayCompletion(
+                response=ModelResponse(text="actual model answer", usage=TokenUsage(10, 2, 12)),
+                deployment_id="deepseek-deployment",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-chat",
+                attempted_logical_models=(request.logical_model,),
+            )
+
+    plan = _one_step_plan()
+    plan = plan.model_copy(update={
+        "agents": (plan.agents[0].model_copy(update={"logical_model": "deepseek"}),),
+    })
+    runtime = CrewDispatchRuntime(Gateway(), plan, crew_factory=FastFactory())
+    return [_public_event_payload(event.to_payload()) async for event in runtime.run(_context())]
+
+
+class PublicModelEvidenceClient:
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+        self.run_id = events[0]["run_id"]
+        self.requests: list[tuple[str, str]] = []
+
+    def request_json(
+        self, method: str, path: str, *, body: object = None, idempotency_key: object = None,
+    ) -> dict[str, Any]:
+        assert method == "GET" and body is None and idempotency_key is None
+        self.requests.append((method, path))
+        root = f"/api/v1/runs/{self.run_id}"
+        if path == root:
+            return {"id": self.run_id, "status": "completed"}
+        assert path == f"{root}/events"
+        return {"items": copy.deepcopy(self.events)}
+
+
+def collect_direct_model_evidence(module: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
+    client = PublicModelEvidenceClient(events)
+    evidence = module._collect_model_scope_evidence(
+        module.RealUserAcceptanceClient(client),
+        logical_model="deepseek",
+        submitted_run_ids=[client.run_id],
+        accepted_repair_run_ids=[],
+        result_run_id=client.run_id,
+    )
+    assert client.requests == [
+        ("GET", f"/api/v1/runs/{client.run_id}"),
+        ("GET", f"/api/v1/runs/{client.run_id}/events"),
+    ]
+    return cast(dict[str, Any], evidence)
+
+
+async def test_scoped_collector_accepts_real_configured_direct_public_completion_metadata(
+    direct_public_model_events: list[dict[str, Any]],
+) -> None:
+    module = load_script()
+    assert [event["kind"] for event in direct_public_model_events] == [
+        "model.started", "artifact.created", "checkpoint.saved", "runtime.completed",
+    ]
+    evidence = collect_direct_model_evidence(module, direct_public_model_events)
+    assert evidence["ok"] is True, evidence["errors"]
+    retained = evidence["runs"][0]["model_events"]
+    assert [event["kind"] for event in retained] == [
+        "model.started", "artifact.created", "runtime.completed",
+    ]
+    assert retained[1]["payload"]["deployment"]
+    assert retained[1]["payload"]["upstream_model"] == "deepseek/deepseek-chat"
+    assert retained[1]["payload"]["attempted_logical_models"] == ["deepseek"]
+    assert all(
+        set(event) <= {"kind", "run_id", "sequence", "actor", "payload", "model_artifact"}
+        for event in retained
+    )
+    assert all(
+        set(event["payload"]) <= {
+            "logical_model", "requested_logical_model", "attempted_logical_models",
+            "artifact_id", "deployment", "provider", "upstream_model", "artifact_origin",
+        }
+        for event in retained
+    )
+
+
+async def test_scoped_collector_accepts_real_crew_typed_completion_artifact(
+    crew_public_model_events: list[dict[str, Any]],
+) -> None:
+    module = load_script()
+    assert all(event["kind"] != "model.completed" for event in crew_public_model_events)
+    artifact_event = next(
+        event for event in crew_public_model_events
+        if event["kind"] == "artifact.created" and event["artifact"]["type"] == "model_response"
+    )
+    assert artifact_event["payload"] == {"agent_id": "writer"}
+    evidence = collect_direct_model_evidence(module, crew_public_model_events)
+    assert evidence["ok"] is True, evidence["errors"]
+    proof = next(event for event in evidence["runs"][0]["model_events"] if "model_artifact" in event)
+    assert proof["kind"] == "artifact.created"
+    assert proof["payload"]["logical_model"] == "deepseek"
+    assert proof["payload"]["attempted_logical_models"] == ["deepseek"]
+    assert proof["model_artifact"]["content_sha256"] == artifact_event["artifact"]["content_sha256"]
+    assert proof["model_artifact"]["hash_verified"] is True
+    assert proof["model_artifact"]["type"] == "model_response"
+    assert "actual model answer" not in json.dumps(evidence)
+    assert "content" not in proof["model_artifact"]
+
+
+@pytest.mark.parametrize("endpoint", ["run", "events"])
+def test_scope_collector_never_echoes_http_or_client_exception_body(endpoint: str) -> None:
+    module = load_script()
+    secret = "Authorization: Bearer private-token password=private-password"
+
+    class FailingClient:
+        def request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, object]:
+            if endpoint == "run" or path.endswith("/events"):
+                raise RuntimeError(secret)
+            return {"id": "run-1", "status": "completed"}
+
+    evidence = module._collect_model_scope_evidence(
+        module.RealUserAcceptanceClient(FailingClient()), logical_model="deepseek",
+        submitted_run_ids=["run-1"], accepted_repair_run_ids=[], result_run_id="run-1",
+    )
+    assert evidence["ok"] is False
+    assert "run-1: public_model_scope_read_failed (RuntimeError)" in evidence["errors"]
+    assert "private-token" not in json.dumps(evidence)
+    assert "private-password" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["foreign_actual", "foreign_attempt", "empty_attempts", "missing_attempts",
+                "hash_mismatch", "missing_provenance", "empty_deployment", "empty_upstream",
+                "wrong_producer", "step_only", "text_only", "missing_hash"],
+)
+async def test_crew_completion_rejects_requested_role_model_and_invalid_actual_artifact(
+    crew_public_model_events: list[dict[str, Any]], invalid: str,
+) -> None:
+    from agent_hub.runtime.contracts import Artifact
+
+    module = load_script()
+    events = copy.deepcopy(crew_public_model_events)
+    artifact_event = next(
+        event for event in events
+        if event["kind"] == "artifact.created" and event["artifact"]["type"] == "model_response"
+    )
+    artifact = artifact_event["artifact"]
+    if invalid in {"step_only", "text_only"}:
+        events = [event for event in events if event is not artifact_event]
+        if invalid == "step_only":
+            events = [event for event in events if event["kind"] == "step.completed"]
+    elif invalid == "hash_mismatch":
+        artifact["content_sha256"] = "0" * 64
+    elif invalid == "missing_hash":
+        artifact.pop("content_sha256")
+    else:
+        if invalid == "foreign_actual":
+            artifact["provenance"]["logical_model"] = "other-model"
+        elif invalid == "foreign_attempt":
+            artifact["content"]["attempted_logical_models"] = ["other-model", "deepseek"]
+        elif invalid == "empty_attempts":
+            artifact["content"]["attempted_logical_models"] = []
+        elif invalid == "missing_attempts":
+            artifact["content"].pop("attempted_logical_models")
+        elif invalid == "missing_provenance":
+            artifact["provenance"] = None
+        elif invalid == "empty_deployment":
+            artifact["provenance"]["deployment_id"] = ""
+        elif invalid == "empty_upstream":
+            artifact["provenance"]["provider_model"] = ""
+        elif invalid == "wrong_producer":
+            artifact["producer"] = "another-agent"
+        if invalid not in {"empty_deployment", "empty_upstream"}:
+            artifact["content_sha256"] = ""
+            artifact_event["artifact"] = Artifact.from_payload({
+                key: value for key, value in artifact.items()
+                if key not in {"public_content_sha256", "content_redacted"}
+            }).to_payload()
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+    assert "actual model answer" not in json.dumps(evidence)
+
+
+def projected_model_events(events: list[dict[str, Any]], redacted: bool) -> list[dict[str, Any]]:
+    from agent_hub.runtime.contracts import Artifact
+
+    result = copy.deepcopy(events)
+    for event in result:
+        artifact = event.get("artifact")
+        if not isinstance(artifact, dict) or artifact.get("provenance") is None:
+            continue
+        original_digest = artifact["content_sha256"]
+        artifact.pop("public_content_sha256", None)
+        artifact.pop("content_redacted", None)
+        if redacted:
+            artifact["content"]["text"] = "[redacted]"
+        artifact["content_sha256"] = ""
+        public_digest = Artifact.from_payload(artifact).content_sha256
+        artifact.update(
+            content_sha256=original_digest,
+            public_content_sha256=public_digest,
+            content_redacted=redacted,
+        )
+    return result
+
+
+@pytest.mark.parametrize("runtime", ["direct", "crew"])
+@pytest.mark.parametrize("redacted", [False, True])
+async def test_scoped_collector_validates_public_projection_envelope_without_retaining_content(
+    direct_public_model_events: list[dict[str, Any]],
+    crew_public_model_events: list[dict[str, Any]], runtime: str, redacted: bool,
+) -> None:
+    module = load_script()
+    original = direct_public_model_events if runtime == "direct" else crew_public_model_events
+    events = projected_model_events(original, redacted)
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is True, evidence["errors"]
+    proofs = [event["model_artifact"] for event in evidence["runs"][0]["model_events"]
+              if "model_artifact" in event]
+    assert proofs
+    for proof in proofs:
+        artifact = next(event["artifact"] for event in events
+                        if isinstance(event.get("artifact"), dict)
+                        and event["artifact"]["id"] == proof["id"])
+        assert proof["content_sha256"] == artifact["content_sha256"]
+        assert proof["public_content_sha256"] == artifact["public_content_sha256"]
+        assert proof["content_redacted"] is redacted
+        assert proof["hash_verification_scope"] == "public_projection"
+        assert (proof["content_sha256"] != proof["public_content_sha256"]) is redacted
+        assert "content" not in proof
+    assert "actual model answer" not in json.dumps(evidence)
+    assert "[redacted]" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize("runtime", ["direct", "crew"])
+async def test_scoped_collector_keeps_legacy_original_hash_validation(
+    direct_public_model_events: list[dict[str, Any]],
+    crew_public_model_events: list[dict[str, Any]], runtime: str,
+) -> None:
+    module = load_script()
+    original = direct_public_model_events if runtime == "direct" else crew_public_model_events
+    events = copy.deepcopy(original)
+    for event in events:
+        artifact = event.get("artifact")
+        if isinstance(artifact, dict):
+            artifact.pop("public_content_sha256", None)
+            artifact.pop("content_redacted", None)
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is True, evidence["errors"]
+    assert all("public_content_sha256" not in event.get("model_artifact", {})
+               for event in evidence["runs"][0]["model_events"])
+    assert all(event["model_artifact"]["hash_verification_scope"] == "original"
+               for event in evidence["runs"][0]["model_events"] if "model_artifact" in event)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing_public_hash", "missing_flag", "bad_flag", "integer_flag",
+                "bad_public_hash", "bad_original_hash", "equal_redacted_hashes",
+                "different_unredacted_hashes", "tampered_content", "tampered_provenance"],
+)
+async def test_scoped_collector_rejects_incomplete_or_contradictory_projection_metadata(
+    crew_public_model_events: list[dict[str, Any]], invalid: str,
+) -> None:
+    module = load_script()
+    events = projected_model_events(crew_public_model_events, True)
+    artifact = next(event["artifact"] for event in events
+                    if isinstance(event.get("artifact"), dict)
+                    and event["artifact"]["type"] == "model_response")
+    if invalid == "missing_public_hash":
+        artifact.pop("public_content_sha256")
+    elif invalid == "missing_flag":
+        artifact.pop("content_redacted")
+    elif invalid == "bad_flag":
+        artifact["content_redacted"] = "true"
+    elif invalid == "integer_flag":
+        artifact["content_redacted"] = 1
+    elif invalid == "bad_public_hash":
+        artifact["public_content_sha256"] = "not-a-hash"
+    elif invalid == "bad_original_hash":
+        artifact["content_sha256"] = "not-a-hash"
+    elif invalid == "equal_redacted_hashes":
+        artifact["content_sha256"] = artifact["public_content_sha256"]
+    elif invalid == "different_unredacted_hashes":
+        artifact["content_redacted"] = False
+    elif invalid == "tampered_content":
+        artifact["content"]["text"] = "private output must not appear in errors"
+    elif invalid == "tampered_provenance":
+        artifact["provenance"]["logical_model"] = "other-model"
+    events.append(_model_event(events[0]["run_id"], "deepseek"))
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert any("public_model_scope_read_failed" in error for error in evidence["errors"])
+    assert "private output" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize("projection_metadata", [False, True])
+async def test_actual_public_security_redaction_requires_verified_projection_hash(
+    crew_public_model_events: list[dict[str, Any]], projection_metadata: bool,
+) -> None:
+    from agent_hub.runs.repository import _public_event_payload
+    from agent_hub.runtime.contracts import Artifact
+
+    module = load_script()
+    events = copy.deepcopy(crew_public_model_events)
+    event = next(event for event in events if isinstance(event.get("artifact"), dict)
+                 and event["artifact"]["type"] == "model_response")
+    raw: dict[str, Any] = {key: value for key, value in event["artifact"].items()
+           if key not in {"public_content_sha256", "content_redacted"}}
+    raw["content"]["text"] = "Security review: password policy is covered."
+    raw["content_sha256"] = ""
+    event["artifact"] = Artifact.from_payload(raw).to_payload()
+    public = _public_event_payload(event)
+    projected = cast(dict[str, Any], public["artifact"])
+    assert projected["content"]["text"] == "[redacted]"
+    if projection_metadata:
+        assert projected["content_redacted"] is True
+        assert projected["public_content_sha256"] != projected["content_sha256"]
+    else:
+        projected.pop("public_content_sha256", None)
+        projected.pop("content_redacted", None)
+    events[events.index(event)] = public
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is projection_metadata, evidence["errors"]
+    assert "password policy" not in json.dumps(evidence)
+    assert "[redacted]" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize("invalid_index", [0, 1, 2])
+@pytest.mark.parametrize("invalid", [None, "foreign_attempt", "hash_mismatch"])
+async def test_scoped_collector_checks_every_typed_completion_not_just_final_model(
+    crew_public_model_events: list[dict[str, Any]], invalid_index: int, invalid: str | None,
+) -> None:
+    from uuid import uuid4
+
+    from agent_hub.runtime.contracts import Artifact
+
+    module = load_script()
+    original = next(
+        event for event in crew_public_model_events
+        if event["kind"] == "artifact.created" and event["artifact"]["type"] == "model_response"
+    )
+    completions = []
+    for index in range(3):
+        event = copy.deepcopy(original)
+        event["sequence"] = index + 1
+        event["artifact"]["id"] = str(uuid4())
+        if index == invalid_index and invalid == "foreign_attempt":
+            event["artifact"]["content"]["attempted_logical_models"] = ["other-model", "deepseek"]
+            event["artifact"]["content_sha256"] = ""
+            event["artifact"] = Artifact.from_payload({
+                key: value for key, value in event["artifact"].items()
+                if key not in {"public_content_sha256", "content_redacted"}
+            }).to_payload()
+        elif index == invalid_index and invalid == "hash_mismatch":
+            event["artifact"]["content_sha256"] = "0" * 64
+        completions.append(event)
+    # An otherwise valid completion must not hide any mismatching model artifact.
+    events = [*completions, _model_event(original["run_id"], "deepseek")]
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is (invalid is None)
+    assert bool(evidence["errors"]) is (invalid is not None)
+    if invalid is None:
+        retained = evidence["runs"][0]["model_events"]
+        assert len([event for event in retained if "model_artifact" in event]) == 3
+    if invalid == "hash_mismatch":
+        assert any("public_model_scope_read_failed" in error for error in evidence["errors"])
+    assert "actual model answer" not in json.dumps(evidence)
+
+
+@pytest.mark.parametrize("tamper", [None, "hash_flag", "provenance", "empty_attempts", "actor", "builtin_fixture",
+                                   "half_projection", "contradictory_projection"])
+async def test_crew_completion_proof_is_revalidated_on_resume_and_finalization(
+    crew_public_model_events: list[dict[str, Any]], tamper: str | None,
+) -> None:
+    module = load_script()
+    evidence = collect_direct_model_evidence(module, crew_public_model_events)
+    assert evidence["ok"] is True
+    proof = next(event for event in evidence["runs"][0]["model_events"] if "model_artifact" in event)
+    if tamper == "hash_flag":
+        proof["model_artifact"]["hash_verified"] = 1
+    elif tamper == "provenance":
+        proof["model_artifact"]["provenance"]["logical_model"] = "other-model"
+    elif tamper == "empty_attempts":
+        proof["payload"]["attempted_logical_models"] = []
+    elif tamper == "actor":
+        proof["actor"] = "another-agent"
+    elif tamper == "builtin_fixture":
+        proof["payload"]["artifact_origin"] = "builtin_fixture"
+    elif tamper == "half_projection":
+        proof["model_artifact"]["public_content_sha256"] = proof["model_artifact"]["content_sha256"]
+        proof["model_artifact"].pop("content_redacted", None)
+    elif tamper == "contradictory_projection":
+        proof["model_artifact"]["public_content_sha256"] = proof["model_artifact"]["content_sha256"]
+        proof["model_artifact"]["content_redacted"] = True
+    report = _pending_automated_report("deepseek")
+    case = report["cases"][0]
+    run_id = case["run"]["run_id"]
+    evidence.update(original_run_id=run_id, result_run_id=run_id)
+    run = evidence["runs"][0]
+    run.update(run_id=run_id, events_endpoint=f"/api/v1/runs/{quote(run_id, safe='')}/events")
+    for event in run["model_events"]:
+        event["run_id"] = run_id
+    case["model_scope_evidence"] = evidence
+    assert module._has_complete_core_evidence(
+        case, safe_execution_id="matrix-123", case_key="auto-small"
+    ) is (tamper is None)
+    if tamper is None:
+        finalized = module.finalize_real_device_acceptance(
+            report, _real_device_evidence("matrix-123", "deepseek")
+        )
+        assert finalized["acceptance_complete"] is True
+    else:
+        with pytest.raises(ValueError):
+            module.finalize_real_device_acceptance(
+                report, _real_device_evidence("matrix-123", "deepseek")
+            )
+
+
+@pytest.mark.parametrize("attempts", [["other-model", "deepseek"], [], ["other-model"]])
+async def test_crew_event_attempts_cannot_be_overwritten_by_artifact_history(
+    crew_public_model_events: list[dict[str, Any]], attempts: list[str],
+) -> None:
+    module = load_script()
+    events = copy.deepcopy(crew_public_model_events)
+    event = next(event for event in events if isinstance(event.get("artifact"), dict)
+                 and event["artifact"]["type"] == "model_response")
+    event["payload"]["attempted_logical_models"] = attempts
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+
+
+@pytest.mark.parametrize("envelope", [None, "not-an-envelope", {}, "missing"])
+async def test_extra_malformed_model_envelope_cannot_hide_behind_valid_completion(
+    direct_public_model_events: list[dict[str, Any]], envelope: object,
+) -> None:
+    module = load_script()
+    events = copy.deepcopy(direct_public_model_events)
+    malformed = copy.deepcopy(events[1])
+    malformed["sequence"] = events[-1]["sequence"] + 1
+    if envelope == "missing":
+        malformed.pop("artifact")
+    else:
+        malformed["artifact"] = envelope
+    events.append(malformed)
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+
+
+async def test_crew_fixture_model_response_is_not_real_completion(
+    crew_public_model_events: list[dict[str, Any]],
+) -> None:
+    module = load_script()
+    events = copy.deepcopy(crew_public_model_events)
+    event = next(event for event in events if isinstance(event.get("artifact"), dict)
+                 and event["artifact"]["type"] == "model_response")
+    event["payload"]["artifact_origin"] = "builtin_fixture"
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "started_only", "request_only", "artifact_only", "runtime_only", "no_start",
+        "no_artifact", "no_runtime", "runtime_without_metadata", "no_artifact_attempts",
+        "no_runtime_attempts", "empty_artifact_attempts", "empty_runtime_attempts",
+        "foreign_artifact_attempt", "foreign_runtime_attempt", "foreign_start",
+        "foreign_artifact_model", "foreign_runtime_model", "foreign_requested_model",
+        "artifact_id_mismatch", "actor_mismatch", "sequence_mismatch", "boolean_sequence",
+        "no_deployment", "empty_upstream", "empty_provider", "builtin_fixture",
+        "wrong_artifact_run", "wrong_runtime_run", "direct_hash_mismatch",
+    ],
+)
+async def test_scoped_direct_completion_requires_linked_actual_gateway_metadata(
+    direct_public_model_events: list[dict[str, Any]],
+    invalid: str,
+) -> None:
+    module = load_script()
+    events = copy.deepcopy(direct_public_model_events)
+    start, artifact, _, completed = events
+    if invalid.endswith("_only"):
+        if invalid == "request_only":
+            start["kind"] = "request.created"
+        selected = artifact if invalid == "artifact_only" else (
+            completed if invalid == "runtime_only" else start
+        )
+        events = [selected]
+    elif invalid in {"no_start", "no_artifact", "no_runtime"}:
+        kind = {"no_start": "model.started", "no_artifact": "artifact.created",
+                "no_runtime": "runtime.completed"}[invalid]
+        events = [event for event in events if event["kind"] != kind]
+    elif invalid == "runtime_without_metadata":
+        completed["payload"] = {}
+    elif invalid in {"no_artifact_attempts", "no_runtime_attempts"}:
+        event = artifact if invalid == "no_artifact_attempts" else completed
+        event["payload"].pop("attempted_logical_models")
+    elif invalid in {"empty_artifact_attempts", "empty_runtime_attempts"}:
+        event = artifact if invalid == "empty_artifact_attempts" else completed
+        event["payload"]["attempted_logical_models"] = []
+    elif invalid in {"foreign_artifact_attempt", "foreign_runtime_attempt"}:
+        event = artifact if invalid == "foreign_artifact_attempt" else completed
+        event["payload"]["attempted_logical_models"] = ["other-model", "deepseek"]
+    elif invalid in {"foreign_start", "foreign_artifact_model", "foreign_runtime_model"}:
+        event = start if invalid == "foreign_start" else (
+            artifact if invalid == "foreign_artifact_model" else completed
+        )
+        event["payload"]["logical_model"] = "other-model"
+    elif invalid == "foreign_requested_model":
+        artifact["payload"]["requested_logical_model"] = "other-model"
+    elif invalid == "artifact_id_mismatch":
+        completed["payload"]["artifact_id"] = "another-artifact"
+    elif invalid == "actor_mismatch":
+        completed["actor"] = "another-agent"
+    elif invalid == "sequence_mismatch":
+        completed["sequence"] = start["sequence"]
+    elif invalid == "boolean_sequence":
+        start["sequence"] = True
+    elif invalid == "no_deployment":
+        artifact["payload"].pop("deployment")
+    elif invalid == "empty_upstream":
+        artifact["payload"]["upstream_model"] = ""
+    elif invalid == "empty_provider":
+        artifact["payload"]["provider"] = ""
+    elif invalid == "builtin_fixture":
+        artifact["payload"]["artifact_origin"] = "builtin_fixture"
+    elif invalid == "wrong_artifact_run":
+        artifact["run_id"] = "another-run"
+    elif invalid == "wrong_runtime_run":
+        completed["run_id"] = "another-run"
+    elif invalid == "direct_hash_mismatch":
+        artifact["artifact"]["content_sha256"] = "0" * 64
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+
+
+@pytest.mark.parametrize("attempts", ["empty", "missing"])
+async def test_another_completion_cannot_hide_direct_artifact_without_attempt_proof(
+    direct_public_model_events: list[dict[str, Any]], attempts: str,
+) -> None:
+    module = load_script()
+    events = copy.deepcopy(direct_public_model_events)
+    artifact = events[1]
+    if attempts == "empty":
+        artifact["payload"]["attempted_logical_models"] = []
+    else:
+        artifact["payload"].pop("attempted_logical_models")
+    events.append(_model_event(events[0]["run_id"], "deepseek"))
+    evidence = collect_direct_model_evidence(module, events)
+    assert evidence["ok"] is False
+    assert evidence["errors"]
+
+
+@pytest.mark.parametrize("tamper", [None, "empty_attempts", "missing_start", "missing_deployment"])
+async def test_direct_completion_proof_is_revalidated_during_finalization(
+    direct_public_model_events: list[dict[str, Any]],
+    tamper: str | None,
+) -> None:
+    module = load_script()
+    evidence = collect_direct_model_evidence(module, direct_public_model_events)
+    report = _pending_automated_report("deepseek")
+    case = report["cases"][0]
+    run_id = case["run"]["run_id"]
+    for key in ("original_run_id", "result_run_id"):
+        evidence[key] = run_id
+    run = evidence["runs"][0]
+    run["run_id"] = run_id
+    run["events_endpoint"] = f"/api/v1/runs/{quote(run_id, safe='')}/events"
+    for event in run["model_events"]:
+        event["run_id"] = run_id
+    if tamper == "empty_attempts":
+        run["model_events"][1]["payload"]["attempted_logical_models"] = []
+    elif tamper == "missing_start":
+        run["model_events"].pop(0)
+    elif tamper == "missing_deployment":
+        run["model_events"][1]["payload"].pop("deployment", None)
+    case["model_scope_evidence"] = evidence
+    if tamper is None:
+        finalized = module.finalize_real_device_acceptance(
+            report, _real_device_evidence("matrix-123", "deepseek")
+        )
+        assert finalized["acceptance_complete"] is True
+    else:
+        with pytest.raises(ValueError):
+            module.finalize_real_device_acceptance(
+                report, _real_device_evidence("matrix-123", "deepseek")
+            )
+
+
 @pytest.mark.parametrize(
     "invalid",
     [

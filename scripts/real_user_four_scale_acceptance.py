@@ -21,7 +21,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import cast
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_TIERS,
@@ -40,6 +40,7 @@ from agent_hub.harness.project_scale_runner import (
     _safe_zip_member_path,
     execute_project_scale_plan,
 )
+from agent_hub.runtime.contracts import Artifact, GatewayProvenance
 
 _MODE_CAPABILITIES = ("direct", "dispatch", "hybrid", "multi_agent")
 _ROUTE_INTENTS = ("auto", *_MODE_CAPABILITIES)
@@ -61,6 +62,11 @@ _SAFE_ID_RE = re.compile(r"[^a-z0-9-]+")
 _SAFE_MODEL_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}")
 _ADMIN_RUN_PREFIX = "/api/v1/admin/runs"
 _MAX_PREVIEW_ASSETS = 24
+_MAX_MODEL_ARTIFACT_BYTES = 2_100_000
+_MODEL_SCOPE_PAYLOAD_KEYS = (
+    "logical_model", "requested_logical_model", "attempted_logical_models",
+    "artifact_id", "deployment", "provider", "upstream_model", "artifact_origin",
+)
 _WEBSITE_DELIVERABLE_REQUIREMENT = (
     " Also include a complete interactive website for the project. Put a self-contained "
     "preview.html or index.html entrypoint in the workspace with usable navigation and at least "
@@ -272,6 +278,145 @@ def _validate_report_model_profile(
                     )
 
 
+def _model_artifact_hashes(raw: Mapping[str, object]) -> tuple[str, str, bool | None]:
+    original = raw.get("content_sha256")
+    if not isinstance(original, str) or _SHA256_RE.fullmatch(original) is None:
+        raise ValueError("invalid model artifact digest")
+    if "public_content_sha256" not in raw and "content_redacted" not in raw:
+        return original, original, None
+    public, redacted = raw.get("public_content_sha256"), raw.get("content_redacted")
+    if (
+        not isinstance(public, str) or _SHA256_RE.fullmatch(public) is None
+        or type(redacted) is not bool or (original != public) is not redacted
+    ):
+        raise ValueError("invalid model artifact projection metadata")
+    return original, public, redacted
+
+
+def _public_model_artifact(event: Mapping[str, object]) -> dict[str, object]:
+    try:
+        raw = event.get("artifact")
+        if not isinstance(raw, Mapping):
+            raise TypeError
+        original_digest, public_digest, redacted = _model_artifact_hashes(raw)
+        encoded = json.dumps(dict(raw), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(encoded) > _MAX_MODEL_ARTIFACT_BYTES:
+            raise ValueError
+        envelope = {
+            key: value for key, value in raw.items()
+            if key not in {"public_content_sha256", "content_redacted"}
+        }
+        envelope["content_sha256"] = public_digest
+        artifact = Artifact.from_payload(envelope)
+        provenance = artifact.provenance
+        if provenance is None:
+            raise ValueError
+        return {
+            "source": "public_event_artifact",
+            "id": str(artifact.id),
+            "type": artifact.type,
+            "producer": artifact.producer,
+            "version": artifact.version,
+            "source_ids": list(artifact.source_ids),
+            "content_sha256": original_digest,
+            **({"public_content_sha256": public_digest, "content_redacted": redacted}
+               if redacted is not None else {}),
+            "hash_verified": True,
+            "hash_verification_scope": "original" if redacted is None else "public_projection",
+            "provenance": provenance.to_payload(),
+        }
+    except Exception:  # noqa: BLE001 - contract errors can include model output.
+        raise ValueError("public model artifact envelope/hash is invalid or unavailable") from None
+
+
+def _valid_model_artifact_proof(event: Mapping[str, object]) -> bool:
+    proof, payload = event.get("model_artifact"), event.get("payload")
+    if not isinstance(proof, Mapping) or not isinstance(payload, Mapping):
+        return False
+    digest, producer = proof.get("content_sha256"), proof.get("producer")
+    if (
+        proof.get("source") != "public_event_artifact"
+        or payload.get("artifact_origin") == "builtin_fixture"
+        or proof.get("hash_verified") is not True
+        or not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None
+        or not isinstance(producer, str) or not producer.strip()
+        or type(proof.get("version")) is not int or cast(int, proof["version"]) < 1
+        or not isinstance(proof.get("source_ids"), list)
+        or proof.get("id") != payload.get("artifact_id")
+        or proof.get("type") not in {"model_response", "text", "tool_result"}
+        or (proof.get("type") == "model_response" and event.get("actor") != producer)
+    ):
+        return False
+    try:
+        _, _, redacted = _model_artifact_hashes(proof)
+        if proof.get("hash_verification_scope") != (
+            "original" if redacted is None else "public_projection"
+        ):
+            return False
+        provenance = GatewayProvenance.from_payload(proof.get("provenance"))
+        # Validate the retained envelope identities without retaining its content.
+        if str(UUID(cast(str, proof.get("id")))) != proof.get("id"):
+            return False
+        sources = cast(list[object], proof["source_ids"])
+        if any(not isinstance(item, str) or str(UUID(item)) != item for item in sources):
+            return False
+        if len(set(cast(list[str], sources))) != len(sources):
+            return False
+    except Exception:  # noqa: BLE001 - evidence must fail closed without echoing inputs.
+        return False
+    attempts = payload.get("attempted_logical_models")
+    return (
+        payload.get("logical_model") == provenance.logical_model
+        and isinstance(attempts, list) and bool(attempts)
+        and all(isinstance(item, str) and bool(item) for item in attempts)
+        and attempts[-1] == provenance.logical_model
+        and all(
+            key not in payload or payload[key] == value
+            for key, value in (
+                ("deployment", provenance.deployment_id), ("provider", provenance.provider_id),
+                ("upstream_model", provenance.provider_model),
+            )
+        )
+    )
+
+
+def _has_direct_model_completion(events: list[object]) -> bool:
+    starts: dict[str, tuple[int, object]] = {}
+    artifacts: dict[tuple[str, str], tuple[int, Mapping[str, object]]] = {}
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        actor, sequence, payload = event.get("actor"), event.get("sequence"), event.get("payload")
+        if not isinstance(actor, str) or type(sequence) is not int or not isinstance(payload, Mapping):
+            continue
+        if sequence < 1:
+            continue
+        kind = event.get("kind")
+        if kind == "model.started":
+            starts[actor] = (sequence, payload.get("logical_model"))
+            continue
+        artifact_id, logical_model = payload.get("artifact_id"), payload.get("logical_model")
+        if not isinstance(artifact_id, str) or payload.get("artifact_origin") == "builtin_fixture":
+            continue
+        if kind == "artifact.created" and _valid_model_artifact_proof(event):
+            start = starts.get(actor)
+            if (
+                start is not None and start[0] < sequence and start[1] == logical_model
+                and payload.get("requested_logical_model") == logical_model
+                and all(isinstance(payload.get(key), str) and payload[key]
+                        for key in ("deployment", "provider", "upstream_model"))
+            ):
+                artifacts[actor, artifact_id] = (sequence, payload)
+        elif kind == "runtime.completed":
+            artifact = artifacts.get((actor, artifact_id))
+            if artifact is not None and artifact[0] < sequence and all(
+                key in payload and payload[key] == artifact[1].get(key)
+                for key in ("logical_model", "requested_logical_model", "attempted_logical_models")
+            ):
+                return True
+    return False
+
+
 def _model_scope_errors(
     evidence: object, *, logical_model: str, result_run_id: object
 ) -> list[str]:
@@ -314,7 +459,7 @@ def _model_scope_errors(
         if not isinstance(events, list):
             errors.append(f"{run_id}: model events are malformed")
             continue
-        completions = 0
+        completions = int(_has_direct_model_completion(events))
         for event in events:
             if not isinstance(event, Mapping) or event.get("run_id") != run_id:
                 errors.append(f"{run_id}: model event run scope is invalid")
@@ -324,12 +469,33 @@ def _model_scope_errors(
                 errors.append(f"{run_id}: model event payload is malformed")
                 continue
             completed = event.get("kind") == "model.completed"
+            proof = event.get("model_artifact")
+            if event.get("kind") == "artifact.created" and proof is None and any(
+                key in payload for key in ("attempted_logical_models", "requested_logical_model")
+            ):
+                errors.append(f"{run_id}: actual model artifact proof is missing")
+            if completed and payload.get("artifact_origin") == "builtin_fixture":
+                completed = False
+                errors.append(f"{run_id}: builtin fixture is not an actual model completion")
+            if proof is not None:
+                if not _valid_model_artifact_proof(event):
+                    errors.append(f"{run_id}: actual model artifact proof is invalid")
+                elif (
+                    event.get("kind") == "artifact.created" and isinstance(proof, Mapping)
+                    and proof.get("type") == "model_response"
+                    and event.get("actor") == proof.get("producer")
+                    and type(event.get("sequence")) is int
+                    and cast(int, event["sequence"]) > 0
+                ):
+                    completed = True
             if completed:
                 completions += 1
             if (completed or "logical_model" in payload) and payload.get(
                 "logical_model"
             ) != logical_model:
                 errors.append(f"{run_id}: observed logical model does not match selected model")
+            if "requested_logical_model" in payload and payload["requested_logical_model"] != logical_model:
+                errors.append(f"{run_id}: requested logical model does not match selected model")
             if "attempted_logical_models" in payload:
                 attempted = payload.get("attempted_logical_models")
                 if not isinstance(attempted, list) or any(
@@ -337,7 +503,7 @@ def _model_scope_errors(
                 ):
                     errors.append(f"{run_id}: attempted logical models do not match selected model")
         if completions == 0:
-            errors.append(f"{run_id}: no actual model.completed evidence")
+            errors.append(f"{run_id}: no actual model completion evidence")
     if seen != required:
         errors.append("model scope evidence does not cover every original/result/repair run")
     return errors
@@ -382,6 +548,38 @@ def _collect_model_scope_evidence(
                     raise TypeError("public run events contain a malformed event")
                 payload = event.get("payload")
                 kind = event.get("kind")
+                artifact = event.get("artifact")
+                proof: dict[str, object] | None = None
+                if kind == "artifact.created" and (
+                    (isinstance(artifact, Mapping) and artifact.get("type") == "model_response")
+                    or (isinstance(payload, Mapping) and any(
+                        key in payload for key in ("attempted_logical_models", "requested_logical_model")
+                    ))
+                ):
+                    if not isinstance(artifact, Mapping):
+                        raise ValueError("public model artifact envelope is missing")
+                    proof = _public_model_artifact(event)
+                    provenance = cast(Mapping[str, object], proof["provenance"])
+                    actual_payload: dict[str, object] = dict(payload) if isinstance(payload, Mapping) else {}
+                    if (
+                        "artifact_id" in actual_payload and actual_payload["artifact_id"] != proof["id"]
+                        or "logical_model" in actual_payload
+                        and actual_payload["logical_model"] != provenance["logical_model"]
+                    ):
+                        raise ValueError("public model artifact identity contradicts its event")
+                    if artifact.get("type") == "model_response":
+                        content = artifact.get("content")
+                        if not isinstance(content, Mapping):
+                            raise ValueError("public model completion content is unavailable")
+                        if "attempted_logical_models" in actual_payload and (
+                            actual_payload["attempted_logical_models"]
+                            != content.get("attempted_logical_models")
+                        ):
+                            raise ValueError("public model attempt histories contradict")
+                        actual_payload["logical_model"] = provenance["logical_model"]
+                        actual_payload["attempted_logical_models"] = content.get("attempted_logical_models")
+                    actual_payload["artifact_id"] = proof["id"]
+                    payload = actual_payload
                 if (
                     isinstance(kind, str)
                     and kind.startswith("model.")
@@ -392,26 +590,27 @@ def _collect_model_scope_evidence(
                         )
                     )
                 ):
-                    # Retain only model identity evidence, never output text or credentials.
+                    # Preserve verified completion identities, never response text/tool arguments.
                     model_events.append(
                         {
                             **{
                                 key: event[key]
-                                for key in ("kind", "run_id", "sequence")
+                                for key in ("kind", "run_id", "sequence", "actor")
                                 if key in event
                             },
                             "payload": {
                                 key: copy.deepcopy(payload[key])
-                                for key in ("logical_model", "attempted_logical_models")
+                                for key in _MODEL_SCOPE_PAYLOAD_KEYS
                                 if key in payload
                             }
                             if isinstance(payload, Mapping)
                             else None,
+                            **({"model_artifact": proof} if proof is not None else {}),
                         }
                     )
             item["model_events"] = model_events
         except Exception as error:  # noqa: BLE001 - missing public evidence must fail the case.
-            errors.append(f"{run_id}: {error}")
+            errors.append(f"{run_id}: public_model_scope_read_failed ({type(error).__name__})")
         runs.append(item)
     evidence: dict[str, object] = {
         "source": "public_run_events",

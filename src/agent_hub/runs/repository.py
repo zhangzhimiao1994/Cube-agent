@@ -2272,7 +2272,9 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
         return context_event_projection(payload)
     public = {
-        key: _sanitize_public_json(value)
+        key: _public_artifact_payload(value)
+        if key == "artifact" and isinstance(value, dict)
+        else _sanitize_public_json(value, project_artifacts=True)
         for key, value in payload.items()
         if _is_public_key(key) and key not in {"checkpoint", "checkpoint_summary"}
     }
@@ -2322,20 +2324,38 @@ def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:
 
 
 def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {
-        key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
+    try:
+        original = Artifact.from_payload(payload)
+    except (TypeError, ValueError):
+        original = None
+    public = {
+        key: _sanitize_public_json(value)
+        for key, value in payload.items()
+        if _is_public_key(key) and key not in {"public_content_sha256", "content_redacted"}
     }
+    if original is None or payload.get("content_sha256") != original.content_sha256:
+        return public
+    try:
+        # The original digest belongs to private storage; validate a separate public envelope.
+        projected = Artifact.from_payload({**public, "content_sha256": ""})
+    except (TypeError, ValueError):
+        return public
+    public["public_content_sha256"] = projected.content_sha256
+    public["content_redacted"] = projected.content_sha256 != original.content_sha256
+    return public
 
 
-def _sanitize_public_json(value: object) -> object:
+def _sanitize_public_json(value: object, *, project_artifacts: bool = False) -> object:
     if isinstance(value, dict):
         return {
-            str(key): _sanitize_public_json(item)
+            str(key): _public_artifact_payload(item)
+            if project_artifacts and key == "artifact" and isinstance(item, dict)
+            else _sanitize_public_json(item, project_artifacts=project_artifacts)
             for key, item in value.items()
             if _is_public_key(str(key))
         }
     if isinstance(value, list):
-        return [_sanitize_public_json(item) for item in value]
+        return [_sanitize_public_json(item, project_artifacts=project_artifacts) for item in value]
     if type(value) is str and _SENSITIVE_PUBLIC_TEXT.search(value):
         return "[redacted]"
     return value
