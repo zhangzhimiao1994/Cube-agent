@@ -42,6 +42,7 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
+from agent_hub.runtime.model_scope import ModelScopeTracker
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
 from agent_hub.runtime.project_scale_artifact import (
     is_project_scale_artifact_request,
@@ -1042,8 +1043,62 @@ class DirectRuntime:
         self._active_task: asyncio.Task[GatewayCompletion] | None = None
         self._active_capability_task: asyncio.Task[Mapping[str, JsonValue]] | None = None
         self._cancel_requested = False
+        self._model_scope_tracker: ModelScopeTracker | None = None
+        self._model_scope_published = False
         self._last_checkpoint: RuntimeCheckpoint | None = None
         self._restored_checkpoint: RuntimeCheckpoint | None = None
+
+    async def _complete_with_scope(self, request: ModelRequest) -> GatewayCompletion:
+        tracker = self._model_scope_tracker
+        index = tracker.begin() if tracker is not None else None
+        try:
+            completion = await self._gateway.complete_with_context(request)
+        except Exception as error:
+            if tracker is not None and index is not None:
+                tracker.failed(index, error)
+            raise
+        validated = self._strict_completion(completion)
+        if tracker is not None and index is not None and validated is not None:
+            tracker.received(index, request, validated)
+        return completion
+
+    def _model_scope_events(
+        self, *, run_id: UUID, sequence: int, include_received_only: bool = False,
+    ) -> tuple[RunEvent, ...]:
+        tracker = self._model_scope_tracker
+        if tracker is None or self._model_scope_published or self._cancel_requested:
+            return ()
+        artifacts = tracker.artifacts(include_received_only=include_received_only)
+        self._model_scope_published = True
+        if tracker.incomplete:
+            return (RunEvent(kind="model.scope_incomplete", sequence=sequence, run_id=run_id,
+                             payload={"actor": "main_agent", "logical_model": self._logical_model,
+                                      "call_count": tracker.call_count}),)
+        events: list[RunEvent] = []
+        for artifact in artifacts:
+            if artifact.provenance is None:
+                continue
+            calls = cast(tuple[Mapping[str, JsonValue], ...], artifact.content["calls"])
+            attempts = tuple(dict.fromkeys(
+                model for call in calls
+                for model in cast(tuple[str, ...], cast(Mapping[str, JsonValue], call["receipt"])[
+                    "attempted_logical_models"
+                ])
+            ))
+            provenance = artifact.provenance
+            payload: dict[str, JsonValue] = {
+                "artifact_id": str(artifact.id), "logical_model": provenance.logical_model,
+                "requested_logical_model": self._logical_model, "attempted_logical_models": attempts,
+                "deployment": provenance.deployment_id, "provider": provenance.provider_id,
+                "upstream_model": provenance.provider_model,
+            }
+            events.extend((
+                RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=sequence + len(events),
+                         run_id=run_id, actor="main_agent", artifact=artifact, payload=payload),
+                RunEvent(kind="model.failure_receipt", sequence=sequence + len(events) + 1,
+                         run_id=run_id, payload={**payload, "actor": "main_agent"}),
+            ))
+        return tuple(events)
 
     async def _deliver_workspace_incrementally(
         self,
@@ -1427,7 +1482,7 @@ class DirectRuntime:
             prompt_estimate = next_prompt_estimate
             if self._cancel_requested:
                 raise asyncio.CancelledError
-            gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
+            gateway_task = asyncio.create_task(self._complete_with_scope(request))
             self._active_task = gateway_task
             try:
                 completion = await gateway_task
@@ -1492,12 +1547,18 @@ class DirectRuntime:
         self._active_task = None
         self._active_capability_task = None
         self._cancel_requested = False
+        self._model_scope_tracker = ModelScopeTracker(
+            run_id=context.run_id, tenant_id=context.tenant_id, logical_model=self._logical_model,
+        )
+        self._model_scope_published = False
         return stream
 
     async def _run(
         self, context: TaskContext, token: object, done: asyncio.Event
     ) -> AsyncIterator[RunEvent]:
         gateway_task: asyncio.Task[GatewayCompletion] | None = None
+        scope_run_id = context.run_id
+        injection_offset = 0
         self._last_checkpoint = None
         try:
             restored = self._restored_checkpoint
@@ -1608,7 +1669,7 @@ class DirectRuntime:
                 nonlocal submission_started
                 submission_started = True
                 submission_ready.set()
-                return await self._gateway.complete_with_context(model_request)
+                return await self._complete_with_scope(model_request)
 
             retry_deadline = asyncio.get_running_loop().time() + context.timeout_seconds
             gateway_task = asyncio.create_task(submit_model(request))
@@ -2040,6 +2101,12 @@ class DirectRuntime:
             if workspace_delivery is not None:
                 artifact_payload["workspace_delivery"] = workspace_delivery
                 completed_payload["workspace_delivery"] = workspace_delivery
+            scope_events = self._model_scope_events(
+                run_id=scope_run_id, sequence=2 + injection_offset,
+            )
+            for scope_event in scope_events:
+                yield scope_event
+            injection_offset += len(scope_events)
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2 + injection_offset,
@@ -2061,6 +2128,7 @@ class DirectRuntime:
                     "artifact_id": str(artifact.id),
                     "artifact_sha256": artifact.content_sha256,
                     "next_sequence": 4 + injection_offset,
+                    **({"model_scope_event_count": len(scope_events)} if scope_events else {}),
                 },
             )
             self._last_checkpoint = checkpoint
@@ -2079,6 +2147,12 @@ class DirectRuntime:
                 payload=completed_payload,
                 inputs=(artifact,),
             )
+        except RuntimeExecutionError:
+            for scope_event in self._model_scope_events(
+                run_id=scope_run_id, sequence=2 + injection_offset, include_received_only=True,
+            ):
+                yield scope_event
+            raise
         finally:
             if gateway_task is not None:
                 if not gateway_task.done():
@@ -2091,6 +2165,7 @@ class DirectRuntime:
                 self._active_done = None
                 self._active_task = None
                 self._active_capability_task = None
+                self._model_scope_tracker = None
                 if active_stream is not None:
                     active_stream._mark_closed()
             done.set()
@@ -2447,7 +2522,8 @@ class DirectRuntime:
     @staticmethod
     def _is_completed_checkpoint_state(checkpoint: RuntimeCheckpoint) -> bool:
         state = checkpoint.state
-        if set(state) != {"completed", "artifact_id", "artifact_sha256", "next_sequence"}:
+        base_keys = {"completed", "artifact_id", "artifact_sha256", "next_sequence"}
+        if set(state) not in (base_keys, base_keys | {"model_scope_event_count"}):
             return False
         artifact_id = state["artifact_id"]
         artifact_sha256 = state["artifact_sha256"]
@@ -2462,7 +2538,15 @@ class DirectRuntime:
             and type(artifact_sha256) is str
             and _SHA256.fullmatch(artifact_sha256) is not None
             and type(state["next_sequence"]) is int
-            and state["next_sequence"] in (3, 4, 5)
+            and (
+                state["next_sequence"] in (3, 4, 5) if "model_scope_event_count" not in state
+                else type(state["model_scope_event_count"]) is int
+                and 0 < state["model_scope_event_count"] <= 2**63 - 6
+                and state["next_sequence"] in (
+                    4 + state["model_scope_event_count"],
+                    5 + state["model_scope_event_count"],
+                )
+            )
         )
 
     async def cancel(self) -> None:

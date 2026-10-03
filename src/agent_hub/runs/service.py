@@ -1823,11 +1823,25 @@ class RunService:
                 configured_tokens=self._runtime_token_budget,
                 mode=mode,
             )
+            non_progress_artifact_ids: frozenset[str] = frozenset()
+            if checkpoint is not None and isinstance(
+                checkpoint_registry := checkpoint.state.get("artifact_registry"), Mapping
+            ):
+                # Registry hashes carry no type; match persisted receipt artifacts on recovery.
+                non_progress_artifact_ids = frozenset(
+                    str(event.artifact.id)
+                    for event in await self._repository.raw_events(tenant_id, run_id)
+                    if event.artifact is not None and event.artifact.type == "model_attempt"
+                    and checkpoint_registry.get(str(event.artifact.id)) == event.artifact.content_sha256
+                )
+            checkpoint_progress_units = _checkpoint_progress_units(
+                checkpoint, non_progress_artifact_ids=non_progress_artifact_ids,
+            )
             token_budget = _runtime_token_budget(
                 mode,
                 configured_tokens=self._runtime_token_budget,
                 routing_decision=runtime_routing_decision,
-                progress_units=_checkpoint_progress_units(checkpoint),
+                progress_units=checkpoint_progress_units,
             )
             instructions = None
             if mode in (TaskMode.DIRECT, TaskMode.DISPATCH) and self._instruction_context_loader is not None:
@@ -1901,7 +1915,7 @@ class RunService:
                     configured_seconds=self._runtime_timeout_seconds,
                     explicit_seconds=_routing_runtime_timeout_seconds(
                         runtime_routing_decision,
-                        progress_units=_checkpoint_progress_units(checkpoint),
+                        progress_units=checkpoint_progress_units,
                     ),
                 ),
                 token_budget=token_budget,
@@ -1944,7 +1958,8 @@ class RunService:
                     context,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
-                    initial_progress_units=_checkpoint_progress_units(checkpoint),
+                    initial_progress_units=checkpoint_progress_units,
+                    non_progress_artifact_ids=non_progress_artifact_ids,
                 ):
                     cancel_runtime = False
                     stop_runtime_loop = False
@@ -3391,6 +3406,7 @@ def _has_delivery_artifact(events: tuple[RunEvent, ...]) -> bool:
     return any(
         event.kind is EventKind.ARTIFACT_CREATED
         and event.artifact is not None
+        and event.artifact.type != "model_attempt"
         and event.artifact.producer != "run_service"
         for event in events
     )
@@ -4820,7 +4836,9 @@ def _routing_runtime_timeout_seconds(
     return min(absolute_timeout, initial_timeout + soft_timeout * progress_share)
 
 
-def _checkpoint_progress_units(checkpoint: RuntimeCheckpoint | None) -> int:
+def _checkpoint_progress_units(
+    checkpoint: RuntimeCheckpoint | None, *, non_progress_artifact_ids: frozenset[str] = frozenset(),
+) -> int:
     if checkpoint is None:
         return 0
     state = checkpoint.state
@@ -4840,7 +4858,8 @@ def _checkpoint_progress_units(checkpoint: RuntimeCheckpoint | None) -> int:
         else set()
     )
     artifact_units = (
-        sum(1 for artifact_id in registry if artifact_id not in input_ids)
+        sum(1 for artifact_id in registry
+            if artifact_id not in input_ids and artifact_id not in non_progress_artifact_ids)
         if isinstance(registry, Mapping)
         else 0
     )
@@ -4952,25 +4971,34 @@ async def _adaptive_runtime_events(
     configured_tokens: int,
     routing_decision: Mapping[str, object],
     initial_progress_units: int,
+    non_progress_artifact_ids: frozenset[str] = frozenset(),
 ) -> AsyncIterator[RunEvent]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
     seen_artifacts: set[UUID] = set()
+    metadata_artifact_ids = set(non_progress_artifact_ids)
     async for event in runtime.run(context):
+        if event.artifact is not None and event.artifact.type == "model_attempt":
+            metadata_artifact_ids.add(str(event.artifact.id))
         if event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id is not None:
             if event.tool_call_id not in seen_tool_calls:
                 seen_tool_calls.add(event.tool_call_id)
                 progress_units += 1
             if event.artifact is not None:
                 seen_artifacts.add(event.artifact.id)
-        elif event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None:
+        elif (
+            event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+            and event.artifact.type != "model_attempt"
+        ):
             if event.artifact.id not in seen_artifacts:
                 seen_artifacts.add(event.artifact.id)
                 progress_units += 1
         elif event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None:
             progress_units = max(
                 progress_units,
-                _checkpoint_progress_units(event.checkpoint),
+                _checkpoint_progress_units(
+                    event.checkpoint, non_progress_artifact_ids=frozenset(metadata_artifact_ids),
+                ),
             )
         extended_budget = _runtime_token_budget(
             context.mode,

@@ -41,6 +41,7 @@ from agent_hub.harness.project_scale_runner import (
     execute_project_scale_plan,
 )
 from agent_hub.runtime.contracts import Artifact, GatewayProvenance
+from agent_hub.runtime.model_scope import validate_model_scope_artifact
 
 _MODE_CAPABILITIES = ("direct", "dispatch", "hybrid", "multi_agent")
 _ROUTE_INTENTS = ("auto", *_MODE_CAPABILITIES)
@@ -66,6 +67,7 @@ _MAX_MODEL_ARTIFACT_BYTES = 2_100_000
 _MODEL_SCOPE_PAYLOAD_KEYS = (
     "logical_model", "requested_logical_model", "attempted_logical_models",
     "artifact_id", "deployment", "provider", "upstream_model", "artifact_origin",
+    "model_scope_origin",
 )
 _WEBSITE_DELIVERABLE_REQUIREMENT = (
     " Also include a complete interactive website for the project. Put a self-contained "
@@ -311,7 +313,7 @@ def _public_model_artifact(event: Mapping[str, object]) -> dict[str, object]:
         provenance = artifact.provenance
         if provenance is None:
             raise ValueError
-        return {
+        proof: dict[str, object] = {
             "source": "public_event_artifact",
             "id": str(artifact.id),
             "type": artifact.type,
@@ -325,6 +327,13 @@ def _public_model_artifact(event: Mapping[str, object]) -> dict[str, object]:
             "hash_verification_scope": "original" if redacted is None else "public_projection",
             "provenance": provenance.to_payload(),
         }
+        if artifact.type == "model_attempt":
+            if redacted is True:
+                raise ValueError
+            proof["scope_content"] = validate_model_scope_artifact(
+                artifact, _model_scope_source(event, artifact_id=str(artifact.id), digest=original_digest)[0]
+            )
+        return proof
     except Exception:  # noqa: BLE001 - contract errors can include model output.
         raise ValueError("public model artifact envelope/hash is invalid or unavailable") from None
 
@@ -417,6 +426,166 @@ def _has_direct_model_completion(events: list[object]) -> bool:
     return False
 
 
+def _model_scope_source(
+    event: Mapping[str, object], *, artifact_id: str | None = None, digest: str | None = None,
+) -> tuple[str, int]:
+    payload = event.get("payload")
+    if not isinstance(payload, Mapping):
+        raise TypeError
+    origin = payload.get("model_scope_origin")
+    run_id, sequence = event.get("run_id"), event.get("sequence")
+    if origin is not None:
+        keys = {"schema_version", "source", "run_id", "sequence", "parent_run_id"}
+        if artifact_id is not None:
+            keys |= {"artifact_id", "content_sha256"}
+        if (
+            not isinstance(origin, Mapping) or set(origin) != keys
+            or type(origin.get("schema_version")) is not int or origin["schema_version"] != 1
+            or origin["source"] != "hybrid_runtime" or origin["parent_run_id"] != run_id
+            or artifact_id is not None and (
+                origin["artifact_id"] != artifact_id or origin["content_sha256"] != digest
+            )
+        ):
+            raise ValueError
+        run_id, sequence = origin["run_id"], origin["sequence"]
+    if (not isinstance(run_id, str) or str(UUID(run_id)) != run_id
+            or type(sequence) is not int or sequence < 1):
+        raise ValueError
+    return run_id, sequence
+
+
+def _valid_model_scope_proof(event: Mapping[str, object]) -> bool:
+    proof, payload = event.get("model_artifact"), event.get("payload")
+    if not isinstance(proof, Mapping) or not isinstance(payload, Mapping):
+        return False
+    try:
+        original, public, redacted = _model_artifact_hashes(proof)
+        if (
+            proof.get("source") != "public_event_artifact"
+            or proof.get("hash_verified") is not True or redacted is True
+            or proof.get("hash_verification_scope") != (
+                "original" if redacted is None else "public_projection"
+            )
+            or original != public or event.get("actor") != "main_agent"
+            or payload.get("artifact_origin") == "builtin_fixture"
+            or proof.get("id") != payload.get("artifact_id")
+        ):
+            return False
+        artifact = Artifact.from_payload({
+            key: proof.get(key) for key in (
+                "id", "type", "producer", "version", "source_ids", "provenance"
+            )
+        } | {"content": proof.get("scope_content"), "content_sha256": original})
+        source_id, _ = _model_scope_source(event, artifact_id=str(artifact.id), digest=original)
+        content = validate_model_scope_artifact(artifact, source_id)
+        provenance = artifact.provenance
+        if provenance is None:
+            return False
+        calls = cast(list[Mapping[str, object]], content["calls"])
+        attempts = list(dict.fromkeys(
+            model for call in calls
+            for model in cast(list[str], cast(Mapping[str, object], call["receipt"])[
+                "attempted_logical_models"
+            ])
+        ))
+        return all(payload.get(key) == value for key, value in (
+            ("logical_model", provenance.logical_model),
+            ("requested_logical_model", content["requested_logical_model"]),
+            ("attempted_logical_models", attempts), ("deployment", provenance.deployment_id),
+            ("provider", provenance.provider_id), ("upstream_model", provenance.provider_model),
+        ))
+    except Exception:  # noqa: BLE001 - untrusted report content must fail closed.
+        return False
+
+
+def _has_failed_attempt_scope(events: list[object]) -> bool:
+    starts: dict[str, tuple[int, int, object]] = {}
+    artifacts: dict[str, tuple[int, Mapping[str, object], Mapping[str, object], str, int, str]] = {}
+    linked_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        sequence, payload = event.get("sequence"), event.get("payload")
+        if type(sequence) is not int or sequence < 1 or not isinstance(payload, Mapping):
+            if event.get("kind") == "model.failure_receipt":
+                return False
+            continue
+        if event.get("actor") != "main_agent":
+            if event.get("kind") == "model.failure_receipt":
+                return False
+            continue
+        if event.get("kind") == "model.started":
+            try:
+                source_id, source_sequence = _model_scope_source(event)
+            except (TypeError, ValueError):
+                continue
+            starts[source_id] = (sequence, source_sequence, payload.get("logical_model"))
+        elif event.get("kind") == "artifact.created" and _valid_model_scope_proof(event):
+            proof = cast(Mapping[str, object], event["model_artifact"])
+            source_id, source_sequence = _model_scope_source(
+                event, artifact_id=cast(str, proof["id"]), digest=cast(str, proof["content_sha256"])
+            )
+            start = starts.get(source_id)
+            if (start is not None and start[0] < sequence and start[1] < source_sequence
+                    and start[2] == payload.get("logical_model")):
+                if cast(str, payload["artifact_id"]) in artifacts:
+                    return False
+                artifacts[cast(str, payload["artifact_id"])] = (
+                    sequence, payload, cast(Mapping[str, object], proof["scope_content"]),
+                    source_id, source_sequence, cast(str, proof["content_sha256"]),
+                )
+        elif event.get("kind") == "model.failure_receipt":
+            linked = artifacts.get(cast(str, payload.get("artifact_id")))
+            if linked is None:
+                return False
+            try:
+                source_id, source_sequence = _model_scope_source(
+                    event, artifact_id=cast(str, payload["artifact_id"]), digest=linked[5]
+                )
+            except (TypeError, ValueError):
+                return False
+            if linked[0] < sequence and linked[3] == source_id and linked[4] < source_sequence and all(
+                payload.get(key) == linked[1].get(key) for key in _MODEL_SCOPE_PAYLOAD_KEYS
+                if key != "model_scope_origin"
+            ):
+                artifact_id = cast(str, payload["artifact_id"])
+                if artifact_id in linked_ids:
+                    return False
+                linked_ids.add(artifact_id)
+            else:
+                return False
+    if not artifacts or linked_ids != set(artifacts):
+        return False
+    groups: dict[str, list[Mapping[str, object]]] = {}
+    for _, _, content, _, _, _ in artifacts.values():
+        groups.setdefault(cast(str, content["scope_id"]), []).append(content)
+    call_ids: set[str] = set()
+    for parts in groups.values():
+        parts.sort(key=lambda part: cast(int, part["part_index"]))
+        first = parts[0]
+        if len(parts) != first["part_count"]:
+            return False
+        offset = 0
+        for index, part in enumerate(parts, 1):
+            if part["part_index"] != index or part["call_offset"] != offset or any(
+                part[key] != first[key] for key in (
+                    "run_id", "tenant_id", "requested_logical_model", "call_count", "part_count"
+                )
+            ):
+                return False
+            calls = cast(list[Mapping[str, object]], part["calls"])
+            for call in calls:
+                receipt = cast(Mapping[str, object], call["receipt"])
+                call_id = cast(str, receipt["call_id"])
+                if call_id in call_ids:
+                    return False
+                call_ids.add(call_id)
+            offset += len(calls)
+        if offset != first["call_count"]:
+            return False
+    return True
+
+
 def _model_scope_errors(
     evidence: object, *, logical_model: str, result_run_id: object
 ) -> list[str]:
@@ -453,13 +622,14 @@ def _model_scope_errors(
         endpoint = f"/api/v1/runs/{quote(run_id, safe='')}/events"
         if run.get("events_endpoint") != endpoint:
             errors.append(f"{run_id}: model evidence endpoint does not match run")
-        if run.get("status") not in {"completed", "failed", "cancelled"}:
+        if run.get("status") not in {"completed", "failed"}:
             errors.append(f"{run_id}: model evidence requires a terminal run")
         events = run.get("model_events")
         if not isinstance(events, list):
             errors.append(f"{run_id}: model events are malformed")
             continue
         completions = int(_has_direct_model_completion(events))
+        scope_present = False
         for event in events:
             if not isinstance(event, Mapping) or event.get("run_id") != run_id:
                 errors.append(f"{run_id}: model event run scope is invalid")
@@ -469,6 +639,10 @@ def _model_scope_errors(
                 errors.append(f"{run_id}: model event payload is malformed")
                 continue
             completed = event.get("kind") == "model.completed"
+            if event.get("kind") == "model.scope_incomplete":
+                errors.append(f"{run_id}: model call scope is incomplete")
+            if event.get("kind") == "model.failure_receipt":
+                scope_present = True
             proof = event.get("model_artifact")
             if event.get("kind") == "artifact.created" and proof is None and any(
                 key in payload for key in ("attempted_logical_models", "requested_logical_model")
@@ -478,7 +652,10 @@ def _model_scope_errors(
                 completed = False
                 errors.append(f"{run_id}: builtin fixture is not an actual model completion")
             if proof is not None:
-                if not _valid_model_artifact_proof(event):
+                scope_proof = isinstance(proof, Mapping) and proof.get("type") == "model_attempt"
+                scope_present = scope_present or scope_proof
+                if not (_valid_model_scope_proof(event) if scope_proof
+                        else _valid_model_artifact_proof(event)):
                     errors.append(f"{run_id}: actual model artifact proof is invalid")
                 elif (
                     event.get("kind") == "artifact.created" and isinstance(proof, Mapping)
@@ -502,7 +679,14 @@ def _model_scope_errors(
                     item != logical_model for item in attempted
                 ):
                     errors.append(f"{run_id}: attempted logical models do not match selected model")
-        if completions == 0:
+        scope_complete = _has_failed_attempt_scope(events)
+        if scope_present and not scope_complete:
+            errors.append(f"{run_id}: model call scope chain is incomplete")
+        recovered_failure = (
+            run_id in repairs and run_id not in {original, result_run_id}
+            and run.get("status") == "failed" and scope_complete
+        )
+        if completions == 0 and not recovered_failure:
             errors.append(f"{run_id}: no actual model completion evidence")
     if seen != required:
         errors.append("model scope evidence does not cover every original/result/repair run")
@@ -598,6 +782,9 @@ def _collect_model_scope_evidence(
                                 for key in ("kind", "run_id", "sequence", "actor")
                                 if key in event
                             },
+                            **({"actor": payload.get("actor")}
+                               if kind == "model.failure_receipt" and isinstance(payload, Mapping)
+                               and event.get("actor") is None else {}),
                             "payload": {
                                 key: copy.deepcopy(payload[key])
                                 for key in _MODEL_SCOPE_PAYLOAD_KEYS

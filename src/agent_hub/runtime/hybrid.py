@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from time import monotonic
+from types import MappingProxyType
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
@@ -38,6 +39,7 @@ from agent_hub.runtime.generated_file_recovery import (
     final_attachment_result,
     final_attachment_text_conflicts,
 )
+from agent_hub.runtime.model_scope import validate_model_scope_artifact, validate_model_scope_parts
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "2"
@@ -52,6 +54,10 @@ class RuntimeExecutionError(RuntimeError):
 
 class RuntimeBusy(RuntimeExecutionError):
     """One HybridRuntime instance is single-flight."""
+
+
+class _ChildModelScopeError(RuntimeExecutionError):
+    """Scope integrity failures must not become partial delivery successes."""
 
 
 class ChildRuntime(Protocol):
@@ -88,6 +94,12 @@ class HybridPlan:
 
 
 @dataclass(slots=True)
+class _ModelScopeBoundary:
+    parts: list[Mapping[str, object]] = field(default_factory=list)
+    incomplete: bool = False
+
+
+@dataclass(slots=True)
 class _StageBudget:
     token_limit: int
     timeout_limit: float
@@ -95,6 +107,7 @@ class _StageBudget:
     checkpoint_token_baseline: int = 0
     artifact_tokens: int = 0
     accounted_artifact_ids: set[UUID] = field(default_factory=set)
+    model_scope: _ModelScopeBoundary = field(default_factory=_ModelScopeBoundary)
 
     @property
     def consumed_tokens(self) -> int:
@@ -158,6 +171,7 @@ class HybridRuntime:
         restored_absolute_timeout_seconds: float | None = None
         last_child_progress_fingerprint: str | None = None
         restored_child_checkpoint: RuntimeCheckpoint | None = None
+        model_scope = _ModelScopeBoundary()
         try:
             restored = self._restored
             if restored is not None:
@@ -246,6 +260,7 @@ class HybridRuntime:
                 stage_budget = _StageBudget(
                     token_limit=remaining_tokens,
                     timeout_limit=stage_timeout,
+                    model_scope=model_scope,
                     checkpoint_tokens=(
                         _reported_tokens(child_checkpoint.state)
                         if child_checkpoint is not None
@@ -421,7 +436,10 @@ class HybridRuntime:
             raise
         except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
             failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
-            partial_reason = _partial_hybrid_completion_reason(artifacts, failure_reason)
+            partial_reason = (
+                None if isinstance(error, _ChildModelScopeError)
+                else _partial_hybrid_completion_reason(artifacts, failure_reason)
+            )
             if partial_reason is not None:
                 checkpoint = self._checkpoint(
                     context,
@@ -569,10 +587,21 @@ class HybridRuntime:
         self._active_child = child
         terminal_seen = False
         child_failure_reason: str | None = None
+        model_starts: dict[UUID, RunEvent] = {}
+        scope_artifacts: dict[str, RunEvent] = {}
         try:
             if checkpoint is not None:
                 await child.restore_checkpoint(checkpoint)
             async for item in child.run(child_context):
+                scope_artifact = _validate_child_model_scope_event(
+                    item, parent.tenant_id, model_starts, scope_artifacts,
+                )
+                if scope_artifact is not None and item.kind is EventKind.ARTIFACT_CREATED:
+                    stage_budget.model_scope.parts.append(validate_model_scope_artifact(
+                        scope_artifact, str(item.run_id),
+                    ))
+                elif item.kind == "model.scope_incomplete":
+                    stage_budget.model_scope.incomplete = True
                 _record_stage_usage(stage_budget, item)
                 if item.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and item.reason:
                     child_failure_reason = item.reason
@@ -582,9 +611,11 @@ class HybridRuntime:
                 if item.kind is EventKind.RUNTIME_CANCELLED:
                     raise asyncio.CancelledError
                 if item.kind is EventKind.RUNTIME_COMPLETED:
+                    _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
                     terminal_seen = True
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
+                    _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
                     yield _renumber_child_event(
                         item,
                         sequence,
@@ -600,7 +631,10 @@ class HybridRuntime:
                     and item.artifact is not None
                     or _is_forwardable_child_event(item)
                 ):
-                    yield _renumber_child_event(item, sequence, parent.run_id, inputs=artifacts)
+                    yield _renumber_child_event(
+                        item, sequence, parent.run_id, inputs=artifacts,
+                        scope_artifact=scope_artifact,
+                    )
                     sequence += 1
         except RuntimeExecutionError:
             raise
@@ -609,6 +643,7 @@ class HybridRuntime:
                 f"hybrid {mode.value} failed: {_safe_failure_reason(error, fallback='runtime failed')}"
             ) from None
         self._active_child = None
+        _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
         if not terminal_seen:
             raise RuntimeExecutionError("hybrid child ended without terminal")
 
@@ -852,6 +887,8 @@ def _mutable_json_value(value: JsonValue) -> object:
 
 def _is_forwardable_child_event(event: RunEvent) -> bool:
     return event.kind in {
+        "model.failure_receipt",
+        "model.scope_incomplete",
         EventKind.STEP_STARTED,
         EventKind.STEP_COMPLETED,
         EventKind.STEP_FAILED,
@@ -865,14 +902,111 @@ def _is_forwardable_child_event(event: RunEvent) -> bool:
     }
 
 
+def _validate_child_model_scope_event(
+    event: RunEvent,
+    tenant_id: UUID,
+    starts: dict[UUID, RunEvent],
+    artifacts: dict[str, RunEvent],
+) -> Artifact | None:
+    if event.kind is EventKind.MODEL_STARTED and event.actor == "main_agent":
+        starts[event.run_id] = event
+        return None
+    artifact = event.artifact
+    is_scope = artifact is not None and artifact.type == "model_attempt"
+    if not is_scope and event.kind not in {"model.failure_receipt", "model.scope_incomplete"}:
+        return None
+    try:
+        start = starts.get(event.run_id)
+        if start is None or start.sequence >= event.sequence:
+            raise ValueError
+        if is_scope:
+            assert artifact is not None
+            # Verify the original envelope before adding the parent event association.
+            validated = Artifact.from_payload(artifact.to_payload())
+            content = validate_model_scope_artifact(validated, str(event.run_id))
+            provenance = validated.provenance
+            if provenance is None:
+                raise ValueError
+            calls = cast(list[Mapping[str, object]], content["calls"])
+            attempts = tuple(dict.fromkeys(
+                model for call in calls
+                for model in cast(list[str], cast(Mapping[str, object], call["receipt"])[
+                    "attempted_logical_models"
+                ])
+            ))
+            if (
+                event.actor != "main_agent" or content["tenant_id"] != str(tenant_id)
+                or start.payload.get("logical_model") != content["requested_logical_model"]
+                or any(event.payload.get(key) != value for key, value in (
+                    ("artifact_id", str(artifact.id)),
+                    ("requested_logical_model", content["requested_logical_model"]),
+                    ("logical_model", provenance.logical_model),
+                    ("attempted_logical_models", attempts),
+                    ("deployment", provenance.deployment_id),
+                    ("provider", provenance.provider_id),
+                    ("upstream_model", provenance.provider_model),
+                ))
+                or str(artifact.id) in artifacts
+            ):
+                raise ValueError
+            artifacts[str(artifact.id)] = event
+            return artifact
+        if event.actor is not None or event.payload.get("actor") != "main_agent":
+            raise ValueError
+        if event.kind == "model.scope_incomplete":
+            if event.payload.get("logical_model") != start.payload.get("logical_model"):
+                raise ValueError
+            return None
+        linked = artifacts.pop(cast(str, event.payload.get("artifact_id")), None)
+        if (
+            linked is None or linked.run_id != event.run_id or linked.sequence >= event.sequence
+            or any(event.payload.get(key) != linked.payload.get(key) for key in (
+                "artifact_id", "logical_model", "requested_logical_model",
+                "attempted_logical_models", "deployment", "provider", "upstream_model",
+            ))
+        ):
+            raise ValueError
+        return linked.artifact
+    except Exception:  # noqa: BLE001 - do not disclose malformed scope evidence.
+        raise _ChildModelScopeError("hybrid child model scope evidence is invalid") from None
+
+
+def _seal_child_model_scope(
+    pending: Mapping[str, RunEvent], boundary: _ModelScopeBoundary,
+) -> None:
+    try:
+        if pending or boundary.incomplete:
+            raise ValueError
+        if boundary.parts:
+            validate_model_scope_parts(tuple(boundary.parts))
+    except Exception:  # noqa: BLE001 - do not expose untrusted scope metadata.
+        raise _ChildModelScopeError("hybrid child model scope evidence is invalid") from None
+
+
 def _renumber_child_event(
     event: RunEvent,
     sequence: int,
     run_id: UUID,
     *,
     inputs: tuple[Artifact, ...],
+    scope_artifact: Artifact | None = None,
 ) -> RunEvent:
     updates: dict[str, object] = {"sequence": sequence, "run_id": run_id}
+    if scope_artifact is not None or event.kind in {
+        EventKind.MODEL_STARTED, "model.scope_incomplete",
+    }:
+        origin: dict[str, JsonValue] = {
+            "schema_version": 1, "source": "hybrid_runtime", "run_id": str(event.run_id),
+            "sequence": event.sequence, "parent_run_id": str(run_id),
+        }
+        if scope_artifact is not None:
+            origin.update(artifact_id=str(scope_artifact.id),
+                          content_sha256=scope_artifact.content_sha256)
+        if "model_scope_origin" in event.payload:
+            raise _ChildModelScopeError("hybrid child model scope evidence is invalid")
+        updates["payload"] = MappingProxyType({
+            **event.payload, "model_scope_origin": MappingProxyType(origin),
+        })
     if event.kind is EventKind.MESSAGE_CREATED:
         updates["session_id"] = str(run_id)
         if not event.inputs:
@@ -996,9 +1130,10 @@ def _partial_hybrid_completion_reason(
     artifacts: list[Artifact],
     failure_reason: str,
 ) -> str | None:
-    if not artifacts:
+    delivery_artifacts = [artifact for artifact in artifacts if artifact.type != "model_attempt"]
+    if not delivery_artifacts:
         return None
-    if final_attachment_result(artifacts) is not None:
+    if final_attachment_result(delivery_artifacts) is not None:
         return "partial_hybrid_after_final_attachment"
     if failure_reason.startswith("hybrid discuss failed: model gateway failed"):
         return "partial_hybrid_after_discussion_failure"

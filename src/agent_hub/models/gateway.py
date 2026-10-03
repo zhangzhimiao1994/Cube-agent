@@ -12,7 +12,8 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from agent_hub.harness.provider import NormalizedProviderEvent
@@ -25,6 +26,13 @@ from agent_hub.models.capacity import (
     CapacityQueueFull,
     CapacityUnavailable,
     CapacityWaitTimeout,
+)
+from agent_hub.models.failure_receipt import (
+    MAX_GATEWAY_FAILURE_ATTEMPTS,
+    GatewayFailureAttempt,
+    GatewayFailureReceipt,
+    _attach_gateway_failure_receipt,
+    _valid_usage,
 )
 from agent_hub.models.litellm_client import (
     ModelResponseCancelled,
@@ -158,6 +166,83 @@ class GatewayCompletion:
 @dataclass(frozen=True, slots=True)
 class _SafeTransportFailure:
     error: ModelTransportError | ModelGatewayError | ModelResponseCancelled
+
+
+@dataclass(slots=True)
+class _GatewayFailureHistory:
+    call_id: str = field(default_factory=lambda: str(uuid4()))
+    attempted_logical_models: list[str] = field(default_factory=list)
+    attempts: list[GatewayFailureAttempt] = field(default_factory=list)
+    entered_count: int = 0
+    history_complete: bool = True
+
+    def attach(self, error: BaseException, request: ModelRequest) -> None:
+        if not self.attempts:
+            return
+        models = tuple(dict.fromkeys(self.attempted_logical_models))
+        complete = (
+            self.history_complete
+            and self.entered_count == len(self.attempts)
+            and len(models) <= MAX_GATEWAY_FAILURE_ATTEMPTS
+        )
+        try:
+            receipt = GatewayFailureReceipt(
+                call_id=self.call_id,
+                requested_logical_model=request.logical_model,
+                allow_fallback=request.allow_fallback,
+                history_complete=complete,
+                attempted_logical_models=models[:MAX_GATEWAY_FAILURE_ATTEMPTS],
+                attempts=tuple(self.attempts),
+            )
+            _attach_gateway_failure_receipt(error, receipt)
+        except Exception:  # noqa: BLE001 - optional evidence must not alter a primary error.
+            return
+
+
+@dataclass(slots=True)
+class _GatewayFailureTracking:
+    history: _GatewayFailureHistory
+    deployment: Deployment
+    ordinal: int = 0
+    recorded: bool = False
+
+    def enter(self) -> None:
+        self.history.entered_count += 1
+        self.ordinal = self.history.entered_count
+        if self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
+            self.history.history_complete = False
+
+    def record(
+        self, outcome: Literal["empty_response", "transport_error"],
+        status_code: int | None, usage: TokenUsage | None = None,
+    ) -> None:
+        if self.ordinal == 0 or self.recorded or self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
+            self.history.history_complete = False
+            return
+        self.recorded = True
+        usage_status: Literal["known", "missing", "invalid"] = (
+            "missing" if usage is None else "known" if _valid_usage(usage) else "invalid"
+        )
+        if usage_status == "invalid" or (outcome == "transport_error" and status_code is None):
+            self.history.history_complete = False
+        try:
+            self.history.attempts.append(GatewayFailureAttempt(
+                ordinal=self.ordinal,
+                logical_model=self.deployment.logical_model,
+                deployment_id=self.deployment.id,
+                provider_id=self.deployment.provider_model.split("/", 1)[0],
+                provider_model=self.deployment.provider_model,
+                outcome=outcome,
+                status_code=status_code,
+                usage_status=usage_status,
+                usage=None if usage_status != "known" else TokenUsage(
+                    cast(TokenUsage, usage).prompt_tokens,
+                    cast(TokenUsage, usage).completion_tokens,
+                    cast(TokenUsage, usage).total_tokens,
+                ),
+            ))
+        except Exception:  # noqa: BLE001 - invalid supplier metadata must fail closed.
+            self.history.history_complete = False
 
 
 class GatewayResponseCancelled(asyncio.CancelledError):
@@ -457,6 +542,18 @@ class ModelGateway:
         )
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        failure_history = _GatewayFailureHistory()
+        try:
+            return await self._complete_with_failure_history(request, failure_history)
+        except (ModelTransportError, ModelGatewayError) as error:
+            if isinstance(error, GatewayRejectedOutput):
+                failure_history.history_complete = False
+            failure_history.attach(error, request)
+            raise
+
+    async def _complete_with_failure_history(
+        self, request: ModelRequest, failure_history: _GatewayFailureHistory,
+    ) -> GatewayCompletion:
         request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         (
             candidate_groups,
@@ -464,6 +561,7 @@ class ModelGateway:
             fallback_from_logical_model,
             fallback_reason,
         ) = self._capable_candidate_groups(request)
+        failure_history.attempted_logical_models = attempted_logical_models
         relevant_deployments = tuple(
             deployment
             for _logical_model, candidates in candidate_groups
@@ -476,6 +574,7 @@ class ModelGateway:
         for logical_model, candidates in candidate_groups:
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
+                failure_history.history_complete = False
                 break
             attempted_logical_models.append(logical_model)
             compatible_candidates = self._context_compatible_candidates(
@@ -511,6 +610,7 @@ class ModelGateway:
                     timeout=acquire_timeout,
                 )
             except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+                failure_history.history_complete = False
                 if fallback_from_logical_model is None:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
@@ -534,6 +634,7 @@ class ModelGateway:
                 raise CapacityBackendError("model capacity returned an unknown deployment")
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
+                failure_history.history_complete = False
                 cleanup_error = await self._release_cleanup(
                     capacity, lease, deadline=request_deadline
                 )
@@ -543,7 +644,8 @@ class ModelGateway:
             selected_request = self._request_for_deployment(request, selected, input_tokens)
             try:
                 response = await self._complete_leased(
-                    capacity, selected, lease, selected_request, deadline=request_deadline
+                    capacity, selected, lease, selected_request, deadline=request_deadline,
+                    failure_tracking=_GatewayFailureTracking(failure_history, selected),
                 )
             except ModelResponseCancelled as error:
                 cancelled = self._cancelled_output(
@@ -1253,6 +1355,7 @@ class ModelGateway:
         request: ModelRequest,
         *,
         deadline: float,
+        failure_tracking: _GatewayFailureTracking | None = None,
     ) -> ModelResponse:
         primary_error: BaseException | None = None
         response: ModelResponse | None = None
@@ -1280,7 +1383,10 @@ class ModelGateway:
             else:
                 transport_started = self._monotonic()
                 invocation = asyncio.create_task(
-                    self._invoke_with_heartbeat(capacity, deployment, request, api_key, lease)
+                    self._invoke_with_heartbeat(
+                        capacity, deployment, request, api_key, lease,
+                        failure_tracking=failure_tracking,
+                    )
                 )
                 del api_key
                 try:
@@ -1301,24 +1407,34 @@ class ModelGateway:
                             and not outcome.tool_calls
                         ):
                             primary_error = ModelGatewayError("model response text is empty")
+                            if failure_tracking is not None:
+                                failure_tracking.record("empty_response", 200, outcome.usage)
                         elif outcome.text is None and not outcome.tool_calls:
                             primary_error = ModelGatewayError("model response is empty")
+                            if failure_tracking is not None:
+                                failure_tracking.record("empty_response", 200, outcome.usage)
                         else:
                             response = outcome
                         status_code = 200
                         should_record = True
                 except TimeoutError:
+                    if failure_tracking is not None:
+                        failure_tracking.history.history_complete = False
                     primary_error = ModelTransportError(
                         "model request deadline exhausted", status_code=408
                     )
                     should_record = True
                 except asyncio.CancelledError as error:
+                    if failure_tracking is not None:
+                        failure_tracking.history.history_complete = False
                     if isinstance(error, ModelResponseCancelled):
                         receipt = error.receipt
                     elif invocation.done() and not invocation.cancelled() and invocation.exception() is None:
                         receipt = _received_result(invocation.result())
                     primary_error = error
                 except (CapacityBackendError, CapacityConfigurationError) as error:
+                    if failure_tracking is not None:
+                        failure_tracking.history.history_complete = False
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
                     should_record = True
@@ -1346,11 +1462,15 @@ class ModelGateway:
                         succeeded=response is not None,
                     )
                 except asyncio.CancelledError as error:
+                    if failure_tracking is not None:
+                        failure_tracking.history.history_complete = False
                     if primary_error is None or isinstance(
                         primary_error, ModelResponseError | asyncio.CancelledError
                     ):
                         primary_error = error
                 except Exception:  # noqa: BLE001 - preserve any primary model failure
+                    if failure_tracking is not None:
+                        failure_tracking.history.history_complete = False
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
         finally:
@@ -1361,6 +1481,8 @@ class ModelGateway:
                 primary_error, ModelResponseError | asyncio.CancelledError
             ):
                 primary_error = release_error
+            if release_error is not None and failure_tracking is not None:
+                failure_tracking.history.history_complete = False
             if release_error is not None and primary_error is None:
                 if isinstance(release_error, asyncio.CancelledError):
                     primary_error = release_error
@@ -1372,6 +1494,8 @@ class ModelGateway:
             cancelled.args = primary_error.args
             raise cancelled from None
         if primary_error is not None:
+            if failure_tracking is not None and not failure_tracking.recorded:
+                failure_tracking.history.history_complete = False
             raise primary_error from None
         if response is None:  # pragma: no cover - defensive invariant
             raise ModelGatewayError("model gateway completed without a response")
@@ -1384,9 +1508,13 @@ class ModelGateway:
         request: ModelRequest,
         api_key: str,
         lease: CapacityLease,
+        *,
+        failure_tracking: _GatewayFailureTracking | None = None,
     ) -> ModelResponse | _SafeTransportFailure:
         transport_task = asyncio.create_task(
-            self._call_transport_safely(deployment, request, api_key)
+            self._call_transport_safely(
+                deployment, request, api_key, failure_tracking=failure_tracking,
+            )
         )
         del api_key
         heartbeat_task = asyncio.create_task(self._heartbeat(capacity, lease))
@@ -1436,9 +1564,13 @@ class ModelGateway:
         deployment: Deployment,
         request: ModelRequest,
         api_key: str,
+        *,
+        failure_tracking: _GatewayFailureTracking | None = None,
     ) -> ModelResponse | _SafeTransportFailure:
         outcome: ModelResponse | _SafeTransportFailure
         try:
+            if failure_tracking is not None:
+                failure_tracking.enter()
             outcome = await self._transport.complete(deployment, request, api_key)
         except ModelResponseCancelled as error:
             # A task-cancelled state/gather can discard a CancelledError subclass's receipt.
@@ -1459,6 +1591,8 @@ class ModelGateway:
             error.__cause__ = None
             del error
         except ModelTransportError as error:
+            if failure_tracking is not None:
+                failure_tracking.record("transport_error", error.status_code)
             _LOGGER.warning(
                 "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
                 deployment.id,
@@ -1488,6 +1622,8 @@ class ModelGateway:
             if isinstance(safe_error, ModelResponseError):
                 outcome = _SafeTransportFailure(safe_error)
             elif isinstance(safe_error, ModelTransportError):
+                if failure_tracking is not None:
+                    failure_tracking.record("transport_error", safe_error.status_code)
                 outcome = _SafeTransportFailure(
                     ModelTransportError("model transport failed", status_code=safe_error.status_code)
                 )

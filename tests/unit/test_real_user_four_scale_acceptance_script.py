@@ -1988,6 +1988,159 @@ def collect_direct_model_evidence(module: Any, events: list[dict[str, Any]]) -> 
     return cast(dict[str, Any], evidence)
 
 
+@pytest.mark.parametrize("failed_status", ["failed", "cancelled", "running"])
+@pytest.mark.parametrize("failed_identity", ["repair", "original", "result"])
+@pytest.mark.parametrize("scope_variant", [
+    "valid", "hash", "unknown_field", "history", "foreign_model", "count",
+    "wrong_run", "duplicate_call", "unknown_call", "missing_start", "missing_receipt",
+    "wrong_actor", "wrong_link", "out_of_order", "payload_history", "redacted", "extra_receipt",
+])
+async def test_recovered_failure_scope_is_not_a_model_completion(
+    direct_public_model_events: list[dict[str, Any]], failed_status: str,
+    failed_identity: str, scope_variant: str,
+) -> None:
+    from uuid import uuid4
+
+    from agent_hub.runtime.contracts import Artifact, GatewayProvenance
+
+    module = load_script()
+    original_id, result_id, repair_id = (str(uuid4()) for _ in range(3))
+    provenance = GatewayProvenance(
+        logical_model="deepseek", deployment_id="deepseek-deployment",
+        provider_id="deepseek", provider_model="deepseek/deepseek-chat",
+    )
+    receipt: dict[str, Any] = {
+        "schema_version": 1, "source": "model_gateway", "call_id": str(uuid4()),
+        "requested_logical_model": "deepseek", "allow_fallback": False,
+        "disposition": "failed", "history_complete": True,
+        "attempted_logical_models": ["deepseek"],
+        "attempts": [{"ordinal": 1, "provenance": provenance.to_payload(),
+                      "transport_state": "entered", "outcome": "empty_response",
+                      "status_code": 200, "usage_status": "known",
+                      "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}],
+    }
+    failed_id = {"repair": repair_id, "original": original_id, "result": result_id}[failed_identity]
+    artifact = Artifact(
+        id=uuid4(), type="model_attempt", producer="main_agent", provenance=provenance,
+        content={"schema_version": 1, "source": "direct_runtime", "run_id": failed_id,
+                 "tenant_id": str(uuid4()), "requested_logical_model": "deepseek",
+                 "scope_id": str(uuid4()), "part_index": 1, "part_count": 1, "call_offset": 0,
+                 "history_complete": True, "call_count": 1,
+                 "calls": ({"outcome": "failed", "receipt": receipt},)},
+    )
+    linkage = {"artifact_id": str(artifact.id), "logical_model": "deepseek",
+               "requested_logical_model": "deepseek", "attempted_logical_models": ["deepseek"],
+               "deployment": provenance.deployment_id, "provider": provenance.provider_id,
+               "upstream_model": provenance.provider_model}
+    failure_events: list[dict[str, Any]] = [
+        {"run_id": failed_id, "kind": "model.started", "sequence": 1,
+         "actor": "main_agent", "payload": {"logical_model": "deepseek"}},
+        {"run_id": failed_id, "kind": "artifact.created", "sequence": 2,
+         "actor": "main_agent", "payload": linkage, "artifact": artifact.to_payload()},
+        {"run_id": failed_id, "kind": "model.failure_receipt", "sequence": 3,
+         "actor": None, "payload": {**linkage, "actor": "main_agent"}},
+    ]
+    envelope = artifact.to_payload()
+    if scope_variant in {"unknown_field", "history", "foreign_model", "count", "wrong_run",
+                         "duplicate_call", "unknown_call"}:
+        content = cast(dict[str, Any], envelope["content"])
+        if scope_variant == "unknown_field":
+            content["calls"][0]["receipt"]["response"] = "private body"
+        elif scope_variant == "history":
+            content["calls"][0]["receipt"]["history_complete"] = False
+        elif scope_variant == "foreign_model":
+            content["calls"][0]["receipt"]["attempted_logical_models"] = ["foreign", "deepseek"]
+        elif scope_variant == "count":
+            content["call_count"] = 2
+        elif scope_variant == "wrong_run":
+            content["run_id"] = str(uuid4())
+        elif scope_variant == "duplicate_call":
+            content["calls"].append(copy.deepcopy(content["calls"][0]))
+            content["call_count"] = 2
+        else:
+            content["calls"][0]["outcome"] = "unknown"
+        envelope.pop("content_sha256")
+        failure_events[1]["artifact"] = Artifact.from_payload(envelope).to_payload()
+    elif scope_variant == "hash":
+        failure_events[1]["artifact"]["content_sha256"] = "0" * 64
+    elif scope_variant == "redacted":
+        failure_events[1]["artifact"].update(
+            content_sha256="0" * 64, public_content_sha256=artifact.content_sha256,
+            content_redacted=True,
+        )
+    elif scope_variant == "missing_start":
+        failure_events.pop(0)
+    elif scope_variant == "missing_receipt":
+        failure_events.pop()
+    elif scope_variant == "wrong_actor":
+        failure_events[-1]["payload"]["actor"] = "other_agent"
+    elif scope_variant == "wrong_link":
+        failure_events[-1]["payload"] = {**failure_events[-1]["payload"], "artifact_id": str(uuid4())}
+    elif scope_variant == "out_of_order":
+        failure_events[-1]["sequence"] = 1
+    elif scope_variant == "payload_history":
+        failure_events[-1]["payload"] = {**failure_events[-1]["payload"],
+                                       "attempted_logical_models": ["foreign", "deepseek"]}
+    elif scope_variant == "extra_receipt":
+        extra = copy.deepcopy(failure_events[-1])
+        extra["sequence"] = 4
+        extra["payload"]["upstream_model"] = "deepseek/other"
+        failure_events.append(extra)
+    by_run: dict[str, Any] = {}
+    for run_id in (original_id, result_id, repair_id):
+        events = copy.deepcopy(direct_public_model_events)
+        for event in events:
+            event["run_id"] = run_id
+        by_run[run_id] = {"status": "completed", "events": events}
+    by_run[failed_id] = {"status": failed_status, "events": failure_events}
+
+    class Client:
+        def request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            assert method == "GET" and all(value is None for value in kwargs.values())
+            run_id = path.split("/")[4]
+            if path.endswith("/events"):
+                return {"items": copy.deepcopy(by_run[run_id]["events"])}
+            return {"id": run_id, "status": by_run[run_id]["status"]}
+
+    evidence = module._collect_model_scope_evidence(
+        module.RealUserAcceptanceClient(Client()), logical_model="deepseek",
+        submitted_run_ids=[original_id, repair_id], accepted_repair_run_ids=[],
+        result_run_id=result_id,
+    )
+    permitted = (failed_status == "failed" and failed_identity == "repair"
+                 and scope_variant == "valid")
+    assert evidence["ok"] is permitted, evidence["errors"]
+    assert module._has_direct_model_completion(failure_events) is False
+    assert "private body" not in json.dumps(evidence)
+    if permitted:
+        retained = evidence["runs"][1]["model_events"]
+        assert module._has_failed_attempt_scope(retained)
+        assert not module._has_direct_model_completion(retained)
+        retained[1]["model_artifact"]["scope_content"]["call_count"] = 2
+        assert not module._has_failed_attempt_scope(retained)
+        assert module._model_scope_errors(evidence, logical_model="deepseek", result_run_id=result_id)
+
+
+async def test_cancelled_repair_with_partial_model_completion_is_rejected(
+    direct_public_model_events: list[dict[str, Any]],
+) -> None:
+    module = load_script()
+    evidence = collect_direct_model_evidence(module, direct_public_model_events)
+    assert evidence["ok"]
+    run = copy.deepcopy(evidence["runs"][0])
+    original = run["run_id"]
+    from uuid import uuid4
+
+    run["run_id"] = str(uuid4())
+    run["status"] = "cancelled"
+    run["events_endpoint"] = f"/api/v1/runs/{run['run_id']}/events"
+    for event in run["model_events"]:
+        event["run_id"] = run["run_id"]
+    evidence["runs"].append(run)
+    evidence["accepted_repair_run_ids"] = [run["run_id"]]
+    assert module._model_scope_errors(evidence, logical_model="deepseek", result_run_id=original)
+
+
 async def test_scoped_collector_accepts_real_configured_direct_public_completion_metadata(
     direct_public_model_events: list[dict[str, Any]],
 ) -> None:
