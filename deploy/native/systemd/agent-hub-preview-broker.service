@@ -1,0 +1,33 @@
+[Unit]
+Description=Agent Hub dedicated privileged dynamic preview broker
+Requires=agent-hub-preview-broker.socket
+After=agent-hub-preview-broker.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+Environment=PYTHONPATH=/opt/agent-hub/current/src PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/agent-hub/current
+ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.previews.dynamic_broker --config /etc/agent-hub/preview-broker.json
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
+LockPersonality=yes
+ReadOnlyPaths=/opt/agent-hub/current
+InaccessiblePaths=-/etc/agent-hub/secrets.env
+# PID1 owns transient mounts; host-to-broker propagation must remain enabled.
+ReadWritePaths=/run/agent-hub-preview
+KillMode=control-group
+TimeoutStopSec=90s
+
+[Install]
+WantedBy=agent-hub.target

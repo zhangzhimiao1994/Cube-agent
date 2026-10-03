@@ -24,6 +24,7 @@ import { SetupPage } from "../pages/SetupPage";
 import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
 import { WorkflowsPage } from "../pages/WorkflowsPage";
+import { WebsitePreviewPage } from "../pages/WebsitePreviewPage";
 import { MODULE_GROUPS } from "./navigation";
 
 const queryClient = new QueryClient({
@@ -38,6 +39,7 @@ export function AppRoutes() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/setup" element={<SetupPage />} />
+      <Route path="/website-preview/:previewId" element={<RequireAuth><WebsitePreviewPage /></RequireAuth>} />
       <Route
         path="/"
         element={

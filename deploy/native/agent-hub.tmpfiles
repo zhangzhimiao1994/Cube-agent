@@ -1,4 +1,5 @@
 d /run/agent-hub 0750 agent-hub agent-hub -
+d /run/agent-hub-preview 0700 root root -
 d /var/lib/agent-hub 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/attachments 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/skills 0750 agent-hub agent-hub -

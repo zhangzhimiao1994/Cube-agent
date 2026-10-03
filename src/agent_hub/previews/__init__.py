@@ -1,6 +1,9 @@
 """Process-local website preview hosting."""
 
+from .dynamic_runtime import DynamicPreviewCleanupError, DynamicPreviewUnavailable
 from .manager import (
+    ApplicationBackend,
+    ApplicationRuntime,
     InvalidPreviewPath,
     PreviewCapacityExceeded,
     PreviewError,
@@ -14,6 +17,10 @@ from .manager import (
 )
 
 __all__ = [
+    "ApplicationBackend",
+    "ApplicationRuntime",
+    "DynamicPreviewCleanupError",
+    "DynamicPreviewUnavailable",
     "InvalidPreviewPath",
     "PreviewCapacityExceeded",
     "PreviewError",

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validatePreviewRequest, validatePreviewResponse, type PreviewAppRequest, type PreviewAppResponse } from "../preview/transport";
 
 const PrincipalSchema = z.object({
   user_id: z.string(),
@@ -1030,6 +1031,7 @@ const WebPreviewSchema = z.object({
   status: z.enum(["starting", "ready", "stopping", "stopped", "failed", "expired"]),
   preview_url: z.string().nullable(),
   lease_expires_at: z.string().nullable(),
+  application_transport: z.boolean().optional(),
 });
 
 export type WebPreview = z.infer<typeof WebPreviewSchema>;
@@ -2869,6 +2871,15 @@ export const api = {
       { method: "DELETE", keepalive: options.keepalive },
       WebPreviewSchema,
     );
+  },
+  async requestWebPreviewApplication(id: string, payload: PreviewAppRequest, signal: AbortSignal): Promise<PreviewAppResponse> {
+    const body = validatePreviewRequest(payload);
+    const result = await request(
+      `/api/v1/web-previews/${encodeURIComponent(id)}/app-request`,
+      { method: "POST", body: JSON.stringify(body), signal },
+      z.object({ status_code: z.number().int(), headers: z.array(z.tuple([z.string(), z.string()])), body_base64: z.string() }).strict(),
+    );
+    return validatePreviewResponse(result);
   },
   approveSkill(id: string): Promise<Skill> {
     return request(`/api/v1/admin/skills/${id}/approve`, { method: "POST" }, SkillSchema);

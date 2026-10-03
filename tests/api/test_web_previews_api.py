@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import base64
+import json
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
-from uuid import uuid4
+from typing import TypedDict, cast
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_hub.api.routers.previews import WebPreviewService
+from agent_hub.api.routers.previews import WebPreviewResponse, WebPreviewService
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
-from agent_hub.previews import PreviewManager, PreviewNotFound
+from agent_hub.previews import PreviewLaunch, PreviewManager, PreviewNotFound
+from agent_hub.previews import bridge as preview_bridge
+from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
 
 
 class StubAuthService:
@@ -138,21 +143,22 @@ def test_preview_uses_http_only_cookie_and_rewrites_root_relative_assets(
         "status": "ready",
         "preview_url": payload["preview_url"],
         "lease_expires_at": payload["lease_expires_at"],
+        "application_transport": False,
     }
     assert payload["preview_url"].endswith("/content/")
     assert "token" not in payload["preview_url"]
     assert "httponly" in started.headers["set-cookie"].casefold()
     root = client.get(payload["preview_url"])
-    asset = client.get(f'{payload["preview_url"]}style.css')
-    script = client.get(f'{payload["preview_url"]}assets/app.js')
+    asset = client.get(f"{payload['preview_url']}style.css")
+    script = client.get(f"{payload['preview_url']}assets/app.js")
 
     assert root.status_code == 200
     assert "preview" in root.text
-    assert f'{payload["preview_url"]}style.css' in root.text
-    assert f'{payload["preview_url"]}assets/app.js' in root.text
+    assert f"{payload['preview_url']}style.css" in root.text
+    assert f"{payload['preview_url']}assets/app.js" in root.text
     assert f'<base href="{payload["preview_url"]}">' in root.text
     storage_shim = root.text.index("data-agent-preview-storage-shim")
-    application_script = root.text.index(f'{payload["preview_url"]}assets/app.js')
+    application_script = root.text.index(f"{payload['preview_url']}assets/app.js")
     assert storage_shim < application_script
     assert "Object.defineProperty(window, name" in root.text
     assert 'installStorage("localStorage")' in root.text
@@ -205,7 +211,7 @@ def test_preview_management_requires_login_and_is_tenant_scoped(
     )
     assert (
         client.delete(
-            f'/api/v1/web-previews/{started["id"]}',
+            f"/api/v1/web-previews/{started['id']}",
             headers=_bearer(),
         ).status_code
         == 404
@@ -288,11 +294,11 @@ def test_stop_revokes_content_token_and_current_preview(
     ).json()
 
     renewed = client.post(
-        f'/api/v1/web-previews/{started["id"]}/renew',
+        f"/api/v1/web-previews/{started['id']}/renew",
         headers=_bearer(),
     )
     stopped = client.delete(
-        f'/api/v1/web-previews/{started["id"]}',
+        f"/api/v1/web-previews/{started['id']}",
         headers=_bearer(),
     )
 
@@ -365,3 +371,418 @@ def test_service_reaper_forgets_expired_raw_preview_token(tmp_path: Path) -> Non
             service._owned_access(principal.tenant_id, started.id)
     finally:
         service.close()
+
+
+class AppRuntime:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, tuple[tuple[str, str], ...], bytes]] = []
+        self.closed = False
+        self.fail_close = False
+        from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+
+        self.response = DynamicPreviewResponse(
+            201, (("content-type", "application/json"),), b'{"id":1}'
+        )
+
+    def request(
+        self, method: str, target: str, headers: tuple[tuple[str, str], ...], body: bytes
+    ) -> DynamicPreviewResponse:
+        self.calls.append((method, target, headers, body))
+        return self.response
+
+    def close(self) -> None:
+        from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+
+        if self.fail_close:
+            raise DynamicPreviewCleanupError("cleanup not confirmed")
+        self.closed = True
+
+
+class AppBackend:
+    def __init__(self) -> None:
+        self.runtime = AppRuntime()
+
+    def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+        assert (source_root / "server.js").is_file()
+        return self.runtime
+
+
+class StartedPreview(TypedDict):
+    id: str
+    preview_url: str
+    application_transport: bool
+
+
+DynamicClient = tuple[
+    TestClient, AuthenticatedPrincipal, StubConversationService, AppBackend, StartedPreview
+]
+
+
+@pytest.fixture
+def dynamic_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[DynamicClient]:
+
+    # Contract fixture only; the actual trusted bridge belongs to the parent.
+    def preview_fetch_shim(preview_id: str) -> str:
+        return f'<script data-test-fetch-shim="{preview_id}"></script>'
+
+    monkeypatch.setattr(preview_bridge, "preview_fetch_shim", preview_fetch_shim)
+    principal = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
+    display = _workspace(tmp_path, principal)
+    (display / "index.html").write_text(
+        '<!doctype html><script src="/assets/app.js"></script><head></head>'
+        '<script>fetch("/tasks")</script><main>actual generated UI</main>'
+    )
+    no_html = getattr(request, "param", None) == "no_html"
+    if no_html:
+        (display / "index.html").unlink()
+    (display.parent / "package.json").write_text(
+        json.dumps({"scripts": {"start": "node server.js"}})
+    )
+    (display.parent / "server.js").write_text("throw new Error('host execution forbidden')")
+    backend = AppBackend()
+    conversations = StubConversationService()
+    app = create_app(
+        auth_service=StubAuthService(principal),
+        rate_limiter=object(),
+        config_service=object(),
+        admin_resource_service=conversations,
+        run_service=object(),
+        preview_manager=PreviewManager(tmp_path, dynamic_backend=backend),
+    )
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/api/v1/web-previews/start",
+            headers=_bearer(),
+            json={
+                "conversation_id": "conv-preview",
+                "project_id": "project-preview",
+                "workspace_session_id": "session-preview",
+                "root": None if no_html else "dist",
+            },
+        )
+        assert response.status_code == 201
+        started = WebPreviewResponse.model_validate(response.json())
+        assert started.preview_url is not None
+        payload: StartedPreview = {
+            "id": started.id,
+            "preview_url": started.preview_url,
+            "application_transport": started.application_transport,
+        }
+        yield client, principal, conversations, backend, payload
+    finally:
+        backend.runtime.fail_close = False
+        app.state.preview_manager.close()
+        client.close()
+
+
+def envelope(method: str = "POST", target: str = "/tasks?label=a%2Fb") -> dict[str, object]:
+    return {
+        "method": method,
+        "target": target,
+        "headers": [["Content-Type", "application/json"]],
+        "body_base64": base64.b64encode(b'{"title":"new"}').decode(),
+    }
+
+
+def test_app_request_wire_and_dynamic_shim(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    assert started["application_transport"] is True
+    endpoint = f"/api/v1/web-previews/{started['id']}/app-request"
+    response = client.post(endpoint, headers=_bearer(), json=envelope())
+    assert response.status_code == 200
+    assert response.json() == {
+        "status_code": 201,
+        "headers": [["content-type", "application/json"]],
+        "body_base64": base64.b64encode(b'{"id":1}').decode(),
+    }
+    assert backend.runtime.calls[0] == (
+        "POST",
+        "/tasks?label=a%2Fb",
+        (("content-type", "application/json"),),
+        b'{"title":"new"}',
+    )
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+
+    backend.runtime.response = DynamicPreviewResponse(
+        200, (("content-type", "text/html"),), b'<head><script>fetch("/tasks")</script></head>'
+    )
+    content = client.get(started["preview_url"])
+    assert content.status_code == 200
+    assert content.text.index("data-test-fetch-shim") < content.text.index('fetch("/tasks")')
+    assert "allow-same-origin" not in content.headers["content-security-policy"]
+
+
+def test_app_request_requires_creator_and_live_scope(dynamic_client: DynamicClient) -> None:
+    client, principal, conversations, backend, started = dynamic_client
+    endpoint = f"/api/v1/web-previews/{started['id']}/app-request"
+    assert client.post(endpoint, json=envelope()).status_code == 401
+    cast(FastAPI, client.app).state.auth_service.principal = AuthenticatedPrincipal(
+        uuid4(), principal.tenant_id, Role.OPERATOR
+    )
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 404
+    cast(FastAPI, client.app).state.auth_service.principal = principal
+    conversations.run_statuses = ("running",)
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 409
+    conversations.run_statuses = ()
+    conversations.workspace_path = "another-session"
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 409
+    assert not backend.runtime.calls
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"body_base64": "%%%"},
+        {"body": ""},
+        {"method": "CONNECT"},
+        {"target": "//example.com/"},
+        {"target": "/%2fsecret"},
+        {"headers": [["Content-Type", "x\r\nHost: evil"]]},
+        {"headers": [["Authorization", "x", "extra"]]},
+    ],
+)
+def test_app_request_rejects_invalid_envelopes(
+    dynamic_client: DynamicClient, patch: dict[str, object]
+) -> None:
+    client, _, _, backend, started = dynamic_client
+    payload = envelope()
+    payload.update(patch)
+    assert (
+        client.post(
+            f"/api/v1/web-previews/{started['id']}/app-request", headers=_bearer(), json=payload
+        ).status_code
+        == 422
+    )
+    assert not backend.runtime.calls
+
+
+def test_app_request_preserves_empty_and_error_responses_without_replay(
+    dynamic_client: DynamicClient,
+) -> None:
+    client, _, _, backend, started = dynamic_client
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+
+    endpoint = f"/api/v1/web-previews/{started['id']}/app-request"
+    for method, status, body in [("DELETE", 204, b""), ("PATCH", 422, b"real application error")]:
+        backend.runtime.response = DynamicPreviewResponse(status, (), body)
+        response = client.post(endpoint, headers=_bearer(), json=envelope(method))
+        assert response.status_code == 200
+        assert response.json()["status_code"] == status
+        assert base64.b64decode(response.json()["body_base64"]) == body
+    assert len(backend.runtime.calls) == 2
+    assert (
+        client.delete(f"/api/v1/web-previews/{started['id']}", headers=_bearer()).status_code == 200
+    )
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 404
+
+
+def test_app_request_request_limit_and_duplicate_json_fields(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    endpoint = f"/api/v1/web-previews/{started['id']}/app-request"
+    payload = envelope()
+    payload["body_base64"] = base64.b64encode(b"x" * (1024 * 1024 + 1)).decode()
+    assert client.post(endpoint, headers=_bearer(), json=payload).status_code == 413
+    assert (
+        client.post(
+            endpoint,
+            headers={**_bearer(), "Content-Type": "application/json"},
+            content='{"method":"POST","method":"GET","target":"/","headers":[],"body_base64":""}',
+        ).status_code
+        == 422
+    )
+    assert not backend.runtime.calls
+
+
+def test_current_requires_creator_and_reauthorizes_conversation(dynamic_client: DynamicClient) -> None:
+    client, principal, conversations, _, _ = dynamic_client
+    path = "/api/v1/web-previews/conversations/conv-preview"
+    cast(FastAPI, client.app).state.auth_service.principal = AuthenticatedPrincipal(
+        uuid4(), principal.tenant_id, Role.OPERATOR
+    )
+    assert client.get(path, headers=_bearer()).status_code == 404
+    cast(FastAPI, client.app).state.auth_service.principal = principal
+    conversations.archived_at = datetime.now(UTC)
+    assert client.get(path, headers=_bearer()).status_code == 409
+
+
+def test_dynamic_shim_is_before_even_scripts_outside_head(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+
+    backend.runtime.response = DynamicPreviewResponse(
+        200,
+        (("content-type", "text/html"),),
+        b'<!doctype html><script>fetch("/tasks")</script><head></head>',
+    )
+    response = client.get(started["preview_url"])
+    assert response.text.index("data-test-fetch-shim") < response.text.index('fetch("/tasks")')
+    assert "connect-src 'none'" in response.headers["content-security-policy"]
+
+
+def test_header_allowlists_and_external_redirect_rejection(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+
+    endpoint = f"/api/v1/web-previews/{started['id']}/app-request"
+    payload = envelope()
+    payload["headers"] = [
+        ["Accept-Language", "zh-CN"],
+        ["Cookie", "secret=value"],
+        ["Authorization", "Bearer secret"],
+        ["Host", "console"],
+        ["Origin", "console"],
+    ]
+    backend.runtime.response = DynamicPreviewResponse(204, (("set-cookie", "secret=value"),), b"")
+    response = client.post(endpoint, headers=_bearer(), json=payload)
+    assert response.status_code == 200
+    assert response.json()["headers"] == []
+    assert backend.runtime.calls[0][2] == (("accept-language", "zh-CN"),)
+    backend.runtime.response = DynamicPreviewResponse(
+        302, (("location", "https://evil.example"),), b""
+    )
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 422
+
+
+def test_stop_cleanup_failure_remains_revoked_and_retryable(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    endpoint = f"/api/v1/web-previews/{started['id']}"
+    backend.runtime.fail_close = True
+    response = client.delete(endpoint, headers=_bearer())
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "preview_cleanup_pending"
+    assert (
+        client.post(endpoint + "/app-request", headers=_bearer(), json=envelope()).status_code
+        == 404
+    )
+    backend.runtime.fail_close = False
+    assert client.delete(endpoint, headers=_bearer()).status_code == 200
+
+
+def test_slow_dynamic_start_does_not_block_other_owned_preview(tmp_path: Path) -> None:
+    principal = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
+    display = _workspace(tmp_path, principal)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingBackend(AppBackend):
+        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+            entered.set()
+            assert release.wait(5)
+            return self.runtime
+
+    backend = BlockingBackend()
+    service = WebPreviewService(PreviewManager(tmp_path, dynamic_backend=backend))
+    def launch_preview(conversation_id: str) -> WebPreviewResponse:
+        return service.start(
+            tenant_id=principal.tenant_id,
+            conversation_id=conversation_id,
+            project_id="project-preview",
+            session_id="session-preview",
+            root="dist",
+            user_id=principal.user_id,
+        )
+
+    first = launch_preview("first")
+    (display.parent / "package.json").write_text('{"scripts":{"start":"node server.js"}}')
+    start_errors: list[BaseException] = []
+    completed = threading.Event()
+
+    def start_second() -> None:
+        try:
+            launch_preview("second")
+        except (PreviewNotFound, AssertionError, RuntimeError) as error:
+            start_errors.append(error)
+
+    def use_first() -> None:
+        assert service.current(principal.tenant_id, "first", principal.user_id) is not None
+        access = service._owned_access(principal.tenant_id, first.id, principal.user_id)
+        assert service.read(first.id, access.token, "").status_code == 200
+        assert service.stop(principal.tenant_id, first.id, principal.user_id).status == "stopped"
+        completed.set()
+
+    starter = threading.Thread(target=start_second)
+    reader = threading.Thread(target=use_first)
+    try:
+        starter.start()
+        assert entered.wait(2)
+        reader.start()
+        assert completed.wait(1), "another preview was blocked by application preparation"
+    finally:
+        release.set()
+        starter.join(5)
+        reader.join(5)
+        service.close()
+    assert not start_errors
+
+
+def test_service_does_not_register_launch_revoked_before_registration(tmp_path: Path) -> None:
+    principal = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
+    _workspace(tmp_path, principal)
+
+    class RevokingManager(PreviewManager):
+        def start(
+            self,
+            *,
+            tenant_id: UUID,
+            conversation_id: str,
+            project_id: str,
+            session_id: str,
+            root: str | None = None,
+            lease: timedelta | None = None,
+        ) -> PreviewLaunch:
+            launch = super().start(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                session_id=session_id,
+                root=root,
+                lease=lease,
+            )
+            self.stop(launch.state.preview_id)
+            return launch
+
+    service = WebPreviewService(RevokingManager(tmp_path))
+    try:
+        with pytest.raises(PreviewNotFound):
+            service.start(
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+                conversation_id="conv-preview",
+                project_id="project-preview",
+                session_id="session-preview",
+                root="dist",
+            )
+        assert not service._access_by_id
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("dynamic_client", ["no_html"], indirect=True)
+def test_cookie_content_cannot_proxy_backend_without_immutable_html(
+    dynamic_client: DynamicClient,
+) -> None:
+    client, principal, _, backend, started = dynamic_client
+    cast(FastAPI, client.app).state.auth_service.principal = AuthenticatedPrincipal(
+        uuid4(), principal.tenant_id, Role.OPERATOR
+    )
+    assert client.get(started["preview_url"] + "api/private?mode=read").status_code == 404
+    assert client.get(started["preview_url"]).status_code == 404
+    assert client.post(f'/api/v1/web-previews/{started["id"]}/app-request',
+                       headers=_bearer(), json=envelope()).status_code == 404
+    assert not backend.runtime.calls
+
+
+def test_application_wire_and_response_limits(dynamic_client: DynamicClient) -> None:
+    client, _, _, backend, started = dynamic_client
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+    endpoint = f'/api/v1/web-previews/{started["id"]}/app-request'
+    oversized_wire = " " * (1536 * 1024 + 1)
+    assert client.post(endpoint, headers={**_bearer(), "Content-Type": "application/json"},
+                       content=oversized_wire).status_code == 413
+    assert not backend.runtime.calls
+    backend.runtime.response = DynamicPreviewResponse(200, (), b"x" * (8 * 1024 * 1024 + 1))
+    assert client.post(endpoint, headers=_bearer(), json=envelope()).status_code == 413
+    assert len(backend.runtime.calls) == 1

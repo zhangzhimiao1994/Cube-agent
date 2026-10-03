@@ -440,6 +440,103 @@ remove_legacy_native_skill_unit() {
   rm -f /etc/systemd/system/agent-hub-skill@.service
 }
 
+write_native_preview_broker_config() {
+  local allowed_uid temporary workspace_root
+  allowed_uid="$(id -u agent-hub)" \
+    || die "cannot resolve agent-hub UID for preview broker"
+  [[ "$allowed_uid" =~ ^[1-9][0-9]*$ ]] \
+    || die "preview broker requires a non-root agent-hub UID"
+  workspace_root="${AGENT_HUB_PROJECT_WORKSPACE_DIR-$STATE_DIR/workspaces}"
+  # Match the API EnvironmentFile override without evaluating or loading secrets.
+  if [[ -f "${SECRETS_FILE:-}" ]] \
+    && grep -q '^AGENT_HUB_PROJECT_WORKSPACE_DIR=' "$SECRETS_FILE"; then
+    workspace_root="$(native_secret_value AGENT_HUB_PROJECT_WORKSPACE_DIR)"
+  fi
+  mkdir -p "$CONFIG_DIR"
+  temporary="$(mktemp "$CONFIG_DIR/.preview-broker.json.XXXXXX")" || return 1
+  if ! env -i PATH=/usr/bin:/bin "$INSTALL_ROOT/current/.venv/bin/python" - \
+    "$allowed_uid" "$workspace_root" \
+    "$INSTALL_ROOT/current/src/agent_hub" "$INSTALL_ROOT/node" > "$temporary" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import PurePosixPath
+
+uid = int(sys.argv[1])
+if uid <= 0:
+    raise SystemExit("preview broker requires a non-root console UID")
+workspace = sys.argv[2].strip()
+if workspace.startswith(("'", '"')):
+    values = shlex.split(workspace)
+    if len(values) != 1:
+        raise SystemExit("invalid preview workspace setting")
+    workspace = values[0]
+if (not workspace.startswith("/") or ".." in PurePosixPath(workspace).parts
+        or any(char.isspace() or char in ': %\\"' for char in workspace)):
+    raise SystemExit("preview workspace must be an absolute systemd-safe path")
+json.dump({
+    "workspace_root": workspace,
+    "allowed_uid": uid,
+    "runtime_root": "/run/agent-hub-preview",
+    "trusted_source_root": sys.argv[3],
+    "node_root": sys.argv[4],
+}, sys.stdout)
+sys.stdout.write("\n")
+PY
+  then
+    rm -f -- "$temporary"
+    die "cannot generate preview broker policy"
+  fi
+  if ! chown root:root "$temporary" || ! chmod 0600 "$temporary" \
+    || ! mv -fT -- "$temporary" "$CONFIG_DIR/preview-broker.json"; then
+    rm -f -- "$temporary"
+    die "cannot publish root-only preview broker policy"
+  fi
+}
+
+require_native_preview_broker() {
+  if ! runuser -u agent-hub -- env -i \
+    PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+    "$INSTALL_ROOT/current/.venv/bin/python" - /run/agent-hub/preview-broker.sock <<'PY'
+import json
+import socket
+import struct
+import sys
+import time
+
+deadline = time.monotonic() + 60
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.settimeout(60)
+    connection.connect(sys.argv[1])
+    request = b'{"version":1,"action":"probe"}'
+    connection.sendall(struct.pack("!I", len(request)) + request)
+
+    def read_exact(size):
+        data = bytearray()
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit("preview probe timed out")
+            connection.settimeout(remaining)
+            part = connection.recv(size - len(data))
+            if not part:
+                raise SystemExit("preview probe connection closed")
+            data.extend(part)
+        return bytes(data)
+
+    size = struct.unpack("!I", read_exact(4))[0]
+    if not 0 < size <= 4096:
+        raise SystemExit("invalid preview probe frame")
+    response = json.loads(read_exact(size))
+    if response != {"ok": True, "state": "probe"} or response.get("ok") is not True:
+        raise SystemExit("preview isolation unavailable")
+PY
+  then
+    die "native preview broker isolation probe failed"
+  fi
+  log "native preview broker isolation probe is ready"
+}
+
 probe_native_plugin_sandbox() {
   [[ -x /usr/bin/bwrap ]] || return 1
   command -v runuser >/dev/null 2>&1 || return 1
@@ -781,9 +878,11 @@ install_native_mode() {
     mkdir -p /run/agent-hub "$STATE_DIR" /var/log/agent-hub
     chown agent-hub:agent-hub /run/agent-hub "$STATE_DIR" /var/log/agent-hub 2>/dev/null || true
     chmod 0750 /run/agent-hub "$STATE_DIR" /var/log/agent-hub
+    install -d -o root -g root -m 0700 /run/agent-hub-preview
   fi
   install_native_plugin_sandbox_profile
   deploy_native_release
+  write_native_preview_broker_config
   write_litellm_config
   install_native_caddy
   install_native_systemd_units
@@ -794,17 +893,22 @@ install_native_mode() {
   systemctl enable caddy
   systemctl reload-or-restart caddy || systemctl restart caddy
   systemctl enable --now agent-hub-skill-broker.socket
+  systemctl enable --now agent-hub-preview-broker.socket
   systemctl enable --now agent-hub.target
   systemctl stop agent-hub-skill-broker.service 2>/dev/null || true
+  systemctl restart agent-hub-preview-broker.service
   systemctl restart agent-hub-litellm.service
   systemctl restart agent-hub-api.service
   systemctl restart agent-hub-worker.service
   require_native_service_active agent-hub-skill-broker.socket
+  require_native_service_active agent-hub-preview-broker.socket
+  require_native_service_active agent-hub-preview-broker.service
   require_native_service_active caddy.service
   require_native_service_active agent-hub-api.service
   require_native_service_active agent-hub-worker.service
   require_native_service_active agent-hub-litellm.service
   require_native_readiness
   require_native_plugin_package_runtime
+  require_native_preview_broker
   mark_stage "native-up"
 }

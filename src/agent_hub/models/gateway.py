@@ -8,9 +8,11 @@ import logging
 import math
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -51,6 +53,87 @@ from agent_hub.models.types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_SCOPE_DIAGNOSTIC_ISSUER = object()
+_SCOPE_DIAGNOSTIC_ATTRIBUTE = "_gateway_scope_diagnostic"
+
+
+class ScopeIncompletePhase(StrEnum):
+    PRETRANSPORT_CAPACITY = "pretransport_capacity"
+    PRETRANSPORT_CREDENTIALS = "pretransport_credentials"
+    OUTER_DEADLINE = "outer_deadline"
+    CANCELLATION = "cancellation"
+    CLEANUP = "cleanup"
+    RECORDER = "recorder"
+    TRANSPORT = "transport"
+    SCOPE_TRACKER = "scope_tracker"
+    UNKNOWN_ADAPTER = "unknown_adapter"
+
+
+class ScopeIncompleteReason(StrEnum):
+    CAPACITY_UNAVAILABLE = "capacity_unavailable"
+    CAPACITY_BACKEND_FAILURE = "capacity_backend_failure"
+    CREDENTIAL_RESOLUTION_FAILED = "credential_resolution_failed"
+    DEADLINE_EXHAUSTED = "deadline_exhausted"
+    CANCELLED = "cancelled"
+    RELEASE_FAILED = "release_failed"
+    OUTCOME_RECORDING_FAILED = "outcome_recording_failed"
+    MISSING_STATUS = "missing_status"
+    INVALID_USAGE = "invalid_usage"
+    UNKNOWN_FAILURE = "unknown_failure"
+    REJECTED_OUTPUT = "rejected_output"
+    ATTEMPT_LIMIT = "attempt_limit"
+    EVIDENCE_INVALID = "evidence_invalid"
+    EVIDENCE_LIMIT = "evidence_limit"
+    UNRECORDED_CALL = "unrecorded_call"
+    RECEIPT_ISSUANCE_FAILED = "receipt_issuance_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayScopeDiagnostic:
+    """Diagnostic only: never authorizes a receipt or completes a scope."""
+
+    phase: ScopeIncompletePhase
+    reason: ScopeIncompleteReason
+    transport_entered_count: int
+    failure_attempt_count: int
+    _issuer: object | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (type(self.phase) is not ScopeIncompletePhase
+                or type(self.reason) is not ScopeIncompleteReason
+                or type(self.transport_entered_count) is not int
+                or type(self.failure_attempt_count) is not int
+                or not 0 <= self.failure_attempt_count <= self.transport_entered_count
+                or self.failure_attempt_count > MAX_GATEWAY_FAILURE_ATTEMPTS):
+            raise ValueError("invalid gateway scope diagnostic")
+
+
+_gateway_scope_observer: ContextVar[Callable[[GatewayScopeDiagnostic], None] | None] = ContextVar(
+    "gateway_scope_observer", default=None,
+)
+
+
+def get_gateway_scope_diagnostic(value: object) -> GatewayScopeDiagnostic | None:
+    """Accept immutable issuer metadata only, without adapter attribute protocols."""
+    try:
+        if type(value) is GatewayCompletion:
+            diagnostic = value.scope_diagnostic
+        elif isinstance(value, BaseException):
+            namespace = object.__getattribute__(value, "__dict__")
+            binding = namespace.get(_SCOPE_DIAGNOSTIC_ATTRIBUTE) if type(namespace) is dict else None
+            if (type(binding) is not tuple or len(binding) != 3
+                    or binding[0] is not _SCOPE_DIAGNOSTIC_ISSUER or binding[1] is not value):
+                return None
+            diagnostic = binding[2]
+        else:
+            return None
+        if (type(diagnostic) is not GatewayScopeDiagnostic
+                or diagnostic._issuer is not _SCOPE_DIAGNOSTIC_ISSUER):
+            return None
+        diagnostic.__post_init__()
+        return diagnostic
+    except BaseException:  # noqa: BLE001 - optional diagnostics cannot expose adapter details.
+        return None
 
 
 class ModelGatewayError(RuntimeError):
@@ -118,6 +201,7 @@ class GatewayCompletion:
     fallback_from_logical_model: str | None = None
     fallback_reason: str | None = None
     attempted_logical_models: tuple[str, ...] = ()
+    scope_diagnostic: GatewayScopeDiagnostic | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
@@ -175,6 +259,32 @@ class _GatewayFailureHistory:
     attempts: list[GatewayFailureAttempt] = field(default_factory=list)
     entered_count: int = 0
     history_complete: bool = True
+    first_incomplete: tuple[ScopeIncompletePhase, ScopeIncompleteReason] | None = None
+
+    def mark_incomplete(self, phase: ScopeIncompletePhase, reason: ScopeIncompleteReason) -> None:
+        self.history_complete = False
+        if self.first_incomplete is None:
+            self.first_incomplete = (phase, reason)
+
+    def diagnostic(self) -> GatewayScopeDiagnostic | None:
+        if self.first_incomplete is None:
+            return None
+        diagnostic = GatewayScopeDiagnostic(
+            *self.first_incomplete, self.entered_count, len(self.attempts),
+        )
+        object.__setattr__(diagnostic, "_issuer", _SCOPE_DIAGNOSTIC_ISSUER)
+        return diagnostic
+
+    def attach_diagnostic(self, error: BaseException) -> None:
+        try:
+            diagnostic = self.diagnostic()
+            namespace = object.__getattribute__(error, "__dict__")
+            if diagnostic is not None and type(namespace) is dict:
+                namespace[_SCOPE_DIAGNOSTIC_ATTRIBUTE] = (
+                    _SCOPE_DIAGNOSTIC_ISSUER, error, diagnostic,
+                )
+        except BaseException:  # noqa: BLE001 - preserve the original failure/cancellation.
+            return
 
     def attach(self, error: BaseException, request: ModelRequest) -> None:
         if not self.attempts:
@@ -196,7 +306,8 @@ class _GatewayFailureHistory:
             )
             _attach_gateway_failure_receipt(error, receipt)
         except Exception:  # noqa: BLE001 - optional evidence must not alter a primary error.
-            return
+            self.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                 ScopeIncompleteReason.RECEIPT_ISSUANCE_FAILED)
 
 
 @dataclass(slots=True)
@@ -210,21 +321,27 @@ class _GatewayFailureTracking:
         self.history.entered_count += 1
         self.ordinal = self.history.entered_count
         if self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
-            self.history.history_complete = False
+            self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                         ScopeIncompleteReason.ATTEMPT_LIMIT)
 
     def record(
         self, outcome: Literal["empty_response", "transport_error"],
         status_code: int | None, usage: TokenUsage | None = None,
     ) -> None:
         if self.ordinal == 0 or self.recorded or self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
-            self.history.history_complete = False
+            self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                         ScopeIncompleteReason.EVIDENCE_INVALID)
             return
         self.recorded = True
         usage_status: Literal["known", "missing", "invalid"] = (
             "missing" if usage is None else "known" if _valid_usage(usage) else "invalid"
         )
-        if usage_status == "invalid" or (outcome == "transport_error" and status_code is None):
-            self.history.history_complete = False
+        if usage_status == "invalid":
+            self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                         ScopeIncompleteReason.INVALID_USAGE)
+        elif outcome == "transport_error" and status_code is None:
+            self.history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
+                                         ScopeIncompleteReason.MISSING_STATUS)
         try:
             self.history.attempts.append(GatewayFailureAttempt(
                 ordinal=self.ordinal,
@@ -242,7 +359,8 @@ class _GatewayFailureTracking:
                 ),
             ))
         except Exception:  # noqa: BLE001 - invalid supplier metadata must fail closed.
-            self.history.history_complete = False
+            self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                         ScopeIncompleteReason.EVIDENCE_INVALID)
 
 
 class GatewayResponseCancelled(asyncio.CancelledError):
@@ -543,13 +661,39 @@ class ModelGateway:
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         failure_history = _GatewayFailureHistory()
+        # Consume the call-local observer before spawning transport/cleanup tasks.
+        observer = _gateway_scope_observer.get()
+        _gateway_scope_observer.set(None)
         try:
-            return await self._complete_with_failure_history(request, failure_history)
-        except (ModelTransportError, ModelGatewayError) as error:
+            completion = await self._complete_with_failure_history(request, failure_history)
+            diagnostic = failure_history.diagnostic()
+            return (completion if diagnostic is None
+                    else replace(completion, scope_diagnostic=diagnostic))
+        except BaseException as error:
             if isinstance(error, GatewayRejectedOutput):
-                failure_history.history_complete = False
-            failure_history.attach(error, request)
+                failure_history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
+                                                ScopeIncompleteReason.REJECTED_OUTPUT)
+            elif isinstance(error, asyncio.CancelledError):
+                failure_history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
+                                                ScopeIncompleteReason.CANCELLED)
+            elif isinstance(error, (CapacityBackendError, CapacityConfigurationError)):
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
+                                                ScopeIncompleteReason.CAPACITY_BACKEND_FAILURE)
+            elif not failure_history.attempts or not failure_history.history_complete:
+                failure_history.mark_incomplete(ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                                ScopeIncompleteReason.UNKNOWN_FAILURE)
+            if isinstance(error, (ModelTransportError, ModelGatewayError)):
+                failure_history.attach(error, request)
+            failure_history.attach_diagnostic(error)
             raise
+        finally:
+            if observer is not None:
+                try:
+                    diagnostic = failure_history.diagnostic()
+                    if diagnostic is not None:
+                        observer(diagnostic)
+                except BaseException:  # noqa: BLE001 - diagnostics never replace model outcomes.
+                    _LOGGER.warning("model_scope_observer_failed")
 
     async def _complete_with_failure_history(
         self, request: ModelRequest, failure_history: _GatewayFailureHistory,
@@ -574,7 +718,8 @@ class ModelGateway:
         for logical_model, candidates in candidate_groups:
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
-                failure_history.history_complete = False
+                failure_history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
+                                                ScopeIncompleteReason.DEADLINE_EXHAUSTED)
                 break
             attempted_logical_models.append(logical_model)
             compatible_candidates = self._context_compatible_candidates(
@@ -610,7 +755,8 @@ class ModelGateway:
                     timeout=acquire_timeout,
                 )
             except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
-                failure_history.history_complete = False
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
+                                                ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
                 if fallback_from_logical_model is None:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
@@ -624,6 +770,8 @@ class ModelGateway:
                 None,
             )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
+                                                ScopeIncompleteReason.CAPACITY_BACKEND_FAILURE)
                 cleanup_error = await self._release_cleanup(
                     capacity, lease, deadline=request_deadline
                 )
@@ -634,7 +782,8 @@ class ModelGateway:
                 raise CapacityBackendError("model capacity returned an unknown deployment")
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
-                failure_history.history_complete = False
+                failure_history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
+                                                ScopeIncompleteReason.DEADLINE_EXHAUSTED)
                 cleanup_error = await self._release_cleanup(
                     capacity, lease, deadline=request_deadline
                 )
@@ -1363,6 +1512,7 @@ class ModelGateway:
         transport_started: float | None = None
         should_record = False
         status_code: int | None = None
+        history = failure_tracking.history if failure_tracking is not None else None
         try:
             try:
                 remaining_seconds = deadline - asyncio.get_running_loop().time()
@@ -1373,12 +1523,21 @@ class ModelGateway:
                     timeout=remaining_seconds,
                 )
             except TimeoutError:
+                if history is not None:
+                    history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
+                                            ScopeIncompleteReason.DEADLINE_EXHAUSTED)
                 primary_error = ModelTransportError(
                     "model request deadline exhausted", status_code=408
                 )
             except asyncio.CancelledError as error:
+                if history is not None:
+                    history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
+                                            ScopeIncompleteReason.CANCELLED)
                 primary_error = error
             except Exception:  # noqa: BLE001 - redact resolver details at the boundary
+                if history is not None:
+                    history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CREDENTIALS,
+                                            ScopeIncompleteReason.CREDENTIAL_RESOLUTION_FAILED)
                 primary_error = ModelGatewayError("model credential resolution failed")
             else:
                 transport_started = self._monotonic()
@@ -1418,25 +1577,31 @@ class ModelGateway:
                         status_code = 200
                         should_record = True
                 except TimeoutError:
-                    if failure_tracking is not None:
-                        failure_tracking.history.history_complete = False
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
+                                                ScopeIncompleteReason.DEADLINE_EXHAUSTED)
                     primary_error = ModelTransportError(
                         "model request deadline exhausted", status_code=408
                     )
                     should_record = True
                 except asyncio.CancelledError as error:
-                    if failure_tracking is not None:
-                        failure_tracking.history.history_complete = False
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
+                                                ScopeIncompleteReason.CANCELLED)
                     if isinstance(error, ModelResponseCancelled):
                         receipt = error.receipt
                     elif invocation.done() and not invocation.cancelled() and invocation.exception() is None:
                         receipt = _received_result(invocation.result())
                     primary_error = error
                 except (CapacityBackendError, CapacityConfigurationError) as error:
-                    if failure_tracking is not None:
-                        failure_tracking.history.history_complete = False
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
+                                                ScopeIncompleteReason.CAPACITY_BACKEND_FAILURE)
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                                ScopeIncompleteReason.UNKNOWN_FAILURE)
                     should_record = True
                     primary_error = ModelGatewayError("model client internal failure")
                 finally:
@@ -1462,15 +1627,17 @@ class ModelGateway:
                         succeeded=response is not None,
                     )
                 except asyncio.CancelledError as error:
-                    if failure_tracking is not None:
-                        failure_tracking.history.history_complete = False
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                                ScopeIncompleteReason.CANCELLED)
                     if primary_error is None or isinstance(
                         primary_error, ModelResponseError | asyncio.CancelledError
                     ):
                         primary_error = error
                 except Exception:  # noqa: BLE001 - preserve any primary model failure
-                    if failure_tracking is not None:
-                        failure_tracking.history.history_complete = False
+                    if history is not None:
+                        history.mark_incomplete(ScopeIncompletePhase.RECORDER,
+                                                ScopeIncompleteReason.OUTCOME_RECORDING_FAILED)
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
         finally:
@@ -1481,8 +1648,11 @@ class ModelGateway:
                 primary_error, ModelResponseError | asyncio.CancelledError
             ):
                 primary_error = release_error
-            if release_error is not None and failure_tracking is not None:
-                failure_tracking.history.history_complete = False
+            if release_error is not None and history is not None:
+                history.mark_incomplete(ScopeIncompletePhase.CLEANUP,
+                                        ScopeIncompleteReason.CANCELLED
+                                        if isinstance(release_error, asyncio.CancelledError)
+                                        else ScopeIncompleteReason.RELEASE_FAILED)
             if release_error is not None and primary_error is None:
                 if isinstance(release_error, asyncio.CancelledError):
                     primary_error = release_error
@@ -1495,7 +1665,8 @@ class ModelGateway:
             raise cancelled from None
         if primary_error is not None:
             if failure_tracking is not None and not failure_tracking.recorded:
-                failure_tracking.history.history_complete = False
+                failure_tracking.history.mark_incomplete(ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                                         ScopeIncompleteReason.UNKNOWN_FAILURE)
             raise primary_error from None
         if response is None:  # pragma: no cover - defensive invariant
             raise ModelGatewayError("model gateway completed without a response")
@@ -1574,6 +1745,9 @@ class ModelGateway:
             outcome = await self._transport.complete(deployment, request, api_key)
         except ModelResponseCancelled as error:
             # A task-cancelled state/gather can discard a CancelledError subclass's receipt.
+            if failure_tracking is not None:
+                failure_tracking.history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
+                                                         ScopeIncompleteReason.CANCELLED)
             outcome = _SafeTransportFailure(ModelResponseCancelled(receipt=error.receipt))
             error.__traceback__ = None
             error.__context__ = None
@@ -1583,6 +1757,9 @@ class ModelGateway:
             raise
         except ModelResponseError as error:
             _LOGGER.warning("model_response_rejected deployment_id=%s", deployment.id)
+            if failure_tracking is not None:
+                failure_tracking.history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
+                                                         ScopeIncompleteReason.REJECTED_OUTPUT)
             outcome = _SafeTransportFailure(ModelResponseError(
                 "model response rejected", status_code=error.status_code, evidence=error.evidence,
             ))
@@ -1620,6 +1797,9 @@ class ModelGateway:
             error.__traceback__ = None
             del error
             if isinstance(safe_error, ModelResponseError):
+                if failure_tracking is not None:
+                    failure_tracking.history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
+                                                             ScopeIncompleteReason.REJECTED_OUTPUT)
                 outcome = _SafeTransportFailure(safe_error)
             elif isinstance(safe_error, ModelTransportError):
                 if failure_tracking is not None:
@@ -1628,6 +1808,9 @@ class ModelGateway:
                     ModelTransportError("model transport failed", status_code=safe_error.status_code)
                 )
             else:
+                if failure_tracking is not None:
+                    failure_tracking.history.mark_incomplete(ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                                             ScopeIncompleteReason.UNKNOWN_FAILURE)
                 outcome = _SafeTransportFailure(ModelGatewayError("model client internal failure"))
         del api_key, request
         return outcome

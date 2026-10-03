@@ -5,6 +5,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
+import { PreviewFrame } from "../preview/PreviewFrame";
 import {
   ArtifactFileCard,
   artifactFileName,
@@ -3816,7 +3817,12 @@ export function WebsiteServicePreview({
       setPreview(null);
       setError(formatApiError(caught, "网站预览续期失败，请重新启动"));
     });
-    window.open(preview.preview_url, "_blank", "noopener,noreferrer");
+    if (preview.application_transport && scope) {
+      const opened = window.open(`/website-preview/${encodeURIComponent(preview.id)}?conversation=${encodeURIComponent(scope.conversationId)}`, "_blank");
+      if (opened) opened.opener = null;
+    } else {
+      window.open(preview.preview_url, "_blank", "noopener,noreferrer");
+    }
   };
 
   const serviceVisible = preview?.status === "starting" || (preview?.status === "ready" && Boolean(preview.preview_url));
@@ -3842,12 +3848,9 @@ export function WebsiteServicePreview({
         </div>
       ) : null}
       {preview?.status === "ready" && preview.preview_url ? (
-        <iframe
-          className="agent-workbench-web-preview"
+        <PreviewFrame
+          preview={preview}
           title={`${title} 网站预览`}
-          src={preview.preview_url}
-          sandbox="allow-scripts allow-forms allow-modals"
-          referrerPolicy="no-referrer"
           onLoad={() => void api.renewWebPreview(preview.id).then(setPreview).catch((caught) => {
             setPreview(null);
             setError(formatApiError(caught, "网站预览续期失败，请重新启动"));

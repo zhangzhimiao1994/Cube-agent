@@ -1073,7 +1073,8 @@ class DirectRuntime:
         if tracker.incomplete:
             return (RunEvent(kind="model.scope_incomplete", sequence=sequence, run_id=run_id,
                              payload={"actor": "main_agent", "logical_model": self._logical_model,
-                                      "call_count": tracker.call_count}),)
+                                      "call_count": tracker.call_count,
+                                      **tracker.diagnostic_payload}),)
         events: list[RunEvent] = []
         for artifact in artifacts:
             if artifact.provenance is None:

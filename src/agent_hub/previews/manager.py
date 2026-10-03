@@ -1,4 +1,4 @@
-"""In-process, loopback-only static website previews."""
+"""Owned static previews and isolated application preview lifecycles."""
 
 from __future__ import annotations
 
@@ -6,27 +6,39 @@ import hmac
 import http.client
 import logging
 import mimetypes
+import os
 import re
 import secrets
 import shutil
+import stat
+import sys
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import TemporaryDirectory
-from typing import Literal, Self
+from typing import Literal, Protocol, Self
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID, uuid4
+
+from agent_hub.previews.dynamic_runner import json_object, validate_target
+from agent_hub.previews.dynamic_runtime import (
+    DynamicPreviewBackend,
+    DynamicPreviewCleanupError,
+    DynamicPreviewResponse,
+    DynamicPreviewUnavailable,
+)
 
 PreviewStatus = Literal["ready", "stopped", "expired"]
 _SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _LOOPBACK_HOST = "127.0.0.1"
 _DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_APPLICATION_REQUEST_BYTES = 1024 * 1024
 _DEFAULT_MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 _DEFAULT_MAX_SNAPSHOT_FILES = 10_000
 _MAX_FINISHED_STATES = 256
@@ -81,6 +93,7 @@ class PreviewState:
     max_expires_at: datetime
     created_at: datetime
     stopped_at: datetime | None = None
+    application_transport: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +118,26 @@ class _PreviewRuntime:
     state: PreviewState
     token_sha256: str
     entrypoint: str
-    server: ThreadingHTTPServer
-    thread: threading.Thread
+    server: ThreadingHTTPServer | None
+    thread: threading.Thread | None
     snapshot: TemporaryDirectory[str]
+    application: ApplicationRuntime | None = None
+    request_lock: threading.Lock = field(default_factory=threading.Lock)
+    display_root: Path | None = None
+
+
+class ApplicationRuntime(Protocol):
+    def request(
+        self, method: str, target: str, headers: tuple[tuple[str, str], ...], body: bytes
+    ) -> DynamicPreviewResponse: ...
+
+    def close(self) -> None: ...
+
+
+class ApplicationBackend(Protocol):
+    def start(
+        self, source_root: Path, preview_id: str, lifetime_seconds: int
+    ) -> ApplicationRuntime: ...
 
 
 class _LoopbackPreviewServer(ThreadingHTTPServer):
@@ -131,6 +161,7 @@ class PreviewManager:
         max_active_per_tenant: int = 8,
         reaper_interval: timedelta = timedelta(seconds=5),
         clock: Callable[[], datetime] | None = None,
+        dynamic_backend: ApplicationBackend | None = None,
     ) -> None:
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
@@ -145,6 +176,9 @@ class PreviewManager:
         if reaper_interval <= timedelta(0):
             raise ValueError("reaper_interval must be positive")
         self._workspace_root = workspace_root.resolve()
+        self._dynamic_backend = dynamic_backend or DynamicPreviewBackend(
+            workspace_root=self._workspace_root,
+        )
         self._max_response_bytes = max_response_bytes
         self._max_snapshot_bytes = max_snapshot_bytes
         self._max_snapshot_files = max_snapshot_files
@@ -159,6 +193,7 @@ class PreviewManager:
         self._finished: OrderedDict[str, PreviewState] = OrderedDict()
         self._active_by_conversation: dict[tuple[UUID, str], str] = {}
         self._start_reservations: set[tuple[UUID, str]] = set()
+        self._cancelled_starts: set[tuple[UUID, str]] = set()
         self._closed = False
         self._reaper_stop = threading.Event()
         self._reaper_thread = threading.Thread(
@@ -195,10 +230,27 @@ class PreviewManager:
             self._reserve_start_locked(reservation_key)
         try:
             session_root = self._session_root(tenant_id, project, session)
+            application = _has_application(session_root)
             if root is None:
-                preview_root, entrypoint = _find_preview_root(session_root)
+                try:
+                    preview_root, entrypoint = _find_preview_root(session_root)
+                except PreviewNotFound:
+                    if not application:
+                        raise
+                    preview_root, entrypoint = session_root, "index.html"
             else:
                 preview_root, entrypoint = _find_explicit_preview_root(session_root, root)
+            if application:
+                return self._start_application(
+                    tenant_id,
+                    conversation,
+                    project,
+                    session,
+                    session_root,
+                    preview_root,
+                    entrypoint,
+                    requested_lease,
+                )
             snapshot, served_root = _snapshot_preview_root(
                 preview_root,
                 max_bytes=self._max_snapshot_bytes,
@@ -251,13 +303,22 @@ class PreviewManager:
                 snapshot=snapshot,
             )
             with self._lock:
+                if reservation_key in self._cancelled_starts:
+                    server.server_close()
+                    snapshot.cleanup()
+                    raise PreviewTokenRejected("preview startup was revoked")
                 if self._closed:
                     server.server_close()
                     snapshot.cleanup()
                     raise RuntimeError("preview manager is closed")
-                current_id = self._active_by_conversation.get(reservation_key)
-                if current_id is not None:
-                    self._stop_locked(current_id, status="stopped", now=now)
+                try:
+                    current_id = self._active_by_conversation.get(reservation_key)
+                    if current_id is not None:
+                        self._stop_locked(current_id, status="stopped", now=now)
+                except BaseException:
+                    server.server_close()
+                    snapshot.cleanup()
+                    raise
                 self._runtimes[preview_id] = runtime
                 self._active_by_conversation[reservation_key] = preview_id
                 try:
@@ -273,14 +334,87 @@ class PreviewManager:
             with self._lock:
                 self._release_start_reservation_locked(reservation_key)
 
+    def _start_application(
+        self,
+        tenant_id: UUID,
+        conversation: str,
+        project: str,
+        session: str,
+        session_root: Path,
+        preview_root: Path,
+        entrypoint: str,
+        lease: timedelta,
+    ) -> PreviewLaunch:
+        now = _aware_utc(self._clock())
+        key = (tenant_id, conversation)
+        # Retire the previous runtime before reserving a second isolated process.
+        with self._lock:
+            previous = self._active_by_conversation.get(key)
+            if previous is not None:
+                self._stop_locked(previous, status="stopped", now=now)
+        staging = self._workspace_root / ".preview-staging"
+        _reject_path_aliases(self._workspace_root, staging)
+        staging.mkdir(exist_ok=True)
+        snapshot, source_root = _snapshot_preview_root(
+            session_root,
+            max_bytes=self._max_snapshot_bytes,
+            max_files=self._max_snapshot_files,
+            staging=staging,
+        )
+        token = secrets.token_urlsafe(32)
+        state = PreviewState(
+            preview_id=str(uuid4()),
+            tenant_id=tenant_id,
+            conversation_id=conversation,
+            project_id=project,
+            session_id=session,
+            token_sha256=sha256(token.encode()).hexdigest(),
+            status="ready",
+            internal_host=_LOOPBACK_HOST,
+            internal_port=0,
+            preview_root=preview_root,
+            lease_expires_at=min(now + lease, now + self._max_lifetime),
+            max_expires_at=now + self._max_lifetime,
+            created_at=now,
+            application_transport=True,
+        )
+        runtime = _PreviewRuntime(state, state.token_sha256, entrypoint, None, None, snapshot)
+        display_root = source_root / preview_root.relative_to(session_root)
+        if (display_root / entrypoint).is_file():
+            runtime.display_root = display_root
+        try:
+            runtime.application = self._dynamic_backend.start(
+                source_root,
+                state.preview_id,
+                max(1, int(self._max_lifetime.total_seconds())),
+            )
+        except BaseException:
+            snapshot.cleanup()
+            raise
+        with self._lock:
+            self._runtimes[state.preview_id] = runtime
+            self._active_by_conversation[key] = state.preview_id
+            if key in self._cancelled_starts:
+                self._stop_locked(state.preview_id, status="stopped", now=now)
+                raise PreviewTokenRejected("preview startup was revoked")
+            if self._closed:
+                self._stop_locked(state.preview_id, status="stopped", now=now)
+                raise RuntimeError("preview manager is closed")
+            ready_at = _aware_utc(self._clock())
+            if state.lease_expires_at <= ready_at or state.max_expires_at <= ready_at:
+                self._stop_locked(state.preview_id, status="expired", now=ready_at)
+                raise PreviewTokenRejected("preview expired during startup")
+        return PreviewLaunch(state, token)
+
     def _reserve_start_locked(self, key: tuple[UUID, str]) -> None:
         if self._closed:
             raise RuntimeError("preview manager is closed")
         if key in self._start_reservations:
-            raise PreviewCapacityExceeded(
-                "preview startup is already in progress for conversation"
-            )
-        occupied = set(self._active_by_conversation)
+            raise PreviewCapacityExceeded("preview startup is already in progress for conversation")
+        occupied = {
+            (runtime.state.tenant_id, runtime.state.conversation_id)
+            for runtime in self._runtimes.values()
+        }
         occupied.update(self._start_reservations)
         if key not in occupied:
             if len(occupied) >= self._max_active_global:
@@ -292,6 +426,7 @@ class PreviewManager:
 
     def _release_start_reservation_locked(self, key: tuple[UUID, str]) -> None:
         self._start_reservations.discard(key)
+        self._cancelled_starts.discard(key)
 
     def current(self, tenant_id: UUID, conversation_id: str) -> PreviewState | None:
         conversation = _safe_segment(conversation_id)
@@ -303,10 +438,7 @@ class PreviewManager:
             if runtime is None or runtime.state.status != "ready":
                 return None
             now = _aware_utc(self._clock())
-            if (
-                runtime.state.lease_expires_at <= now
-                or runtime.state.max_expires_at <= now
-            ):
+            if runtime.state.lease_expires_at <= now or runtime.state.max_expires_at <= now:
                 self._stop_locked(preview_id, status="expired", now=now)
                 return None
             return runtime.state
@@ -348,6 +480,9 @@ class PreviewManager:
     ) -> PreviewState | None:
         conversation = _safe_segment(conversation_id)
         with self._lock:
+            key = (tenant_id, conversation)
+            if key in self._start_reservations:
+                self._cancelled_starts.add(key)
             preview_id = self._active_by_conversation.get((tenant_id, conversation))
             if preview_id is None:
                 return None
@@ -363,14 +498,28 @@ class PreviewManager:
             expired = tuple(
                 preview_id
                 for preview_id, runtime in self._runtimes.items()
-                if runtime.state.status == "ready"
-                and (
+                if runtime.state.status != "ready"
+                or (
                     runtime.state.lease_expires_at <= current_time
                     or runtime.state.max_expires_at <= current_time
                 )
             )
+            errors: list[Exception] = []
             for preview_id in expired:
-                self._stop_locked(preview_id, status="expired", now=current_time)
+                try:
+                    pending_status = self._runtimes[preview_id].state.status
+                    self._stop_locked(
+                        preview_id,
+                        status="stopped" if pending_status == "stopped" else "expired",
+                        now=current_time,
+                    )
+                except Exception as error:
+                    logger.exception("preview cleanup failed for %s", preview_id)
+                    errors.append(error)
+            if errors:
+                raise DynamicPreviewCleanupError(
+                    f"{len(errors)} preview cleanup attempts failed"
+                ) from ExceptionGroup("preview cleanup failures", errors)
             return expired
 
     def read(self, preview_id: str, token: str, path: str = "") -> PreviewResponse:
@@ -380,6 +529,22 @@ class PreviewManager:
                 token,
                 now=_aware_utc(self._clock()),
             )
+            if runtime.display_root is not None:
+                relative = _validated_request_path(runtime.display_root, runtime.entrypoint, path)
+                try:
+                    target = _resolved_asset(runtime.display_root, relative)
+                except FileNotFoundError:
+                    return PreviewResponse(404, (), b"")
+                if target.stat().st_size > self._max_response_bytes:
+                    raise PreviewResponseTooLarge("preview display response is too large")
+                with target.open("rb") as stream:
+                    body = stream.read(self._max_response_bytes + 1)
+                if len(body) > self._max_response_bytes:
+                    raise PreviewResponseTooLarge("preview display response is too large")
+                mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                return PreviewResponse(200, (("Content-Type", mime),), body)
+            if runtime.application is not None:
+                raise PreviewNotFound("dynamic preview has no immutable HTML entrypoint")
             relative_path = _validated_request_path(
                 runtime.state.preview_root,
                 runtime.entrypoint,
@@ -412,23 +577,61 @@ class PreviewManager:
         finally:
             connection.close()
 
-    def close(self) -> None:
-        self._reaper_stop.set()
+    def app_request(
+        self,
+        preview_id: str,
+        token: str,
+        method: str,
+        target: str,
+        headers: tuple[tuple[str, str], ...],
+        body: bytes,
+    ) -> PreviewResponse:
+        if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+            raise ValueError("invalid application method")
+        validate_target(target)
+        request_headers = _application_headers(headers)
+        if len(body) > MAX_APPLICATION_REQUEST_BYTES:
+            raise PreviewResponseTooLarge("application request is too large")
         with self._lock:
-            if self._closed:
-                return
+            runtime = self._authorized_runtime(preview_id, token, now=_aware_utc(self._clock()))
+            if runtime.application is None:
+                raise PreviewNotFound("preview has no application transport")
+        # A queued write rechecks revocation before reaching the owned transport.
+        with runtime.request_lock:
+            with self._lock:
+                self._authorized_runtime(preview_id, token, now=_aware_utc(self._clock()))
+            result = runtime.application.request(method, target, request_headers, body)
+            if len(result.body) > min(self._max_response_bytes, _DEFAULT_MAX_RESPONSE_BYTES):
+                raise PreviewResponseTooLarge("application response is too large")
+            if not 200 <= result.status_code <= 599:
+                raise DynamicPreviewUnavailable("invalid application response status")
+            response_headers = _application_headers(result.headers, response=True)
+            with self._lock:
+                self._authorized_runtime(preview_id, token, now=_aware_utc(self._clock()))
+            return PreviewResponse(result.status_code, response_headers, result.body)
+
+    def is_application(self, preview_id: str, token: str) -> bool:
+        with self._lock:
+            runtime = self._authorized_runtime(preview_id, token, now=_aware_utc(self._clock()))
+            return runtime.state.application_transport
+
+    def close(self) -> None:
+        error: Exception | None = None
+        with self._lock:
             self._closed = True
             now = _aware_utc(self._clock())
-            active_ids = tuple(
-                preview_id
-                for preview_id, runtime in self._runtimes.items()
-                if runtime.state.status == "ready"
-            )
+            active_ids = tuple(preview_id for preview_id, runtime in self._runtimes.items())
             for preview_id in active_ids:
-                self._stop_locked(preview_id, status="stopped", now=now)
-            self._active_by_conversation.clear()
-            self._runtimes.clear()
+                try:
+                    self._stop_locked(preview_id, status="stopped", now=now)
+                except (PreviewError, DynamicPreviewCleanupError, OSError, RuntimeError) as exc:
+                    if error is None:
+                        error = exc
             self._finished.clear()
+            if not self._runtimes and not self._start_reservations:
+                self._reaper_stop.set()
+        if error is not None:
+            raise error
         if self._reaper_thread is not threading.current_thread():
             self._reaper_thread.join(timeout=2)
 
@@ -436,6 +639,9 @@ class PreviewManager:
         while not self._reaper_stop.wait(self._reaper_interval_seconds):
             try:
                 self.reap_expired()
+                with self._lock:
+                    if self._closed and not self._runtimes and not self._start_reservations:
+                        self._reaper_stop.set()
             except Exception:
                 logger.exception("preview expiry reaper failed")
 
@@ -469,13 +675,16 @@ class PreviewManager:
         runtime = self._runtimes[preview_id]
         runtime.state = replace(runtime.state, status=status, stopped_at=now)
         key = (runtime.state.tenant_id, runtime.state.conversation_id)
-        if self._active_by_conversation.get(key) == preview_id:
-            self._active_by_conversation.pop(key, None)
-        runtime.server.shutdown()
-        runtime.server.server_close()
-        if runtime.thread is not threading.current_thread():
+        if runtime.application is not None:
+            runtime.application.close()
+        if runtime.server is not None:
+            runtime.server.shutdown()
+            runtime.server.server_close()
+        if runtime.thread is not None and runtime.thread is not threading.current_thread():
             runtime.thread.join(timeout=2)
         runtime.snapshot.cleanup()
+        if self._active_by_conversation.get(key) == preview_id:
+            self._active_by_conversation.pop(key, None)
         self._runtimes.pop(preview_id, None)
         self._finished[preview_id] = runtime.state
         self._finished.move_to_end(preview_id)
@@ -570,36 +779,237 @@ def _snapshot_preview_root(
     *,
     max_bytes: int,
     max_files: int,
+    staging: Path | None = None,
 ) -> tuple[TemporaryDirectory[str], Path]:
-    snapshot = TemporaryDirectory(prefix="agent-hub-preview-")
+    snapshot = TemporaryDirectory(prefix="agent-hub-preview-", dir=staging)
     destination_root = Path(snapshot.name) / "site"
     destination_root.mkdir()
     total_bytes = 0
     file_count = 0
     try:
+        if staging is not None and sys.platform == "linux":
+            _copy_application_snapshot(root, destination_root, max_bytes, max_files)
+            return snapshot, destination_root
         pending = [(root, destination_root)]
         while pending:
             source_dir, destination_dir = pending.pop()
             for source in source_dir.iterdir():
                 if source.is_symlink() or source.is_junction():
                     raise InvalidPreviewPath("preview snapshot contains an alias")
+                if staging is not None and (
+                    source.name
+                    in {
+                        "node_modules",
+                        ".git",
+                        ".preview-staging",
+                        ".venv",
+                        ".npmrc",
+                        ".ssh",
+                        ".aws",
+                        ".codex",
+                    }
+                    or source.name == ".env"
+                    or source.name.startswith(".env.")
+                ):
+                    continue
                 destination = destination_dir / source.name
                 if source.is_dir():
+                    if staging is not None:
+                        file_count += 1
+                        if file_count > max_files:
+                            raise PreviewResponseTooLarge(
+                                "preview snapshot exceeds configured limits"
+                            )
                     destination.mkdir()
                     pending.append((source, destination))
                     continue
                 if not source.is_file():
                     raise InvalidPreviewPath("preview snapshot contains an unsupported entry")
                 size = source.stat().st_size
+                if staging is not None and source.stat().st_nlink != 1:
+                    raise InvalidPreviewPath("preview snapshot contains a hardlink")
                 file_count += 1
                 total_bytes += size
                 if file_count > max_files or total_bytes > max_bytes:
                     raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
-                shutil.copyfile(source, destination)
+                if staging is None:
+                    shutil.copyfile(source, destination)
+                else:
+                    before = source.stat()
+                    with source.open("rb") as stream:
+                        data = stream.read(max_bytes - (total_bytes - size) + 1)
+                    after = source.stat()
+                    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
+                        raise InvalidPreviewPath("preview source changed during preparation")
+                    total_bytes += len(data) - size
+                    if total_bytes > max_bytes:
+                        raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
+                    destination.write_bytes(data)
+                    destination.chmod(0o444)
         return snapshot, destination_root
     except BaseException:
         snapshot.cleanup()
         raise
+
+
+def _copy_application_snapshot(
+    root: Path, destination: Path, max_bytes: int, max_files: int
+) -> None:
+    """Anchor Linux source reads against concurrent path replacement."""
+    if sys.platform != "linux":
+        raise RuntimeError("descriptor-based snapshots require Linux")
+    nofollow = os.O_NOFOLLOW
+    directory = os.O_DIRECTORY
+    fd = os.open(root.anchor, os.O_RDONLY | directory | nofollow)
+    try:
+        for part in root.parts[1:]:
+            child = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        _copy_application_files(fd, destination, max_bytes, max_files, nofollow)
+    except OSError as error:
+        raise InvalidPreviewPath("preview source could not be safely snapshotted") from error
+    finally:
+        os.close(fd)
+
+
+def _copy_application_files(
+    root_fd: int,
+    destination: Path,
+    max_bytes: int,
+    max_files: int,
+    nofollow: int,
+) -> None:
+    if sys.platform != "linux":
+        raise RuntimeError("descriptor-based snapshots require Linux")
+    total = 0
+    entries = 0
+    excluded = {
+        "node_modules",
+        ".git",
+        ".preview-staging",
+        ".venv",
+        ".npmrc",
+        ".ssh",
+        ".aws",
+        ".codex",
+    }
+    for relative, directories, files, fd in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
+        target = destination / relative
+        for name in tuple(directories) + tuple(files):
+            if name in excluded or name == ".env" or name.startswith(".env."):
+                if name in directories:
+                    directories.remove(name)
+                continue
+            entries += 1
+            if entries > max_files:
+                raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
+            child = os.open(name, os.O_RDONLY | nofollow | os.O_NONBLOCK, dir_fd=fd)
+            try:
+                info = os.fstat(child)
+                path = target / name
+                if stat.S_ISDIR(info.st_mode):
+                    path.mkdir()
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    if info.st_size > max_bytes - total:
+                        raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
+                    with os.fdopen(os.dup(child), "rb") as stream:
+                        data = stream.read(max_bytes - total + 1)
+                    after = os.fstat(child)
+                    if (info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ):
+                        raise InvalidPreviewPath("preview source changed during preparation")
+                    total += len(data)
+                    if total > max_bytes:
+                        raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
+                    path.write_bytes(data)
+                    path.chmod(0o444)
+                else:
+                    raise InvalidPreviewPath("preview source contains a link or special file")
+            finally:
+                os.close(child)
+        target.chmod(0o555)
+
+
+def _has_application(root: Path) -> bool:
+    manifest = root / "package.json"
+    _reject_path_aliases(root, manifest)
+    if not manifest.exists():
+        return False
+    if not manifest.is_file() or manifest.stat().st_size > MAX_APPLICATION_REQUEST_BYTES:
+        raise InvalidPreviewPath("invalid application manifest")
+    try:
+        payload = json_object(manifest.read_bytes())
+    except (ValueError, UnicodeError) as error:
+        raise InvalidPreviewPath("invalid application manifest") from error
+    if not isinstance(payload, dict):
+        raise InvalidPreviewPath("invalid application manifest")
+    scripts = payload.get("scripts", {})
+    if not isinstance(scripts, dict):
+        raise InvalidPreviewPath("invalid application scripts")
+    if "start" not in scripts:
+        return False
+    if not isinstance(scripts["start"], str) or not scripts["start"].strip():
+        raise InvalidPreviewPath("invalid application start script")
+    return True
+
+
+def _application_headers(
+    headers: tuple[tuple[str, str], ...],
+    *,
+    response: bool = False,
+) -> tuple[tuple[str, str], ...]:
+    if len(headers) > 64:
+        raise ValueError("too many application headers")
+    size = 0
+    for name, value in headers:
+        if re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is None:
+            raise ValueError("invalid application header name")
+        if any(ord(char) < 32 or ord(char) > 126 for char in value):
+            raise ValueError("invalid application header value")
+        size += len(name) + len(value)
+        if size > 16384:
+            raise ValueError("application headers too large")
+    nominated = {
+        value.strip().casefold()
+        for name, content in headers
+        if name.casefold() == "connection"
+        for value in content.split(",")
+    }
+    allowed = (
+        {
+            "content-type",
+            "content-language",
+            "etag",
+            "last-modified",
+            "cache-control",
+            "content-range",
+            "accept-ranges",
+            "location",
+        }
+        if response
+        else {"accept", "accept-language", "content-type", "if-match", "if-none-match", "range"}
+    )
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, value in headers:
+        name = name.casefold()
+        if name not in allowed or name in nominated:
+            continue
+        if name in seen:
+            raise ValueError("duplicate application header")
+        seen.add(name)
+        if response and name == "location":
+            validate_target(value)
+        result.append((name, value))
+    return tuple(result)
 
 
 def _find_preview_root(session_root: Path) -> tuple[Path, str]:
@@ -635,9 +1045,7 @@ def _find_explicit_preview_root(session_root: Path, root: str) -> tuple[Path, st
     if parsed.scheme or parsed.netloc or posix.is_absolute() or windows.is_absolute():
         raise InvalidPreviewPath("preview root must be a safe relative directory")
     if not posix.parts or any(
-        part in {"", ".", ".."}
-        or part.startswith(".")
-        or _SAFE_SEGMENT.fullmatch(part) is None
+        part in {"", ".", ".."} or part.startswith(".") or _SAFE_SEGMENT.fullmatch(part) is None
         for part in posix.parts
     ):
         raise InvalidPreviewPath("preview root must be a safe relative directory")

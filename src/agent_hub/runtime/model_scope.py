@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -11,7 +11,14 @@ from agent_hub.models.failure_receipt import (
     GatewayFailureReceipt,
     get_gateway_failure_receipt,
 )
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import (
+    GatewayCompletion,
+    GatewayScopeDiagnostic,
+    ScopeIncompletePhase,
+    ScopeIncompleteReason,
+    _gateway_scope_observer,
+    get_gateway_scope_diagnostic,
+)
 from agent_hub.models.types import ModelRequest
 from agent_hub.runtime.contracts import Artifact, EventKind, GatewayProvenance, JsonValue, RunEvent
 
@@ -175,6 +182,11 @@ class ModelScopeTracker:
         self._count = 0
         self._bytes = 0
         self._incomplete = False
+        self._recorded_count = 0
+        self._observer: Callable[[GatewayScopeDiagnostic], None] | None = None
+        self._first_incomplete: tuple[
+            int | None, ScopeIncompletePhase, ScopeIncompleteReason, GatewayScopeDiagnostic | None,
+        ] | None = None
 
     @property
     def call_count(self) -> int:
@@ -184,48 +196,126 @@ class ModelScopeTracker:
     def incomplete(self) -> bool:
         return self._incomplete or any(call is None for call in self._calls)
 
+    def _mark_incomplete(
+        self, index: int | None, phase: ScopeIncompletePhase, reason: ScopeIncompleteReason,
+        diagnostic: GatewayScopeDiagnostic | None = None,
+    ) -> None:
+        if self._first_incomplete is None:
+            # A previous unrecorded call cannot be hidden by a later identified failure.
+            for pending, call in enumerate(self._calls):
+                if index is not None and pending >= index:
+                    break
+                if call is None:
+                    index, phase, reason, diagnostic = (
+                        pending, ScopeIncompletePhase.SCOPE_TRACKER,
+                        ScopeIncompleteReason.UNRECORDED_CALL, None,
+                    )
+                    break
+            self._first_incomplete = (index, phase, reason, diagnostic)
+        self._incomplete = True
+
+    @property
+    def diagnostic_payload(self) -> dict[str, JsonValue]:
+        if not self.incomplete:
+            return {}
+        if self._first_incomplete is None:
+            self._mark_incomplete(None, ScopeIncompletePhase.SCOPE_TRACKER,
+                                  ScopeIncompleteReason.UNRECORDED_CALL)
+        assert self._first_incomplete is not None
+        index, phase, reason, diagnostic = self._first_incomplete
+        payload: dict[str, JsonValue] = {
+            "first_incomplete_phase": phase.value, "first_incomplete_reason": reason.value,
+            "recorded_call_count": self._recorded_count,
+        }
+        if index is not None:
+            payload["first_incomplete_call"] = index + 1
+        if diagnostic is not None:
+            payload["transport_entered_count"] = diagnostic.transport_entered_count
+            payload["failure_attempt_count"] = diagnostic.failure_attempt_count
+        return payload
+
     def begin(self) -> int:
         self._count += 1
         if self._incomplete:
             return -1
         self._calls.append(None)
-        return len(self._calls) - 1
+        index = len(self._calls) - 1
+
+        def observe(diagnostic: GatewayScopeDiagnostic) -> None:
+            self._mark_incomplete(index, diagnostic.phase, diagnostic.reason, diagnostic)
+
+        self._observer = observe
+        _gateway_scope_observer.set(observe)
+        return index
+
+    def _finish_observation(self) -> None:
+        if _gateway_scope_observer.get() is self._observer:
+            _gateway_scope_observer.set(None)
+        self._observer = None
 
     def _record(self, index: int, call: dict[str, JsonValue]) -> None:
         if index < 0 or self._incomplete:
             return
-        size = len(json.dumps(call, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        try:
+            size = len(json.dumps(call, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            if index >= len(self._calls) or self._calls[index] is not None:
+                raise ValueError
+        except Exception:  # noqa: BLE001 - recording failure cannot replace model execution.
+            self._mark_incomplete(index, ScopeIncompletePhase.SCOPE_TRACKER,
+                                  ScopeIncompleteReason.EVIDENCE_INVALID)
+            return
         # This bounds telemetry memory, not model/tool execution or project size.
         if self._bytes + size > 2_000_000:
-            self._incomplete = True
+            self._mark_incomplete(index, ScopeIncompletePhase.SCOPE_TRACKER,
+                                  ScopeIncompleteReason.EVIDENCE_LIMIT)
             self._calls.clear()
             return
         self._bytes += size
         self._calls[index] = call
+        self._recorded_count += 1
 
     def received(self, index: int, request: ModelRequest, completion: GatewayCompletion) -> None:
-        provenance = GatewayProvenance(
-            logical_model=completion.logical_model, deployment_id=completion.deployment_id,
-            provider_id=completion.provider_id, provider_model=completion.provider_model,
-        )
-        self._record(index, {
-            "outcome": "received", "receipt": {
-                "schema_version": 1, "source": "model_gateway", "call_id": str(uuid4()),
-                "requested_logical_model": request.logical_model,
-                "allow_fallback": request.allow_fallback,
-                "attempted_logical_models": tuple(completion.attempted_logical_models),
-                "provenance": cast(dict[str, JsonValue], provenance.to_payload()),
-            },
-        })
+        self._finish_observation()
+        if self._incomplete:
+            return
+        diagnostic = get_gateway_scope_diagnostic(completion)
+        if diagnostic is not None:
+            self._mark_incomplete(index, diagnostic.phase, diagnostic.reason, diagnostic)
+            return
+        try:
+            provenance = GatewayProvenance(
+                logical_model=completion.logical_model, deployment_id=completion.deployment_id,
+                provider_id=completion.provider_id, provider_model=completion.provider_model,
+            )
+            self._record(index, {
+                "outcome": "received", "receipt": {
+                    "schema_version": 1, "source": "model_gateway", "call_id": str(uuid4()),
+                    "requested_logical_model": request.logical_model,
+                    "allow_fallback": request.allow_fallback,
+                    "attempted_logical_models": tuple(completion.attempted_logical_models),
+                    "provenance": cast(dict[str, JsonValue], provenance.to_payload()),
+                },
+            })
+        except Exception:  # noqa: BLE001 - metadata recording must not expose supplier data.
+            self._mark_incomplete(index, ScopeIncompletePhase.SCOPE_TRACKER,
+                                  ScopeIncompleteReason.EVIDENCE_INVALID)
 
     def failed(self, index: int, error: Exception) -> None:
+        self._finish_observation()
+        diagnostic = get_gateway_scope_diagnostic(error)
+        if diagnostic is not None:
+            self._mark_incomplete(index, diagnostic.phase, diagnostic.reason, diagnostic)
+            return
         receipt = get_gateway_failure_receipt(error)
         if receipt is not None:
-            self._record(index, {"outcome": "failed", "receipt": receipt.to_payload()})
             if not receipt.history_complete:
-                self._incomplete = True
+                self._mark_incomplete(index, ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                      ScopeIncompleteReason.UNKNOWN_FAILURE)
+            else:
+                self._record(index, {"outcome": "failed", "receipt": receipt.to_payload()})
         else:
-            self._incomplete = True
+            self._mark_incomplete(index, ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                  ScopeIncompleteReason.UNKNOWN_FAILURE)
 
     def artifacts(self, *, include_received_only: bool = False) -> tuple[Artifact, ...]:
         if not self._calls or self.incomplete:
@@ -263,7 +353,8 @@ class ModelScopeTracker:
                 offset += len(part)
             return tuple(artifacts)
         except Exception:  # noqa: BLE001 - incomplete evidence must not change execution.
-            self._incomplete = True
+            self._mark_incomplete(None, ScopeIncompletePhase.SCOPE_TRACKER,
+                                  ScopeIncompleteReason.EVIDENCE_INVALID)
             return ()
 
     def _artifact(
