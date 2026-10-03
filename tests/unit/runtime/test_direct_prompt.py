@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import json
+import logging
 import zipfile
 from collections.abc import Mapping
 from io import BytesIO
@@ -120,6 +121,8 @@ class HostileWorkspaceError(RuntimeCapabilityError):
 async def test_direct_workspace_failure_logs_only_fixed_diagnostic_code(
     error: Exception, expected_code: str, caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.WARNING, logger="agent_hub.runtime.direct")
+
     class FailingCapabilities(RecordingCapabilityGateway):
         async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
             raise error
@@ -155,6 +158,8 @@ async def test_direct_real_workspace_boundary_preserves_partial_files_and_safe_d
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
     path: str, content: str, expected_code: str,
 ) -> None:
+    caplog.set_level(logging.WARNING, logger="agent_hub.runtime.direct")
+
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
                           request="Build project")
     workspace_root = tmp_path / "workspaces"
