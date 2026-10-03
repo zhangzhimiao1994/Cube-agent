@@ -14,6 +14,7 @@ from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.files.workspace import WORKSPACE_METADATA_DOTFILES
 from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
@@ -77,6 +78,13 @@ _AGENT_STANDARD_EVIDENCE_FILENAMES = frozenset(
     }
 )
 _LOGGER = logging.getLogger(__name__)
+_WORKSPACE_PATH_POLICY = (
+    "WORKSPACE_PATH_POLICY: Use unpadded relative POSIX paths without control characters "
+    "or parent traversal. Hidden directories and files are forbidden except these root "
+    "metadata files: " + ", ".join(sorted(WORKSPACE_METADATA_DOTFILES)) + ". "
+    "Use visible configuration filenames or package.json fields for other configuration. "
+    "Never write secrets or credentials; file contents must not be blank. "
+)
 
 
 def _workspace_capability_failure_code(error: Exception) -> str:
@@ -235,6 +243,12 @@ class _BudgetUsageOutcome:
 
 class RuntimeExecutionError(RuntimeError):
     """Stable, redacted direct-runtime failure."""
+
+
+class _WorkspaceDeliveryValidationError(RuntimeExecutionError):
+    def __init__(self, failure_code: str) -> None:
+        super().__init__("incremental workspace delivery failed")
+        self.failure_code = failure_code
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -1026,6 +1040,8 @@ class DirectRuntime:
         self._active_stream: DirectRunStream | None = None
         self._active_done: asyncio.Event | None = None
         self._active_task: asyncio.Task[GatewayCompletion] | None = None
+        self._active_capability_task: asyncio.Task[Mapping[str, JsonValue]] | None = None
+        self._cancel_requested = False
         self._last_checkpoint: RuntimeCheckpoint | None = None
         self._restored_checkpoint: RuntimeCheckpoint | None = None
 
@@ -1071,36 +1087,56 @@ class DirectRuntime:
         deadline: float,
     ) -> Mapping[str, JsonValue]:
         gateway = self._capability_gateway
+        if self._cancel_requested:
+            raise asyncio.CancelledError
         if gateway is None:
             _raise_execution_error("incremental workspace delivery is unavailable")
         remaining_seconds = deadline - asyncio.get_running_loop().time()
         if remaining_seconds <= 0:
             _raise_execution_error("incremental workspace delivery timed out")
+        capability_task = asyncio.create_task(gateway.execute(
+            tenant_id=context.tenant_id,
+            run_id=context.run_id,
+            actor="main_agent",
+            name=name,
+            arguments=arguments,
+            idempotency_key=idempotency_key,
+        ))
+        self._active_capability_task = capability_task
         try:
             async with asyncio.timeout(remaining_seconds):
-                return await gateway.execute(
-                    tenant_id=context.tenant_id,
-                    run_id=context.run_id,
-                    actor="main_agent",
-                    name=name,
-                    arguments=arguments,
-                    idempotency_key=idempotency_key,
-                )
+                result = await capability_task
+                if self._cancel_requested:
+                    raise asyncio.CancelledError
+                return result
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - redact capability boundary
+            failure_code = _workspace_capability_failure_code(error)
             _LOGGER.warning(
                 "direct_workspace_capability_failed run_id=%s capability=%s "
                 "error_type=%s failure_code=%s",
                 context.run_id,
                 name,
                 type(error).__name__,
-                _workspace_capability_failure_code(error),
+                failure_code,
             )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
+        finally:
+            if not capability_task.done():
+                capability_task.cancel()
+            await asyncio.gather(capability_task, return_exceptions=True)
+            if self._active_capability_task is capability_task:
+                self._active_capability_task = None
+        if self._cancel_requested:
+            raise asyncio.CancelledError
+        if name == "workspace.write_text" and failure_code in {
+            "hidden_path", "invalid_path", "empty_content", "invalid_content", "file_too_large",
+        }:
+            raise _WorkspaceDeliveryValidationError(failure_code) from None
         _raise_execution_error("incremental workspace delivery failed")
 
     async def _write_workspace_batch(
@@ -1138,6 +1174,8 @@ class DirectRuntime:
         known_files: Mapping[str, str],
         deadline: float,
     ) -> Mapping[str, JsonValue]:
+        if self._cancel_requested:
+            raise asyncio.CancelledError
         if (
             context.routing_decision.get("replace_workspace_files") is True
             and _workspace_file_set_is_authoritative(known_files)
@@ -1235,9 +1273,11 @@ class DirectRuntime:
         summaries: list[str] = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        total_reported_tokens = 0
         usage_estimated = False
         progress_units = 0
         completed_batches = 0
+        validation_failures: dict[str, int] = {}
         initial_token_limit = context.token_budget
         active_token_limit = _workspace_delivery_token_limit(
             context,
@@ -1249,6 +1289,8 @@ class DirectRuntime:
         )
         base_messages = request.messages
         while True:
+            if self._cancel_requested:
+                raise asyncio.CancelledError
             budget_outcome = self._verified_budget_usage(
                 response.usage,
                 prompt_estimate=prompt_estimate,
@@ -1262,26 +1304,37 @@ class DirectRuntime:
                 )
             total_prompt_tokens += budget_outcome.usage.prompt_tokens
             total_completion_tokens += budget_outcome.usage.completion_tokens
+            total_reported_tokens += budget_outcome.usage.total_tokens
             usage_estimated = usage_estimated or budget_outcome.estimated
-            consumed_tokens = total_prompt_tokens + total_completion_tokens
+            consumed_tokens = total_reported_tokens
             if consumed_tokens > active_token_limit:
                 _raise_execution_error("model response budget exceeds runtime limit")
-            await self._write_workspace_batch(
-                context,
-                batch,
-                known_files=known_files,
-                deadline=deadline,
-            )
+            validation_code: str | None = None
+            try:
+                await self._write_workspace_batch(
+                    context, batch, known_files=known_files, deadline=deadline,
+                )
+            except _WorkspaceDeliveryValidationError as error:
+                validation_code = error.failure_code
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
             evidence_files.update(
                 {
                     path: content
                     for path, content in batch.files.items()
-                    if path.rsplit("/", 1)[-1].casefold()
-                    in _AGENT_STANDARD_EVIDENCE_FILENAMES
+                    if path.rsplit("/", 1)[-1].casefold() in _AGENT_STANDARD_EVIDENCE_FILENAMES
+                    and known_files.get(path) == hashlib.sha256(content.encode("utf-8")).hexdigest()
                 }
             )
-            progress_units += max(1, len(batch.files))
-            completed_batches += 1
+            if validation_code is not None:
+                validation_failures[validation_code] = validation_failures.get(validation_code, 0) + 1
+                if validation_failures[validation_code] >= 2:
+                    _raise_execution_error("incremental workspace delivery failed")
+            else:
+                validation_failures.clear()
+                progress_units += max(1, len(batch.files))
+                completed_batches += 1
             active_token_limit = _workspace_delivery_token_limit(
                 context,
                 initial_soft_limit=initial_token_limit,
@@ -1295,9 +1348,9 @@ class DirectRuntime:
                 now=asyncio.get_running_loop().time(),
             )
             deadline = delivery_deadline.deadline
-            if batch.summary:
+            if batch.summary and validation_code is None:
                 summaries.append(batch.summary)
-            if batch.complete:
+            if batch.complete and validation_code is None:
                 delivery = await self._finish_workspace_delivery(
                     context,
                     known_files=known_files,
@@ -1309,7 +1362,7 @@ class DirectRuntime:
                     usage=TokenUsage(
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=total_completion_tokens,
-                        total_tokens=total_prompt_tokens + total_completion_tokens,
+                        total_tokens=total_reported_tokens,
                     ),
                     usage_estimated=usage_estimated,
                     completion=completion,
@@ -1326,6 +1379,7 @@ class DirectRuntime:
                 {
                     "written_file_count": len(known_files),
                     "continuation": batch.continuation,
+                    **({"validation_error": validation_code} if validation_code is not None else {}),
                 },
                 ensure_ascii=False,
                 allow_nan=False,
@@ -1336,7 +1390,12 @@ class DirectRuntime:
                 role="user",
                 content=(
                     "Continue the same workspace delivery. Return only the next "
-                    "workspace_batch JSON object. Progress: " + progress_payload
+                    "workspace_batch JSON object. "
+                    + ("Correct the rejected batch using WORKSPACE_PATH_POLICY; preserve already "
+                       "written files and include the corrected configuration and remaining project "
+                       "files. Do not repeat the rejected path or blank content. "
+                       if validation_code is not None else "")
+                    + "Progress: " + progress_payload
                 ),
             )
             next_messages = (*base_messages, progress_message)
@@ -1366,6 +1425,8 @@ class DirectRuntime:
                 max_output_tokens=next_output_tokens,
             )
             prompt_estimate = next_prompt_estimate
+            if self._cancel_requested:
+                raise asyncio.CancelledError
             gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
             self._active_task = gateway_task
             try:
@@ -1429,6 +1490,8 @@ class DirectRuntime:
         self._active_stream = stream
         self._active_done = done
         self._active_task = None
+        self._active_capability_task = None
+        self._cancel_requested = False
         return stream
 
     async def _run(
@@ -2027,6 +2090,7 @@ class DirectRuntime:
                 self._active_stream = None
                 self._active_done = None
                 self._active_task = None
+                self._active_capability_task = None
                 if active_stream is not None:
                     active_stream._mark_closed()
             done.set()
@@ -2132,6 +2196,7 @@ class DirectRuntime:
                         "Include a self-contained preview.html (or index.html) that demonstrates "
                         "the main user flow without external network dependencies. "
                     )
+                project_delivery_context += _WORKSPACE_PATH_POLICY
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
                 + (f"{guidance_context}\n" if guidance_context else "")
@@ -2416,6 +2481,10 @@ class DirectRuntime:
             if active_stream is not stream or done is None or token is None:
                 stream._mark_closed()
                 return
+            self._cancel_requested = True
+            capability_task = self._active_capability_task
+            if capability_task is not None and not capability_task.done():
+                capability_task.cancel()
             if active is not None and not active.done():
                 active.cancel()
             generator = stream._generator

@@ -210,6 +210,251 @@ class SequencedDirectGateway:
         )
 
 
+@pytest.mark.parametrize("scenario", ("correct", "repeated", "correct_twice"))
+async def test_direct_workspace_batches_correct_hidden_paths_without_policy_bypass(
+    tmp_path: Path, scenario: str,
+) -> None:
+    repeat_invalid = scenario == "repeated"
+    prior = {".gitignore": "dist\n", "package.json": "{}", "tsconfig.json": "{}",
+             "vitest.config.ts": "export {}"}
+    invalid = {**prior, ".prettierrc": '{"semi":true}'}
+    corrected = {"prettier.config.cjs": "module.exports = {semi: true};\n",
+                 "src/main.js": "export const ready = true;\n"}
+    batches = [(invalid, True), (invalid if repeat_invalid else {**prior, **corrected},
+                                scenario != "correct_twice")]
+    if scenario == "correct_twice":
+        batches.extend([(invalid, True), ({"src/second.js": "export const second = true;\n"}, True)])
+    gateway = SequencedDirectGateway(tuple(
+        ModelResponse(text=json.dumps({"workspace_batch": {
+            "files": files, "complete": complete,
+            "continuation": "" if complete else "continue source",
+        }}), usage=TokenUsage(100, 80, 180))
+        for files, complete in batches
+    ))
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a project with source and tests.", timeout_seconds=60,
+        token_budget=50_000,
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"},
+    )
+    write_paths: list[JsonValue] = []
+
+    class CountingCapabilities(RuntimeCapabilityGateway):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            if kwargs["name"] == "workspace.write_text":
+                write_paths.append(cast(Mapping[str, JsonValue], kwargs["arguments"])["path"])
+            return await super().execute(**kwargs)  # type: ignore[arg-type]
+
+    capabilities = CountingCapabilities(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=tmp_path / "workspaces",
+        generated_artifact_dir=tmp_path / "generated",
+        run_repository=FakeRunRepository(stored_run(
+            tenant=context.tenant_id, run=context.run_id,
+            project_id="correction-project", session="correction-session",
+        )),
+    )
+    runtime = DirectRuntime(gateway, logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=capabilities)
+    if repeat_invalid:
+        with pytest.raises(RuntimeExecutionError, match="^incremental workspace delivery failed$"):
+            _ = [event async for event in runtime.run(context)]
+    else:
+        events = [event async for event in runtime.run(context)]
+        assert any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert len(gateway.requests) == (4 if scenario == "correct_twice" else 2)
+    second = cast(ModelRequest, gateway.requests[1])
+    prompt = "\n".join(cast(str, message.content) for message in second.messages)
+    assert "hidden_path" in prompt
+    assert "WORKSPACE_PATH_POLICY" in prompt
+    assert ".gitignore" in prompt
+    assert ".prettierrc" not in prompt
+    root = (tmp_path / "workspaces" / str(context.tenant_id) / "projects"
+            / "correction-project" / "sessions" / "correction-session")
+    files = {item.relative_to(root).as_posix(): item.read_text()
+             for item in root.rglob("*") if item.is_file() and item.suffix != ".zip"}
+    assert all(files[path] == content for path, content in prior.items())
+    assert all(write_paths.count(path) == 1 for path in prior)
+    assert ".prettierrc" not in files
+    if repeat_invalid:
+        assert files == prior
+    else:
+        assert all(files[path] == content for path, content in corrected.items())
+        if scenario == "correct_twice":
+            assert files["src/second.js"] == "export const second = true;\n"
+
+
+async def test_direct_workspace_batch_does_not_retry_authorization_denial() -> None:
+    gateway = SequencedDirectGateway((ModelResponse(text=json.dumps({"workspace_batch": {
+        "files": {"src/main.js": "export {};"}, "complete": True, "continuation": "",
+    }}), usage=TokenUsage(100, 80, 180)),))
+
+    class DeniedCapabilities(RecordingCapabilityGateway):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            raise RuntimeCapabilityError("workspace write is not authorized")
+
+    runtime = DirectRuntime(gateway, logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=DeniedCapabilities())
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a project.", timeout_seconds=60, token_budget=50_000,
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"},
+    )
+    with pytest.raises(RuntimeExecutionError, match="^incremental workspace delivery failed$"):
+        _ = [event async for event in runtime.run(context)]
+    assert len(gateway.requests) == 1
+
+
+@pytest.mark.parametrize("evidence_written", (True, False))
+async def test_direct_correction_retains_only_successfully_written_evidence(
+    tmp_path: Path, evidence_written: bool,
+) -> None:
+    evidence = {
+        "IMPLEMENTATION_PLAN.md": (
+            "Read before implementation: AGENTS.md, HANDOFF, PROJECT_REQUIREMENTS.md, SKILL.md."
+        ),
+        "VERIFICATION.md": "Build and tests verified.",
+    }
+    invalid = {".prettierrc": "{}"}
+    initial_files = {**evidence, **invalid} if evidence_written else {**invalid, **evidence}
+    gateway = SequencedDirectGateway(tuple(ModelResponse(text=json.dumps({"workspace_batch": {
+        "files": files, "complete": True, "continuation": "",
+    }}), usage=TokenUsage(100, 80, 180)) for files in (
+        initial_files, {"src/main.js": "export {};"},
+    )))
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a project.", timeout_seconds=60, token_budget=50_000,
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"},
+    )
+    capabilities = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=tmp_path / "workspaces",
+        generated_artifact_dir=tmp_path / "generated",
+        run_repository=FakeRunRepository(stored_run(
+            tenant=context.tenant_id, run=context.run_id,
+            project_id="correction-project", session="correction-session",
+        )),
+    )
+    runtime = DirectRuntime(gateway, logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=capabilities)
+    events = [event async for event in runtime.run(context)]
+    completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    assert ("agent_standard_verification" in completed.payload) is evidence_written
+    root = (tmp_path / "workspaces" / str(context.tenant_id) / "projects"
+            / "correction-project" / "sessions" / "correction-session")
+    assert all((root / path).exists() is evidence_written for path in evidence)
+
+
+@pytest.mark.parametrize("boundary", ("write", "invalid_write", "ignored_cancel", "manifest", "bundle"))
+async def test_direct_cancel_interrupts_workspace_boundary_without_correction(
+    boundary: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class WaitingCapabilities(RecordingCapabilityGateway):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            name = kwargs["name"]
+            arguments = cast(Mapping[str, JsonValue], kwargs["arguments"])
+            target = (
+                name == "workspace.bundle" if boundary == "bundle" else
+                name == "workspace.write_text" and arguments["path"] == (
+                    "DELIVERY_MANIFEST.json" if boundary == "manifest" else "src/main.js"
+                )
+            )
+            if target:
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if boundary == "ignored_cancel":
+                        raise RuntimeCapabilityError(
+                            "workspace path must not contain hidden files"
+                        ) from None
+                    raise
+                if boundary == "invalid_write" and not release.is_set():
+                    raise RuntimeCapabilityError("workspace path must not contain hidden files")
+            return await super().execute(**kwargs)  # type: ignore[arg-type]
+
+    response = ModelResponse(text=json.dumps({"workspace_batch": {
+        "files": {"src/main.js": "export {};"}, "complete": True, "continuation": "",
+    }}), usage=TokenUsage(100, 80, 180))
+    gateway = SequencedDirectGateway((response, response))
+    capabilities = WaitingCapabilities()
+    runtime = DirectRuntime(gateway, logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=capabilities)
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a project.", timeout_seconds=60, token_budget=50_000,
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"},
+    )
+
+    async def consume() -> None:
+        _ = [event async for event in runtime.run(context)]
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(runtime.cancel(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        assert len(gateway.requests) == 1
+        assert not any(name == "workspace.bundle" for name, _, _ in capabilities.calls)
+        release.set()
+        events = [event async for event in runtime.run(context)]
+        assert any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+        assert len(gateway.requests) == 2
+    finally:
+        release.set()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.parametrize("token_budget", (5_000, 50_000))
+async def test_direct_workspace_correction_accounts_provider_total_tokens(token_budget: int) -> None:
+    from agent_hub.models.gateway import GatewayCompletion
+
+    class ValidatingCapabilities(RecordingCapabilityGateway):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            arguments = cast(Mapping[str, JsonValue], kwargs["arguments"])
+            if kwargs["name"] == "workspace.write_text" and arguments["path"] == ".prettierrc":
+                raise RuntimeCapabilityError("workspace path must not contain hidden files")
+            return await super().execute(**kwargs)  # type: ignore[arg-type]
+
+    responses = tuple(ModelResponse(text=json.dumps({"workspace_batch": {
+        "files": {path: "export {};"}, "complete": True, "continuation": "",
+    }}), usage=TokenUsage(100, 80, 4_500)) for path in (".prettierrc", "src/main.js"))
+    gateway = SequencedDirectGateway(responses)
+    runtime = DirectRuntime(gateway, logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=ValidatingCapabilities())
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        request="Build a project.", timeout_seconds=60, token_budget=token_budget,
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"},
+    )
+    request = runtime._build_request(context).request
+    assert request is not None
+    completion = cast(GatewayCompletion, await gateway.complete_with_context(request))
+    batch = _workspace_batch_from_model_text(responses[0].text or "")
+    assert batch is not None
+    delivery = runtime._deliver_workspace_batches(
+        context, initial_batch=batch, initial_response=responses[0],
+        initial_completion=completion, initial_request=request, prompt_estimate=100,
+        deadline=asyncio.get_running_loop().time() + 60,
+    )
+    if token_budget == 5_000:
+        with pytest.raises(RuntimeExecutionError, match="budget"):
+            await delivery
+        assert len(gateway.requests) == 1
+    else:
+        outcome = await delivery
+        assert outcome.usage == TokenUsage(200, 160, 9_000)
+        assert len(gateway.requests) == 2
+
+
 @pytest.mark.asyncio
 async def test_direct_project_preflight_terminal_checkpoint_resumes_at_sequence_three() -> None:
     run_id = uuid4()
@@ -994,7 +1239,8 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
     second_request = cast(ModelRequest, gateway.requests[1])
     rendered = "\n".join(cast(str, message.content) for message in second_request.messages)
     assert "continue with source and tests" in rendered
-    assert "package.json" not in rendered
+    assert "package.json" not in cast(str, second_request.messages[-1].content)
+    assert '{"scripts":{"test":"node --test"}}' not in rendered
     completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
     assert completed.payload["workspace_delivery"]
     agent_standard = cast(

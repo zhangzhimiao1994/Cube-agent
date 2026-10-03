@@ -18,6 +18,15 @@ from urllib.parse import quote
 from uuid import UUID
 
 WORKSPACE_ZIP_MIME_TYPE = "application/zip"
+WORKSPACE_METADATA_DOTFILES = frozenset({
+    ".dockerignore",
+    ".editorconfig",
+    ".eslintignore",
+    ".gitattributes",
+    ".gitignore",
+    ".nvmrc",
+    ".prettierignore",
+})
 _SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 WorkspacePlatform = Literal["windows", "linux", "other"]
 ExecutableFinder = Callable[[str], str | None]
@@ -552,18 +561,9 @@ def _safe_workspace_path(value: str) -> str:
     parts = posix.parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("workspace path must not escape the session")
-    allowed_metadata_dotfiles = {
-        ".dockerignore",
-        ".editorconfig",
-        ".eslintignore",
-        ".gitattributes",
-        ".gitignore",
-        ".nvmrc",
-        ".prettierignore",
-    }
     hidden_parts = tuple(part for part in parts if part.startswith("."))
     if hidden_parts and not (
-        len(parts) == 1 and parts[0] in allowed_metadata_dotfiles
+        len(parts) == 1 and parts[0] in WORKSPACE_METADATA_DOTFILES
     ):
         raise ValueError("workspace path must not contain hidden files")
     return posix.as_posix()

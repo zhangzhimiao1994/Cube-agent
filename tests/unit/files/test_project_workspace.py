@@ -7,7 +7,23 @@ from uuid import uuid4
 
 import pytest
 
+from agent_hub.files import workspace
 from agent_hub.files.workspace import ProjectWorkspaceStore
+
+
+def test_workspace_metadata_dotfiles_exports_exact_immutable_policy() -> None:
+    dotfiles = getattr(workspace, "WORKSPACE_METADATA_DOTFILES", None)
+
+    assert isinstance(dotfiles, frozenset)
+    assert dotfiles == {
+        ".dockerignore",
+        ".editorconfig",
+        ".eslintignore",
+        ".gitattributes",
+        ".gitignore",
+        ".nvmrc",
+        ".prettierignore",
+    }
 
 
 def test_project_workspace_store_writes_and_lists_session_files(tmp_path: Path) -> None:
@@ -98,6 +114,19 @@ def test_project_workspace_store_uses_run_workspace_segment_rules(tmp_path: Path
         "src/../../secret.txt",
         "src/.hidden",
         ".env",
+        ".env.example",
+        ".git",
+        ".git/config",
+        ".git/hooks/pre-commit",
+        ".github/workflows/ci.yml",
+        ".husky/pre-commit",
+        ".npmrc",
+        ".codex/config.toml",
+        ".agents/config.json",
+        ".prettierrc",
+        ".eslintrc.json",
+        "src/.gitignore",
+        ".gitignore/child.txt",
         "bad\x1fname.txt",
     ],
 )
@@ -117,8 +146,20 @@ def test_project_workspace_store_rejects_unsafe_relative_paths(
         )
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        ".dockerignore",
+        ".editorconfig",
+        ".eslintignore",
+        ".gitattributes",
+        ".gitignore",
+        ".nvmrc",
+        ".prettierignore",
+    ),
+)
 def test_project_workspace_store_allows_known_project_metadata_dotfiles(
-    tmp_path: Path,
+    tmp_path: Path, relative_path: str,
 ) -> None:
     tenant_id = uuid4()
     store = ProjectWorkspaceStore(tmp_path)
@@ -127,19 +168,22 @@ def test_project_workspace_store_allows_known_project_metadata_dotfiles(
         tenant_id=tenant_id,
         project_id="project",
         session_id="session",
-        relative_path=".gitignore",
+        relative_path=relative_path,
         data=b"node_modules/\n",
         mime_type="text/plain",
     )
 
-    assert metadata.path == ".gitignore"
+    assert metadata.path == relative_path
     assert [item.path for item in store.list_files(tenant_id, "project", "session")] == [
-        ".gitignore"
+        relative_path
     ]
+    assert store.resolve_file(tenant_id, "project", "session", relative_path).read_bytes() == (
+        b"node_modules/\n"
+    )
     bundle = store.create_session_zip(tenant_id, "project", "session")
     with zipfile.ZipFile(bundle.path) as archive:
-        assert archive.namelist() == [".gitignore"]
-        assert archive.read(".gitignore") == b"node_modules/\n"
+        assert archive.namelist() == [relative_path]
+        assert archive.read(relative_path) == b"node_modules/\n"
 
 
 def test_project_workspace_store_rejects_symlink_escape_on_download(tmp_path: Path) -> None:
