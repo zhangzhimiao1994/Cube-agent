@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -76,6 +77,50 @@ _AGENT_STANDARD_EVIDENCE_FILENAMES = frozenset(
     }
 )
 _LOGGER = logging.getLogger(__name__)
+
+
+def _workspace_capability_failure_code(error: Exception) -> str:
+    try:
+        return _classify_workspace_capability_failure(error)
+    except Exception:  # noqa: BLE001 - diagnostics must preserve the redacted boundary
+        return "capability_failed"
+
+
+def _classify_workspace_capability_failure(error: Exception) -> str:
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    io_error = error if isinstance(error, OSError) else error.__context__
+    if isinstance(io_error, TimeoutError):
+        return "timeout"
+    if isinstance(io_error, PermissionError):
+        return "storage_permission"
+    if isinstance(io_error, OSError):
+        if io_error.errno in {errno.ENOSPC, errno.EDQUOT}:
+            return "storage_full"
+        return "storage_io"
+    # Match only constant validation messages; never log arbitrary exception text.
+    messages = {
+        "content must not be empty": "empty_content",
+        "content must be a string": "invalid_content",
+        "workspace path must not contain hidden files": "hidden_path",
+        "workspace path must be unpadded and non-blank": "invalid_path",
+        "workspace path must not contain control characters": "invalid_path",
+        "workspace path must use POSIX separators": "invalid_path",
+        "workspace path must be relative": "invalid_path",
+        "workspace path must not escape the session": "invalid_path",
+        "workspace path escapes session root": "path_scope_denied",
+        "workspace path aliases another scope": "path_scope_denied",
+        "workspace path escapes authorized scope": "path_scope_denied",
+        "workspace write is not authorized": "write_denied",
+        "workspace access is not authorized": "access_denied",
+        "workspace scope is not configured": "scope_unavailable",
+        "workspace scope could not be resolved": "scope_unavailable",
+        "project workspace store is not configured": "store_unavailable",
+        "workspace file is too large": "file_too_large",
+    }
+    if len(error.args) == 1 and type(error.args[0]) is str:
+        return messages.get(error.args[0], "capability_failed")
+    return "capability_failed"
 
 
 def _model_output_has_agent_standard_evidence(value: object) -> bool:
@@ -1045,16 +1090,18 @@ class DirectRuntime:
             raise
         except Exception as error:  # noqa: BLE001 - redact capability boundary
             _LOGGER.warning(
-                "direct_workspace_capability_failed run_id=%s capability=%s error_type=%s",
+                "direct_workspace_capability_failed run_id=%s capability=%s "
+                "error_type=%s failure_code=%s",
                 context.run_id,
                 name,
                 type(error).__name__,
+                _workspace_capability_failure_code(error),
             )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
-            _raise_execution_error("incremental workspace delivery failed")
+        _raise_execution_error("incremental workspace delivery failed")
 
     async def _write_workspace_batch(
         self,

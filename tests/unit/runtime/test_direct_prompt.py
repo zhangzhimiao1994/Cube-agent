@@ -1,12 +1,16 @@
+import asyncio
+import errno
 import json
 import zipfile
 from collections.abc import Mapping
 from io import BytesIO
+from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
 import pytest
 
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.project_scale_runner import (
     _embedded_workspace_bundle_from_text,
@@ -34,6 +38,7 @@ from agent_hub.runtime.direct import (
 )
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 from tests.contracts.test_runtime_contract import FakeGateway
+from tests.unit.capabilities.test_scoped_read import FakeRunRepository, stored_run
 
 
 class UnusedGateway:
@@ -74,6 +79,108 @@ class RecordingCapabilityGateway:
 
     def is_replay_safe(self, name: str) -> bool:
         return name in {"workspace.write_text", "workspace.prune", "workspace.bundle"}
+
+
+def _wrapped_workspace_io_error(error: OSError) -> RuntimeCapabilityError:
+    try:
+        raise error
+    except OSError as cause:
+        try:
+            raise RuntimeCapabilityError(str(cause)) from None
+        except RuntimeCapabilityError as wrapped:
+            return wrapped
+
+
+class HostileWorkspaceError(RuntimeCapabilityError):
+    @property
+    def args(self) -> tuple[object, ...]:  # type: ignore[override]
+        raise ValueError("private-content confidential secret")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    (
+        (RuntimeCapabilityError("content must not be empty"), "empty_content"),
+        (RuntimeCapabilityError("workspace path must not contain hidden files"), "hidden_path"),
+        (RuntimeCapabilityError("workspace write is not authorized"), "write_denied"),
+        (RuntimeCapabilityError("workspace scope could not be resolved"), "scope_unavailable"),
+        (RuntimeCapabilityError("workspace file is too large"), "file_too_large"),
+        (RuntimeCapabilityError("private-content Bearer confidential"), "capability_failed"),
+        (RuntimeCapabilityError("workspace path must not contain hidden files", "secret"),
+         "capability_failed"),
+        (PermissionError("private-path private-content"), "storage_permission"),
+        (_wrapped_workspace_io_error(PermissionError("private-path")), "storage_permission"),
+        (_wrapped_workspace_io_error(OSError(errno.ENOSPC, "private-path")), "storage_full"),
+        (RuntimeCapabilityError("workspace path must be relative"), "invalid_path"),
+        (_wrapped_workspace_io_error(TimeoutError("private-content")), "timeout"),
+        (HostileWorkspaceError("private-content"), "capability_failed"),
+        (TimeoutError("private-content"), "timeout"),
+    ),
+)
+async def test_direct_workspace_failure_logs_only_fixed_diagnostic_code(
+    error: Exception, expected_code: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingCapabilities(RecordingCapabilityGateway):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
+            raise error
+
+    runtime = DirectRuntime(
+        UnusedGateway(),  # type: ignore[arg-type]
+        logical_model="main", capability_gateway=FailingCapabilities(),
+    )
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+                          request="Build project")
+    with pytest.raises(RuntimeExecutionError, match="^incremental workspace delivery failed$") as raised:
+        await runtime._execute_workspace_capability(
+            context, name="workspace.write_text",
+            arguments={"path": "private-path", "content": "private-content"},
+            idempotency_key="diagnostic", deadline=asyncio.get_running_loop().time() + 10,
+        )
+
+    assert f"failure_code={expected_code}" in caplog.text
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert str(context.run_id) in caplog.text
+    for private in ("private-path", "private-content", "confidential", "secret"):
+        assert private not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("path", "content", "expected_code"),
+    (("src/empty.ts", "", "empty_content"),
+     (".prettierrc", "{}", "hidden_path"),
+     (" src/main.ts", "export {}", "invalid_path")),
+)
+async def test_direct_real_workspace_boundary_preserves_partial_files_and_safe_diagnostic(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    path: str, content: str, expected_code: str,
+) -> None:
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+                          request="Build project")
+    workspace_root = tmp_path / "workspaces"
+    capabilities = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=workspace_root,
+        run_repository=FakeRunRepository(stored_run(
+            tenant=context.tenant_id, run=context.run_id,
+            project_id="diagnostic-project", session="diagnostic-session",
+        )),
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main",  # type: ignore[arg-type]
+                            capability_gateway=capabilities)
+    prior_files = {".gitignore": "dist\n", "package.json": "{}",
+                   "tsconfig.json": "{}", "vitest.config.ts": "export {}"}
+    with pytest.raises(RuntimeExecutionError, match="^incremental workspace delivery failed$") as raised:
+        await runtime._deliver_workspace_incrementally(
+            context, {"files": {**prior_files, path: content}},
+        )
+
+    session_root = (workspace_root / str(context.tenant_id) / "projects"
+                    / "diagnostic-project" / "sessions" / "diagnostic-session")
+    assert {item.relative_to(session_root).as_posix(): item.read_text()
+            for item in session_root.rglob("*") if item.is_file()} == prior_files
+    assert f"failure_code={expected_code}" in caplog.text
+    assert raised.value.__context__ is None
+    assert path not in caplog.text
 
 
 class SequencedDirectGateway:
