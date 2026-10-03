@@ -124,6 +124,8 @@ class StubRunService:
     ]
     enqueue_count: int = 0
     direct_models: list[str | None] | None = None
+    allowed_model_selections: list[tuple[str, ...]] = field(default_factory=list)
+    queued_submit_options: list[dict[str, object]] = field(default_factory=list)
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
     reference_workflow_ids: list[str | None] = field(default_factory=list)
@@ -165,6 +167,7 @@ class StubRunService:
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        allowed_models: tuple[str, ...] = (),
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
         project_id: str | None = None,
@@ -188,6 +191,7 @@ class StubRunService:
                 "task support."
             )
         self.actor_roles.append(actor_role)
+        self.allowed_model_selections.append(allowed_models)
         self.reference_workflow_ids.append(reference_workflow_id)
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
@@ -257,7 +261,10 @@ class StubRunService:
                     "budget_minutes": 120,
                     "rubric": ["实测表现", "反例覆盖", "人工验收"],
                     "summary": "主 Agent 判断这条消息适合进入进化任务。",
-                    "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
+                    "metadata": {
+                        "source": "chat_evolution_proposal",
+                        "requires_user_confirmation": "true",
+                    },
                 },
             )
         if not skip_evolution_proposal and "生成一个相关的 skill" in message:
@@ -298,7 +305,10 @@ class StubRunService:
                     "budget_minutes": 120,
                     "rubric": ["实测表现", "反例覆盖", "人工验收"],
                     "summary": "主 Agent 判断这条消息是在创建可沉淀的 Skill：先收敛目标和输入资料，再生成 SKILL.md、references/scripts/assets，并用真实任务验收。",
-                    "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
+                    "metadata": {
+                        "source": "chat_evolution_proposal",
+                        "requires_user_confirmation": "true",
+                    },
                 },
             )
         if "OpenClaw" in message and "execute date" in message:
@@ -326,7 +336,10 @@ class StubRunService:
                     "operation_text": message,
                     "source_conversation_id": conversation_id or "conv-test",
                     "summary": "User confirmation is required before creating an OpenClaw operation.",
-                    "metadata": {"source": "chat_openclaw_proposal", "requires_user_confirmation": "true"},
+                    "metadata": {
+                        "source": "chat_openclaw_proposal",
+                        "requires_user_confirmation": "true",
+                    },
                 },
             )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
@@ -582,7 +595,9 @@ class StubRunService:
         idempotency_key: str,
         **submit_options: object,
     ) -> ConversationQueueItem:
-        del actor_id, actor_role, mode, submit_options
+        self.queued_submit_options.append(
+            {"actor_id": actor_id, "actor_role": actor_role, "mode": mode, **submit_options}
+        )
         if not self.conversation_active:
             raise ConversationQueueConflict("conversation has no active run")
         now = datetime.now(UTC)
@@ -1047,6 +1062,7 @@ def test_run_submission_rejects_archived_conversation_with_conflict() -> None:
     assert response.json()["error"]["code"] == "conversation_archived"
     assert service.submitted == []
 
+
 def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
     client, service, principal = _client()
     service.direct_models = []
@@ -1074,6 +1090,94 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             False,
         )
     ]
+
+
+@pytest.mark.parametrize("mode", ["auto", "direct", "dispatch", "hybrid"])
+def test_run_submission_forwards_and_audits_allowed_models(mode: str) -> None:
+    settings = StubSettingsService()
+    client, service, principal = _client(settings_service=settings)
+    service.direct_models = []
+
+    response = client.post(
+        "/api/v1/runs",
+        headers={**bearer(), "Idempotency-Key": "allowed-model-submit"},
+        json={
+            "message": "answer directly",
+            "mode": mode,
+            "direct_model": "deepseek",
+            "allowed_models": ["deepseek", "backup_model-2"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.allowed_model_selections == [("deepseek", "backup_model-2")]
+    assert service.direct_models == ["deepseek"]
+    assert service.actor_roles == [principal.role]
+    assert service.submitted[0][3].value == mode
+    details = cast(dict[str, object], settings.audit_events[-1]["details"])
+    assert details["allowed_models"] == ["deepseek", "backup_model-2"]
+    assert details["direct_model"] == "deepseek"
+
+
+@pytest.mark.parametrize(
+    "allowed_models",
+    [
+        ["DeepSeek"],
+        [""],
+        ["deepseek/chat"],
+        [" deepseek"],
+        ["deepseek\n"],
+        ["a" * 129],
+        ["deepseek", "deepseek"],
+        [f"model-{i}" for i in range(65)],
+        [1],
+        None,
+    ],
+)
+def test_run_submission_rejects_invalid_allowed_models(allowed_models: object) -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "answer directly", "allowed_models": allowed_models},
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
+def test_conversation_queue_forwards_allowed_models_and_actor() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/admin/conversations/conv-models/queue",
+        headers={**bearer(), "Idempotency-Key": "allowed-model-queue"},
+        json={
+            "message": "continue",
+            "mode": "hybrid",
+            "direct_model": "deepseek",
+            "allowed_models": ["deepseek"],
+        },
+    )
+
+    assert response.status_code == 202
+    options = service.queued_submit_options[-1]
+    assert options["allowed_models"] == ("deepseek",)
+    assert options["direct_model"] == "deepseek"
+    assert options["actor_id"] == principal.user_id
+    assert options["actor_role"] == principal.role
+    assert options["mode"] is TaskMode.HYBRID
+    assert service.queued_items[-1].idempotency_key == "allowed-model-queue"
+    item = response.json()
+    redirected = client.post(
+        f"/api/v1/admin/conversation-queue/{item['id']}/redirect",
+        headers=bearer(),
+        json={"version": item["version"]},
+    )
+    assert redirected.status_code == 200
+    assert redirected.json()["successor_run_id"] == item["successor_run_id"]
+    assert len(service.queued_submit_options) == 1
 
 
 def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
@@ -1533,6 +1637,7 @@ def test_attachment_upload_stores_image_without_exposing_server_path(tmp_path: P
     assert body["sha256"]
     assert "path" not in body
     assert list(tmp_path.rglob("*.bin"))
+
 
 def test_attachment_upload_decodes_percent_encoded_filename_header(tmp_path: Path) -> None:
     client, _, _ = _client(attachment_store_dir=tmp_path)

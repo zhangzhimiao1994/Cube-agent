@@ -124,7 +124,13 @@ from agent_hub.runs.service import (
     TaskQueue,
 )
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
-from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
+from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.defaults import (
+    TenantSecretResolver,
+    _gateway_for_config,
+    _scope_runtime_model_config,
+    configured_runtime_registry,
+)
 from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.invalidation import (
     RuntimeConfigInvalidationBus,
@@ -196,6 +202,7 @@ class _MainAgentModeRouter:
         self,
         *,
         get_config: MainAgentConfigGetter,
+        get_current_config: Callable[[UUID], Awaitable[object | None]] | None = None,
         list_models: RegisteredModelListGetter | None = None,
         secret_service: SecretService,
         tenant_id: UUID,
@@ -204,6 +211,7 @@ class _MainAgentModeRouter:
         capacity_factory: RouterCapacityFactory | None = None,
     ) -> None:
         self._get_config = get_config
+        self._get_current_config = get_current_config
         self._list_models = list_models
         self._secret_service = secret_service
         self._tenant_id = tenant_id
@@ -254,6 +262,70 @@ class _MainAgentModeRouter:
             _LOGGER.warning("main_agent_router_unavailable error_type=%s", type(error).__name__)
             return _waiting_route_decision("main_agent_router_unavailable")
 
+    async def route_scoped(
+        self,
+        task_text: object,
+        *,
+        tenant_id: UUID,
+        allowed_models: tuple[str, ...],
+        logical_model: str | None,
+    ) -> RouteDecision:
+        try:
+            if not allowed_models or self._get_current_config is None:
+                return _waiting_route_decision("main_agent_router_unavailable")
+            current = await self._get_current_config(tenant_id)
+            selection: dict[str, JsonValue] = {
+                "allowed_models": allowed_models,
+                "direct_model": logical_model,
+            }
+            config = _scope_runtime_model_config(
+                PlatformConfig.model_validate(getattr(current, "document", None)),
+                selection,
+            )
+
+            async def capacity_factory(
+                _tenant_id: UUID,
+                deployments: tuple[Deployment, ...],
+            ) -> CapacityController | CapacityPool:
+                return (
+                    await self._capacity_factory(deployments)
+                    if self._capacity_factory is not None
+                    else await self._default_capacity(deployments, tenant_id=tenant_id)
+                )
+
+            gateway, selected_model, _ = await _gateway_for_config(
+                config,
+                tenant_id=tenant_id,
+                secret_service=self._secret_service,
+                capacity_factory=capacity_factory,
+                transport=self._transport,
+                routing_decision=selection,
+            )
+            router = ModeRouter(
+                GatewayRouteClassifier(
+                    gateway,
+                    logical_model=selected_model,
+                    source=RouteSource.CLASSIFIER,
+                    prefer_plain_json=True,
+                ),
+                GatewayRouteClassifier(
+                    gateway,
+                    logical_model=selected_model,
+                    source=RouteSource.VERIFIER,
+                    prefer_plain_json=True,
+                ),
+                token_store=InMemoryDecisionTokenStore(),
+                policy=RoutingPolicy(
+                    confidence_threshold=0.65,
+                    parallel_classifiers=False,
+                    allow_single_classifier_decision=True,
+                ),
+            )
+            return await router.route(task_text)
+        except Exception as error:  # noqa: BLE001 - scoped routing must degrade safely.
+            _LOGGER.warning("scoped_router_unavailable error_type=%s", type(error).__name__)
+            return _waiting_route_decision("main_agent_router_unavailable")
+
     async def _deployment_from_config(self, model: admin.MainAgentModelConfig) -> Deployment:
         if self._list_models is None:
             return admin._main_agent_model_deployment(model)
@@ -300,12 +372,17 @@ class _MainAgentModeRouter:
     async def _default_capacity(
         self,
         deployments: tuple[Deployment, ...],
+        *,
+        tenant_id: UUID | None = None,
     ) -> CapacityPool:
         credentials = CredentialRegistry(
             [
                 CredentialDescriptor(
                     deployment.secret_ref,
-                    await self._secret_service.fingerprint(self._tenant_id, deployment.secret_ref),
+                    await self._secret_service.fingerprint(
+                        self._tenant_id if tenant_id is None else tenant_id,
+                        deployment.secret_ref,
+                    ),
                 )
                 for deployment in deployments
             ]
@@ -1219,12 +1296,8 @@ def create_app(
                         )
                     plugin_package_subprocess_registration_status = (
                         _plugin_package_subprocess_registration_status(
-                            enabled=(
-                                configured.plugin_package_subprocess_runner_enabled
-                            ),
-                            adapter_ids=tuple(
-                                configured.plugin_package_subprocess_adapter_ids
-                            ),
+                            enabled=(configured.plugin_package_subprocess_runner_enabled),
+                            adapter_ids=tuple(configured.plugin_package_subprocess_adapter_ids),
                             isolation_backend=(
                                 configured.plugin_package_subprocess_isolation_backend
                             ),
@@ -1236,8 +1309,8 @@ def create_app(
                     application.state.plugin_package_subprocess_registration_status = (
                         plugin_package_subprocess_registration_status
                     )
-                    plugin_dependency_policy = (
-                        plugin_package_dependency_policy_from_settings(configured)
+                    plugin_dependency_policy = plugin_package_dependency_policy_from_settings(
+                        configured
                     )
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
@@ -1245,9 +1318,7 @@ def create_app(
                         dependency_policy=plugin_dependency_policy,
                         adapters=build_plugin_package_subprocess_adapters(
                             enabled=configured.plugin_package_subprocess_runner_enabled,
-                            adapter_ids=tuple(
-                                configured.plugin_package_subprocess_adapter_ids
-                            ),
+                            adapter_ids=tuple(configured.plugin_package_subprocess_adapter_ids),
                             package_store_dir=configured.plugin_package_store_dir,
                             isolation_backend=(
                                 configured.plugin_package_subprocess_isolation_backend
@@ -1255,12 +1326,8 @@ def create_app(
                             bubblewrap_executable=(
                                 configured.plugin_package_subprocess_bubblewrap_executable
                             ),
-                            timeout_seconds=(
-                                configured.plugin_package_subprocess_timeout_seconds
-                            ),
-                            max_stdin_bytes=(
-                                configured.plugin_package_subprocess_max_stdin_bytes
-                            ),
+                            timeout_seconds=(configured.plugin_package_subprocess_timeout_seconds),
+                            max_stdin_bytes=(configured.plugin_package_subprocess_max_stdin_bytes),
                             max_stdout_bytes=(
                                 configured.plugin_package_subprocess_max_stdout_bytes
                             ),
@@ -1334,10 +1401,12 @@ def create_app(
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
                         project_workspace_dir=configured.project_workspace_dir,
-                        require_approval_for_tools=lambda tenant_id: _require_tool_approval_from_settings(
-                            _admin_settings_getter_for_tenant(
-                                admin_service_for_capabilities,
-                                tenant_id,
+                        require_approval_for_tools=lambda tenant_id: (
+                            _require_tool_approval_from_settings(
+                                _admin_settings_getter_for_tenant(
+                                    admin_service_for_capabilities,
+                                    tenant_id,
+                                )
                             )
                         ),
                         tool_approval_mode=lambda tenant_id: _tool_approval_mode_from_settings(
@@ -1376,6 +1445,12 @@ def create_app(
                     )
                     active_mode_router = _MainAgentModeRouter(
                         get_config=admin_service_for_router.get_main_agent_config,
+                        get_current_config=cast(
+                            CurrentConfigService,
+                            config_service
+                            if config_service is not None
+                            else application.state.config_service,
+                        ).get_current,
                         list_models=admin_service_for_router.list_models,
                         secret_service=active_secret_service,
                         tenant_id=configured.bootstrap_tenant_id,
@@ -1442,9 +1517,8 @@ def create_app(
                 application.state.schedule_service = SchedulerService(
                     lambda task: _submit_scheduled_task(application, task)
                 )
-            if (
-                active_sessions is not None
-                and isinstance(application.state.schedule_service, SchedulerService)
+            if active_sessions is not None and isinstance(
+                application.state.schedule_service, SchedulerService
             ):
                 schedule_service = application.state.schedule_service
 

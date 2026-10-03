@@ -236,11 +236,27 @@ class HarnessTaskRequirements:
     privacy_sensitive: bool = False
     estimated_input_tokens: int = 0
     prefers_prefix_cache: bool = False
+    allowed_logical_models: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "required_capabilities", _capability_set(self.required_capabilities))
+        object.__setattr__(
+            self, "required_capabilities", _capability_set(self.required_capabilities)
+        )
         if self.required_logical_model is not None:
             _require_safe_id("required_logical_model", self.required_logical_model)
+        if (
+            not isinstance(self.allowed_logical_models, frozenset)
+            or len(self.allowed_logical_models) > 64
+        ):
+            raise ValueError("allowed_logical_models must be a bounded frozenset")
+        for model in self.allowed_logical_models:
+            _require_safe_id("allowed_logical_model", model)
+        if (
+            self.allowed_logical_models
+            and self.required_logical_model is not None
+            and self.required_logical_model not in self.allowed_logical_models
+        ):
+            raise ValueError("required_logical_model must be allowed")
         if self.required_sandbox_mode is not None:
             _require_safe_id("required_sandbox_mode", self.required_sandbox_mode)
             if self.required_sandbox_mode != "none":
@@ -256,7 +272,10 @@ class HarnessTaskRequirements:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
-        if type(self.estimated_input_tokens) is not int or not 0 <= self.estimated_input_tokens <= 10_000_000:
+        if (
+            type(self.estimated_input_tokens) is not int
+            or not 0 <= self.estimated_input_tokens <= 10_000_000
+        ):
             raise ValueError("estimated_input_tokens must be a bounded integer")
 
 

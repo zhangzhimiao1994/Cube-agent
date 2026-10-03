@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 import pytest
 
@@ -646,7 +647,42 @@ _FINALIZER_CASE_IDS = tuple(
 )
 
 
-def _pending_automated_report() -> dict[str, Any]:
+def _model_event(run_id: str, logical_model: str = "deepseek-backup") -> dict[str, Any]:
+    from agent_hub.runs.repository import _public_event_payload
+
+    return _public_event_payload(
+        {
+            "kind": "model.completed",
+            "run_id": run_id,
+            "sequence": 1,
+            "payload": {
+                "logical_model": logical_model,
+                "attempted_logical_models": [logical_model],
+            },
+        }
+    )
+
+
+def _scope_evidence(run_id: str, logical_model: str) -> dict[str, Any]:
+    return {
+        "source": "public_run_events",
+        "original_run_id": run_id,
+        "result_run_id": run_id,
+        "accepted_repair_run_ids": [],
+        "ok": True,
+        "errors": [],
+        "runs": [
+            {
+                "run_id": run_id,
+                "status": "completed",
+                "events_endpoint": f"/api/v1/runs/{quote(run_id, safe='')}/events",
+                "model_events": [_model_event(run_id, logical_model)],
+            }
+        ],
+    }
+
+
+def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any]:
     module = load_script()
     cases = []
     for case_id in _FINALIZER_CASE_IDS:
@@ -727,7 +763,7 @@ def _pending_automated_report() -> dict[str, Any]:
                 },
             )
         )
-    return {
+    report: dict[str, Any] = {
         "schema_version": 1,
         "kind": "real_user_four_scale_acceptance",
         "execution_id": "matrix-123",
@@ -751,9 +787,18 @@ def _pending_automated_report() -> dict[str, Any]:
         "dynamic_web_preview": {"status": "pending_real_device"},
         "cases": cases,
     }
+    if logical_model is not None:
+        profile = {"direct_model": logical_model, "allowed_models": [logical_model]}
+        report["model_profile"] = copy.deepcopy(profile)
+        report["execution_identity"]["model_profile"] = copy.deepcopy(profile)
+        for case in cases:
+            case["model_profile"] = copy.deepcopy(profile)
+            case["model_scope_evidence"] = _scope_evidence(case["run"]["run_id"], logical_model)
+            case["success_basis"]["model_scope"] = True
+    return report
 
 
-def _real_device_evidence(execution_id: str) -> dict[str, Any]:
+def _real_device_evidence(execution_id: str, logical_model: str | None = None) -> dict[str, Any]:
     scopes = {case["case_id"]: case for case in _pending_automated_report()["cases"]}
     checks = {
         "login": True,
@@ -762,7 +807,7 @@ def _real_device_evidence(execution_id: str) -> dict[str, Any]:
         "preview_interaction": True,
         "preview_revoked": True,
     }
-    return {
+    evidence = {
         "schema_version": 1,
         "execution_id": execution_id,
         "desktop_browser_interaction": {
@@ -806,6 +851,12 @@ def _real_device_evidence(execution_id: str) -> dict[str, Any]:
             for case_id in _FINALIZER_CASE_IDS
         },
     }
+    if logical_model is not None:
+        evidence["model_profile"] = {
+            "direct_model": logical_model,
+            "allowed_models": [logical_model],
+        }
+    return evidence
 
 
 def test_finalize_real_device_acceptance_requires_and_merges_both_viewports() -> None:
@@ -1232,6 +1283,7 @@ def matrix_harness(
             self.observed_runs: list[str] = []
             self.requests: list[tuple[str, str]] = []
             self.interrupt_after_commit: str | None = None
+            self.model_events: dict[str, object] = {}
 
         def _interrupt(self, path: str) -> None:
             if self.interrupt_after_commit == path:
@@ -1308,7 +1360,10 @@ def matrix_harness(
                 self._interrupt(path)
                 return copy.deepcopy(run)
             if method == "GET" and path.startswith("/api/v1/runs/"):
-                if path.endswith(("/events", "/artifacts")):
+                if path.endswith("/events"):
+                    run_id = path.split("/")[4]
+                    return {"items": self.model_events.get(run_id, [_model_event(run_id)])}
+                if path.endswith("/artifacts"):
                     return []
                 run_id = path.split("/")[4]
                 self.observed_runs.append(run_id)
@@ -1578,6 +1633,439 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
     )
 
 
+def test_logical_model_scopes_all_twenty_public_requests_without_changing_modes_or_scales(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    from agent_hub.api.routers.runs import CreateRunRequest
+
+    module, delegate, plans, _ = matrix_harness
+    payload = run_matrix(module, delegate, logical_model="deepseek-backup")
+    profile = {"direct_model": "deepseek-backup", "allowed_models": ["deepseek-backup"]}
+    assert len(delegate.run_bodies) == len(plans) == 20
+    assert payload["model_profile"] == profile
+    assert payload["execution_identity"]["model_profile"] == profile
+    assert payload["core_acceptance_ok"] is True
+    for plan, case, body in zip(plans, payload["cases"], delegate.run_bodies.values(), strict=True):
+        assert body["direct_model"] == "deepseek-backup"
+        assert body["allowed_models"] == ("deepseek-backup",)
+        public_request = CreateRunRequest.model_validate(body)
+        assert public_request.allowed_models == ("deepseek-backup",)
+        baseline = module.build_real_user_scale_plan(
+            scale=case["scale"],
+            route_intent=case["route_intent"],
+            project_id=body["project_id"],
+            project_label=body["project_label"],
+            conversation_id=body["conversation_id"],
+            workspace_session_id=body["workspace_session_id"],
+        )
+        assert {k: v for k, v in body.items() if k not in profile} == baseline.requests[0].body
+        assert plan.requests[0].validation_focus == baseline.requests[0].validation_focus
+        assert case["model_profile"] == profile
+        assert case["model_scope_evidence"]["ok"] is True
+        assert case["success_basis"]["model_scope"] is True
+        assert ("GET", f"/api/v1/runs/{case['run']['run_id']}/events") in delegate.requests
+        assert "participant_models" not in case["run"]
+
+
+@pytest.mark.parametrize(
+    "logical_model",
+    ["", " backup", "backup ", "Backup", "a/b", "a.b", "a:b", "-a", "a\n", "a" * 129, 123],
+)
+def test_logical_model_rejects_unsafe_ids_before_http_or_writes(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    logical_model: object,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    output = tmp_path / "report.json"
+    with pytest.raises(ValueError, match="safe logical model"):
+        run_matrix(module, delegate, logical_model=logical_model, output_path=str(output))
+    assert delegate.requests == []
+    assert plans == []
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("saved_model", "requested_model"),
+    [(None, "deepseek-backup"), ("deepseek-backup", None), ("deepseek-backup", "other-model")],
+)
+@pytest.mark.parametrize("finalized", [False, True])
+def test_model_profile_resume_mismatch_rejects_before_side_effects(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    saved_model: str | None,
+    requested_model: str | None,
+    finalized: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report(saved_model)
+    if finalized:
+        saved = module.finalize_real_device_acceptance(
+            saved, _real_device_evidence("matrix-123", saved_model)
+        )
+    before = copy.deepcopy(saved)
+    output = tmp_path / "report.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original_bytes = output.read_bytes()
+    with pytest.raises(ValueError, match="model profile"):
+        run_matrix(
+            module,
+            delegate,
+            logical_model=requested_model,
+            resume_report=saved,
+            output_path=str(output),
+        )
+    assert saved == before
+    assert output.read_bytes() == original_bytes
+    assert delegate.requests == []
+    assert plans == []
+
+
+@pytest.mark.parametrize("section", ["execution_identity", "cases", "attempt_history"])
+def test_model_profile_cannot_relabel_existing_run_or_attempt_evidence(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    section: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report("deepseek-backup")
+    saved["attempt_history"] = [copy.deepcopy(saved["cases"][0])]
+    target = saved[section] if section == "execution_identity" else saved[section][0]
+    target.pop("model_profile")
+    before = copy.deepcopy(saved)
+    with pytest.raises(ValueError, match="model profile"):
+        run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
+    with pytest.raises(ValueError, match="model profile"):
+        module.finalize_real_device_acceptance(
+            saved, _real_device_evidence("matrix-123", "deepseek-backup")
+        )
+    assert saved == before
+    assert delegate.requests == []
+    assert plans == []
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        None,
+        {},
+        {"direct_model": "deepseek-backup", "allowed_models": []},
+        {"direct_model": "deepseek-backup", "allowed_models": ["other-model"]},
+        {"direct_model": "a/b", "allowed_models": ["a/b"]},
+    ],
+)
+def test_finalizer_requires_exact_model_profile_in_device_evidence(profile: object) -> None:
+    module = load_script()
+    saved = _pending_automated_report("deepseek-backup")
+    evidence = _real_device_evidence("matrix-123")
+    if profile is not None:
+        evidence["model_profile"] = profile
+    with pytest.raises((TypeError, ValueError), match="model profile"):
+        module.finalize_real_device_acceptance(saved, evidence)
+
+
+def test_scoped_finalizer_preserves_profile_and_does_not_invent_model_evidence() -> None:
+    module = load_script()
+    saved = _pending_automated_report("deepseek-backup")
+    evidence = _real_device_evidence("matrix-123", "deepseek-backup")
+    before = copy.deepcopy(saved)
+    completed = module.finalize_real_device_acceptance(saved, evidence)
+    assert completed["model_profile"] == saved["model_profile"]
+    assert completed["real_device_acceptance"]["model_profile"] == saved["model_profile"]
+    assert saved == before
+    assert [case["run"] for case in completed["cases"]] == [case["run"] for case in saved["cases"]]
+
+
+def test_legacy_unscoped_resume_keeps_default_requests_and_report_identity(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved["cases"] = []
+    resumed = run_matrix(module, delegate, resume_report=saved)
+    assert resumed["core_acceptance_ok"] is True
+    assert resumed["execution_identity"] == saved["execution_identity"]
+    assert "model_profile" not in resumed
+    for plan, case in zip(plans, resumed["cases"], strict=True):
+        assert "direct_model" not in plan.requests[0].body
+        assert "allowed_models" not in plan.requests[0].body
+        assert "model_profile" not in case
+
+
+def test_failed_case_retry_and_existing_runner_repairs_keep_request_model_scope(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+) -> None:
+    from agent_hub.harness.project_scale_runner import _deliverable_repair_body
+
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    execute = module.execute_project_scale_plan
+
+    def failed(plan: Any, client: Any, **kwargs: Any) -> Any:
+        report = execute(plan, client, **kwargs)
+        return replace(report, results=(replace(report.results[0], errors=("failed repair",)),))
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", failed)
+    saved = run_matrix(module, delegate, logical_model="deepseek-backup")
+    assert saved["failed_case_count"] == 1
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    resumed = run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
+    assert resumed["core_acceptance_ok"] is True
+    assert resumed["cases"][0]["attempt"] == 2
+    assert resumed["attempt_history"] == saved["cases"]
+    for plan in plans:
+        body = dict(plan.requests[0].body)
+        original = copy.deepcopy(body)
+        for mode in ("direct", "dispatch", "hybrid"):
+            body = _deliverable_repair_body(
+                body,
+                plan.requests[0].case_id,
+                benchmark_kind="capability",
+                effective_mode=mode,
+                failed_reasons=("generated_project_validation: failed",),
+            )
+            assert body["direct_model"] == "deepseek-backup"
+            assert body["allowed_models"] == ("deepseek-backup",)
+        assert plan.requests[0].body == original
+
+
+def test_logical_model_cli_scopes_requests(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    output = tmp_path / "report.json"
+    assert (
+        module.main(
+            [
+                "--base-url",
+                "http://example.test",
+                "--execution-id",
+                "matrix-123",
+                "--output",
+                str(output),
+                "--logical-model",
+                "deepseek-backup",
+            ]
+        )
+        == 2
+    )
+    assert len(delegate.run_bodies) == 20
+    assert json.loads(output.read_text(encoding="utf-8"))["model_profile"] == {
+        "direct_model": "deepseek-backup",
+        "allowed_models": ["deepseek-backup"],
+    }
+
+
+@pytest.mark.parametrize("action", ["resume", "finalize"])
+def test_model_profile_cli_mismatch_preserves_existing_report_before_client_creation(
+    tmp_path: Path,
+    monkeypatch: Any,
+    action: str,
+) -> None:
+    module = load_script()
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(_pending_automated_report()), encoding="utf-8")
+    before = report.read_bytes()
+    args = ["--logical-model", "deepseek-backup", "--output", str(report)]
+    if action == "resume":
+        args += ["--resume-report", str(report)]
+    else:
+        evidence = tmp_path / "evidence.json"
+        evidence.write_text(json.dumps(_real_device_evidence("matrix-123")), encoding="utf-8")
+        args += ["--finalize-report", str(report), "--real-device-evidence", str(evidence)]
+
+    def forbidden_client(**kwargs: Any) -> Any:
+        pytest.fail("profile mismatch must stop before client creation")
+
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", forbidden_client)
+    with pytest.raises(SystemExit) as error:
+        module.main(args)
+    assert error.value.code == 2
+    assert report.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "foreign",
+        "attempted",
+        "null_attempts",
+        "bad_attempts",
+        "wrong_run",
+        "flat_payload",
+        "noncompletion",
+        "other_event_foreign",
+        "malformed_event",
+    ],
+)
+def test_scoped_core_requires_actual_public_completions_and_no_foreign_attempts(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    invalid: str,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    event = _model_event("run-1")
+    events: list[Any] = [event]
+    if invalid == "missing":
+        events = []
+    elif invalid == "foreign":
+        event["payload"]["logical_model"] = "other-model"
+    elif invalid == "attempted":
+        event["payload"]["attempted_logical_models"] = ["other-model", "deepseek-backup"]
+    elif invalid == "null_attempts":
+        event["payload"]["attempted_logical_models"] = None
+    elif invalid == "bad_attempts":
+        event["payload"]["attempted_logical_models"] = "deepseek-backup"
+    elif invalid == "wrong_run":
+        event["run_id"] = "another-run"
+    elif invalid == "flat_payload":
+        event.update(event.pop("payload"))
+    elif invalid == "noncompletion":
+        event["kind"] = "model.started"
+    elif invalid == "other_event_foreign":
+        events.append(
+            {
+                "kind": "model.failed",
+                "run_id": "run-1",
+                "payload": {"attempted_logical_models": ["other-model"]},
+            }
+        )
+    elif invalid == "malformed_event":
+        events.append("malformed")
+    delegate.model_events["run-1"] = events
+    payload = run_matrix(module, delegate, logical_model="deepseek-backup")
+    case = payload["cases"][0]
+    assert payload["core_acceptance_ok"] is False
+    assert case["core_acceptance_ok"] is False
+    assert case["model_scope_evidence"]["ok"] is False
+    assert case["model_scope_evidence"]["errors"]
+
+
+@pytest.mark.parametrize("attempts", ["absent", "empty"])
+def test_scoped_completion_allows_old_adapters_without_attempt_history(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    attempts: str,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    event = _model_event("run-1")
+    if attempts == "absent":
+        event["payload"].pop("attempted_logical_models")
+    else:
+        event["payload"]["attempted_logical_models"] = []
+    delegate.model_events["run-1"] = [event]
+    payload = run_matrix(module, delegate, logical_model="deepseek-backup")
+    assert payload["core_acceptance_ok"] is True
+    assert payload["cases"][0]["model_scope_evidence"]["runs"][0]["model_events"] == [event]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing",
+        "foreign",
+        "attempted",
+        "missing_original",
+        "missing_repair",
+        "nonterminal",
+        "flag",
+    ],
+)
+def test_scope_evidence_revalidated_on_resume_and_finalization(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    tamper: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report("deepseek-backup")
+    case = saved["cases"][0]
+    scope = case["model_scope_evidence"]
+    if tamper == "missing":
+        case.pop("model_scope_evidence")
+    elif tamper == "foreign":
+        scope["runs"][0]["model_events"][0]["payload"]["logical_model"] = "other-model"
+    elif tamper == "attempted":
+        scope["runs"][0]["model_events"][0]["payload"]["attempted_logical_models"] = ["other-model"]
+    elif tamper == "missing_original":
+        scope["original_run_id"] = "missing-original"
+    elif tamper == "missing_repair":
+        scope["accepted_repair_run_ids"] = ["missing-repair"]
+    elif tamper == "nonterminal":
+        scope["runs"][0]["status"] = "running"
+    elif tamper == "flag":
+        scope["ok"] = 1
+    with pytest.raises(ValueError):
+        module.finalize_real_device_acceptance(
+            saved, _real_device_evidence("matrix-123", "deepseek-backup")
+        )
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    saved["cases"] = [case]
+    resumed = run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
+    assert len(plans) == 1
+    assert resumed["cases"][0]["attempt"] == 2
+    assert resumed["attempt_history"] == [case]
+
+
+@pytest.mark.parametrize("repair_path", ["deliverable", "accepted"])
+@pytest.mark.parametrize("bad_run", [None, "run-1", "repair-1", "run-2"])
+def test_scoped_core_checks_original_result_and_every_accepted_repair_run(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any,
+    repair_path: str,
+    bad_run: str | None,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    execute = module.execute_project_scale_plan
+    request = delegate.request_json
+
+    def accepted(method: str, path: str, **kwargs: Any) -> Any:
+        if method == "POST" and path == "/api/v1/runs/run-1/accept-repair":
+            delegate.runs["accepted"] = {
+                **delegate.runs[next(iter(delegate.runs))],
+                "id": "repair-1",
+            }
+            return copy.deepcopy(delegate.runs["accepted"])
+        return request(method, path, **kwargs)
+
+    monkeypatch.setattr(delegate, "request_json", accepted)
+
+    def repaired(plan: Any, client: Any, **kwargs: Any) -> Any:
+        report = execute(plan, client, **kwargs)
+        if repair_path == "accepted":
+            client.request_json(
+                "POST",
+                "/api/v1/runs/run-1/accept-repair",
+                body={"decision_token": "token", "version": 1},
+            )
+        else:
+            client.request_json(
+                "POST", "/api/v1/runs", body=dict(plan.requests[0].body), idempotency_key="repair-1"
+            )
+        # A distinct final run also needs proof, even if it was not returned by submission.
+        delegate.runs["result"] = {**next(iter(delegate.runs.values())), "id": "result-run"}
+        return replace(report, results=(replace(report.results[0], run_id="result-run"),))
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", repaired)
+    repair_id = "repair-1" if repair_path == "accepted" else "run-2"
+    if bad_run is not None:
+        invalid_id = "result-run" if bad_run not in {"run-1", repair_id} else bad_run
+        delegate.model_events[invalid_id] = []
+    payload = run_matrix(module, delegate, logical_model="deepseek-backup")
+    scope = payload["cases"][0]["model_scope_evidence"]
+    assert scope["original_run_id"] == "run-1"
+    assert scope["accepted_repair_run_ids"] == [repair_id]
+    assert {item["run_id"] for item in scope["runs"]} == {"run-1", repair_id, "result-run"}
+    assert payload["core_acceptance_ok"] is (bad_run is None)
+
+
 def test_retry_preserves_flat_attempt_history_and_does_not_mutate_saved_evidence(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     tmp_path: Path,
@@ -1666,18 +2154,23 @@ def test_failed_retry_checkpoint_stops_before_next_case_and_preserves_disk_histo
     assert list(tmp_path.iterdir()) == [output]
 
 
+@pytest.mark.parametrize("logical_model", [None, "deepseek-backup"])
 def test_resume_finalized_report_returns_exact_evidence_without_tasks_or_writes(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     tmp_path: Path,
     monkeypatch: Any,
+    logical_model: str | None,
 ) -> None:
     module, delegate, plans, _ = matrix_harness
     saved = module.finalize_real_device_acceptance(
-        _pending_automated_report(), _real_device_evidence("matrix-123")
+        _pending_automated_report(logical_model),
+        _real_device_evidence("matrix-123", logical_model),
     )
     saved["cases"].reverse()
     saved["finished_at"] = "2026-10-02T13:00:00Z"
     saved["attempt_history"] = [{"case_id": "small:auto", "attempt": 1, "status": "failed"}]
+    if logical_model is not None:
+        saved["attempt_history"][0]["model_profile"] = copy.deepcopy(saved["model_profile"])
     before = copy.deepcopy(saved)
     output = tmp_path / "finalized.json"
     module._write_report(str(output), saved)
@@ -1687,7 +2180,9 @@ def test_resume_finalized_report_returns_exact_evidence_without_tasks_or_writes(
         pytest.fail("finalized resume must not save a snapshot")
 
     monkeypatch.setattr(module, "_save_report", forbidden_write)
-    resumed = run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    resumed = run_matrix(
+        module, delegate, output_path=str(output), resume_report=saved, logical_model=logical_model
+    )
     assert resumed == before
     assert saved == before
     assert output.read_bytes() == original_bytes
@@ -1775,15 +2270,18 @@ def test_resume_rejects_invalid_finalized_report_before_tasks_or_writes(
 
 
 @pytest.mark.parametrize("invalid", [False, True])
+@pytest.mark.parametrize("logical_model", [None, "deepseek-backup"])
 def test_resume_finalized_cli_preserves_file_and_uses_only_authenticated_identity(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     tmp_path: Path,
     monkeypatch: Any,
     invalid: bool,
+    logical_model: str | None,
 ) -> None:
     module, delegate, plans, _ = matrix_harness
     saved = module.finalize_real_device_acceptance(
-        _pending_automated_report(), _real_device_evidence("matrix-123")
+        _pending_automated_report(logical_model),
+        _real_device_evidence("matrix-123", logical_model),
     )
     if invalid:
         saved["real_device_acceptance"]["mobile_browser_interaction"]["passed"] = False
@@ -1808,6 +2306,7 @@ def test_resume_finalized_cli_preserves_file_and_uses_only_authenticated_identit
             "--resume-report",
             str(output),
         ]
+        + (["--logical-model", logical_model] if logical_model is not None else [])
     )
     assert exit_code == (1 if invalid else 0)
     assert output.read_bytes() == before

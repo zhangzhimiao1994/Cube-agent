@@ -17,6 +17,51 @@ from agent_hub.harness.types import (
 TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
+def test_scheduler_filters_request_model_scope_before_provider_preference() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="backup"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="excluded"),
+        )
+    )
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"}),
+            allowed_logical_models=frozenset({"backup"}),
+        ),
+        policy=HarnessPolicy(preferred_providers=("openai",)),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_logical_model == "backup"
+    assert any(
+        item.logical_model == "excluded" and item.reason == "logical_model_blocked"
+        for item in decision.fallback_candidates
+    )
+
+
+def test_scheduler_model_scope_cannot_bypass_capability_requirements() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="backup"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="excluded"),
+        )
+    )
+    with pytest.raises(HarnessSchedulingError):
+        scheduler.select(
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DIRECT,
+            requirements=HarnessTaskRequirements(
+                required_capabilities=frozenset({"image_generation"}),
+                allowed_logical_models=frozenset({"backup"}),
+            ),
+            policy=HarnessPolicy(),
+            hermes_hint=None,
+        )
+
+
 def test_scheduler_prefers_deepseek_for_reasoning_tool_tasks_with_prefix_cache() -> None:
     scheduler = CapabilityAwareHarnessScheduler(
         profiles=(

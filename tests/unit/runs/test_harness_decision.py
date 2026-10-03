@@ -56,9 +56,12 @@ class RecordingRepository:
         routing_decision: dict[str, object] | None = None,
         enqueue: bool,
     ) -> RunRecord:
-        del idempotency_key, actor_role, enqueue
         self.created.append(
             {
+                "actor_id": actor_id,
+                "actor_role": actor_role,
+                "idempotency_key": idempotency_key,
+                "enqueue": enqueue,
                 "request": request,
                 "mode": mode,
                 "status": status,
@@ -255,6 +258,165 @@ async def test_direct_submit_constrains_harness_decision_to_direct_model() -> No
     harness = routing["harness_decision"]
     assert isinstance(harness, dict)
     assert harness["selected_logical_model"] == "main"
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.HYBRID])
+@pytest.mark.parametrize("allowed_models", [(), ("deepseek",), ("deepseek", "backup_model-2")])
+async def test_submit_records_only_nonempty_allowed_models(
+    mode: TaskMode, allowed_models: tuple[str, ...]
+) -> None:
+    repository = RecordingRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(mode),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        actor_role=Role.ADMIN,
+        message="ordinary question",
+        mode=mode,
+        direct_model="deepseek",
+        allowed_models=allowed_models,
+        idempotency_key="allowed-model-scope",
+    )
+
+    created = repository.created[0]
+    routing = created["routing_decision"]
+    assert isinstance(routing, dict)
+    if allowed_models:
+        assert routing["allowed_models"] == list(allowed_models)
+    else:
+        assert "allowed_models" not in routing
+    assert routing["direct_model"] == "deepseek"
+    assert routing["requested_mode"] == mode.value
+    assert submitted.mode is mode
+    assert created["actor_id"] == ACTOR_ID
+    assert created["actor_role"] is Role.ADMIN
+    assert created["idempotency_key"] == "allowed-model-scope"
+    assert submitted.status is RunStatus.QUEUED
+    assert created["enqueue"] is True
+
+
+async def test_allowed_models_without_direct_model_constrains_actual_harness_scheduler() -> None:
+    repository = RecordingRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=CapabilityAwareHarnessScheduler(
+            profiles=(
+                ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="backup"),
+                ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="excluded"),
+            )
+        ),
+    )
+    await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="Answer briefly.",
+        mode=TaskMode.DIRECT,
+        allowed_models=("backup",),
+        sandbox_profile="none",
+    )
+
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    decision = routing["harness_decision"]
+    assert isinstance(decision, dict)
+    assert decision["selected_logical_model"] == "backup"
+
+
+@pytest.mark.parametrize(
+    "allowed_models,direct_model",
+    [
+        (("DeepSeek",), None),
+        (("",), None),
+        (("deepseek/chat",), None),
+        ((" deepseek",), None),
+        (("deepseek\n",), None),
+        (("a" * 129,), None),
+        (("deepseek", "deepseek"), None),
+        (tuple(f"model-{i}" for i in range(65)), None),
+        ((1,), None),
+        (("deepseek",), "main"),
+    ],
+)
+async def test_submit_rejects_invalid_allowed_models_before_run_creation(
+    allowed_models: tuple[object, ...], direct_model: str | None
+) -> None:
+    repository = RecordingRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    with pytest.raises(ValueError, match="allowed_models"):
+        await service.submit(
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            message="ordinary question",
+            mode=TaskMode.DIRECT,
+            direct_model=direct_model,
+            allowed_models=allowed_models,  # type: ignore[arg-type]
+        )
+
+    assert repository.created == []
+    assert queue.enqueued == []
+
+
+async def test_submit_accepts_allowed_model_limits_without_main_selection() -> None:
+    repository = RecordingRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+    allowed_models = ("a" * 128, *(f"model-{i}" for i in range(63)))
+
+    await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="ordinary question",
+        mode=TaskMode.DIRECT,
+        allowed_models=allowed_models,
+    )
+
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["allowed_models"] == list(allowed_models)
+    assert "direct_model" not in routing
+
+
+@pytest.mark.parametrize("allowed_models", ["abc", None, {"deepseek": True}])
+async def test_submit_rejects_non_tuple_allowed_models(allowed_models: object) -> None:
+    repository = RecordingRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    with pytest.raises(ValueError, match="allowed_models"):
+        await service.submit(
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            message="ordinary question",
+            mode=TaskMode.DIRECT,
+            allowed_models=allowed_models,  # type: ignore[arg-type]
+        )
+
+    assert repository.created == []
 
 
 def test_harness_decision_uses_provider_policy_from_routing_payload() -> None:

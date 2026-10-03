@@ -874,6 +874,7 @@ class ConfigBackedDirectRuntime:
         config = PlatformConfig.model_validate(current.document)
         if not config.models:
             return UnavailableRuntime(TaskMode.DIRECT)
+        config = _scope_runtime_model_config(config, context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -960,7 +961,11 @@ class ConfigBackedDispatchRuntime:
         await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
-        config = await _current_platform_config(self._config_service, context.tenant_id)
+        config = await _current_platform_config(
+            self._config_service,
+            context.tenant_id,
+            context.routing_decision,
+        )
         if config is None:
             return UnavailableRuntime(TaskMode.DISPATCH)
         try:
@@ -1060,10 +1065,7 @@ class ConfigBackedDispatchRuntime:
             harness_tool_gateway=self._harness_tool_gateway,
             artifact_repository=self._artifact_repository,
         )
-        if (
-            self._harness_tool_gateway is not None
-            and _is_project_scale_artifact_request(context)
-        ):
+        if self._harness_tool_gateway is not None and _is_project_scale_artifact_request(context):
             dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
                 dispatch_runtime,
                 harness_tool_gateway=self._harness_tool_gateway,
@@ -1151,7 +1153,11 @@ class ConfigBackedDiscussionRuntime:
         await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
-        config = await _current_platform_config(self._config_service, context.tenant_id)
+        config = await _current_platform_config(
+            self._config_service,
+            context.tenant_id,
+            context.routing_decision,
+        )
         if config is None:
             return UnavailableRuntime(TaskMode.DISCUSS)
         try:
@@ -1315,7 +1321,11 @@ class ConfigBackedHybridRuntime:
         await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
-        config = await _current_platform_config(self._config_service, context.tenant_id)
+        config = await _current_platform_config(
+            self._config_service,
+            context.tenant_id,
+            context.routing_decision,
+        )
         if config is None:
             return UnavailableRuntime(TaskMode.HYBRID)
         try:
@@ -1485,10 +1495,7 @@ class ConfigBackedHybridRuntime:
             harness_tool_gateway=self._harness_tool_gateway,
             artifact_repository=self._artifact_repository,
         )
-        if (
-            self._harness_tool_gateway is not None
-            and _is_project_scale_artifact_request(context)
-        ):
+        if self._harness_tool_gateway is not None and _is_project_scale_artifact_request(context):
             dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
                 dispatch_runtime,
                 harness_tool_gateway=self._harness_tool_gateway,
@@ -1555,6 +1562,7 @@ def _runtime_plan_context(context: TaskContext) -> TaskContext:
 async def _current_platform_config(
     config_service: ConfigService,
     tenant_id: UUID,
+    routing_decision: Mapping[str, JsonValue] | None = None,
 ) -> PlatformConfig | None:
     current = await config_service.get_current(tenant_id)
     if current is None:
@@ -1562,7 +1570,57 @@ async def _current_platform_config(
     config = PlatformConfig.model_validate(current.document)
     if not config.models:
         return None
-    return config
+    return _scope_runtime_model_config(config, routing_decision)
+
+
+def _scope_runtime_model_config(
+    config: PlatformConfig,
+    routing_decision: Mapping[str, JsonValue] | None,
+) -> PlatformConfig:
+    if routing_decision is None:
+        return config
+    raw = routing_decision.get("allowed_models", ())
+    if not isinstance(raw, (list, tuple)) or len(raw) > 64:
+        raise HarnessModelSelectionError("invalid run model scope")
+    if not raw:
+        return config
+    if any(
+        not isinstance(item, str)
+        or len(item) > 128
+        or re.fullmatch(r"[a-z0-9][a-z0-9_-]*", item) is None
+        for item in raw
+    ):
+        raise HarnessModelSelectionError("invalid run model scope")
+    allowed = {cast(str, item) for item in raw}
+    if len(allowed) != len(raw) or not allowed.issubset(config.models):
+        raise HarnessModelSelectionError("run model scope is unavailable")
+    harness_model = _harness_selected_logical_model(routing_decision)
+    selections = (
+        harness_model,
+        routing_decision.get("direct_model"),
+        routing_decision.get("main_agent_model"),
+    )
+    for selected in selections:
+        if selected is not None and (not isinstance(selected, str) or selected not in allowed):
+            raise HarnessModelSelectionError("selected model is outside run model scope")
+    main = next((item for item in selections if isinstance(item, str)), min(allowed))
+    # Ephemeral view: keep role identities/tools, but never expose excluded model routes.
+    models = {
+        name: definition.model_copy(
+            update={
+                "fallback_model": (
+                    definition.fallback_model if definition.fallback_model in allowed else None
+                ),
+            }
+        )
+        for name, definition in config.models.items()
+        if name in allowed
+    }
+    agents = [
+        agent if agent.model in allowed else agent.model_copy(update={"model": main})
+        for agent in config.agents
+    ]
+    return config.model_copy(update={"models": models, "agents": agents})
 
 
 async def _gateway_for_config(
@@ -2660,6 +2718,7 @@ def _selected_config_agent_purpose(
     if any(keyword in text for keyword in ("裁决", "决策", "decision", "record")):
         return RolePurpose.RECORD_DECISION
     return default
+
 
 def _temporary_role_assignments(
     context: TaskContext,
@@ -4433,6 +4492,7 @@ def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> in
     if "general" in task_characteristics and ("general" in characteristics or "text" in characteristics):
         score += 4
     return score
+
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
     value = context.routing_decision.get("requested_skills")

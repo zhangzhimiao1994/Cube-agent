@@ -522,6 +522,7 @@ class RunService:
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        allowed_models: tuple[str, ...] = (),
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
         project_id: str | None = None,
@@ -535,6 +536,24 @@ class RunService:
         idempotency_key: str | None = None,
         blocked_by_run_id: UUID | None = None,
     ) -> SubmittedRun:
+        if (
+            not isinstance(allowed_models, tuple)
+            or len(allowed_models) > 64
+            or any(
+                not isinstance(item, str) or _SAFE_MODEL_ID.fullmatch(item) is None
+                for item in allowed_models
+            )
+        ):
+            raise ValueError(
+                "allowed_models must contain at most 64 safe logical model identifiers"
+            )
+        if len(set(allowed_models)) != len(allowed_models):
+            raise ValueError("allowed_models must contain unique logical model identifiers")
+        cleaned_direct_model = direct_model.strip() if direct_model else None
+        if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
+            raise ValueError("direct_model must be a safe logical model identifier")
+        if allowed_models and cleaned_direct_model and cleaned_direct_model not in allowed_models:
+            raise ValueError("direct_model must be included in allowed_models")
         requested_mode = mode
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
         conversation = None
@@ -555,9 +574,6 @@ class RunService:
             requested_permissions=requested_permissions,
         )
         resolved_execution_backend = normalize_execution_backend(execution_backend)
-        cleaned_direct_model = direct_model.strip() if direct_model else None
-        if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
-            raise ValueError("direct_model must be a safe logical model identifier")
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
             "selected_agent_ids": list(agent_ids),
@@ -612,6 +628,8 @@ class RunService:
             operator_selection["reference_workflow_id"] = cleaned_reference_workflow_id
         if cleaned_direct_model:
             operator_selection["direct_model"] = cleaned_direct_model
+        if allowed_models:
+            operator_selection["allowed_models"] = list(allowed_models)
         if vibe_coding:
             operator_selection["vibe_coding"] = True
             operator_selection["capability"] = "vibe_coding"
@@ -772,6 +790,9 @@ class RunService:
                     self._router,
                     message,
                     timeout_seconds=_AUTO_ROUTER_TIMEOUT_SECONDS,
+                    tenant_id=tenant_id,
+                    allowed_models=allowed_models,
+                    logical_model=cleaned_direct_model,
                 )
             if decision is not None and decision.status == "ready":
                 assert decision.mode is not None
@@ -3610,10 +3631,15 @@ def _harness_task_requirements(
 ) -> HarnessTaskRequirements:
     capabilities = {"text"}
     vibe_coding = _routing_requests_vibe_coding(routing_decision)
-    needs_tool_calls = _message_suggests_tool_use(message) or mode in {
-        TaskMode.DISPATCH,
-        TaskMode.HYBRID,
-    } or vibe_coding
+    needs_tool_calls = (
+        _message_suggests_tool_use(message)
+        or mode
+        in {
+            TaskMode.DISPATCH,
+            TaskMode.HYBRID,
+        }
+        or vibe_coding
+    )
     if needs_tool_calls:
         capabilities.add("tool_calling")
     token_estimate = estimate_tokens(message)
@@ -3621,14 +3647,14 @@ def _harness_task_requirements(
     return HarnessTaskRequirements(
         required_capabilities=frozenset(capabilities),
         required_logical_model=_string_or_none(routing_decision.get("direct_model")),
+        allowed_logical_models=frozenset(_string_tuple(routing_decision.get("allowed_models"))),
         needs_reasoning=vibe_coding
         or mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID},
         needs_streamed_tool_calls=needs_tool_calls,
         needs_parallel_tool_calls=vibe_coding or mode in {TaskMode.DISPATCH, TaskMode.HYBRID},
         needs_long_running=vibe_coding
         or (
-            mode in {TaskMode.DISPATCH, TaskMode.HYBRID}
-            and _message_suggests_long_running(message)
+            mode in {TaskMode.DISPATCH, TaskMode.HYBRID} and _message_suggests_long_running(message)
         ),
         requires_sandbox=vibe_coding
         or sandbox_profile != "none"
@@ -4152,7 +4178,9 @@ _SKILL_CREATION_RE = re.compile(
     r"(skill|技能).{0,24}(生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make))",
     re.IGNORECASE,
 )
-_EVOLUTION_NEGATION_RE = re.compile(r"(不要|别|不需要|无需|先不|暂不|not|do not|don't)", re.IGNORECASE)
+_EVOLUTION_NEGATION_RE = re.compile(
+    r"(不要|别|不需要|无需|先不|暂不|not|do not|don't)", re.IGNORECASE
+)
 _SKILL_ID_RE = re.compile(r"\b([a-z0-9][a-z0-9_-]{1,80}-skill)\b", re.IGNORECASE)
 
 
@@ -4553,6 +4581,7 @@ def _schedule_weekday(message: str) -> int:
 
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
+
 
 def _explicit_new_conversation_request(message: str) -> bool:
     normalized = re.sub(r"\s+", " ", message).strip().casefold()
@@ -5198,9 +5227,25 @@ async def _safe_route(
     message: str,
     *,
     timeout_seconds: int,
+    tenant_id: UUID | None = None,
+    allowed_models: tuple[str, ...] = (),
+    logical_model: str | None = None,
 ) -> RouteDecision | None:
     try:
         async with asyncio.timeout(timeout_seconds):
+            if allowed_models:
+                route_scoped = getattr(router, "route_scoped", None)
+                if tenant_id is None or not callable(route_scoped):
+                    return None
+                return cast(
+                    RouteDecision,
+                    await route_scoped(
+                        message,
+                        tenant_id=tenant_id,
+                        allowed_models=allowed_models,
+                        logical_model=logical_model,
+                    ),
+                )
             return await router.route(message)
     except TimeoutError:
         _LOGGER.warning("auto_router_timed_out timeout_seconds=%s", timeout_seconds)

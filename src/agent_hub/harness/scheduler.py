@@ -62,6 +62,9 @@ class CapabilityAwareHarnessScheduler:
             if (
                 requirements.required_logical_model is not None
                 and profile.logical_model != requirements.required_logical_model
+            ) or (
+                requirements.allowed_logical_models
+                and profile.logical_model not in requirements.allowed_logical_models
             ):
                 _record_fallback(
                     fallbacks,

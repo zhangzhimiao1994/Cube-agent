@@ -58,6 +58,7 @@ _ACCEPTANCE_CASES = (
 )
 _SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
 _SAFE_ID_RE = re.compile(r"[^a-z0-9-]+")
+_SAFE_MODEL_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}")
 _ADMIN_RUN_PREFIX = "/api/v1/admin/runs"
 _MAX_PREVIEW_ASSETS = 24
 _WEBSITE_DELIVERABLE_REQUIREMENT = (
@@ -135,6 +136,8 @@ class RealUserAcceptanceClient:
         self._delegate = delegate
         self.request_log: list[str] = []
         self.blocked_admin_run_requests: list[str] = []
+        self.submitted_run_ids: list[str] = []
+        self.accepted_repair_run_ids: list[str] = []
 
     def request_json(
         self,
@@ -149,12 +152,20 @@ class RealUserAcceptanceClient:
             blocked = f"{method.upper()} {path}"
             self.blocked_admin_run_requests.append(blocked)
             raise RuntimeError(f"{blocked} is forbidden as acceptance evidence")
-        return self._delegate.request_json(
+        response = self._delegate.request_json(
             method,
             path,
             body=body,
             idempotency_key=idempotency_key,
         )
+        if method.upper() == "POST" and isinstance(response, dict):
+            run_id = response.get("id")
+            if isinstance(run_id, str) and run_id.strip():
+                if path == "/api/v1/runs":
+                    self.submitted_run_ids.append(run_id)
+                elif re.fullmatch(r"/api/v1/runs/[^/]+/accept-repair", path):
+                    self.accepted_repair_run_ids.append(run_id)
+        return response
 
     def request_bytes(self, method: str, path: str) -> bytes:
         self._record(method, path)
@@ -181,9 +192,11 @@ def build_real_user_scale_plan(
     conversation_id: str,
     workspace_session_id: str,
     route_intent: str,
+    logical_model: str | None = None,
 ) -> ProjectScaleRunPlan:
     """Build one natural AUTO scale case or one explicit mode capability case."""
 
+    profile = _model_profile(logical_model)
     if route_intent not in _ROUTE_INTENTS:
         raise ValueError(f"unknown real-user route intent: {route_intent}")
 
@@ -206,12 +219,213 @@ def build_real_user_scale_plan(
             "message": f"{body['message']}{_WEBSITE_DELIVERABLE_REQUIREMENT}",
         }
     )
+    if profile is not None:
+        body.update(direct_model=logical_model, allowed_models=(logical_model,))
     scoped_request = ProjectScaleRunRequest(
         case_id=f"{scale}:{route_intent}",
         body=body,
         validation_focus=request.validation_focus,
     )
     return replace(base, requests=(scoped_request,))
+
+
+def _model_profile(logical_model: str | None) -> dict[str, object] | None:
+    if logical_model is None:
+        return None
+    if not isinstance(logical_model, str) or _SAFE_MODEL_RE.fullmatch(logical_model) is None:
+        raise ValueError("logical_model must be a safe logical model identifier")
+    return {"direct_model": logical_model, "allowed_models": [logical_model]}
+
+
+def _report_model_profile(report: Mapping[str, object]) -> dict[str, object] | None:
+    profile = report.get("model_profile")
+    if profile is None:
+        return None
+    if not isinstance(profile, Mapping) or not isinstance(profile.get("direct_model"), str):
+        raise TypeError("model profile must specify a safe logical model")
+    try:
+        expected = _model_profile(cast(str, profile["direct_model"]))
+    except ValueError as error:
+        raise ValueError("model profile must specify a safe logical model") from error
+    if profile != expected:
+        raise ValueError("model profile must contain exactly one matching allowed model")
+    return expected
+
+
+def _validate_report_model_profile(
+    report: Mapping[str, object], expected: Mapping[str, object] | None
+) -> None:
+    if _report_model_profile(report) != expected:
+        raise ValueError("model profile does not match this execution")
+    identity = report.get("execution_identity")
+    if expected is not None and not isinstance(identity, Mapping):
+        raise ValueError("model profile requires a scoped execution identity")
+    if isinstance(identity, Mapping) and identity.get("model_profile") != expected:
+        raise ValueError("execution identity model profile is inconsistent")
+    for section in ("cases", "attempt_history"):
+        items = report.get(section, [])
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, Mapping) and item.get("model_profile") != expected:
+                    raise ValueError(
+                        f"{section} model profile is inconsistent; cannot relabel runs"
+                    )
+
+
+def _model_scope_errors(
+    evidence: object, *, logical_model: str, result_run_id: object
+) -> list[str]:
+    if not isinstance(evidence, Mapping):
+        return ["model scope evidence is missing"]
+    errors: list[str] = []
+    if evidence.get("source") != "public_run_events" or evidence.get("errors") != []:
+        errors.append("model scope public evidence is incomplete")
+    original = evidence.get("original_run_id")
+    repairs = evidence.get("accepted_repair_run_ids")
+    if (
+        not isinstance(original, str)
+        or not original.strip()
+        or not isinstance(result_run_id, str)
+        or not result_run_id.strip()
+        or evidence.get("result_run_id") != result_run_id
+        or not isinstance(repairs, list)
+        or any(not isinstance(item, str) or not item.strip() for item in repairs)
+    ):
+        return [*errors, "model scope original/result/repair run identity is incomplete"]
+    required = {original, result_run_id, *cast(list[str], repairs)}
+    runs = evidence.get("runs")
+    if not isinstance(runs, list):
+        return [*errors, "model scope runs must be a list"]
+    seen: set[str] = set()
+    for run in runs:
+        if not isinstance(run, Mapping) or not isinstance(run.get("run_id"), str):
+            errors.append("model scope contains malformed run evidence")
+            continue
+        run_id = cast(str, run["run_id"])
+        if run_id in seen or run_id not in required:
+            errors.append("model scope contains duplicate or unrelated run evidence")
+        seen.add(run_id)
+        endpoint = f"/api/v1/runs/{quote(run_id, safe='')}/events"
+        if run.get("events_endpoint") != endpoint:
+            errors.append(f"{run_id}: model evidence endpoint does not match run")
+        if run.get("status") not in {"completed", "failed", "cancelled"}:
+            errors.append(f"{run_id}: model evidence requires a terminal run")
+        events = run.get("model_events")
+        if not isinstance(events, list):
+            errors.append(f"{run_id}: model events are malformed")
+            continue
+        completions = 0
+        for event in events:
+            if not isinstance(event, Mapping) or event.get("run_id") != run_id:
+                errors.append(f"{run_id}: model event run scope is invalid")
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                errors.append(f"{run_id}: model event payload is malformed")
+                continue
+            completed = event.get("kind") == "model.completed"
+            if completed:
+                completions += 1
+            if (completed or "logical_model" in payload) and payload.get(
+                "logical_model"
+            ) != logical_model:
+                errors.append(f"{run_id}: observed logical model does not match selected model")
+            if "attempted_logical_models" in payload:
+                attempted = payload.get("attempted_logical_models")
+                if not isinstance(attempted, list) or any(
+                    item != logical_model for item in attempted
+                ):
+                    errors.append(f"{run_id}: attempted logical models do not match selected model")
+        if completions == 0:
+            errors.append(f"{run_id}: no actual model.completed evidence")
+    if seen != required:
+        errors.append("model scope evidence does not cover every original/result/repair run")
+    return errors
+
+
+def _collect_model_scope_evidence(
+    client: RealUserAcceptanceClient,
+    *,
+    logical_model: str,
+    submitted_run_ids: Sequence[str],
+    accepted_repair_run_ids: Sequence[str],
+    result_run_id: str | None,
+) -> dict[str, object]:
+    original = submitted_run_ids[0] if submitted_run_ids else None
+    repairs = list(dict.fromkeys((*submitted_run_ids[1:], *accepted_repair_run_ids)))
+    required = list(
+        dict.fromkeys(
+            run_id for run_id in (original, *repairs, result_run_id) if run_id is not None
+        )
+    )
+    runs: list[dict[str, object]] = []
+    errors: list[str] = []
+    for run_id in required:
+        root = f"/api/v1/runs/{quote(run_id, safe='')}"
+        item: dict[str, object] = {
+            "run_id": run_id,
+            "events_endpoint": f"{root}/events",
+            "model_events": [],
+        }
+        try:
+            details = client.request_json("GET", root)
+            if not isinstance(details, Mapping) or details.get("id") != run_id:
+                raise ValueError("public run identity does not match model evidence")
+            item["status"] = details.get("status")
+            response = client.request_json("GET", f"{root}/events")
+            events = response.get("items") if isinstance(response, Mapping) else None
+            if not isinstance(events, list):
+                raise TypeError("public run events must contain an items list")
+            model_events: list[dict[str, object]] = []
+            for event in events:
+                if not isinstance(event, Mapping):
+                    raise TypeError("public run events contain a malformed event")
+                payload = event.get("payload")
+                kind = event.get("kind")
+                if (
+                    isinstance(kind, str)
+                    and kind.startswith("model.")
+                    or (
+                        isinstance(payload, Mapping)
+                        and any(
+                            key in payload for key in ("logical_model", "attempted_logical_models")
+                        )
+                    )
+                ):
+                    # Retain only model identity evidence, never output text or credentials.
+                    model_events.append(
+                        {
+                            **{
+                                key: event[key]
+                                for key in ("kind", "run_id", "sequence")
+                                if key in event
+                            },
+                            "payload": {
+                                key: copy.deepcopy(payload[key])
+                                for key in ("logical_model", "attempted_logical_models")
+                                if key in payload
+                            }
+                            if isinstance(payload, Mapping)
+                            else None,
+                        }
+                    )
+            item["model_events"] = model_events
+        except Exception as error:  # noqa: BLE001 - missing public evidence must fail the case.
+            errors.append(f"{run_id}: {error}")
+        runs.append(item)
+    evidence: dict[str, object] = {
+        "source": "public_run_events",
+        "original_run_id": original,
+        "result_run_id": result_run_id,
+        "accepted_repair_run_ids": repairs,
+        "runs": runs,
+        "errors": [],
+    }
+    errors.extend(
+        _model_scope_errors(evidence, logical_model=logical_model, result_run_id=result_run_id)
+    )
+    evidence.update(ok=not errors, errors=errors)
+    return evidence
 
 
 def verify_public_workspace_artifacts(
@@ -525,6 +739,8 @@ def build_case_report(
     result: ProjectScaleCaseResult,
     public_artifacts: Mapping[str, object],
     dynamic_web_preview: Mapping[str, object],
+    logical_model: str | None = None,
+    model_scope_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     generated_project_ok = result.evidence.get("generated_project_validation") is True
     requirements_ok = result.evidence.get("requirements_validation") is True
@@ -582,7 +798,7 @@ def build_case_report(
         and artifact_origin_ok
         and multi_agent_evidence_ok
     )
-    return {
+    report: dict[str, object] = {
         "case_id": result.case_id,
         "case_kind": case_kind,
         "scale": scale,
@@ -642,6 +858,22 @@ def build_case_report(
             "admin_internal_run_data": False,
         },
     }
+    if logical_model is not None:
+        model_ok = (
+            model_scope_evidence is not None
+            and model_scope_evidence.get("ok") is True
+            and not _model_scope_errors(
+                model_scope_evidence, logical_model=logical_model, result_run_id=result.run_id
+            )
+        )
+        report["model_profile"] = _model_profile(logical_model)
+        report["model_scope_evidence"] = copy.deepcopy(model_scope_evidence)
+        cast(dict[str, object], report["success_basis"])["model_scope"] = model_ok
+        if not model_ok:
+            report.update(
+                status="failed", core_acceptance_ok=False, automated_acceptance_complete=False
+            )
+    return report
 
 
 def _create_or_recover_case_resource(
@@ -708,7 +940,11 @@ def run_real_user_four_scale_acceptance(
     authentication_method: str = "password",
     output_path: str | None = None,
     resume_report: Mapping[str, object] | None = None,
+    logical_model: str | None = None,
 ) -> dict[str, object]:
+    profile = _model_profile(logical_model)
+    if resume_report is not None:
+        _validate_report_model_profile(resume_report, profile)
     started_at = _utc_now()
     principal = client.request_json("GET", "/api/v1/auth/me")
     if not isinstance(principal, dict):
@@ -716,7 +952,7 @@ def run_real_user_four_scale_acceptance(
     cases: list[dict[str, object]] = []
     attempt_history: list[dict[str, object]] = []
     safe_execution_id = _safe_identifier(execution_id)
-    identity = _execution_identity(execution_id, base_url, principal)
+    identity = _execution_identity(execution_id, base_url, principal, profile)
     if resume_report is not None:
         cases = _resume_cases(resume_report, identity, attempt_history)
         device = resume_report.get("real_device_acceptance")
@@ -778,6 +1014,10 @@ def run_real_user_four_scale_acceptance(
         )
         if progress is not None:
             progress(f"{case_kind}/{scale}/{route_intent}: creating project and conversation")
+        submitted_start = len(client.submitted_run_ids)
+        repair_start = len(client.accepted_repair_run_ids)
+        result_run_id: str | None = None
+        model_scope_evidence: dict[str, object] | None = None
         try:
             project = _create_or_recover_case_resource(
                 client,
@@ -816,6 +1056,7 @@ def run_real_user_four_scale_acceptance(
                 conversation_id=conversation_id,
                 workspace_session_id=workspace_session_id,
                 route_intent=route_intent,
+                logical_model=logical_model,
             )
             effective_wait = _effective_execute_wait_seconds(
                 plan,
@@ -852,8 +1093,17 @@ def run_real_user_four_scale_acceptance(
                 auto_approve_capability_requests=True,
             )
             result = runner_report.results[0]
+            result_run_id = result.run_id
             if result.case_id != case_id:
                 raise RuntimeError("capability runner returned evidence for the wrong case")
+            if logical_model is not None:
+                model_scope_evidence = _collect_model_scope_evidence(
+                    client,
+                    logical_model=logical_model,
+                    submitted_run_ids=client.submitted_run_ids[submitted_start:],
+                    accepted_repair_run_ids=client.accepted_repair_run_ids[repair_start:],
+                    result_run_id=result_run_id,
+                )
             public_artifacts = verify_public_workspace_artifacts(
                 client,
                 project_id=project_id,
@@ -872,6 +1122,8 @@ def run_real_user_four_scale_acceptance(
                 result=result,
                 public_artifacts=public_artifacts,
                 dynamic_web_preview=dynamic_web_preview,
+                logical_model=logical_model,
+                model_scope_evidence=model_scope_evidence,
             )
         except Exception as error:  # noqa: BLE001 - every matrix case must be attempted.
             completed_case = {
@@ -897,6 +1149,17 @@ def run_real_user_four_scale_acceptance(
                     "admin_internal_run_data": False,
                 },
             }
+        if logical_model is not None and "model_profile" not in completed_case:
+            if model_scope_evidence is None:
+                model_scope_evidence = _collect_model_scope_evidence(
+                    client,
+                    logical_model=logical_model,
+                    submitted_run_ids=client.submitted_run_ids[submitted_start:],
+                    accepted_repair_run_ids=client.accepted_repair_run_ids[repair_start:],
+                    result_run_id=result_run_id,
+                )
+            completed_case["model_profile"] = copy.deepcopy(profile)
+            completed_case["model_scope_evidence"] = model_scope_evidence
         completed_case["attempt"] = attempt
         if previous is not None:
             cases[cases.index(previous)] = completed_case
@@ -934,7 +1197,7 @@ def _matrix_report(
         and all(case.get("core_acceptance_ok") is True for case in cases)
     )
     status = "pending_real_device" if core_ok else "failed" if finished else "in_progress"
-    return {
+    report = {
         "schema_version": 1,
         "kind": "real_user_four_scale_acceptance",
         "status": status,
@@ -991,10 +1254,16 @@ def _matrix_report(
         "cases": copy.deepcopy(cases),
         "attempt_history": copy.deepcopy(attempt_history),
     }
+    if "model_profile" in identity:
+        report["model_profile"] = copy.deepcopy(identity["model_profile"])
+    return report
 
 
 def _execution_identity(
-    execution_id: str, base_url: str, principal: Mapping[str, object]
+    execution_id: str,
+    base_url: str,
+    principal: Mapping[str, object],
+    model_profile: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     identity: dict[str, object] = {
         "execution_id": execution_id,
@@ -1007,6 +1276,8 @@ def _execution_identity(
         identity[key] = value
     if not execution_id.strip() or not _SAFE_ID_RE.sub("-", execution_id.casefold()).strip("-"):
         raise ValueError("execution identity requires a usable execution_id")
+    if model_profile is not None:
+        identity["model_profile"] = copy.deepcopy(dict(model_profile))
     return identity
 
 
@@ -1031,7 +1302,9 @@ def _resume_cases(
         or not isinstance(base_url, str)
     ):
         raise TypeError("resume report execution identity is incomplete")
-    saved_identity = _execution_identity(execution_id, base_url, principal)
+    profile = _report_model_profile(report)
+    _validate_report_model_profile(report, profile)
+    saved_identity = _execution_identity(execution_id, base_url, principal, profile)
     if saved_identity != identity or (
         "execution_identity" in report and report["execution_identity"] != identity
     ):
@@ -1119,6 +1392,21 @@ def _has_complete_core_evidence(
         or case.get("errors", []) != []
     ):
         return False
+    profile = _report_model_profile(case)
+    if profile is not None:
+        scope = case.get("model_scope_evidence")
+        run_payload = case.get("run")
+        if (
+            not isinstance(scope, Mapping)
+            or scope.get("ok") is not True
+            or not isinstance(run_payload, Mapping)
+            or _model_scope_errors(
+                scope,
+                logical_model=cast(str, profile["direct_model"]),
+                result_run_id=run_payload.get("run_id"),
+            )
+        ):
+            return False
     sections = ("run", "project", "conversation", "public_artifacts", "dynamic_web_preview")
     if any(not isinstance(case.get(key), Mapping) for key in sections):
         return False
@@ -1257,6 +1545,8 @@ def _has_complete_core_evidence(
         result=result,
         public_artifacts=public,
         dynamic_web_preview=preview,
+        logical_model=cast(str, profile["direct_model"]) if profile is not None else None,
+        model_scope_evidence=cast(Mapping[str, object] | None, case.get("model_scope_evidence")),
     )
     compared_fields = (
         "case_kind",
@@ -1481,6 +1771,10 @@ def finalize_real_device_acceptance(
 ) -> dict[str, object]:
     """Merge deployed desktop/mobile evidence into a completed acceptance report."""
 
+    profile = _report_model_profile(automated_report)
+    _validate_report_model_profile(automated_report, profile)
+    if _report_model_profile(evidence) != profile:
+        raise ValueError("real-device evidence model profile does not match automated report")
     if (
         automated_report.get("kind") != "real_user_four_scale_acceptance"
         or type(automated_report.get("schema_version")) is not int
@@ -1502,7 +1796,7 @@ def finalize_real_device_acceptance(
     principal = actor.get("principal") if isinstance(actor, Mapping) else None
     if not isinstance(principal, Mapping) or not isinstance(base_url, str):
         raise TypeError("automated report execution identity is incomplete")
-    identity = _execution_identity(execution_id, base_url, principal)
+    identity = _execution_identity(execution_id, base_url, principal, profile)
     if (
         "execution_identity" in automated_report
         and automated_report["execution_identity"] != identity
@@ -1523,6 +1817,10 @@ def finalize_real_device_acceptance(
         "mobile_browser_interaction": mobile,
         "cases": case_evidence,
     }
+    if profile is not None:
+        cast(dict[str, object], completed["real_device_acceptance"])["model_profile"] = (
+            copy.deepcopy(profile)
+        )
     dynamic_preview = completed.get("dynamic_web_preview")
     if isinstance(dynamic_preview, dict):
         dynamic_preview["status"] = "passed"
@@ -1618,6 +1916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--finalize-report")
     parser.add_argument("--real-device-evidence")
+    parser.add_argument("--logical-model", help="Scope this test to one safe logical model ID.")
     parser.add_argument(
         "--resume-report",
         "--resume",
@@ -1625,6 +1924,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Resume matching core evidence and retry failed/incomplete cases from this JSON report.",
     )
     args = parser.parse_args(argv)
+    try:
+        profile = _model_profile(args.logical_model)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.finalize_report or args.real_device_evidence:
         if args.resume_report:
@@ -1632,9 +1935,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.finalize_report or not args.real_device_evidence:
             parser.error("--finalize-report and --real-device-evidence must be used together")
         try:
+            automated = _read_json_mapping(args.finalize_report)
+            device_evidence = _read_json_mapping(args.real_device_evidence)
+            saved_profile = _report_model_profile(automated)
+            _validate_report_model_profile(automated, saved_profile)
+            if args.logical_model is not None and profile != saved_profile:
+                raise ValueError("model profile does not match --logical-model")
+            if _report_model_profile(device_evidence) != saved_profile:
+                raise ValueError(
+                    "real-device evidence model profile does not match automated report"
+                )
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(str(error))
+        try:
             payload = finalize_real_device_acceptance(
-                _read_json_mapping(args.finalize_report),
-                _read_json_mapping(args.real_device_evidence),
+                automated,
+                device_evidence,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             payload = {
@@ -1651,6 +1967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.resume_report:
         try:
             resume_report = _read_json_mapping(args.resume_report)
+            _validate_report_model_profile(resume_report, profile)
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"cannot read resume report: {error}")
         saved_execution_id = resume_report.get("execution_id")
@@ -1694,6 +2011,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             authentication_method="bearer_token" if bearer_token else "password",
             output_path=args.output,
             resume_report=resume_report,
+            logical_model=args.logical_model,
             progress=lambda message: print(
                 f"real-user-four-scale progress: {message}",
                 file=sys.stderr,

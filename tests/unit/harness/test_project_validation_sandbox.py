@@ -20,8 +20,7 @@ from typing import Any
 import pytest
 
 _SOURCE = (
-    Path(__file__).resolve().parents[3]
-    / "src/agent_hub/harness/project_validation_sandbox.py"
+    Path(__file__).resolve().parents[3] / "src/agent_hub/harness/project_validation_sandbox.py"
 )
 _SPEC = importlib.util.spec_from_file_location("validation_sandbox", _SOURCE)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -236,28 +235,46 @@ def _npm_runtime() -> tuple[str, Path]:
 
 def _install_locally(assembly: Any, root: Path, registry: str) -> subprocess.CompletedProcess[str]:
     node, cli = _npm_runtime()
-    argv = assembly.generated_command(assembly._INSTALL, cwd=root, config={
-        "NPM_CONFIG_REGISTRY": registry,
-    })
-    inner = argv[argv.index("--") + 1:]
+    argv = assembly.generated_command(
+        assembly._INSTALL,
+        cwd=root,
+        config={
+            "NPM_CONFIG_REGISTRY": registry,
+        },
+    )
+    inner = argv[argv.index("--") + 1 :]
     if Path(inner[0]).name == "npm":
         inner = [node, str(cli), *inner[1:]]
     else:
         inner = [node, *inner[1:]]
         inner[3] = str(cli)
     env = assembly.sandbox_environment({"NPM_CONFIG_REGISTRY": registry})
-    env.update({
-        "PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
-        "HOME": str(root), "NPM_CONFIG_CACHE": str(root / "cache"),
-        "NPM_CONFIG_USERCONFIG": str(root / "user.npmrc"),
-        "NPM_CONFIG_GLOBALCONFIG": str(root / "global.npmrc"),
-    })
-    return subprocess.run(inner, cwd=root, env=env, capture_output=True, text=True,
-                          timeout=40, check=False)
+    env.update(
+        {
+            "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+            "HOME": str(root),
+            "NPM_CONFIG_CACHE": str(root / "cache"),
+            "NPM_CONFIG_USERCONFIG": str(root / "user.npmrc"),
+            "NPM_CONFIG_GLOBALCONFIG": str(root / "global.npmrc"),
+        }
+    )
+    return subprocess.run(
+        inner,
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=40,
+        check=False,
+    )
 
 
 def test_real_git_prepare_node_preload_cannot_reach_host_network(
-    assembly: Any, tmp_path: Path,
+    assembly: Any,
+    tmp_path: Path,
 ) -> None:
     node, cli = _npm_runtime()
     git = shutil.which("git")
@@ -277,15 +294,38 @@ def test_real_git_prepare_node_preload_cannot_reach_host_network(
 
     repository = tmp_path / "dependency"
     repository.mkdir()
-    (repository / "package.json").write_text(json.dumps({
-        "name": "prepare-fixture", "version": "1.0.0",
-        "scripts": {"prepare": "node -e \"process.exit(0)\""},
-    }))
-    for args in (("init",), ("add", "package.json"),
-                 ("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
-                  "commit", "-m", "fixture")):
-        result = subprocess.run([git, *args], cwd=repository, capture_output=True,
-                                text=True, timeout=10, check=False)
+    (repository / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "prepare-fixture",
+                "version": "1.0.0",
+                "scripts": {"prepare": 'node -e "process.exit(0)"'},
+            }
+        )
+    )
+    for args in (
+        ("init",),
+        ("add", "package.json"),
+        (
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ),
+    ):
+        result = subprocess.run(
+            [git, *args],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
         assert result.returncode == 0, result.stderr
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -297,29 +337,51 @@ def test_real_git_prepare_node_preload_cannot_reach_host_network(
                 root.mkdir()
                 payload = root / "preload.cjs"
                 payload.write_text(
-                    "require('node:http').get(" + json.dumps(registry + "/preload")
+                    "require('node:http').get("
+                    + json.dumps(registry + "/preload")
                     + ",r=>r.resume()).on('error',()=>{});"
                 )
-                (root / ".npmrc").write_text("node-options=--require=" + payload.as_posix())
-                (root / "package.json").write_text(json.dumps({
-                    "private": True, "dependencies": {
-                        "prepare-fixture": "git+" + repository.as_uri(),
-                    },
-                }))
+                (root / ".npmrc").write_text(
+                    "node-options=--require=" + payload.as_posix(),
+                    encoding="utf-8",
+                )
+                (root / "package.json").write_text(
+                    json.dumps(
+                        {
+                            "private": True,
+                            "dependencies": {
+                                "prepare-fixture": "git+" + repository.as_uri(),
+                            },
+                        }
+                    )
+                )
                 before = len(requests)
                 if protected:
                     result = _install_locally(assembly, root, registry)
-                    assert len(requests) == before, "Git preparation ran project preload on host network"
+                    assert len(requests) == before, (
+                        "Git preparation ran project preload on host network"
+                    )
                     assert result.returncode != 0, "non-registry dependency must fail closed"
                 else:
-                    env = dict(os.environ, NPM_CONFIG_CACHE=str(root / "cache"),
-                               NPM_CONFIG_USERCONFIG=str(root / "user.npmrc"),
-                               NPM_CONFIG_GLOBALCONFIG=str(root / "global.npmrc"))
+                    env = dict(
+                        os.environ,
+                        NPM_CONFIG_CACHE=str(root / "cache"),
+                        NPM_CONFIG_USERCONFIG=str(root / "user.npmrc"),
+                        NPM_CONFIG_GLOBALCONFIG=str(root / "global.npmrc"),
+                    )
                     env.pop("NODE_OPTIONS", None)
                     env.pop("NPM_CONFIG_NODE_OPTIONS", None)
-                    result = subprocess.run([node, str(cli), *assembly._INSTALL[1:]], cwd=root,
-                                            env=env, capture_output=True, text=True,
-                                            timeout=40, check=False)
+                    result = subprocess.run(
+                        [node, str(cli), *assembly._INSTALL[1:]],
+                        cwd=root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=40,
+                        check=False,
+                    )
                     assert len(requests) > before, result.stderr
         finally:
             server.shutdown()

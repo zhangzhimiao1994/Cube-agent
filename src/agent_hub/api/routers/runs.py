@@ -97,6 +97,7 @@ class RunServiceProtocol(Protocol):
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        allowed_models: tuple[str, ...] = (),
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
         project_id: str | None = None,
@@ -253,6 +254,7 @@ class CreateRunRequest(BaseModel):
         max_length=128,
         pattern=r"^[a-z0-9][a-z0-9_-]*$",
     )
+    allowed_models: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
     workflow_id: str | None = Field(default=None, max_length=128)
     reference_workflow_id: str | None = Field(
         default=None,
@@ -270,8 +272,12 @@ class CreateRunRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=128)
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
-    sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
-    execution_backend: Literal["systemd", "docker", "ssh", "modal", "daytona", "vercel"] | None = None
+    sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = (
+        "workspace_write"
+    )
+    execution_backend: Literal["systemd", "docker", "ssh", "modal", "daytona", "vercel"] | None = (
+        None
+    )
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     runtime_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
 
@@ -296,6 +302,16 @@ class CreateRunRequest(BaseModel):
         for item in value:
             if item in seen or not re.fullmatch(r"att_[a-f0-9]{32}", item):
                 raise ValueError("attachment_ids must be unique attachment identifiers")
+            seen.add(item)
+        return value
+
+    @field_validator("allowed_models")
+    @classmethod
+    def validate_allowed_models(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        for item in value:
+            if item in seen or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", item) is None:
+                raise ValueError("allowed_models must be unique safe logical model identifiers")
             seen.add(item)
         return value
 
@@ -662,6 +678,8 @@ async def _record_run_submit_audit(
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
     }
+    if body.allowed_models:
+        details["allowed_models"] = list(body.allowed_models)
     await recorder(
         actor=str(principal.user_id),
         action="run.submit",
@@ -1197,6 +1215,7 @@ async def create_run(
             reference_conversation_id=body.reference_conversation_id,
             attachment_ids=body.attachment_ids,
             direct_model=body.direct_model,
+            allowed_models=body.allowed_models,
             vibe_coding=body.vibe_coding,
             skip_evolution_proposal=body.skip_evolution_proposal,
             project_id=body.project_id,
@@ -1279,6 +1298,7 @@ async def queue_conversation_message(
             allow_scale_mode_upgrade=body.allow_scale_mode_upgrade,
             replace_workspace_files=body.replace_workspace_files,
             direct_model=body.direct_model,
+            allowed_models=body.allowed_models,
             vibe_coding=body.vibe_coding,
             skip_evolution_proposal=body.skip_evolution_proposal,
             project_id=body.project_id,
