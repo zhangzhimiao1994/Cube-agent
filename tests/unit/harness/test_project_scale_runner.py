@@ -2754,23 +2754,33 @@ def test_capability_repair_requires_honest_unexecuted_checks(scale: str, deliver
 
 
 @pytest.mark.parametrize("saturated_evidence", (False, True))
+@pytest.mark.parametrize("preview_required", (False, True))
+@pytest.mark.parametrize("flow", (
+    "artifact_production", "direct", "dispatch", "hybrid", "multi_agent",
+))
 def test_medium_compact_report_repair_preserves_complete_business_guidance(
-    saturated_evidence: bool,
+    saturated_evidence: bool, preview_required: bool, flow: str,
 ) -> None:
     plan = build_project_scale_run_plan(
-        scales=("medium",), flows=("direct",), benchmark_kind="capability",
+        scales=("medium",), flows=(flow,), benchmark_kind="capability",
     )
+    body = dict(plan.requests[0].body)
+    if preview_required:
+        body["message"] = (
+            str(body["message"])
+            + " Put a self-contained preview.html or index.html entrypoint in the workspace."
+        )
     reasons = ["workspace_bundle: missing verification report artifact"]
     if saturated_evidence:
         reasons.insert(0, "generated_project_validation: " + "compile evidence " * 100)
 
     repair = _deliverable_repair_body(
-        dict(plan.requests[0].body), "medium:direct", benchmark_kind="capability",
+        body, f"medium:{flow}", benchmark_kind="capability",
         failed_reasons=tuple(reasons),
     )
 
     message = str(repair["message"])
-    assert len(message) <= 2_000
+    assert len(message) <= 6_000
     assert "Reference validation order is frozen" in message
     assert "before validating unrelated fields" in message
     assert "even if email, due_at, note, amount, or stage is absent or invalid" in message
@@ -2782,6 +2792,36 @@ def test_medium_compact_report_repair_preserves_complete_business_guidance(
     assert "read_before_implementation:true" in message
     assert "AGENTS.md workspace rules, HANDOFF, PROJECT_REQUIREMENTS.md" in message
     assert "applicable SKILL.md or agent-standard rules" in message
+    if not preview_required and flow in {"direct", "dispatch", "hybrid"}:
+        assert len(message) <= 2_000
+    if preview_required:
+        assert "Every authoritative replacement must include preview.html or index.html" in message
+    if flow == "multi_agent":
+        assert "normalized agent_id values architect, implementer, tester, and synthesizer" in message
+        assert "explicit handoffs" in message
+
+
+def test_compact_repair_budget_only_expands_for_guidance_not_external_text() -> None:
+    guidance = "MANDATORY_CONTRACT " * 130
+    external = "UNTRUSTED_NOISE " * 20_000
+    message = project_scale_runner_module._compose_capability_repair_message(
+        guidance=guidance, failed_evidence=external, original_request=external,
+        workspace_context="", max_chars=2_000,
+    )
+
+    assert message.startswith(" ".join(guidance.split()))
+    assert 2_000 < len(message) <= len(" ".join(guidance.split())) + 260
+    assert message.count("UNTRUSTED_NOISE") < 20
+
+
+def test_compact_repair_budget_has_bounded_contract_expansion() -> None:
+    message = project_scale_runner_module._compose_capability_repair_message(
+        guidance="OVERSIZED_CONTRACT " * 20_000, failed_evidence="FAILURE",
+        original_request="REQUEST", workspace_context="", max_chars=2_000,
+    )
+
+    assert len(message) <= 6_000
+    assert "FAILURE" in message
 
 
 def test_report_only_incremental_patch_preserves_source_and_package() -> None:

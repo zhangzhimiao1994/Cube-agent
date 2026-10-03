@@ -4754,6 +4754,11 @@ def _compose_capability_repair_message(
         fixed_suffix = " ".join(
             part for part in (evidence, "Original request:") if part
         )
+        # The compact target is soft; fixed contract guidance must survive extra modes/preview.
+        max_chars = max(
+            max_chars,
+            min(6_000, len(compact_guidance) + len(fixed_suffix) + 2),
+        )
         guidance_budget = max(0, max_chars - len(fixed_suffix) - 1)
         bounded_guidance = _bounded_repair_section(
             compact_guidance,
