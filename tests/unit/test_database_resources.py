@@ -1,5 +1,7 @@
 import asyncio
 import importlib.util
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,6 +16,36 @@ from agent_hub.db.migrations import resolve_database_url
 from agent_hub.db.models import AdminResourceRow, ConversationRow, RunRow
 from agent_hub.db.session import Database, build_database, build_session_factory
 from agent_hub.settings import Settings
+
+
+def test_offline_migration_preserves_existing_application_logger() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    script = """
+import io
+import logging
+import sys
+from pathlib import Path
+from alembic import command
+from alembic.config import Config
+
+logger = logging.getLogger('agent_hub.runtime.direct')
+messages = io.StringIO()
+logger.addHandler(logging.StreamHandler(messages))
+logger.setLevel(logging.WARNING)
+config = Config(str(Path(sys.argv[1]) / 'alembic.ini'))
+config.output_buffer = io.StringIO()
+config.set_main_option('sqlalchemy.url', 'postgresql+asyncpg://offline@localhost/offline')
+command.upgrade(config, 'base:0001_initial', sql=True)
+assert 'CREATE TABLE agent_hub_tenants' in config.output_buffer.getvalue()
+assert not logger.disabled, 'migration disabled the existing application logger'
+logger.warning('fixed-diagnostic-sentinel')
+assert 'fixed-diagnostic-sentinel' in messages.getvalue()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(repository)],
+        cwd=repository, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 async def test_database_exposes_and_disposes_its_owned_engine() -> None:
