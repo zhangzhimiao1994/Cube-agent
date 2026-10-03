@@ -103,8 +103,9 @@ async def test_acknowledged_congestion_stops_scanning_at_shared_window(
 
 @pytest.mark.parametrize("scoped", [False, True])
 @pytest.mark.parametrize("reason", [1, 2])
+@pytest.mark.parametrize("window", [0.004, 0.054], ids=["terminal-sleep", "regular-poll"])
 async def test_terminal_poll_does_not_restart_admission_when_timer_wakes_early(
-    monkeypatch: pytest.MonkeyPatch, scoped: bool, reason: int,
+    monkeypatch: pytest.MonkeyPatch, scoped: bool, reason: int, window: float,
 ) -> None:
     redis = DeadlineRedis()
     selected = deployment("selected")
@@ -130,10 +131,10 @@ async def test_terminal_poll_does_not_restart_admission_when_timer_wakes_early(
         patch.setattr(loop, "time", lambda: now)
         patch.setattr(asyncio, "sleep", early_sleep)
         with pytest.raises(CapacityWaitTimeout):
-            await capacity.acquire([selected], wait_timeout=0.004, estimated_tokens=11)
+            await capacity.acquire([selected], wait_timeout=window, estimated_tokens=11)
 
     assert len(redis.attempted_keys) == 1, "terminal polling must not issue a near-zero-budget RPC"
-    assert len(sleeps) == 1
+    assert len(sleeps) == (1 if window < root._poll_interval else 2)
     assert not redis.leases and root._waiters == 0
 
 

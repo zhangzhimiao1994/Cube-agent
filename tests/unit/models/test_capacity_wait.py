@@ -67,6 +67,42 @@ async def test_queue_window_is_soft_without_authorized_fallback(streaming: bool)
     assert len(capacity.records) == len(capacity.releases) == 1
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("timeout,windows", [(0.025, 1), (0.075, 2), (0.1, 2)])
+@pytest.mark.parametrize("clock_base", [0.0, 1000.0, 100000.0])
+async def test_final_soft_window_does_not_retry_after_early_timer_wake(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool, timeout: float, windows: int,
+    clock_base: float,
+) -> None:
+    capacity = CapacityStub([
+        *[CapacityWaitTimeout("busy") for _ in range(windows)],
+        CapacityBackendError("unexpected near-zero-budget retry"),
+    ])
+    gateway, secrets, transport = gateway_for(capacity)
+    loop = asyncio.get_running_loop()
+    real_sleep = asyncio.sleep
+    now = clock_base
+
+    async def early_sleep(delay: float) -> None:
+        nonlocal now
+        if delay > 0:
+            now += max(0, delay - 0.000001)
+        await real_sleep(0)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(loop, "time", lambda: now)
+        patch.setattr(asyncio, "sleep", early_sleep)
+        with pytest.raises(CapacityUnavailable):
+            await complete(gateway, streaming=streaming, timeout=timeout)
+
+    attempts = [
+        event for event in capacity.events if isinstance(event, tuple) and event[0] == "acquire"
+    ]
+    assert len(attempts) == windows
+    assert not secrets.references and not transport.calls and not transport.stream_calls
+    assert not capacity.records and not capacity.releases
+
+
 class WaitingCapacity(CapacityStub):
     def __init__(self) -> None:
         super().__init__([CapacityWaitTimeout("busy")])

@@ -677,18 +677,27 @@ class CapacityPool:
                     )
                     if lease is not None:
                         return lease
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise CapacityWaitTimeout("model capacity queue timeout")
-                if remaining <= self._poll_interval:
-                    # Timer callbacks can wake slightly early; the final poll
-                    # must not start another RPC with a near-zero budget.
-                    await asyncio.sleep(remaining)
-                    raise CapacityWaitTimeout("model capacity queue timeout")
-                await asyncio.sleep(self._poll_interval)
+                await self._wait_for_next_poll(deadline)
         finally:
             async with self._waiter_lock:
                 self._waiters -= 1
+
+    async def _wait_for_next_poll(self, deadline: float) -> None:
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise CapacityWaitTimeout("model capacity queue timeout")
+        terminal_poll = remaining <= self._poll_interval
+        await asyncio.sleep(min(self._poll_interval, remaining))
+        if terminal_poll:
+            raise CapacityWaitTimeout("model capacity queue timeout")
+        # A regular poll can also wake too close to the deadline for another
+        # query. Keep the confirmed busy outcome instead of issuing a tiny RPC.
+        remaining = deadline - loop.time()
+        if remaining <= self._poll_interval:
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            raise CapacityWaitTimeout("model capacity queue timeout")
 
     def _ordered_candidates(self, candidates: Sequence[Deployment]) -> tuple[Deployment, ...]:
         by_scope: dict[str, list[Deployment]] = {}
@@ -1123,13 +1132,7 @@ class _CapacityScopeView:
                     )
                     if lease is not None:
                         return lease
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise CapacityWaitTimeout("model capacity queue timeout")
-                if remaining <= root._poll_interval:
-                    await asyncio.sleep(remaining)
-                    raise CapacityWaitTimeout("model capacity queue timeout")
-                await asyncio.sleep(root._poll_interval)
+                await root._wait_for_next_poll(deadline)
         finally:
             async with root._waiter_lock:
                 root._waiters -= 1

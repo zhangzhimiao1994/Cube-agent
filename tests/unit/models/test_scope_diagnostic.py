@@ -57,9 +57,10 @@ async def test_gateway_classifies_local_gap_without_raw_error_text(
         ModelTransportError(private) if stage == "missing_status" else None,
         block=block if stage == "transport_timeout" else None,
     )
+    timeout = 0.03 if stage in {"credential_timeout", "transport_timeout"} else 1
     with pytest.raises(Exception) as caught:
         await make_gateway(transport, capacity, secret=secret).complete_with_context(
-            replace(request(allow_fallback=False), timeout_seconds=0.03),
+            replace(request(allow_fallback=False), timeout_seconds=timeout),
         )
     result = diagnostic(caught.value)
     assert result is not None

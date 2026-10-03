@@ -971,16 +971,23 @@ class ModelGateway:
         has_fallback: bool,
     ) -> CapacityLease:
         loop = asyncio.get_running_loop()
+        window_deadline = loop.time()
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise CapacityWaitTimeout("model capacity queue timeout")
             await self._initialize_capacity(capacity, timeout=min(wait_timeout, remaining))
-            remaining = deadline - loop.time()
+            started = loop.time()
+            remaining = deadline - started
             if remaining <= 0:
                 raise CapacityWaitTimeout("model capacity queue timeout")
+            # Carry and round the planned boundary forward so early wakes and
+            # floating-point tails cannot create an extra admission window.
+            window_deadline = min(
+                deadline,
+                math.nextafter(max(started, window_deadline) + wait_timeout, math.inf),
+            )
             window = min(wait_timeout, remaining)
-            started = loop.time()
             try:
                 # Native pools bound every RPC themselves; an outer timer would
                 # race their last window and misclassify an unknown Redis outcome.
@@ -996,7 +1003,9 @@ class ModelGateway:
                 if has_fallback or loop.time() >= deadline:
                     raise
                 # Custom controllers may report congestion before the window elapses.
-                await asyncio.sleep(max(0, min(started + window, deadline) - loop.time()))
+                await asyncio.sleep(max(0, window_deadline - loop.time()))
+                if window_deadline >= deadline:
+                    raise
 
     async def _initialize_capacity(
         self, capacity: CapacityController | CapacityPool, *, timeout: float,
