@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO, Protocol, cast
 from urllib.parse import unquote, urlsplit
@@ -41,6 +41,45 @@ _RESPONSE_HEADERS = {
     "content-type", "content-language", "cache-control", "etag", "last-modified",
     "location", "content-range", "accept-ranges",
 }
+
+
+class ProbeFailure(RuntimeError):
+    def __init__(self, phase: str, reason: str) -> None:
+        if phase not in {
+            "bootstrap", "control_fds", "node", "npm", "storage_read", "storage_write",
+            "http_bind", "http_relay", "http_cleanup", "trusted_prepare", "storage_prepare",
+            "runner_protocol", "runner_exit", "storage_roundtrip", "cleanup",
+        } or reason not in {
+            "permission_denied", "not_found", "read_only", "timeout", "nonzero_exit",
+            "bootstrap_failed", "invalid_result", "io_error", "failed",
+        }:
+            raise ValueError("invalid probe diagnostic")
+        self.phase = phase
+        self.reason = reason
+        super().__init__(f"preview probe failed: {phase}/{reason}")
+
+    def response(self) -> dict[str, object]:
+        return {"ok": False, "error": "preview probe failed", "phase": self.phase, "reason": self.reason}
+
+
+@contextlib.contextmanager
+def probe_phase(phase: str) -> Iterator[None]:
+    try:
+        yield
+    except ProbeFailure:
+        raise
+    except (OSError, ValueError, RuntimeError, EOFError, subprocess.SubprocessError) as error:
+        if isinstance(error, PermissionError):
+            reason = "permission_denied"
+        elif isinstance(error, FileNotFoundError):
+            reason = "not_found"
+        elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+            reason = "timeout"
+        elif isinstance(error, OSError):
+            reason = "read_only" if error.errno == 30 else "io_error"
+        else:
+            reason = "failed"
+        raise ProbeFailure(phase, reason) from None
 
 
 class FrameStream(Protocol):
@@ -227,8 +266,8 @@ def application_environment() -> dict[str, str]:
         "TMPDIR": "/preview/work/tmp", "TMP": "/preview/work/tmp",
         "PORT": str(APP_PORT), "HOST": "127.0.0.1", "DATA_DIR": "/preview/work/data",
         "NODE_OPTIONS": "", "NPM_CONFIG_NODE_OPTIONS": "",
-        "NPM_CONFIG_CACHE": "/preview/work/cache", "NPM_CONFIG_USERCONFIG": "/dev/null",
-        "NPM_CONFIG_GLOBALCONFIG": "/dev/null", "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+        "NPM_CONFIG_CACHE": "/preview/work/cache", "NPM_CONFIG_USERCONFIG": "/tmp/npm-user.npmrc",
+        "NPM_CONFIG_GLOBALCONFIG": "/tmp/npm-global.npmrc", "NPM_CONFIG_IGNORE_SCRIPTS": "true",
         "NPM_CONFIG_AUDIT": "false", "NPM_CONFIG_FUND": "false",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false", "NPM_CONFIG_FETCH_RETRIES": "0",
         "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
@@ -386,12 +425,15 @@ def _ensure_work_directory(path: Path) -> None:
 
 
 def _probe() -> None:
-    _protect_control_fds()
+    with probe_phase("control_fds"):
+        _protect_control_fds()
     _probe_toolchain()
     work = Path("/preview/work")
-    if (work / ".broker-storage-probe").read_bytes() != b"preview-storage-v1":
-        raise RuntimeError("private storage is not shared with PID1")
-    (work / ".runner-storage-probe").write_bytes(b"preview-storage-v1")
+    with probe_phase("storage_read"):
+        if (work / ".broker-storage-probe").read_bytes() != b"preview-storage-v1":
+            raise ProbeFailure("storage_read", "invalid_result")
+    with probe_phase("storage_write"):
+        (work / ".runner-storage-probe").write_bytes(b"preview-storage-v1")
     class ProbeHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             self.send_response(204)
@@ -400,31 +442,36 @@ def _probe() -> None:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with http.server.HTTPServer(("127.0.0.1", APP_PORT), ProbeHandler) as server:
+    with probe_phase("http_bind"):
+        server = http.server.HTTPServer(("127.0.0.1", APP_PORT), ProbeHandler)
+    with server:
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
-            response = relay_http(validate_http_request("GET", "/", (), b""))
-            if response["status_code"] != 204:
-                raise RuntimeError("private HTTP probe failed")
-            write_frame(sys.stdout.buffer, {"ok": True, "state": "probe"})
+            with probe_phase("http_relay"):
+                response = relay_http(validate_http_request("GET", "/", (), b""))
+                if response["status_code"] != 204:
+                    raise ProbeFailure("http_relay", "invalid_result")
+                write_frame(sys.stdout.buffer, {"ok": True, "state": "probe"})
         finally:
-            server.shutdown()
-            worker.join(timeout=2)
+            with probe_phase("http_cleanup"):
+                server.shutdown()
+                worker.join(timeout=2)
 
 
 def _probe_toolchain() -> None:
     if sys.platform != "linux":
         raise RuntimeError("preview toolchain probe requires isolated Linux")
-    for command in (
-        ("/preview/node/bin/node", "--version"),
-        ("/preview/node/bin/node", "/preview/node/bin/npm", "--version"),
+    for phase, command in (
+        ("node", ("/preview/node/bin/node", "--version")),
+        ("npm", ("/preview/node/bin/node", "/preview/node/bin/npm", "--version")),
     ):
-        result = subprocess.run(command, cwd="/preview/work", env=application_environment(),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, close_fds=True, timeout=5, check=False)
-        if result.returncode != 0:
-            raise RuntimeError("dedicated preview Node/npm unavailable inside unit")
+        with probe_phase(phase):
+            result = subprocess.run(command, cwd="/preview/work", env=application_environment(),
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, close_fds=True, timeout=5, check=False)
+            if result.returncode != 0:
+                raise ProbeFailure(phase, "nonzero_exit")
 
 
 def main() -> None:
@@ -435,6 +482,9 @@ def main() -> None:
             _probe()
         else:
             _run_stage(sys.argv[1])
+    except ProbeFailure as error:
+        write_frame(sys.stdout.buffer, error.response())
+        raise SystemExit(1) from None
     except (EOFError, ValueError, OSError, RuntimeError, TimeoutError, subprocess.SubprocessError):
         write_frame(sys.stdout.buffer, {"ok": False, "error": "preview stage failed"})
         raise SystemExit(1) from None

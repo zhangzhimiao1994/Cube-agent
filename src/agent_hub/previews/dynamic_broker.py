@@ -34,7 +34,9 @@ from agent_hub.previews.dynamic_runner import (
     READY_TIMEOUT,
     REQUEST_TIMEOUT,
     FrameStream,
+    ProbeFailure,
     json_object,
+    probe_phase,
     read_frame,
     validate_wire_http,
     write_frame,
@@ -342,17 +344,31 @@ class _Session:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
-def _pipe_read(process: subprocess.Popen[bytes], timeout: float) -> dict[str, object]:
+def _pipe_read(process: subprocess.Popen[bytes], timeout: float,
+               diagnostic: bytearray | None = None) -> dict[str, object]:
     assert process.stdout is not None
     stdout = process.stdout
     deadline = time.monotonic() + timeout
+    stderr = process.stderr if diagnostic is not None else None
 
     def exact(size: int) -> bytes:
+        nonlocal stderr
         data = bytearray()
         while len(data) < size:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([stdout], [], [], remaining)[0]:
+            if remaining <= 0:
                 raise TimeoutError("preview runner IPC timeout")
+            readable = select.select([stdout] if stderr is None else [stdout, stderr], [], [], remaining)[0]
+            if not readable:
+                raise TimeoutError("preview runner IPC timeout")
+            if stderr is not None and stderr in readable:
+                chunk = os.read(stderr.fileno(), 4096)
+                if diagnostic is not None:
+                    diagnostic.extend(chunk[:max(0, 4096 - len(diagnostic))])
+                if not chunk:
+                    stderr = None
+            if stdout not in readable:
+                continue
             chunk = os.read(stdout.fileno(), size - len(data))
             if not chunk:
                 raise EOFError("preview runner exited")
@@ -531,15 +547,42 @@ class PreviewBroker:
         remaining = max(1, int(session.expires_at - time.monotonic()))
         command = build_systemd_command(self.policy, session.handle, stage, session.owned, remaining)
         process = subprocess.Popen(command, env=_ENV, stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE if stage == "probe" else subprocess.DEVNULL,
                                    close_fds=True, bufsize=0)
         session.process = process
-        result = _pipe_read(process, min(remaining, READY_TIMEOUT + 2 if stage == "start" else 125))
+        if stage == "probe":
+            diagnostic = bytearray()
+            try:
+                result = _pipe_read(process, min(remaining, 125), diagnostic)
+            except (OSError, EOFError, ValueError) as error:
+                reason = "timeout" if isinstance(error, TimeoutError) else "bootstrap_failed"
+                if b"can't open file '/preview/trusted/dynamic_runner.py'" in diagnostic:
+                    if b"[Errno 13]" in diagnostic:
+                        reason = "permission_denied"
+                    elif b"[Errno 2]" in diagnostic:
+                        reason = "not_found"
+                raise ProbeFailure("bootstrap", reason) from None
+            if result.get("ok") is False:
+                phase, reported_reason = result.get("phase"), result.get("reason")
+                if isinstance(phase, str) and isinstance(reported_reason, str):
+                    try:
+                        failure = ProbeFailure(phase, reported_reason)
+                    except ValueError:
+                        failure = ProbeFailure("runner_protocol", "invalid_result")
+                    raise failure
+                raise ProbeFailure("runner_protocol", "invalid_result")
+        else:
+            result = _pipe_read(process, min(remaining, READY_TIMEOUT + 2 if stage == "start" else 125))
         expected = "ready" if stage == "start" else "probe" if stage == "probe" else "prepared"
         if result != {"ok": True, "state": expected}:
+            if stage == "probe":
+                raise ProbeFailure("runner_protocol", "invalid_result")
             raise RuntimeError(f"preview {stage} failed")
         if stage != "start":
             if process.wait(timeout=5) != 0:
+                if stage == "probe":
+                    raise ProbeFailure("runner_exit", "nonzero_exit")
                 raise RuntimeError(f"preview {stage} failed")
             self._stop_unit(unit)
             session.units.remove(unit)
@@ -686,14 +729,18 @@ class PreviewBroker:
                 (probe_session.owned / "root").mkdir(mode=0o755)
                 (probe_session.owned / "root").chmod(0o755)
                 (probe_session.owned / "work").mkdir(mode=0o755)
-                self._prepare_trusted(probe_session)
-                self._prepare_storage(probe_session)
+                with probe_phase("trusted_prepare"):
+                    self._prepare_trusted(probe_session)
+                with probe_phase("storage_prepare"):
+                    self._prepare_storage(probe_session)
                 self._launch(probe_session, "probe")
-                if (probe_session.owned / "work/.runner-storage-probe").read_bytes() != b"preview-storage-v1":
-                    raise RuntimeError("PID1 storage probe round trip failed")
+                with probe_phase("storage_roundtrip"):
+                    if (probe_session.owned / "work/.runner-storage-probe").read_bytes() != b"preview-storage-v1":
+                        raise ProbeFailure("storage_roundtrip", "invalid_result")
                 return {"ok": True, "state": "probe"}
             finally:
-                self._stop(probe_session)
+                with probe_phase("cleanup"):
+                    self._stop(probe_session)
         if action == "start":
             with self._lock:
                 if any(session.owner is owner for session in self._sessions.values()):
@@ -828,6 +875,9 @@ def serve_broker(listener: socket.socket, broker: PreviewBroker,
                 payload = read_frame(stream)
                 try:
                     result = broker.handle(payload, peer_uid=uid, owner=owner)
+                except ProbeFailure as error:
+                    print(str(error), file=sys.stderr, flush=True)
+                    result = error.response()
                 except (ValueError, OSError, RuntimeError, EOFError, subprocess.SubprocessError):
                     result = {"ok": False, "error": "preview broker operation failed"}
                 write_frame(stream, result)

@@ -381,7 +381,8 @@ def test_fixed_trusted_copies_are_readable_before_any_unit(
     payload: dict[str, object] = {"version": 1, "action": action}
     if action == "start":
         payload.update(source_root=str(source), preview_id="fixture", lifetime_seconds=30)
-    with pytest.raises(RuntimeError, match="fixture stops before OS execution"):
+    expected = "storage_prepare/failed" if action == "probe" else "fixture stops before OS execution"
+    with pytest.raises(RuntimeError, match=expected):
         service.handle(payload, peer_uid=policy.allowed_uid, owner=object())
 
 
@@ -395,6 +396,63 @@ def test_units_bind_only_owned_trusted_copies(tmp_path: Path, stage: str) -> Non
     assert "BindReadOnlyPaths=/run/preview/owned/trusted/harness/project_validation_sandbox.py:/preview/trusted/harness/project_validation_sandbox.py" in command
     assert not any(str(policy.trusted_source_root) in item for item in command)
     assert "SupplementaryGroups=" in command
+
+
+@pytest.mark.parametrize("stderr,reason", [
+    (b"/usr/bin/python3: can't open file '/preview/trusted/dynamic_runner.py': [Errno 13] Permission denied", "permission_denied"),
+    (b"/usr/bin/python3: can't open file '/preview/trusted/dynamic_runner.py': [Errno 2] No such file or directory", "not_found"),
+    (b"secret fixture unrecognized stderr", "bootstrap_failed"),
+])
+def test_probe_bootstrap_diagnostics_are_fixed_and_probe_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: bytes, reason: str,
+) -> None:
+    from types import SimpleNamespace
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    session = mod._Session("a" * 32, "probe", object(), Path("/run/preview/owned"), 1e20)
+    observed: list[object] = []
+
+    def popen(argv: object, **kwargs: object) -> object:
+        observed.append(kwargs["stderr"])
+        return SimpleNamespace()
+
+    def read(process: object, timeout: float, diagnostic: bytearray | None = None) -> dict[str, object]:
+        if diagnostic is not None:
+            diagnostic.extend(stderr)
+        raise EOFError("fixture")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", popen)
+    monkeypatch.setattr(mod, "_pipe_read", read)
+    with pytest.raises(mod.ProbeFailure) as failure:
+        service._launch(session, "probe")
+    assert (failure.value.phase, failure.value.reason) == ("bootstrap", reason)
+    with pytest.raises(EOFError):
+        service._launch(session, "start")
+    assert observed == [mod.subprocess.PIPE, mod.subprocess.DEVNULL]
+
+
+def test_probe_stderr_capture_is_bounded_and_separate_from_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+    mod = broker()
+    output = io.BytesIO()
+    mod.write_frame(output, {"ok": True, "state": "probe"})
+    output.seek(0)
+    stdout = SimpleNamespace(fileno=lambda: 1)
+    stderr = SimpleNamespace(fileno=lambda: 2)
+    process = SimpleNamespace(stdout=stdout, stderr=stderr)
+    diagnostic = bytearray()
+
+    def read(fd: int, count: int) -> bytes:
+        return output.read(count) if fd == 1 else b"x" * count
+
+    monkeypatch.setattr(mod.os, "read", read)
+    monkeypatch.setattr(mod.select, "select", lambda readers, *args: (readers, [], []))
+    assert mod._pipe_read(process, 1, diagnostic) == {"ok": True, "state": "probe"}
+    assert diagnostic == b"x" * 4096
 
 
 def test_stage_work_permissions_are_handed_off_by_root_broker(
