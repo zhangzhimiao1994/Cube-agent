@@ -139,6 +139,27 @@ def test_snapshot_is_frozen_and_not_affected_by_caller_writes(tmp_path: Path) ->
     assert digest != mod.inspect_source(root, policy)
 
 
+@pytest.mark.parametrize("stage", ["install", "build", "start", "probe"])
+def test_install_metadata_file_uses_existing_disk_budget_only(tmp_path: Path, stage: str) -> None:
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    owned = Path("/run/preview/owned")
+    command = mod.build_systemd_command(policy, "a" * 32, stage, owned, 30)
+    storage = mod.build_storage_command(policy, "a" * 32, owned)
+    options = next(item.removeprefix("--options=") for item in storage
+                   if item.startswith("--options="))
+    size = dict(item.split("=", 1) for item in options.split(",") if "=" in item)["size"]
+    assert size == "256M"
+    expected = int(size[:-1]) * 1024 * 1024 if stage == "install" else 32 * 1024 * 1024
+    assert [item for item in command if item.startswith("LimitFSIZE=")] == [
+        f"LimitFSIZE={expected}",
+    ]
+    assert "MemoryMax=384M" in command
+    assert "MemorySwapMax=0" in command
+    assert "TasksMax=64" in command
+    assert "CPUQuota=50%" in command
+
+
 def test_full_tree_cleanup_failure_retains_quota_and_owned_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -698,6 +719,9 @@ def test_reaper_reclaims_crashed_ready_runner_without_waiting_for_lease(
     "nonzero_exit", "permission_denied", "storage_full", "read_only", "resource_limit",
     "registry_unavailable", "dependency_unavailable", "dependency_conflict", "package_invalid",
     "certificate_error", "dependency_rejected", "supervisor_exit",
+    "storage_conflict", "runtime_incompatible", "integrity_error", "registry_denied",
+    "npm_exit_incomplete", "npm_internal_error",
+    "signal_abort", "signal_kill", "signal_segv", "signal_term", "file_size_limit", "signal_exit",
 ])
 def test_launch_preserves_whitelisted_startup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, reason: str,

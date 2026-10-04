@@ -374,7 +374,8 @@ def run_stage_with_logs(
     monkeypatch.setattr(mod.threading, "Thread", ImmediateThread)
     if log_limit is not None:
         monkeypatch.setattr(mod, "MAX_LOG", log_limit)
-    if exit_code == 0 and log_limit is None:
+    overflow = sum(len(chunk) for chunk in stdout + stderr) > mod.MAX_LOG
+    if exit_code == 0 and not overflow:
         mod.main()
     else:
         with pytest.raises(SystemExit) as failure:
@@ -382,7 +383,8 @@ def run_stage_with_logs(
         assert failure.value.code == 1
     assert cleaned == [child]
     assert child.stdout.closed and child.stderr.closed
-    assert bool(killed) is (log_limit is not None)
+    assert bool(killed) is overflow
+    assert b"sentinel" not in output.getvalue()
     output.seek(0)
     result: dict[str, object] = mod.read_frame(output)
     assert not output.read(), "only one sanitized frame may leave the runner"
@@ -394,6 +396,7 @@ def run_stage_with_logs(
     (b"EACCES", "permission_denied"), (b"EPERM", "permission_denied"),
     (b"ENOENT", "not_found"),
     (b"ENOSPC", "storage_full"), (b"EROFS", "read_only"),
+    (b"EFBIG", "file_size_limit"),
     (b"ENOMEM", "resource_limit"), (b"EMFILE", "resource_limit"),
     (b"ENFILE", "resource_limit"), (b"ENOTFOUND", "registry_unavailable"),
     (b"EAI_AGAIN", "registry_unavailable"), (b"ECONNREFUSED", "registry_unavailable"),
@@ -406,6 +409,18 @@ def run_stage_with_logs(
     (b"UNABLE_TO_VERIFY_LEAF_SIGNATURE", "certificate_error"),
     (b"SELF_SIGNED_CERT_IN_CHAIN", "certificate_error"),
     (b"DEPTH_ZERO_SELF_SIGNED_CERT", "certificate_error"),
+    (b"EEXIST", "storage_conflict"), (b"ENOTEMPTY", "storage_conflict"),
+    (b"EBADENGINE", "runtime_incompatible"), (b"EBADDEVENGINES", "runtime_incompatible"),
+    (b"EBADPLATFORM", "runtime_incompatible"), (b"EINTEGRITY", "integrity_error"),
+    (b"E401", "registry_denied"), (b"E403", "registry_denied"),
+    (b"ENEEDAUTH", "registry_denied"),
+    (b"EINVALIDPACKAGENAME", "package_invalid"), (b"EINVALIDTAGNAME", "package_invalid"),
+    (b"EINVALIDPACKAGETYPE", "package_invalid"), (b"EUSAGE", "package_invalid"),
+    (b"E500", "registry_unavailable"), (b"E502", "registry_unavailable"),
+    (b"E503", "registry_unavailable"), (b"E504", "registry_unavailable"),
+    (b"E429", "registry_unavailable"), (b"ENOTCACHED", "registry_unavailable"),
+    (b"ESOCKETTIMEDOUT", "registry_unavailable"),
+    (b"ERR_WORKER_INIT_FAILED", "resource_limit"),
 ])
 def test_install_stderr_reports_only_fixed_npm_category(
     monkeypatch: pytest.MonkeyPatch, prefix: bytes, code: bytes, reason: str,
@@ -419,10 +434,38 @@ def test_install_stderr_reports_only_fixed_npm_category(
     }
 
 
+@pytest.mark.parametrize("prefix", [b"npm error ", b"npm ERR! "])
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n", b""])
+@pytest.mark.parametrize("chunk_size", [1, 4096])
+@pytest.mark.parametrize("message,reason", [
+    (b"Exit handler never called!", "npm_exit_incomplete"),
+    (b"Cannot read properties of undefined (reading 'sentinel')", "npm_internal_error"),
+    (b"Cannot read properties of null (reading 'sentinel')", "npm_internal_error"),
+    (b"Invalid Version: /private/token=sentinel", "package_invalid"),
+    (b"Invalid comparator: /private/token=sentinel", "package_invalid"),
+])
+def test_install_known_npm_messages_report_only_fixed_category(
+    monkeypatch: pytest.MonkeyPatch, prefix: bytes, ending: bytes, chunk_size: int,
+    message: bytes, reason: str,
+) -> None:
+    line = prefix + message + ending
+    chunks = tuple(line[i:i + chunk_size] for i in range(0, len(line), chunk_size))
+    assert run_stage_with_logs(monkeypatch, chunks) == {
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": reason,
+    }
+
+
 @pytest.mark.parametrize("line,reason", [
     (b"npm ERR! code ENOSPC\n", "storage_full"),
     (b"npm error code ERESOLVE\r\n", "dependency_conflict"),
     (b"npm error code ENOLOCK", "package_invalid"),
+    (b"npm error code EEXIST\n", "storage_conflict"),
+    (b"npm ERR! code EBADDEVENGINES\r\n", "runtime_incompatible"),
+    (b"npm error code EINTEGRITY", "integrity_error"),
+    (b"npm error code ENEEDAUTH\n", "registry_denied"),
+    (b"npm error code EINVALIDPACKAGETYPE\n", "package_invalid"),
+    (b"npm error code ENOTCACHED\n", "registry_unavailable"),
+    (b"npm error code ERR_WORKER_INIT_FAILED\n", "resource_limit"),
     (b"generated dependency source rejected: /private/token=sentinel\n", "dependency_rejected"),
     (b"generated dependency source rejected: /private/token=sentinel", "dependency_rejected"),
 ])
@@ -444,6 +487,31 @@ def test_install_diagnostic_handles_single_byte_chunks(
     b"npm error code EACCES\rhidden\n", b"npm error code EACCES\xff\n",
     b"generated dependency source rejected:/private/token=sentinel\n",
     b"prefix generated dependency source rejected: sentinel\n",
+    b"npm error code E501\n", b"npm error code E499\n",
+    b"npm error code EEXIST token=sentinel\n", b"npm error code EEXISTING\n",
+    b"npm error code ERR_WORKER_INIT_FAILED_EXTRA\n",
+    b"npm error code eintegrity\n", b"npm error code E401\x00\n",
+    b"npm error /private/token=sentinel Exit handler never called!\n",
+    b"npm error Exit handler never called! token=sentinel\n",
+    b"npm error Exit handler never called\n",
+    b"npm error Exit handler never called!\rhidden\n",
+    b"npm error Exit handler never called!\x1b[0m\n",
+    b"npm error Cannot read properties of undefined\n",
+    b"npm error Cannot read properties of null sentinel\n",
+    b"npm error Cannot read properties of undefined (reading sentinel)\n",
+    b"npm error Cannot read properties of null (reading \"sentinel\")\n",
+    b"npm error Cannot read properties of undefined (reading 'sentinel'\n",
+    b"npm error Cannot read properties of undefined (reading 'sentinel') suffix\n",
+    b"npm error Cannot read properties of null (writing 'sentinel')\n",
+    b"npm error Cannot read properties of false (reading 'sentinel')\n",
+    b"npm error Cannot read properties of null (reading 'sentinel\x00')\n",
+    b"npm error Cannot read properties of null (reading 'sentinel\rhidden')\n",
+    b"npm error Cannot read properties of null (reading 'sentinel\xff')\n",
+    b"npm error Invalid Version:/private/token=sentinel\n",
+    b"npm error Invalid comparator:/private/token=sentinel\n",
+    b"npm error Invalid Version \n", b"npm error Invalid comparator \n",
+    b"npm error Invalid version: token=sentinel\n",
+    b"npm error Invalid Comparator: token=sentinel\n",
 ])
 def test_unknown_install_stderr_does_not_classify_or_leak(
     monkeypatch: pytest.MonkeyPatch, line: bytes,
@@ -454,10 +522,33 @@ def test_unknown_install_stderr_does_not_classify_or_leak(
     }
 
 
+@pytest.mark.parametrize("prefix", [
+    b"", b"prefix npm error ", b"npm warn ", b"npm notice ",
+    b"npm ERR ", b"npm error code ", b"\x1b[31mnpm error ",
+])
+@pytest.mark.parametrize("message", [
+    b"Exit handler never called!",
+    b"Cannot read properties of undefined (reading 'sentinel')",
+    b"Cannot read properties of null (reading 'sentinel')",
+    b"Invalid Version: /private/token=sentinel",
+    b"Invalid comparator: /private/token=sentinel",
+])
+def test_npm_message_requires_exact_error_prefix(
+    monkeypatch: pytest.MonkeyPatch, prefix: bytes, message: bytes,
+) -> None:
+    assert run_stage_with_logs(monkeypatch, (prefix + message + b"\n",)) == {
+        "ok": False, "error": "preview startup failed", "phase": "install",
+        "reason": "nonzero_exit",
+    }
+
+
 @pytest.mark.parametrize("tail,reason", [
     (b"npm error code EACCES\n", "nonzero_exit"),
     (b"npm error code EACCES", "nonzero_exit"),
     (b"npm error code EACCES\nnpm error code ENOSPC\n", "storage_full"),
+    (b"npm error Exit handler never called!\n", "nonzero_exit"),
+    (b"npm error Invalid Version: sentinel", "nonzero_exit"),
+    (b"npm error Invalid comparator: sentinel\nnpm error code EEXIST\n", "storage_conflict"),
 ])
 def test_install_discards_entire_overlong_line_until_newline(
     monkeypatch: pytest.MonkeyPatch, tail: bytes, reason: str,
@@ -469,20 +560,34 @@ def test_install_discards_entire_overlong_line_until_newline(
     assert result["reason"] == reason
 
 
-@pytest.mark.parametrize("length,reason", [(512, "dependency_rejected"), (513, "nonzero_exit")])
+@pytest.mark.parametrize("prefix,suffix,reason", [
+    (b"generated dependency source rejected: ", b"", "dependency_rejected"),
+    (b"npm error Invalid Version: ", b"", "package_invalid"),
+    (b"npm ERR! Invalid comparator: ", b"", "package_invalid"),
+    (b"npm error Cannot read properties of null (reading '", b"')", "npm_internal_error"),
+])
+@pytest.mark.parametrize("length", [512, 513])
+@pytest.mark.parametrize("ending", [b"\n", b""])
 def test_install_diagnostic_line_buffer_has_fixed_boundary(
-    monkeypatch: pytest.MonkeyPatch, length: int, reason: str,
+    monkeypatch: pytest.MonkeyPatch, prefix: bytes, suffix: bytes, reason: str,
+    length: int, ending: bytes,
 ) -> None:
-    line = b"generated dependency source rejected: ".ljust(length, b"x")
-    result = run_stage_with_logs(monkeypatch, (line[:500], line[500:], b"\n"))
-    assert result["reason"] == reason
+    line = prefix.ljust(length - len(suffix), b"x") + suffix
+    result = run_stage_with_logs(monkeypatch, (line[:500], line[500:] + ending))
+    assert result["reason"] == (reason if length == 512 else "nonzero_exit")
 
 
 @pytest.mark.parametrize("stage,stream", [
     ("install", "stdout"), ("build", "stderr"), ("start", "stderr"),
+    ("build", "stdout"), ("start", "stdout"),
 ])
 @pytest.mark.parametrize("line", [
     b"npm error code EACCES\n", b"generated dependency source rejected: sentinel\n",
+    b"npm error code EEXIST\n", b"npm ERR! Exit handler never called!\n",
+    b"npm error Cannot read properties of undefined (reading 'sentinel')\n",
+    b"npm error Cannot read properties of null (reading 'sentinel')\n",
+    b"npm error Invalid Version: token=sentinel\n",
+    b"npm ERR! Invalid comparator: token=sentinel\n",
 ])
 def test_install_classification_is_restricted_to_install_stderr(
     monkeypatch: pytest.MonkeyPatch, stage: str, stream: str, line: bytes,
@@ -496,6 +601,11 @@ def test_install_classification_is_restricted_to_install_stderr(
 
 @pytest.mark.parametrize("line", [
     b"npm error code EACCES\n", b"generated dependency source rejected: sentinel\n",
+    b"npm error code EINTEGRITY\n", b"npm error Exit handler never called!\n",
+    b"npm error Cannot read properties of undefined (reading 'sentinel')\n",
+    b"npm error Cannot read properties of null (reading 'sentinel')\n",
+    b"npm ERR! Invalid Version: token=sentinel\n",
+    b"npm error Invalid comparator: token=sentinel\n",
 ])
 def test_successful_install_ignores_error_looking_stderr(
     monkeypatch: pytest.MonkeyPatch, line: bytes,
@@ -505,17 +615,105 @@ def test_successful_install_ignores_error_looking_stderr(
     }
 
 
-@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("stage", ["install", "build", "start"])
+@pytest.mark.parametrize("stderr", [(), (b"unknown /private/token=sentinel\n",)])
+@pytest.mark.parametrize("exit_code,reason", [
+    (-6, "signal_abort"), (-9, "signal_kill"), (-11, "signal_segv"),
+    (-15, "signal_term"), (-25, "file_size_limit"),
+    (-1, "signal_exit"), (-127, "signal_exit"),
+])
+def test_signal_exit_reports_fixed_category_only_for_preparation(
+    monkeypatch: pytest.MonkeyPatch, stage: str, stderr: tuple[bytes, ...],
+    exit_code: int, reason: str,
+) -> None:
+    assert run_stage_with_logs(monkeypatch, stderr, stage=stage, exit_code=exit_code) == {
+        "ok": False, "error": "preview startup failed", "phase": stage,
+        "reason": "nonzero_exit" if stage == "start" else reason,
+    }
+
+
+@pytest.mark.parametrize("stage", ["install", "build"])
+@pytest.mark.parametrize("exit_code", [0, 1, 6, 9, 11, 15, 25, 134, 137, 139, 143, 153])
+def test_nonnegative_preparation_exit_does_not_become_signal_category(
+    monkeypatch: pytest.MonkeyPatch, stage: str, exit_code: int,
+) -> None:
+    result = run_stage_with_logs(monkeypatch, (), stage=stage, exit_code=exit_code)
+    if exit_code == 0:
+        assert result == {"ok": True, "state": "prepared"}
+    else:
+        assert result == {
+            "ok": False, "error": "preview startup failed", "phase": stage,
+            "reason": "nonzero_exit",
+        }
+
+
+@pytest.mark.parametrize("exit_code", [-6, -9, -11, -15, -25, -1])
+@pytest.mark.parametrize("line,reason", [
+    (b"npm error code EEXIST\n", "storage_conflict"),
+    (b"npm error Exit handler never called!\n", "npm_exit_incomplete"),
+    (b"generated dependency source rejected: token=sentinel\n", "dependency_rejected"),
+])
+def test_install_diagnostic_takes_priority_over_signal_category(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, line: bytes, reason: str,
+) -> None:
+    assert run_stage_with_logs(monkeypatch, (line,), exit_code=exit_code) == {
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": reason,
+    }
+
+
+@pytest.mark.parametrize("stage,stream", [
+    ("install", "stdout"), ("build", "stdout"), ("build", "stderr"),
+])
+def test_npm_text_outside_install_stderr_does_not_override_signal_category(
+    monkeypatch: pytest.MonkeyPatch, stage: str, stream: str,
+) -> None:
+    line = b"npm error code EEXIST\n"
+    assert run_stage_with_logs(
+        monkeypatch, (line,) if stream == "stderr" else (),
+        stdout=(line,) if stream == "stdout" else (), stage=stage, exit_code=-9,
+    ) == {
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": "signal_kill",
+    }
+
+
+@pytest.mark.parametrize("stage", ["install", "build"])
+@pytest.mark.parametrize("exit_code", [0, 1, -6, -9, -11, -15, -25, -1])
 @pytest.mark.parametrize("chunks", [
     (b"npm error code EACCES\n", b"x" * 65),
     (b"x" * 65 + b"\nnpm error code EACCES\n",),
+    (b"npm error Exit handler never called!\n", b"x" * 65),
+    (b"npm error Invalid Version: sentinel\n", b"x" * 65),
 ])
 def test_log_limit_takes_priority_over_install_classification(
-    monkeypatch: pytest.MonkeyPatch, exit_code: int, chunks: tuple[bytes, ...],
+    monkeypatch: pytest.MonkeyPatch, stage: str, exit_code: int, chunks: tuple[bytes, ...],
 ) -> None:
-    assert run_stage_with_logs(monkeypatch, chunks, exit_code=exit_code, log_limit=64) == {
-        "ok": False, "error": "preview startup failed", "phase": "install", "reason": "log_limit",
+    assert run_stage_with_logs(
+        monkeypatch, chunks, stage=stage, exit_code=exit_code, log_limit=64,
+    ) == {
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": "log_limit",
     }
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("extra_byte", [b"", b"x"])
+@pytest.mark.parametrize("stream", ["stderr", "combined"])
+def test_install_diagnostic_preserves_one_mib_log_boundary(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, extra_byte: bytes, stream: str,
+) -> None:
+    line = b"npm error Exit handler never called!\n"
+    padding = b"x" * (1024 * 1024 - len(line)) + extra_byte
+    chunks = tuple(padding[i:i + 4096] for i in range(0, len(padding), 4096))
+    result = run_stage_with_logs(
+        monkeypatch, (line,) + chunks if stream == "stderr" else (line,),
+        stdout=chunks if stream == "combined" else (), exit_code=exit_code,
+    )
+    if not extra_byte and exit_code == 0:
+        assert result == {"ok": True, "state": "prepared"}
+    else:
+        assert result == {
+            "ok": False, "error": "preview startup failed", "phase": "install",
+            "reason": "log_limit" if extra_byte else "npm_exit_incomplete",
+        }
 
 
 @pytest.mark.parametrize("error,reason", [
@@ -547,6 +745,14 @@ def test_startup_phase_sanitizes_errors_and_preserves_inner_phase(
 @pytest.mark.parametrize("phase,reason", [
     ("/private/source", "failed"), ("install", "token=sentinel"),
     ([], "failed"), ("install", {}), (True, "failed"), ("probe", "failed"),
+    ("install", "storage_conflict token=sentinel"), ("install", "runtime_incompatible/sentinel"),
+    ("install", "integrity_error\n"), ("install", "registry_denied\x00"),
+    ("install", "npm_exit_incomplete sentinel"), ("install", "npm_internal_error/sentinel"),
+    ("install", "EEXIST"), ("install", "npm_unknown_error"),
+    ("install", "signal_abort sentinel"), ("install", "signal_kill/sentinel"),
+    ("install", "signal_segv\n"), ("install", "signal_term\x00"),
+    ("install", "file_size_limit sentinel"), ("install", "signal_exit/sentinel"),
+    ("install", "SIGKILL"), ("install", "signal_bus"),
 ])
 def test_startup_diagnostic_rejects_non_whitelisted_values(phase: Any, reason: Any) -> None:
     mod = runner()

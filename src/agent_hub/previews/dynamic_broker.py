@@ -50,6 +50,7 @@ _HANDLE = re.compile(r"[0-9a-f]{32}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 _PLATFORM = sys.platform
+_PRIVATE_DISK_MIB = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +276,9 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
     root, work, source = (_systemd_path(owned / name) for name in ("root", "work", "source"))
     trusted = _systemd_path(owned / "trusted")
     node = _systemd_path(policy.node_root)
+    # Trusted npm caches full registry metadata, which can exceed an app file's cap.
+    # Installation still shares the same bounded disk; generated code keeps its cap.
+    file_limit = _PRIVATE_DISK_MIB * 1024 * 1024 if stage == "install" else 33554432
     properties = [
         "BindsTo=agent-hub-preview-broker.service", "After=agent-hub-preview-broker.service",
         f"RequiresMountsFor={work}",
@@ -286,7 +290,7 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
         "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictRealtime=yes",
         "KillMode=control-group", "SendSIGKILL=yes", "TimeoutStopSec=3s",
         "TasksMax=64", "MemoryMax=384M", "MemorySwapMax=0", "CPUQuota=50%",
-        "LimitFSIZE=33554432", "LimitNOFILE=256", "LimitCORE=0",
+        f"LimitFSIZE={file_limit}", "LimitNOFILE=256", "LimitCORE=0",
         f"RuntimeMaxSec={min(lifetime_seconds, 130) if stage in {'install', 'build'} else lifetime_seconds}s",
         f"RootDirectory={root}",
         "InaccessiblePaths=-/home -/root -/var/lib/agent-hub -/run/agent-hub -/run/docker.sock -/etc/agent-hub -/opt/agent-hub -/usr/local",
@@ -321,7 +325,7 @@ def build_storage_command(policy: PreviewBrokerPolicy, handle: str, owned: Path)
         raise ValueError("invalid internal storage identity")
     return (
         "/usr/bin/systemd-mount", "--quiet", "--collect", "--type=tmpfs",
-        "--options=size=256M,nr_inodes=16384,nosuid,nodev,mode=0777",
+        f"--options=size={_PRIVATE_DISK_MIB}M,nr_inodes=16384,nosuid,nodev,mode=0777",
         "--property=BindsTo=agent-hub-preview-broker.service",
         "--property=After=agent-hub-preview-broker.service", "--property=TimeoutSec=5s",
         "tmpfs", _systemd_path(owned / "work"),

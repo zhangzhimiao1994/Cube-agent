@@ -45,13 +45,25 @@ _MAX_INSTALL_DIAGNOSTIC_LINE = 512
 _NPM_INSTALL_REASONS = {
     b"EACCES": "permission_denied", b"EPERM": "permission_denied",
     b"ENOENT": "not_found", b"ENOSPC": "storage_full", b"EROFS": "read_only",
+    b"EFBIG": "file_size_limit",
+    b"EEXIST": "storage_conflict", b"ENOTEMPTY": "storage_conflict",
+    b"EBADENGINE": "runtime_incompatible", b"EBADDEVENGINES": "runtime_incompatible",
+    b"EBADPLATFORM": "runtime_incompatible", b"EINTEGRITY": "integrity_error",
+    b"E401": "registry_denied", b"E403": "registry_denied", b"ENEEDAUTH": "registry_denied",
     b"ENOMEM": "resource_limit", b"EMFILE": "resource_limit", b"ENFILE": "resource_limit",
+    b"ERR_WORKER_INIT_FAILED": "resource_limit",
     b"ENOTFOUND": "registry_unavailable", b"EAI_AGAIN": "registry_unavailable",
     b"ECONNREFUSED": "registry_unavailable", b"ECONNRESET": "registry_unavailable",
     b"ETIMEDOUT": "registry_unavailable", b"ERR_SOCKET_TIMEOUT": "registry_unavailable",
+    b"ESOCKETTIMEDOUT": "registry_unavailable", b"ENOTCACHED": "registry_unavailable",
+    b"E500": "registry_unavailable", b"E502": "registry_unavailable",
+    b"E503": "registry_unavailable", b"E504": "registry_unavailable",
+    b"E429": "registry_unavailable",
     b"E404": "dependency_unavailable", b"ETARGET": "dependency_unavailable",
     b"ERESOLVE": "dependency_conflict", b"EJSONPARSE": "package_invalid",
     b"ENOLOCK": "package_invalid", b"EPACKAGEJSON": "package_invalid",
+    b"EINVALIDPACKAGENAME": "package_invalid", b"EINVALIDTAGNAME": "package_invalid",
+    b"EINVALIDPACKAGETYPE": "package_invalid", b"EUSAGE": "package_invalid",
     b"CERT_HAS_EXPIRED": "certificate_error",
     b"UNABLE_TO_VERIFY_LEAF_SIGNATURE": "certificate_error",
     b"SELF_SIGNED_CERT_IN_CHAIN": "certificate_error",
@@ -110,6 +122,10 @@ class PreviewStartupFailure(RuntimeError):
             "storage_full", "resource_limit", "registry_unavailable", "dependency_unavailable",
             "dependency_conflict", "package_invalid", "certificate_error", "dependency_rejected",
             "supervisor_exit",
+            "storage_conflict", "runtime_incompatible", "integrity_error", "registry_denied",
+            "npm_exit_incomplete", "npm_internal_error",
+            "signal_abort", "signal_kill", "signal_segv", "signal_term", "file_size_limit",
+            "signal_exit",
         }:
             raise ValueError("invalid startup diagnostic")
         self.phase = phase
@@ -388,7 +404,22 @@ def _install_failure_reason(line: bytearray) -> str | None:
     if line.startswith(b"generated dependency source rejected: "):
         return "dependency_rejected"
     match = re.fullmatch(rb"npm (?:ERR!|error) code ([A-Z0-9_]+)\r?", line)
-    return _NPM_INSTALL_REASONS.get(match[1]) if match else None
+    if match:
+        return _NPM_INSTALL_REASONS.get(match[1])
+    match = re.fullmatch(rb"npm (?:ERR!|error) (.*?)\r?", line)
+    if match is None:
+        return None
+    message = match[1]
+    if message == b"Exit handler never called!":
+        return "npm_exit_incomplete"
+    if re.fullmatch(
+        rb"Cannot read properties of (?:undefined|null) "
+        rb"\(reading '[^'\x00-\x1f\x7f-\xff]+'\)", message,
+    ):
+        return "npm_internal_error"
+    if message.startswith((b"Invalid Version: ", b"Invalid comparator: ")):
+        return "package_invalid"
+    return None
 
 
 def _run_stage(stage: str) -> None:
@@ -458,7 +489,13 @@ def _run_stage(stage: str) -> None:
                 if log_overflow.is_set():
                     raise PreviewStartupFailure(stage, "log_limit")
                 if exit_code != 0:
-                    raise PreviewStartupFailure(stage, install_reason or "nonzero_exit")
+                    reason = install_reason or "nonzero_exit"
+                    if install_reason is None and exit_code < 0:
+                        reason = {
+                            -6: "signal_abort", -9: "signal_kill", -11: "signal_segv",
+                            -15: "signal_term", -25: "file_size_limit",
+                        }.get(exit_code, "signal_exit")
+                    raise PreviewStartupFailure(stage, reason)
                 write_frame(sys.stdout.buffer, {"ok": True, "state": "prepared"})
                 return
             ready_deadline = time.monotonic() + READY_TIMEOUT

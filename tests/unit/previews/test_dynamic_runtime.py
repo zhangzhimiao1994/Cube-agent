@@ -78,6 +78,12 @@ def test_frames_are_length_bounded_and_strict() -> None:
     ("install", "dependency_conflict"), ("install", "package_invalid"),
     ("install", "certificate_error"), ("install", "dependency_rejected"),
     ("install", "supervisor_exit"),
+    ("install", "storage_conflict"), ("install", "runtime_incompatible"),
+    ("install", "integrity_error"), ("install", "registry_denied"),
+    ("install", "npm_exit_incomplete"), ("install", "npm_internal_error"),
+    ("install", "signal_abort"), ("install", "signal_kill"),
+    ("install", "signal_segv"), ("install", "signal_term"),
+    ("install", "file_size_limit"), ("install", "signal_exit"),
 ])
 def test_startup_failure_preserves_only_validated_diagnostic(phase: str, reason: str) -> None:
     mod = runtime()

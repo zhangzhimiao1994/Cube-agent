@@ -782,6 +782,12 @@ def test_stop_cleanup_failure_remains_revoked_and_retryable(dynamic_client: Dyna
     ("install", "dependency_conflict"), ("install", "package_invalid"),
     ("install", "certificate_error"), ("install", "dependency_rejected"),
     ("install", "supervisor_exit"),
+    ("install", "storage_conflict"), ("install", "runtime_incompatible"),
+    ("install", "integrity_error"), ("install", "registry_denied"),
+    ("install", "npm_exit_incomplete"), ("install", "npm_internal_error"),
+    ("install", "signal_abort"), ("install", "signal_kill"),
+    ("install", "signal_segv"), ("install", "signal_term"),
+    ("install", "file_size_limit"), ("install", "signal_exit"),
 ])
 def test_start_failure_returns_safe_stage_not_missing_broker(
     dynamic_client: DynamicClient, monkeypatch: pytest.MonkeyPatch, phase: str, reason: str,
