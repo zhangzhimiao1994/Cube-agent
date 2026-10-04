@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import cast
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from uuid import UUID, uuid4
 
 from agent_hub.harness.project_scale import (
@@ -35,11 +35,14 @@ from agent_hub.harness.project_scale_runner import (
     ProjectScaleCaseResult,
     UrllibAcceptanceClient,
     _acceptance_credentials_from_env,
+    _deliverable_repair_idempotency_key,
     _effective_execute_wait_seconds,
+    _idempotency_key,
     _safe_workspace_session_token,
     _safe_zip_member_path,
     execute_project_scale_plan,
 )
+from agent_hub.harness.submission_journal import SubmissionJournal
 from agent_hub.models.failure_receipt import GatewayFailureReceipt
 from agent_hub.runtime.contracts import Artifact, GatewayProvenance
 
@@ -146,6 +149,81 @@ class RealUserAcceptanceClient:
         self.blocked_admin_run_requests: list[str] = []
         self.submitted_run_ids: list[str] = []
         self.accepted_repair_run_ids: list[str] = []
+        self.submission_journal: SubmissionJournal | None = None
+        self._submission_context: dict[str, object] | None = None
+        self._persist_submission: Callable[[], None] | None = None
+        self._submission_reconciliation_failed = False
+
+    def configure_submission_journal(
+        self, journal: SubmissionJournal, persist: Callable[[], None],
+    ) -> None:
+        self.submission_journal = journal
+        self._persist_submission = persist
+
+    def set_submission_context(self, context: dict[str, object]) -> None:
+        self._submission_context = copy.deepcopy(context)
+
+    def require_resolved_submissions(self) -> None:
+        if self.submission_journal is not None and self.submission_journal.has_unresolved:
+            raise ValueError("unresolved submission: automatic paid-request replay is forbidden")
+        if self._submission_reconciliation_failed:
+            raise ValueError("confirmed submission requires successful read-only reconciliation")
+
+    def _request_run(
+        self, path: str, body: dict[str, object] | None, idempotency_key: str | None,
+    ) -> dict[str, object] | list[object]:
+        journal, persist = self.submission_journal, self._persist_submission
+        if journal is None or persist is None or self._submission_context is None:
+            raise ValueError("paid submissions require a durable submission journal")
+        self.require_resolved_submissions()
+        if path == "/api/v1/runs":
+            if body is None or any(
+                body.get(key) != self._submission_context[key]
+                for key in ("project_id", "conversation_id", "workspace_session_id")
+            ):
+                raise ValueError("submission request does not match the current case scope")
+            identity = cast(Mapping[str, object], journal.snapshot()["identity"])
+            profile = identity.get("model_profile")
+            if isinstance(profile, Mapping) and (
+                body.get("direct_model") != profile.get("direct_model")
+                or not isinstance(body.get("allowed_models"), (tuple, list))
+                or list(cast(Sequence[object], body["allowed_models"])) != profile.get("allowed_models")
+            ):
+                raise ValueError("submission request does not match the selected model profile")
+        index, confirmed = journal.prepare(
+            path=path, body=json.loads(json.dumps(body or {}, allow_nan=False)),
+            idempotency_key=idempotency_key,
+            context=self._submission_context, persist=persist,
+        )
+        if confirmed is not None:
+            return self.read_confirmed_submission(confirmed)
+        response = self._delegate.request_json(
+            "POST", path, body=body, idempotency_key=idempotency_key,
+        )
+        if not isinstance(response, dict):
+            raise ValueError("unresolved submission: response is not an object")  # noqa: TRY004
+        journal.confirm(index, response, persist)
+        return response
+
+    def read_confirmed_submission(self, confirmed: Mapping[str, object]) -> dict[str, object]:
+        try:
+            observed = self.request_json(
+                "GET", f"/api/v1/runs/{quote(str(confirmed['id']), safe='')}",
+            )
+            if (
+                not isinstance(observed, dict)
+                or observed.get("id") != confirmed["id"]
+                or observed.get("tenant_id") != confirmed["tenant_id"]
+                or not isinstance(observed.get("status"), str) or not observed["status"]
+            ):
+                raise ValueError("confirmed submission read-back identity is inconsistent")
+            for key in ("project_id", "conversation_id", "workspace_session_id"):
+                if key in observed and observed[key] != confirmed.get(key):
+                    raise ValueError("confirmed submission read-back scope is inconsistent")
+            return {**confirmed, **observed}
+        except BaseException:
+            self._submission_reconciliation_failed = True
+            raise
 
     def request_json(
         self,
@@ -160,12 +238,19 @@ class RealUserAcceptanceClient:
             blocked = f"{method.upper()} {path}"
             self.blocked_admin_run_requests.append(blocked)
             raise RuntimeError(f"{blocked} is forbidden as acceptance evidence")
-        response = self._delegate.request_json(
-            method,
-            path,
-            body=body,
-            idempotency_key=idempotency_key,
+        is_submission = method.upper() == "POST" and (
+            path == "/api/v1/runs" or re.fullmatch(r"/api/v1/runs/[^/]+/accept-repair", path)
         )
+        if is_submission:
+            try:
+                response = self._request_run(path, body, idempotency_key)
+            except BaseException:
+                self._submission_reconciliation_failed = True
+                raise
+        else:
+            response = self._delegate.request_json(
+                method, path, body=body, idempotency_key=idempotency_key,
+            )
         if method.upper() == "POST" and isinstance(response, dict):
             run_id = response.get("id")
             if isinstance(run_id, str) and run_id.strip():
@@ -1525,6 +1610,8 @@ def run_real_user_four_scale_acceptance(
     profile = _model_profile(logical_model)
     if resume_report is not None:
         _validate_report_model_profile(resume_report, profile)
+    if not isinstance(output_path, str) or not output_path.strip():
+        raise ValueError("paid acceptance requires a durable output_path")
     started_at = _utc_now()
     principal = client.request_json("GET", "/api/v1/auth/me")
     if not isinstance(principal, dict):
@@ -1533,6 +1620,10 @@ def run_real_user_four_scale_acceptance(
     attempt_history: list[dict[str, object]] = []
     safe_execution_id = _safe_identifier(execution_id)
     identity = _execution_identity(execution_id, base_url, principal, profile)
+    journal = (
+        _submission_journal_from_report(resume_report, identity)
+        if resume_report is not None else SubmissionJournal(identity)
+    )
     if resume_report is not None:
         cases = _resume_cases(resume_report, identity, attempt_history)
         device = resume_report.get("real_device_acceptance")
@@ -1544,6 +1635,7 @@ def run_real_user_four_scale_acceptance(
             and (device.get("status") == "passed" or device.get("counted_as_complete") is True)
         ):
             return _validated_finalized_report(resume_report)
+        _verify_retry_submissions(client, journal, resume_report, safe_execution_id)
         previous_start = resume_report.get("started_at")
         if isinstance(previous_start, str) and _timestamp(previous_start) is not None:
             started_at = previous_start
@@ -1563,8 +1655,8 @@ def run_real_user_four_scale_acceptance(
             finished=finished,
         )
 
-    if output_path:
-        _save_report(output_path, snapshot())
+    client.configure_submission_journal(journal, lambda: _save_report(output_path, snapshot()))
+    _save_report(output_path, snapshot())
 
     for case_kind, scale, route_intent, case_key in _ACCEPTANCE_CASES:
         case_id = f"{scale}:{route_intent}"
@@ -1592,6 +1684,10 @@ def run_real_user_four_scale_acceptance(
             conversation_id,
             runner_execution_id,
         )
+        client.set_submission_context({
+            "case_id": case_id, "attempt": attempt, "project_id": project_id,
+            "conversation_id": conversation_id, "workspace_session_id": workspace_session_id,
+        })
         if progress is not None:
             progress(f"{case_kind}/{scale}/{route_intent}: creating project and conversation")
         submitted_start = len(client.submitted_run_ids)
@@ -1729,6 +1825,7 @@ def run_real_user_four_scale_acceptance(
                     "admin_internal_run_data": False,
                 },
             }
+        client.require_resolved_submissions()
         if "model_scope_evidence" not in completed_case:
             if model_scope_evidence is None:
                 model_scope_evidence = _collect_model_scope_evidence(
@@ -1777,6 +1874,8 @@ def _matrix_report(
     expected_case_count = len(_ACCEPTANCE_CASES)
     core_ok = (
         finished
+        and client.submission_journal is not None
+        and not client.submission_journal.has_unresolved
         and len(cases) == expected_case_count
         and all(case.get("core_acceptance_ok") is True for case in cases)
     )
@@ -1837,6 +1936,9 @@ def _matrix_report(
         "blocked_admin_run_requests": list(client.blocked_admin_run_requests),
         "cases": copy.deepcopy(cases),
         "attempt_history": copy.deepcopy(attempt_history),
+        "submission_journal": (
+            client.submission_journal.snapshot() if client.submission_journal is not None else None
+        ),
     }
     if "model_profile" in identity:
         report["model_profile"] = copy.deepcopy(identity["model_profile"])
@@ -1863,6 +1965,127 @@ def _execution_identity(
     if model_profile is not None:
         identity["model_profile"] = copy.deepcopy(dict(model_profile))
     return identity
+
+
+def _verify_retry_submissions(
+    client: RealUserAcceptanceClient, journal: SubmissionJournal,
+    report: Mapping[str, object], safe_execution_id: str,
+) -> None:
+    case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
+    entries = report.get("cases", [])
+    assert isinstance(entries, list)  # Validated with the journal before reaching this gate.
+    for case in entries:
+        assert isinstance(case, dict)
+        case_id = case.get("case_id") or f"{case.get('scale')}:{case.get('route_intent')}"
+        key = case_keys.get(str(case_id))
+        if key is None or _has_complete_core_evidence(
+            case, safe_execution_id=safe_execution_id, case_key=key,
+        ):
+            continue
+        for record in journal.records:
+            context = cast(Mapping[str, object], record["context"])
+            if context["case_id"] == case_id:
+                response = client.read_confirmed_submission(
+                    cast(Mapping[str, object], record["response"]),
+                )
+                if response["status"] not in {"completed", "failed", "cancelled"}:
+                    raise ValueError("nonterminal confirmed submission cannot start a new attempt")
+
+
+def _submission_journal_from_report(
+    report: Mapping[str, object], identity: Mapping[str, object],
+) -> SubmissionJournal:
+    raw = report.get("submission_journal")
+    if not isinstance(raw, Mapping):
+        raise ValueError("submission journal is missing; legacy submissions cannot be replayed")  # noqa: TRY004
+    journal = SubmissionJournal(identity, raw)
+    if journal.has_unresolved:
+        raise ValueError("unresolved submission: automatic paid-request replay is forbidden")
+    case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
+    confirmed: dict[tuple[str, int], set[str]] = {}
+    post_counts: dict[tuple[str, int], int] = {}
+    for record in journal.records:
+        context = cast(dict[str, object], record["context"])
+        case_id, attempt = cast(str, context["case_id"]), cast(int, context["attempt"])
+        if case_id not in case_keys:
+            raise ValueError("submission journal contains an unknown case")
+        scope = _case_execution_token(
+            _safe_identifier(cast(str, identity["execution_id"])), case_keys[case_id], attempt,
+        )
+        conversation = _bounded_identifier(f"conv-{scope}", 128)
+        if context != {
+            "case_id": case_id, "attempt": attempt,
+            "project_id": _bounded_identifier(f"uat-{scope}", 128),
+            "conversation_id": conversation,
+            "workspace_session_id": _safe_workspace_session_token(conversation, scope),
+        }:
+            raise ValueError("submission journal does not match the canonical case scope")
+        case = (case_id, attempt)
+        ids = confirmed.setdefault(case, set())
+        path = cast(str, record["path"])
+        if path == "/api/v1/runs":
+            ordinal = post_counts.get(case, 0)
+            expected_key = (
+                _idempotency_key(case_id, 0, execution_id=scope) if ordinal == 0
+                else _deliverable_repair_idempotency_key(
+                    case_id, 0, execution_id=scope, repair_attempt=ordinal,
+                )
+            )
+            if record["idempotency_key"] != expected_key:
+                raise ValueError("submission journal does not match the canonical request key")
+            if ordinal == 0:
+                scale, route = case_id.split(":")
+                profile = identity.get("model_profile")
+                plan = build_real_user_scale_plan(
+                    scale=scale, route_intent=route,
+                    project_id=cast(str, context["project_id"]),
+                    conversation_id=conversation,
+                    workspace_session_id=cast(str, context["workspace_session_id"]),
+                    project_label=(
+                        f"真实用户 {scale} AUTO 规模验收" if route == "auto"
+                        else f"真实用户 {route} 模式能力验收"
+                    ),
+                    logical_model=(
+                        cast(str, profile["direct_model"]) if isinstance(profile, Mapping) else None
+                    ),
+                )
+                expected_digest = hashlib.sha256(json.dumps(
+                    plan.requests[0].body, sort_keys=True, ensure_ascii=False,
+                    allow_nan=False, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                if record["request_sha256"] != expected_digest:
+                    raise ValueError("submission request digest does not match the case plan")
+            post_counts[case] = ordinal + 1
+        else:
+            parent = unquote(path.split("/")[4])
+            if parent not in ids:
+                raise ValueError("repair submission parent is not confirmed in this case")
+        response = cast(Mapping[str, object], record["response"])
+        ids.add(cast(str, response["id"]))
+    for section in ("cases", "attempt_history"):
+        entries = report.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError("submission journal requires flat case evidence")  # noqa: TRY004
+        for case in entries:
+            if not isinstance(case, Mapping):
+                raise ValueError("submission journal requires object case evidence")  # noqa: TRY004
+            case_id = case.get("case_id") or f"{case.get('scale')}:{case.get('route_intent')}"
+            ids = confirmed.get((cast(str, case_id), _case_attempt(case)), set())
+            run = case.get("run")
+            run_id = run.get("run_id") if isinstance(run, Mapping) else None
+            scope_evidence = case.get("model_scope_evidence")
+            required = {run_id} if isinstance(run_id, str) and run_id else set()
+            if isinstance(scope_evidence, Mapping):
+                required.update(
+                    value for key in ("original_run_id", "result_run_id")
+                    if isinstance(value := scope_evidence.get(key), str) and value
+                )
+                repairs = scope_evidence.get("accepted_repair_run_ids", [])
+                if isinstance(repairs, list):
+                    required.update(value for value in repairs if isinstance(value, str) and value)
+            if not required <= ids:
+                raise ValueError("submission journal does not match case core evidence")
+    return journal
 
 
 def _resume_cases(
@@ -1893,6 +2116,7 @@ def _resume_cases(
         "execution_identity" in report and report["execution_identity"] != identity
     ):
         raise ValueError("resume report execution identity does not match this execution")
+    _submission_journal_from_report(report, identity)
     raw_cases = report.get("cases")
     if not isinstance(raw_cases, list):
         raise TypeError("resume report cases must be a list")
@@ -2390,6 +2614,7 @@ def finalize_real_device_acceptance(
         and automated_report["execution_identity"] != identity
     ):
         raise ValueError("automated report execution identity is inconsistent")
+    _submission_journal_from_report(automated_report, identity)
     desktop = _validated_device_result(evidence, "desktop_browser_interaction")
     mobile = _validated_device_result(evidence, "mobile_browser_interaction")
     case_evidence = _validated_case_evidence(automated_report, evidence)
@@ -2541,6 +2766,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 device_evidence,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            if args.output and Path(args.output).resolve() == Path(args.finalize_report).resolve():
+                print(f"finalization rejected; source checkpoint preserved: {error}", file=sys.stderr)
+                return 1
             payload = {
                 "schema_version": 1,
                 "kind": "real_user_four_scale_acceptance",

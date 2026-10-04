@@ -8,8 +8,9 @@ import json
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pytest
 
@@ -870,6 +871,36 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
             case["model_profile"] = copy.deepcopy(profile)
             case["model_scope_evidence"] = _scope_evidence(case["run"]["run_id"], logical_model)
             case["success_basis"]["model_scope"] = True
+    journal = module.SubmissionJournal(report["execution_identity"])
+    for case in cases:
+        scale, route = case["case_id"].split(":")
+        case_key = f"auto-{scale}" if route == "auto" else f"mode-{scale}-{route.replace('_', '-')}"
+        scope = f"matrix-123-{case_key}"
+        context = {
+            "case_id": case["case_id"], "attempt": 1,
+            "project_id": case["project"]["project_id"],
+            "conversation_id": case["conversation"]["conversation_id"],
+            "workspace_session_id": case["conversation"]["workspace_path"],
+        }
+        plan = module.build_real_user_scale_plan(
+            scale=scale, route_intent=route, project_id=context["project_id"],
+            project_label=(
+                f"真实用户 {scale} AUTO 规模验收" if route == "auto"
+                else f"真实用户 {route} 模式能力验收"
+            ), conversation_id=context["conversation_id"],
+            workspace_session_id=context["workspace_session_id"], logical_model=logical_model,
+        )
+        index, _ = journal.prepare(
+            path="/api/v1/runs", body=json.loads(json.dumps(plan.requests[0].body)), context=context,
+            idempotency_key=_idempotency_key(case["case_id"], 0, execution_id=scope),
+            persist=lambda: None,
+        )
+        journal.confirm(index, {
+            "id": case["run"]["run_id"], "tenant_id": "tenant-test", "status": "completed",
+            "project_id": context["project_id"], "conversation_id": context["conversation_id"],
+            "workspace_session_id": context["workspace_session_id"], "version": 1,
+        }, lambda: None)
+    report["submission_journal"] = journal.snapshot()
     return report
 
 
@@ -1424,6 +1455,8 @@ def matrix_harness(
                     self.runs[idempotency_key] = {
                         **body,
                         "id": f"run-{len(self.runs) + 1}",
+                        "tenant_id": "tenant-test",
+                        "version": 1,
                         "status": "completed",
                         "mode": "direct" if body["mode"] == "auto" else body["mode"],
                         "requested_mode": body["mode"],
@@ -1440,7 +1473,7 @@ def matrix_harness(
                     return {"items": self.model_events.get(run_id, [_model_event(run_id)])}
                 if path.endswith("/artifacts"):
                     return []
-                run_id = path.split("/")[4]
+                run_id = unquote(path.split("/")[4])
                 self.observed_runs.append(run_id)
                 return copy.deepcopy(next(run for run in self.runs.values() if run["id"] == run_id))
             if method == "POST" and path == "/api/v1/web-previews/start":
@@ -1621,17 +1654,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
 ) -> None:
     module, delegate, plans, scoped_workspace_paths = matrix_harness
-    client = module.RealUserAcceptanceClient(delegate)
-
-    payload = module.run_real_user_four_scale_acceptance(
-        client,
-        username="test",
-        base_url="http://example.test",
-        execution_id="matrix-123",
-        wait_seconds=1,
-        poll_interval_seconds=0,
-        artifact_build_timeout_seconds=1,
-    )
+    payload = run_matrix(module, delegate)
 
     assert len(payload["cases"]) == 20
     assert [
@@ -1701,12 +1724,202 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
         "artifact_build_timeout_seconds": 1,
         **kwargs,
     }
-    return cast(
-        dict[str, Any],
-        module.run_real_user_four_scale_acceptance(
-            module.RealUserAcceptanceClient(delegate), **options
-        ),
-    )
+    def execute() -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            module.run_real_user_four_scale_acceptance(
+                module.RealUserAcceptanceClient(delegate), **options
+            ),
+        )
+
+    if "output_path" in options:
+        return execute()
+    with TemporaryDirectory(prefix="matrix-checkpoint-") as temporary:
+        options["output_path"] = str(Path(temporary) / "report.json")
+        return execute()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "json", "utf8", "disconnect", "list", "id", "scope"])
+def test_unknown_submissions_stop_matrix_and_restart_without_post_or_checkpoint_changes(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, failure: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    request = delegate.request_json
+    output = tmp_path / "journal.json"
+
+    def uncertain(method: str, path: str, **kwargs: Any) -> Any:
+        if method == "POST" and path == "/api/v1/runs":
+            intent = json.loads(output.read_text(encoding="utf-8"))
+            assert intent["submission_journal"]["records"][0]["state"] == "unresolved"
+            assert intent["cases"] == []
+            response = request(method, path, **kwargs)
+            if failure == "timeout":
+                raise TimeoutError("response lost")
+            if failure == "json":
+                raise json.JSONDecodeError("invalid response", "{", 1)
+            if failure == "utf8":
+                raise UnicodeDecodeError("utf8", b"\xff", 0, 1, "invalid")
+            if failure == "disconnect":
+                raise ConnectionResetError("disconnected")
+            if failure == "list":
+                return []
+            if failure == "id":
+                response.pop("id")
+            if failure == "scope":
+                response["workspace_session_id"] = "other-workspace"
+            return response
+        return request(method, path, **kwargs)
+
+    monkeypatch.setattr(delegate, "request_json", uncertain)
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, output_path=str(output))
+    assert len(plans) == len(delegate.submissions) == 1
+    saved_bytes = output.read_bytes()
+    saved = json.loads(saved_bytes)
+    assert saved["cases"] == saved["attempt_history"] == []
+    record = saved["submission_journal"]["records"][0]
+    assert record["state"] == "unresolved" and record["response"] is None
+    assert record["context"]["attempt"] == 1
+    assert "message" not in record and "body" not in record
+    delegate.requests.clear()
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert len(delegate.submissions) == 1
+    assert output.read_bytes() == saved_bytes
+
+
+@pytest.mark.parametrize("failure_write", [2, 3])
+def test_submission_persistence_failures_do_not_advance_paid_matrix(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, failure_write: int,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    output = tmp_path / "journal.json"
+    replace_file = module.os.replace
+    writes = 0
+
+    def fail_replace(source: object, target: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == failure_write:
+            raise OSError("checkpoint unavailable")
+        replace_file(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, output_path=str(output))
+    assert len(delegate.submissions) == failure_write - 2
+    saved_bytes = output.read_bytes()
+    saved = json.loads(saved_bytes)
+    assert saved["cases"] == []
+    records = saved["submission_journal"]["records"]
+    if failure_write == 2:
+        assert records == []
+    else:
+        assert records[0]["state"] == "unresolved"
+        with pytest.raises(ValueError, match="unresolved submission"):
+            run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+        assert len(delegate.submissions) == 1
+        assert output.read_bytes() == saved_bytes
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_paid_matrix_requires_durable_output_before_any_request(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    with pytest.raises(ValueError, match="durable output_path"):
+        run_matrix(module, delegate, output_path=None)
+    assert delegate.requests == []
+
+
+def test_legacy_report_without_journal_cannot_resume_or_finalize(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved.pop("submission_journal")
+    output = tmp_path / "legacy.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original = output.read_bytes()
+    with pytest.raises(ValueError, match="journal is missing"):
+        run_matrix(module, delegate, resume_report=saved, output_path=str(output))
+    with pytest.raises(ValueError, match="journal is missing"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert output.read_bytes() == original
+
+
+def test_submission_digest_conflict_stops_other_cases_instead_of_classifying_retryable_failure(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    saved = run_matrix(module, delegate)
+    saved["cases"] = []
+    saved["submission_journal"]["records"] = saved["submission_journal"]["records"][:1]
+    saved["submission_journal"]["records"][0]["request_sha256"] = "0" * 64
+    original_posts = len(delegate.submissions)
+    with pytest.raises(ValueError, match="submission"):
+        run_matrix(module, delegate, resume_report=saved, output_path=str(tmp_path / "report.json"))
+    assert len(delegate.submissions) == original_posts
+
+
+def test_finalize_cli_does_not_overwrite_unresolved_source_report(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, _, _, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved["submission_journal"]["records"][0].update(state="unresolved", response=None)
+    output, device = tmp_path / "report.json", tmp_path / "device.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    device.write_text(json.dumps(_real_device_evidence("matrix-123")), encoding="utf-8")
+    original = output.read_bytes()
+    assert module.main([
+        "--finalize-report", str(output), "--real-device-evidence", str(device),
+        "--output", str(output),
+    ]) == 1
+    assert output.read_bytes() == original
+
+
+def test_completed_report_still_rejects_original_request_digest_mismatch(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved["submission_journal"]["records"][0]["request_sha256"] = "0" * 64
+    output = tmp_path / "report.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original = output.read_bytes()
+    with pytest.raises(ValueError, match="digest"):
+        run_matrix(module, delegate, resume_report=saved, output_path=str(output))
+    with pytest.raises(ValueError, match="digest"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert plans == []
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("status", ["running", "queued", "waiting_approval"])
+def test_confirmed_nonterminal_run_is_not_replaced_by_new_attempt_on_resume(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, status: str,
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
+    saved = run_matrix(module, delegate)
+    saved["cases"][0]["run"]["errors"] = ["poll lost connection"]
+    next(iter(delegate.runs.values()))["status"] = status
+    output = tmp_path / "journal.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original = output.read_bytes()
+    delegate.requests.clear()
+    with pytest.raises(ValueError, match="nonterminal"):
+        run_matrix(module, delegate, resume_report=saved, output_path=str(output))
+    assert len(delegate.submissions) == 1
+    assert all(method == "GET" for method, _ in delegate.requests)
+    assert output.read_bytes() == original
 
 
 def test_logical_model_scopes_all_twenty_public_requests_without_changing_modes_or_scales(
@@ -1851,12 +2064,13 @@ def test_scoped_finalizer_preserves_profile_and_does_not_invent_model_evidence()
     assert [case["run"] for case in completed["cases"]] == [case["run"] for case in saved["cases"]]
 
 
-def test_legacy_unscoped_resume_keeps_default_requests_and_report_identity(
+def test_unscoped_resume_keeps_default_requests_and_report_identity(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
 ) -> None:
     module, delegate, plans, _ = matrix_harness
     saved = _pending_automated_report()
     saved["cases"] = []
+    saved["submission_journal"]["records"] = []
     resumed = run_matrix(module, delegate, resume_report=saved)
     assert resumed["core_acceptance_ok"] is True
     assert resumed["execution_identity"] == saved["execution_identity"]
@@ -2880,6 +3094,14 @@ def test_scope_evidence_revalidated_on_resume_and_finalization(
         )
     monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
     saved["cases"] = [case]
+    saved["submission_journal"]["records"] = saved["submission_journal"]["records"][:1]
+    if tamper in {"missing_original", "missing_repair"}:
+        with pytest.raises(ValueError, match="submission journal"):
+            run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
+        assert plans == []
+        return
+    receipt = saved["submission_journal"]["records"][0]["response"]
+    delegate.runs["original"] = copy.deepcopy(receipt)
     resumed = run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
     assert len(plans) == 1
     assert resumed["cases"][0]["attempt"] == 2
@@ -3018,7 +3240,7 @@ def test_failed_retry_checkpoint_stops_before_next_case_and_preserves_disk_histo
         replace_file(source, target)
 
     monkeypatch.setattr(module.os, "replace", fail_after_initial_checkpoint)
-    with pytest.raises(OSError, match="cannot save retry"):
+    with pytest.raises(ValueError, match="unresolved submission"):
         run_matrix(module, delegate, output_path=str(output), resume_report=saved)
     assert len(plans) == 1
     durable = json.loads(output.read_text(encoding="utf-8"))
@@ -3499,7 +3721,7 @@ def test_checkpoint_does_not_count_wrong_case_or_nonterminal_runner_result(
     assert payload["failed_case_count"] == 1
 
 
-def test_resume_interrupted_active_case_reuses_run_idempotency_scope(
+def test_resume_confirmed_active_case_uses_reads_without_reposting(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     tmp_path: Path,
     monkeypatch: Any,
@@ -3535,15 +3757,19 @@ def test_resume_interrupted_active_case_reuses_run_idempotency_scope(
     ]
     assert delegate.created_projects.count("uat-matrix-123-auto-small") == 1
     assert delegate.created_conversations.count("conv-matrix-123-auto-small") == 1
-    assert delegate.submissions[0] == delegate.submissions[1]
-    assert delegate.observed_runs[0] == delegate.observed_runs[1]
+    assert delegate.submissions.count(
+        ("project-scale-small-auto-0-matrix-123-auto-small", "run-1")
+    ) == 1
+    assert len(delegate.submissions) == 20
+    assert len({key for key, _ in delegate.submissions}) == 20
+    assert set(delegate.observed_runs[:2]) == {"run-1"}
     assert resumed["cases"][0]["attempt"] == 1
     assert resumed["core_passed_case_count"] == 20
 
 
 @pytest.mark.parametrize(
     "interrupt_path",
-    ["/api/v1/admin/project-workspaces", "/api/v1/admin/conversations", "/api/v1/runs"],
+    ["/api/v1/admin/project-workspaces", "/api/v1/admin/conversations"],
 )
 def test_resume_recovers_resources_committed_before_response_was_saved(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
@@ -3574,12 +3800,6 @@ def test_resume_recovers_resources_committed_before_response_was_saved(
         ) in delegate.requests
     assert len(delegate.runs) == 1
     assert resumed["cases"][0]["run"]["run_id"] == "run-1"
-    if interrupt_path == "/api/v1/runs":
-        assert delegate.submissions == [
-            ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
-            ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
-        ]
-        assert set(delegate.observed_runs) == {"run-1"}
 
 
 @pytest.mark.parametrize(
@@ -3705,7 +3925,7 @@ def test_resource_conflict_requires_authenticated_lookup_before_reuse(
     assert delegate.runs == {}
 
 
-def test_real_runner_reobserves_run_committed_before_interruption(
+def test_real_runner_never_reposts_unknown_commit_after_interruption(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     tmp_path: Path,
     monkeypatch: Any,
@@ -3719,26 +3939,17 @@ def test_real_runner_reobserves_run_committed_before_interruption(
     with pytest.raises(KeyboardInterrupt):
         run_matrix(module, delegate, output_path=str(output))
     saved = json.loads(output.read_text(encoding="utf-8"))
-    request = delegate.request_json
-
-    def stop_after_observation(method: str, path: str, **kwargs: Any) -> Any:
-        response = request(method, path, **kwargs)
-        if method == "GET" and path == "/api/v1/runs/run-1/details":
-            assert response["id"] == "run-1"
-            # Stop before unrelated deliverable validation and repair side effects.
-            raise KeyboardInterrupt
-        return response
-
-    monkeypatch.setattr(delegate, "request_json", stop_after_observation)
-    with pytest.raises(KeyboardInterrupt):
+    before = output.read_bytes()
+    request_count = len(delegate.requests)
+    with pytest.raises(ValueError, match="unresolved"):
         run_matrix(module, delegate, output_path=str(output), resume_report=saved)
 
     assert len(delegate.runs) == 1
     assert delegate.submissions == [
         ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
-        ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
     ]
-    assert "run-1" in delegate.observed_runs
+    assert delegate.requests[request_count:] == [("GET", "/api/v1/auth/me")]
+    assert output.read_bytes() == before
     checkpoint = json.loads(output.read_text(encoding="utf-8"))
     assert checkpoint["cases"] == []
     assert checkpoint["core_acceptance_ok"] is False
