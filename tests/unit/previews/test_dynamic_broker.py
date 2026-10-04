@@ -154,7 +154,11 @@ def test_install_metadata_file_uses_existing_disk_budget_only(tmp_path: Path, st
     assert [item for item in command if item.startswith("LimitFSIZE=")] == [
         f"LimitFSIZE={expected}",
     ]
-    assert "MemoryMax=384M" in command
+    memory = 384 + int(size[:-1]) if stage == "install" else 384
+    assert [item for item in command if item.startswith("MemoryMax=")] == [
+        f"MemoryMax={memory}M",
+    ]
+    assert "LimitNOFILE=256" in command
     assert "MemorySwapMax=0" in command
     assert "TasksMax=64" in command
     assert "CPUQuota=50%" in command

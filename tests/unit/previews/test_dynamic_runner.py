@@ -35,8 +35,9 @@ def test_generated_process_has_clean_environment_and_no_control_descriptors() ->
 def test_install_uses_existing_trusted_validation_guard() -> None:
     mod = runner()
     assert mod.stage_argv("install") == (
-        "/preview/node/bin/node", "-e", mod.install_guard(), "/preview/node/bin/npm",
-        "install", "--ignore-scripts", "--no-audit", "--no-fund",
+        "/preview/node/bin/node", "--max-old-space-size=256", "-e", mod.install_guard(),
+        "/preview/node/bin/npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
+        "--maxsockets=2",
     )
     assert "subprocess execution is forbidden" in mod.install_guard()
     assert "unsupported dependency source" in mod.install_guard()
@@ -786,3 +787,327 @@ def test_running_application_failure_does_not_become_startup_failure(
     output.seek(0)
     assert mod.read_frame(output) == {"ok": True, "state": "ready"}
     assert mod.read_frame(output) == {"ok": False, "error": "preview stage failed"}
+
+
+def lifecycle_output(
+    monkeypatch: pytest.MonkeyPatch, child: Any, stage: str, cleanup: Any,
+) -> Any:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    output = io.BytesIO()
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(
+        platform="linux", argv=["runner", stage], stdout=SimpleNamespace(buffer=output),
+        stdin=SimpleNamespace(buffer=io.BytesIO()),
+    ))
+    monkeypatch.setattr(mod, "_ensure_work_directory", lambda path: None)
+    monkeypatch.setattr(mod, "_copy_source", lambda source, work: None)
+    monkeypatch.setattr(mod, "_spawn_application", lambda selected: child)
+    monkeypatch.setattr(mod, "_kill_child", cleanup)
+    monkeypatch.setattr(mod, "_kill_group", lambda pid: None)
+    return output
+
+
+def lifecycle_frames(output: Any) -> list[dict[str, object]]:
+    import io
+    mod = runner()
+    try:
+        mod.main()
+    except SystemExit as error:
+        assert error.code == 1
+    raw = output.getvalue()
+    assert b"sentinel" not in raw
+    stream = io.BytesIO(raw)
+    frames = []
+    while stream.tell() < len(raw):
+        frames.append(mod.read_frame(stream))
+    return frames
+
+
+@pytest.mark.parametrize("ending", [b"\n", b""])
+def test_real_inherited_pipe_is_drained_before_install_classification(
+    monkeypatch: pytest.MonkeyPatch, ending: bytes,
+) -> None:
+    import io
+    import os
+    from types import SimpleNamespace
+    reader, writer = os.pipe()
+    with os.fdopen(reader, "rb") as stderr, os.fdopen(writer, "wb", buffering=0) as descendant:
+        descendant.write(b"npm error code EEXIST" + ending)
+        child = SimpleNamespace(
+            pid=123, stdout=io.BytesIO(), stderr=stderr,
+            wait=lambda timeout: 1, poll=lambda: 1,
+        )
+        output = lifecycle_output(monkeypatch, child, "install", lambda process: descendant.close())
+        assert lifecycle_frames(output) == [{
+            "ok": False, "error": "preview startup failed", "phase": "install",
+            "reason": "storage_conflict",
+        }]
+        assert stderr.closed
+
+
+@pytest.mark.parametrize("stage", ["install", "build"])
+def test_prepared_frame_requires_completed_cleanup(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    import io
+    from types import SimpleNamespace
+    child = SimpleNamespace(
+        pid=123, stdout=io.BytesIO(), stderr=io.BytesIO(),
+        wait=lambda timeout: 0, poll=lambda: 0,
+    )
+    frames_at_cleanup: list[bytes] = []
+    output: io.BytesIO
+    output = lifecycle_output(
+        monkeypatch, child, stage, lambda process: frames_at_cleanup.append(output.getvalue()),
+    )
+    assert lifecycle_frames(output) == [{"ok": True, "state": "prepared"}]
+    assert frames_at_cleanup == [b""]
+    assert child.stdout.closed and child.stderr.closed
+
+
+def test_real_pipe_log_limit_after_leader_exit_prevents_prepared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import os
+    from types import SimpleNamespace
+    mod = runner()
+    reader, writer = os.pipe()
+    with os.fdopen(reader, "rb") as stderr, os.fdopen(writer, "wb", buffering=0) as descendant:
+        child = SimpleNamespace(
+            pid=123, stdout=io.BytesIO(), stderr=stderr,
+            wait=lambda timeout: 0, poll=lambda: 0,
+        )
+
+        def cleanup(process: object) -> None:
+            descendant.write(b"x" * 9)
+            descendant.close()
+
+        output = lifecycle_output(monkeypatch, child, "install", cleanup)
+        monkeypatch.setattr(mod, "MAX_LOG", 8)
+        assert lifecycle_frames(output) == [{
+            "ok": False, "error": "preview startup failed", "phase": "install",
+            "reason": "log_limit",
+        }]
+        assert stderr.closed
+
+
+@pytest.mark.parametrize("operation", ["read", "close"])
+@pytest.mark.parametrize("stage", ["install", "build", "start"])
+@pytest.mark.parametrize("exception_type", [OSError, MemoryError])
+def test_drain_io_failure_is_sanitized_and_never_prepared_or_ready(
+    monkeypatch: pytest.MonkeyPatch, operation: str, stage: str,
+    exception_type: type[Exception],
+) -> None:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    attempted = threading.Event()
+    thread_errors: list[object] = []
+
+    class BrokenPipe(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            if operation == "read":
+                attempted.set()
+                raise exception_type("private read sentinel")
+            return b""
+
+        def read1(self, size: int | None = -1) -> bytes:
+            return self.read(size)
+
+        def close(self) -> None:
+            super().close()
+            if operation == "close":
+                attempted.set()
+                raise exception_type("private close sentinel")
+
+    def wait(timeout: float) -> int:
+        assert attempted.wait(1)
+        return 0
+
+    child = SimpleNamespace(
+        pid=123, stdout=io.BytesIO(), stderr=BrokenPipe(), wait=wait, poll=lambda: None,
+    )
+    output = lifecycle_output(monkeypatch, child, stage, lambda process: None)
+    monkeypatch.setattr(threading, "excepthook", thread_errors.append)
+    monkeypatch.setattr(mod, "relay_http", lambda request: wait(1))
+
+    def end_requests(*args: object) -> None:
+        raise EOFError
+
+    monkeypatch.setattr(mod, "_wait_request", end_requests)
+    assert lifecycle_frames(output) == [{
+        "ok": False, "error": "preview startup failed", "phase": stage, "reason": "failed",
+    }]
+    assert not thread_errors
+    assert child.stdout.closed and child.stderr.closed
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("timeout", "timeout"), ("exit", "storage_conflict"), ("success", "failed"),
+])
+@pytest.mark.parametrize("exception_type", [OSError, MemoryError])
+def test_cleanup_error_cannot_overwrite_failure_or_follow_prepared(
+    monkeypatch: pytest.MonkeyPatch, mode: str, reason: str,
+    exception_type: type[Exception],
+) -> None:
+    import io
+    import subprocess
+    from types import SimpleNamespace
+
+    def wait(timeout: float) -> int:
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired("private sentinel", timeout)
+        return 1 if mode == "exit" else 0
+
+    child = SimpleNamespace(
+        pid=123, stdout=io.BytesIO(), stderr=io.BytesIO(b"npm error code EEXIST\n"),
+        wait=wait, poll=lambda: None,
+    )
+
+    def cleanup(process: object) -> None:
+        raise exception_type("private cleanup sentinel")
+
+    output = lifecycle_output(monkeypatch, child, "install", cleanup)
+    assert lifecycle_frames(output) == [{
+        "ok": False, "error": "preview startup failed", "phase": "install", "reason": reason,
+    }]
+    assert child.stdout.closed and child.stderr.closed
+
+
+def test_unclosed_inherited_pipe_fails_closed_with_bounded_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import os
+    import time
+    from types import SimpleNamespace
+    reader, writer = os.pipe()
+    with os.fdopen(reader, "rb") as stderr, os.fdopen(writer, "wb", buffering=0):
+        child = SimpleNamespace(
+            pid=123, stdout=io.BytesIO(), stderr=stderr,
+            wait=lambda timeout: 0, poll=lambda: 0,
+        )
+        output = lifecycle_output(monkeypatch, child, "build", lambda process: None)
+        started = time.monotonic()
+        frames = lifecycle_frames(output)
+        elapsed = time.monotonic() - started
+        assert frames == [{
+            "ok": False, "error": "preview startup failed", "phase": "build", "reason": "timeout",
+        }]
+        assert elapsed < 4
+
+
+def test_start_drain_failure_interrupts_idle_ipc_without_exposing_thread_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    ready = threading.Event()
+    attempted = threading.Event()
+    thread_errors: list[object] = []
+    idle_iterations: list[object] = []
+
+    class RuntimeBrokenPipe(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            assert ready.wait(3)
+            attempted.set()
+            raise OSError("runtime drain sentinel")
+
+        def read1(self, size: int | None = -1) -> bytes:
+            return self.read(size)
+
+    child = SimpleNamespace(
+        pid=123, stdout=io.BytesIO(), stderr=RuntimeBrokenPipe(), poll=lambda: None,
+    )
+    output = lifecycle_output(monkeypatch, child, "start", lambda process: ready.set())
+    monkeypatch.setattr(threading, "excepthook", thread_errors.append)
+    monkeypatch.setattr(mod, "relay_http", lambda request: {})
+
+    def idle(*args: object) -> tuple[list[object], list[object], list[object]]:
+        idle_iterations.append(None)
+        ready.set()
+        assert attempted.wait(1)
+        if len(idle_iterations) > 2:
+            raise EOFError
+        return [], [], []
+
+    monkeypatch.setattr(mod.select, "select", idle)
+    assert lifecycle_frames(output) == [
+        {"ok": True, "state": "ready"}, {"ok": False, "error": "preview stage failed"},
+    ]
+    assert len(idle_iterations) <= 2
+    assert not thread_errors
+
+
+def test_start_request_failure_is_not_replayed_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from types import SimpleNamespace
+    mod = runner()
+    child = SimpleNamespace(pid=123, stdout=io.BytesIO(), stderr=io.BytesIO(), poll=lambda: None)
+    output = lifecycle_output(monkeypatch, child, "start", lambda process: None)
+    request: dict[str, object] = {
+        "method": "POST", "target": "/trusted-fixture", "headers": [], "body": "",
+    }
+    pending = iter([request])
+    sent: list[object] = []
+
+    def wait_request(*args: object) -> dict[str, object]:
+        try:
+            return next(pending)
+        except StopIteration:
+            raise EOFError from None
+
+    def relay(payload: dict[str, object]) -> dict[str, object]:
+        if payload["method"] == "GET":
+            return {}
+        sent.append(payload)
+        raise OSError("already committed sentinel")
+
+    monkeypatch.setattr(mod, "_wait_request", wait_request)
+    monkeypatch.setattr(mod, "relay_http", relay)
+    assert lifecycle_frames(output) == [
+        {"ok": True, "state": "ready"},
+        {"ok": False, "error": "application request failed"},
+        {"ok": False, "error": "preview stage failed"},
+    ]
+    assert sent == [request]
+
+
+def test_real_pipe_short_output_hits_log_limit_before_child_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import os
+    import subprocess
+    from types import SimpleNamespace
+    mod = runner()
+    killed = threading.Event()
+    reader, writer = os.pipe()
+    with os.fdopen(reader, "rb") as stderr, os.fdopen(writer, "wb", buffering=0) as descendant:
+        descendant.write(b"x" * 65)
+
+        def wait(timeout: float) -> int:
+            if not killed.wait(1):
+                raise subprocess.TimeoutExpired("trusted fixture", timeout)
+            return -9
+
+        def kill_group(pid: int) -> None:
+            killed.set()
+            descendant.close()
+
+        child = SimpleNamespace(
+            pid=123, stdout=io.BytesIO(), stderr=stderr, wait=wait, poll=lambda: None,
+        )
+        output = lifecycle_output(monkeypatch, child, "install", lambda process: descendant.close())
+        monkeypatch.setattr(mod, "MAX_LOG", 64)
+        monkeypatch.setattr(mod, "_kill_group", kill_group)
+        assert lifecycle_frames(output) == [{
+            "ok": False, "error": "preview startup failed", "phase": "install",
+            "reason": "log_limit",
+        }]
+        assert stderr.closed

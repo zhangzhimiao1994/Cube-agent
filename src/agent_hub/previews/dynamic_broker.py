@@ -51,6 +51,7 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 _PLATFORM = sys.platform
 _PRIVATE_DISK_MIB = 256
+_PROCESS_MEMORY_MIB = 384
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +280,8 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
     # Trusted npm caches full registry metadata, which can exceed an app file's cap.
     # Installation still shares the same bounded disk; generated code keeps its cap.
     file_limit = _PRIVATE_DISK_MIB * 1024 * 1024 if stage == "install" else 33554432
+    # npm's written cache pages and its heap share the install cgroup's budget.
+    memory_mib = _PROCESS_MEMORY_MIB + (_PRIVATE_DISK_MIB if stage == "install" else 0)
     properties = [
         "BindsTo=agent-hub-preview-broker.service", "After=agent-hub-preview-broker.service",
         f"RequiresMountsFor={work}",
@@ -289,7 +292,7 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
         "ProcSubset=pid", "RestrictSUIDSGID=yes", "LockPersonality=yes",
         "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictRealtime=yes",
         "KillMode=control-group", "SendSIGKILL=yes", "TimeoutStopSec=3s",
-        "TasksMax=64", "MemoryMax=384M", "MemorySwapMax=0", "CPUQuota=50%",
+        "TasksMax=64", f"MemoryMax={memory_mib}M", "MemorySwapMax=0", "CPUQuota=50%",
         f"LimitFSIZE={file_limit}", "LimitNOFILE=256", "LimitCORE=0",
         f"RuntimeMaxSec={min(lifetime_seconds, 130) if stage in {'install', 'build'} else lifetime_seconds}s",
         f"RootDirectory={root}",

@@ -367,8 +367,10 @@ def install_guard() -> str:
 
 def stage_argv(stage: str) -> tuple[str, ...]:
     if stage == "install":
-        return ("/preview/node/bin/node", "-e", install_guard(), "/preview/node/bin/npm",
-                "install", "--ignore-scripts", "--no-audit", "--no-fund")
+        # Keep registry parsing and concurrent cache writes within the sandbox budget.
+        return ("/preview/node/bin/node", "--max-old-space-size=256", "-e", install_guard(),
+                "/preview/node/bin/npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
+                "--maxsockets=2")
     if stage == "build":
         return ("/preview/node/bin/npm", "run", "build", "--if-present", "--ignore-scripts")
     if stage == "start":
@@ -436,56 +438,93 @@ def _run_stage(stage: str) -> None:
     log_bytes = 0
     log_lock = threading.Lock()
     log_overflow = threading.Event()
+    drain_failed = threading.Event()
     install_reason: str | None = None
 
-    def drain(pipe: BinaryIO) -> None:
+    def drain(pipe: BinaryIO, finished: threading.Event) -> None:
         nonlocal log_bytes, install_reason
         classify = stage == "install" and pipe is child.stderr
         line = bytearray()
         discard_line = False
         try:
-            while chunk := pipe.read(4096):
-                with log_lock:
-                    log_bytes += len(chunk)
-                    if log_bytes > MAX_LOG:
-                        log_overflow.set()
-                        with contextlib.suppress(ProcessLookupError):
-                            _kill_group(child.pid)
-                        return
-                if classify and install_reason is None:
-                    for byte in chunk:
-                        if byte == 10:
-                            if not discard_line:
-                                install_reason = _install_failure_reason(line)
-                            line.clear()
-                            discard_line = False
-                            if install_reason is not None:
-                                break
-                        elif not discard_line:
-                            if len(line) < _MAX_INSTALL_DIAGNOSTIC_LINE:
-                                line.append(byte)
-                            else:
-                                # Never classify a truncated line or its later chunks.
+            try:
+                # Buffered read() can wait for 4096 bytes while a descendant holds the pipe.
+                read = getattr(pipe, "read1", pipe.read)
+                while chunk := read(4096):
+                    with log_lock:
+                        log_bytes += len(chunk)
+                        if log_bytes > MAX_LOG:
+                            log_overflow.set()
+                            with contextlib.suppress(ProcessLookupError):
+                                _kill_group(child.pid)
+                            return
+                    if classify and install_reason is None:
+                        for byte in chunk:
+                            if byte == 10:
+                                if not discard_line:
+                                    install_reason = _install_failure_reason(line)
                                 line.clear()
-                                discard_line = True
-            if classify and install_reason is None and not discard_line and line:
-                install_reason = _install_failure_reason(line)
+                                discard_line = False
+                                if install_reason is not None:
+                                    break
+                            elif not discard_line:
+                                if len(line) < _MAX_INSTALL_DIAGNOSTIC_LINE:
+                                    line.append(byte)
+                                else:
+                                    # Never classify a truncated line or its later chunks.
+                                    line.clear()
+                                    discard_line = True
+                if classify and install_reason is None and not discard_line and line:
+                    install_reason = _install_failure_reason(line)
+            finally:
+                line.clear()
+                pipe.close()
+        except Exception:  # noqa: BLE001 - thread boundary must fail closed without raw tracebacks
+            # Thread exceptions must neither leak application text nor count as clean EOF.
+            drain_failed.set()
+            with contextlib.suppress(Exception):
+                _kill_group(child.pid)
         finally:
-            line.clear()
-            pipe.close()
+            finished.set()
 
-    threads: list[threading.Thread] = []
-    for pipe in (child.stdout, child.stderr):
-        assert pipe is not None
-        thread = threading.Thread(target=drain, args=(pipe,), daemon=True)
-        thread.start()
-        threads.append(thread)
+    threads: list[tuple[threading.Thread, threading.Event]] = []
+    cleanup_done = False
+    cleanup_failure: PreviewStartupFailure | None = None
+
+    def cleanup() -> PreviewStartupFailure | None:
+        nonlocal cleanup_done, cleanup_failure
+        if cleanup_done:
+            return cleanup_failure
+        cleanup_done = True
+        try:
+            with preview_startup_phase(stage):
+                _kill_child(child)
+        except PreviewStartupFailure as error:
+            cleanup_failure = error
+        except Exception:  # noqa: BLE001 - cleanup must not replace the active stage failure
+            cleanup_failure = PreviewStartupFailure(stage, "failed")
+        for thread, finished in threads:
+            try:
+                thread.join(timeout=1)
+                if not finished.is_set() and cleanup_failure is None:
+                    cleanup_failure = PreviewStartupFailure(stage, "timeout")
+            except Exception:  # noqa: BLE001 - unfinished readers cannot authorize prepared
+                if cleanup_failure is None:
+                    cleanup_failure = PreviewStartupFailure(stage, "failed")
+        # A stuck reader owns its pipe; closing it here could block on its buffered-I/O lock.
+        return cleanup_failure
+
     try:
         with preview_startup_phase(stage):
+            for pipe in (child.stdout, child.stderr):
+                assert pipe is not None
+                finished = threading.Event()
+                thread = threading.Thread(target=drain, args=(pipe, finished), daemon=True)
+                thread.start()
+                threads.append((thread, finished))
             if stage != "start":
                 exit_code = child.wait(timeout=120)
-                for thread in threads:
-                    thread.join(timeout=1)
+                cleanup_error = cleanup()
                 if log_overflow.is_set():
                     raise PreviewStartupFailure(stage, "log_limit")
                 if exit_code != 0:
@@ -496,12 +535,18 @@ def _run_stage(stage: str) -> None:
                             -15: "signal_term", -25: "file_size_limit",
                         }.get(exit_code, "signal_exit")
                     raise PreviewStartupFailure(stage, reason)
+                if drain_failed.is_set():
+                    raise PreviewStartupFailure(stage, "failed")
+                if cleanup_error is not None:
+                    raise cleanup_error
                 write_frame(sys.stdout.buffer, {"ok": True, "state": "prepared"})
                 return
             ready_deadline = time.monotonic() + READY_TIMEOUT
             while True:
                 if log_overflow.is_set():
                     raise PreviewStartupFailure(stage, "log_limit")
+                if drain_failed.is_set():
+                    raise PreviewStartupFailure(stage, "failed")
                 poll_code = child.poll()
                 if poll_code is not None:
                     raise PreviewStartupFailure(
@@ -515,10 +560,14 @@ def _run_stage(stage: str) -> None:
                         break
                 except (OSError, http.client.HTTPException):
                     time.sleep(0.1)
+            if log_overflow.is_set():
+                raise PreviewStartupFailure(stage, "log_limit")
+            if drain_failed.is_set():
+                raise PreviewStartupFailure(stage, "failed")
             write_frame(sys.stdout.buffer, {"ok": True, "state": "ready"})
         while True:
-            payload = _wait_request(child, log_overflow)
-            if child.poll() is not None or log_overflow.is_set():
+            payload = _wait_request(child, log_overflow, drain_failed)
+            if child.poll() is not None or log_overflow.is_set() or drain_failed.is_set():
                 raise RuntimeError("preview application exited")
             try:
                 result = relay_http(payload)
@@ -527,13 +576,18 @@ def _run_stage(stage: str) -> None:
                 # The write might have committed; neither runner nor client retries.
                 write_frame(sys.stdout.buffer, {"ok": False, "error": "application request failed"})
     finally:
-        _kill_child(child)
+        # Preserve an active stage/request failure even when process cleanup also fails.
+        cleanup()
 
 
-def _wait_request(child: subprocess.Popen[bytes], log_overflow: threading.Event) -> dict[str, object]:
+def _wait_request(
+    child: subprocess.Popen[bytes], log_overflow: threading.Event,
+    drain_failed: threading.Event | None = None,
+) -> dict[str, object]:
     while True:
-        if child.poll() is not None or log_overflow.is_set():
-            raise RuntimeError("preview application exited or exceeded log limit")
+        if (child.poll() is not None or log_overflow.is_set()
+                or (drain_failed is not None and drain_failed.is_set())):
+            raise RuntimeError("preview application exited or log drain failed")
         if select.select([sys.stdin.buffer], [], [], 0.25)[0]:
             return read_frame(sys.stdin.buffer)
 
