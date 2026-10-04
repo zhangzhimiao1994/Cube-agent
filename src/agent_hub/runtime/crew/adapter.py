@@ -18,7 +18,7 @@ import re
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -4274,6 +4274,11 @@ class CrewDispatchRuntime:
         step_deadline = asyncio.get_running_loop().time() + min(
             step.timeout_seconds, self._remaining_timeout(run_state)
         )
+
+        def advance_step_deadline(deadline: float) -> None:
+            nonlocal step_deadline
+            step_deadline = deadline
+
         recovery_attempt = 0
         while True:
             attempt_sources = self._ordered_artifacts(
@@ -4313,6 +4318,7 @@ class CrewDispatchRuntime:
                     run_state,
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
+                    on_step_progress=advance_step_deadline,
                 )
                 completion = _project_scale_structured_role_completion(step, agent, completion)
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
@@ -4717,6 +4723,7 @@ class CrewDispatchRuntime:
         step_deadline: float,
         *,
         use_repair_tool_keys: bool = False,
+        on_step_progress: Callable[[float], None] | None = None,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         content_limits = self._content_limits(
             context,
@@ -4788,6 +4795,15 @@ class CrewDispatchRuntime:
         evidence: list[Artifact] = []
         call_cursor = _ModelCallCursor()
         runtime = self
+        step_timeout = asyncio.timeout(self._remaining_timeout(run_state, step_deadline))
+
+        def advance_step_deadline(deadline: float) -> None:
+            nonlocal step_deadline
+            # Keep the framework timer and the caller's review/retry budget in sync.
+            step_timeout.reschedule(deadline)
+            step_deadline = deadline
+            if on_step_progress is not None:
+                on_step_progress(deadline)
 
         class StepBridge:
             async def complete(self, crew_messages: object) -> str:
@@ -4817,6 +4833,7 @@ class CrewDispatchRuntime:
                     run_state,
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
+                    on_step_progress=advance_step_deadline,
                 )
                 text = last_completion.response.text
                 if text is None:
@@ -4824,7 +4841,7 @@ class CrewDispatchRuntime:
                 return text
 
         try:
-            async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+            async with step_timeout:
                 raw = await generation.execute(
                     step.id,
                     user_text,
@@ -5532,6 +5549,7 @@ class CrewDispatchRuntime:
         step_deadline: float,
         *,
         use_repair_tool_keys: bool = False,
+        on_step_progress: Callable[[float], None] | None = None,
     ) -> GatewayCompletion:
         max_output_tokens = min(agent.max_output_tokens, step.token_budget)
         content_limits = self._content_limits(
@@ -5717,6 +5735,21 @@ class CrewDispatchRuntime:
             reused_semantic_results = 0
             round_progressed = False
             argument_correction_requested = False
+
+            def record_round_progress() -> None:
+                nonlocal round_progressed, step_deadline
+                if round_progressed:
+                    return
+                round_progressed = True
+                if run_state.deadline is not None:
+                    step_deadline = _tool_progress_step_deadline(
+                        context,
+                        step_deadline=step_deadline,
+                        run_deadline=run_state.deadline,
+                    )
+                    if on_step_progress is not None:
+                        on_step_progress(step_deadline)
+
             for tool_index, tool_call in enumerate(response.tool_calls):
                 tool_call = _scope_project_workspace_tool_call(context, tool_call)
                 if tool_call.name not in step.tools:
@@ -5780,7 +5813,7 @@ class CrewDispatchRuntime:
                     evidence.append(semantic_artifact)
                     if semantic_artifact.source_ids == (str(trigger_model_artifact.id),):
                         # Hydration must rebuild the original continuation, including its tools.
-                        round_progressed = True
+                        record_round_progress()
                     else:
                         reused_semantic_results += 1
                     continue
@@ -6049,7 +6082,7 @@ class CrewDispatchRuntime:
                         await tool_boundary(idempotency_key, succeeded, artifact)
                         evidence.append(artifact)
                         results.append({"name": tool_call.name, "result": result})
-                        round_progressed = True
+                        record_round_progress()
                         continue
                     rejection = _correctable_tool_argument_rejection(
                         tool_call,
@@ -6404,7 +6437,7 @@ class CrewDispatchRuntime:
                 await tool_boundary(idempotency_key, succeeded, artifact)
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
-                round_progressed = True
+                record_round_progress()
             reused_result_count = reused_generated_file_results + reused_semantic_results
             if argument_correction_requested:
                 last_round_progressed = False
@@ -6431,12 +6464,6 @@ class CrewDispatchRuntime:
             if reused_generated_file_results == len(response.tool_calls):
                 return _generated_file_ready_completion(completion, response)
             force_result_synthesis = reused_result_count == len(response.tool_calls)
-            if round_progressed and run_state.deadline is not None:
-                step_deadline = _tool_progress_step_deadline(
-                    context,
-                    step_deadline=step_deadline,
-                    run_deadline=run_state.deadline,
-                )
             last_round_progressed = round_progressed
             messages.append(
                 ModelMessage(

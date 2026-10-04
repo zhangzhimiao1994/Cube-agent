@@ -2572,6 +2572,163 @@ async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
+@pytest.mark.parametrize("reviewed", [False, True])
+async def test_tool_progress_crosses_initial_step_deadline_without_retry(
+    reviewed: bool,
+) -> None:
+    class TimedProgressGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.started_at: float | None = None
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            loop = asyncio.get_running_loop()
+            if self.started_at is None:
+                self.started_at = loop.time()
+            self.requests.append(request)
+            index = len(self.requests)
+            targets = (0.10, 0.25, 0.45, 0.60, 0.65)
+            await asyncio.sleep(max(0, self.started_at + targets[min(index, 5) - 1] - loop.time()))
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id=f"progress-{index}", name="web_search",
+                        arguments={"q": f"unique-{index}"},
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if index <= 3 else ModelResponse(
+                    text='{"verdict":"approve"}' if request.logical_model == "review" else "done",
+                    usage=TokenUsage(1, 1, 2),
+                )
+            )
+            return GatewayCompletion(
+                response=response, deployment_id="primary", logical_model=request.logical_model,
+                provider_id="deepseek", provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    plan = _tool_plan()
+    step = plan.steps[0].model_copy(update={"timeout_seconds": 0.4})
+    if reviewed:
+        plan = plan.model_copy(update={"agents": (*plan.agents, AgentSpec(
+            id="reviewer", role="reviewer", goal="Review", logical_model="review",
+        ))})
+        step = step.model_copy(update={"reviewer": "reviewer"})
+    plan = plan.model_copy(update={"steps": (step,)})
+    gateway = TimedProgressGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness, crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    completions_at: list[float] = []
+    async for event in runtime.run(_context(
+        timeout_seconds=5, routing_decision={"project_scale": "medium"},
+    )):
+        events.append(event)
+        if event.kind is EventKind.TOOL_COMPLETED:
+            completions_at.append(asyncio.get_running_loop().time())
+
+    assert gateway.started_at is not None
+    assert completions_at[-1] > gateway.started_at + 0.4
+    assert len(harness.calls) == 3
+    assert len(gateway.requests) == (5 if reviewed else 4)
+    assert not any(event.kind in {EventKind.STEP_RETRYING, EventKind.STEP_FAILED} for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.parametrize("tool_progress", [False, True])
+async def test_tool_progress_never_extends_the_run_deadline(tool_progress: bool) -> None:
+    class StalledGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if tool_progress and not self.requests:
+                return await super().complete_with_context(request)
+            self.requests.append(request)
+            await asyncio.Event().wait()
+            raise AssertionError("stalled model unexpectedly resumed")
+
+    plan = _tool_plan()
+    plan = plan.model_copy(update={"steps": (
+        plan.steps[0].model_copy(update={"timeout_seconds": 0.15}),
+    )})
+    gateway = StalledGateway()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness, crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    # An independent watchdog catches any accidental removal of the run fuse.
+    async with asyncio.timeout(2):
+        with pytest.raises(RuntimeExecutionError):
+            async for event in runtime.run(_context(timeout_seconds=0.6)):
+                events.append(event)
+    assert len(harness.calls) == int(tool_progress)
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+
+
+async def test_first_durable_tool_extends_timer_before_the_batch_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.runtime.crew import adapter
+
+    class BatchGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completion = await super().complete_with_context(request)
+            if len(self.requests) == 1:
+                return GatewayCompletion(
+                    response=ModelResponse(
+                        text=None,
+                        tool_calls=tuple(ToolCall(
+                            id=f"batch-{index}", name="web_search", arguments={"q": str(index)},
+                        ) for index in range(3)),
+                        usage=TokenUsage(1, 1, 2),
+                    ),
+                    deployment_id="primary", logical_model=request.logical_model,
+                    provider_id="deepseek", provider_model="deepseek/deepseek-v4-flash",
+                    cost_usd=Decimal(0),
+                )
+            return completion
+
+    class DelayedSecondTool(RecordingHarnessToolGateway):
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            if len(self.calls) == 1:
+                await asyncio.sleep(0.55)
+            return await super().invoke(tenant_id, request, user_id=user_id, role=role)
+
+    extensions: list[float] = []
+    extend = adapter._tool_progress_step_deadline
+
+    def record_extension(context: TaskContext, *, step_deadline: float, run_deadline: float) -> float:
+        extensions.append(step_deadline)
+        return extend(context, step_deadline=step_deadline, run_deadline=run_deadline)
+
+    monkeypatch.setattr(adapter, "_tool_progress_step_deadline", record_extension)
+    plan = _tool_plan()
+    plan = plan.model_copy(update={"steps": (
+        plan.steps[0].model_copy(update={"timeout_seconds": 0.4}),
+    )})
+    gateway = BatchGateway()
+    harness = DelayedSecondTool()
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness, crew_factory=FastFactory(),
+    )
+    events = [event async for event in runtime.run(_context(timeout_seconds=5))]
+    assert len(harness.calls) == 3
+    assert len(gateway.requests) == 2
+    assert len(extensions) == 1
+    assert not any(event.kind in {EventKind.STEP_RETRYING, EventKind.STEP_FAILED} for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 @pytest.mark.parametrize(
     ("project_scale", "hard_limit"),
     [
