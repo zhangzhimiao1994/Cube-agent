@@ -280,6 +280,7 @@ class ProjectScaleCaseResult:
     participant_event_count: int = 0
     validation_focus: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    validated_workspace_manifest: dict[str, tuple[int, str]] | None = None
 
     @property
     def required_evidence(self) -> tuple[str, ...]:
@@ -351,6 +352,14 @@ class ProjectScaleCaseResult:
             "final_effective_scale": self.final_effective_scale or self.effective_scale,
             "artifact_origin": self.artifact_origin,
             "workspace_bundle_source": self.workspace_bundle_source,
+            "validated_workspace_manifest": (
+                {
+                    path: [size, digest]
+                    for path, (size, digest) in self.validated_workspace_manifest.items()
+                }
+                if self.validated_workspace_manifest is not None
+                else None
+            ),
             "participant_agent_ids": list(self.participant_agent_ids),
             "participant_event_kinds": list(self.participant_event_kinds),
             "participant_event_count": self.participant_event_count,
@@ -684,6 +693,7 @@ def execute_project_scale_plan(
         final_effective_scale: str | None = None
         artifact_origin: str | None = None
         workspace_bundle_source: str | None = None
+        validated_workspace_manifest: dict[str, tuple[int, str]] | None = None
         participant_agent_ids: set[str] = set()
         participant_event_kinds: list[str] = []
         multi_agent_contract_reasons: tuple[str, ...] = ()
@@ -758,6 +768,7 @@ def execute_project_scale_plan(
             status = approval_status or status
 
             _report_progress(progress, f"{case_label}: observing run {run_id}")
+            validated_workspace_manifest = None
             observation = _collect_run_observation(
                 client,
                 run_id=run_id,
@@ -825,6 +836,7 @@ def execute_project_scale_plan(
                             ),
                         )
                     else:
+                        validated_workspace_manifest = None
                         repair_response = client.request_json(
                             "POST",
                             f"/api/v1/runs/{quote(run_id)}/accept-repair",
@@ -983,6 +995,10 @@ def execute_project_scale_plan(
                         observation.workspace_bundle, generated_project_validation
                     )
                     evidence["deliverable_quality"] = deliverable_quality.passed
+                    if generated_project_validation.passed and observation.workspace_bundle is not None:
+                        validated_workspace_manifest = _workspace_bundle_manifest(
+                            observation.workspace_bundle
+                        )
             if evidence["workspace_bundle"]:
                 _drop_recovered_workspace_bundle_errors(errors)
             deliverable_repair_attempts = 0
@@ -1133,6 +1149,7 @@ def execute_project_scale_plan(
                     except Exception as error:  # noqa: BLE001 - repair can still supersede it.
                         errors.append(f"cleanup_cancel: {error}")
                 deliverable_repair_attempts += 1
+                validated_workspace_manifest = None
                 _report_progress(
                     progress,
                     f"{case_label}: submitting deliverable repair {deliverable_repair_attempts}",
@@ -1275,8 +1292,11 @@ def execute_project_scale_plan(
                 )
                 repair_workspace_bundle = (
                     repair_observation.workspace_bundle
-                    if repair_body.get("replace_workspace_files") is True
-                    and _workspace_bundle_is_authoritative(repair_observation.workspace_bundle)
+                    if repair_observation.workspace_bundle_source == "public_workspace_api"
+                    or (
+                        repair_body.get("replace_workspace_files") is True
+                        and _workspace_bundle_is_authoritative(repair_observation.workspace_bundle)
+                    )
                     else _merged_workspace_bundle(
                         current_workspace_bundle,
                         repair_observation.workspace_bundle,
@@ -1341,6 +1361,10 @@ def execute_project_scale_plan(
                             repair_workspace_bundle, generated_project_validation
                         )
                         evidence["deliverable_quality"] = deliverable_quality.passed
+                        if generated_project_validation.passed and repair_workspace_bundle is not None:
+                            validated_workspace_manifest = _workspace_bundle_manifest(
+                                repair_workspace_bundle
+                            )
                     if not _generated_project_validation_is_repairable(
                         generated_project_validation
                     ):
@@ -1540,6 +1564,7 @@ def execute_project_scale_plan(
                 except Exception as error:  # noqa: BLE001 - cleanup can still cancel stale runs.
                     errors.append(f"terminal_status_refresh: {error}")
         except Exception as error:  # noqa: BLE001 - collect per-case failures and continue.
+            validated_workspace_manifest = None
             errors.append(str(error))
         finally:
             if run_id is not None:
@@ -1555,6 +1580,12 @@ def execute_project_scale_plan(
                         errors.append(f"cleanup_cancel: {error}")
         if evidence["terminal_status"] and status != "completed":
             errors.append(f"terminal_status: {status or 'unknown'}")
+        if (
+            status != "completed"
+            or evidence.get("generated_project_validation") is not True
+            or evidence.get("requirements_validation") is not True
+        ):
+            validated_workspace_manifest = None
         result = ProjectScaleCaseResult(
             case_id=run_request.case_id,
             run_id=run_id,
@@ -1577,6 +1608,7 @@ def execute_project_scale_plan(
             participant_event_count=len(participant_event_kinds),
             validation_focus=run_request.validation_focus,
             errors=tuple(errors),
+            validated_workspace_manifest=validated_workspace_manifest,
         )
         _report_progress(
             progress,
@@ -2097,25 +2129,8 @@ def _merged_workspace_bundle(base: bytes | None, patch: bytes | None) -> bytes |
         return patch
     if patch_files is None:
         return base
-    for path, content in patch_files.items():
-        base_content = base_files.get(path)
-        if (
-            path.casefold().endswith(".json")
-            and base_content is not None
-            and _json_bytes_are_valid(base_content)
-            and not _json_bytes_are_valid(content)
-        ):
-            continue
-        base_files[path] = content
+    base_files.update(patch_files)
     return _workspace_bundle_from_file_bytes(base_files)
-
-
-def _json_bytes_are_valid(content: bytes) -> bool:
-    try:
-        json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return True
 
 
 def _workspace_bundle_file_bytes(workspace_bundle: bytes) -> dict[str, bytes] | None:

@@ -814,13 +814,52 @@ def _collect_model_scope_evidence(
     return evidence
 
 
+def _validated_manifest(value: object) -> dict[str, tuple[int, str]] | None:
+    if not isinstance(value, Mapping) or not value:
+        return None
+    result: dict[str, tuple[int, str]] = {}
+    for path, metadata in value.items():
+        if not isinstance(path, str) or not isinstance(metadata, (list, tuple)) or len(metadata) != 2:
+            return None
+        try:
+            if str(_safe_zip_member_path(path)) != path:
+                return None
+        except RuntimeError:
+            return None
+        size, digest = metadata
+        if type(size) is not int or size < 0 or not isinstance(digest, str):
+            return None
+        if _SHA256_RE.fullmatch(digest) is None:
+            return None
+        result[path] = (size, digest)
+    return result
+
+
+def _public_bundle_matches_validation(
+    expected: object,
+    public: Mapping[str, object],
+) -> bool:
+    validated = _validated_manifest(expected)
+    downloaded = _validated_manifest(public.get("workspace_manifest"))
+    return (
+        validated is not None
+        and downloaded == validated
+        and public.get("validated_bundle_matches") is True
+        and all(
+            type(public.get(key)) is int and public[key] == len(validated)
+            for key in ("file_count", "downloaded_file_count", "zip_member_count")
+        )
+    )
+
+
 def verify_public_workspace_artifacts(
     client: AcceptanceClient,
     *,
     project_id: str,
     workspace_session_id: str,
+    validated_workspace_manifest: object = None,
 ) -> dict[str, object]:
-    """Cross-check the public file API, every public download, and the public ZIP."""
+    """Bind public downloads to the exact content that passed build and business tests."""
 
     encoded_project = quote(project_id, safe="")
     encoded_session = quote(workspace_session_id, safe="")
@@ -896,6 +935,9 @@ def verify_public_workspace_artifacts(
         except RuntimeError as error:
             errors.append(str(error))
             continue
+        if safe_path in listed_paths:
+            errors.append(f"public file list contains duplicate path: {safe_path}")
+            continue
         listed_paths.add(safe_path)
         if not isinstance(raw_size, int) or isinstance(raw_size, bool) or raw_size < 0:
             errors.append(f"public file has invalid size: {safe_path}")
@@ -933,6 +975,17 @@ def verify_public_workspace_artifacts(
     if unsafe_member_count:
         errors.append(f"public ZIP contains {unsafe_member_count} unsafe members")
 
+    public_manifest = {
+        path: (len(content), hashlib.sha256(content).hexdigest())
+        for path, content in zip_files.items()
+    }
+    expected_manifest = _validated_manifest(validated_workspace_manifest)
+    validated_bundle_matches = expected_manifest is not None and public_manifest == expected_manifest
+    if expected_manifest is None:
+        errors.append("validated workspace manifest is missing or invalid")
+    elif not validated_bundle_matches:
+        errors.append("public ZIP differs from the workspace that passed validation")
+
     return {
         "ok": not errors,
         "source": "public_workspace_api",
@@ -947,6 +1000,8 @@ def verify_public_workspace_artifacts(
         "zip_crc_ok": zip_crc_ok,
         "metadata_matches_zip": metadata_matches_zip,
         "unsafe_member_count": unsafe_member_count,
+        "workspace_manifest": {path: list(item) for path, item in public_manifest.items()},
+        "validated_bundle_matches": validated_bundle_matches,
         "errors": errors,
     }
 
@@ -1131,6 +1186,9 @@ def build_case_report(
     generated_project_ok = result.evidence.get("generated_project_validation") is True
     requirements_ok = result.evidence.get("requirements_validation") is True
     public_artifacts_ok = public_artifacts.get("ok") is True
+    validated_bundle_matches = _public_bundle_matches_validation(
+        result.validated_workspace_manifest, public_artifacts,
+    )
     preview_ok = dynamic_web_preview.get("counted_as_passed") is True
     route_intent = result.case_id.split(":", 1)[1]
     case_kind = "auto_scale" if route_intent == "auto" else "mode_capability"
@@ -1178,6 +1236,7 @@ def build_case_report(
         and generated_project_ok
         and requirements_ok
         and public_artifacts_ok
+        and validated_bundle_matches
         and preview_ok
         and route_policy_ok
         and scale_fidelity_ok
@@ -1205,6 +1264,7 @@ def build_case_report(
             "exact_mode" if exact_mode_coverage_ok else "safe_upgrade" if safe_upgrade else "none"
         ),
         "artifact_origin_ok": artifact_origin_ok,
+        "validated_bundle_matches": validated_bundle_matches,
         "autonomous_mode_selected": case_kind == "auto_scale" and route_policy_ok,
         "multi_agent_evidence_ok": multi_agent_evidence_ok,
         "status": "pending_real_device" if core_ok else "failed",
@@ -1216,10 +1276,15 @@ def build_case_report(
         "conversation": dict(conversation),
         "run": result.to_payload(),
         "build_and_test": {
-            "status": "passed" if generated_project_ok and requirements_ok else "failed",
+            "status": (
+                "passed"
+                if generated_project_ok and requirements_ok and validated_bundle_matches
+                else "failed"
+            ),
             "source": "project_scale_runner.generated_project_validation",
             "generated_project_validation": generated_project_ok,
             "requirements_validation": requirements_ok,
+            "validated_bundle_matches": validated_bundle_matches,
         },
         "public_artifacts": dict(public_artifacts),
         "dynamic_web_preview": dict(dynamic_web_preview),
@@ -1235,6 +1300,7 @@ def build_case_report(
             "public_run_api": True,
             "public_workspace_file_api": public_artifacts_ok,
             "public_workspace_zip": public_artifacts_ok,
+            "validated_workspace_bundle": validated_bundle_matches,
             "public_preview_lifecycle": preview_ok,
             "observed_route": route_policy_ok,
             "exact_mode_coverage": exact_mode_coverage_ok,
@@ -1494,6 +1560,7 @@ def run_real_user_four_scale_acceptance(
                 client,
                 project_id=project_id,
                 workspace_session_id=workspace_session_id,
+                validated_workspace_manifest=result.validated_workspace_manifest,
             )
             dynamic_web_preview = verify_dynamic_web_preview(
                 client,
@@ -1862,6 +1929,9 @@ def _has_complete_core_evidence(
         or event_count < 0
     ):
         return False
+    validated_manifest = _validated_manifest(run.get("validated_workspace_manifest"))
+    if not _public_bundle_matches_validation(validated_manifest, public):
+        return False
     result = ProjectScaleCaseResult(
         case_id=case_id,
         run_id=cast(str, run["run_id"]),
@@ -1878,6 +1948,7 @@ def _has_complete_core_evidence(
         participant_agent_ids=tuple(cast(list[str], participants)),
         participant_event_kinds=tuple(cast(list[str], event_kinds)),
         participant_event_count=event_count,
+        validated_workspace_manifest=validated_manifest,
     )
     if not result.ok or run.get("required_evidence") != list(result.required_evidence):
         return False
@@ -1940,6 +2011,7 @@ def _has_complete_core_evidence(
         "scale_fidelity_ok",
         "route_policy_ok",
         "artifact_origin_ok",
+        "validated_bundle_matches",
         "multi_agent_evidence_ok",
         "build_and_test",
         "success_basis",

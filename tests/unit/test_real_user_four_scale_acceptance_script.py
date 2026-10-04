@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -114,6 +115,28 @@ def workspace_zip() -> bytes:
         archive.writestr("README.md", "# Readme")
         archive.writestr("src/app.py", "print('ok')\n")
     return buffer.getvalue()
+
+
+def validated_workspace_manifest() -> dict[str, tuple[int, str]]:
+    with zipfile.ZipFile(io.BytesIO(workspace_zip())) as archive:
+        return {
+            item.filename: (item.file_size, hashlib.sha256(archive.read(item)).hexdigest())
+            for item in archive.infolist()
+        }
+
+
+def public_artifact_evidence() -> dict[str, object]:
+    return {
+        "ok": True,
+        "source": "public_workspace_api",
+        "validated_bundle_matches": True,
+        "workspace_manifest": {
+            path: list(item) for path, item in validated_workspace_manifest().items()
+        },
+        "file_count": 2,
+        "downloaded_file_count": 2,
+        "zip_member_count": 2,
+    }
 
 
 def test_auto_scale_plan_keeps_natural_user_request_in_auto_mode() -> None:
@@ -334,6 +357,7 @@ def test_public_workspace_verification_checks_list_files_and_zip() -> None:
         client,
         project_id="project-small",
         workspace_session_id="conv-small",
+        validated_workspace_manifest=validated_workspace_manifest(),
     )
 
     assert result["ok"] is True
@@ -349,6 +373,7 @@ def test_public_workspace_verification_checks_list_files_and_zip() -> None:
 def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="small:artifact_production",
         run_id="run-small",
         status="completed",
@@ -382,7 +407,7 @@ def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> No
         project={"project_id": "project-small"},
         conversation={"conversation_id": "conv-small"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={
             "status": "passed",
             "counted_as_passed": True,
@@ -414,6 +439,7 @@ def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> No
 def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverage() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="large:direct",
         run_id="run-large",
         status="completed",
@@ -433,7 +459,7 @@ def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverag
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -447,6 +473,7 @@ def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverag
 def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="large:auto",
         run_id="run-large-repair",
         status="completed",
@@ -464,7 +491,7 @@ def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() ->
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -479,6 +506,7 @@ def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() ->
 def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="large:auto",
         run_id="run-large-repair",
         status="completed",
@@ -496,7 +524,7 @@ def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -508,6 +536,7 @@ def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None
 def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="large:hybrid",
         run_id="run-large-repair",
         status="completed",
@@ -525,7 +554,7 @@ def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -537,6 +566,7 @@ def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
 def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="small:direct",
         run_id="run-small",
         status="completed",
@@ -554,7 +584,7 @@ def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale(
         project={"project_id": "project-small"},
         conversation={"conversation_id": "conv-small"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -566,6 +596,7 @@ def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale(
 def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="large:direct",
         run_id="run-large",
         status="completed",
@@ -583,7 +614,7 @@ def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> 
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -595,6 +626,7 @@ def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> 
 def test_report_rejects_medium_case_when_effective_scale_drifts_to_large() -> None:
     module = load_script()
     case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
         case_id="medium:dispatch",
         run_id="run-medium",
         status="completed",
@@ -612,7 +644,7 @@ def test_report_rejects_medium_case_when_effective_scale_drifts_to_large() -> No
         project={"project_id": "project-medium"},
         conversation={"conversation_id": "conv-medium"},
         result=case,
-        public_artifacts={"ok": True, "source": "public_workspace_api"},
+        public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
 
@@ -701,6 +733,7 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
             else route
         )
         result = ProjectScaleCaseResult(
+            validated_workspace_manifest=validated_workspace_manifest(),
             case_id=case_id,
             run_id=f"run-{case_id}",
             status="completed",
@@ -730,6 +763,7 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
                 },
                 result=result,
                 public_artifacts={
+                    **public_artifact_evidence(),
                     "ok": True,
                     "source": "public_workspace_api",
                     "admin_internal_run_data_used": False,
@@ -1474,6 +1508,7 @@ def matrix_harness(
             )
         )
         result = ProjectScaleCaseResult(
+            validated_workspace_manifest=validated_workspace_manifest(),
             case_id=plan.requests[0].case_id,
             run_id=str(observed["id"]),
             status="completed",

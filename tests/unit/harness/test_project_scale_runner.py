@@ -111,7 +111,7 @@ def test_generated_project_command_env_allows_npm_registry_override(
     assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org/"
 
 
-def test_incremental_workspace_merge_preserves_valid_json_when_patch_is_invalid() -> None:
+def test_incremental_workspace_merge_overwrites_valid_json_when_patch_is_invalid() -> None:
     base = _project_bundle(
         {
             "package.json": json.dumps(
@@ -132,7 +132,8 @@ def test_incremental_workspace_merge_preserves_valid_json_when_patch_is_invalid(
     assert merged is not None
     with zipfile.ZipFile(BytesIO(merged)) as archive:
         package = archive.read("package.json").decode("utf-8")
-        assert json.loads(package)["scripts"]["test"] == "vitest run"
+        assert package == "{'scripts': {'build': 'tsc', 'test': 'vitest run'}}\n"
+        assert archive.read("src/main.ts") == b"export const value = 1;\n"
         assert archive.read("preview.html").decode("utf-8").startswith("<!doctype html>")
 
 
@@ -6187,7 +6188,9 @@ def test_execute_project_scale_plan_merges_partial_repair_bundle(
             "tests/audit.test.js": "throw new Error('syntax stays broken');\n",
         }
     )
-    patch_bundle = _project_bundle({"tests/audit.test.js": "import assert from 'node:assert/strict';\nassert.equal(42, 42);\n"})
+    patch_files = {
+        "tests/audit.test.js": "import assert from 'node:assert/strict';\nassert.equal(42, 42);\n"
+    }
     seen: list[bytes | None] = []
 
     def validate_generated_project_bundle(
@@ -6212,7 +6215,13 @@ def test_execute_project_scale_plan_merges_partial_repair_bundle(
         "_validate_generated_project_bundle",
         validate_generated_project_bundle,
     )
-    client = FakeAcceptanceClient(
+    class EmbeddedRepairClient(FakeAcceptanceClient):
+        def request_bytes(self, method: str, path: str) -> bytes:
+            if self._collecting_repair_run:
+                raise RuntimeError("public workspace unavailable for embedded patch")
+            return super().request_bytes(method, path)
+
+    client = EmbeddedRepairClient(
         run_id="run-large-direct-merge",
         session_id="project-scale-large-direct",
         create_status="waiting_approval",
@@ -6237,7 +6246,10 @@ def test_execute_project_scale_plan_merges_partial_repair_bundle(
             }
         ],
         workspace_bundle=base_bundle,
-        repair_workspace_bundle=patch_bundle,
+        repair_events=[
+            _trusted_agent_standard_event(),
+            {"kind": "artifact.created", "payload": {"workspace_bundle": {"files": patch_files}}},
+        ],
     )
 
     report = execute_project_scale_plan(plan, client, wait_seconds=5, poll_interval_seconds=0)
@@ -6247,7 +6259,218 @@ def test_execute_project_scale_plan_merges_partial_repair_bundle(
     assert result.run_id == "run-large-direct-merge-repair"
     assert result.evidence["generated_project_validation"] is True
     assert result.evidence["deliverable_repair_trace"] is True
+    assert result.workspace_bundle_source == "embedded_bundle"
     assert len(seen) == 2
+
+
+def _validation_manifest_files() -> dict[str, str]:
+    return {
+        "README.md": "# Task API\nImplements the requested scope.\n",
+        "PROJECT_REQUIREMENTS.md": "- Task API with persistence\n",
+        "IMPLEMENTATION_PLAN.md": _AGENT_STANDARD_IMPLEMENTATION_PLAN,
+        "VERIFICATION.md": "Independent build and tests are required.\n",
+        "package.json": '{"scripts":{"build":"node --check src/main.js","test":"node --test"}}',
+        "src/main.js": _functional_js_source(),
+        "tests/main.test.js": _functional_js_test(),
+        "tests/retired.test.js": "// retained only in the initial workspace\n",
+        "tests/expected.json": '{"expected":42}',
+    }
+
+
+@pytest.mark.parametrize("replace_files", (False, True))
+@pytest.mark.parametrize("authoritative", (False, True))
+@pytest.mark.parametrize("defect", ("missing_file", "invalid_json"))
+def test_public_repair_validation_never_merges_previous_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    replace_files: bool,
+    authoritative: bool,
+    defect: str,
+) -> None:
+    base_files = _validation_manifest_files()
+    public_files = dict(base_files)
+    if defect == "missing_file":
+        del public_files["tests/retired.test.js"]
+    else:
+        public_files["tests/expected.json"] = "{"
+    if not authoritative:
+        del public_files["IMPLEMENTATION_PLAN.md"]
+    seen: list[bytes | None] = []
+
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        seen.append(bundle)
+        reason = (
+            "generated_project_validation: command failed exit=1"
+            if len(seen) == 1
+            else "generated_project_validation: isolated systemd validator is required"
+        )
+        return project_scale_runner_module._EvidenceCheck(passed=False, reasons=(reason,))
+
+    original_repair_body = project_scale_runner_module._deliverable_repair_body
+
+    def repair_body(*args: Any, **kwargs: Any) -> dict[str, object]:
+        body = original_repair_body(*args, **kwargs)
+        body["replace_workspace_files"] = replace_files
+        return body
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_body", repair_body)
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability", scales=("small",), flows=("direct",), execute=True
+    )
+    client = FakeAcceptanceClient(
+        status="completed", artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+        workspace_bundle=_project_bundle(base_files),
+        repair_workspace_bundle=_project_bundle(public_files),
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert len(seen) == 2
+    assert client.submitted_bodies[1]["replace_workspace_files"] is replace_files
+    assert seen[1] is not None
+    with zipfile.ZipFile(BytesIO(seen[1])) as archive:
+        actual = {name: archive.read(name) for name in archive.namelist()}
+    assert actual == {path: content.encode() for path, content in public_files.items()}
+    assert result.evidence["generated_project_validation"] is False
+    assert result.validated_workspace_manifest is None
+
+
+@pytest.mark.parametrize("delivery", ("initial", "replacement", "materialized_patch"))
+def test_validated_workspace_manifest_records_last_successful_input(
+    monkeypatch: pytest.MonkeyPatch, delivery: str,
+) -> None:
+    files = _validation_manifest_files()
+    final_files = dict(files)
+    final_files["tests/expected.json"] = '{"expected":43}'
+    seen: list[bytes | None] = []
+
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        seen.append(bundle)
+        passed = delivery == "initial" or len(seen) > 1
+        return project_scale_runner_module._EvidenceCheck(
+            passed=passed,
+            reasons=() if passed else ("generated_project_validation: command failed exit=1",),
+        )
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    if delivery == "replacement":
+        original_repair_body = project_scale_runner_module._deliverable_repair_body
+
+        def replacement_body(*args: Any, **kwargs: Any) -> dict[str, object]:
+            return {**original_repair_body(*args, **kwargs), "replace_workspace_files": True}
+
+        monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_body", replacement_body)
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability", scales=("small",), flows=("direct",), execute=True
+    )
+    client = FakeAcceptanceClient(
+        status="completed", artifacts=[{"id": "artifact-1"}],
+        events=[_trusted_agent_standard_event()],
+        workspace_bundle=_project_bundle(files),
+        repair_workspace_bundle=_project_bundle(final_files),
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert result.ok, result.errors
+    assert len(seen) == (1 if delivery == "initial" else 2)
+    expected_files = files if delivery == "initial" else final_files
+    expected = {
+        path: (len(content.encode()), hashlib.sha256(content.encode()).hexdigest())
+        for path, content in expected_files.items()
+    }
+    assert result.validated_workspace_manifest == expected
+    payload = result.to_payload()
+    assert payload["validated_workspace_manifest"] == {
+        path: [size, digest] for path, (size, digest) in expected.items()
+    }
+    assert json.loads(json.dumps(payload))["validated_workspace_manifest"] == (
+        payload["validated_workspace_manifest"]
+    )
+
+
+@pytest.mark.parametrize("failure", ("submission", "observation", "build", "requirements", "preview"))
+def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    files = _validation_manifest_files()
+    repair_files = dict(files)
+    del repair_files["tests/retired.test.js"]
+    validations: list[bytes | None] = []
+
+    def validate(bundle: bytes | None, **kwargs: object) -> object:
+        validations.append(bundle)
+        if len(validations) == 1:
+            return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+        if failure == "build":
+            raise RuntimeError("build validator failed after repair")
+        if failure == "requirements":
+            return project_scale_runner_module._EvidenceCheck(
+                passed=False, reasons=("requirements: persistence lost",),
+            )
+        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+
+    original_observe = project_scale_runner_module._collect_run_observation
+    observations = 0
+
+    def observe(*args: Any, **kwargs: Any) -> object:
+        nonlocal observations
+        observations += 1
+        if observations > 1 and failure == "observation":
+            raise RuntimeError("repair observation failed")
+        return original_observe(*args, **kwargs)
+
+    original_preview = project_scale_runner_module._validate_requested_web_preview
+
+    def preview(bundle: bytes | None, body: dict[str, object]) -> object:
+        if len(validations) > 1 and failure == "preview":
+            return project_scale_runner_module._EvidenceCheck(
+                passed=False, reasons=("requirements: preview entrypoint missing",),
+            )
+        return original_preview(bundle, body)
+
+    class FailingRepairClient(FakeAcceptanceClient):
+        def request_json(
+            self, method: str, path: str, **kwargs: Any,
+        ) -> dict[str, object] | list[object]:
+            if (
+                method == "POST" and path == "/api/v1/runs"
+                and self.submitted_bodies and failure == "submission"
+            ):
+                raise RuntimeError("repair submission failed")
+            return super().request_json(method, path, **kwargs)
+
+    monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
+    monkeypatch.setattr(project_scale_runner_module, "_collect_run_observation", observe)
+    monkeypatch.setattr(project_scale_runner_module, "_validate_requested_web_preview", preview)
+    monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_attempt_limit", lambda *a, **k: 1)
+    monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_safety_limit", lambda *a, **k: 1)
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability", scales=("small",), flows=("direct",), execute=True
+    )
+    # Missing trusted process evidence triggers repair after a successful first validation.
+    client = FailingRepairClient(
+        status="completed", artifacts=[{"id": "artifact-1"}],
+        workspace_bundle=_project_bundle(files), repair_workspace_bundle=_project_bundle(repair_files),
+        repair_events=[_trusted_agent_standard_event()],
+    )
+
+    result = execute_project_scale_plan(plan, client).results[0]
+
+    assert validations
+    assert len(validations) == (1 if failure in {"submission", "observation"} else 2)
+    assert result.ok is False
+    assert result.validated_workspace_manifest is None
+    assert result.to_payload()["validated_workspace_manifest"] is None
+
+
+def test_validated_workspace_manifest_defaults_to_none_without_requirements() -> None:
+    result = ProjectScaleCaseResult(
+        case_id="small:direct", run_id="run-small-direct", status="completed", evidence={},
+    )
+    assert result.validated_workspace_manifest is None
+    assert result.to_payload()["validated_workspace_manifest"] is None
 
 
 @pytest.mark.usefixtures("trusted_python_fixture_commands")
