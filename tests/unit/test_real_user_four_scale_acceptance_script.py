@@ -407,6 +407,7 @@ def test_report_counts_preview_api_but_keeps_real_device_browser_pending() -> No
         project={"project_id": "project-small"},
         conversation={"conversation_id": "conv-small"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={
             "status": "passed",
@@ -459,6 +460,7 @@ def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverag
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -491,6 +493,7 @@ def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() ->
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -524,6 +527,7 @@ def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -554,6 +558,7 @@ def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -584,6 +589,7 @@ def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale(
         project={"project_id": "project-small"},
         conversation={"conversation_id": "conv-small"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -614,6 +620,7 @@ def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> 
         project={"project_id": "project-large"},
         conversation={"conversation_id": "conv-large"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -644,6 +651,7 @@ def test_report_rejects_medium_case_when_effective_scale_drifts_to_large() -> No
         project={"project_id": "project-medium"},
         conversation={"conversation_id": "conv-medium"},
         result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
         public_artifacts=public_artifact_evidence(),
         dynamic_web_preview={"counted_as_passed": True},
     )
@@ -680,22 +688,51 @@ _FINALIZER_CASE_IDS = tuple(
 
 
 def _model_event(run_id: str, logical_model: str = "deepseek-backup") -> dict[str, Any]:
-    from agent_hub.runs.repository import _public_event_payload
+    from uuid import NAMESPACE_URL, uuid5
 
-    return _public_event_payload(
+    from agent_hub.runs.repository import _public_event_payload
+    from agent_hub.runtime.contracts import Artifact, GatewayProvenance
+
+    artifact = Artifact(
+        id=uuid5(NAMESPACE_URL, f"operator-test:{run_id}:{logical_model}"),
+        type="model_response",
+        producer="architect",
+        provenance=GatewayProvenance(
+            logical_model=logical_model, deployment_id="fixture-deployment",
+            provider_id="fixture-provider", provider_model="fixture-provider/fixture-model",
+        ),
+        content={"attempted_logical_models": (logical_model,), "text": "Fixed test response"},
+    )
+    event = _public_event_payload(
         {
-            "kind": "model.completed",
+            "kind": "artifact.created",
             "run_id": run_id,
             "sequence": 1,
+            "actor": "architect",
             "payload": {
+                "artifact_id": str(artifact.id),
                 "logical_model": logical_model,
                 "attempted_logical_models": [logical_model],
             },
+            "artifact": artifact.to_payload(),
         }
     )
+    public_artifact = cast(dict[str, Any], event["artifact"])
+    event["model_artifact"] = {
+        "source": "public_event_artifact",
+        **{key: copy.deepcopy(public_artifact[key]) for key in (
+            "id", "type", "producer", "version", "source_ids", "content_sha256",
+            "public_content_sha256", "content_redacted", "provenance",
+        )},
+        "hash_verified": True,
+        "hash_verification_scope": "public_projection",
+    }
+    return event
 
 
 def _scope_evidence(run_id: str, logical_model: str) -> dict[str, Any]:
+    event = _model_event(run_id, logical_model)
+    event.pop("artifact")
     return {
         "source": "public_run_events",
         "original_run_id": run_id,
@@ -708,7 +745,7 @@ def _scope_evidence(run_id: str, logical_model: str) -> dict[str, Any]:
                 "run_id": run_id,
                 "status": "completed",
                 "events_endpoint": f"/api/v1/runs/{quote(run_id, safe='')}/events",
-                "model_events": [_model_event(run_id, logical_model)],
+                "model_events": [event],
             }
         ],
     }
@@ -762,6 +799,10 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
                     "workspace_path": conversation_id,
                 },
                 result=result,
+                logical_model=logical_model,
+                model_scope_evidence=_scope_evidence(
+                    str(result.run_id), logical_model or "deepseek-backup",
+                ),
                 public_artifacts={
                     **public_artifact_evidence(),
                     "ok": True,
@@ -2477,7 +2518,10 @@ async def test_scoped_collector_checks_every_typed_completion_not_just_final_mod
             event["artifact"]["content_sha256"] = "0" * 64
         completions.append(event)
     # An otherwise valid completion must not hide any mismatching model artifact.
-    events = [*completions, _model_event(original["run_id"], "deepseek")]
+    events = [*completions, {
+        "kind": "model.completed", "run_id": original["run_id"],
+        "payload": {"logical_model": "deepseek", "attempted_logical_models": ["deepseek"]},
+    }]
     evidence = collect_direct_model_evidence(module, events)
     assert evidence["ok"] is (invalid is None)
     assert bool(evidence["errors"]) is (invalid is not None)
@@ -2749,7 +2793,7 @@ def test_scoped_core_requires_actual_public_completions_and_no_foreign_attempts(
     elif invalid == "wrong_run":
         event["run_id"] = "another-run"
     elif invalid == "flat_payload":
-        event.update(event.pop("payload"))
+        events = [{"kind": "model.completed", "run_id": "run-1", **event["payload"]}]
     elif invalid == "noncompletion":
         event["kind"] = "model.started"
     elif invalid == "other_event_foreign":
@@ -2771,23 +2815,28 @@ def test_scoped_core_requires_actual_public_completions_and_no_foreign_attempts(
     assert case["model_scope_evidence"]["errors"]
 
 
-@pytest.mark.parametrize("attempts", ["absent", "empty"])
-def test_scoped_completion_allows_old_adapters_without_attempt_history(
+@pytest.mark.parametrize("attempts", ["absent", "empty", "present"])
+def test_scoped_completion_rejects_unproven_adapter_completion(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
     monkeypatch: Any,
     attempts: str,
 ) -> None:
     module, delegate, _, _ = matrix_harness
     monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
-    event = _model_event("run-1")
+    event: dict[str, Any] = {
+        "kind": "model.completed", "run_id": "run-1", "sequence": 1,
+        "payload": {"logical_model": "deepseek-backup"},
+    }
     if attempts == "absent":
-        event["payload"].pop("attempted_logical_models")
-    else:
+        pass
+    elif attempts == "empty":
         event["payload"]["attempted_logical_models"] = []
+    else:
+        event["payload"]["attempted_logical_models"] = ["deepseek-backup"]
     delegate.model_events["run-1"] = [event]
     payload = run_matrix(module, delegate, logical_model="deepseek-backup")
-    assert payload["core_acceptance_ok"] is True
-    assert payload["cases"][0]["model_scope_evidence"]["runs"][0]["model_events"] == [event]
+    assert payload["core_acceptance_ok"] is False
+    assert payload["cases"][0]["model_scope_evidence"]["ok"] is False
 
 
 @pytest.mark.parametrize(
@@ -3530,7 +3579,7 @@ def test_resume_recovers_resources_committed_before_response_was_saved(
             ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
             ("project-scale-small-auto-0-matrix-123-auto-small", "run-1"),
         ]
-        assert delegate.observed_runs == ["run-1"]
+        assert set(delegate.observed_runs) == {"run-1"}
 
 
 @pytest.mark.parametrize(

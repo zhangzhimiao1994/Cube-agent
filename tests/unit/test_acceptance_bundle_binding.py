@@ -14,6 +14,7 @@ from tests.unit.test_real_user_four_scale_acceptance_script import (
     _passing_evidence,
     _pending_automated_report,
     _real_device_evidence,
+    _scope_evidence,
     load_script,
     public_artifact_evidence,
     validated_workspace_manifest,
@@ -46,6 +47,7 @@ def test_case_without_validated_identity_cannot_receive_core_credit() -> None:
         project={},
         conversation={},
         result=result,
+        model_scope_evidence=_scope_evidence("run-small", "deepseek-backup"),
         public_artifacts={"ok": True, "source": "public_workspace_api"},
         dynamic_web_preview={"counted_as_passed": True},
     )

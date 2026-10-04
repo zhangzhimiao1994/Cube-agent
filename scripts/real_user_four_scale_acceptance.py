@@ -40,8 +40,8 @@ from agent_hub.harness.project_scale_runner import (
     _safe_zip_member_path,
     execute_project_scale_plan,
 )
+from agent_hub.models.failure_receipt import GatewayFailureReceipt
 from agent_hub.runtime.contracts import Artifact, GatewayProvenance
-from agent_hub.runtime.model_scope import validate_model_scope_artifact
 
 _MODE_CAPABILITIES = ("direct", "dispatch", "hybrid", "multi_agent")
 _ROUTE_INTENTS = ("auto", *_MODE_CAPABILITIES)
@@ -295,6 +295,95 @@ def _model_artifact_hashes(raw: Mapping[str, object]) -> tuple[str, str, bool | 
     return original, public, redacted
 
 
+def _acceptance_model_scope_content(artifact: Artifact, run_id: str) -> dict[str, object]:
+    # The runtime's shared validator requires one model. Acceptance may be unselected,
+    # so validate the original fallback identities here, without rewriting the proof.
+    content = artifact.to_payload()["content"]
+    keys = {
+        "schema_version", "source", "run_id", "tenant_id", "requested_logical_model",
+        "history_complete", "call_count", "calls", "scope_id", "part_index", "part_count",
+        "call_offset",
+    }
+    if (
+        artifact.type != "model_attempt" or artifact.producer != "main_agent"
+        or artifact.source_ids or artifact.provenance is None
+        or not isinstance(content, dict) or set(content) != keys
+    ):
+        raise ValueError("model attempt scope envelope is invalid")
+    model = content["requested_logical_model"]
+    if (
+        type(content["schema_version"]) is not int or content["schema_version"] != 1
+        or content["source"] != "direct_runtime" or str(UUID(run_id)) != run_id
+        or content["run_id"] != run_id or not isinstance(model, str)
+        or content["history_complete"] is not True
+        or type(content["call_count"]) is not int or content["call_count"] < 1
+        or not isinstance(content["calls"], list) or not content["calls"]
+        or content["call_count"] < len(content["calls"])
+        or type(content["part_index"]) is not int or type(content["part_count"]) is not int
+        or not 1 <= content["part_index"] <= content["part_count"] <= content["call_count"]
+        or type(content["call_offset"]) is not int or content["call_offset"] < 0
+        or content["call_offset"] + len(content["calls"]) > content["call_count"]
+    ):
+        raise ValueError("model attempt scope content is invalid")
+    for key in ("tenant_id", "scope_id"):
+        if not isinstance(content[key], str) or str(UUID(content[key])) != content[key]:
+            raise ValueError("model attempt scope identity is invalid")
+    seen: set[str] = set()
+    final_provenance: GatewayProvenance | None = None
+    for call in content["calls"]:
+        if not isinstance(call, dict) or set(call) != {"outcome", "receipt"}:
+            raise ValueError("model attempt call is invalid")
+        if call["outcome"] == "failed":
+            failure = GatewayFailureReceipt.from_payload(call["receipt"])
+            if not failure.history_complete:
+                raise ValueError("model attempt failure history is incomplete")
+            positions = {model: index for index, model in enumerate(failure.attempted_logical_models)}
+            previous_position = -1
+            for attempt in failure.attempts:
+                position = positions[attempt.logical_model]
+                # Skipped candidates and same-model deployment retries are valid.
+                if position < previous_position:
+                    raise ValueError("model attempt transport history reverses declared model order")
+                previous_position = position
+            receipt = cast(dict[str, object], failure.to_payload())
+            final_provenance = GatewayProvenance.from_payload(
+                failure.attempts[-1].to_payload()["provenance"]
+            )
+        elif call["outcome"] == "received":
+            receipt = call["receipt"]
+            if (
+                not isinstance(receipt, dict) or set(receipt) != {
+                    "schema_version", "source", "call_id", "requested_logical_model",
+                    "allow_fallback", "attempted_logical_models", "provenance",
+                }
+                or type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1
+                or receipt["source"] != "model_gateway"
+                or type(receipt["allow_fallback"]) is not bool
+            ):
+                raise ValueError("model attempt received receipt is invalid")
+            final_provenance = GatewayProvenance.from_payload(receipt["provenance"])
+        else:
+            raise ValueError("model attempt call outcome is unknown")
+        attempts = receipt["attempted_logical_models"]
+        call_id = receipt["call_id"]
+        if (
+            receipt["requested_logical_model"] != model
+            or not isinstance(attempts, list) or not attempts or attempts[0] != model
+            or not receipt["allow_fallback"] and any(item != model for item in attempts)
+            or call["outcome"] == "received" and attempts[-1] != final_provenance.logical_model
+            or not isinstance(call_id, str) or str(UUID(call_id)) != call_id or call_id in seen
+        ):
+            raise ValueError("model attempt receipt identities are inconsistent")
+        for attempted in attempts:
+            GatewayProvenance.from_payload({
+                **final_provenance.to_payload(), "logical_model": attempted,
+            })
+        seen.add(call_id)
+    if final_provenance != artifact.provenance:
+        raise ValueError("model attempt final provenance is inconsistent")
+    return cast(dict[str, object], content)
+
+
 def _public_model_artifact(event: Mapping[str, object]) -> dict[str, object]:
     try:
         raw = event.get("artifact")
@@ -330,7 +419,7 @@ def _public_model_artifact(event: Mapping[str, object]) -> dict[str, object]:
         if artifact.type == "model_attempt":
             if redacted is True:
                 raise ValueError
-            proof["scope_content"] = validate_model_scope_artifact(
+            proof["scope_content"] = _acceptance_model_scope_content(
                 artifact, _model_scope_source(event, artifact_id=str(artifact.id), digest=original_digest)[0]
             )
         return proof
@@ -379,6 +468,10 @@ def _valid_model_artifact_proof(event: Mapping[str, object]) -> bool:
         and isinstance(attempts, list) and bool(attempts)
         and all(isinstance(item, str) and bool(item) for item in attempts)
         and attempts[-1] == provenance.logical_model
+        and (
+            "requested_logical_model" not in payload
+            or payload["requested_logical_model"] == attempts[0]
+        )
         and all(
             key not in payload or payload[key] == value
             for key, value in (
@@ -404,14 +497,15 @@ def _has_direct_model_completion(events: list[object]) -> bool:
         if kind == "model.started":
             starts[actor] = (sequence, payload.get("logical_model"))
             continue
-        artifact_id, logical_model = payload.get("artifact_id"), payload.get("logical_model")
+        artifact_id = payload.get("artifact_id")
         if not isinstance(artifact_id, str) or payload.get("artifact_origin") == "builtin_fixture":
             continue
         if kind == "artifact.created" and _valid_model_artifact_proof(event):
             start = starts.get(actor)
             if (
-                start is not None and start[0] < sequence and start[1] == logical_model
-                and payload.get("requested_logical_model") == logical_model
+                start is not None and start[0] < sequence
+                and start[1] == payload.get("requested_logical_model")
+                and isinstance(start[1], str) and bool(start[1])
                 and all(isinstance(payload.get(key), str) and payload[key]
                         for key in ("deployment", "provider", "upstream_model"))
             ):
@@ -424,6 +518,28 @@ def _has_direct_model_completion(events: list[object]) -> bool:
             ):
                 return True
     return False
+
+
+def _crew_model_start_matches(event: Mapping[str, object], events: list[object]) -> bool:
+    starts = [
+        item for item in events if isinstance(item, Mapping)
+        and item.get("kind") == "model.started" and item.get("actor") == event.get("actor")
+    ]
+    if not starts:
+        return True
+    if any(
+        type(start.get("sequence")) is not int or cast(int, start["sequence"]) < 1
+        or not isinstance(start.get("payload"), Mapping) for start in starts
+    ):
+        return False
+    preceding = [start for start in starts if start["sequence"] < event["sequence"]]
+    if not preceding:
+        return False
+    latest = max(preceding, key=lambda start: cast(int, start["sequence"]))
+    attempts = cast(Mapping[str, object], event["payload"])["attempted_logical_models"]
+    return cast(Mapping[str, object], latest["payload"]).get("logical_model") == (
+        cast(list[str], attempts)[0]
+    )
 
 
 def _model_scope_source(
@@ -477,7 +593,7 @@ def _valid_model_scope_proof(event: Mapping[str, object]) -> bool:
             )
         } | {"content": proof.get("scope_content"), "content_sha256": original})
         source_id, _ = _model_scope_source(event, artifact_id=str(artifact.id), digest=original)
-        content = validate_model_scope_artifact(artifact, source_id)
+        content = _acceptance_model_scope_content(artifact, source_id)
         provenance = artifact.provenance
         if provenance is None:
             return False
@@ -527,7 +643,7 @@ def _has_failed_attempt_scope(events: list[object]) -> bool:
             )
             start = starts.get(source_id)
             if (start is not None and start[0] < sequence and start[1] < source_sequence
-                    and start[2] == payload.get("logical_model")):
+                    and start[2] == payload.get("requested_logical_model")):
                 if cast(str, payload["artifact_id"]) in artifacts:
                     return False
                 artifacts[cast(str, payload["artifact_id"])] = (
@@ -587,7 +703,7 @@ def _has_failed_attempt_scope(events: list[object]) -> bool:
 
 
 def _model_scope_errors(
-    evidence: object, *, logical_model: str, result_run_id: object
+    evidence: object, *, logical_model: str | None, result_run_id: object
 ) -> list[str]:
     if not isinstance(evidence, Mapping):
         return ["model scope evidence is missing"]
@@ -638,7 +754,8 @@ def _model_scope_errors(
             if not isinstance(payload, Mapping):
                 errors.append(f"{run_id}: model event payload is malformed")
                 continue
-            completed = event.get("kind") == "model.completed"
+            # Runtime completion markers are telemetry, not artifact-backed proof.
+            completed = False
             if event.get("kind") == "model.scope_incomplete":
                 errors.append(f"{run_id}: model call scope is incomplete")
             if event.get("kind") == "model.failure_receipt":
@@ -648,8 +765,10 @@ def _model_scope_errors(
                 key in payload for key in ("attempted_logical_models", "requested_logical_model")
             ):
                 errors.append(f"{run_id}: actual model artifact proof is missing")
-            if completed and payload.get("artifact_origin") == "builtin_fixture":
-                completed = False
+            if (
+                event.get("kind") == "model.completed"
+                and payload.get("artifact_origin") == "builtin_fixture"
+            ):
                 errors.append(f"{run_id}: builtin fixture is not an actual model completion")
             if proof is not None:
                 scope_proof = isinstance(proof, Mapping) and proof.get("type") == "model_attempt"
@@ -665,18 +784,25 @@ def _model_scope_errors(
                     and cast(int, event["sequence"]) > 0
                 ):
                     completed = True
+                    if not _crew_model_start_matches(event, events):
+                        errors.append(f"{run_id}: model completion does not match actor start")
             if completed:
                 completions += 1
-            if (completed or "logical_model" in payload) and payload.get(
+            if logical_model is not None and (completed or "logical_model" in payload) and payload.get(
                 "logical_model"
             ) != logical_model:
                 errors.append(f"{run_id}: observed logical model does not match selected model")
-            if "requested_logical_model" in payload and payload["requested_logical_model"] != logical_model:
+            if (
+                logical_model is not None and "requested_logical_model" in payload
+                and payload["requested_logical_model"] != logical_model
+            ):
                 errors.append(f"{run_id}: requested logical model does not match selected model")
             if "attempted_logical_models" in payload:
                 attempted = payload.get("attempted_logical_models")
                 if not isinstance(attempted, list) or any(
-                    item != logical_model for item in attempted
+                    not isinstance(item, str) or not item
+                    or logical_model is not None and item != logical_model
+                    for item in attempted
                 ):
                     errors.append(f"{run_id}: attempted logical models do not match selected model")
         scope_complete = _has_failed_attempt_scope(events)
@@ -696,7 +822,7 @@ def _model_scope_errors(
 def _collect_model_scope_evidence(
     client: RealUserAcceptanceClient,
     *,
-    logical_model: str,
+    logical_model: str | None,
     submitted_run_ids: Sequence[str],
     accepted_repair_run_ids: Sequence[str],
     result_run_id: str | None,
@@ -735,7 +861,8 @@ def _collect_model_scope_evidence(
                 artifact = event.get("artifact")
                 proof: dict[str, object] | None = None
                 if kind == "artifact.created" and (
-                    (isinstance(artifact, Mapping) and artifact.get("type") == "model_response")
+                    (isinstance(artifact, Mapping)
+                     and artifact.get("type") in {"model_response", "model_attempt"})
                     or (isinstance(payload, Mapping) and any(
                         key in payload for key in ("attempted_logical_models", "requested_logical_model")
                     ))
@@ -765,7 +892,8 @@ def _collect_model_scope_evidence(
                     actual_payload["artifact_id"] = proof["id"]
                     payload = actual_payload
                 if (
-                    isinstance(kind, str)
+                    proof is not None
+                    or isinstance(kind, str)
                     and kind.startswith("model.")
                     or (
                         isinstance(payload, Mapping)
@@ -1310,21 +1438,21 @@ def build_case_report(
             "admin_internal_run_data": False,
         },
     }
-    if logical_model is not None:
-        model_ok = (
-            model_scope_evidence is not None
-            and model_scope_evidence.get("ok") is True
-            and not _model_scope_errors(
-                model_scope_evidence, logical_model=logical_model, result_run_id=result.run_id
-            )
+    model_ok = (
+        model_scope_evidence is not None
+        and model_scope_evidence.get("ok") is True
+        and not _model_scope_errors(
+            model_scope_evidence, logical_model=logical_model, result_run_id=result.run_id
         )
+    )
+    if logical_model is not None:
         report["model_profile"] = _model_profile(logical_model)
-        report["model_scope_evidence"] = copy.deepcopy(model_scope_evidence)
-        cast(dict[str, object], report["success_basis"])["model_scope"] = model_ok
-        if not model_ok:
-            report.update(
-                status="failed", core_acceptance_ok=False, automated_acceptance_complete=False
-            )
+    report["model_scope_evidence"] = copy.deepcopy(model_scope_evidence)
+    cast(dict[str, object], report["success_basis"])["model_scope"] = model_ok
+    if not model_ok:
+        report.update(
+            status="failed", core_acceptance_ok=False, automated_acceptance_complete=False
+        )
     return report
 
 
@@ -1548,14 +1676,13 @@ def run_real_user_four_scale_acceptance(
             result_run_id = result.run_id
             if result.case_id != case_id:
                 raise RuntimeError("capability runner returned evidence for the wrong case")
-            if logical_model is not None:
-                model_scope_evidence = _collect_model_scope_evidence(
-                    client,
-                    logical_model=logical_model,
-                    submitted_run_ids=client.submitted_run_ids[submitted_start:],
-                    accepted_repair_run_ids=client.accepted_repair_run_ids[repair_start:],
-                    result_run_id=result_run_id,
-                )
+            model_scope_evidence = _collect_model_scope_evidence(
+                client,
+                logical_model=logical_model,
+                submitted_run_ids=client.submitted_run_ids[submitted_start:],
+                accepted_repair_run_ids=client.accepted_repair_run_ids[repair_start:],
+                result_run_id=result_run_id,
+            )
             public_artifacts = verify_public_workspace_artifacts(
                 client,
                 project_id=project_id,
@@ -1602,7 +1729,7 @@ def run_real_user_four_scale_acceptance(
                     "admin_internal_run_data": False,
                 },
             }
-        if logical_model is not None and "model_profile" not in completed_case:
+        if "model_scope_evidence" not in completed_case:
             if model_scope_evidence is None:
                 model_scope_evidence = _collect_model_scope_evidence(
                     client,
@@ -1611,8 +1738,12 @@ def run_real_user_four_scale_acceptance(
                     accepted_repair_run_ids=client.accepted_repair_run_ids[repair_start:],
                     result_run_id=result_run_id,
                 )
-            completed_case["model_profile"] = copy.deepcopy(profile)
             completed_case["model_scope_evidence"] = model_scope_evidence
+            cast(dict[str, object], completed_case["success_basis"])["model_scope"] = (
+                model_scope_evidence.get("ok") is True
+            )
+        if logical_model is not None:
+            completed_case["model_profile"] = copy.deepcopy(profile)
         completed_case["attempt"] = attempt
         if previous is not None:
             cases[cases.index(previous)] = completed_case
@@ -1846,20 +1977,19 @@ def _has_complete_core_evidence(
     ):
         return False
     profile = _report_model_profile(case)
-    if profile is not None:
-        scope = case.get("model_scope_evidence")
-        run_payload = case.get("run")
-        if (
-            not isinstance(scope, Mapping)
-            or scope.get("ok") is not True
-            or not isinstance(run_payload, Mapping)
-            or _model_scope_errors(
-                scope,
-                logical_model=cast(str, profile["direct_model"]),
-                result_run_id=run_payload.get("run_id"),
-            )
-        ):
-            return False
+    scope = case.get("model_scope_evidence")
+    run_payload = case.get("run")
+    if (
+        not isinstance(scope, Mapping)
+        or scope.get("ok") is not True
+        or not isinstance(run_payload, Mapping)
+        or _model_scope_errors(
+            scope,
+            logical_model=cast(str, profile["direct_model"]) if profile is not None else None,
+            result_run_id=run_payload.get("run_id"),
+        )
+    ):
+        return False
     sections = ("run", "project", "conversation", "public_artifacts", "dynamic_web_preview")
     if any(not isinstance(case.get(key), Mapping) for key in sections):
         return False
