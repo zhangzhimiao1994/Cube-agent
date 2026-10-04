@@ -3,6 +3,21 @@ import pytest
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 
 
+def test_ultra_contract_declares_fixed_pagination_workload() -> None:
+    from agent_hub.harness.project_scale import PROJECT_ULTRA_LOAD_GUIDANCE
+    from agent_hub.harness.project_scale_runner import _deliverable_repair_body
+
+    plan = build_project_scale_run_plan(
+        scales=("ultra",), flows=("direct",), benchmark_kind="capability",
+    )
+    body = plan.requests[0].body
+    repair = _deliverable_repair_body(dict(body), "ultra:direct", benchmark_kind="capability")
+    for message in (str(body["message"]), str(repair["message"])):
+        assert PROJECT_ULTRA_LOAD_GUIDANCE in message
+        for required in ("offset", "1..100", "1000", "17", "four concurrent", "String(project_id)"):
+            assert required in message
+
+
 @pytest.mark.parametrize("scale, required", [
     ("large", (
         "reservations atomically consume stock", "rejected reservations leave stock unchanged",

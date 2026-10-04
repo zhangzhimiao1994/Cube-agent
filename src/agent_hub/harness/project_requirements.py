@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from io import StringIO
 from pathlib import Path
@@ -55,6 +56,14 @@ def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[st
 
 def validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     return _dispatch_validation(root, timeout_seconds, "ultra", _validate_ultra_portfolio_api)
+
+
+def validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[str, object]:
+    if _PLATFORM == "posix":
+        from agent_hub.harness.project_validation_sandbox import validate_scale_load
+
+        return validate_scale_load(root, "ultra", timeout_seconds)
+    return _validate_ultra_portfolio_load(root, timeout_seconds)
 
 
 class _ValidationFailure(Exception):
@@ -620,8 +629,22 @@ class _PortfolioAPI:
         connection = http.client.HTTPConnection(
             "127.0.0.1", self.port, timeout=min(2.0, _remaining(self.deadline))
         )
+        timer: threading.Timer | None = None
         try:
             connection.connect()
+            sock = connection.sock
+
+            def interrupt() -> None:
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+            # Bound headers and body together, including continuously streaming bytes.
+            timer = threading.Timer(_remaining(self.deadline), interrupt)
+            timer.daemon = True
+            timer.start()
             connection.request(
                 method,
                 path,
@@ -645,6 +668,9 @@ class _PortfolioAPI:
                     raise _ValidationFailure(f"{method} {path}: invalid JSON response") from exc
             return response.status, payload
         finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join(timeout=1)
             connection.close()
 
     def create(self, path: str, body: Mapping[str, object]) -> dict[str, object]:
@@ -686,18 +712,19 @@ class _PortfolioAPI:
             )
 
 
-def _environment(data: str) -> dict[str, str]:
+def _environment(data: str, runtime: str | None = None) -> dict[str, str]:
     # Do not expose host/provider credentials or the host's npm user configuration.
     env = {
         key: value for key, value in os.environ.items()
         if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}
     }
+    runtime = data if runtime is None else runtime
     env.update({
-        "DATA_DIR": data, "HOME": data, "USERPROFILE": data,
-        "TMP": data, "TEMP": data, "TMPDIR": data,
-        "npm_config_userconfig": str(Path(data) / "user.npmrc"),
-        "npm_config_globalconfig": str(Path(data) / "global.npmrc"),
-        "npm_config_cache": str(Path(data) / "npm-cache"),
+        "DATA_DIR": data, "HOME": runtime, "USERPROFILE": runtime,
+        "TMP": runtime, "TEMP": runtime, "TMPDIR": runtime,
+        "npm_config_userconfig": str(Path(runtime) / "user.npmrc"),
+        "npm_config_globalconfig": str(Path(runtime) / "global.npmrc"),
+        "npm_config_cache": str(Path(runtime) / "npm-cache"),
         "npm_config_update_notifier": "false", "npm_config_audit": "false",
     })
     return env
@@ -1538,6 +1565,273 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
             except OSError as exc:
                 failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
     return tuple(failures)
+
+
+def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[str, object]:
+    """Run the fixed ultra workload inside a native sandbox or trusted Windows fixture.
+
+    Expected rows come only from acknowledged seed writes. Active clients count
+    traversal loops (including their barrier), never claimed HTTP concurrency.
+    """
+    started = time.monotonic()
+    measurements: dict[str, int | float] = dict.fromkeys((
+        "target_projects", "foreign_projects", "module_records", "concurrent_clients",
+        "peak_active_clients", "initial_traversals", "restart_traversals", "updated_traversals",
+        "boundary_pages", "read_model_requests", "write_requests", "request_errors",
+    ), 0)
+    measurements["elapsed_seconds"] = 0.0
+    reasons: list[str] = []
+    result: dict[str, object] = {
+        "schema_version": 1, "profile": "ultra-load-v1", "scale": "ultra",
+        "status": "passed", "reasons": reasons, "cleanup_ok": True,
+        "measurements": measurements,
+    }
+    process: subprocess.Popen[bytes] | None = None
+    data: tempfile.TemporaryDirectory[str] | None = None
+    runtime: tempfile.TemporaryDirectory[str] | None = None
+    taskkill: str | None = None
+    deadline = started
+    phase = "environment"
+    lock = threading.Lock()
+
+    def increment(key: str) -> None:
+        with lock:
+            measurements[key] += 1
+
+    def record_failure(exc: Exception, context: str) -> None:
+        unknown = (
+            not isinstance(exc, _ValidationFailure)
+            or str(exc).startswith("timeout:")
+            or "npm start exited" in str(exc)
+        )
+        # A response interrupted at the deadline may raise HTTPException/OSError.
+        label = "timeout" if time.monotonic() >= deadline and unknown else context
+        with lock:
+            reasons.append(f"{label}: {exc}")
+            if not unknown or result["status"] != "failed":
+                result["status"] = "unknown" if unknown else "failed"
+
+    def valid_id(value: object, context: str) -> str:
+        _require(
+            isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) != "",
+            f"{context}: invalid id",
+        )
+        return str(value)
+
+    def create(api: _PortfolioAPI, path: str, body: dict[str, object]) -> dict[str, object]:
+        _remaining(deadline)
+        increment("write_requests")
+        try:
+            item = api.create(path, body)
+            valid_id(item.get("id"), f"POST {path}")
+            _business_record_fields(item, body, f"POST {path}")
+            return item
+        except (_ValidationFailure, OSError, ValueError, http.client.HTTPException):
+            increment("request_errors")
+            raise
+
+    expected_rows: list[dict[str, object]] = []
+    program_id: object = None
+
+    def page(api: _PortfolioAPI, offset: int, limit: int, *, defaults: bool = False) -> None:
+        _remaining(deadline)
+        path = f"/portfolio/read-model?program_id={quote(str(program_id), safe='')}"
+        if not defaults or offset != 0:
+            path += f"&offset={offset}"
+        if not defaults or limit != 100:
+            path += f"&limit={limit}"
+        increment("read_model_requests")
+        try:
+            items = _business_items(api.get_object(path), "portfolio load page")
+            expected = expected_rows[offset:offset + limit]
+            _require(len(items) == len(expected), f"portfolio load page offset {offset}: row count")
+            for actual, wanted in zip(items, expected, strict=True):
+                _business_record_fields(actual, wanted, f"portfolio load page offset {offset}")
+        except (_ValidationFailure, OSError, ValueError, http.client.HTTPException):
+            increment("request_errors")
+            raise
+
+    def traverse(api: _PortfolioAPI, limit: int, counter: str, *, defaults: bool = False) -> None:
+        # Include an empty page even when the preceding page is short.
+        for offset in range(0, len(expected_rows) + limit, limit):
+            page(api, offset, limit, defaults=defaults)
+        increment(counter)
+
+    errors = (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
+              subprocess.SubprocessError, threading.BrokenBarrierError)
+    try:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        deadline = started + timeout_seconds
+        if _PLATFORM not in ("posix", "nt"):
+            raise OSError(f"unsupported platform for process-tree cleanup: {_PLATFORM}")
+        npm = shutil.which("npm")
+        if npm is None:
+            raise OSError("npm executable unavailable; ultra load was not validated")
+        taskkill = shutil.which("taskkill") if _PLATFORM == "nt" else None
+        if _PLATFORM == "nt" and taskkill is None:
+            raise OSError("taskkill unavailable for Windows process-tree cleanup")
+        root = root.resolve(strict=True)
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        scripts = package.get("scripts") if isinstance(package, dict) else None
+        _require(
+            isinstance(scripts, dict) and isinstance(scripts.get("start"), str)
+            and bool(scripts["start"].strip()),
+            "package.json must provide an npm start script",
+        )
+        _remaining(deadline)
+        data = tempfile.TemporaryDirectory(prefix="ultra-load-data-")
+        runtime = tempfile.TemporaryDirectory(prefix="ultra-load-runtime-")
+        env = _environment(data.name, runtime.name)
+
+        def start() -> _PortfolioAPI:
+            nonlocal process
+            _remaining(deadline)
+            port = _free_port()
+            env["PORT"] = str(port)
+            process = subprocess.Popen(
+                [npm, "start"], cwd=root, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=_PLATFORM == "posix",
+            )
+            api = _PortfolioAPI(port, deadline)
+            _ready_portfolio(api, process)
+            _remaining(deadline)
+            return api
+
+        phase = "startup"
+        api = start()
+        phase = "seed"
+        programs = [create(api, "/programs", {"name": f"Load portfolio {uuid4().hex}"})
+                    for _ in range(2)]
+        program_id = programs[0]["id"]
+        _require(str(program_id) != str(programs[1]["id"]), "programs: duplicate id")
+        project_records: dict[str, dict[str, object]] = {}
+        module_ids: dict[str, set[str]] = {name: set() for name in (
+            "budgets", "staffing", "risks", "milestones",
+        )}
+        seeded: list[dict[str, object]] = []
+
+        def seed_project(selected_program: object, counter: str) -> dict[str, object]:
+            body = {
+                "program_id": selected_program, "name": f'Load project, "{uuid4().hex}"',
+                "owner": f"owner-{uuid4().hex[:12]}@example.test",
+            }
+            created = create(api, "/projects", body)
+            key = valid_id(created["id"], "projects")
+            _require(key not in project_records, "projects: duplicate id")
+            project_records[key] = {"id": created["id"], **body}
+            increment(counter)
+            # Never take expected fields or aggregate values from a read response.
+            return {
+                "project_id": created["id"], "program_id": selected_program, "name": body["name"],
+                "budget_total": 0, "staffing_allocation": 0, "risk_count": 0, "milestone_count": 0,
+            }
+
+        def seed_module(project: dict[str, object], module: str, body: dict[str, object]) -> None:
+            path = f"/projects/{quote(str(project['project_id']), safe='')}/{module}"
+            item = create(api, path, body)
+            _business_record_fields(item, {"project_id": project["project_id"]}, module)
+            key = valid_id(item["id"], module)
+            _require(key not in module_ids[module], f"{module}: duplicate id")
+            module_ids[module].add(key)
+
+        for index in range(1000):
+            project = seed_project(program_id, "target_projects")
+            seeded.append(project)
+            if index % 59 == 0 and measurements["foreign_projects"] < 17:
+                seed_project(programs[1]["id"], "foreign_projects")
+            if index % 97 == 0:
+                amount = 1001 + index * 13
+                allocation = (index % 3 + 1) / 4
+                bodies: dict[str, dict[str, object]] = {
+                    "budgets": {"category": f"budget-{index}", "amount": amount},
+                    "staffing": {"person": f"person-{index}", "role": "lead",
+                                 "allocation": allocation},
+                    "risks": {"title": f"risk-{index}", "severity": "high" if index % 2 else "low"},
+                    "milestones": {"name": f"milestone-{index}", "due_at": "2030-04-01"},
+                }
+                for module, body in bodies.items():
+                    seed_module(project, module, body)
+                    increment("module_records")
+                project.update(budget_total=amount, staffing_allocation=allocation,
+                               risk_count=1, milestone_count=1)
+        # JavaScript String ordering compares UTF-16 code units, including non-ASCII IDs.
+        expected_rows = sorted(seeded, key=lambda p: str(p["project_id"]).encode(
+            "utf-16-be", errors="surrogatepass",
+        ))
+        phase = "initial traversals"
+        barrier = threading.Barrier(4)
+        active = 0
+
+        def client(limit: int, defaults: bool) -> None:
+            nonlocal active
+            with lock:
+                active += 1
+                measurements["concurrent_clients"] += 1
+                measurements["peak_active_clients"] = max(measurements["peak_active_clients"], active)
+            try:
+                barrier.wait(timeout=_remaining(deadline))
+                traverse(_PortfolioAPI(api.port, deadline), limit, "initial_traversals",
+                         defaults=defaults)
+            except errors as exc:
+                barrier.abort()
+                record_failure(exc, "initial traversals")
+            finally:
+                with lock:
+                    active -= 1
+
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="ultra-load") as executor:
+            futures = [executor.submit(client, limit, index == 0)
+                       for index, limit in enumerate((100, 100, 37, 37))]
+            for future in futures:
+                future.result()
+        if reasons:
+            return result
+        phase = "boundary pages"
+        for offset in (0, 999, 1000):
+            page(api, offset, 1)
+            increment("boundary_pages")
+        phase = "restart"
+        _remaining(deadline)
+        assert process is not None
+        try:
+            _stop_tree(process, taskkill)
+        except errors as exc:
+            result["cleanup_ok"] = False
+            raise _ValidationFailure(f"process-tree cleanup failed: {exc}") from exc
+        process = None
+        api = start()
+        traverse(api, 100, "restart_traversals")
+        phase = "updated traversal"
+        updated = seeded[0]
+        seed_module(updated, "budgets", {"category": f"update-{uuid4().hex}", "amount": 7919})
+        updated["budget_total"] = cast(int, updated["budget_total"]) + 7919
+        traverse(api, 100, "updated_traversals")
+        _remaining(deadline)
+    except errors as exc:
+        record_failure(exc, phase)
+    finally:
+        if process is not None:
+            try:
+                _stop_tree(process, taskkill)
+            except errors as exc:
+                result["cleanup_ok"] = False
+                result["status"] = "failed"
+                reasons.append(f"process-tree cleanup failed: {exc}")
+        for label, directory in (("DATA_DIR", data), ("runtime", runtime)):
+            if directory is not None:
+                try:
+                    directory.cleanup()
+                except OSError as exc:
+                    result["cleanup_ok"] = False
+                    result["status"] = "failed"
+                    reasons.append(f"temporary {label} cleanup failed: {exc}")
+        if result["status"] == "passed" and time.monotonic() >= deadline:
+            result["status"] = "unknown"
+            reasons.append("timeout: ultra load validation deadline exceeded")
+        measurements["elapsed_seconds"] = float(time.monotonic() - started)
+    return result
 
 
 def _ready_crm(api: _TenantCRMAPI, process: subprocess.Popen[bytes], tenant: str) -> None:

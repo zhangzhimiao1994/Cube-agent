@@ -16,6 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -523,3 +524,186 @@ def test_install_masks_project_npmrc_without_masking_build(
     build = assembly.generated_command(("npm", "run", "build"), cwd=tmp_path, config={})
     assert "--unshare-net" in build
     assert "/workspace/.npmrc" not in build
+
+
+def _load_result(status: str = "passed") -> dict[str, Any]:
+    return {
+        "schema_version": 1, "profile": "ultra-load-v1", "scale": "ultra",
+        "status": status, "reasons": [] if status == "passed" else ["load incomplete"],
+        "cleanup_ok": status == "passed",
+        "measurements": {
+            "target_projects": 1000, "foreign_projects": 17, "module_records": 44,
+            "concurrent_clients": 4, "peak_active_clients": 4, "initial_traversals": 4,
+            "restart_traversals": 1, "updated_traversals": 1, "boundary_pages": 3,
+            "read_model_requests": 105, "write_requests": 1064, "request_errors": 0,
+            "elapsed_seconds": 1.25,
+        },
+    }
+
+
+def _assert_unknown(result: dict[str, Any]) -> None:
+    from agent_hub.harness.project_validation_result import validate_scale_validation_result
+
+    assert validate_scale_validation_result(result) == result
+    assert result["status"] == "unknown"
+    assert result["cleanup_ok"] is False and result["reasons"]
+    assert all(value == 0 for value in result["measurements"].values())
+
+
+@pytest.mark.parametrize("status", ["passed", "failed", "unknown"])
+def test_scale_load_ipc_preserves_valid_results_in_private_trusted_cli(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    payload = _load_result(status)
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), ""))
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    result = sandbox.validate_scale_load(tmp_path, "ultra", 12.5)
+    assert result == payload
+    command = run.call_args.args[0]
+    assert command[0] == "/usr/bin/bwrap" and "--unshare-net" in command
+    assert command[command.index("--") + 1:] == [
+        "/usr/bin/python3", "-I",
+        "/opt/validator/src/agent_hub/harness/project_validation_sandbox.py",
+        "portfolio-load", "ultra", "12.5",
+    ]
+    assert any(command[i:i + 3] == ["--ro-bind", str(_SOURCE.parents[2]), "/opt/validator/src"]
+               for i in range(len(command) - 2))
+    assert run.call_args.kwargs == {
+        "cwd": tmp_path, "env": {"PATH": "/usr/bin:/bin"}, "stdin": subprocess.DEVNULL,
+        "capture_output": True, "text": True, "encoding": "utf-8", "errors": "strict",
+        "timeout": 12.5, "check": False,
+    }
+
+
+@pytest.mark.parametrize("stdout", [
+    "", "not json", "[]", '["legacy failure"]', "null", "true", "{}",
+    json.dumps(_load_result()) + "\n[]", "noise\n" + json.dumps(_load_result()),
+    json.dumps(_load_result()).replace('"target_projects": 1000', '"target_projects": 999'),
+    json.dumps(_load_result()).replace('"cleanup_ok": true', '"cleanup_ok": false'),
+    json.dumps(_load_result()).replace('"schema_version": 1', '"schema_version": true'),
+    json.dumps(_load_result()).replace('"restart_traversals": 1', '"restart_traversals": true'),
+    json.dumps(_load_result()).replace('"elapsed_seconds": 1.25', '"elapsed_seconds": NaN'),
+    json.dumps(_load_result()).replace('"elapsed_seconds": 1.25', '"elapsed_seconds": Infinity'),
+    json.dumps(_load_result()).replace('"elapsed_seconds": 1.25', '"elapsed_seconds": -Infinity'),
+    json.dumps(_load_result()).replace('"elapsed_seconds": 1.25', '"elapsed_seconds": 1e999'),
+    json.dumps(_load_result()).replace('"status": "passed"', '"status": "failed", "status": "passed"'),
+    json.dumps(_load_result()).replace('"target_projects": 1000',
+                                     '"target_projects": 999, "target_projects": 1000'),
+    json.dumps(_load_result()).replace('"target_projects": 1000',
+                                     '"target_projects": 1000, "target_projects": 1000'),
+    json.dumps({**_load_result(), "extra": True}),
+])
+def test_scale_load_ipc_rejects_tampered_or_legacy_stdout(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str,
+) -> None:
+    monkeypatch.setattr(sandbox.subprocess, "run", Mock(
+        return_value=subprocess.CompletedProcess([], 0, stdout, ""),
+    ))
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, "ultra", 10))
+
+
+@pytest.mark.parametrize("returncode", [1, 2, -9])
+def test_scale_load_ipc_nonzero_cannot_claim_success(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returncode: int,
+) -> None:
+    monkeypatch.setattr(sandbox.subprocess, "run", Mock(
+        return_value=subprocess.CompletedProcess([], returncode, json.dumps(_load_result()), ""),
+    ))
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, "ultra", 10))
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.TimeoutExpired("bwrap", 10, output=json.dumps(_load_result())),
+    OSError("launch failed"), RuntimeError("sandbox unavailable"),
+    UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid stdout"),
+])
+def test_scale_load_ipc_launch_failure_or_timeout_is_unknown(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    monkeypatch.setattr(sandbox.subprocess, "run", Mock(side_effect=error))
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, "ultra", 10))
+
+
+def test_scale_load_missing_sandbox_never_runs_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "sandbox_available", lambda: False)
+    run = Mock(side_effect=AssertionError("must not launch without sandbox"))
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, "ultra", 10))
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), -float("inf"),
+                                      True, "10", None, 10**400])
+def test_scale_load_invalid_timeout_never_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: Any,
+) -> None:
+    command = Mock(side_effect=AssertionError("invalid deadline must not launch"))
+    monkeypatch.setattr(sandbox, "sandbox_command", command)
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, "ultra", timeout))
+    command.assert_not_called()
+
+
+@pytest.mark.parametrize("scale", ["small", "medium", "large", "ULTRA", ""])
+def test_scale_load_unsupported_scale_never_uses_requirements_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scale: str,
+) -> None:
+    command = Mock(side_effect=AssertionError("unsupported scale must not launch"))
+    monkeypatch.setattr(sandbox, "sandbox_command", command)
+    _assert_unknown(sandbox.validate_scale_load(tmp_path, scale, 10))
+    command.assert_not_called()
+
+
+@pytest.mark.parametrize(("command", "scale", "validator", "payload"), [
+    ("portfolio-load", "ultra", "_validate_ultra_portfolio_load", _load_result()),
+    ("requirements", "small", "_validate_small_task_api", ()),
+    ("requirements", "ultra", "_validate_ultra_portfolio_api", ("business failure",)),
+])
+def test_cli_dispatches_trusted_runpy_validator_without_harness_imports(
+    tmp_path: Path, command: str, scale: str, validator: str, payload: object,
+) -> None:
+    # -S makes normal harness dependencies unavailable; the CLI must use stdlib only.
+    script = """
+import json, pathlib, runpy, sys
+source, command, scale, name, payload = sys.argv[1:]
+expected = json.loads(payload)
+module = runpy.run_path(source)
+def validate(root, timeout):
+    assert root == pathlib.Path('/workspace') and timeout == 12.5
+    return expected
+def load(path):
+    assert pathlib.Path(path) == pathlib.Path(source).with_name('project_requirements.py')
+    return {name: validate}
+runpy.run_path = load
+sys.argv = [source, command, scale, '12.5']
+module['_main']()
+assert 'agent_hub.harness' not in sys.modules
+"""
+    (tmp_path / "json.py").write_text("raise RuntimeError('generated json imported')")
+    (tmp_path / "project_requirements.py").write_text("raise RuntimeError('untrusted validator')")
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script, str(_SOURCE), command, scale, validator,
+         json.dumps(payload)], cwd=tmp_path, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == json.loads(json.dumps(payload))
+
+
+@pytest.mark.parametrize("args", [
+    [], ["portfolio-load", "small", "10"], ["portfolio-load", "ultra"],
+    ["portfolio-load", "ultra", "10", "extra"], ["unknown", "ultra", "10"],
+    ["portfolio-load", "ultra", "nan"], ["portfolio-load", "ultra", "inf"],
+    ["portfolio-load", "ultra", "-inf"], ["portfolio-load", "ultra", "0"],
+    ["portfolio-load", "ultra", "-1"], ["portfolio-load", "ultra", "invalid"],
+])
+def test_cli_rejects_invalid_load_arguments_before_loading_validator(
+    monkeypatch: pytest.MonkeyPatch, args: list[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", [str(_SOURCE), *args])
+    load = Mock(side_effect=AssertionError("must reject before loading validator"))
+    monkeypatch.setattr(sandbox.runpy, "run_path", load)
+    with pytest.raises(SystemExit) as exc:
+        sandbox._main()
+    assert exc.value.code == 2
+    load.assert_not_called()

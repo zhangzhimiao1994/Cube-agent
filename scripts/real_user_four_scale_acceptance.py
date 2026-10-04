@@ -1454,6 +1454,7 @@ def build_case_report(
         and preview_ok
         and route_policy_ok
         and scale_fidelity_ok
+        and result.scale_specific_evidence_ok
         and artifact_origin_ok
         and multi_agent_evidence_ok
     )
@@ -1473,6 +1474,7 @@ def build_case_report(
         "initial_effective_scale": effective_scale,
         "final_effective_scale": final_effective_scale,
         "scale_fidelity_ok": scale_fidelity_ok,
+        "scale_specific_evidence_ok": result.scale_specific_evidence_ok,
         "route_policy_ok": route_policy_ok,
         "observed_route_ok": route_policy_ok,
         "exact_mode_coverage_ok": exact_mode_coverage_ok,
@@ -1495,11 +1497,13 @@ def build_case_report(
             "status": (
                 "passed"
                 if generated_project_ok and requirements_ok and validated_bundle_matches
+                and result.scale_specific_evidence_ok
                 else "failed"
             ),
             "source": "project_scale_runner.generated_project_validation",
             "generated_project_validation": generated_project_ok,
             "requirements_validation": requirements_ok,
+            "scale_specific_evidence_ok": result.scale_specific_evidence_ok,
             "validated_bundle_matches": validated_bundle_matches,
         },
         "public_artifacts": dict(public_artifacts),
@@ -1521,6 +1525,7 @@ def build_case_report(
             "observed_route": route_policy_ok,
             "exact_mode_coverage": exact_mode_coverage_ok,
             "scale_fidelity": scale_fidelity_ok,
+            "scale_specific_evidence": result.scale_specific_evidence_ok,
             "artifact_origin": artifact_origin_ok,
             "multi_agent_participation": multi_agent_evidence_ok,
             "admin_internal_run_data": False,
@@ -2292,6 +2297,9 @@ def _has_complete_core_evidence(
     validated_manifest = _validated_manifest(run.get("validated_workspace_manifest"))
     if not _public_bundle_matches_validation(validated_manifest, public):
         return False
+    scale_validation = run.get("scale_validation")
+    if scale_validation is not None and not isinstance(scale_validation, dict):
+        return False
     result = ProjectScaleCaseResult(
         case_id=case_id,
         run_id=cast(str, run["run_id"]),
@@ -2310,6 +2318,7 @@ def _has_complete_core_evidence(
         participant_event_kinds=tuple(cast(list[str], event_kinds)),
         participant_event_count=event_count,
         validated_workspace_manifest=validated_manifest,
+        scale_validation=scale_validation,
     )
     if not result.ok or run.get("required_evidence") != list(result.required_evidence):
         return False
@@ -2370,6 +2379,7 @@ def _has_complete_core_evidence(
         "case_kind",
         "route_intent",
         "scale_fidelity_ok",
+        "scale_specific_evidence_ok",
         "route_policy_ok",
         "artifact_origin_ok",
         "validated_bundle_matches",

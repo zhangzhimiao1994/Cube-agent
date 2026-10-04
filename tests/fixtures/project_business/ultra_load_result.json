@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile": "ultra-load-v1",
+  "scale": "ultra",
+  "status": "passed",
+  "reasons": [],
+  "cleanup_ok": true,
+  "measurements": {
+    "target_projects": 1000,
+    "foreign_projects": 17,
+    "module_records": 44,
+    "concurrent_clients": 4,
+    "peak_active_clients": 4,
+    "initial_traversals": 4,
+    "restart_traversals": 1,
+    "updated_traversals": 1,
+    "boundary_pages": 3,
+    "read_model_requests": 105,
+    "write_requests": 1064,
+    "request_errors": 0,
+    "elapsed_seconds": 2.5
+  }
+}

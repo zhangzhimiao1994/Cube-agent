@@ -126,6 +126,19 @@ def validated_workspace_manifest() -> dict[str, tuple[int, str]]:
         }
 
 
+def scale_validation_evidence(case_id: str, run_id: str) -> dict[str, object] | None:
+    from agent_hub.harness.project_validation_result import scale_validation_manifest_sha256
+
+    if not case_id.startswith("ultra:"):
+        return None
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/project_business/ultra_load_result.json"
+    return {
+        "case_id": case_id, "run_id": run_id,
+        "manifest_sha256": scale_validation_manifest_sha256(validated_workspace_manifest()),
+        "result": json.loads(fixture.read_text(encoding="utf-8")),
+    }
+
+
 def public_artifact_evidence() -> dict[str, object]:
     return {
         "ok": True,
@@ -638,6 +651,7 @@ def test_report_preserves_matching_completion_scale_after_repair(scale: str) -> 
     case = ProjectScaleCaseResult(
         validated_workspace_manifest=validated_workspace_manifest(),
         case_id=f"{scale}:hybrid", run_id="run-repaired", status="completed",
+        scale_validation=scale_validation_evidence(f"{scale}:hybrid", "run-repaired"),
         observed_mode="hybrid", final_observed_mode="hybrid", requested_mode="hybrid",
         effective_scale=scale, final_effective_scale=scale,
         artifact_origin="model_workspace_bundle", workspace_bundle_source="embedded_bundle",
@@ -736,6 +750,28 @@ def _passing_evidence() -> dict[str, bool]:
     }
 
 
+def test_ultra_report_rejects_missing_independent_load_evidence() -> None:
+    module = load_script()
+    result = ProjectScaleCaseResult(
+        case_id="ultra:direct", run_id="run-ultra", status="completed",
+        evidence=_passing_evidence(), observed_mode="direct", final_observed_mode="direct",
+        requested_mode="direct", effective_scale="ultra", final_effective_scale="ultra",
+        artifact_origin="tool_workspace_write", workspace_bundle_source="public_workspace_api",
+        validated_workspace_manifest=validated_workspace_manifest(),
+    )
+
+    report = module.build_case_report(
+        scale="ultra", project={"project_id": "project-ultra"},
+        conversation={"conversation_id": "conv-ultra"}, result=result,
+        model_scope_evidence=_scope_evidence("run-ultra", "deepseek-backup"),
+        public_artifacts=public_artifact_evidence(),
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+
+    assert report["core_acceptance_ok"] is False
+    assert report["scale_specific_evidence_ok"] is False
+
+
 _FINALIZER_CASE_IDS = tuple(
     f"{scale}:{route}"
     for scale in ("small", "medium", "large", "ultra")
@@ -829,6 +865,7 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
             validated_workspace_manifest=validated_workspace_manifest(),
             case_id=case_id,
             run_id=f"run-{case_id}",
+            scale_validation=scale_validation_evidence(case_id, f"run-{case_id}"),
             status="completed",
             observed_mode=mode,
             final_observed_mode=mode,
@@ -1121,6 +1158,43 @@ def test_finalize_rejects_contradictory_core_evidence(
     before = copy.deepcopy(pending)
     with pytest.raises(ValueError, match="core"):
         module.finalize_real_device_acceptance(pending, evidence)
+    assert pending == before
+
+
+@pytest.mark.parametrize("mutation", (
+    "missing", "run", "case", "manifest", "profile", "count", "boolean_count",
+    "unknown", "extra", "nan", "top_flag",
+))
+def test_finalizer_rejects_unbound_or_incomplete_ultra_load(mutation: str) -> None:
+    module = load_script()
+    pending = _pending_automated_report()
+    case = next(row for row in pending["cases"] if row["case_id"] == "ultra:auto")
+    bound = case["run"]["scale_validation"]
+    if mutation == "missing":
+        case["run"].pop("scale_validation")
+    elif mutation == "run":
+        bound["run_id"] = "other-run"
+    elif mutation == "case":
+        bound["case_id"] = "ultra:direct"
+    elif mutation == "manifest":
+        bound["manifest_sha256"] = "0" * 64
+    elif mutation == "profile":
+        bound["result"]["profile"] = "legacy"
+    elif mutation == "count":
+        bound["result"]["measurements"]["target_projects"] = 999
+    elif mutation == "boolean_count":
+        bound["result"]["measurements"]["restart_traversals"] = True
+    elif mutation == "unknown":
+        bound["result"].update(status="unknown", reasons=["not executed"])
+    elif mutation == "extra":
+        bound["trusted"] = True
+    elif mutation == "nan":
+        bound["result"]["measurements"]["elapsed_seconds"] = float("inf")
+    else:
+        case["scale_specific_evidence_ok"] = False
+    before = copy.deepcopy(pending)
+    with pytest.raises(ValueError, match="core"):
+        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"))
     assert pending == before
 
 
@@ -1646,6 +1720,7 @@ def matrix_harness(
             validated_workspace_manifest=validated_workspace_manifest(),
             case_id=plan.requests[0].case_id,
             run_id=str(observed["id"]),
+            scale_validation=scale_validation_evidence(plan.requests[0].case_id, str(observed["id"])),
             status="completed",
             observed_mode=(
                 "hybrid"

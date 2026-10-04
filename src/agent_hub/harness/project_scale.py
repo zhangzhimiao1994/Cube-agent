@@ -24,6 +24,17 @@ PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE = (
     "mark checks not executed when they were not run. "
     "Do not prefill pass records or fabricate execution. "
 )
+PROJECT_ULTRA_LOAD_GUIDANCE = (
+    "Portfolio pagination contract: GET /portfolio/read-model accepts offset (default 0, "
+    "nonnegative) and limit (default 100, range 1..100). Filter by program_id BEFORE "
+    "sorting by String(project_id) in fixed lexical order and taking the requested slice; "
+    "an offset past the last row returns empty items. The independent workload creates "
+    "1000 target-program projects plus 17 foreign-program projects with varied module "
+    "records, then checks four concurrent complete traversals at page sizes 100/100/37/37, "
+    "limit=1 boundary pages, full traversal after process restart, and changed aggregates "
+    "after an additional budget write. Preserve exact IDs, fields, counts, filtering and "
+    "persistence throughout. This is fixed-workload correctness, not a throughput SLO. "
+)
 PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
     "direct",
     "dispatch",
@@ -454,7 +465,8 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "staffing_allocation,risk_count,milestone_count in each row. budget_total is the sum "
             "of that project's budget amounts; staffing_allocation sums its allocations; "
             "risk_count and milestone_count count its records. Projects without those records "
-            "have zero aggregates. All analytics must reflect stored data, including after restart."
+            "have zero aggregates. All analytics must reflect stored data, including after restart. "
+            + PROJECT_ULTRA_LOAD_GUIDANCE
         ),
     }[case.scale]
     flow_instruction = {
@@ -503,6 +515,7 @@ __all__ = [
     "PROJECT_SCALE_REQUIRED_EVIDENCE",
     "PROJECT_SCALE_TIERS",
     "PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE",
+    "PROJECT_ULTRA_LOAD_GUIDANCE",
     "ProjectScaleBenchmarkKind",
     "ProjectScaleCase",
     "ProjectScaleFlow",

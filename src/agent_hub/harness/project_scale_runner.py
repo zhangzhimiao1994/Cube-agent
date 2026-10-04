@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -28,12 +29,19 @@ from agent_hub.harness.project_requirements import (
     validate_medium_crm_api,
     validate_small_task_api,
     validate_ultra_portfolio_api,
+    validate_ultra_portfolio_load,
 )
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE,
+    PROJECT_ULTRA_LOAD_GUIDANCE,
     ProjectScaleBenchmarkKind,
     ProjectScaleRunPlan,
     build_project_scale_run_plan,
+)
+from agent_hub.harness.project_validation_result import (
+    scale_validation_manifest_sha256,
+    scale_validation_passed,
+    validate_scale_validation_result,
 )
 from agent_hub.harness.project_validation_sandbox import generated_command, sandbox_available
 from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
@@ -281,6 +289,29 @@ class ProjectScaleCaseResult:
     validation_focus: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
     validated_workspace_manifest: dict[str, tuple[int, str]] | None = None
+    scale_validation: dict[str, object] | None = None
+
+    @property
+    def scale_specific_evidence_ok(self) -> bool:
+        if self.case_id.split(":", 1)[0] != "ultra":
+            return True
+        bound = self.scale_validation
+        if (
+            not isinstance(bound, dict)
+            or set(bound) != {"case_id", "run_id", "manifest_sha256", "result"}
+            or bound.get("case_id") != self.case_id
+            or not self.run_id
+            or bound.get("run_id") != self.run_id
+            or self.validated_workspace_manifest is None
+            or not scale_validation_passed(bound.get("result"))
+        ):
+            return False
+        try:
+            return bound.get("manifest_sha256") == scale_validation_manifest_sha256(
+                self.validated_workspace_manifest
+            )
+        except (TypeError, ValueError):
+            return False
 
     @property
     def required_evidence(self) -> tuple[str, ...]:
@@ -358,6 +389,7 @@ class ProjectScaleCaseResult:
             "final_effective_scale": self.completion_scale,
             "artifact_origin": self.artifact_origin,
             "workspace_bundle_source": self.workspace_bundle_source,
+            "scale_validation": copy.deepcopy(self.scale_validation),
             "validated_workspace_manifest": (
                 {
                     path: [size, digest]
@@ -615,6 +647,7 @@ class _DownloadedWorkspaceBundle:
 class _EvidenceCheck:
     passed: bool
     reasons: tuple[str, ...]
+    scale_validation: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +733,7 @@ def execute_project_scale_plan(
         artifact_origin: str | None = None
         workspace_bundle_source: str | None = None
         validated_workspace_manifest: dict[str, tuple[int, str]] | None = None
+        scale_validation_result: dict[str, object] | None = None
         participant_agent_ids: set[str] = set()
         participant_event_kinds: list[str] = []
         multi_agent_contract_reasons: tuple[str, ...] = ()
@@ -775,6 +809,7 @@ def execute_project_scale_plan(
 
             _report_progress(progress, f"{case_label}: observing run {run_id}")
             validated_workspace_manifest = None
+            scale_validation_result = None
             observation = _collect_run_observation(
                 client,
                 run_id=run_id,
@@ -843,6 +878,7 @@ def execute_project_scale_plan(
                         )
                     else:
                         validated_workspace_manifest = None
+                        scale_validation_result = None
                         repair_response = client.request_json(
                             "POST",
                             f"/api/v1/runs/{quote(run_id)}/accept-repair",
@@ -991,6 +1027,7 @@ def execute_project_scale_plan(
                         run_request.case_id if plan.benchmark_kind == "capability" else None
                     ),
                 )
+                scale_validation_result = generated_project_validation.scale_validation
                 generated_project_validation = _merge_evidence_checks(
                     generated_project_validation,
                     _validate_requested_web_preview(
@@ -1160,6 +1197,7 @@ def execute_project_scale_plan(
                         errors.append(f"cleanup_cancel: {error}")
                 deliverable_repair_attempts += 1
                 validated_workspace_manifest = None
+                scale_validation_result = None
                 _report_progress(
                     progress,
                     f"{case_label}: submitting deliverable repair {deliverable_repair_attempts}",
@@ -1359,6 +1397,7 @@ def execute_project_scale_plan(
                             run_request.case_id if plan.benchmark_kind == "capability" else None
                         ),
                     )
+                    scale_validation_result = generated_project_validation.scale_validation
                     generated_project_validation = _merge_evidence_checks(
                         generated_project_validation,
                         _validate_requested_web_preview(
@@ -1623,6 +1662,9 @@ def execute_project_scale_plan(
             validation_focus=run_request.validation_focus,
             errors=tuple(errors),
             validated_workspace_manifest=validated_workspace_manifest,
+            scale_validation=_bind_scale_validation(
+                scale_validation_result, run_request.case_id, run_id, validated_workspace_manifest
+            ),
         )
         _report_progress(
             progress,
@@ -2197,6 +2239,21 @@ def _merge_evidence_checks(*checks: _EvidenceCheck) -> _EvidenceCheck:
     )
 
 
+def _bind_scale_validation(
+    result: dict[str, object] | None,
+    case_id: str,
+    run_id: str | None,
+    manifest: dict[str, tuple[int, str]] | None,
+) -> dict[str, object] | None:
+    if result is None or manifest is None or not run_id or not scale_validation_passed(result):
+        return None
+    return {
+        "case_id": case_id, "run_id": run_id,
+        "manifest_sha256": scale_validation_manifest_sha256(manifest),
+        "result": copy.deepcopy(result),
+    }
+
+
 def _is_preview_api_base_name(value: str) -> bool:
     normalized = "".join(char for char in value.casefold() if char.isalnum())
     return normalized in {"apibase", "apibaseurl", "apiurl", "apiendpoint", "visibleapibase"}
@@ -2378,6 +2435,7 @@ def _validate_generated_project_bundle(
     absolute_deadline: float = float("inf"),
     requirements_case_id: str | None = None,
 ) -> _EvidenceCheck:
+    scale_validation: dict[str, object] | None = None
     if workspace_bundle is None:
         return _EvidenceCheck(
             passed=False,
@@ -2444,12 +2502,39 @@ def _validate_generated_project_bundle(
                             for failure in failures
                         ),
                     )
+                if scale == "ultra":
+                    remaining_seconds = min(timeout_seconds, absolute_deadline - time.monotonic())
+                    if remaining_seconds <= 0:
+                        return _EvidenceCheck(
+                            passed=False,
+                            reasons=("requirements: ultra load unavailable: deadline exhausted",),
+                        )
+                    try:
+                        scale_validation = validate_scale_validation_result(
+                            validate_ultra_portfolio_load(root, remaining_seconds)
+                        )
+                    except (TypeError, ValueError) as error:
+                        return _EvidenceCheck(
+                            passed=False,
+                            reasons=(f"requirements: ultra load unavailable: invalid result: {error}",),
+                        )
+                    if not scale_validation_passed(scale_validation):
+                        category = (
+                            "failed" if scale_validation["status"] == "failed" else "unavailable"
+                        )
+                        return _EvidenceCheck(
+                            passed=False,
+                            reasons=tuple(
+                                f"requirements: ultra load {category}: {reason}"
+                                for reason in cast(list[str], scale_validation["reasons"])
+                            ),
+                        )
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         return _EvidenceCheck(
             passed=False,
             reasons=(f"generated_project_validation: {error}",),
         )
-    return _EvidenceCheck(passed=True, reasons=())
+    return _EvidenceCheck(passed=True, reasons=(), scale_validation=scale_validation)
 
 
 def _extract_workspace_bundle_safely(workspace_bundle: bytes, root: Path) -> None:
@@ -2561,6 +2646,8 @@ def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
         "unsupported platform for process-tree cleanup",
         "process-tree cleanup failed",
         "temporary data_dir cleanup failed",
+        "temporary runtime cleanup failed",
+        "ultra load unavailable",
     )
     return not any(
         marker in reason.casefold()
@@ -4259,7 +4346,8 @@ def _deliverable_repair_body(
             "does not prevent lost updates; rerun the concurrency and restart-persistence tests. "
         )
         ultra_guidance = (
-            "For the ultra generated-project acceptance initialization contract, baseline CRUD "
+            PROJECT_ULTRA_LOAD_GUIDANCE
+            + "For the ultra generated-project acceptance initialization contract, baseline CRUD "
             "including POST /programs, /projects, nested milestones/budgets/staffing/risks, "
             "/dependencies, and /approvals must return 201 without requiring an authorization "
             "header. Keep RBAC behavior explicit at PATCH /approvals/:id: JSON role viewer must "

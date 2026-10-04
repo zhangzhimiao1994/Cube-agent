@@ -248,13 +248,78 @@ def validate_requirements(root: Path, scale: str, timeout_seconds: float) -> tup
         return (f"bwrap sandbox requirements unavailable: {exc}",)
 
 
+def validate_scale_load(root: Path, scale: str, timeout_seconds: float) -> dict[str, object]:
+    # Host-only imports: the isolated CLI must never import the normal harness package.
+    from agent_hub.harness.project_validation_result import (
+        scale_validation_unknown,
+        validate_scale_validation_result,
+    )
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate result key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"nonfinite result number: {value}")
+
+    try:
+        if (
+            type(timeout_seconds) not in (int, float)
+            or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+        ):
+            return scale_validation_unknown("timeout_seconds must be finite and positive")
+        if scale != "ultra":
+            return scale_validation_unknown("bwrap sandbox: load evaluator unavailable for this scale")
+        command = sandbox_command(
+            (
+                "/usr/bin/python3", "-I",
+                "/opt/validator/src/agent_hub/harness/project_validation_sandbox.py",
+                "portfolio-load", scale, str(timeout_seconds),
+            ),
+            cwd=root, shared_network=False, config={},
+        )
+        completed = subprocess.run(
+            command, cwd=root, env={"PATH": "/usr/bin:/bin"},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="strict", timeout=timeout_seconds, check=False,
+        )
+        if completed.returncode != 0:
+            return scale_validation_unknown(
+                f"bwrap sandbox load validator failed: exit={completed.returncode}",
+            )
+        payload = json.loads(
+            completed.stdout, object_pairs_hook=strict_object, parse_constant=reject_constant,
+        )
+        return validate_scale_validation_result(payload)
+    except subprocess.TimeoutExpired:
+        return scale_validation_unknown("timeout: bwrap sandbox load validation deadline exceeded")
+    except (OSError, RuntimeError, ValueError, OverflowError) as exc:
+        return scale_validation_unknown(f"bwrap sandbox load validation unavailable: {exc}")
+
+
 def _main() -> None:
-    if len(sys.argv) != 4 or sys.argv[1] != "requirements" or sys.argv[2] not in _VALIDATORS:
+    if len(sys.argv) != 4:
+        raise SystemExit(2)
+    if sys.argv[1] == "requirements" and sys.argv[2] in _VALIDATORS:
+        validator = _VALIDATORS[sys.argv[2]]
+    elif sys.argv[1] == "portfolio-load" and sys.argv[2] == "ultra":
+        try:
+            timeout = float(sys.argv[3])
+        except ValueError:
+            raise SystemExit(2) from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise SystemExit(2)
+        validator = "_validate_ultra_portfolio_load"
+    else:
         raise SystemExit(2)
     # Load only the trusted stdlib validator; -I excludes generated cwd/PYTHONPATH.
     validators = runpy.run_path(str(Path(__file__).with_name("project_requirements.py")))
-    failures = validators[_VALIDATORS[sys.argv[2]]](Path("/workspace"), float(sys.argv[3]))
-    print(json.dumps(failures))
+    result = validators[validator](Path("/workspace"), float(sys.argv[3]))
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

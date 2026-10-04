@@ -86,6 +86,83 @@ def test_default_generated_project_install_disables_dependency_lifecycle_scripts
     )
 
 
+def test_ultra_generated_bundle_requires_independent_load_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(project_scale_runner_module, "_run_generated_project_command",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_api",
+                        lambda *args, **kwargs: ())
+
+    def load_check(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append("load")
+        return {"status": "unknown", "reasons": ["not executed"]}
+
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_load",
+                        load_check, raising=False)
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
+        timeout_seconds=1, requirements_case_id="ultra:direct",
+    )
+
+    assert result.passed is False
+    assert calls == ["load"]
+
+
+def _ultra_load_result() -> dict[str, object]:
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_load_result.json"
+    return cast(dict[str, object], json.loads(fixture.read_text(encoding="utf-8")))
+
+
+def test_ultra_generated_bundle_preserves_verified_load_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(project_scale_runner_module, "_run_generated_project_command",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_api",
+                        lambda *args, **kwargs: ())
+    measurements = _ultra_load_result()
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_load",
+                        lambda *args, **kwargs: measurements)
+    result = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
+        timeout_seconds=10, requirements_case_id="ultra:direct",
+    )
+    assert result.passed, result.reasons
+    assert result.scale_validation == measurements
+    assert result.scale_validation is not measurements
+
+
+@pytest.mark.parametrize("missing", ("result", "run", "manifest", "failed_result"))
+def test_ultra_load_binding_drops_incomplete_validation(missing: str) -> None:
+    measurements = _ultra_load_result()
+    if missing == "failed_result":
+        measurements.update(status="failed", reasons=["wrong data"])
+    bound = project_scale_runner_module._bind_scale_validation(
+        None if missing == "result" else measurements,
+        "ultra:direct", None if missing == "run" else "run-ultra",
+        None if missing == "manifest" else {"src/app.js": (1, "a" * 64)},
+    )
+    assert bound is None
+
+
+def test_ultra_load_binding_is_checked_against_current_manifest_and_run() -> None:
+    manifest = {"src/app.js": (1, "a" * 64)}
+    bound = project_scale_runner_module._bind_scale_validation(
+        _ultra_load_result(), "ultra:direct", "run-ultra", manifest,
+    )
+    result = ProjectScaleCaseResult(
+        case_id="ultra:direct", run_id="run-ultra", status="completed", evidence={},
+        validated_workspace_manifest=manifest, scale_validation=bound,
+    )
+    assert result.scale_specific_evidence_ok
+    assert result.to_payload()["scale_validation"] == bound
+    assert result.to_payload()["scale_validation"] is not bound
+    manifest["src/app.js"] = (1, "b" * 64)
+    assert not result.scale_specific_evidence_ok
+
+
 def test_generated_project_command_env_uses_stable_default_npm_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -844,6 +921,8 @@ def test_sandbox_project_failure_and_timeout_remain_repairable(reason: str) -> N
         "requirements: unsupported platform for process-tree cleanup: windows",
         "requirements: process-tree cleanup failed: permission denied",
         "requirements: temporary DATA_DIR cleanup failed: permission denied",
+        "requirements: ultra load failed: temporary runtime cleanup failed: permission denied",
+        "requirements: ultra load unavailable: bwrap sandbox validator failed: exit=1",
     ),
 )
 def test_validator_infrastructure_failure_is_not_treated_as_project_repair(reason: str) -> None:
@@ -2429,7 +2508,7 @@ def test_capability_ultra_uses_independent_portfolio_requirements(
     assert "requirements: RBAC approval missing" in result.reasons
 
 
-def test_controlled_ultra_project_bundle_passes_independent_validation() -> None:
+def test_controlled_ultra_project_bundle_without_pagination_is_rejected() -> None:
     if shutil.which("npm") is None:
         pytest.skip("npm is required for generated project validation")
     if not project_scale_runner_module._generated_project_validation_is_isolated():
@@ -2451,8 +2530,9 @@ def test_controlled_ultra_project_bundle_passes_independent_validation() -> None
         requirements_case_id="ultra:direct",
     )
 
-    assert result.passed is True
-    assert result.reasons == ()
+    assert result.passed is False
+    assert any("requirements: ultra load failed:" in reason for reason in result.reasons)
+    assert result.scale_validation is None
 
 
 def test_capability_quality_uses_executed_checks_instead_of_claimed_pass_records() -> None:
@@ -6502,8 +6582,9 @@ def test_public_repair_validation_never_merges_previous_workspace(
 
 
 @pytest.mark.parametrize("delivery", ("initial", "replacement", "materialized_patch"))
+@pytest.mark.parametrize("scale", ("small", "ultra"))
 def test_validated_workspace_manifest_records_last_successful_input(
-    monkeypatch: pytest.MonkeyPatch, delivery: str,
+    monkeypatch: pytest.MonkeyPatch, delivery: str, scale: str,
 ) -> None:
     files = _validation_manifest_files()
     final_files = dict(files)
@@ -6516,6 +6597,7 @@ def test_validated_workspace_manifest_records_last_successful_input(
         return project_scale_runner_module._EvidenceCheck(
             passed=passed,
             reasons=() if passed else ("generated_project_validation: command failed exit=1",),
+            scale_validation=_ultra_load_result() if passed and scale == "ultra" else None,
         )
 
     monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
@@ -6527,9 +6609,14 @@ def test_validated_workspace_manifest_records_last_successful_input(
 
         monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_body", replacement_body)
     plan = build_project_scale_run_plan(
-        benchmark_kind="capability", scales=("small",), flows=("direct",), execute=True
+        benchmark_kind="capability", scales=(scale,), flows=("direct",), execute=True
     )
     client = FakeAcceptanceClient(
+        run_id=f"run-{scale}-direct", session_id=f"project-scale-{scale}-direct",
+        create_status="waiting_approval" if scale == "ultra" else "completed",
+        decision_token="approve-scale", decision_version=2,
+        repair_create_status="waiting_approval" if scale == "ultra" else "completed",
+        repair_decision_token="approve-scale-repair", repair_decision_version=3,
         status="completed", artifacts=[{"id": "artifact-1"}],
         events=[_trusted_agent_standard_event()],
         workspace_bundle=_project_bundle(files),
@@ -6546,6 +6633,16 @@ def test_validated_workspace_manifest_records_last_successful_input(
         for path, content in expected_files.items()
     }
     assert result.validated_workspace_manifest == expected
+    assert result.scale_specific_evidence_ok
+    if scale == "ultra":
+        assert result.scale_validation == project_scale_runner_module._bind_scale_validation(
+            _ultra_load_result(), f"{scale}:direct", result.run_id, expected,
+        )
+        assert result.run_id == f"run-{scale}-direct" + (
+            "" if delivery == "initial" else "-repair"
+        )
+    else:
+        assert result.scale_validation is None
     payload = result.to_payload()
     assert payload["validated_workspace_manifest"] == {
         path: [size, digest] for path, (size, digest) in expected.items()
@@ -6556,8 +6653,9 @@ def test_validated_workspace_manifest_records_last_successful_input(
 
 
 @pytest.mark.parametrize("failure", ("submission", "observation", "build", "requirements", "preview"))
+@pytest.mark.parametrize("scale", ("small", "ultra"))
 def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
-    monkeypatch: pytest.MonkeyPatch, failure: str,
+    monkeypatch: pytest.MonkeyPatch, failure: str, scale: str,
 ) -> None:
     files = _validation_manifest_files()
     repair_files = dict(files)
@@ -6567,14 +6665,20 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     def validate(bundle: bytes | None, **kwargs: object) -> object:
         validations.append(bundle)
         if len(validations) == 1:
-            return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+            return project_scale_runner_module._EvidenceCheck(
+                passed=True, reasons=(),
+                scale_validation=_ultra_load_result() if scale == "ultra" else None,
+            )
         if failure == "build":
             raise RuntimeError("build validator failed after repair")
         if failure == "requirements":
             return project_scale_runner_module._EvidenceCheck(
                 passed=False, reasons=("requirements: persistence lost",),
             )
-        return project_scale_runner_module._EvidenceCheck(passed=True, reasons=())
+        return project_scale_runner_module._EvidenceCheck(
+            passed=True, reasons=(),
+            scale_validation=_ultra_load_result() if scale == "ultra" else None,
+        )
 
     original_observe = project_scale_runner_module._collect_run_observation
     observations = 0
@@ -6612,10 +6716,15 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_attempt_limit", lambda *a, **k: 1)
     monkeypatch.setattr(project_scale_runner_module, "_deliverable_repair_safety_limit", lambda *a, **k: 1)
     plan = build_project_scale_run_plan(
-        benchmark_kind="capability", scales=("small",), flows=("direct",), execute=True
+        benchmark_kind="capability", scales=(scale,), flows=("direct",), execute=True
     )
     # Missing trusted process evidence triggers repair after a successful first validation.
     client = FailingRepairClient(
+        run_id=f"run-{scale}-direct", session_id=f"project-scale-{scale}-direct",
+        create_status="waiting_approval" if scale == "ultra" else "completed",
+        decision_token="approve-scale", decision_version=2,
+        repair_create_status="waiting_approval" if scale == "ultra" else "completed",
+        repair_decision_token="approve-scale-repair", repair_decision_version=3,
         status="completed", artifacts=[{"id": "artifact-1"}],
         workspace_bundle=_project_bundle(files), repair_workspace_bundle=_project_bundle(repair_files),
         repair_events=[_trusted_agent_standard_event()],
@@ -6628,6 +6737,9 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     assert result.ok is False
     assert result.validated_workspace_manifest is None
     assert result.to_payload()["validated_workspace_manifest"] is None
+    assert result.scale_validation is None
+    assert result.to_payload()["scale_validation"] is None
+    assert result.scale_specific_evidence_ok is (scale != "ultra")
 
 
 def test_validated_workspace_manifest_defaults_to_none_without_requirements() -> None:
