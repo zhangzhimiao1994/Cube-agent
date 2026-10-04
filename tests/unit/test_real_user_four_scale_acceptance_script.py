@@ -484,6 +484,7 @@ def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() ->
         final_observed_mode="direct",
         requested_mode="direct",
         effective_scale="large",
+        final_effective_scale="large",
         artifact_origin="incremental_workspace_delivery",
         workspace_bundle_source="public_workspace_api",
         evidence={**_passing_evidence(), "deliverable_repair_trace": True},
@@ -518,6 +519,7 @@ def test_report_does_not_let_auto_repair_mode_hide_wrong_initial_route() -> None
         final_observed_mode="hybrid",
         requested_mode="hybrid",
         effective_scale="large",
+        final_effective_scale="large",
         artifact_origin="incremental_workspace_delivery",
         workspace_bundle_source="public_workspace_api",
         evidence={**_passing_evidence(), "deliverable_repair_trace": True},
@@ -549,6 +551,7 @@ def test_report_keeps_explicit_mode_coverage_bound_to_final_run() -> None:
         final_observed_mode="direct",
         requested_mode="direct",
         effective_scale="large",
+        final_effective_scale="large",
         artifact_origin="incremental_workspace_delivery",
         workspace_bundle_source="public_workspace_api",
         evidence={**_passing_evidence(), "deliverable_repair_trace": True},
@@ -598,6 +601,58 @@ def test_report_rejects_missing_effective_scale_instead_of_using_expected_scale(
     assert payload["effective_scale"] is None
     assert payload["scale_fidelity_ok"] is False
     assert payload["core_acceptance_ok"] is False
+
+
+@pytest.mark.parametrize("expected, final", [
+    ("large", "small"), ("ultra", "large"), ("medium", "ultra"),
+    ("large", ""), ("ultra", "unknown"), ("large", None),
+])
+def test_report_rejects_changed_or_unknown_completion_scale_after_repair(
+    expected: str, final: str | None,
+) -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
+        case_id=f"{expected}:hybrid", run_id="run-repaired", status="completed",
+        observed_mode="hybrid", final_observed_mode="hybrid", requested_mode="hybrid",
+        effective_scale=expected, final_effective_scale=final,
+        artifact_origin="model_workspace_bundle", workspace_bundle_source="embedded_bundle",
+        evidence={**_passing_evidence(), "deliverable_repair_trace": True},
+    )
+    payload = module.build_case_report(
+        scale=expected, project={"project_id": "project-scale"},
+        conversation={"conversation_id": "conv-scale"}, result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
+        public_artifacts=public_artifact_evidence(),
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+    assert payload["scale_fidelity_ok"] is False
+    assert payload["core_acceptance_ok"] is False
+    assert payload["initial_effective_scale"] == expected
+    assert payload["final_effective_scale"] == final
+
+
+@pytest.mark.parametrize("scale", ["small", "medium", "large", "ultra"])
+def test_report_preserves_matching_completion_scale_after_repair(scale: str) -> None:
+    module = load_script()
+    case = ProjectScaleCaseResult(
+        validated_workspace_manifest=validated_workspace_manifest(),
+        case_id=f"{scale}:hybrid", run_id="run-repaired", status="completed",
+        observed_mode="hybrid", final_observed_mode="hybrid", requested_mode="hybrid",
+        effective_scale=scale, final_effective_scale=scale,
+        artifact_origin="model_workspace_bundle", workspace_bundle_source="embedded_bundle",
+        evidence={**_passing_evidence(), "deliverable_repair_trace": True},
+    )
+    payload = module.build_case_report(
+        scale=scale, project={"project_id": "project-scale"},
+        conversation={"conversation_id": "conv-scale"}, result=case,
+        model_scope_evidence=_scope_evidence(str(case.run_id), "deepseek-backup"),
+        public_artifacts=public_artifact_evidence(),
+        dynamic_web_preview={"counted_as_passed": True},
+    )
+    assert payload["scale_fidelity_ok"] is True
+    assert payload["core_acceptance_ok"] is True
+    assert payload["initial_effective_scale"] == payload["final_effective_scale"] == scale
 
 
 def test_report_rejects_unverified_mode_change_and_fixture_artifact_origin() -> None:
@@ -1037,6 +1092,12 @@ def test_finalize_real_device_acceptance_rejects_missing_case_evidence() -> None
         ("run", "missing_evidence", ["run_events"]),
         ("run", "evidence", {}),
         ("run", "effective_scale", "ultra"),
+        ("run", "final_effective_scale", "ultra"),
+        ("run", "final_effective_scale", None),
+        ("run", "final_effective_scale", ""),
+        ("run", "final_effective_scale", True),
+        (None, "final_effective_scale", "ultra"),
+        (None, "initial_effective_scale", "ultra"),
         ("run", "final_observed_mode", "unknown"),
         ("run", "artifact_origin", "builtin_fixture"),
         ("build_and_test", "status", "failed"),

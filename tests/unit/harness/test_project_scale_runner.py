@@ -3894,6 +3894,171 @@ def test_execute_project_scale_plan_preserves_initial_route_evidence_across_repa
     assert payload["final_effective_scale"] == "large"
 
 
+@pytest.mark.parametrize("initial_scale", (None, "large"))
+@pytest.mark.parametrize("repair_path", ("self_repair", "deliverable_repair"))
+@pytest.mark.parametrize(
+    ("response_evidence", "detail_evidence", "expected_scale"),
+    (
+        ({}, {}, None),
+        ({"effective_scale": "small"}, {}, "small"),
+        ({}, {"effective_scale": "small"}, "small"),
+        ({"effective_scale": "large"}, {}, "large"),
+        ({}, {"effective_scale": "large"}, "large"),
+        ({"effective_scale": "large"}, {"effective_scale": "small"}, "small"),
+        ({"effective_scale": "small"}, {"effective_scale": "large"}, "large"),
+        ({"effective_scale": ""}, {"effective_scale": "unknown"}, None),
+        ({"effective_scale": None}, {"effective_scale": None}, None),
+    ),
+    ids=(
+        "absent", "response-downgrade", "detail-downgrade", "response-same", "detail-same",
+        "detail-overrides-downgrade", "detail-overrides-upgrade", "invalid", "null",
+    ),
+)
+def test_execute_project_scale_plan_completion_scale_uses_current_repair_evidence(
+    initial_scale: str | None,
+    repair_path: str,
+    response_evidence: dict[str, object],
+    detail_evidence: dict[str, object],
+    expected_scale: str | None,
+) -> None:
+    class RepairScaleClient(FakeAcceptanceClient):
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            response = super().request_json(
+                method, path, body=body, idempotency_key=idempotency_key
+            )
+            if isinstance(response, dict) and response.get("id") == self.repair_run_id:
+                response["effective_mode"] = "direct"
+                response.update(
+                    detail_evidence if path.endswith("/details") else response_evidence
+                )
+            return response
+
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture", scales=("large",), flows=("direct",), execute=True
+    )
+    self_repair = repair_path == "self_repair"
+    client = RepairScaleClient(
+        run_id="run-large-direct",
+        session_id="project-scale-large-direct",
+        create_status="waiting_approval",
+        decision_token="approve-large-scale",
+        decision_version=1,
+        repair_create_status="completed",
+        statuses=("failed", "completed") if self_repair else ("completed",),
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality_sequence=(True,) if self_repair else (False, True),
+        self_repair_decision_token="repair-scale-token" if self_repair else None,
+        self_repair_decision_version=1 if self_repair else None,
+        initial_route_evidence={"effective_mode": "direct", "effective_scale": initial_scale},
+    )
+
+    result = execute_project_scale_plan(
+        plan, client, wait_seconds=5, poll_interval_seconds=0
+    ).results[0]
+
+    assert result.ok, result.errors
+    assert result.run_id == "run-large-direct-repair"
+    assert result.repair_attempted is True
+    assert result.effective_scale == initial_scale
+    assert result.final_effective_scale == expected_scale
+    assert result.completion_scale == expected_scale
+    assert result.to_payload()["effective_scale"] == initial_scale
+    assert result.to_payload()["final_effective_scale"] == expected_scale
+
+
+@pytest.mark.parametrize("first_repair_path", ("self_repair", "deliverable_repair"))
+def test_execute_project_scale_plan_completion_scale_forgets_previous_repair(
+    first_repair_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MultipleRepairScaleClient(FakeAcceptanceClient):
+        repair_count = 0
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: dict[str, object] | None = None,
+            idempotency_key: str | None = None,
+        ) -> dict[str, object] | list[object]:
+            if method == "POST" and (
+                path.endswith("/accept-repair")
+                or (path == "/api/v1/runs" and "deliverable-repair" in (idempotency_key or ""))
+            ):
+                self.repair_count += 1
+                self.repair_run_id = f"{self.run_id}-repair-{self.repair_count}"
+                self.repair_route_evidence = {"effective_mode": "direct"}
+                if self.repair_count == 1:
+                    self.repair_route_evidence["effective_scale"] = "medium"
+            response = super().request_json(
+                method, path, body=body, idempotency_key=idempotency_key
+            )
+            if isinstance(response, dict) and path.endswith("/accept-repair"):
+                response.update(self.repair_route_evidence)
+            return response
+
+    monkeypatch.setattr(project_scale_runner_module, "_FIXTURE_DELIVERABLE_REPAIR_ATTEMPTS", 2)
+    plan = build_project_scale_run_plan(
+        benchmark_kind="fixture", scales=("large",), flows=("direct",), execute=True
+    )
+    self_repair = first_repair_path == "self_repair"
+    client = MultipleRepairScaleClient(
+        run_id="run-large-direct",
+        session_id="project-scale-large-direct",
+        create_status="waiting_approval",
+        decision_token="approve-large-scale",
+        decision_version=1,
+        repair_create_status="completed",
+        statuses=("failed", "completed") if self_repair else ("completed",),
+        artifacts=[{"id": "artifact-1"}],
+        deliverable_quality_sequence=(True, False, True) if self_repair else (False, False, True),
+        self_repair_decision_token="repair-scale-token" if self_repair else None,
+        self_repair_decision_version=1 if self_repair else None,
+        initial_route_evidence={"effective_mode": "direct", "effective_scale": "large"},
+    )
+
+    result = execute_project_scale_plan(
+        plan, client, wait_seconds=5, poll_interval_seconds=0
+    ).results[0]
+
+    assert result.ok, result.errors
+    assert client.repair_count == 2
+    assert result.run_id == "run-large-direct-repair-2"
+    assert result.repair_attempted is True
+    assert result.effective_scale == "large"
+    assert result.final_effective_scale is None
+    assert result.completion_scale is None
+    assert result.to_payload()["final_effective_scale"] is None
+
+
+@pytest.mark.parametrize("repair_trace", (None, "self_repair_trace", "deliverable_repair_trace"))
+@pytest.mark.parametrize("final_scale", (None, "small", "large", "", "unknown"))
+def test_project_scale_completion_scale_preserves_unknown_and_invalid_evidence(
+    repair_trace: str | None,
+    final_scale: str | None,
+) -> None:
+    result = ProjectScaleCaseResult(
+        case_id="large:direct",
+        run_id="run-large-direct",
+        status="completed",
+        evidence={} if repair_trace is None else {repair_trace: True},
+        effective_scale="large",
+        final_effective_scale=final_scale,
+    )
+    expected_scale = "large" if final_scale is None and repair_trace is None else final_scale
+
+    assert result.to_payload()["final_effective_scale"] == expected_scale
+    assert result.completion_scale == expected_scale
+
+
 def test_execute_auto_scale_repair_submits_the_observed_mode() -> None:
     plan = _auto_scale_plan("small")
     client = FakeAcceptanceClient(

@@ -1430,7 +1430,8 @@ def build_case_report(
     )
     route_policy_ok = exact_mode_coverage_ok or safe_upgrade
     effective_scale = result.effective_scale
-    scale_fidelity_ok = effective_scale == scale
+    final_effective_scale = result.completion_scale
+    scale_fidelity_ok = effective_scale == scale and final_effective_scale == scale
     artifact_origin_ok = result.artifact_origin in {
         "model_workspace_bundle",
         "tool_workspace_write",
@@ -1469,6 +1470,8 @@ def build_case_report(
         "route_reason": result.route_reason,
         "mode_source": result.mode_source,
         "effective_scale": effective_scale,
+        "initial_effective_scale": effective_scale,
+        "final_effective_scale": final_effective_scale,
         "scale_fidelity_ok": scale_fidelity_ok,
         "route_policy_ok": route_policy_ok,
         "observed_route_ok": route_policy_ok,
@@ -2265,12 +2268,15 @@ def _has_complete_core_evidence(
         "route_reason",
         "mode_source",
         "effective_scale",
+        "final_effective_scale",
         "artifact_origin",
         "workspace_bundle_source",
     )
     if any(run.get(key) is not None and not isinstance(run.get(key), str) for key in string_fields):
         return False
     if run.get("final_observed_mode") not in ("direct", "dispatch", "hybrid"):
+        return False
+    if run.get("final_effective_scale") not in ("small", "medium", "large", "ultra"):
         return False
     participants, event_kinds = run.get("participant_agent_ids"), run.get("participant_event_kinds")
     event_count = run.get("participant_event_count")
@@ -2297,6 +2303,7 @@ def _has_complete_core_evidence(
         route_reason=cast(str | None, run.get("route_reason")),
         mode_source=cast(str | None, run.get("mode_source")),
         effective_scale=cast(str | None, run.get("effective_scale")),
+        final_effective_scale=cast(str | None, run.get("final_effective_scale")),
         artifact_origin=cast(str | None, run.get("artifact_origin")),
         workspace_bundle_source=cast(str | None, run.get("workspace_bundle_source")),
         participant_agent_ids=tuple(cast(list[str], participants)),
@@ -2378,6 +2385,8 @@ def _has_complete_core_evidence(
         "route_reason",
         "mode_source",
         "effective_scale",
+        "initial_effective_scale",
+        "final_effective_scale",
         "observed_route_ok",
         "exact_mode_coverage_ok",
         "coverage_credit",

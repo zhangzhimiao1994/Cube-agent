@@ -327,6 +327,12 @@ class ProjectScaleCaseResult:
         )
 
     @property
+    def completion_scale(self) -> str | None:
+        if self.final_effective_scale is not None:
+            return self.final_effective_scale
+        return None if self.repair_attempted else self.effective_scale
+
+    @property
     def repair_outcome(self) -> str:
         if not self.repair_attempted:
             return "not_attempted"
@@ -349,7 +355,7 @@ class ProjectScaleCaseResult:
             "final_requested_mode": self.final_requested_mode or self.requested_mode,
             "final_route_reason": self.final_route_reason or self.route_reason,
             "final_mode_source": self.final_mode_source or self.mode_source,
-            "final_effective_scale": self.final_effective_scale or self.effective_scale,
+            "final_effective_scale": self.completion_scale,
             "artifact_origin": self.artifact_origin,
             "workspace_bundle_source": self.workspace_bundle_source,
             "validated_workspace_manifest": (
@@ -856,6 +862,11 @@ def execute_project_scale_plan(
                         repair_run_id = repair_response.get("id")
                         if not isinstance(repair_run_id, str) or not repair_run_id:
                             raise RuntimeError("self repair acceptance response missing id")
+                        repair_scale = _public_route_evidence(
+                            repair_response, requested_body=request_body
+                        )[2]
+                        if repair_run_id != run_id or repair_scale is not None:
+                            final_effective_scale = repair_scale
                         run_id = repair_run_id
                         status = _string_value(repair_response.get("status")) or status
                         final_observed_mode = (
@@ -909,7 +920,6 @@ def execute_project_scale_plan(
                         )
                         route_reason = route_reason or repaired_reason
                         mode_source = mode_source or repaired_source
-                        effective_scale = effective_scale or repaired_scale
                         requested_mode = requested_mode or repaired_requested
                         final_route_reason = repaired_reason or final_route_reason
                         final_mode_source = repaired_source or final_mode_source
@@ -1206,6 +1216,11 @@ def execute_project_scale_plan(
                 repair_run_id = repair_response.get("id")
                 if not isinstance(repair_run_id, str) or not repair_run_id:
                     raise RuntimeError("deliverable repair response missing id")
+                repair_scale = _public_route_evidence(
+                    repair_response, requested_body=request_body
+                )[2]
+                if repair_run_id != run_id or repair_scale is not None:
+                    final_effective_scale = repair_scale
                 evidence["deliverable_repair_trace"] = True
                 run_id = repair_run_id
                 status = _string_value(repair_response.get("status")) or status
@@ -1267,7 +1282,6 @@ def execute_project_scale_plan(
                 )
                 route_reason = route_reason or repaired_reason
                 mode_source = mode_source or repaired_source
-                effective_scale = effective_scale or repaired_scale
                 requested_mode = requested_mode or repaired_requested
                 final_route_reason = repaired_reason or final_route_reason
                 final_mode_source = repaired_source or final_mode_source
@@ -1600,7 +1614,7 @@ def execute_project_scale_plan(
             final_requested_mode=final_requested_mode or requested_mode,
             final_route_reason=final_route_reason or route_reason,
             final_mode_source=final_mode_source or mode_source,
-            final_effective_scale=final_effective_scale or effective_scale,
+            final_effective_scale=final_effective_scale,
             artifact_origin=artifact_origin,
             workspace_bundle_source=workspace_bundle_source,
             participant_agent_ids=tuple(sorted(participant_agent_ids)),
