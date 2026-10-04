@@ -3,6 +3,33 @@ import pytest
 from agent_hub.harness.project_scale import build_project_scale_run_plan
 
 
+@pytest.mark.parametrize("scale, required", [
+    ("large", (
+        "reservations atomically consume stock", "rejected reservations leave stock unchanged",
+        "orders.total", "orders.authorized_count", "inventory.reserved_units",
+        "fulfillment.total", "fulfillment.cancelled_count", "nonnegative integers",
+        "entity_id", "order.created", "payment.authorized", "survive process restart",
+        "POST /inventory/stock adds quantity to the existing SKU balance",
+    )),
+    ("ultra", (
+        "GET /projects/:id/milestones", "GET /projects/:id/budgets",
+        "GET /projects/:id/staffing", "GET /projects/:id/risks", "GET /dependencies/:id",
+        "project_id,program_id,name", "budget_total", "staffing_allocation",
+        "risk_count", "milestone_count", "survive process restart",
+        "filter by program_id", "CSV quoting",
+    )),
+])
+def test_large_business_contract_declares_independent_readback_checks(
+    scale: str, required: tuple[str, ...],
+) -> None:
+    plan = build_project_scale_run_plan(
+        scales=(scale,), flows=("direct",), benchmark_kind="capability",
+    )
+    message = str(plan.requests[0].body["message"])
+    for phrase in required:
+        assert phrase in message
+
+
 @pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
 def test_capability_request_requires_canonical_verification_report(scale: str) -> None:
     plan = build_project_scale_run_plan(

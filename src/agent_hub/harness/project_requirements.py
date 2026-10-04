@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import http.client
 import json
@@ -17,6 +18,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from io import StringIO
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
@@ -968,6 +970,51 @@ def _validate_medium_crm_api(root: Path, timeout_seconds: float) -> tuple[str, .
     return tuple(failures)
 
 
+def _order_report(api: _OrderOpsAPI) -> dict[str, int]:
+    report = api.get_object("/admin/reports/summary")
+    metrics: dict[str, int] = {}
+    for section, fields in (
+        ("orders", ("total", "authorized_count")),
+        ("inventory", ("reserved_units",)),
+        ("fulfillment", ("total", "cancelled_count")),
+    ):
+        value = report.get(section)
+        _require(isinstance(value, dict), f"admin report: expected {section} object")
+        assert isinstance(value, dict)
+        for field in fields:
+            counter = value.get(field)
+            _require(
+                type(counter) is int and counter >= 0,
+                f"admin report: {section}.{field} must be a nonnegative integer",
+            )
+            assert isinstance(counter, int)
+            metrics[f"{section}.{field}"] = counter
+    return metrics
+
+
+def _order_audit(
+    api: _OrderOpsAPI, order_id: object,
+    required_actions: tuple[str, ...] = ("order.created", "payment.authorized"),
+) -> None:
+    audit = api.get_object(f"/audit?entity_id={quote(str(order_id), safe='')}")
+    items = audit.get("items")
+    _require(isinstance(items, list) and bool(items), "audit: expected nonempty items")
+    assert isinstance(items, list)
+    actions: set[str] = set()
+    for item in items:
+        _require(isinstance(item, dict), "audit: expected object items")
+        assert isinstance(item, dict)
+        _require(item.get("entity_id") == order_id, "audit: wrong entity_id")
+        action = item.get("action")
+        _require(isinstance(action, str) and bool(action), "audit: missing action")
+        assert isinstance(action, str)
+        actions.add(action)
+    _require(
+        set(required_actions) <= actions,
+        "audit: missing required order action",
+    )
+
+
 def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     """Check the large order-operations contract with failure paths and persistence."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
@@ -987,8 +1034,13 @@ def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[s
     deadline = time.monotonic() + timeout_seconds
     phase = "startup"
     sku = f"SKU-{uuid4().hex[:8]}"
+    inventory_sku = f"RESERVE-{uuid4().hex[:8]}"
+    remaining_sku = f"REMAINING-{uuid4().hex[:8]}"
     order: dict[str, object] = {}
+    other_order: dict[str, object] = {}
     fulfillment: dict[str, object] = {}
+    baseline: dict[str, int] = {}
+    final_report: dict[str, int] = {}
     try:
         root = root.resolve(strict=True)
         package = json.loads((root / "package.json").read_text(encoding="utf-8"))
@@ -1018,24 +1070,70 @@ def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[s
             api = _OrderOpsAPI(port, deadline)
             _ready_order_ops(api, process)
             if cycle == 0:
+                baseline = _order_report(api)
                 item = api.create(
                     "/catalog/items",
-                    {"sku": sku, "name": "Acceptance Widget", "price": 1200},
+                    {"sku": inventory_sku, "name": "Reservation Widget", "price": 1200},
                 )
-                _require(str(item.get("sku")) == sku, "catalog: sku was not preserved")
-                stock = api.create("/inventory/stock", {"sku": sku, "quantity": 2})
-                _require(str(stock.get("sku")) == sku, "inventory stock: sku mismatch")
+                _require(item.get("sku") == inventory_sku, "catalog: sku was not preserved")
+                stock = api.create("/inventory/stock", {"sku": inventory_sku, "quantity": 2})
+                _require(stock.get("sku") == inventory_sku, "inventory stock: sku mismatch")
                 reservation = api.create(
                     "/inventory/reservations",
-                    {"sku": sku, "quantity": 1, "reason": "acceptance"},
+                    {"sku": inventory_sku, "quantity": 1, "reason": "acceptance"},
                 )
-                _require(str(reservation.get("sku")) == sku, "reservation: sku mismatch")
+                _require(reservation.get("sku") == inventory_sku, "reservation: sku mismatch")
                 api.expect_conflict(
                     "POST",
                     "/inventory/reservations",
-                    {"sku": sku, "quantity": 99, "reason": "conflict"},
+                    {"sku": inventory_sku, "quantity": 99, "reason": "conflict"},
                     context="stock conflict reservation",
                 )
+                second_reservation = api.create(
+                    "/inventory/reservations",
+                    {"sku": inventory_sku, "quantity": 1, "reason": "remaining stock"},
+                )
+                _require(
+                    second_reservation.get("sku") == inventory_sku,
+                    "remaining reservation: sku mismatch",
+                )
+                api.expect_conflict(
+                    "POST", "/inventory/reservations",
+                    {"sku": inventory_sku, "quantity": 1, "reason": "exhausted"},
+                    context="exhausted inventory reservation",
+                )
+                reserved_report = _order_report(api)
+                expected_reserved_report = dict(baseline)
+                expected_reserved_report["inventory.reserved_units"] += 2
+                _require(
+                    reserved_report == expected_reserved_report,
+                    "admin report: explicit reservations must add exactly two reserved units",
+                )
+                # Replenishing exactly one unit exposes failed requests that drove
+                # an exhausted balance negative. Keep another SKU nonempty at restart.
+                api.create("/inventory/stock", {"sku": inventory_sku, "quantity": 1})
+                api.create(
+                    "/inventory/reservations",
+                    {"sku": inventory_sku, "quantity": 1, "reason": "replenished"},
+                )
+                api.create(
+                    "/catalog/items", {"sku": remaining_sku, "name": "Persist Widget", "price": 1200},
+                )
+                api.create("/inventory/stock", {"sku": remaining_sku, "quantity": 2})
+                api.create(
+                    "/inventory/reservations",
+                    {"sku": remaining_sku, "quantity": 1, "reason": "keep one unit"},
+                )
+                expected_reserved_report["inventory.reserved_units"] += 2
+                _require(
+                    _order_report(api) == expected_reserved_report,
+                    "admin report: replenishment and partial inventory must reflect reservations",
+                )
+                # Orders may reserve stock implicitly, so use a separate SKU.
+                api.create(
+                    "/catalog/items", {"sku": sku, "name": "Order Widget", "price": 1200},
+                )
+                api.create("/inventory/stock", {"sku": sku, "quantity": 2})
                 request_id = f"order-{uuid4().hex[:8]}"
                 order = api.create(
                     "/orders",
@@ -1092,16 +1190,60 @@ def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[s
                     {"status": "completed"},
                     context="cancelled fulfillment completion",
                 )
+                other_order = api.create(
+                    "/orders", {
+                        "customer_id": "another-customer",
+                        "client_request_id": f"other-{uuid4().hex[:8]}",
+                        "lines": [{"sku": sku, "quantity": 1}],
+                    },
+                )
+                _require(other_order["id"] != order["id"], "orders: duplicate id")
             persisted_order = api.get_object(f"/orders/{quote(str(order['id']), safe='')}")
             _require(
                 persisted_order.get("payment_state") == "authorized",
                 "orders: authorized payment must persist",
             )
-            audit = api.get_object(f"/audit?entity_id={quote(str(order['id']), safe='')}")
-            _require(_payload_has_items(audit), "audit: expected nonempty items")
-            report = api.get_object("/admin/reports/summary")
-            for key in ("orders", "inventory", "fulfillment"):
-                _require(key in report, f"admin report: missing {key}")
+            _order_audit(api, order["id"])
+            _order_audit(api, other_order["id"], ("order.created",))
+            report = _order_report(api)
+            if cycle == 0:
+                for metric, increment in (
+                    ("orders.total", 2), ("orders.authorized_count", 1),
+                    ("fulfillment.total", 1), ("fulfillment.cancelled_count", 1),
+                ):
+                    _require(
+                        report[metric] == baseline[metric] + increment,
+                        f"admin report: {metric} must reflect the actual business write",
+                    )
+                _require(
+                    report["inventory.reserved_units"] >= baseline["inventory.reserved_units"] + 4,
+                    "admin report: completed order must not discard explicit reservations",
+                )
+                final_report = report
+            else:
+                _require(report == final_report, "admin report: metrics must persist after restart")
+                api.expect_conflict(
+                    "POST", "/inventory/reservations",
+                    {"sku": inventory_sku, "quantity": 1, "reason": "after restart"},
+                    context="exhausted inventory must persist after restart",
+                )
+                api.create("/inventory/stock", {"sku": inventory_sku, "quantity": 1})
+                for reserved_sku in (inventory_sku, remaining_sku):
+                    api.create(
+                        "/inventory/reservations",
+                        {"sku": reserved_sku, "quantity": 1, "reason": "persisted balance"},
+                    )
+                api.expect_conflict(
+                    "POST", "/inventory/reservations",
+                    {"sku": remaining_sku, "quantity": 1, "reason": "persisted balance exhausted"},
+                    context="remaining inventory must persist exactly after restart",
+                )
+                expected_after_restart = dict(final_report)
+                expected_after_restart["inventory.reserved_units"] += 2
+                _require(
+                    _order_report(api) == expected_after_restart,
+                    "admin report: restarted inventory reservations must add exactly two units",
+                )
             _stop_tree(process, taskkill)
             process = None
     except (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
@@ -1120,6 +1262,79 @@ def _validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[s
             except OSError as exc:
                 failures.append(f"temporary DATA_DIR cleanup failed: {exc}")
     return tuple(failures)
+
+
+def _business_record_fields(
+    actual: Mapping[str, object], expected: Mapping[str, object], context: str,
+) -> None:
+    for field, value in expected.items():
+        received = actual.get(field)
+        numeric = type(value) in (int, float)
+        _require(
+            received == value and (not numeric or type(received) in (int, float)),
+            f"{context}: {field} must preserve the submitted value",
+        )
+
+
+def _business_items(payload: Mapping[str, object], context: str) -> list[dict[str, object]]:
+    items = payload.get("items")
+    _require(isinstance(items, list), f"{context}: expected items array")
+    assert isinstance(items, list)
+    _require(all(isinstance(item, dict) for item in items), f"{context}: expected object items")
+    return cast(list[dict[str, object]], items)
+
+
+def _portfolio_analytics(
+    api: _PortfolioAPI, projects: Sequence[Mapping[str, object]],
+    expected_metrics: Mapping[str, Mapping[str, object]],
+) -> None:
+    for program_id in dict.fromkeys(str(project["program_id"]) for project in projects):
+        selected = [project for project in projects if str(project["program_id"]) == program_id]
+        status, payload = api.request(
+            "GET", f"/analytics/portfolio.csv?program_id={quote(program_id, safe='')}",
+        )
+        _require(status == 200, f"portfolio CSV: expected 200, got {status}")
+        _require(isinstance(payload, str), "portfolio CSV: expected text")
+        assert isinstance(payload, str)
+        try:
+            reader = csv.DictReader(StringIO(payload), strict=True)
+            columns = reader.fieldnames or []
+            _require(
+                {"project_id", "program_id", "name"} <= set(columns)
+                and len(columns) == len(set(columns)),
+                "portfolio CSV: missing or duplicate columns",
+            )
+            rows = list(reader)
+        except csv.Error as exc:
+            raise _ValidationFailure("portfolio CSV: malformed quoting") from exc
+        _require(
+            all(None not in row and all(value is not None for value in row.values()) for row in rows),
+            "portfolio CSV: malformed row columns",
+        )
+        actual_rows = [
+            (row["project_id"], row["program_id"], row["name"]) for row in rows
+        ]
+        expected_rows = [
+            (str(project["id"]), str(project["program_id"]), str(project["name"]))
+            for project in selected
+        ]
+        _require(
+            sorted(actual_rows) == sorted(expected_rows),
+            "portfolio CSV: expected exact filtered project rows without duplicates",
+        )
+        read_model = api.get_object(
+            f"/portfolio/read-model?program_id={quote(program_id, safe='')}&limit=100",
+        )
+        items = _business_items(read_model, "portfolio read model")
+        _require(len(items) == len(selected), "portfolio read model: filtered row count mismatch")
+        for project in selected:
+            matches = [item for item in items if item.get("project_id") == project["id"]]
+            _require(len(matches) == 1, "portfolio read model: missing or duplicate project")
+            expected = {
+                "project_id": project["id"], "program_id": project["program_id"],
+                "name": project["name"], **expected_metrics[str(project["id"])],
+            }
+            _business_record_fields(matches[0], expected, "portfolio read model")
 
 
 def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
@@ -1144,6 +1359,9 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
     project: dict[str, object] = {}
     dependency: dict[str, object] = {}
     approval: dict[str, object] = {}
+    projects: list[dict[str, object]] = []
+    records: dict[str, list[dict[str, object]]] = {}
+    expected_metrics: dict[str, dict[str, object]] = {}
     try:
         root = root.resolve(strict=True)
         package = json.loads((root / "package.json").read_text(encoding="utf-8"))
@@ -1174,38 +1392,67 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
             _ready_portfolio(api, process)
             if cycle == 0:
                 program = api.create("/programs", {"name": "Transformation Portfolio"})
-                project = api.create(
-                    "/projects",
-                    {
-                        "program_id": program["id"],
-                        "name": "Customer Migration",
-                        "owner": "pm@example.test",
-                    },
+                other_program = api.create("/programs", {"name": "Independent Portfolio"})
+                _require(program["id"] != other_program["id"], "programs: duplicate id")
+                marker = uuid4().hex[:8]
+                for name, program_id in (
+                    (f'Customer Migration, "{marker}"', program["id"]),
+                    (f'Billing Modernization, "{marker}"', program["id"]),
+                    (f'Independent Project, "{marker}"', other_program["id"]),
+                ):
+                    body: dict[str, object] = {
+                        "program_id": program_id, "name": name, "owner": "pm@example.test",
+                    }
+                    created = api.create("/projects", body)
+                    _business_record_fields(created, body, "projects")
+                    projects.append({"id": created["id"], **body})
+                _require(
+                    len({str(item["id"]) for item in projects}) == len(projects),
+                    "projects: duplicate id",
                 )
-                sibling = api.create(
-                    "/projects",
-                    {
-                        "program_id": program["id"],
-                        "name": "Billing Modernization",
-                        "owner": "pm2@example.test",
-                    },
-                )
-                api.create(
-                    f"/projects/{quote(str(project['id']), safe='')}/milestones",
-                    {"name": "Pilot", "due_at": "2030-03-01"},
-                )
-                api.create(
-                    f"/projects/{quote(str(project['id']), safe='')}/budgets",
-                    {"category": "engineering", "amount": 125000},
-                )
-                api.create(
-                    f"/projects/{quote(str(project['id']), safe='')}/staffing",
-                    {"person": "Ava", "role": "lead", "allocation": 0.5},
-                )
-                api.create(
-                    f"/projects/{quote(str(project['id']), safe='')}/risks",
-                    {"title": "Data readiness", "severity": "high"},
-                )
+                project, sibling, _ = projects
+                budget_amount = 125001 + int(marker, 16) % 10000
+                module_requests: dict[str, tuple[dict[str, object], ...]] = {
+                    "milestones": (
+                        {"name": f"Pilot {marker}", "due_at": "2030-03-01"},
+                        {"name": f"Launch {marker}", "due_at": "2030-04-01"},
+                    ),
+                    "budgets": (
+                        {"category": "engineering", "amount": budget_amount},
+                        {"category": "operations", "amount": 7500},
+                    ),
+                    "staffing": (
+                        {"person": f"Ava {marker}", "role": "lead", "allocation": 0.5},
+                        {"person": f"Sam {marker}", "role": "reviewer", "allocation": 0.25},
+                    ),
+                    "risks": (
+                        {"title": f"Data readiness {marker}", "severity": "high"},
+                        {"title": f"Schedule {marker}", "severity": "low"},
+                    ),
+                }
+                for module, bodies in module_requests.items():
+                    records[module] = []
+                    for module_body in bodies:
+                        created = api.create(
+                            f"/projects/{quote(str(project['id']), safe='')}/{module}", module_body,
+                        )
+                        expected_record = {
+                            "id": created["id"], "project_id": project["id"], **module_body,
+                        }
+                        _business_record_fields(created, expected_record, module)
+                        _require(
+                            all(item["id"] != created["id"] for item in records[module]),
+                            f"{module}: duplicate id",
+                        )
+                        records[module].append(expected_record)
+                for item in projects:
+                    populated = item["id"] == project["id"]
+                    expected_metrics[str(item["id"])] = {
+                        "budget_total": budget_amount + 7500 if populated else 0,
+                        "staffing_allocation": 0.75 if populated else 0,
+                        "risk_count": 2 if populated else 0,
+                        "milestone_count": 2 if populated else 0,
+                    }
                 dependency = api.create(
                     "/dependencies",
                     {"from_project_id": project["id"], "to_project_id": sibling["id"]},
@@ -1249,11 +1496,22 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
                 _require(isinstance(payload, dict), "access check: expected object")
                 assert isinstance(payload, dict)
                 _require(payload.get("allowed") is False, "access check: viewer approve must deny")
-            persisted_project = api.get_object(f"/projects/{quote(str(project['id']), safe='')}")
-            _require(
-                persisted_project.get("program_id") == program["id"],
-                "projects: program link must persist",
-            )
+            for item in projects:
+                prefix = f"/projects/{quote(str(item['id']), safe='')}"
+                _business_record_fields(api.get_object(prefix), item, "projects persistence")
+                for module, expected_records in records.items():
+                    context = f"{module} persistence"
+                    items = _business_items(api.get_object(f"{prefix}/{module}"), context)
+                    populated = item["id"] == project["id"]
+                    _require(
+                        len(items) == (len(expected_records) if populated else 0),
+                        f"{context}: expected stored records filtered by project",
+                    )
+                    if populated:
+                        for expected_record in expected_records:
+                            matches = [row for row in items if row.get("id") == expected_record["id"]]
+                            _require(len(matches) == 1, f"{context}: missing or duplicate id")
+                            _business_record_fields(matches[0], expected_record, context)
             persisted_dependency = api.get_object(
                 f"/dependencies/{quote(str(dependency['id']), safe='')}"
             )
@@ -1261,19 +1519,7 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
                 persisted_dependency.get("from_project_id") == project["id"],
                 "dependencies: from project must persist",
             )
-            status, csv_payload = api.request(
-                "GET",
-                f"/analytics/portfolio.csv?program_id={quote(str(program['id']), safe='')}",
-            )
-            _require(status == 200, f"portfolio CSV: expected 200, got {status}")
-            _require(
-                isinstance(csv_payload, str) and "Customer Migration" in csv_payload,
-                "portfolio CSV: expected project row",
-            )
-            read_model = api.get_object(
-                f"/portfolio/read-model?program_id={quote(str(program['id']), safe='')}&limit=100"
-            )
-            _require(_payload_has_items(read_model), "portfolio read model: expected nonempty items")
+            _portfolio_analytics(api, projects, expected_metrics)
             _stop_tree(process, taskkill)
             process = None
     except (_ValidationFailure, OSError, ValueError, http.client.HTTPException,
