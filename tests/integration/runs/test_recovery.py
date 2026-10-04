@@ -134,12 +134,17 @@ class ApprovalAfterArtifactRuntime:
         )
         checkpoint = RuntimeCheckpoint(
             id=uuid4(),
-            runtime_type="approval-boundary-dispatch",
-            runtime_version="1",
+            runtime_type="crew",
+            runtime_version="11",
             run_id=context.run_id,
             tenant_id=context.tenant_id,
             mode=TaskMode.DISPATCH,
-            state={"artifact_id": str(artifact.id)},
+            state={
+                "artifact_id": str(artifact.id),
+                "tools": {"write-1": {
+                    "status": "waiting_approval", "approval_id": self.approval_id,
+                }},
+            },
         )
         yield RunEvent(
             kind=EventKind.ARTIFACT_CREATED,
@@ -2196,14 +2201,28 @@ async def test_approved_capability_resume_fails_safe_when_non_replayable_event_a
         approval_fingerprint=approval_fingerprint,
     )
     waiting = await repository.get(tenant_id, submitted.id)
-    await repository.approve_capability_and_enqueue(
-        tenant_id=tenant_id,
-        run_id=submitted.id,
-        approval_id=approval_id,
-        version=waiting.version,
+    with pytest.raises(RunConflict, match="checkpoint"):
+        await repository.approve_capability_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            approval_id=approval_id,
+            version=waiting.version,
+        )
+    async with run_session_factory() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(RunOutboxRow).where(
+                RunOutboxRow.run_id == submitted.id,
+            )
+        ) == 0
+    assert (await repository.get(tenant_id, submitted.id)).status is RunStatus.WAITING_APPROVAL
+
+    # Legacy inline resolutions still cannot bypass the execution-time recovery guard.
+    await repository.resolve_capability_approval(
+        tenant_id, submitted.id, RunStatus.RUNNING,
+        approval_id=approval_id, approval_fingerprint=approval_fingerprint,
     )
 
-    resumed = await service.execute(submitted.id)
+    resumed = await service.execute(submitted.id, allow_running_recovery=True)
     events = await service.events(tenant_id, submitted.id)
 
     assert resumed.status is RunStatus.FAILED
@@ -2215,6 +2234,110 @@ async def test_approved_capability_resume_fails_safe_when_non_replayable_event_a
     assert isinstance(failure_payload, dict)
     assert failure_payload["error_code"] == "runtime.recovery_blocked"
     assert failure_payload["retryable"] is False
+
+
+@pytest.mark.parametrize("request_persisted", [True, False])
+async def test_capability_approval_can_retry_after_waiting_checkpoint_is_durable(
+    run_session_factory: async_sessionmaker[AsyncSession],
+    request_persisted: bool,
+) -> None:
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=uuid4(), actor_id=uuid4(), request="write a project file",
+        mode=TaskMode.DISPATCH, status=RunStatus.RUNNING,
+        idempotency_key=None, routing_decision={}, enqueue=False,
+    )
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(), runtime_type="crew", runtime_version="11",
+        run_id=submitted.id, tenant_id=submitted.tenant_id, mode=TaskMode.DISPATCH,
+        state={"tools": {"write-1": {"status": "prepared"}}},
+    )
+    async with run_session_factory() as session, session.begin():
+        row = await repository.get_for_update(session, submitted.id)
+        row.worker_id = "worker-before-approval"
+        row.worker_lease_token = uuid4()
+        row.worker_lease_expires_at = datetime.now(UTC) + timedelta(seconds=60)
+        await repository.persist_event(
+            session, tenant_id=submitted.tenant_id, run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED, sequence=1,
+                run_id=submitted.id, checkpoint=checkpoint,
+            ),
+        )
+        if request_persisted:
+            await repository.persist_event(
+                session, tenant_id=submitted.tenant_id, run_id=submitted.id,
+                event=RunEvent(
+                    kind=EventKind.TOOL_REQUESTED, sequence=2, run_id=submitted.id,
+                    actor="implementer", tool_call_id="write-1", tool_name="workspace.write_text",
+                    payload={"status": "requested", "replay_safe": True},
+                ),
+            )
+    await repository.begin_capability_approval(
+        tenant_id=submitted.tenant_id, run_id=submitted.id,
+        approval_id="write-approval", approval_fingerprint="write-fingerprint",
+    )
+    waiting = await repository.get(submitted.tenant_id, submitted.id)
+    assert (waiting.routing_decision or {}).get("approval_checkpoint_required") is True
+    with pytest.raises(RunConflict, match="checkpoint"):
+        await repository.approve_capability_and_enqueue(
+            tenant_id=submitted.tenant_id, run_id=submitted.id,
+            approval_id="write-approval", version=waiting.version,
+        )
+    unchanged = await repository.get(submitted.tenant_id, submitted.id)
+    assert unchanged.version == waiting.version
+    assert unchanged.status is RunStatus.WAITING_APPROVAL
+    async with run_session_factory() as session:
+        approval = await session.scalar(
+            select(RunApprovalRow).where(RunApprovalRow.run_id == submitted.id)
+        )
+        assert approval is not None and approval.status == "pending"
+
+    async with run_session_factory() as session, session.begin():
+        await repository.persist_event(
+            session, tenant_id=submitted.tenant_id, run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED, sequence=3, run_id=submitted.id,
+                checkpoint=RuntimeCheckpoint(
+                    id=uuid4(), runtime_type="crew", runtime_version="11",
+                    run_id=submitted.id, tenant_id=submitted.tenant_id, mode=TaskMode.DISPATCH,
+                    state={"tools": {"write-1": {
+                        "status": "waiting_approval", "approval_id": "stale-approval",
+                    }}},
+                ),
+            ),
+        )
+    with pytest.raises(RunConflict, match="checkpoint"):
+        await repository.approve_capability_and_enqueue(
+            tenant_id=submitted.tenant_id, run_id=submitted.id,
+            approval_id="write-approval", version=waiting.version,
+        )
+    async with run_session_factory() as session, session.begin():
+        await repository.persist_event(
+            session, tenant_id=submitted.tenant_id, run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED, sequence=4, run_id=submitted.id,
+                checkpoint=RuntimeCheckpoint(
+                    id=uuid4(), runtime_type="crew", runtime_version="11",
+                    run_id=submitted.id, tenant_id=submitted.tenant_id, mode=TaskMode.DISPATCH,
+                    state={"tools": {"write-1": {
+                        "status": "waiting_approval", "approval_id": "write-approval",
+                    }}},
+                ),
+            ),
+        )
+    for _ in range(2):
+        approved = await repository.approve_capability_and_enqueue(
+            tenant_id=submitted.tenant_id, run_id=submitted.id,
+            approval_id="write-approval", version=waiting.version,
+        )
+        assert approved.status is RunStatus.QUEUED
+    async with run_session_factory() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(RunOutboxRow).where(
+                RunOutboxRow.run_id == submitted.id,
+            )
+        ) == 1
 
 
 async def test_submission_writes_run_and_outbox_atomically_then_publisher_delivers_once(

@@ -40,6 +40,7 @@ from agent_hub.runtime.generated_file_recovery import (
     final_attachment_text_conflicts,
 )
 from agent_hub.runtime.model_scope import validate_model_scope_artifact, validate_model_scope_parts
+from agent_hub.runtime.streams import closing_runtime_events
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "2"
@@ -301,68 +302,69 @@ class HybridRuntime:
                         child_checkpoint,
                     )
                 )
-                async for event in child_events:
-                    sequence = event.sequence + 1
-                    if event.kind is EventKind.CHECKPOINT_SAVED:
-                        if event.checkpoint is None:
-                            raise RuntimeExecutionError(
-                                "hybrid child checkpoint is unavailable"
+                async with closing_runtime_events(child_events) as events:
+                    async for event in events:
+                        sequence = event.sequence + 1
+                        if event.kind is EventKind.CHECKPOINT_SAVED:
+                            if event.checkpoint is None:
+                                raise RuntimeExecutionError(
+                                    "hybrid child checkpoint is unavailable"
+                                )
+                            if stage_budget.consumed_tokens > remaining_tokens:
+                                raise RuntimeExecutionError(
+                                    "hybrid child exceeded token budget"
+                                )
+                            child_progress_fingerprint = hashlib.sha256(
+                                json.dumps(
+                                    {
+                                        "stage": stage_index,
+                                        "state_sha256": event.checkpoint.state_sha256,
+                                        "consumed_tokens": stage_budget.consumed_tokens,
+                                    },
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest()
+                            if child_progress_fingerprint != last_child_progress_fingerprint:
+                                last_child_progress_fingerprint = child_progress_fingerprint
+                                timeout_progress_units += 1
+                                adaptive_deadline.observe(
+                                    progress_units=timeout_progress_units,
+                                    now=monotonic(),
+                                )
+                            deadline = adaptive_deadline.deadline
+                            in_stage_checkpoint = self._checkpoint(
+                                context,
+                                artifacts=tuple(artifacts),
+                                next_sequence=sequence,
+                                next_stage=stage_index,
+                                terminal=False,
+                                reason=None,
+                                remaining_tokens=(
+                                    remaining_tokens - stage_budget.consumed_tokens
+                                ),
+                                remaining_timeout_seconds=max(0.0, deadline - monotonic()),
+                                remaining_absolute_timeout_seconds=(
+                                    adaptive_deadline.absolute_remaining(now=monotonic())
+                                ),
+                                timeout_progress_units=timeout_progress_units,
+                                last_child_progress_fingerprint=(
+                                    last_child_progress_fingerprint
+                                ),
+                                child_checkpoint=event.checkpoint,
                             )
-                        if stage_budget.consumed_tokens > remaining_tokens:
-                            raise RuntimeExecutionError(
-                                "hybrid child exceeded token budget"
+                            self._last_checkpoint = in_stage_checkpoint
+                            yield event.model_copy(
+                                update={"checkpoint": in_stage_checkpoint}
                             )
-                        child_progress_fingerprint = hashlib.sha256(
-                            json.dumps(
-                                {
-                                    "stage": stage_index,
-                                    "state_sha256": event.checkpoint.state_sha256,
-                                    "consumed_tokens": stage_budget.consumed_tokens,
-                                },
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ).encode("utf-8")
-                        ).hexdigest()
-                        if child_progress_fingerprint != last_child_progress_fingerprint:
-                            last_child_progress_fingerprint = child_progress_fingerprint
-                            timeout_progress_units += 1
-                            adaptive_deadline.observe(
-                                progress_units=timeout_progress_units,
-                                now=monotonic(),
+                            continue
+                        if event.artifact is not None and event.artifact.id not in known:
+                            await self._repository.put(
+                                context.tenant_id, context.run_id, event.artifact
                             )
-                        deadline = adaptive_deadline.deadline
-                        in_stage_checkpoint = self._checkpoint(
-                            context,
-                            artifacts=tuple(artifacts),
-                            next_sequence=sequence,
-                            next_stage=stage_index,
-                            terminal=False,
-                            reason=None,
-                            remaining_tokens=(
-                                remaining_tokens - stage_budget.consumed_tokens
-                            ),
-                            remaining_timeout_seconds=max(0.0, deadline - monotonic()),
-                            remaining_absolute_timeout_seconds=(
-                                adaptive_deadline.absolute_remaining(now=monotonic())
-                            ),
-                            timeout_progress_units=timeout_progress_units,
-                            last_child_progress_fingerprint=(
-                                last_child_progress_fingerprint
-                            ),
-                            child_checkpoint=event.checkpoint,
-                        )
-                        self._last_checkpoint = in_stage_checkpoint
-                        yield event.model_copy(
-                            update={"checkpoint": in_stage_checkpoint}
-                        )
-                        continue
-                    if event.artifact is not None and event.artifact.id not in known:
-                        await self._repository.put(
-                            context.tenant_id, context.run_id, event.artifact
-                        )
-                        artifacts.append(event.artifact)
-                        known.add(event.artifact.id)
-                    yield event
+                            artifacts.append(event.artifact)
+                            known.add(event.artifact.id)
+                        yield event
                 if stage_budget.consumed_tokens > remaining_tokens:
                     raise RuntimeExecutionError("hybrid child exceeded token budget")
                 remaining_tokens -= stage_budget.consumed_tokens
@@ -536,7 +538,7 @@ class HybridRuntime:
             inputs=artifacts,
         )
         try:
-            async for event in self._run_child(
+            async with closing_runtime_events(self._run_child(
                 self._discussion,
                 parent,
                 TaskMode.DISCUSS,
@@ -544,11 +546,12 @@ class HybridRuntime:
                 sequence + 1,
                 stage_budget,
                 checkpoint,
-            ):
-                # The composite owns the normalized discussion.started event.
-                if event.kind is EventKind.DISCUSSION_STARTED:
-                    continue
-                yield event
+            )) as events:
+                async for event in events:
+                    # The composite owns the normalized discussion.started event.
+                    if event.kind is EventKind.DISCUSSION_STARTED:
+                        continue
+                    yield event
         except RuntimeExecutionError as error:
             reason = _safe_failure_reason(error, fallback="discussion_failed")
             if not (
@@ -592,50 +595,51 @@ class HybridRuntime:
         try:
             if checkpoint is not None:
                 await child.restore_checkpoint(checkpoint)
-            async for item in child.run(child_context):
-                scope_artifact = _validate_child_model_scope_event(
-                    item, parent.tenant_id, model_starts, scope_artifacts,
-                )
-                if scope_artifact is not None and item.kind is EventKind.ARTIFACT_CREATED:
-                    stage_budget.model_scope.parts.append(validate_model_scope_artifact(
-                        scope_artifact, str(item.run_id),
-                    ))
-                elif item.kind == "model.scope_incomplete":
-                    stage_budget.model_scope.incomplete = True
-                _record_stage_usage(stage_budget, item)
-                if item.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and item.reason:
-                    child_failure_reason = item.reason
-                if item.kind is EventKind.RUNTIME_FAILED:
-                    reason = item.reason or child_failure_reason or "runtime failed"
-                    raise RuntimeExecutionError(f"hybrid {mode.value} failed: {reason}")
-                if item.kind is EventKind.RUNTIME_CANCELLED:
-                    raise asyncio.CancelledError
-                if item.kind is EventKind.RUNTIME_COMPLETED:
-                    _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
-                    terminal_seen = True
-                    continue
-                if item.kind is EventKind.CHECKPOINT_SAVED:
-                    _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
-                    yield _renumber_child_event(
-                        item,
-                        sequence,
-                        parent.run_id,
-                        inputs=artifacts,
+            async with closing_runtime_events(child.run(child_context)) as events:
+                async for item in events:
+                    scope_artifact = _validate_child_model_scope_event(
+                        item, parent.tenant_id, model_starts, scope_artifacts,
                     )
-                    sequence += 1
-                    continue
-                if mode is TaskMode.DIRECT:
-                    item = _reconcile_synthesis_event(item, artifacts)
-                if (
-                    item.kind is EventKind.ARTIFACT_CREATED
-                    and item.artifact is not None
-                    or _is_forwardable_child_event(item)
-                ):
-                    yield _renumber_child_event(
-                        item, sequence, parent.run_id, inputs=artifacts,
-                        scope_artifact=scope_artifact,
-                    )
-                    sequence += 1
+                    if scope_artifact is not None and item.kind is EventKind.ARTIFACT_CREATED:
+                        stage_budget.model_scope.parts.append(validate_model_scope_artifact(
+                            scope_artifact, str(item.run_id),
+                        ))
+                    elif item.kind == "model.scope_incomplete":
+                        stage_budget.model_scope.incomplete = True
+                    _record_stage_usage(stage_budget, item)
+                    if item.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and item.reason:
+                        child_failure_reason = item.reason
+                    if item.kind is EventKind.RUNTIME_FAILED:
+                        reason = item.reason or child_failure_reason or "runtime failed"
+                        raise RuntimeExecutionError(f"hybrid {mode.value} failed: {reason}")
+                    if item.kind is EventKind.RUNTIME_CANCELLED:
+                        raise asyncio.CancelledError
+                    if item.kind is EventKind.RUNTIME_COMPLETED:
+                        _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
+                        terminal_seen = True
+                        continue
+                    if item.kind is EventKind.CHECKPOINT_SAVED:
+                        _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
+                        yield _renumber_child_event(
+                            item,
+                            sequence,
+                            parent.run_id,
+                            inputs=artifacts,
+                        )
+                        sequence += 1
+                        continue
+                    if mode is TaskMode.DIRECT:
+                        item = _reconcile_synthesis_event(item, artifacts)
+                    if (
+                        item.kind is EventKind.ARTIFACT_CREATED
+                        and item.artifact is not None
+                        or _is_forwardable_child_event(item)
+                    ):
+                        yield _renumber_child_event(
+                            item, sequence, parent.run_id, inputs=artifacts,
+                            scope_artifact=scope_artifact,
+                        )
+                        sequence += 1
         except RuntimeExecutionError:
             raise
         except Exception as error:  # noqa: BLE001 - child runtime boundary is normalized.

@@ -6173,6 +6173,11 @@ class CrewDispatchRuntime:
                     failed_reason = tool_result.failure_reason or "capability execution failed"
                     if _tool_result_requires_capability_approval(tool_result):
                         approval_id = cast(str, tool_result.payload["approval_id"])
+                        waiting = dict(tool_prepared)
+                        waiting["status"] = "waiting_approval"
+                        waiting["approval_id"] = approval_id
+                        # Persist the resumable approval boundary before emitting failure.
+                        await tool_boundary(idempotency_key, waiting, None)
                         await emit(
                             kind=EventKind.TOOL_FAILED,
                             actor=step.agent,
@@ -6191,10 +6196,6 @@ class CrewDispatchRuntime:
                             },
                             reason=failed_reason,
                         )
-                        waiting = dict(tool_prepared)
-                        waiting["status"] = "waiting_approval"
-                        waiting["approval_id"] = approval_id
-                        await tool_boundary(idempotency_key, waiting, None)
                         raise RuntimeExecutionError("capability execution failed") from None
                     if _is_optional_read_context_unavailable(tool_call.name, failed_reason):
                         result = cast(
@@ -7760,7 +7761,7 @@ class CrewDispatchRuntime:
             "uncertain",
         }
         if checkpoint.runtime_version == _RUNTIME_VERSION:
-            allowed_tool_statuses.add("rejected")
+            allowed_tool_statuses.update({"rejected", "waiting_approval"})
         for key, value in tool_entries.items():
             if (
                 type(key) is not str
@@ -7768,7 +7769,7 @@ class CrewDispatchRuntime:
                 or not isinstance(value, Mapping)
             ):
                 _fail("runtime checkpoint is incompatible")
-            if set(value) != {
+            tool_state_keys = {
                 "status",
                 "step_id",
                 "attempt",
@@ -7780,7 +7781,13 @@ class CrewDispatchRuntime:
                 "replay_safe",
                 "artifact_id",
                 "sha256",
-            }:
+            }
+            if value.get("status") == "waiting_approval":
+                tool_state_keys.add("approval_id")
+                approval_id = value.get("approval_id")
+                if type(approval_id) is not str or not approval_id.strip():
+                    _fail("runtime checkpoint is incompatible")
+            if set(value) != tool_state_keys:
                 _fail("runtime checkpoint is incompatible")
             status = value["status"]
             tool_step_id = value["step_id"]

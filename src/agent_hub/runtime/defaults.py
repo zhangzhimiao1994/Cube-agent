@@ -89,6 +89,7 @@ from agent_hub.runtime.self_repair_context import (
     self_repair_recovery_plan_payload,
     self_repair_role_capability_requirements,
 )
+from agent_hub.runtime.streams import closing_runtime_events
 from agent_hub.security.secrets import SecretService
 
 _LOGGER = logging.getLogger(__name__)
@@ -443,8 +444,9 @@ class _PlannedRuntime:
             sequence_offset = len(planning_events)
             for event in planning_events:
                 yield event
-        async for event in self._child.run(context):
-            yield _renumber_event(event, sequence_offset, run_id=context.run_id)
+        async with closing_runtime_events(self._child.run(context)) as events:
+            async for event in events:
+                yield _renumber_event(event, sequence_offset, run_id=context.run_id)
 
     def _planning_events(self, context: TaskContext) -> tuple[RunEvent, ...]:
         model_plan = dict(
@@ -845,8 +847,9 @@ class ConfigBackedDirectRuntime:
         execution_key = (context.run_id, execution_token)
         self._active[execution_key] = runtime
         try:
-            async for event in runtime.run(context):
-                yield event
+            async with closing_runtime_events(runtime.run(context)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._active.pop(execution_key, None)
 
@@ -939,8 +942,9 @@ class ConfigBackedDispatchRuntime:
         execution_key = (context.run_id, execution_token)
         self._active[execution_key] = runtime
         try:
-            async for event in runtime.run(context):
-                yield event
+            async with closing_runtime_events(runtime.run(context)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._active.pop(execution_key, None)
 
@@ -1131,8 +1135,9 @@ class ConfigBackedDiscussionRuntime:
         execution_key = (context.run_id, execution_token)
         self._active[execution_key] = runtime
         try:
-            async for event in runtime.run(context):
-                yield event
+            async with closing_runtime_events(runtime.run(context)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._active.pop(execution_key, None)
 
@@ -1299,8 +1304,9 @@ class ConfigBackedHybridRuntime:
         execution_key = (context.run_id, execution_token)
         self._active[execution_key] = runtime
         try:
-            async for event in runtime.run(context):
-                yield event
+            async with closing_runtime_events(runtime.run(context)) as events:
+                async for event in events:
+                    yield event
         finally:
             self._active.pop(execution_key, None)
 

@@ -31,6 +31,7 @@ from agent_hub.db.models import (
     RunUsageRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
@@ -1161,6 +1162,33 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def _require_capability_approval_checkpoint(
+        self,
+        session: AsyncSession,
+        row: RunRow,
+        routing_decision: dict[str, object],
+        *,
+        approval_id: str,
+    ) -> None:
+        if routing_decision.get("approval_checkpoint_required") is True:
+            checkpoint = await self.latest_checkpoint(
+                session, tenant_id=row.tenant_id, run_id=row.id,
+            )
+            if (
+                checkpoint is None
+                or checkpoint.run_id != row.id
+                or checkpoint.tenant_id != row.tenant_id
+                or checkpoint.mode.value != row.mode
+                or not checkpoint_waits_for_approval(checkpoint, approval_id)
+            ):
+                raise RunConflict("capability approval is waiting for a durable recovery checkpoint")
+        if await self._recovery_blocked_after_checkpoint(
+            session,
+            run_id=row.id,
+            minimum_event_sequence=_self_repair_recovery_baseline_sequence(routing_decision),
+        ):
+            raise RunConflict("capability approval is waiting for a durable recovery checkpoint")
+
     async def begin_capability_approval(
         self,
         tenant_id: UUID,
@@ -1183,6 +1211,7 @@ class RunRepository:
                 return self._record(row)
             if RunStatus(row.status) is not RunStatus.RUNNING:
                 raise RunConflict("run is not running")
+            approval_worker_token = row.worker_lease_token
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1190,6 +1219,9 @@ class RunRepository:
                 "approval_kind": "capability_tool",
                 "approval_id": approval_id,
                 "approval_fingerprint": approval_fingerprint,
+                "approval_checkpoint_required": approval_worker_token is not None,
+                **({"approval_checkpoint_worker_token": str(approval_worker_token)}
+                   if approval_worker_token is not None else {}),
                 "reason": "capability requires approval",
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }
@@ -1238,13 +1270,23 @@ class RunRepository:
                 or routing_decision.get("approval_fingerprint") != approval_fingerprint
             ):
                 raise RunConflict("run is waiting for a different approval")
+            if (
+                status is RunStatus.RUNNING
+                and routing_decision.get("approval_checkpoint_required") is True
+            ):
+                await self._require_capability_approval_checkpoint(
+                    session, row, routing_decision, approval_id=approval_id,
+                )
             row.status = status.value
             self.clear_worker_lease(row)
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
                 if key
-                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
+                not in {
+                    "approval_kind", "approval_id", "approval_fingerprint", "approval_scope",
+                    "approval_checkpoint_required", "approval_checkpoint_worker_token",
+                }
             }
             await self._upsert_capability_approval(
                 session,
@@ -1416,11 +1458,17 @@ class RunRepository:
             approval_scope = _optional_string(routing_decision.get("approval_scope"))
             if row.version != version:
                 raise RunConflict("run version is stale")
+            await self._require_capability_approval_checkpoint(
+                session, row, routing_decision, approval_id=approval_id,
+            )
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
                 if key
-                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
+                not in {
+                    "approval_kind", "approval_id", "approval_fingerprint", "approval_scope",
+                    "approval_checkpoint_required", "approval_checkpoint_worker_token",
+                }
             }
             row.status = RunStatus.QUEUED.value
             row.version += 1
@@ -1484,7 +1532,10 @@ class RunRepository:
                 key: value
                 for key, value in routing_decision.items()
                 if key
-                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
+                not in {
+                    "approval_kind", "approval_id", "approval_fingerprint", "approval_scope",
+                    "approval_checkpoint_required", "approval_checkpoint_worker_token",
+                }
             }
             row.status = RunStatus.CANCELLED.value
             self.clear_worker_lease(row)

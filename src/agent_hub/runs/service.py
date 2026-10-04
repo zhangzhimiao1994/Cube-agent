@@ -7,7 +7,8 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -35,6 +36,7 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
+from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.conversation_queue import (
     ConversationQueueConflict,
     ConversationQueueItem,
@@ -66,6 +68,7 @@ from agent_hub.runtime.failure_reason import (
 )
 from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.streams import closing_runtime_events
 
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
@@ -93,6 +96,50 @@ _PROJECT_SCALE_TOKEN_MULTIPLIERS = {
     "ultra": 4.0,
 }
 _TERMINAL_HOOK_NOTIFIED_KIND = "terminal.notified"
+_APPROVAL_CHECKPOINT_DRAIN_SECONDS = 30.0
+_APPROVAL_CHECKPOINT_DRAIN_EVENTS = 1024
+
+
+def _required_approval_checkpoint_id(record: RunRecord) -> str | None:
+    routing = record.routing_decision or {}
+    approval_id = routing.get("approval_id")
+    if (
+        record.status is RunStatus.WAITING_APPROVAL
+        and record.worker_lease_token is None
+        and record.worker_id is None
+        and routing.get("approval_kind") == "capability_tool"
+        and routing.get("approval_checkpoint_required") is True
+        and type(approval_id) is str
+        and approval_id.strip()
+    ):
+        return approval_id
+    return None
+
+
+@dataclass(slots=True)
+class _ApprovalCheckpointDrain:
+    worker_lease_token: UUID
+    timeout: asyncio.Timeout | None = None
+    approval_id: str | None = None
+    events: int = 0
+    complete: bool = False
+
+    def owns(self, record: RunRecord) -> bool:
+        return (record.routing_decision or {}).get("approval_checkpoint_worker_token") == str(
+            self.worker_lease_token,
+        )
+
+    def observe(self, record: RunRecord) -> bool:
+        approval_id = _required_approval_checkpoint_id(record)
+        if approval_id is None or self.complete or not self.owns(record):
+            return False
+        if self.approval_id is None:
+            self.approval_id = approval_id
+            if self.timeout is not None:
+                self.timeout.reschedule(
+                    asyncio.get_running_loop().time() + _APPROVAL_CHECKPOINT_DRAIN_SECONDS,
+                )
+        return approval_id == self.approval_id
 
 
 def _runtime_cancel_for_run(
@@ -1787,8 +1834,10 @@ class RunService:
         scheduler_notice_payloads: list[dict[str, object]] = []
         lease_lost = False
         runtime_cancel_failed = False
+        runtime_cancel: Callable[[], Awaitable[None]] | None = None
         heartbeat_stop = asyncio.Event()
         heartbeat_task: asyncio.Task[None] | None = None
+        approval_drain = _ApprovalCheckpointDrain(worker_lease_token)
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
@@ -1950,94 +1999,130 @@ class RunService:
                     worker_lease_token=worker_lease_token,
                     stop=heartbeat_stop,
                     runtime_cancel=runtime_cancel,
+                    approval_drain=approval_drain,
                 )
             )
             try:
-                async for event in _adaptive_runtime_events(
+                runtime_events = _adaptive_runtime_events(
                     runtime,
                     context,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
                     non_progress_artifact_ids=non_progress_artifact_ids,
-                ):
-                    cancel_runtime = False
-                    stop_runtime_loop = False
-                    persist_waiting_approval_checkpoint = False
-                    async with await self._repository.run_transaction() as session, session.begin():
-                        locked = await self._repository.get_for_update(session, run_id)
-                        current_status = RunStatus(locked.status)
-                        if current_status is RunStatus.CANCELLED:
-                            cancel_runtime = True
-                            terminal = RunStatus.CANCELLED
-                            stop_runtime_loop = True
-                        if current_status is RunStatus.PAUSED:
-                            cancel_runtime = True
-                            terminal = RunStatus.PAUSED
-                            stop_runtime_loop = True
-                        if current_status is RunStatus.WAITING_APPROVAL:
-                            terminal = RunStatus.WAITING_APPROVAL
-                            stop_runtime_loop = True
-                            persist_waiting_approval_checkpoint = (
-                                event.kind is EventKind.CHECKPOINT_SAVED
-                            )
-                        if current_status in {
-                            RunStatus.COMPLETED,
-                            RunStatus.FAILED,
-                            RunStatus.CANCELLED,
-                        }:
-                            terminal = current_status
-                            stop_runtime_loop = True
-                        if (
-                            not stop_runtime_loop
-                            and current_status is RunStatus.RUNNING
-                            and not RunRepository.renew_worker_lease(
-                                locked,
-                                worker_id=self._worker_id,
-                                worker_lease_token=worker_lease_token,
-                                worker_lease_expires_at=self._worker_lease_expires_at(),
-                            )
-                        ):
-                            _LOGGER.warning(
-                                "run_worker_lease_lost run_id=%s worker_id=%s",
-                                run_id,
-                                self._worker_id,
-                            )
-                            lease_lost = True
-                            stop_runtime_loop = True
-                        if not stop_runtime_loop or persist_waiting_approval_checkpoint:
-                            sequence = await self._repository.next_event_sequence(session, run_id)
-                            event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
-                            await self._repository.persist_event(
-                                session,
-                                tenant_id=tenant_id,
-                                run_id=run_id,
-                                event=event,
-                            )
-                            observed_events.append(event)
-                            observer_decision = monitor.observe(event)
-                            if observer_decision is not None:
-                                observer_decisions.append(observer_decision)
-                            if event.kind is EventKind.RUNTIME_COMPLETED:
-                                terminal = RunStatus.COMPLETED
-                            elif event.kind is EventKind.RUNTIME_CANCELLED:
-                                terminal = RunStatus.CANCELLED
-                            elif event.kind is EventKind.RUNTIME_FAILED:
-                                terminal = RunStatus.FAILED
-                            if terminal is not RunStatus.RUNNING:
-                                locked.status = terminal.value
-                                locked.version += 1
-                    if cancel_runtime:
-                        try:
-                            await runtime_cancel()
-                        except Exception:
-                            runtime_cancel_failed = True
-                            raise
-                    if stop_runtime_loop:
-                        break
-                    if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
-                        return await self._submitted_by_run_id(tenant_id, run_id)
+                )
+                async with asyncio.timeout(None) as approval_timeout, aclosing(runtime_events):
+                    approval_drain.timeout = approval_timeout
+                    async for event in runtime_events:
+                        cancel_runtime = False
+                        stop_runtime_loop = False
+                        persist_waiting_approval_checkpoint = False
+                        draining_approval = False
+                        async with await self._repository.run_transaction() as session, session.begin():
+                            locked = await self._repository.get_for_update(session, run_id)
+                            current_status = RunStatus(locked.status)
+                            record = RunRepository._record(locked)
+                            if current_status in {
+                                RunStatus.CANCELLED, RunStatus.PAUSED,
+                                RunStatus.QUEUED, RunStatus.RETRYING,
+                            }:
+                                cancel_runtime = True
+                                terminal = current_status
+                                stop_runtime_loop = True
+                            if current_status is RunStatus.WAITING_APPROVAL:
+                                terminal = RunStatus.WAITING_APPROVAL
+                                if (record.routing_decision or {}).get("approval_checkpoint_required") is True:
+                                    draining_approval = approval_drain.observe(record)
+                                    stop_runtime_loop = not draining_approval
+                                    cancel_runtime = not draining_approval
+                                    if draining_approval:
+                                        approval_drain.events += 1
+                                        checkpoint_matches = (
+                                            event.kind is EventKind.CHECKPOINT_SAVED
+                                            and event.checkpoint is not None
+                                            and event.checkpoint.run_id == run_id
+                                            and event.checkpoint.tenant_id == tenant_id
+                                            and event.checkpoint.mode is mode
+                                            and checkpoint_waits_for_approval(
+                                                event.checkpoint, approval_drain.approval_id or "",
+                                            )
+                                        )
+                                        stop_runtime_loop = checkpoint_matches
+                                        persist_waiting_approval_checkpoint = checkpoint_matches
+                                else:
+                                    stop_runtime_loop = True
+                                    persist_waiting_approval_checkpoint = (
+                                        event.kind is EventKind.CHECKPOINT_SAVED
+                                    )
+                            if current_status in {
+                                RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED,
+                            }:
+                                terminal = current_status
+                                stop_runtime_loop = True
+                            if approval_drain.approval_id is not None and not draining_approval:
+                                terminal = current_status
+                                stop_runtime_loop = True
+                                persist_waiting_approval_checkpoint = False
+                                cancel_runtime = True
+                            if (
+                                not stop_runtime_loop
+                                and current_status is RunStatus.RUNNING
+                                and not RunRepository.renew_worker_lease(
+                                    locked,
+                                    worker_id=self._worker_id,
+                                    worker_lease_token=worker_lease_token,
+                                    worker_lease_expires_at=self._worker_lease_expires_at(),
+                                )
+                            ):
+                                _LOGGER.warning(
+                                    "run_worker_lease_lost run_id=%s worker_id=%s",
+                                    run_id, self._worker_id,
+                                )
+                                lease_lost = True
+                                stop_runtime_loop = True
+                            if not stop_runtime_loop or persist_waiting_approval_checkpoint:
+                                sequence = await self._repository.next_event_sequence(session, run_id)
+                                event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
+                                await self._repository.persist_event(
+                                    session, tenant_id=tenant_id, run_id=run_id, event=event,
+                                )
+                                observed_events.append(event)
+                                observer_decision = monitor.observe(event)
+                                if observer_decision is not None:
+                                    observer_decisions.append(observer_decision)
+                                if event.kind is EventKind.RUNTIME_COMPLETED:
+                                    terminal = RunStatus.COMPLETED
+                                elif event.kind is EventKind.RUNTIME_CANCELLED:
+                                    terminal = RunStatus.CANCELLED
+                                elif event.kind is EventKind.RUNTIME_FAILED:
+                                    terminal = RunStatus.FAILED
+                                if terminal is not RunStatus.RUNNING:
+                                    locked.status = terminal.value
+                                    locked.version += 1
+                                if draining_approval and terminal is not RunStatus.WAITING_APPROVAL:
+                                    stop_runtime_loop = True
+                        if stop_runtime_loop:
+                            approval_drain.complete = True
+                            approval_timeout.reschedule(None)
+                        if cancel_runtime:
+                            try:
+                                await asyncio.wait_for(runtime_cancel(), timeout=5.0)
+                            except Exception:
+                                runtime_cancel_failed = True
+                                raise
+                        if stop_runtime_loop:
+                            break
+                        if draining_approval and approval_drain.events >= _APPROVAL_CHECKPOINT_DRAIN_EVENTS:
+                            raise RuntimeError("runtime approval checkpoint event limit exceeded")
+                        if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
+                            return await self._submitted_by_run_id(tenant_id, run_id)
+                    else:
+                        record = await self._repository.get(tenant_id, run_id)
+                        if _required_approval_checkpoint_id(record) is not None:
+                            approval_drain.observe(record)
+                            raise RuntimeError("runtime ended before approval checkpoint was saved")
             finally:
+                approval_drain.timeout = None
                 heartbeat_stop.set()
                 await self._await_worker_lease_heartbeat(heartbeat_task)
             if lease_lost:
@@ -2051,7 +2136,16 @@ class RunService:
                     complete_if_running=True,
                 )
             except RunConflict:
-                return await self._submitted_by_run_id(tenant_id, run_id)
+                released_record = await self._repository.get(tenant_id, run_id)
+                if not (
+                    approval_drain.complete
+                    and approval_drain.approval_id is not None
+                    and approval_drain.owns(released_record)
+                    and terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+                    and released_record.status is terminal
+                    and not _record_has_worker_execution(released_record)
+                ):
+                    return _submitted(released_record)
             terminal = released_record.status
         except Exception as error:
             _LOGGER.exception(
@@ -2059,36 +2153,49 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
-            try:
-                failed = await self._repository.fail_run(
-                    run_id,
-                    reason=_runtime_failure_reason(error),
-                    worker_id=self._worker_id,
-                    worker_lease_token=worker_lease_token,
+            approval_failure = None
+            if runtime_cancel is not None:
+                approval_failure = await self._fail_approval_checkpoint_drain(
+                    tenant_id=tenant_id, run_id=run_id, drain=approval_drain, error=error,
                 )
-            except RunConflict:
-                return await self._submitted_by_run_id(tenant_id, run_id)
-            if not runtime_cancel_failed:
-                try:
-                    failed = await self._repository.release_worker_execution(
-                        failed.tenant_id,
-                        run_id,
-                        worker_id=self._worker_id,
-                        worker_lease_token=worker_lease_token,
-                    )
-                except RunConflict:
-                    return await self._submitted_by_run_id(tenant_id, run_id)
+                if approval_failure is not None:
+                    try:
+                        await asyncio.wait_for(runtime_cancel(), timeout=5.0)
+                    except Exception:
+                        _LOGGER.exception("approval_checkpoint_cancel_failed run_id=%s", run_id)
+            if approval_failure is not None:
+                failed = approval_failure
             else:
                 try:
-                    failed = await self._repository.mark_worker_execution_exited(
-                        failed.tenant_id,
+                    failed = await self._repository.fail_run(
                         run_id,
+                        reason=_runtime_failure_reason(error),
                         worker_id=self._worker_id,
                         worker_lease_token=worker_lease_token,
-                        exited_at=datetime.now(UTC),
                     )
                 except RunConflict:
                     return await self._submitted_by_run_id(tenant_id, run_id)
+                if not runtime_cancel_failed:
+                    try:
+                        failed = await self._repository.release_worker_execution(
+                            failed.tenant_id,
+                            run_id,
+                            worker_id=self._worker_id,
+                            worker_lease_token=worker_lease_token,
+                        )
+                    except RunConflict:
+                        return await self._submitted_by_run_id(tenant_id, run_id)
+                else:
+                    try:
+                        failed = await self._repository.mark_worker_execution_exited(
+                            failed.tenant_id,
+                            run_id,
+                            worker_id=self._worker_id,
+                            worker_lease_token=worker_lease_token,
+                            exited_at=datetime.now(UTC),
+                        )
+                    except RunConflict:
+                        return await self._submitted_by_run_id(tenant_id, run_id)
             if failed.status is RunStatus.WAITING_APPROVAL:
                 return _submitted(failed)
             if failed.status in {
@@ -2553,6 +2660,40 @@ class RunService:
             recovered += 1
         return recovered
 
+    async def _fail_approval_checkpoint_drain(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        drain: _ApprovalCheckpointDrain,
+        error: Exception,
+    ) -> RunRecord | None:
+        if drain.complete:
+            return None
+        async with await self._repository.run_transaction() as session, session.begin():
+            locked = await self._repository.get_for_update(session, run_id)
+            record = RunRepository._record(locked)
+            approval_id = _required_approval_checkpoint_id(record)
+            if (
+                record.tenant_id != tenant_id
+                or approval_id is None
+                or not drain.owns(record)
+                or (drain.approval_id is not None and drain.approval_id != approval_id)
+            ):
+                return None
+            sequence = await self._repository.next_event_sequence(session, run_id)
+            await self._repository.persist_event(
+                session, tenant_id=tenant_id, run_id=run_id,
+                event=RunEvent(
+                    kind=EventKind.RUNTIME_FAILED, sequence=sequence, run_id=run_id,
+                    reason=("runtime approval checkpoint drain timed out"
+                            if isinstance(error, TimeoutError) else _runtime_failure_reason(error)),
+                ),
+            )
+            locked.status = RunStatus.FAILED.value
+            locked.version += 1
+            return RunRepository._record(locked)
+
     async def _heartbeat_worker_lease(
         self,
         *,
@@ -2561,6 +2702,7 @@ class RunService:
         worker_lease_token: UUID,
         stop: asyncio.Event,
         runtime_cancel: Callable[[], Awaitable[None]],
+        approval_drain: _ApprovalCheckpointDrain | None = None,
     ) -> None:
         while not stop.is_set():
             try:
@@ -2590,13 +2732,19 @@ class RunService:
                 continue
             if renewed:
                 continue
+            if approval_drain is not None and not approval_drain.complete:
+                record = await self._repository.get(tenant_id, run_id)
+                # Approval intentionally cleared this lease; keep only this bounded
+                # consumer alive until its matching receipt commits. Never renew it.
+                if approval_drain.observe(record):
+                    continue
             _LOGGER.warning(
                 "run_worker_lease_heartbeat_lost run_id=%s worker_id=%s",
                 run_id,
                 self._worker_id,
             )
             try:
-                await runtime_cancel()
+                await asyncio.wait_for(runtime_cancel(), timeout=5.0)
             except Exception:
                 _LOGGER.exception(
                     "run_worker_lease_heartbeat_cancel_failed run_id=%s worker_id=%s",
@@ -4972,44 +5120,45 @@ async def _adaptive_runtime_events(
     routing_decision: Mapping[str, object],
     initial_progress_units: int,
     non_progress_artifact_ids: frozenset[str] = frozenset(),
-) -> AsyncIterator[RunEvent]:
+) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
     seen_artifacts: set[UUID] = set()
     metadata_artifact_ids = set(non_progress_artifact_ids)
-    async for event in runtime.run(context):
-        if event.artifact is not None and event.artifact.type == "model_attempt":
-            metadata_artifact_ids.add(str(event.artifact.id))
-        if event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id is not None:
-            if event.tool_call_id not in seen_tool_calls:
-                seen_tool_calls.add(event.tool_call_id)
-                progress_units += 1
-            if event.artifact is not None:
-                seen_artifacts.add(event.artifact.id)
-        elif (
-            event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
-            and event.artifact.type != "model_attempt"
-        ):
-            if event.artifact.id not in seen_artifacts:
-                seen_artifacts.add(event.artifact.id)
-                progress_units += 1
-        elif event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None:
-            progress_units = max(
-                progress_units,
-                _checkpoint_progress_units(
-                    event.checkpoint, non_progress_artifact_ids=frozenset(metadata_artifact_ids),
-                ),
+    async with closing_runtime_events(runtime.run(context)) as stream:
+        async for event in stream:
+            if event.artifact is not None and event.artifact.type == "model_attempt":
+                metadata_artifact_ids.add(str(event.artifact.id))
+            if event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id is not None:
+                if event.tool_call_id not in seen_tool_calls:
+                    seen_tool_calls.add(event.tool_call_id)
+                    progress_units += 1
+                if event.artifact is not None:
+                    seen_artifacts.add(event.artifact.id)
+            elif (
+                event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+                and event.artifact.type != "model_attempt"
+            ):
+                if event.artifact.id not in seen_artifacts:
+                    seen_artifacts.add(event.artifact.id)
+                    progress_units += 1
+            elif event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None:
+                progress_units = max(
+                    progress_units,
+                    _checkpoint_progress_units(
+                        event.checkpoint, non_progress_artifact_ids=frozenset(metadata_artifact_ids),
+                    ),
+                )
+            extended_budget = _runtime_token_budget(
+                context.mode,
+                configured_tokens=configured_tokens,
+                routing_decision=routing_decision,
+                progress_units=progress_units,
             )
-        extended_budget = _runtime_token_budget(
-            context.mode,
-            configured_tokens=configured_tokens,
-            routing_decision=routing_decision,
-            progress_units=progress_units,
-        )
-        if extended_budget > context.token_budget:
-            # The runtime is suspended at this event boundary and retains this exact context.
-            object.__setattr__(context, "token_budget", extended_budget)
-        yield event
+            if extended_budget > context.token_budget:
+                # The runtime is suspended at this event boundary and retains this exact context.
+                object.__setattr__(context, "token_budget", extended_budget)
+            yield event
 
 
 def _safe_worker_id(worker_id: str | None) -> str:

@@ -19,6 +19,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.streams import closing_runtime_events
 
 PROJECT_SCALE_ARTIFACT_TOOL_NAME = "project.generate_zip"
 PROJECT_SCALE_ARTIFACT_ACTOR = "implementer"
@@ -174,9 +175,10 @@ class ProjectScaleArtifactPreseedRuntime:
                         reason=result.failure_reason or "capability execution failed",
                     )
                     sequence += 1
-        async for event in self._child.run(context):
-            yield event.model_copy(update={"sequence": sequence})
-            sequence += 1
+        async with closing_runtime_events(self._child.run(context)) as events:
+            async for event in events:
+                yield event.model_copy(update={"sequence": sequence})
+                sequence += 1
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         return await self._child.save_checkpoint()

@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from agent_hub.db.models import RunOutboxRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import (
     RunAlreadyActive,
@@ -105,6 +106,16 @@ class _CapabilityApprovalSessionFactory:
 
     def __call__(self) -> _CapabilityApprovalSession:
         return self._session
+
+
+class _ApprovalCheckpointSession(_CapabilityApprovalSession):
+    def __init__(self, row: _FakeRunRow, *, checkpoint_sequence: int, event_sequence: int) -> None:
+        super().__init__(row, approved=False)
+        self.responses: list[object] = [row, checkpoint_sequence, event_sequence]
+
+    async def scalar(self, statement: object) -> object:
+        self.statements.append(statement)
+        return self.responses.pop(0)
 
 
 class _ScalarRecordingSession:
@@ -543,6 +554,151 @@ async def test_mode_choice_ignores_invalid_project_scale_metadata() -> None:
 
     assert record.routing_decision is not None
     assert "effective_scale" not in record.routing_decision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkpoint_sequence,event_sequence", [(123, 124), (0, 1)])
+async def test_capability_approval_does_not_enqueue_before_recovery_checkpoint(
+    checkpoint_sequence: int, event_sequence: int,
+) -> None:
+    row = _FakeRunRow(
+        id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=None,
+        request="write a project file", mode=TaskMode.DISPATCH.value,
+        status=RunStatus.WAITING_APPROVAL.value, version=7, created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "capability_tool", "approval_id": "approval-1",
+            "approval_fingerprint": "fingerprint-1",
+        },
+    )
+    session = _ApprovalCheckpointSession(
+        row, checkpoint_sequence=checkpoint_sequence, event_sequence=event_sequence,
+    )
+    repository = RunRepository(cast(Any, _CapabilityApprovalSessionFactory(session)))
+    original_routing = dict(row.routing_decision or {})
+
+    with pytest.raises(RunConflict, match="checkpoint"):
+        await repository.approve_capability_and_enqueue(
+            tenant_id=row.tenant_id, run_id=row.id, approval_id="approval-1", version=7,
+        )
+
+    assert row.status == RunStatus.WAITING_APPROVAL.value
+    assert row.version == 7
+    assert row.routing_decision == original_routing
+    assert session.added == []
+    assert all("INSERT" not in str(statement) for statement in session.statements)
+
+
+@pytest.mark.asyncio
+async def test_capability_approval_enqueues_when_recovery_checkpoint_covers_events() -> None:
+    row = _FakeRunRow(
+        id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=None,
+        request="write a project file", mode=TaskMode.DISPATCH.value,
+        status=RunStatus.WAITING_APPROVAL.value, version=7, created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "capability_tool", "approval_id": "approval-1",
+            "approval_fingerprint": "fingerprint-1",
+        },
+    )
+    session = _ApprovalCheckpointSession(row, checkpoint_sequence=125, event_sequence=124)
+    repository = RunRepository(cast(Any, _CapabilityApprovalSessionFactory(session)))
+
+    record = await repository.approve_capability_and_enqueue(
+        tenant_id=row.tenant_id, run_id=row.id, approval_id="approval-1", version=7,
+    )
+
+    assert record.status is RunStatus.QUEUED
+    assert record.version == 8
+    assert len(session.added) == 1
+    assert isinstance(session.added[0], RunOutboxRow)
+    assert session.added[0].run_id == row.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_worker", [True, False])
+async def test_begin_capability_approval_requires_checkpoint_for_active_worker(
+    active_worker: bool,
+) -> None:
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.RUNNING, routing_decision=None, blocked_after_sequence=0,
+    )
+    row = repository.row
+    if active_worker:
+        row.worker_id = "worker-current"
+        row.worker_lease_token = repository.lease_token
+    session = _CapabilityApprovalSession(row, approved=False)
+    repository._session_factory = cast(Any, _CapabilityApprovalSessionFactory(session))
+
+    record = await repository.begin_capability_approval(
+        row.tenant_id, row.id, approval_id="approval-1", approval_fingerprint="fingerprint-1",
+    )
+
+    assert record.status is RunStatus.WAITING_APPROVAL
+    assert (record.routing_decision or {}).get("approval_checkpoint_required", False) is active_worker
+    assert (record.routing_decision or {}).get("approval_checkpoint_worker_token") == (
+        str(repository.lease_token) if active_worker else None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolution", ["enqueue", "inline"])
+@pytest.mark.parametrize("receipt", [None, "prepared", "approval-old", "approval-1"])
+async def test_capability_approval_requires_matching_durable_receipt(
+    receipt: str | None, resolution: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _FakeRunRow(
+        id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=None,
+        request="write after approval", mode=TaskMode.DISPATCH.value,
+        status=RunStatus.WAITING_APPROVAL.value, version=7, created_at=datetime.now(UTC),
+        routing_decision={
+            "approval_kind": "capability_tool", "approval_id": "approval-1",
+            "approval_fingerprint": "fingerprint-1", "approval_checkpoint_required": True,
+        },
+    )
+    checkpoint = None if receipt is None else RuntimeCheckpoint(
+        id=uuid4(), runtime_type="crew", runtime_version="11",
+        run_id=row.id, tenant_id=row.tenant_id, mode=TaskMode.DISPATCH,
+        state={"tools": {"tool-key": {
+            "status": "prepared" if receipt == "prepared" else "waiting_approval",
+            "approval_id": receipt,
+        }}},
+    )
+    # The producer has requested approval while TOOL_REQUESTED is still queued.
+    session = _ApprovalCheckpointSession(
+        row, checkpoint_sequence=123, event_sequence=123,
+    )
+    repository = RunRepository(cast(Any, _CapabilityApprovalSessionFactory(session)))
+    original_routing = dict(row.routing_decision or {})
+
+    async def latest_checkpoint(*args: object, **kwargs: object) -> RuntimeCheckpoint | None:
+        return checkpoint
+
+    monkeypatch.setattr(repository, "latest_checkpoint", latest_checkpoint)
+
+    async def approve() -> RunRecord:
+        if resolution == "enqueue":
+            return await repository.approve_capability_and_enqueue(
+                tenant_id=row.tenant_id, run_id=row.id, approval_id="approval-1", version=7,
+            )
+        return await repository.resolve_capability_approval(
+            row.tenant_id, row.id, RunStatus.RUNNING,
+            approval_id="approval-1", approval_fingerprint="fingerprint-1",
+        )
+
+    if receipt != "approval-1":
+        with pytest.raises(RunConflict, match="checkpoint"):
+            await approve()
+        assert row.status == RunStatus.WAITING_APPROVAL.value
+        assert row.version == 7
+        assert row.routing_decision == original_routing
+        assert session.added == []
+        assert all("INSERT" not in str(statement) for statement in session.statements)
+    else:
+        record = await approve()
+        expected_status = RunStatus.QUEUED if resolution == "enqueue" else RunStatus.RUNNING
+        assert record.status is expected_status
+        assert record.version == 8
+        assert "approval_checkpoint_required" not in (record.routing_decision or {})
+        assert len(session.added) == (1 if resolution == "enqueue" else 0)
 
 
 @pytest.mark.asyncio

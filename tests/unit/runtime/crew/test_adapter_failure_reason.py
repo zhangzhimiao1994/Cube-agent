@@ -41,6 +41,7 @@ from agent_hub.runtime.crew.adapter import (
     CrewDispatchRuntime,
     CrewLLMBridge,
     CrewObjectFactory,
+    CrewRunStream,
     CrewTaskDefinition,
     ModelOutcomeUncertain,
     RuntimeExecutionError,
@@ -3358,6 +3359,159 @@ async def test_approval_pending_project_zip_does_not_leave_started_lifecycle() -
     state = next(iter(tool_states.values()))
     assert isinstance(state, Mapping)
     assert state["status"] == "waiting_approval"
+
+
+@pytest.mark.parametrize("receipt_mutation", [
+    None, "missing_approval_id", "blank_approval_id", "non_string_approval_id",
+    "unknown_field", "approval_id_on_prepared",
+])
+async def test_waiting_approval_checkpoint_survives_service_stop_and_resumes_once(
+    receipt_mutation: str | None,
+) -> None:
+    request_persisted = asyncio.Event()
+
+    class WorkspaceGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(ToolCall(
+                        id="write-file", name="workspace.write_text",
+                        arguments={"path": "answer.txt", "content": "approved answer"},
+                    ),),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if len(self.requests) == 1
+                else ModelResponse(text="Workspace written.", usage=TokenUsage(1, 1, 2))
+            )
+            return GatewayCompletion(
+                response=response, deployment_id="primary", logical_model=request.logical_model,
+                provider_id="deepseek", provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class WorkspaceCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "workspace.write_text"
+
+    class ApprovalGateway(WaitingApprovalHarnessToolGateway):
+        waiting = False
+        approved = False
+        executions = 0
+
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            assert request.approval_required is True
+            assert request.tool_name == "workspace.write_text"
+            if not self.approved:
+                await request_persisted.wait()
+                self.waiting = True
+                return await super().invoke(tenant_id, request, user_id=user_id, role=role)
+            assert len(gateway.requests) == 1
+            self.calls.append(request)
+            self.executions += 1
+            return HarnessToolCallResult(
+                call_id=request.call_id, tool_name=request.tool_name, status="succeeded",
+                payload={"summary": "Workspace written."},
+            )
+
+    tools = ("workspace.write_text",)
+    plan = DispatchPlan(
+        agents=(AgentSpec(
+            id="implementer", role="Implementer", goal="Write", logical_model="general",
+            allowed_tools=tools,
+        ),),
+        steps=(DispatchStep(
+            id="final", agent="implementer", task="Write an answer file", tools=tools,
+            final_synthesizer=True, token_budget=100,
+        ),),
+        allowed_tools=tools, total_token_budget=100,
+    )
+    routing: dict[str, JsonValue] = {
+        "sandbox_profile": "workspace_write",
+        "project_id": "approval-probe",
+        "workspace_session_id": "approval-session",
+    }
+    gateway = WorkspaceGateway()
+    harness = ApprovalGateway()
+    capabilities = WorkspaceCapabilities()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=capabilities, harness_tool_gateway=harness,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    persisted: list[RunEvent] = []
+    stream = cast(CrewRunStream, runtime.run(_context(routing_decision=routing)))
+    try:
+        async for event in stream:
+            # Match RunService: stop at the first event observed while waiting;
+            # only a checkpoint is persisted at that boundary.
+            if harness.waiting:
+                if event.kind is EventKind.CHECKPOINT_SAVED:
+                    persisted.append(event)
+                break
+            persisted.append(event)
+            if event.kind is EventKind.TOOL_REQUESTED:
+                request_persisted.set()
+    finally:
+        await stream.aclose()
+
+    requested = next(event for event in persisted if event.kind is EventKind.TOOL_REQUESTED)
+    latest = persisted[-1]
+    assert latest.kind is EventKind.CHECKPOINT_SAVED
+    assert latest.sequence > requested.sequence
+    checkpoint = latest.checkpoint
+    assert checkpoint is not None
+    tool_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+    (waiting,) = tool_states.values()
+    assert waiting["status"] == "waiting_approval"
+    assert waiting["approval_id"] == "approval_project_zip"
+    assert waiting["replay_safe"] is True
+    assert len(gateway.requests) == 1
+    assert harness.executions == 0
+    assert capabilities.calls == []
+
+    harness.approved = True
+    harness.waiting = False
+    resumed = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=capabilities, harness_tool_gateway=harness,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    if receipt_mutation is not None:
+        payload = checkpoint.to_payload()
+        state = cast(dict[str, object], payload["state"])
+        receipts = cast(dict[str, dict[str, object]], state["tools"])
+        receipt = next(iter(receipts.values()))
+        if receipt_mutation == "missing_approval_id":
+            receipt.pop("approval_id")
+        elif receipt_mutation == "blank_approval_id":
+            receipt["approval_id"] = " "
+        elif receipt_mutation == "non_string_approval_id":
+            receipt["approval_id"] = True
+        elif receipt_mutation == "unknown_field":
+            receipt["unknown"] = True
+        else:
+            receipt["status"] = "prepared"
+        payload["state_sha256"] = ""
+        corrupted = RuntimeCheckpoint.from_payload(payload)
+        with pytest.raises(RuntimeExecutionError, match="runtime checkpoint is incompatible"):
+            await resumed.restore_checkpoint(corrupted)
+        assert harness.executions == 0
+        assert len(gateway.requests) == 1
+        return
+    await resumed.restore_checkpoint(checkpoint)
+    events = [event async for event in resumed.run(
+        _context(checkpoint=checkpoint, routing_decision=routing),
+    )]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert harness.executions == 1
+    assert len(harness.calls) == 2
+    assert harness.calls[0].idempotency_key == harness.calls[1].idempotency_key
+    assert len(gateway.requests) == 2  # Initial request plus the new tool-result continuation.
+    assert capabilities.calls == []
 
 
 async def test_project_scale_artifact_text_response_synthesizes_workspace_zip() -> None:
