@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "profile": "ultra-load-storage-v1",
+  "scale": "ultra",
+  "status": "passed",
+  "reasons": [],
+  "cleanup_ok": true,
+  "checks": {
+    "load": {
+      "schema_version": 1,
+      "profile": "ultra-load-v1",
+      "scale": "ultra",
+      "status": "passed",
+      "reasons": [],
+      "cleanup_ok": true,
+      "measurements": {
+        "target_projects": 1000,
+        "foreign_projects": 17,
+        "module_records": 44,
+        "concurrent_clients": 4,
+        "peak_active_clients": 4,
+        "initial_traversals": 4,
+        "restart_traversals": 1,
+        "updated_traversals": 1,
+        "boundary_pages": 3,
+        "read_model_requests": 105,
+        "write_requests": 1064,
+        "request_errors": 0,
+        "elapsed_seconds": 1.25
+      }
+    },
+    "data_dir_isolation": {
+      "status": "passed", "reasons": [], "cleanup_ok": true,
+      "measurements": {
+        "starts": 3, "stops": 3, "empty_program_checks": 1,
+        "marker_writes": 2, "marker_readbacks": 2,
+        "original_program_checks": 2, "marker_absence_checks": 2
+      }
+    },
+    "same_version_relocation": {
+      "status": "passed", "reasons": [], "cleanup_ok": true,
+      "measurements": {
+        "starts": 1, "stops": 1, "target_projects": 1000,
+        "foreign_projects": 17, "traversals": 2, "read_model_requests": 13,
+        "original_program_checks": 2, "old_paths_unavailable": true,
+        "data_files": 1, "data_bytes": 123456,
+        "source_data_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "copied_data_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "frozen_code_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "relocated_code_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    }
+  }
+}

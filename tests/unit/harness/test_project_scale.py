@@ -14,7 +14,11 @@ def test_ultra_contract_declares_fixed_pagination_workload() -> None:
     repair = _deliverable_repair_body(dict(body), "ultra:direct", benchmark_kind="capability")
     for message in (str(body["message"]), str(repair["message"])):
         assert PROJECT_ULTRA_LOAD_GUIDANCE in message
-        for required in ("offset", "1..100", "1000", "17", "four concurrent", "String(project_id)"):
+        for required in (
+            "offset", "1..100", "1000", "17", "four concurrent", "String(project_id)",
+            "DATA_DIR", "distinct empty", "new absolute paths", "inaccessible",
+            "without rebuilding or reinstalling",
+        ):
             assert required in message
 
 

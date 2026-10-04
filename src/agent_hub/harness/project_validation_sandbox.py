@@ -249,11 +249,26 @@ def validate_requirements(root: Path, scale: str, timeout_seconds: float) -> tup
 
 
 def validate_scale_load(root: Path, scale: str, timeout_seconds: float) -> dict[str, object]:
+    return _validate_scale_check(root, scale, timeout_seconds, operation="portfolio-load",
+                                 profile="ultra-load-v1")
+
+
+def validate_scale_storage(root: Path, scale: str, timeout_seconds: float) -> dict[str, object]:
+    return _validate_scale_check(root, scale, timeout_seconds, operation="portfolio-storage",
+                                 profile="ultra-load-storage-v1")
+
+
+def _validate_scale_check(
+    root: Path, scale: str, timeout_seconds: float, *, operation: str, profile: str,
+) -> dict[str, object]:
     # Host-only imports: the isolated CLI must never import the normal harness package.
     from agent_hub.harness.project_validation_result import (
         scale_validation_unknown,
         validate_scale_validation_result,
     )
+
+    def unknown(reason: str) -> dict[str, object]:
+        return scale_validation_unknown(reason, profile=profile)
 
     def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -271,14 +286,14 @@ def validate_scale_load(root: Path, scale: str, timeout_seconds: float) -> dict[
             type(timeout_seconds) not in (int, float)
             or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
         ):
-            return scale_validation_unknown("timeout_seconds must be finite and positive")
+            return unknown("timeout_seconds must be finite and positive")
         if scale != "ultra":
-            return scale_validation_unknown("bwrap sandbox: load evaluator unavailable for this scale")
+            return unknown("bwrap sandbox: load evaluator unavailable for this scale")
         command = sandbox_command(
             (
                 "/usr/bin/python3", "-I",
                 "/opt/validator/src/agent_hub/harness/project_validation_sandbox.py",
-                "portfolio-load", scale, str(timeout_seconds),
+                operation, scale, str(timeout_seconds),
             ),
             cwd=root, shared_network=False, config={},
         )
@@ -288,17 +303,17 @@ def validate_scale_load(root: Path, scale: str, timeout_seconds: float) -> dict[
             encoding="utf-8", errors="strict", timeout=timeout_seconds, check=False,
         )
         if completed.returncode != 0:
-            return scale_validation_unknown(
+            return unknown(
                 f"bwrap sandbox load validator failed: exit={completed.returncode}",
             )
         payload = json.loads(
             completed.stdout, object_pairs_hook=strict_object, parse_constant=reject_constant,
         )
-        return validate_scale_validation_result(payload)
+        return validate_scale_validation_result(payload, expected_profile=profile)
     except subprocess.TimeoutExpired:
-        return scale_validation_unknown("timeout: bwrap sandbox load validation deadline exceeded")
+        return unknown("timeout: bwrap sandbox load validation deadline exceeded")
     except (OSError, RuntimeError, ValueError, OverflowError) as exc:
-        return scale_validation_unknown(f"bwrap sandbox load validation unavailable: {exc}")
+        return unknown(f"bwrap sandbox load validation unavailable: {exc}")
 
 
 def _main() -> None:
@@ -306,14 +321,15 @@ def _main() -> None:
         raise SystemExit(2)
     if sys.argv[1] == "requirements" and sys.argv[2] in _VALIDATORS:
         validator = _VALIDATORS[sys.argv[2]]
-    elif sys.argv[1] == "portfolio-load" and sys.argv[2] == "ultra":
+    elif sys.argv[1] in {"portfolio-load", "portfolio-storage"} and sys.argv[2] == "ultra":
         try:
             timeout = float(sys.argv[3])
         except ValueError:
             raise SystemExit(2) from None
         if not math.isfinite(timeout) or timeout <= 0:
             raise SystemExit(2)
-        validator = "_validate_ultra_portfolio_load"
+        validator = ("_validate_ultra_portfolio_storage" if sys.argv[1] == "portfolio-storage"
+                     else "_validate_ultra_portfolio_load")
     else:
         raise SystemExit(2)
     # Load only the trusted stdlib validator; -I excludes generated cwd/PYTHONPATH.

@@ -8,6 +8,8 @@ import http.client
 import json
 import math
 import os
+import runpy
+import select
 import shutil
 import signal
 import socket
@@ -64,6 +66,14 @@ def validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[st
 
         return validate_scale_load(root, "ultra", timeout_seconds)
     return _validate_ultra_portfolio_load(root, timeout_seconds)
+
+
+def validate_ultra_portfolio_storage(root: Path, timeout_seconds: float) -> dict[str, object]:
+    if _PLATFORM == "posix":
+        from agent_hub.harness.project_validation_sandbox import validate_scale_storage
+
+        return validate_scale_storage(root, "ultra", timeout_seconds)
+    return _validate_ultra_portfolio_storage(root, timeout_seconds)
 
 
 class _ValidationFailure(Exception):
@@ -1567,7 +1577,414 @@ def _validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[s
     return tuple(failures)
 
 
-def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[str, object]:
+_STORAGE_GUARD = r"""
+import json, os, sys
+from pathlib import Path
+blocked, network, selected, npm, token = json.loads(sys.argv[1])
+if Path('/proc/self/ns/net').stat().st_ino != network:
+    raise SystemExit(71)
+for name in blocked:
+    if os.path.lexists(name):
+        raise SystemExit(72)
+for name in selected:
+    if not Path(name).is_dir() or os.path.realpath(name) != name:
+        raise SystemExit(73)
+if os.getcwd() != selected[0] or os.environ['DATA_DIR'] != selected[1]:
+    raise SystemExit(74)
+os.write(1, token.encode('ascii'))
+null = os.open(os.devnull, os.O_WRONLY)
+os.dup2(null, 1)
+os.close(null)
+os.execv(npm, [npm, 'start'])
+"""
+
+
+_STORAGE_CLEANUP = r"""
+import json, shutil, sys
+from pathlib import Path
+name, parent, identity = json.loads(sys.argv[1])
+root = Path(name)
+info = root.lstat()
+if (root.is_symlink() or getattr(info, 'st_file_attributes', 0) & 0x400
+        or root.resolve(strict=True) != root or root.parent != Path(parent)
+        or [info.st_dev, info.st_ino] != identity):
+    raise SystemExit(75)
+shutil.rmtree(root)
+"""
+
+
+class _UltraStorageContext:
+    """Own one fixed A/B/A/C challenge; the legacy load retains its HTTP oracle."""
+
+    def __init__(self, root: Path, deadline: float) -> None:
+        self.source = root.resolve(strict=True)
+        self.deadline = deadline
+        self.checks: dict[str, Any] = {}
+        for name, keys in (
+            ("data_dir_isolation", (
+                "starts", "stops", "empty_program_checks", "marker_writes", "marker_readbacks",
+                "original_program_checks", "marker_absence_checks",
+            )),
+            ("same_version_relocation", (
+                "starts", "stops", "target_projects", "foreign_projects", "traversals",
+                "read_model_requests", "original_program_checks", "data_files", "data_bytes",
+            )),
+        ):
+            self.checks[name] = {
+                "status": "unknown", "reasons": ["storage check not completed"],
+                "cleanup_ok": True, "measurements": dict.fromkeys(keys, 0),
+            }
+        self.checks["same_version_relocation"]["measurements"].update(
+            old_paths_unavailable=False, source_data_sha256=None, copied_data_sha256=None,
+            frozen_code_sha256=None, relocated_code_sha256=None,
+        )
+        self.active = "data_dir_isolation"
+        self.temporary: tempfile.TemporaryDirectory[str] | None = None
+        self.processes: dict[int, tuple[subprocess.Popen[bytes], str, int]] = {}
+        self.runtimes: list[Path] = []
+        self.programs: list[dict[str, object]] = []
+        self.target_rows: list[dict[str, object]] = []
+        self.foreign_rows: list[dict[str, object]] = []
+        self.project_records: dict[str, dict[str, object]] = {}
+        self.markers: list[dict[str, object]] = []
+
+    def prepare(self) -> None:
+        if _PLATFORM not in {"nt", "posix"}:
+            raise OSError("storage validation requires Linux isolation or trusted Windows fixtures")
+        if _PLATFORM == "posix" and (
+            sys.platform != "linux" or self.source != Path("/workspace")
+            or not Path(__file__).resolve().is_relative_to("/opt/validator/src")
+        ):
+            raise OSError("storage validation requires the outer private-network validator")
+        self.helpers = runpy.run_path(str(Path(__file__).with_name("project_validation_storage.py")))
+        self.temporary = tempfile.TemporaryDirectory(prefix="ultra-storage-owned-")
+        # Cleanup is explicit and identity checked, including after exceptional exits.
+        cast(Any, self.temporary)._finalizer.detach()
+        self.owned = Path(self.temporary.name).resolve(strict=True)
+        self.owned_identity = (self.owned.stat().st_dev, self.owned.stat().st_ino)
+        self.code_a, self.code_c = self.owned / "code-a", self.owned / "code-c"
+        self.data_a, self.data_b, self.data_c = (self.owned / f"data-{s}" for s in "abc")
+        first = self.copy(self.source, self.code_a, data=False)
+        second = self.copy(self.source, self.code_c, data=False)
+        _require(first["sha256"] == second["sha256"], "frozen code changed between copies")
+        self.checks["same_version_relocation"]["measurements"].update(
+            frozen_code_sha256=first["sha256"], relocated_code_sha256=second["sha256"],
+        )
+        self.data_a.mkdir()
+        self.data_b.mkdir()
+
+    def copy(self, source: Path, target: Path, *, data: bool) -> dict[str, Any]:
+        _remaining(self.deadline)
+        try:
+            return cast(dict[str, Any], self.helpers["copy_validation_tree"](
+                source, target, deadline=self.deadline, reject_hardlinks=data,
+            ))
+        except (ValueError, RuntimeError) as exc:
+            label = "temporary runtime cleanup failed" if "cleanup" in str(exc) else "unsafe storage copy"
+            raise _ValidationFailure(f"{label}: {exc}") from exc
+
+    def fail(self, exc: Exception, *, cleanup: bool = False) -> None:
+        check = self.checks[self.active]
+        failed = cleanup or (isinstance(exc, _ValidationFailure) and not str(exc).startswith("timeout:"))
+        if check["status"] != "failed":
+            check["status"] = "failed" if failed else "unknown"
+        if check["reasons"] == ["storage check not completed"]:
+            check["reasons"] = []
+        check["reasons"].append(str(exc))
+        if cleanup:
+            check["cleanup_ok"] = False
+
+    def start(
+        self, code: Path, data: Path, check_name: str,
+    ) -> tuple[subprocess.Popen[bytes], _PortfolioAPI]:
+        self.active = check_name
+        _remaining(self.deadline)
+        runtime = self.owned / f"runtime-{len(self.runtimes)}"
+        runtime.mkdir()
+        self.runtimes.append(runtime)
+        npm = shutil.which("npm")
+        if npm is None:
+            raise OSError("npm executable unavailable; storage validation not started")
+        env = _environment(str(data), str(runtime))
+        port = _free_port()
+        env["PORT"] = str(port)
+        command = [npm, "start"]
+        token: bytes | None = None
+        if _PLATFORM == "posix":
+            blocked = [str(self.source), "/workspace", "/opt/validator/src"]
+            blocked.extend(str(p) for p in (
+                self.code_a, self.code_c, self.data_a, self.data_b, self.data_c, *self.runtimes,
+            ) if p not in {code, data, runtime})
+            command = [
+                "/usr/bin/bwrap", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+                "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+                "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
+                "--ro-bind", "/lib", "/lib", "--proc", "/proc", "--dev", "/dev",
+                "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var",
+            ]
+            for system in (Path("/lib64"), Path("/opt/validator/node")):
+                if system.exists():
+                    command.extend(("--ro-bind", str(system), str(system)))
+            for current in (code, data, runtime):
+                command.extend(("--bind", str(current), str(current)))
+            command.extend(("--chdir", str(code), "--clearenv"))
+            for key, value in env.items():
+                command.extend(("--setenv", key, value))
+            token = uuid4().hex.encode("ascii")
+            guard = json.dumps([
+                blocked, Path("/proc/self/ns/net").stat().st_ino,
+                [str(code), str(data), str(runtime)], npm, token.decode("ascii"),
+            ])
+            command.extend(("--", "/usr/bin/python3", "-I", "-B", "-c", _STORAGE_GUARD, guard))
+        process = subprocess.Popen(
+            command, cwd=code, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if token is not None else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=_PLATFORM == "posix",
+        )
+        self.processes[process.pid] = (process, check_name, port)
+        measurements = self.checks[check_name]["measurements"]
+        measurements["starts"] += 1
+        try:
+            if token is not None:
+                assert process.stdout is not None
+                try:
+                    readable, _, _ = select.select([process.stdout], [], [], _remaining(self.deadline))
+                    if not readable or os.read(process.stdout.fileno(), len(token) + 1) != token:
+                        raise OSError("nested namespace guard unavailable before npm launch")
+                finally:
+                    process.stdout.close()
+                if check_name == "same_version_relocation":
+                    measurements["old_paths_unavailable"] = True
+            api = _PortfolioAPI(port, self.deadline)
+            _ready_portfolio(api, process)
+            _remaining(self.deadline)
+            return process, api
+        except Exception:
+            self.stop(process)
+            raise
+
+    def stop(self, process: subprocess.Popen[bytes]) -> None:
+        entry = self.processes.get(process.pid)
+        if entry is None:
+            return
+        _, check_name, port = entry
+        try:
+            _stop_tree(process, shutil.which("taskkill") if _PLATFORM == "nt" else None)
+            close_deadline = min(self.deadline, time.monotonic() + 2)
+            while True:
+                remaining = close_deadline - time.monotonic()
+                with socket.socket() as connection:
+                    connection.settimeout(max(0.001, min(0.1, remaining)))
+                    if connection.connect_ex(("127.0.0.1", port)) != 0:
+                        break
+                remaining = close_deadline - time.monotonic()
+                _require(remaining > 0, "storage process-tree cleanup left a live listener")
+                time.sleep(min(0.05, remaining))
+        except Exception as exc:
+            self.active = check_name
+            self.fail(_ValidationFailure(f"process-tree cleanup failed: {exc}"), cleanup=True)
+            raise
+        self.checks[check_name]["measurements"]["stops"] += 1
+        del self.processes[process.pid]
+
+    def check_b(self) -> None:
+        process, api = self.start(self.code_a, self.data_b, "data_dir_isolation")
+        measured = self.checks["data_dir_isolation"]["measurements"]
+        try:
+            items = _business_items(api.get_object("/programs"), "B programs")
+            _require(not items, "B DATA_DIR must have empty programs")
+            measured["empty_program_checks"] += 1
+            program_body: dict[str, object] = {"name": f"B program {uuid4().hex}"}
+            program = api.create("/programs", program_body)
+            _business_record_fields(program, program_body, "B program write")
+            _require(isinstance(program["id"], (str, int))
+                     and not isinstance(program["id"], bool) and str(program["id"]) != "",
+                     "B program invalid id")
+            measured["marker_writes"] += 1
+            project_body: dict[str, object] = {
+                "program_id": program["id"], "name": f"B project {uuid4().hex}",
+                "owner": f"b-{uuid4().hex}@example.test",
+            }
+            project = api.create("/projects", project_body)
+            _business_record_fields(project, project_body, "B project write")
+            _require(isinstance(project["id"], (str, int))
+                     and not isinstance(project["id"], bool) and str(project["id"]) != "",
+                     "B project invalid id")
+            measured["marker_writes"] += 1
+            self.markers = [
+                {"id": program["id"], **program_body}, {"id": project["id"], **project_body},
+            ]
+            programs = _business_items(api.get_object("/programs"), "B marker programs")
+            _require(len(programs) == 1, "B must contain only its marker program")
+            _business_record_fields(programs[0], self.markers[0], "B program readback")
+            measured["marker_readbacks"] += 1
+            actual = api.get_object(f"/projects/{quote(str(project['id']), safe='')}")
+            _business_record_fields(actual, self.markers[1], "B project readback")
+            measured["marker_readbacks"] += 1
+        except Exception as exc:
+            self.fail(exc)
+            raise
+        finally:
+            self.stop(process)
+
+    def verify_programs(self, api: _PortfolioAPI, check_name: str) -> None:
+        items = _business_items(api.get_object("/programs"), "original programs")
+        _require(len(items) == 2, "original DATA_DIR must preserve exactly two programs")
+        for expected in self.programs:
+            matches = [p for p in items if p.get("id") == expected["id"]]
+            _require(len(matches) == 1, "original program missing or duplicated")
+            _business_record_fields(matches[0], expected, "original program")
+            self.checks[check_name]["measurements"]["original_program_checks"] += 1
+
+    def check_a(self, api: _PortfolioAPI) -> None:
+        try:
+            self.verify_programs(api, "data_dir_isolation")
+            measured = self.checks["data_dir_isolation"]["measurements"]
+            _require(all(p["name"] != self.markers[0]["name"] for p in self.programs),
+                     "B program leaked into A")
+            measured["marker_absence_checks"] += 1
+            marker = self.markers[1]
+            status, actual = api.request("GET", f"/projects/{quote(str(marker['id']), safe='')}")
+            expected = self.project_records.get(str(marker["id"]))
+            if expected is None:
+                _require(status == 404, "B project leaked into A")
+            else:
+                _require(status == 200 and isinstance(actual, dict), "original A project missing")
+                _business_record_fields(cast(dict[str, object], actual), expected, "A project")
+            measured["marker_absence_checks"] += 1
+        except Exception as exc:
+            self.fail(exc)
+            raise
+
+    def relocate(self) -> None:
+        self.active = "same_version_relocation"
+        measured = self.checks[self.active]["measurements"]
+        _require(not self.processes, "relocation requires every writer stopped")
+        # Reuse the copy helper's canonical snapshot, without creating a third code copy.
+        code_tree = self.helpers["_Tree"](self.code_c, self.code_c.lstat(), self.deadline)
+        code_summary = self.helpers["_summary"](
+            self.helpers["_snapshot"](code_tree, True), self.deadline,
+        )
+        measured["relocated_code_sha256"] = code_summary["sha256"]
+        _require(code_summary["sha256"] == measured["frozen_code_sha256"],
+                 "relocated code changed after freeze")
+        copied = self.copy(self.data_a, self.data_c, data=True)
+        measured.update(data_files=copied["files"], data_bytes=copied["bytes"],
+                        source_data_sha256=copied["sha256"], copied_data_sha256=copied["sha256"])
+        _require(copied["files"] > 0 and copied["bytes"] > 0, "DATA_DIR has no persisted data")
+        process, api = self.start(self.code_c, self.data_c, self.active)
+        try:
+            self.verify_programs(api, "same_version_relocation")
+            for rows, program, counter in (
+                (self.target_rows, self.programs[0], "target_projects"),
+                (self.foreign_rows, self.programs[1], "foreign_projects"),
+            ):
+                ordered = sorted(rows, key=lambda p: str(p["project_id"]).encode(
+                    "utf-16-be", errors="surrogatepass",
+                ))
+                for offset in range(0, len(ordered) + 100, 100):
+                    _remaining(self.deadline)
+                    path = (f"/portfolio/read-model?program_id={quote(str(program['id']), safe='')}"
+                            f"&offset={offset}&limit=100")
+                    measured["read_model_requests"] += 1
+                    items = _business_items(api.get_object(path), "relocated portfolio page")
+                    wanted = ordered[offset:offset + 100]
+                    _require(len(items) == len(wanted), "relocated portfolio page row count")
+                    for actual, expected in zip(items, wanted, strict=True):
+                        _business_record_fields(actual, expected, "relocated portfolio row")
+                        measured[counter] += 1
+                measured["traversals"] += 1
+        finally:
+            self.stop(process)
+        check = self.checks["same_version_relocation"]
+        if measured["old_paths_unavailable"]:
+            check.update(status="passed", reasons=[])
+        else:
+            check.update(status="unknown", reasons=[
+                "trusted Windows fixture verified semantics only; old paths are not isolated",
+            ])
+
+    def cleanup_owned(self) -> None:
+        subprocess.run(
+            [sys.executable, "-I", "-B", "-c", _STORAGE_CLEANUP, json.dumps([
+                str(self.owned), str(Path(tempfile.gettempdir()).resolve(strict=True)),
+                list(self.owned_identity),
+            ])],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=3, check=True,
+        )
+        _require(not self.owned.exists(), "owned storage cleanup incomplete")
+
+    def cleanup(self) -> None:
+        for process, _, _ in list(self.processes.values()):
+            try:
+                self.stop(process)
+            except (OSError, ValueError, _ValidationFailure, subprocess.SubprocessError) as exc:
+                self.fail(_ValidationFailure(f"process-tree cleanup failed: {exc}"), cleanup=True)
+        if self.temporary is not None:
+            try:
+                info = self.owned.lstat()
+                _require(
+                    not self.owned.is_symlink() and self.owned.resolve(strict=True) == self.owned
+                    and (info.st_dev, info.st_ino) == self.owned_identity
+                    and self.owned.parent == Path(tempfile.gettempdir()).resolve(strict=True),
+                    "owned storage cleanup boundary changed",
+                )
+                self.cleanup_owned()
+            except (OSError, ValueError, _ValidationFailure, subprocess.SubprocessError) as exc:
+                for name in self.checks:
+                    self.active = name
+                    self.fail(_ValidationFailure(f"temporary runtime cleanup failed: {exc}"), cleanup=True)
+
+
+def _validate_ultra_portfolio_storage(root: Path, timeout_seconds: float) -> dict[str, object]:
+    protocol = runpy.run_path(str(Path(__file__).with_name("project_validation_result.py")))
+    result = cast(dict[str, Any], protocol["scale_validation_unknown"](
+        "storage validation not completed", profile="ultra-load-storage-v1",
+    ))
+    context: _UltraStorageContext | None = None
+    errors: list[str] = []
+    deadline = time.monotonic()
+    try:
+        if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        deadline += timeout_seconds
+        context = _UltraStorageContext(root, deadline)
+        result["checks"].update(context.checks)
+        context.prepare()
+        load = _validate_ultra_portfolio_load(context.code_a, timeout_seconds, _storage=context)
+        result["checks"]["load"] = load
+        if load["status"] == "passed":
+            context.checks["data_dir_isolation"].update(status="passed", reasons=[])
+            context.relocate()
+    except (OSError, ValueError, RuntimeError, _ValidationFailure,
+            subprocess.SubprocessError, http.client.HTTPException) as exc:
+        if context is not None:
+            context.fail(exc)
+        else:
+            errors.append(str(exc))
+    finally:
+        if context is not None:
+            context.cleanup()
+        checks = cast(dict[str, Any], result["checks"])
+        cleanup_ok = all(check["cleanup_ok"] for check in checks.values())
+        result["cleanup_ok"] = cleanup_ok
+        states = [check["status"] for check in checks.values()]
+        result["status"] = (
+            "failed" if "failed" in states else "unknown" if "unknown" in states else "passed"
+        )
+        result["reasons"] = [
+            f"{name}: {reason}" for name, check in checks.items() for reason in check["reasons"]
+        ] + errors
+        if time.monotonic() >= deadline and result["status"] != "failed":
+            result["status"] = "unknown"
+            result["reasons"].append("timeout: storage validation deadline exceeded")
+    return result
+
+
+def _validate_ultra_portfolio_load(
+    root: Path, timeout_seconds: float, *, _storage: _UltraStorageContext | None = None,
+) -> dict[str, object]:
     """Run the fixed ultra workload inside a native sandbox or trusted Windows fixture.
 
     Expected rows come only from acknowledged seed writes. Active clients count
@@ -1662,7 +2079,7 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
     try:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
-        deadline = started + timeout_seconds
+        deadline = started + timeout_seconds if _storage is None else _storage.deadline
         if _PLATFORM not in ("posix", "nt"):
             raise OSError(f"unsupported platform for process-tree cleanup: {_PLATFORM}")
         npm = shutil.which("npm")
@@ -1680,12 +2097,16 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
             "package.json must provide an npm start script",
         )
         _remaining(deadline)
-        data = tempfile.TemporaryDirectory(prefix="ultra-load-data-")
-        runtime = tempfile.TemporaryDirectory(prefix="ultra-load-runtime-")
-        env = _environment(data.name, runtime.name)
+        if _storage is None:
+            data = tempfile.TemporaryDirectory(prefix="ultra-load-data-")
+            runtime = tempfile.TemporaryDirectory(prefix="ultra-load-runtime-")
+            env = _environment(data.name, runtime.name)
 
         def start() -> _PortfolioAPI:
             nonlocal process
+            if _storage is not None:
+                process, api = _storage.start(_storage.code_a, _storage.data_a, "data_dir_isolation")
+                return api
             _remaining(deadline)
             port = _free_port()
             env["PORT"] = str(port)
@@ -1704,6 +2125,8 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
         phase = "seed"
         programs = [create(api, "/programs", {"name": f"Load portfolio {uuid4().hex}"})
                     for _ in range(2)]
+        if _storage is not None:
+            _storage.programs = [{"id": p["id"], "name": p["name"]} for p in programs]
         program_id = programs[0]["id"]
         _require(str(program_id) != str(programs[1]["id"]), "programs: duplicate id")
         project_records: dict[str, dict[str, object]] = {}
@@ -1740,7 +2163,9 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
             project = seed_project(program_id, "target_projects")
             seeded.append(project)
             if index % 59 == 0 and measurements["foreign_projects"] < 17:
-                seed_project(programs[1]["id"], "foreign_projects")
+                foreign = seed_project(programs[1]["id"], "foreign_projects")
+                if _storage is not None:
+                    _storage.foreign_rows.append(foreign)
             if index % 97 == 0:
                 amount = 1001 + index * 13
                 allocation = (index % 3 + 1) / 4
@@ -1760,6 +2185,9 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
         expected_rows = sorted(seeded, key=lambda p: str(p["project_id"]).encode(
             "utf-16-be", errors="surrogatepass",
         ))
+        if _storage is not None:
+            _storage.target_rows = expected_rows
+            _storage.project_records = project_records
         phase = "initial traversals"
         barrier = threading.Barrier(4)
         active = 0
@@ -1796,12 +2224,19 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
         _remaining(deadline)
         assert process is not None
         try:
-            _stop_tree(process, taskkill)
+            if _storage is None:
+                _stop_tree(process, taskkill)
+            else:
+                _storage.stop(process)
         except errors as exc:
             result["cleanup_ok"] = False
             raise _ValidationFailure(f"process-tree cleanup failed: {exc}") from exc
         process = None
+        if _storage is not None:
+            _storage.check_b()
         api = start()
+        if _storage is not None:
+            _storage.check_a(api)
         traverse(api, 100, "restart_traversals")
         phase = "updated traversal"
         updated = seeded[0]
@@ -1814,7 +2249,10 @@ def _validate_ultra_portfolio_load(root: Path, timeout_seconds: float) -> dict[s
     finally:
         if process is not None:
             try:
-                _stop_tree(process, taskkill)
+                if _storage is None:
+                    _stop_tree(process, taskkill)
+                else:
+                    _storage.stop(process)
             except errors as exc:
                 result["cleanup_ok"] = False
                 result["status"] = "failed"

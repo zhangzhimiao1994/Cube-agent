@@ -657,6 +657,7 @@ def test_scale_load_unsupported_scale_never_uses_requirements_fallback(
 
 @pytest.mark.parametrize(("command", "scale", "validator", "payload"), [
     ("portfolio-load", "ultra", "_validate_ultra_portfolio_load", _load_result()),
+    ("portfolio-storage", "ultra", "_validate_ultra_portfolio_storage", {"status": "unknown"}),
     ("requirements", "small", "_validate_small_task_api", ()),
     ("requirements", "ultra", "_validate_ultra_portfolio_api", ("business failure",)),
 ])

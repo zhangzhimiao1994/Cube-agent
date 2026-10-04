@@ -33,7 +33,14 @@ PROJECT_ULTRA_LOAD_GUIDANCE = (
     "records, then checks four concurrent complete traversals at page sizes 100/100/37/37, "
     "limit=1 boundary pages, full traversal after process restart, and changed aggregates "
     "after an additional budget write. Preserve exact IDs, fields, counts, filtering and "
-    "persistence throughout. This is fixed-workload correctness, not a throughput SLO. "
+    "persistence throughout. Store all business state only under the configured DATA_DIR, "
+    "not cwd, HOME, shared temporary files or an old absolute path. A distinct empty DATA_DIR "
+    "must start empty, and switching back must restore only that directory's exact data. "
+    "The same built code and a copy of stopped DATA_DIR must run from new absolute paths "
+    "with old code/data/runtime paths inaccessible, preserving both programs, all target "
+    "and foreign projects and updated aggregates, without rebuilding or reinstalling. "
+    "This is fixed-workload correctness and same-version relocation, not a throughput SLO "
+    "or a future schema migration test. "
 )
 PROJECT_SCALE_FLOW_KINDS: tuple[ProjectScaleFlow, ...] = (
     "direct",

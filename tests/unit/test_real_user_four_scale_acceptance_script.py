@@ -131,7 +131,7 @@ def scale_validation_evidence(case_id: str, run_id: str) -> dict[str, object] | 
 
     if not case_id.startswith("ultra:"):
         return None
-    fixture = Path(__file__).resolve().parents[1] / "fixtures/project_business/ultra_load_result.json"
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/project_business/ultra_storage_result.json"
     return {
         "case_id": case_id, "run_id": run_id,
         "manifest_sha256": scale_validation_manifest_sha256(validated_workspace_manifest()),
@@ -1163,7 +1163,7 @@ def test_finalize_rejects_contradictory_core_evidence(
 
 @pytest.mark.parametrize("mutation", (
     "missing", "run", "case", "manifest", "profile", "count", "boolean_count",
-    "unknown", "extra", "nan", "top_flag",
+    "unknown", "extra", "nan", "top_flag", "legacy_load", "missing_isolation", "old_paths",
 ))
 def test_finalizer_rejects_unbound_or_incomplete_ultra_load(mutation: str) -> None:
     module = load_script()
@@ -1181,15 +1181,21 @@ def test_finalizer_rejects_unbound_or_incomplete_ultra_load(mutation: str) -> No
     elif mutation == "profile":
         bound["result"]["profile"] = "legacy"
     elif mutation == "count":
-        bound["result"]["measurements"]["target_projects"] = 999
+        bound["result"]["checks"]["load"]["measurements"]["target_projects"] = 999
     elif mutation == "boolean_count":
-        bound["result"]["measurements"]["restart_traversals"] = True
+        bound["result"]["checks"]["load"]["measurements"]["restart_traversals"] = True
     elif mutation == "unknown":
         bound["result"].update(status="unknown", reasons=["not executed"])
     elif mutation == "extra":
         bound["trusted"] = True
     elif mutation == "nan":
-        bound["result"]["measurements"]["elapsed_seconds"] = float("inf")
+        bound["result"]["checks"]["load"]["measurements"]["elapsed_seconds"] = float("inf")
+    elif mutation == "legacy_load":
+        bound["result"] = bound["result"]["checks"]["load"]
+    elif mutation == "missing_isolation":
+        del bound["result"]["checks"]["data_dir_isolation"]
+    elif mutation == "old_paths":
+        bound["result"]["checks"]["same_version_relocation"]["measurements"]["old_paths_unavailable"] = False
     else:
         case["scale_specific_evidence_ok"] = False
     before = copy.deepcopy(pending)

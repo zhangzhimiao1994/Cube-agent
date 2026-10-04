@@ -29,7 +29,7 @@ from agent_hub.harness.project_requirements import (
     validate_medium_crm_api,
     validate_small_task_api,
     validate_ultra_portfolio_api,
-    validate_ultra_portfolio_load,
+    validate_ultra_portfolio_storage,
 )
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE,
@@ -39,6 +39,7 @@ from agent_hub.harness.project_scale import (
     build_project_scale_run_plan,
 )
 from agent_hub.harness.project_validation_result import (
+    STORAGE_PROFILE,
     scale_validation_manifest_sha256,
     scale_validation_passed,
     validate_scale_validation_result,
@@ -303,7 +304,7 @@ class ProjectScaleCaseResult:
             or not self.run_id
             or bound.get("run_id") != self.run_id
             or self.validated_workspace_manifest is None
-            or not scale_validation_passed(bound.get("result"))
+            or not scale_validation_passed(bound.get("result"), expected_profile=STORAGE_PROFILE)
         ):
             return False
         try:
@@ -2245,7 +2246,9 @@ def _bind_scale_validation(
     run_id: str | None,
     manifest: dict[str, tuple[int, str]] | None,
 ) -> dict[str, object] | None:
-    if result is None or manifest is None or not run_id or not scale_validation_passed(result):
+    if result is None or manifest is None or not run_id or not scale_validation_passed(
+        result, expected_profile=STORAGE_PROFILE,
+    ):
         return None
     return {
         "case_id": case_id, "run_id": run_id,
@@ -2488,20 +2491,8 @@ def _validate_generated_project_bundle(
                         passed=False,
                         reasons=("requirements: independent evaluator unavailable for this scale",),
                     )
-                failures = validator(
-                    root,
-                    timeout_seconds=min(timeout_seconds, remaining_seconds),
-                )
-                if failures:
-                    return _EvidenceCheck(
-                        passed=False,
-                        reasons=tuple(
-                            failure
-                            if failure.casefold().startswith("requirements:")
-                            else f"requirements: {failure}"
-                            for failure in failures
-                        ),
-                    )
+                # Freeze the same built tree before a legacy business probe can
+                # leave working-directory state that would contaminate relocation.
                 if scale == "ultra":
                     remaining_seconds = min(timeout_seconds, absolute_deadline - time.monotonic())
                     if remaining_seconds <= 0:
@@ -2511,14 +2502,15 @@ def _validate_generated_project_bundle(
                         )
                     try:
                         scale_validation = validate_scale_validation_result(
-                            validate_ultra_portfolio_load(root, remaining_seconds)
+                            validate_ultra_portfolio_storage(root, remaining_seconds),
+                            expected_profile=STORAGE_PROFILE,
                         )
                     except (TypeError, ValueError) as error:
                         return _EvidenceCheck(
                             passed=False,
                             reasons=(f"requirements: ultra load unavailable: invalid result: {error}",),
                         )
-                    if not scale_validation_passed(scale_validation):
+                    if not scale_validation_passed(scale_validation, expected_profile=STORAGE_PROFILE):
                         category = (
                             "failed" if scale_validation["status"] == "failed" else "unavailable"
                         )
@@ -2529,6 +2521,22 @@ def _validate_generated_project_bundle(
                                 for reason in cast(list[str], scale_validation["reasons"])
                             ),
                         )
+                remaining_seconds = min(timeout_seconds, absolute_deadline - time.monotonic())
+                if remaining_seconds <= 0:
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=("generated_project_validation: absolute validation deadline exhausted",),
+                    )
+                failures = validator(root, timeout_seconds=remaining_seconds)
+                if failures:
+                    return _EvidenceCheck(
+                        passed=False,
+                        reasons=tuple(
+                            failure if failure.casefold().startswith("requirements:")
+                            else f"requirements: {failure}"
+                            for failure in failures
+                        ),
+                    )
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         return _EvidenceCheck(
             passed=False,
@@ -5024,9 +5032,10 @@ def _compose_capability_repair_message(
         )
         if section
     )
-    guidance_budget = max(0, max_chars - len(suffix) - (1 if suffix else 0))
-    bounded_guidance = _bounded_repair_section(guidance, max_chars=guidance_budget)
-    return " ".join(part for part in (bounded_guidance, suffix) if part)[:max_chars]
+    # Full repair contracts are repository-owned; external sections remain bounded above.
+    # The nominal budget must not truncate required behavior as the contract grows.
+    complete_guidance = " ".join(guidance.split())
+    return " ".join(part for part in (complete_guidance, suffix) if part)
 
 
 def _format_failed_reasons(reasons: Sequence[str]) -> str:

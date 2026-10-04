@@ -3,7 +3,10 @@ from zipfile import ZipFile
 
 import pytest
 
-from agent_hub.harness.project_scale import PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE
+from agent_hub.harness.project_scale import (
+    PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE,
+    PROJECT_ULTRA_LOAD_GUIDANCE,
+)
 from agent_hub.harness.project_scale_runner import (
     _deliverable_repair_body,
     _validate_requested_web_preview,
@@ -102,7 +105,14 @@ def test_preview_repair_contract_survives_bounded_messages(case_id: str, deliver
     )
 
     message = str(repair["message"])
-    assert len(message) <= 6_000
+    lean_repair = _deliverable_repair_body(
+        {"message": "Build a complete interactive website."},
+        case_id, benchmark_kind="capability",
+        source_workspace_bundle=source if delivery != "replacement" else None,
+        force_workspace_replacement=delivery == "forced_replacement",
+    )
+    # Only bounded external sections may grow beyond the complete fixed contract.
+    assert len(message) <= max(6_000, len(str(lean_repair["message"]))) + 1_100 + 800
     assert repair["replace_workspace_files"] is (delivery != "incremental")
     for requirement in (
         "same-origin", "actual backend", "root-relative", "empty string", "allow empty",
@@ -115,6 +125,7 @@ def test_preview_repair_contract_survives_bounded_messages(case_id: str, deliver
         assert "Reference validation order is frozen" in message
         assert "before validating unrelated fields" in message
     if case_id.startswith("ultra:"):
+        assert " ".join(PROJECT_ULTRA_LOAD_GUIDANCE.split()) in message
         assert "Dependency lifecycle is exact" in message
         assert "GET /portfolio/read-model" in message
     if case_id.endswith(":multi_agent"):

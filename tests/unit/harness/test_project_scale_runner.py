@@ -99,7 +99,7 @@ def test_ultra_generated_bundle_requires_independent_load_check(
         calls.append("load")
         return {"status": "unknown", "reasons": ["not executed"]}
 
-    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_load",
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_storage",
                         load_check, raising=False)
     result = project_scale_runner_module._validate_generated_project_bundle(
         _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
@@ -111,8 +111,65 @@ def test_ultra_generated_bundle_requires_independent_load_check(
 
 
 def _ultra_load_result() -> dict[str, object]:
-    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_load_result.json"
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_storage_result.json"
     return cast(dict[str, object], json.loads(fixture.read_text(encoding="utf-8")))
+
+
+def test_storage_gate_rejects_legacy_load_only_binding() -> None:
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_load_result.json"
+    legacy = json.loads(fixture.read_text(encoding="utf-8"))
+    assert project_scale_runner_module._bind_scale_validation(
+        legacy, "ultra:direct", "run-ultra", {"src/app.js": (1, "a" * 64)},
+    ) is None
+
+
+def test_storage_freezes_before_legacy_business_probe_can_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_storage_result.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+    monkeypatch.setattr(project_scale_runner_module, "_run_generated_project_command",
+                        lambda *args, **kwargs: None)
+
+    def storage(root: Path, timeout: float) -> dict[str, object]:
+        assert not (root / "contaminated").exists()
+        calls.append("storage")
+        return cast(dict[str, object], payload)
+
+    def business(root: Path, timeout_seconds: float) -> tuple[str, ...]:
+        (root / "contaminated").write_text("legacy app state", encoding="utf-8")
+        calls.append("business")
+        return ()
+
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_storage",
+                        storage, raising=False)
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_api", business)
+    checked = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
+        timeout_seconds=10, requirements_case_id="ultra:direct",
+    )
+    assert checked.passed, checked.reasons
+    assert calls == ["storage", "business"]
+
+
+def test_storage_unavailable_does_not_invoke_model_repair_or_bind_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.harness.project_validation_result import scale_validation_unknown
+
+    monkeypatch.setattr(project_scale_runner_module, "_run_generated_project_command",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_storage",
+                        lambda *args: scale_validation_unknown(
+                            "nested namespace unavailable", profile="ultra-load-storage-v1",
+                        ))
+    checked = project_scale_runner_module._validate_generated_project_bundle(
+        _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
+        timeout_seconds=10, requirements_case_id="ultra:direct",
+    )
+    assert not checked.passed and checked.scale_validation is None
+    assert not project_scale_runner_module._generated_project_validation_is_repairable(checked)
 
 
 def test_ultra_generated_bundle_preserves_verified_load_result(
@@ -123,7 +180,7 @@ def test_ultra_generated_bundle_preserves_verified_load_result(
     monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_api",
                         lambda *args, **kwargs: ())
     measurements = _ultra_load_result()
-    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_load",
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_storage",
                         lambda *args, **kwargs: measurements)
     result = project_scale_runner_module._validate_generated_project_bundle(
         _project_bundle({"package.json": "{}"}), commands=(("npm", "test"),),
@@ -595,7 +652,10 @@ def test_capability_repair_preserves_failure_and_request_with_many_long_snippets
     assert "Original request" in message
     assert "ORIGINAL_REQUIREMENT" in message
     assert "Current workspace context for precise repair" in message
-    assert len(message) <= 6_000
+    contract, evidence_and_context = message.split("Previous failed evidence", 1)
+    assert "Dependency lifecycle is exact" in contract
+    assert "GET /portfolio/read-model" in contract
+    assert len(evidence_and_context) <= 1_100 + 800 + 1_500 + 22
 
 
 def test_authoritative_capability_repair_requires_preview_entrypoint() -> None:
@@ -2492,6 +2552,8 @@ def test_capability_large_uses_independent_order_requirements(
 def test_capability_ultra_uses_independent_portfolio_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(project_scale_runner_module, "validate_ultra_portfolio_storage",
+                        lambda *args, **kwargs: _ultra_load_result())
     monkeypatch.setattr(
         project_scale_runner_module,
         "validate_ultra_portfolio_api",
@@ -2903,6 +2965,25 @@ def test_compact_repair_budget_has_bounded_contract_expansion() -> None:
 
     assert len(message) <= 6_000
     assert "FAILURE" in message
+
+
+def test_full_repair_budget_preserves_guidance_with_bounded_external_sections() -> None:
+    guidance = "MANDATORY_CONTRACT " * 400
+    evidence = "FAILURE_NOISE " * 20_000
+    original = "REQUEST_NOISE " * 20_000
+    context = "WORKSPACE_NOISE " * 20_000
+    message = project_scale_runner_module._compose_capability_repair_message(
+        guidance=guidance, failed_evidence=evidence, original_request=original,
+        workspace_context=context, max_chars=6_000,
+    )
+
+    contract = " ".join(guidance.split())
+    assert message.startswith(contract + " ")
+    assert len(message) <= len(contract) + 1_100 + 800 + 1_500 + 22
+    assert message.count("FAILURE_NOISE") < 90
+    assert message.count("REQUEST_NOISE") < 65
+    assert message.count("WORKSPACE_NOISE") < 105
+    assert "Original request:" in message
 
 
 def test_report_only_incremental_patch_preserves_source_and_package() -> None:
