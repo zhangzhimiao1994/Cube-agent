@@ -46,16 +46,61 @@ def _log(root: Path, name: str) -> list[dict[str, Any]]:
 
 def _stopped(root: Path) -> list[dict[str, Any]]:
     launches = _log(root, 'launches.jsonl')
+    assert launches, 'npm must actually launch the trusted HTTP fixture'
+    deadline = time.monotonic() + 2
     for launch in launches:
         assert launch['home'] != launch['data']
         assert launch['tmp'] != launch['data']
         for key in ('data', 'home', 'tmp', 'cache'):
             assert not Path(launch[key]).exists(), f'{key} leaked'
         for key in ('port', 'childPort'):
-            with socket.socket() as connection:
-                connection.settimeout(0.2)
-                assert connection.connect_ex(('127.0.0.1', launch[key])) != 0, key
+            while True:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, (
+                    f'{key} still accepts connections after validation (2s cleanup deadline)'
+                )
+                with socket.socket() as connection:
+                    connection.settimeout(min(0.1, remaining))
+                    if connection.connect_ex(('127.0.0.1', launch[key])) != 0:
+                        break
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     return launches
+
+
+@pytest.mark.parametrize('close_later', [True, False])
+@pytest.mark.parametrize('child_only', [True, False])
+def test_load_cleanup_check_waits_for_close_but_rejects_live_listener(
+    tmp_path: Path, close_later: bool, child_only: bool,
+) -> None:
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(128)
+    port = listener.getsockname()[1]
+    non_listener = socket.socket()
+    non_listener.bind(('127.0.0.1', 0))
+    (tmp_path / 'launches.jsonl').write_text(json.dumps({
+        'port': non_listener.getsockname()[1] if child_only else port, 'childPort': port,
+        'data': str(tmp_path / 'removed-data'),
+        'home': str(tmp_path / 'removed-home'),
+        'tmp': str(tmp_path / 'removed-home'),
+        'cache': str(tmp_path / 'removed-home/npm-cache'),
+    }), encoding='utf-8')
+    timer = threading.Timer(0.25, listener.close) if close_later else None
+    started = time.monotonic()
+    try:
+        if timer is not None:
+            timer.start()
+            _stopped(tmp_path)
+        else:
+            with pytest.raises(AssertionError, match='still accepts connections'):
+                _stopped(tmp_path)
+        assert 0.2 <= time.monotonic() - started < 3
+    finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join(timeout=1)
+        listener.close()
+        non_listener.close()
 
 
 def _shape(result: dict[str, Any]) -> None:
