@@ -129,9 +129,12 @@ def validated_workspace_manifest() -> dict[str, tuple[int, str]]:
 def scale_validation_evidence(case_id: str, run_id: str) -> dict[str, object] | None:
     from agent_hub.harness.project_validation_result import scale_validation_manifest_sha256
 
-    if not case_id.startswith("ultra:"):
+    scale = case_id.split(":", 1)[0]
+    if scale not in {"large", "ultra"}:
         return None
-    fixture = Path(__file__).resolve().parents[1] / "fixtures/project_business/ultra_storage_result.json"
+    # Synthetic complete evidence for integration gates, never native acceptance credit.
+    filename = "large_module_result.json" if scale == "large" else "ultra_storage_result.json"
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/project_business" / filename
     return {
         "case_id": case_id, "run_id": run_id,
         "manifest_sha256": scale_validation_manifest_sha256(validated_workspace_manifest()),
@@ -455,6 +458,7 @@ def test_report_accepts_verified_direct_to_hybrid_upgrade_without_direct_coverag
     module = load_script()
     case = ProjectScaleCaseResult(
         validated_workspace_manifest=validated_workspace_manifest(),
+        scale_validation=scale_validation_evidence("large:direct", "run-large"),
         case_id="large:direct",
         run_id="run-large",
         status="completed",
@@ -490,6 +494,7 @@ def test_report_uses_initial_auto_route_when_deliverable_repair_runs_direct() ->
     module = load_script()
     case = ProjectScaleCaseResult(
         validated_workspace_manifest=validated_workspace_manifest(),
+        scale_validation=scale_validation_evidence("large:auto", "run-large-repair"),
         case_id="large:auto",
         run_id="run-large-repair",
         status="completed",
@@ -1202,6 +1207,52 @@ def test_finalizer_rejects_unbound_or_incomplete_ultra_load(mutation: str) -> No
     with pytest.raises(ValueError, match="core"):
         module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"))
     assert pending == before
+
+
+@pytest.mark.parametrize("mutation", ["missing", "old", "wrong_profile", "run", "manifest",
+                                       "count", "isolation", "cleanup", "npm_binding"])
+@pytest.mark.parametrize("finalized", [False, True])
+def test_large_module_evidence_is_revalidated_at_finalize_and_finalized_resume(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    mutation: str, finalized: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    if finalized:
+        saved = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    case = next(row for row in saved["cases"] if row["case_id"] == "large:auto")
+    bound = case["run"]["scale_validation"]
+    if mutation == "missing":
+        case["run"].pop("scale_validation")
+    elif mutation == "old":
+        bound["result"] = {"status": "passed"}
+    elif mutation == "wrong_profile":
+        ultra = next(row for row in saved["cases"] if row["case_id"] == "ultra:auto")
+        bound["result"] = copy.deepcopy(ultra["run"]["scale_validation"]["result"])
+    elif mutation == "run":
+        bound["run_id"] = "old-run"
+    elif mutation == "manifest":
+        bound["manifest_sha256"] = "0" * 64
+    elif mutation == "count":
+        bound["result"]["measurements"]["composition_markers"] = 4
+    elif mutation == "isolation":
+        bound["result"]["isolation_verified"] = False
+    elif mutation == "cleanup":
+        bound["result"]["cleanup_ok"] = False
+    else:
+        bound["result"]["npm_start_module_binding"] = "passed"
+    before = copy.deepcopy(saved)
+    output = tmp_path / "large-report.json"
+    module._write_report(str(output), saved)
+    original_bytes = output.read_bytes()
+    with pytest.raises(ValueError):
+        if finalized:
+            run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+        else:
+            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert output.read_bytes() == original_bytes and saved == before
+    assert not plans
+    assert delegate.requests == ([("GET", "/api/v1/auth/me")] if finalized else [])
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,7 @@ import tarfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -656,6 +656,7 @@ def test_scale_load_unsupported_scale_never_uses_requirements_fallback(
 
 
 @pytest.mark.parametrize(("command", "scale", "validator", "payload"), [
+    ("large-modules", "large", "_validate_large_order_modules", {"status": "unknown"}),
     ("portfolio-load", "ultra", "_validate_ultra_portfolio_load", _load_result()),
     ("portfolio-storage", "ultra", "_validate_ultra_portfolio_storage", {"status": "unknown"}),
     ("requirements", "small", "_validate_small_task_api", ()),
@@ -692,6 +693,9 @@ assert 'agent_hub.harness' not in sys.modules
 
 
 @pytest.mark.parametrize("args", [
+    ["large-modules", "ultra", "10"], ["portfolio-storage", "large", "10"],
+    ["large-modules", "large", "nan"], ["large-modules", "large", "0"],
+    ["large-modules", "large", "invalid"],
     [], ["portfolio-load", "small", "10"], ["portfolio-load", "ultra"],
     ["portfolio-load", "ultra", "10", "extra"], ["unknown", "ultra", "10"],
     ["portfolio-load", "ultra", "nan"], ["portfolio-load", "ultra", "inf"],
@@ -708,3 +712,83 @@ def test_cli_rejects_invalid_load_arguments_before_loading_validator(
         sandbox._main()
     assert exc.value.code == 2
     load.assert_not_called()
+
+
+def _large_result() -> dict[str, Any]:
+    # Synthetic transport evidence, not a native evaluator observation.
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/large_module_result.json"
+    return cast(dict[str, Any], json.loads(fixture.read_text(encoding="utf-8")))
+
+
+def test_large_modules_ipc_uses_private_network_and_exact_profile(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = getattr(sandbox, "validate_scale_modules", None)
+    assert callable(validate), "large public sandbox dispatch required"
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(_large_result()), ""))
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    assert validate(tmp_path, "large", 12.5) == _large_result()
+    command = run.call_args.args[0]
+    assert "--unshare-net" in command
+    assert command[command.index("--") + 1:] == [
+        "/usr/bin/python3", "-I",
+        "/opt/validator/src/agent_hub/harness/project_validation_sandbox.py",
+        "large-modules", "large", "12.5",
+    ]
+
+
+@pytest.mark.parametrize(("operation", "scale", "profile"), [
+    ("portfolio-load", "ultra", "large-module-v1"),
+    ("portfolio-storage", "ultra", "large-module-v1"),
+    ("large-modules", "ultra", "large-module-v1"),
+    ("portfolio-load", "large", "large-module-v1"),
+    ("large-modules", "large", "ultra-load-v1"),
+    ("large-modules", "large", "ultra-load-storage-v1"),
+    ("unknown", "ultra", "ultra-load-v1"),
+])
+def test_scale_operation_profile_pairing_rejected_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, scale: str, profile: str,
+) -> None:
+    from agent_hub.harness.project_validation_result import validate_scale_validation_result
+
+    launch = Mock(side_effect=AssertionError("invalid pairing must not launch"))
+    monkeypatch.setattr(sandbox, "sandbox_command", launch)
+    result = sandbox._validate_scale_check(
+        tmp_path, scale, 10, operation=operation, profile=profile,
+    )
+    assert validate_scale_validation_result(result, expected_profile=profile)["status"] == "unknown"
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "nan", "extra", "profile", "count", "noise",
+                                       "nonzero", "timeout", "unavailable"])
+def test_large_modules_ipc_fails_closed(
+    assembly: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    validate = getattr(sandbox, "validate_scale_modules", None)
+    assert callable(validate), "large public sandbox dispatch required"
+    raw = json.dumps(_large_result())
+    if mutation == "duplicate":
+        raw = raw.replace('"starts": 1', '"starts": 0, "starts": 1')
+    elif mutation == "nan":
+        raw = raw.replace('"elapsed_seconds": 1.25', '"elapsed_seconds": NaN')
+    elif mutation == "extra":
+        raw = raw[:-1] + ', "trusted": true}'
+    elif mutation == "profile":
+        raw = json.dumps(_load_result())
+    elif mutation == "count":
+        raw = raw.replace('"inventory_commits": 14', '"inventory_commits": 13')
+    elif mutation == "noise":
+        raw += "\n{}"
+    run = Mock(return_value=subprocess.CompletedProcess([], 1 if mutation == "nonzero" else 0,
+                                                        raw, ""))
+    if mutation == "timeout":
+        run.side_effect = subprocess.TimeoutExpired("bwrap", 10)
+    if mutation == "unavailable":
+        monkeypatch.setattr(sandbox, "sandbox_available", lambda: False)
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    result = validate(tmp_path, "large", 10)
+    _assert_unknown(result)
+    assert result["profile"] == "large-module-v1" and result["isolation_verified"] is False
+    if mutation == "unavailable":
+        run.assert_not_called()

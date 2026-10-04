@@ -24,6 +24,38 @@ PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE = (
     "mark checks not executed when they were not run. "
     "Do not prefill pass records or fabricate execution. "
 )
+PROJECT_LARGE_MODULE_GUIDANCE = (
+    'Large module contract: package.json.agent_hub_acceptance={version:1,entry:"./dist/acceptance.js"} '
+    "locates a built ESM or CJS entry inside the project; other safe contained paths are allowed. "
+    "Export createInventory({store}), createReporting({read}), and "
+    "createApp({dataDir,inventoryFactory?,reportingFactory?}). Factories and methods may return "
+    "values or Promises. Importing the entry must not start listeners or child processes. "
+    "createInventory returns addStock({sku,quantity}) and reserve({sku,quantity,reason}). "
+    "Success returns {status:201,body:{id,sku,...}}; conflicts return "
+    "{status:409,body:{error:{code,message}}} with nonempty code/message. IDs are nonempty "
+    "strings or integers, never booleans. InventoryState is "
+    "{stock:Record<string,number>,reservations:[{id,sku,quantity,reason?}]}. "
+    "Each call uses exactly one store.transact(update): the store serializes latest-state "
+    "drafts, invokes a synchronous updater, atomically commits stock and reservations, and "
+    "returns its result. Throwing or returning a thenable must not commit. Returning 409 "
+    "does not roll back automatically: conflicts must leave the full draft unchanged. "
+    "Missing SKU means zero stock; addStock adds quantity; reserve deducts quantity. "
+    "Two independent stores must remain isolated; instances sharing a store see current state. "
+    "Two competing reservations for one unit yield exactly one success. "
+    "createReporting returns snapshot(); each call reads current "
+    "{orders:[{payment_state}],reservations:[{quantity}],fulfillment:[{status}]} without mutation. "
+    "Return {orders:{total,authorized_count},inventory:{reserved_units},"
+    "fulfillment:{total,cancelled_count}} as nonnegative integers: count orders, authorized "
+    "payments, sum reservation quantities, count jobs and cancelled jobs. No cached snapshots. "
+    "createApp returns {handler,close}; handler is a Node HTTP request listener, the caller "
+    "owns listening, and close releases app resources. Use the supplied optional factories "
+    "for stock/reservation/report HTTP paths, preserving injected status/body results. "
+    "Independent checks use 2 stores, 3 inventory instances, 14 calls/commits, 10 successes, "
+    "4 conflicts, 1 concurrency pair; 2 reporting instances and 6 snapshots/reads; "
+    "9 composition HTTP requests with 5 changing/random markers and 1 start/stop. "
+    "Existing npm start business and persistence checks remain mandatory; module checks "
+    "do not prove npm-start module binding or seven independently deployable services. "
+)
 PROJECT_ULTRA_LOAD_GUIDANCE = (
     "Portfolio pagination contract: GET /portfolio/read-model accepts offset (default 0, "
     "nonnegative) and limit (default 100, range 1..100). Filter by program_id BEFORE "
@@ -444,6 +476,7 @@ def _capability_message(case: ProjectScaleCase) -> str:
             "and payment.authorized for the corresponding order. "
             "Stock conflicts, duplicate client_request_id order submissions, and completing "
             "cancelled fulfillment jobs must return 409 with {error:{code,message}}."
+            " " + PROJECT_LARGE_MODULE_GUIDANCE
         ),
         "ultra": (
             "Build an ultra-large project: a TypeScript/Node enterprise project portfolio "
@@ -517,6 +550,7 @@ def _capability_message(case: ProjectScaleCase) -> str:
 
 
 __all__ = [
+    "PROJECT_LARGE_MODULE_GUIDANCE",
     "PROJECT_SCALE_CLEANUP_ACTIONS",
     "PROJECT_SCALE_FLOW_KINDS",
     "PROJECT_SCALE_REQUIRED_EVIDENCE",

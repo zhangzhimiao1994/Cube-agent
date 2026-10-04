@@ -25,6 +25,7 @@ from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from agent_hub.harness.project_requirements import (
+    validate_large_order_modules,
     validate_large_order_ops_api,
     validate_medium_crm_api,
     validate_small_task_api,
@@ -32,6 +33,7 @@ from agent_hub.harness.project_requirements import (
     validate_ultra_portfolio_storage,
 )
 from agent_hub.harness.project_scale import (
+    PROJECT_LARGE_MODULE_GUIDANCE,
     PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE,
     PROJECT_ULTRA_LOAD_GUIDANCE,
     ProjectScaleBenchmarkKind,
@@ -39,9 +41,9 @@ from agent_hub.harness.project_scale import (
     build_project_scale_run_plan,
 )
 from agent_hub.harness.project_validation_result import (
-    STORAGE_PROFILE,
     scale_validation_manifest_sha256,
     scale_validation_passed,
+    scale_validation_profile,
     validate_scale_validation_result,
 )
 from agent_hub.harness.project_validation_sandbox import generated_command, sandbox_available
@@ -294,7 +296,8 @@ class ProjectScaleCaseResult:
 
     @property
     def scale_specific_evidence_ok(self) -> bool:
-        if self.case_id.split(":", 1)[0] != "ultra":
+        profile = scale_validation_profile(self.case_id.split(":", 1)[0])
+        if profile is None:
             return True
         bound = self.scale_validation
         if (
@@ -304,7 +307,7 @@ class ProjectScaleCaseResult:
             or not self.run_id
             or bound.get("run_id") != self.run_id
             or self.validated_workspace_manifest is None
-            or not scale_validation_passed(bound.get("result"), expected_profile=STORAGE_PROFILE)
+            or not scale_validation_passed(bound.get("result"), expected_profile=profile)
         ):
             return False
         try:
@@ -2246,8 +2249,9 @@ def _bind_scale_validation(
     run_id: str | None,
     manifest: dict[str, tuple[int, str]] | None,
 ) -> dict[str, object] | None:
-    if result is None or manifest is None or not run_id or not scale_validation_passed(
-        result, expected_profile=STORAGE_PROFILE,
+    profile = scale_validation_profile(case_id.split(":", 1)[0])
+    if profile is None or result is None or manifest is None or not run_id or not scale_validation_passed(
+        result, expected_profile=profile,
     ):
         return None
     return {
@@ -2493,31 +2497,37 @@ def _validate_generated_project_bundle(
                     )
                 # Freeze the same built tree before a legacy business probe can
                 # leave working-directory state that would contaminate relocation.
-                if scale == "ultra":
+                profile = scale_validation_profile(scale)
+                if profile is not None:
+                    scale_validator = {
+                        "large": validate_large_order_modules,
+                        "ultra": validate_ultra_portfolio_storage,
+                    }[scale]
+                    label = "large modules" if scale == "large" else "ultra load"
                     remaining_seconds = min(timeout_seconds, absolute_deadline - time.monotonic())
                     if remaining_seconds <= 0:
                         return _EvidenceCheck(
                             passed=False,
-                            reasons=("requirements: ultra load unavailable: deadline exhausted",),
+                            reasons=(f"requirements: {label} unavailable: deadline exhausted",),
                         )
                     try:
                         scale_validation = validate_scale_validation_result(
-                            validate_ultra_portfolio_storage(root, remaining_seconds),
-                            expected_profile=STORAGE_PROFILE,
+                            scale_validator(root, remaining_seconds),
+                            expected_profile=profile,
                         )
                     except (TypeError, ValueError) as error:
                         return _EvidenceCheck(
                             passed=False,
-                            reasons=(f"requirements: ultra load unavailable: invalid result: {error}",),
+                            reasons=(f"requirements: {label} unavailable: invalid result: {error}",),
                         )
-                    if not scale_validation_passed(scale_validation, expected_profile=STORAGE_PROFILE):
+                    if not scale_validation_passed(scale_validation, expected_profile=profile):
                         category = (
                             "failed" if scale_validation["status"] == "failed" else "unavailable"
                         )
                         return _EvidenceCheck(
                             passed=False,
                             reasons=tuple(
-                                f"requirements: ultra load {category}: {reason}"
+                                f"requirements: {label} {category}: {reason}"
                                 for reason in cast(list[str], scale_validation["reasons"])
                             ),
                         )
@@ -2656,6 +2666,7 @@ def _generated_project_validation_is_repairable(result: _EvidenceCheck) -> bool:
         "temporary data_dir cleanup failed",
         "temporary runtime cleanup failed",
         "ultra load unavailable",
+        "large modules unavailable",
     )
     return not any(
         marker in reason.casefold()
@@ -4385,6 +4396,8 @@ def _deliverable_repair_body(
             guidance += small_guidance
         if case_id.startswith("medium:"):
             guidance += medium_guidance
+        if case_id.startswith("large:"):
+            guidance += PROJECT_LARGE_MODULE_GUIDANCE
         if case_id.startswith("ultra:"):
             guidance += ultra_guidance
         if case_id.endswith(":multi_agent"):
@@ -4404,7 +4417,7 @@ def _deliverable_repair_body(
             f"{PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE}\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
-        max_chars = 6_000 if context or scale == "ultra" else 2_000
+        max_chars = 6_000 if context or scale in {"large", "ultra"} else 2_000
         repair_body["message"] = _compose_capability_repair_message(
             guidance=guidance,
             failed_evidence=reasons,

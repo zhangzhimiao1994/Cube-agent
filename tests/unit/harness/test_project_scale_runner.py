@@ -115,6 +115,16 @@ def _ultra_load_result() -> dict[str, object]:
     return cast(dict[str, object], json.loads(fixture.read_text(encoding="utf-8")))
 
 
+def _synthetic_scale_result(scale: str) -> dict[str, object] | None:
+    if scale == "ultra":
+        return _ultra_load_result()
+    if scale != "large":
+        return None
+    # Complete synthetic protocol evidence for runner tests, not native acceptance credit.
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/large_module_result.json"
+    return cast(dict[str, object], json.loads(fixture.read_text(encoding="utf-8")))
+
+
 def test_storage_gate_rejects_legacy_load_only_binding() -> None:
     fixture = Path(__file__).resolve().parents[2] / "fixtures/project_business/ultra_load_result.json"
     legacy = json.loads(fixture.read_text(encoding="utf-8"))
@@ -2527,6 +2537,8 @@ def test_capability_medium_uses_independent_crm_requirements(
 def test_capability_large_uses_independent_order_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(project_scale_runner_module, "validate_large_order_modules",
+                        lambda *args: _synthetic_scale_result("large"))
     monkeypatch.setattr(
         project_scale_runner_module,
         "validate_large_order_ops_api",
@@ -2873,7 +2885,8 @@ def test_capability_repair_requires_canonical_report_without_changing_delivery(
         assert "If only the report is missing, return only VERIFICATION.md" in message
     else:
         assert "Replace the entire workspace" in message
-    assert len(message) <= (6_000 if delivery != "replacement" or scale == "ultra" else 2_000)
+    assert len(message) <= (6_000 if delivery != "replacement" or scale in {"large", "ultra"}
+                            else 2_000)
 
 
 @pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
@@ -6663,7 +6676,7 @@ def test_public_repair_validation_never_merges_previous_workspace(
 
 
 @pytest.mark.parametrize("delivery", ("initial", "replacement", "materialized_patch"))
-@pytest.mark.parametrize("scale", ("small", "ultra"))
+@pytest.mark.parametrize("scale", ("small", "large", "ultra"))
 def test_validated_workspace_manifest_records_last_successful_input(
     monkeypatch: pytest.MonkeyPatch, delivery: str, scale: str,
 ) -> None:
@@ -6678,7 +6691,7 @@ def test_validated_workspace_manifest_records_last_successful_input(
         return project_scale_runner_module._EvidenceCheck(
             passed=passed,
             reasons=() if passed else ("generated_project_validation: command failed exit=1",),
-            scale_validation=_ultra_load_result() if passed and scale == "ultra" else None,
+            scale_validation=_synthetic_scale_result(scale) if passed else None,
         )
 
     monkeypatch.setattr(project_scale_runner_module, "_validate_generated_project_bundle", validate)
@@ -6694,9 +6707,9 @@ def test_validated_workspace_manifest_records_last_successful_input(
     )
     client = FakeAcceptanceClient(
         run_id=f"run-{scale}-direct", session_id=f"project-scale-{scale}-direct",
-        create_status="waiting_approval" if scale == "ultra" else "completed",
+        create_status="waiting_approval" if scale in {"large", "ultra"} else "completed",
         decision_token="approve-scale", decision_version=2,
-        repair_create_status="waiting_approval" if scale == "ultra" else "completed",
+        repair_create_status="waiting_approval" if scale in {"large", "ultra"} else "completed",
         repair_decision_token="approve-scale-repair", repair_decision_version=3,
         status="completed", artifacts=[{"id": "artifact-1"}],
         events=[_trusted_agent_standard_event()],
@@ -6715,9 +6728,9 @@ def test_validated_workspace_manifest_records_last_successful_input(
     }
     assert result.validated_workspace_manifest == expected
     assert result.scale_specific_evidence_ok
-    if scale == "ultra":
+    if scale in {"large", "ultra"}:
         assert result.scale_validation == project_scale_runner_module._bind_scale_validation(
-            _ultra_load_result(), f"{scale}:direct", result.run_id, expected,
+            _synthetic_scale_result(scale), f"{scale}:direct", result.run_id, expected,
         )
         assert result.run_id == f"run-{scale}-direct" + (
             "" if delivery == "initial" else "-repair"
@@ -6734,7 +6747,7 @@ def test_validated_workspace_manifest_records_last_successful_input(
 
 
 @pytest.mark.parametrize("failure", ("submission", "observation", "build", "requirements", "preview"))
-@pytest.mark.parametrize("scale", ("small", "ultra"))
+@pytest.mark.parametrize("scale", ("small", "large", "ultra"))
 def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     monkeypatch: pytest.MonkeyPatch, failure: str, scale: str,
 ) -> None:
@@ -6748,7 +6761,7 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
         if len(validations) == 1:
             return project_scale_runner_module._EvidenceCheck(
                 passed=True, reasons=(),
-                scale_validation=_ultra_load_result() if scale == "ultra" else None,
+                scale_validation=_synthetic_scale_result(scale),
             )
         if failure == "build":
             raise RuntimeError("build validator failed after repair")
@@ -6758,7 +6771,7 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
             )
         return project_scale_runner_module._EvidenceCheck(
             passed=True, reasons=(),
-            scale_validation=_ultra_load_result() if scale == "ultra" else None,
+            scale_validation=_synthetic_scale_result(scale),
         )
 
     original_observe = project_scale_runner_module._collect_run_observation
@@ -6802,9 +6815,9 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     # Missing trusted process evidence triggers repair after a successful first validation.
     client = FailingRepairClient(
         run_id=f"run-{scale}-direct", session_id=f"project-scale-{scale}-direct",
-        create_status="waiting_approval" if scale == "ultra" else "completed",
+        create_status="waiting_approval" if scale in {"large", "ultra"} else "completed",
         decision_token="approve-scale", decision_version=2,
-        repair_create_status="waiting_approval" if scale == "ultra" else "completed",
+        repair_create_status="waiting_approval" if scale in {"large", "ultra"} else "completed",
         repair_decision_token="approve-scale-repair", repair_decision_version=3,
         status="completed", artifacts=[{"id": "artifact-1"}],
         workspace_bundle=_project_bundle(files), repair_workspace_bundle=_project_bundle(repair_files),
@@ -6820,7 +6833,7 @@ def test_validated_workspace_manifest_clears_after_success_before_failed_repair(
     assert result.to_payload()["validated_workspace_manifest"] is None
     assert result.scale_validation is None
     assert result.to_payload()["scale_validation"] is None
-    assert result.scale_specific_evidence_ok is (scale != "ultra")
+    assert result.scale_specific_evidence_ok is (scale not in {"large", "ultra"})
 
 
 def test_validated_workspace_manifest_defaults_to_none_without_requirements() -> None:

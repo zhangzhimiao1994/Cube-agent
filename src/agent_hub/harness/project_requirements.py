@@ -56,6 +56,20 @@ def validate_large_order_ops_api(root: Path, timeout_seconds: float) -> tuple[st
     return _dispatch_validation(root, timeout_seconds, "large", _validate_large_order_ops_api)
 
 
+def validate_large_order_modules(root: Path, timeout_seconds: float) -> dict[str, object]:
+    if _PLATFORM == "posix":
+        from agent_hub.harness.project_validation_sandbox import validate_scale_modules
+
+        return validate_scale_modules(root, "large", timeout_seconds)
+    # Trusted Windows fixtures can observe behavior but cannot prove isolation.
+    return _validate_large_order_modules(root, timeout_seconds)
+
+
+def _validate_large_order_modules(root: Path, timeout_seconds: float) -> dict[str, object]:
+    evaluator = runpy.run_path(str(Path(__file__).with_name("project_validation_modules.py")))
+    return cast(dict[str, object], evaluator["validate_large_modules"](root, timeout_seconds))
+
+
 def validate_ultra_portfolio_api(root: Path, timeout_seconds: float) -> tuple[str, ...]:
     return _dispatch_validation(root, timeout_seconds, "ultra", _validate_ultra_portfolio_api)
 

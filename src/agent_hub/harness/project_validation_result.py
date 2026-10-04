@@ -1,4 +1,4 @@
-"""Strict, stdlib-only result protocol for ultra portfolio load validation."""
+"""Strict, stdlib-only result protocols for scale-specific validation."""
 
 from __future__ import annotations
 
@@ -29,6 +29,14 @@ _RESULT_KEYS = {
     "schema_version", "profile", "scale", "status", "reasons", "cleanup_ok", "measurements",
 }
 STORAGE_PROFILE = "ultra-load-storage-v1"
+LARGE_MODULE_PROFILE = "large-module-v1"
+_LARGE_COUNTS = {
+    "inventory_stores": 2, "inventory_instances": 3, "inventory_calls": 14,
+    "inventory_commits": 14, "inventory_successes": 10, "inventory_conflicts": 4,
+    "concurrency_pairs": 1, "reporting_instances": 2, "reporting_snapshots": 6,
+    "reporting_reads": 6, "composition_http_requests": 9, "composition_markers": 5,
+    "starts": 1, "stops": 1,
+}
 _ISOLATION_COUNTS = {
     "starts": 3, "stops": 3, "empty_program_checks": 1, "marker_writes": 2,
     "marker_readbacks": 2, "original_program_checks": 2, "marker_absence_checks": 2,
@@ -43,6 +51,11 @@ _DIGESTS = {
 _RELOCATION_EXTRA = {"old_paths_unavailable", "data_files", "data_bytes", *_DIGESTS}
 
 
+def scale_validation_profile(scale: str) -> str | None:
+    """Return the complete acceptance profile for scales with an extra evidence gate."""
+    return {"large": LARGE_MODULE_PROFILE, "ultra": STORAGE_PROFILE}.get(scale)
+
+
 def validate_scale_validation_result(
     payload: object, *, expected_profile: str | None = None,
 ) -> dict[str, object]:
@@ -53,6 +66,8 @@ def validate_scale_validation_result(
         raise ValueError(f"scale validation requires {expected_profile}")
     if isinstance(payload, dict) and payload.get("profile") == STORAGE_PROFILE:
         return _validate_storage_result(payload)
+    if isinstance(payload, dict) and payload.get("profile") == LARGE_MODULE_PROFILE:
+        return _validate_large_result(payload)
     if not isinstance(payload, dict) or payload.keys() != _RESULT_KEYS:
         raise ValueError("scale validation result must have exactly the protocol fields")
     if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
@@ -109,6 +124,13 @@ def scale_validation_unknown(reason: str, *, profile: str = "ultra-load-v1") -> 
     """Describe unavailable validation without inventing measurements or cleanup evidence."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("unknown scale validation requires a nonempty reason")
+    if profile == LARGE_MODULE_PROFILE:
+        return {
+            "schema_version": 1, "profile": LARGE_MODULE_PROFILE, "scale": "large",
+            "status": "unknown", "reasons": [reason], "cleanup_ok": False,
+            "isolation_verified": False, "npm_start_module_binding": "unknown",
+            "measurements": {**dict.fromkeys(_LARGE_COUNTS, 0), "elapsed_seconds": 0.0},
+        }
     if profile == STORAGE_PROFILE:
         def check(measurements: dict[str, object]) -> dict[str, object]:
             return {"status": "unknown", "reasons": [reason], "cleanup_ok": False,
@@ -138,6 +160,46 @@ def scale_validation_unknown(reason: str, *, profile: str = "ultra-load-v1") -> 
         "cleanup_ok": False,
         "measurements": {**dict.fromkeys(_COUNTS, 0), "elapsed_seconds": 0.0},
     }
+
+
+def _validate_large_result(payload: dict[str, object]) -> dict[str, object]:
+    if payload.keys() != _RESULT_KEYS | {"isolation_verified", "npm_start_module_binding"}:
+        raise ValueError("large module result must have exactly the protocol fields")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise ValueError("large module schema_version must be integer 1")
+    if payload["scale"] != "large":
+        raise ValueError("large module profile requires large scale")
+    status = payload["status"]
+    if not isinstance(status, str) or status not in {"passed", "failed", "unknown"}:
+        raise ValueError("invalid large module status")
+    reasons = payload["reasons"]
+    if not isinstance(reasons, list) or any(
+        not isinstance(reason, str) or not reason.strip() for reason in reasons
+    ) or bool(reasons) != (status != "passed"):
+        raise ValueError("large module reasons must match the observed status")
+    for key in ("cleanup_ok", "isolation_verified"):
+        if type(payload[key]) is not bool or (status == "passed" and not payload[key]):
+            raise ValueError(f"large module {key} must be boolean and true for passed")
+    if payload["npm_start_module_binding"] != "unknown":
+        raise ValueError("large module npm_start_module_binding must remain unknown")
+    measurements = payload["measurements"]
+    if not isinstance(measurements, dict) or measurements.keys() != {
+        *_LARGE_COUNTS, "elapsed_seconds",
+    }:
+        raise ValueError("large module measurements must have exactly the profile fields")
+    for key, maximum in _LARGE_COUNTS.items():
+        value = measurements[key]
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ValueError(f"invalid large module count: {key}")
+        if status == "passed" and value != maximum:
+            raise ValueError(f"passed large module validation requires {key}={maximum}")
+    elapsed = measurements["elapsed_seconds"]
+    if (
+        type(elapsed) not in (int, float) or elapsed < 0
+        or (type(elapsed) is float and not math.isfinite(elapsed))
+    ):
+        raise ValueError("large module elapsed_seconds must be finite and nonnegative")
+    return deepcopy(payload)
 
 
 def _storage_status(check: dict[str, object]) -> str:

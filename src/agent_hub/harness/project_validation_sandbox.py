@@ -23,6 +23,11 @@ _VALIDATORS = {
     "large": "_validate_large_order_ops_api",
     "ultra": "_validate_ultra_portfolio_api",
 }
+_SCALE_CHECKS = {
+    "portfolio-load": ("ultra", "ultra-load-v1", "_validate_ultra_portfolio_load"),
+    "portfolio-storage": ("ultra", "ultra-load-storage-v1", "_validate_ultra_portfolio_storage"),
+    "large-modules": ("large", "large-module-v1", "_validate_large_order_modules"),
+}
 
 # Only trusted npm code runs with shared networking. Gate both manifests/locks and
 # live transitive resolution; blocking child processes also excludes Git prepare.
@@ -258,6 +263,11 @@ def validate_scale_storage(root: Path, scale: str, timeout_seconds: float) -> di
                                  profile="ultra-load-storage-v1")
 
 
+def validate_scale_modules(root: Path, scale: str, timeout_seconds: float) -> dict[str, object]:
+    return _validate_scale_check(root, scale, timeout_seconds, operation="large-modules",
+                                 profile="large-module-v1")
+
+
 def _validate_scale_check(
     root: Path, scale: str, timeout_seconds: float, *, operation: str, profile: str,
 ) -> dict[str, object]:
@@ -287,8 +297,9 @@ def _validate_scale_check(
             or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
         ):
             return unknown("timeout_seconds must be finite and positive")
-        if scale != "ultra":
-            return unknown("bwrap sandbox: load evaluator unavailable for this scale")
+        check = _SCALE_CHECKS.get(operation)
+        if check is None or (scale, profile) != check[:2]:
+            return unknown("bwrap sandbox: evaluator unavailable for operation/scale/profile pairing")
         command = sandbox_command(
             (
                 "/usr/bin/python3", "-I",
@@ -304,37 +315,36 @@ def _validate_scale_check(
         )
         if completed.returncode != 0:
             return unknown(
-                f"bwrap sandbox load validator failed: exit={completed.returncode}",
+                f"bwrap sandbox {operation} validator failed: exit={completed.returncode}",
             )
         payload = json.loads(
             completed.stdout, object_pairs_hook=strict_object, parse_constant=reject_constant,
         )
         return validate_scale_validation_result(payload, expected_profile=profile)
     except subprocess.TimeoutExpired:
-        return unknown("timeout: bwrap sandbox load validation deadline exceeded")
+        return unknown(f"timeout: bwrap sandbox {operation} validation deadline exceeded")
     except (OSError, RuntimeError, ValueError, OverflowError) as exc:
-        return unknown(f"bwrap sandbox load validation unavailable: {exc}")
+        return unknown(f"bwrap sandbox {operation} validation unavailable: {exc}")
 
 
 def _main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit(2)
+    try:
+        timeout = float(sys.argv[3])
+    except ValueError:
+        raise SystemExit(2) from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise SystemExit(2)
     if sys.argv[1] == "requirements" and sys.argv[2] in _VALIDATORS:
         validator = _VALIDATORS[sys.argv[2]]
-    elif sys.argv[1] in {"portfolio-load", "portfolio-storage"} and sys.argv[2] == "ultra":
-        try:
-            timeout = float(sys.argv[3])
-        except ValueError:
-            raise SystemExit(2) from None
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise SystemExit(2)
-        validator = ("_validate_ultra_portfolio_storage" if sys.argv[1] == "portfolio-storage"
-                     else "_validate_ultra_portfolio_load")
+    elif sys.argv[1] in _SCALE_CHECKS and sys.argv[2] == _SCALE_CHECKS[sys.argv[1]][0]:
+        validator = _SCALE_CHECKS[sys.argv[1]][2]
     else:
         raise SystemExit(2)
     # Load only the trusted stdlib validator; -I excludes generated cwd/PYTHONPATH.
     validators = runpy.run_path(str(Path(__file__).with_name("project_requirements.py")))
-    result = validators[validator](Path("/workspace"), float(sys.argv[3]))
+    result = validators[validator](Path("/workspace"), timeout)
     print(json.dumps(result))
 
 
