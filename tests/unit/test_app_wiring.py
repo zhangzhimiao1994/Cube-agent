@@ -52,6 +52,9 @@ from agent_hub.routing.types import RiskLevel
 from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings
+from tests.api.test_foundation_api import (
+    unwritable_default_workspace,  # noqa: F401 -- pytest fixture
+)
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -164,8 +167,10 @@ def valid_settings(attachment_store_dir: Path | None = None, **overrides: object
     return Settings.model_validate(values)
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_starts_and_cleanly_stops_scheduler_loop(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     started = threading.Event()
     stopped = threading.Event()
@@ -189,6 +194,7 @@ def test_create_app_starts_and_cleanly_stops_scheduler_loop(
     monkeypatch.setattr(app_module, "_run_scheduler_tick_loop", scheduler_loop)
     application = create_app(
         settings=valid_settings(
+            project_workspace_dir=tmp_path / "workspaces",
             scheduler_enabled=True,
             scheduler_tick_interval_seconds=1.25,
         ),
@@ -211,8 +217,10 @@ def test_create_app_starts_and_cleanly_stops_scheduler_loop(
     assert observed_interval == [1.25]
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_does_not_start_scheduler_loop_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     started = threading.Event()
 
@@ -222,7 +230,7 @@ def test_create_app_does_not_start_scheduler_loop_when_disabled(
 
     monkeypatch.setattr(app_module, "_run_scheduler_tick_loop", scheduler_loop)
     application = create_app(
-        settings=valid_settings(scheduler_enabled=False),
+        settings=valid_settings(scheduler_enabled=False, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=object(),
@@ -239,12 +247,14 @@ def test_create_app_does_not_start_scheduler_loop_when_disabled(
     assert not started.is_set()
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_initializes_trusted_capability_environment_manager(
     tmp_path: Path,
 ) -> None:
     environment_root = tmp_path / "capability-environments"
     application = create_app(
         settings=valid_settings(
+            project_workspace_dir=tmp_path / "workspaces",
             capability_environment_root_dir=environment_root,
             capability_environment_disk_quota_bytes=8 * 1024 * 1024,
         ),
@@ -292,9 +302,10 @@ def test_create_app_mounts_feishu_webhook_on_main_api() -> None:
     assert application.state.channel_runtime_config is None
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path) -> None:
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -324,6 +335,7 @@ def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path
 
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
     tmp_path: Path,
 ) -> None:
@@ -341,7 +353,7 @@ def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
         "FEISHU_TRANSPORT": "websocket",
     }
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -364,6 +376,7 @@ def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
     assert task.done()
     assert client.cancelled.wait(timeout=1)
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_channel_status_exposes_feishu_websocket_runtime_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -379,7 +392,7 @@ def test_channel_status_exposes_feishu_websocket_runtime_diagnostics(
         "FEISHU_TRANSPORT": "websocket",
     }
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -413,6 +426,7 @@ def test_channel_status_exposes_feishu_websocket_runtime_diagnostics(
         "last_error_message": None,
     }
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_feishu_websocket_restarts_when_channel_config_changes(
     tmp_path: Path,
 ) -> None:
@@ -427,7 +441,7 @@ def test_feishu_websocket_restarts_when_channel_config_changes(
 
     admin_service = InMemoryAdminResourceService()
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -485,9 +499,10 @@ def test_feishu_websocket_restarts_when_channel_config_changes(
         assert getattr(application.state, "feishu_websocket_connector", None) is None
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Path) -> None:
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -504,6 +519,7 @@ def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Pa
     assert isinstance(executor, _ConfigBackedMultimediaGenerationExecutor)
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path) -> None:
     config_service = PublishedConfigService(
         {
@@ -532,7 +548,7 @@ def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path
         }
     )
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -559,6 +575,7 @@ def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path
     ).selected_provider == "deepseek"
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -643,7 +660,7 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     monkeypatch.setattr(app_module, "configured_runtime_registry", fake_configured_runtime_registry)
 
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -683,6 +700,7 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     assert isinstance(registry_kwargs["artifact_repository"], FakePostgresArtifactRepository)
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -733,6 +751,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     application = create_app(
         settings=valid_settings(
             tmp_path,
+            project_workspace_dir=tmp_path / "workspaces",
             plugin_package_store_dir=tmp_path / "packages",
             plugin_package_subprocess_runner_enabled=True,
             plugin_package_subprocess_adapter_ids=["calendar_python"],
@@ -780,6 +799,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     )
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -896,7 +916,7 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
 
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),
@@ -994,6 +1014,7 @@ def test_runtime_config_invalidation_listener_restarts_after_listen_failure(
     assert sleep_delays == [0.0]
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_create_app_reads_tool_approval_settings_for_target_tenant(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1056,7 +1077,7 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
 
     admin_service = TenantScopedSettingsService(TENANT_ID)
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=StubAuthService(),

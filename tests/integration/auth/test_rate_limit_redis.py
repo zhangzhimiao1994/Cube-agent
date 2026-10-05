@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -9,6 +10,10 @@ from redis.asyncio import Redis
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, AuthResult, Role
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
+from agent_hub.settings import Settings
+from tests.api.test_foundation_api import (
+    unwritable_default_workspace,  # noqa: F401 -- pytest fixture
+)
 
 
 class AuthStub:
@@ -152,8 +157,10 @@ class EmptyConfigService:
 
 
 @pytest.mark.integration
-async def test_real_redis_readiness_success_and_failure(redis_client: Redis) -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+async def test_real_redis_readiness_success_and_failure(redis_client: Redis, tmp_path: Path) -> None:
     healthy = create_app(
+        settings=Settings.model_validate({"project_workspace_dir": tmp_path / "healthy-workspaces"}),
         auth_service=object(),
         config_service=EmptyConfigService(),
         rate_limiter=object(),
@@ -169,6 +176,7 @@ async def test_real_redis_readiness_success_and_failure(redis_client: Redis) -> 
     unavailable_redis = Redis.from_url("redis://127.0.0.1:1/15")
     try:
         unhealthy = create_app(
+            settings=Settings.model_validate({"project_workspace_dir": tmp_path / "unhealthy-workspaces"}),
             auth_service=object(),
             config_service=EmptyConfigService(),
             rate_limiter=object(),

@@ -25,6 +25,9 @@ from agent_hub.models.types import Deployment, ModelRequest, ModelResponse
 from agent_hub.runs.service import RunService, _safe_route
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
+from tests.api.test_foundation_api import (
+    unwritable_default_workspace,  # noqa: F401 -- pytest fixture
+)
 from tests.unit.models.test_capacity import InMemoryCapacityRedis
 from tests.unit.runs.test_conversation_mode import (
     ConversationModeRepository,
@@ -592,6 +595,7 @@ async def test_auto_submission_unavailable_scope_keeps_local_resolution_metadata
     assert all(d.logical_model == "deepseek" for d, _ in fixture.transport.calls)
 
 
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_app_wires_same_tenant_current_config_to_scoped_router(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -611,7 +615,7 @@ def test_app_wires_same_tenant_current_config_to_scoped_router(
 
     monkeypatch.setattr(_MainAgentModeRouter, "_default_capacity", capacity)
     application = create_app(
-        settings=valid_settings(tmp_path),
+        settings=valid_settings(tmp_path, project_workspace_dir=tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
         auth_service=object(),

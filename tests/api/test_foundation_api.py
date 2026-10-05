@@ -4,6 +4,7 @@ import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Self
 from uuid import UUID, uuid4
 
@@ -13,6 +14,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
+from agent_hub import app as app_module
 from agent_hub.api.middleware import SafeExceptionMiddleware, StreamAbortedError
 from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import _cleanup_owned_resources, create_app
@@ -27,6 +29,19 @@ from agent_hub.auth.models import (
 from agent_hub.config.repository import ConfigNotFoundError, ConfigRevision, ConfigStatus
 from agent_hub.config.service import ConfigPublishedEvent, PostCommitNotificationError
 from agent_hub.settings import Settings
+
+
+@pytest.fixture
+def unwritable_default_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    default_root = Settings.model_construct().project_workspace_dir.resolve()
+    real_mkdir = Path.mkdir
+
+    def mkdir(path: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        if path == default_root or default_root in path.parents:
+            raise PermissionError("nonroot default workspace fixture")
+        real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
 
 
 class Probe:
@@ -241,9 +256,10 @@ async def test_cancelling_ready_request_cancels_and_reaps_both_probes() -> None:
     assert redis.task is not None and redis.task.done()
 
 
-def test_default_development_key_allows_lifespan_to_start() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_default_development_key_allows_lifespan_to_start(tmp_path: Path) -> None:
     app = create_app(
-        settings=Settings.model_validate({}),
+        settings=Settings.model_validate({"project_workspace_dir": tmp_path / "workspaces"}),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
     )
@@ -252,9 +268,10 @@ def test_default_development_key_allows_lifespan_to_start() -> None:
         pass
 
 
-def test_default_app_wires_user_management_service() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_default_app_wires_user_management_service(tmp_path: Path) -> None:
     app = create_app(
-        settings=valid_settings(),
+        settings=valid_settings(tmp_path / "workspaces"),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
     )
@@ -1086,19 +1103,20 @@ class FakeRedis:
         return True
 
 
-def valid_settings() -> Settings:
+def valid_settings(project_workspace_dir: Path) -> Settings:
     key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
     return Settings.model_validate(
-        {"jwt_signing_key": "base64url:" + key}
+        {"jwt_signing_key": "base64url:" + key, "project_workspace_dir": project_workspace_dir}
     )
 
 
-def test_injected_database_and_redis_are_not_closed() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_injected_database_and_redis_are_not_closed(tmp_path: Path) -> None:
     database = FakeDatabase()
     redis = FakeRedis()
     with TestClient(
         create_app(
-            settings=valid_settings(),
+            settings=valid_settings(tmp_path / "workspaces"),
             database=database,
             redis_client=redis,
             auth_service=StubAuthService(),
@@ -1114,14 +1132,16 @@ def test_injected_database_and_redis_are_not_closed() -> None:
     assert redis.closed is False
 
 
-def test_factory_created_database_and_redis_receive_unredacted_urls_and_are_closed() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_factory_created_database_and_redis_receive_unredacted_urls_and_are_closed(tmp_path: Path) -> None:
     database = FakeDatabase()
     redis = FakeRedis()
     database_url = "postgresql+asyncpg://user:SECRET_DB@localhost/application"
     redis_url = "redis://:SECRET_REDIS@localhost:6379/0"
     configured = Settings.model_validate(
         {
-            "jwt_signing_key": valid_settings().jwt_signing_key_value(),
+            "jwt_signing_key": valid_settings(tmp_path / "workspaces").jwt_signing_key_value(),
+            "project_workspace_dir": tmp_path / "workspaces",
             "database_url": database_url,
             "redis_url": redis_url,
         }
@@ -1156,8 +1176,9 @@ def test_factory_created_database_and_redis_receive_unredacted_urls_and_are_clos
     ("redis_fails", "database_fails"),
     [(True, False), (False, True), (True, True)],
 )
+@pytest.mark.usefixtures("unwritable_default_workspace")
 def test_all_owned_resource_cleanups_are_attempted_and_errors_are_safe(
-    redis_fails: bool, database_fails: bool
+    redis_fails: bool, database_fails: bool, tmp_path: Path,
 ) -> None:
     events: list[str] = []
     database = FakeDatabase(
@@ -1169,7 +1190,7 @@ def test_all_owned_resource_cleanups_are_attempted_and_errors_are_safe(
         events=events,
     )
     app = create_app(
-        settings=valid_settings(),
+        settings=valid_settings(tmp_path / "workspaces"),
         database_factory=lambda url: database,
         redis_factory=lambda url: redis,
         database_probe=Probe(),
@@ -1234,14 +1255,15 @@ async def test_cleanup_cancellation_wins_over_ordinary_cleanup_failure(
     assert "LEAK_DB" not in caplog.text
 
 
-def test_primary_startup_error_is_preserved_over_cleanup_cancellation() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_primary_startup_error_is_preserved_over_cleanup_cancellation(tmp_path: Path) -> None:
     events: list[str] = []
     database = FakeDatabase(
         execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"), events=events
     )
     redis = FakeRedis(cleanup_error=asyncio.CancelledError(), events=events)
     app = create_app(
-        settings=valid_settings(),
+        settings=valid_settings(tmp_path / "workspaces"),
         database_factory=lambda url: database,
         redis_factory=lambda url: redis,
     )
@@ -1267,7 +1289,8 @@ def test_fatal_base_exceptions_from_cleanup_are_not_swallowed(
         cleanup.send(None)
 
 
-def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> None:
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_startup_failure_cleans_every_resource_and_preserves_primary_error(tmp_path: Path) -> None:
     events: list[str] = []
     database = FakeDatabase(
         execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"),
@@ -1291,7 +1314,7 @@ def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> 
         return redis
 
     app = create_app(
-        settings=valid_settings(),
+        settings=valid_settings(tmp_path / "workspaces"),
         database_factory=database_factory,
         redis_factory=redis_factory,
     )
@@ -1301,6 +1324,40 @@ def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> 
 
     assert factories == ["database", "redis"]
     assert events == ["redis.aclose", "database.dispose"]
+
+
+@pytest.mark.parametrize("failure", ["constructor", "default_workspace"])
+@pytest.mark.usefixtures("unwritable_default_workspace")
+def test_preview_constructor_failure_precedes_owned_resource_creation(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    factories: list[str] = []
+    events: list[str] = []
+
+    def database_factory(url: str) -> FakeDatabase:
+        factories.append("database")
+        return FakeDatabase(events=events)
+
+    def redis_factory(url: str) -> FakeRedis:
+        factories.append("redis")
+        return FakeRedis(events=events)
+
+    if failure == "constructor":
+        def fail_preview(root: Path) -> None:
+            raise PermissionError("synthetic preview constructor failure")
+
+        monkeypatch.setattr(app_module, "PreviewManager", fail_preview)
+    configured = Settings.model_validate({})
+    assert configured.project_workspace_dir == Path("/var/lib/agent-hub/workspaces")
+    application = create_app(
+        settings=configured, database_factory=database_factory, redis_factory=redis_factory,
+    )
+    expected = "synthetic preview constructor failure" if failure == "constructor" else "nonroot default workspace"
+    with pytest.raises(PermissionError, match=expected), TestClient(application):
+        pass
+    assert factories == []
+    assert events == []
+    assert application.state.preview_manager is None
 
 
 def test_invalid_jwt_key_is_rejected_before_resource_factories_run() -> None:
