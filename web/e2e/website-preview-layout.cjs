@@ -11,8 +11,35 @@ const { chromium, expect } = require('@playwright/test');
 const esbuild = require(require.resolve('esbuild', { paths: [path.dirname(require.resolve('vite'))] }));
 
 const webRoot = path.resolve(__dirname, '..');
-const preview = { id: 'layout-preview', status: 'ready', preview_url: '/child', lease_expires_at: null, application_transport: false };
-const previewPath = '/website-preview/layout-preview?conversation=layout-conversation';
+const previewId = '10000000-0000-4000-8000-000000000010';
+const contentPath = `/api/v1/web-previews/${previewId}/content/`;
+const preview = {
+  id: previewId, status: 'ready', preview_url: contentPath, lease_expires_at: null, application_transport: false,
+  identity: {
+    preview_id: previewId, kind: 'static', tenant_id: '33333333-3333-4333-8333-333333333333',
+    user_id: '11111111-1111-4111-8111-111111111111', project_id: 'layout-project',
+    conversation_id: 'layout-conversation', workspace_session_id: 'layout-session', runtime_handle: null,
+    source: { scheme: 'preview-static-tree-v1', sha256: 'b'.repeat(64) },
+    display_root: '.', display_entrypoint: 'index.html',
+  },
+  cleanup_url: `/api/v1/web-previews/${previewId}/cleanup`, cleanup_receipt: null,
+};
+const observedAt = '2026-10-05T00:00:00Z';
+// Synthetic fixture facts are unknown, never native cleanup proof.
+const stoppedPreview = {
+  ...preview, status: 'stopped', preview_url: null,
+  cleanup_receipt: {
+    schema_version: 1, identity: preview.identity, observation_id: '10000000-0000-4000-8000-000000000011',
+    requested_at: observedAt, observed_at: observedAt, reason: 'explicit', status: 'unknown',
+    coverage: 'static-loopback-v1', unobserved: [],
+    observations: ['serving_thread', 'listener', 'accepted_threads', 'accepted_sockets',
+      'proxy_operations', 'proxy_sockets', 'capability', 'snapshot'].map((resource) => ({
+      resource, observer: 'manager', observed_at: observedAt, result: 'unknown', reason_code: 'not_attempted',
+      load_state: null, active_state: null, main_pid: null, identity_match: null,
+    })),
+  },
+};
+const previewPath = `/website-preview/${previewId}?conversation=layout-conversation`;
 let server;
 let browser;
 let origin;
@@ -43,19 +70,19 @@ before(async () => {
     if (pathname === '/api/v1/web-previews/conversations/layout-conversation' && req.method === 'GET') {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify(preview));
-    } else if (pathname === '/api/v1/web-previews/layout-preview' && req.method === 'DELETE') {
+    } else if (pathname === `/api/v1/web-previews/${previewId}` && req.method === 'DELETE') {
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ ...preview, status: 'stopped', preview_url: null }));
+      res.end(JSON.stringify(stoppedPreview));
     } else if (pathname === '/styles.css') {
       res.setHeader('Content-Type', 'text/css');
       res.end(css);
     } else if (pathname === '/fixture.js') {
       res.setHeader('Content-Type', 'application/javascript');
       res.end(bundle.outputFiles[0].text);
-    } else if (pathname === '/child') {
+    } else if (pathname === contentPath) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body><h1>Local website preview</h1></body></html>');
-    } else if (pathname === '/website-preview/layout-preview') {
+    } else if (pathname === `/website-preview/${previewId}`) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.end('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Website preview layout fixture</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/styles.css"></head><body><div id="root"></div><script src="/fixture.js"></script></body></html>');
     } else {
