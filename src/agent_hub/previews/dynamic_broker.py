@@ -52,6 +52,7 @@ _ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 _PLATFORM = sys.platform
 _PRIVATE_DISK_MIB = 256
 _PROCESS_MEMORY_MIB = 384
+_CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +284,7 @@ def build_systemd_command(policy: PreviewBrokerPolicy, handle: str, stage: str,
     # npm's written cache pages and its heap share the install cgroup's budget.
     memory_mib = _PROCESS_MEMORY_MIB + (_PRIVATE_DISK_MIB if stage == "install" else 0)
     properties = [
+        "Slice=system.slice",
         "BindsTo=agent-hub-preview-broker.service", "After=agent-hub-preview-broker.service",
         f"RequiresMountsFor={work}",
         "DynamicUser=yes", "SupplementaryGroups=", "UMask=0077", "NoNewPrivileges=yes",
@@ -333,6 +335,110 @@ def build_storage_command(policy: PreviewBrokerPolicy, handle: str, owned: Path)
         "--property=After=agent-hub-preview-broker.service", "--property=TimeoutSec=5s",
         "tmpfs", _systemd_path(owned / "work"),
     )
+
+
+def _cleanup_unit_fields(result: subprocess.CompletedProcess[bytes],
+                         required: set[str], unit: str) -> dict[str, str]:
+    if result.returncode != 0:
+        raise RuntimeError("preview cleanup unit query failed")
+    try:
+        lines = result.stdout.decode("ascii").removesuffix("\n").split("\n")
+    except UnicodeError as error:
+        raise RuntimeError("invalid preview cleanup unit observation") from error
+    fields: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key not in required or key in fields:
+            raise RuntimeError("invalid preview cleanup unit observation")
+        fields[key] = value
+    if fields.keys() != required or fields["LoadState"] not in {"loaded", "not-found"}:
+        raise RuntimeError("incomplete or unknown preview cleanup unit observation")
+    if fields["Id"] != unit:
+        raise RuntimeError("invalid resolved preview cleanup unit identity")
+    if fields["ActiveState"] not in {
+        "active", "reloading", "inactive", "failed", "activating", "deactivating",
+        "maintenance", "refreshing",
+    }:
+        raise RuntimeError("unknown preview cleanup unit active state")
+    if fields["LoadState"] == "not-found" and fields["ActiveState"] != "inactive":
+        raise RuntimeError("contradictory missing preview unit observation")
+    return fields
+
+
+def _cleanup_cgroup_present(path: Path) -> bool:
+    # Only absence of the leaf counts. Every parent must remain observable,
+    # immutable and root-owned, so an alias cannot redirect a privileged read.
+    for current in (*reversed(path.parents), path):
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if current == path:
+                return False
+            raise
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError("unsafe preview cleanup cgroup directory")
+    return True
+
+
+def _confirm_cgroup_empty(unit: str) -> None:
+    path = _CGROUP_ROOT / unit
+    if not _cleanup_cgroup_present(path):
+        return
+    try:
+        events = path / "cgroup.events"
+        info = events.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError("unsafe preview cleanup cgroup events")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(events, flags), "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError("unsafe preview cleanup cgroup events")
+            data = stream.read(4097)
+        if len(data) > 4096:
+            raise RuntimeError("oversized preview cleanup cgroup events")
+        try:
+            lines = data.decode("ascii").removesuffix("\n").split("\n")
+        except UnicodeError as error:
+            raise RuntimeError("invalid preview cleanup cgroup events") from error
+        values: dict[str, str] = {}
+        for line in lines:
+            match = re.fullmatch(r"([a-z_]+) ([0-9]+)", line)
+            if match is None or match[1] in values:
+                raise RuntimeError("invalid preview cleanup cgroup events")
+            values[match[1]] = match[2]
+        if values.get("populated") != "0":
+            raise RuntimeError("preview cgroup empty state not confirmed")
+    except (OSError, RuntimeError):
+        # cgroup removal can race the events read; re-observe the exact leaf
+        # through trusted parents before treating unavailable evidence as absent.
+        if not _cleanup_cgroup_present(path):
+            return
+        raise
+
+
+def _owned_storage_mounted(owned: Path) -> bool:
+    work = owned / "work"
+    parent: os.stat_result | None = None
+    # This is the fixed owned tmpfs mountpoint, not a namespace-wide mount scan.
+    # Inspect each ancestor without resolving aliases or suppressing OS errors.
+    for current in (*reversed(owned.parents), owned, work):
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            if current in {owned, work}:
+                return False
+            raise
+        if (not stat.S_ISDIR(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise RuntimeError("unsafe preview cleanup storage directory")
+        if current == work:
+            assert parent is not None
+            return info.st_dev != parent.st_dev or info.st_ino == parent.st_ino
+        parent = info
+    raise RuntimeError("preview storage observation incomplete")
 
 
 @dataclass(slots=True)
@@ -538,15 +644,14 @@ class PreviewBroker:
 
     def _stop_storage(self, session: _Session) -> None:
         unit = session.mount_unit or self._mount_unit_name(session.owned)
+        self._observe_cleanup_unit(unit, service=False)
         stopped = self._command(("/usr/bin/systemctl", "stop", unit))
-        result = self._command(("/usr/bin/systemctl", "show", unit, "--no-pager",
-                                "--property=LoadState,ActiveState"))
-        fields = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
-        if fields.get("LoadState") != "not-found" and (
-            stopped.returncode != 0 or result.returncode != 0 or fields.get("ActiveState") != "inactive"
+        fields = self._observe_cleanup_unit(unit, service=False)
+        if fields["ActiveState"] != "inactive" or (
+            fields["LoadState"] == "loaded" and stopped.returncode != 0
         ):
             raise RuntimeError("PID1 private disk cleanup not confirmed")
-        if os.path.ismount(session.owned / "work"):
+        if _owned_storage_mounted(session.owned):
             raise RuntimeError("private disk remains mounted")
         session.mounted = False
 
@@ -617,31 +722,42 @@ class PreviewBroker:
             process.kill()
         process.wait(timeout=5)
 
+    def _observe_cleanup_unit(self, unit: str, *, service: bool) -> dict[str, str]:
+        properties = "Id,LoadState,ActiveState"
+        if service:
+            properties += ",MainPID,ControlGroup"
+        result = self._command(("/usr/bin/systemctl", "show", unit, "--no-pager",
+                                "--property=" + properties))
+        fields = _cleanup_unit_fields(result, set(properties.split(",")), unit)
+        if not service:
+            return fields
+        if not re.fullmatch(r"0|[1-9][0-9]*", fields["MainPID"]):
+            raise RuntimeError("invalid preview cleanup process observation")
+        group = fields["ControlGroup"]
+        if group not in {"", f"/system.slice/{unit}"}:
+            raise RuntimeError("invalid owned systemd cgroup")
+        if fields["LoadState"] == "not-found" and (fields["MainPID"] != "0" or group):
+            raise RuntimeError("contradictory missing preview unit observation")
+        return fields
+
     def _stop_unit(self, unit: str) -> None:
-        # stop synchronously applies KillMode=control-group. A failed stop never
-        # permits directory deletion/quota release even if MainPID has vanished.
+        identity = re.fullmatch(r"agent-hub-preview-([0-9a-f]{32})-([a-z]+)\.service", unit)
+        if identity is None or identity[2] not in _STAGES:
+            raise RuntimeError("invalid owned preview cleanup unit")
+        # PID1 may resolve a well-shaped name as an alias. Verify the resolved
+        # identity and cgroup before stopping, then require fresh stopped evidence.
+        self._observe_cleanup_unit(unit, service=True)
         stopped = self._command(("/usr/bin/systemctl", "stop", unit))
         if stopped.returncode != 0:
             self._command(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", unit))
-        result = self._command(("/usr/bin/systemctl", "show", unit, "--no-pager",
-                                "--property=LoadState,ActiveState,MainPID,ControlGroup"))
-        fields = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
-        if fields.get("LoadState") == "not-found":
-            return
-        if result.returncode != 0 or fields.get("ActiveState") not in {"inactive", "failed"}:
+        fields = self._observe_cleanup_unit(unit, service=True)
+        if fields["ActiveState"] not in {"inactive", "failed"}:
             raise RuntimeError("preview cgroup stop not confirmed")
-        if fields.get("MainPID") != "0":
+        if fields["MainPID"] != "0":
             raise RuntimeError("preview process remains alive")
-        group = fields.get("ControlGroup", "")
-        if group:
-            path = Path("/sys/fs/cgroup") / group.lstrip("/")
-            if not path.is_relative_to(Path("/sys/fs/cgroup")) or ".." in path.parts:
-                raise RuntimeError("invalid systemd cgroup")
-            events = path / "cgroup.events"
-            if events.exists() and "populated 1" in events.read_text():
-                raise RuntimeError("preview cgroup contains descendants")
-        if stopped.returncode != 0:
+        if fields["LoadState"] == "loaded" and stopped.returncode != 0:
             raise RuntimeError("preview stop failed; retained for retry")
+        _confirm_cgroup_empty(unit)
 
     def _stop(self, session: _Session) -> None:
         with session.lock:
@@ -828,8 +944,10 @@ class PreviewBroker:
                 raise RuntimeError("unrecognized preview recovery state")
             if stat.S_ISLNK(info.st_mode) or (_PLATFORM == "linux" and info.st_mode & 0o022):
                 raise RuntimeError("unsafe preview recovery directory")
+            # A pending mount unit may not yet be visible in this namespace.
+            # Reserve first and query/stop its exact unit through normal cleanup.
             session = _Session(owned.name, "recovered-" + owned.name, object(), owned, 0,
-                               mounted=os.path.ismount(owned / "work"), revoked=True)
+                               mounted=True, revoked=True)
             session.units = {f"agent-hub-preview-{owned.name}-{stage}.service" for stage in _STAGES}
             with self._lock:
                 self._sessions[session.handle] = session

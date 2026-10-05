@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import importlib
 import os
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +30,7 @@ def linux_metadata(monkeypatch: pytest.MonkeyPatch, metadata: dict[Path, tuple[i
         uid, mode = metadata[path]
         values = list(actual)
         values[0], values[4] = mode, uid
-        return os.stat_result(values)
+        return os.stat_result(values, {"st_file_attributes": getattr(actual, "st_file_attributes", 0)})
 
     monkeypatch.setattr(Path, "lstat", lstat)
     monkeypatch.setattr(broker(), "sys", SimpleNamespace(platform="linux"))
@@ -104,7 +106,7 @@ def test_fixed_systemd_isolation_and_resource_contract(tmp_path: Path, stage: st
     joined = " ".join(command)
     assert command[0] == "/usr/bin/systemd-run"
     assert "SupplementaryGroups=agent-hub" not in joined
-    for required in ["KillMode=control-group", "TasksMax=", "MemoryMax=", "CPUQuota=",
+    for required in ["Slice=system.slice", "KillMode=control-group", "TasksMax=", "MemoryMax=", "CPUQuota=",
                      "LimitFSIZE=", "NoNewPrivileges=yes", "ProtectHome=yes", "RootDirectory=",
                      "InaccessiblePaths=", "/usr/bin/python3", " -I ", "dynamic_runner.py"]:
         assert required in joined
@@ -225,19 +227,574 @@ def test_cgroup_descendants_block_cleanup_even_without_main_pid(
     _, policy = prepared(tmp_path)
     service = mod.PreviewBroker(policy)
     observed: list[tuple[str, ...]] = []
+    unit = f"agent-hub-preview-{'a' * 32}-start.service"
 
     def command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         observed.append(argv)
         if "show" in argv:
             return subprocess.CompletedProcess(argv, 0,
-                b"LoadState=loaded\nActiveState=deactivating\nMainPID=0\nControlGroup=/fixture\n")
+                (f"Id={unit}\nLoadState=loaded\nActiveState=deactivating\n"
+                 f"MainPID=0\nControlGroup=/system.slice/{unit}\n").encode())
         return subprocess.CompletedProcess(argv, 0, b"")
 
     monkeypatch.setattr(service, "_command", command)
     with pytest.raises(RuntimeError, match="cgroup"):
-        service._stop_unit("agent-hub-preview-fixture-start.service")
-    assert observed[0][1] == "stop"
-    assert "show" in observed[1]
+        service._stop_unit(unit)
+    assert [call[1] for call in observed] == ["show", "stop", "show"]
+
+
+_CLEANUP_UNIT = "agent-hub-preview-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-start.service"
+_CLEANUP_GROUP = "/system.slice/" + _CLEANUP_UNIT
+_CLEANUP_ABSENT = b"LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlGroup=\n"
+_CLEANUP_LOADED = b"LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlGroup=\n"
+
+
+@pytest.fixture
+def cleanup_cgroup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An owned temporary filesystem, with Linux directory metadata on Windows."""
+    root = tmp_path / "cgroup" / "system.slice"
+    root.mkdir(parents=True)
+    group = root / _CLEANUP_UNIT
+    metadata = dict.fromkeys((group, root, *root.parents), (0, stat.S_IFDIR | 0o755))
+    linux_metadata(monkeypatch, metadata)
+    monkeypatch.setattr(broker(), "_CGROUP_ROOT", root, raising=False)
+    return group
+
+
+def cleanup_commands(
+    monkeypatch: pytest.MonkeyPatch, service: Any, unit: str, output: bytes,
+    *, query_rc: int = 0, stop_rc: int = 0,
+) -> list[tuple[str, ...]]:
+    calls: list[tuple[str, ...]] = []
+
+    def command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        assert argv[0] == "/usr/bin/systemctl"
+        if argv[1] == "show":
+            properties = "Id,LoadState,ActiveState"
+            if not unit.endswith(".mount"):
+                properties += ",MainPID,ControlGroup"
+            assert argv == (argv[0], "show", unit, "--no-pager", "--property=" + properties)
+            return subprocess.CompletedProcess(argv, query_rc, b"Id=" + unit.encode() + b"\n" + output)
+        if argv[1] == "stop":
+            assert argv == (argv[0], "stop", unit)
+            return subprocess.CompletedProcess(argv, stop_rc, b"")
+        assert argv == (argv[0], "kill", "--kill-whom=all", "--signal=KILL", unit)
+        return subprocess.CompletedProcess(argv, 0, b"")
+
+    monkeypatch.setattr(service, "_command", command)
+    return calls
+
+
+def cleanup_identity_commands(
+    monkeypatch: pytest.MonkeyPatch, service: Any, unit: str, before: bytes, after: bytes,
+    *, pre_rc: int = 0, stop_rc: int = 0,
+) -> list[str]:
+    calls: list[str] = []
+
+    def command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        assert argv[0] == "/usr/bin/systemctl" and unit in argv
+        calls.append(argv[1])
+        if argv[1] == "show":
+            properties = "Id,LoadState,ActiveState"
+            if unit.endswith(".service"):
+                properties += ",MainPID,ControlGroup"
+            assert argv == (argv[0], "show", unit, "--no-pager", "--property=" + properties)
+            first = calls.count("show") == 1
+            return subprocess.CompletedProcess(argv, pre_rc if first else 0,
+                                               before if first else after)
+        return subprocess.CompletedProcess(argv, stop_rc if argv[1] == "stop" else 0, b"")
+
+    monkeypatch.setattr(service, "_command", command)
+    return calls
+
+
+@pytest.mark.parametrize("fault", [
+    "alias", "foreign-cgroup", "missing-id", "duplicate-id", "query-failed",
+    "malformed", "missing-state", "unknown-state", "malformed-pid", "contradictory-absent",
+])
+@pytest.mark.parametrize("stop_rc", [0, 1])
+def test_cleanup_prequery_rejects_unowned_or_unknown_service_before_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, stop_rc: int,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    before = b"Id=" + _CLEANUP_UNIT.encode() + b"\n" + _CLEANUP_LOADED
+    if fault == "alias":
+        before = before.replace(_CLEANUP_UNIT.encode(), _CLEANUP_UNIT.replace("start", "build").encode())
+    elif fault == "foreign-cgroup":
+        before = before.replace(b"ControlGroup=", b"ControlGroup=/system.slice/unrelated.service")
+    elif fault == "missing-id":
+        before = _CLEANUP_LOADED
+    elif fault == "duplicate-id":
+        before += b"Id=" + _CLEANUP_UNIT.encode() + b"\n"
+    elif fault == "malformed":
+        before += b"malformed\n"
+    elif fault == "missing-state":
+        before = before.replace(b"ActiveState=inactive\n", b"")
+    elif fault == "unknown-state":
+        before = before.replace(b"inactive", b"unknown")
+    elif fault == "malformed-pid":
+        before = before.replace(b"MainPID=0", b"MainPID=-1")
+    elif fault == "contradictory-absent":
+        before = before.replace(b"loaded", b"not-found").replace(b"MainPID=0", b"MainPID=12")
+    calls = cleanup_identity_commands(monkeypatch, service, _CLEANUP_UNIT, before, before,
+                                      pre_rc=int(fault == "query-failed"), stop_rc=stop_rc)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(_CLEANUP_UNIT)
+    assert calls == ["show"]
+
+
+@pytest.mark.parametrize("stage", ["install", "build", "start", "probe"])
+@pytest.mark.parametrize("state", ["active", "activating", "deactivating"])
+def test_cleanup_prequery_accepts_running_owned_service_then_checks_stopped_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    stage: str, state: str,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    unit = _CLEANUP_UNIT.replace("-start", "-" + stage)
+    identity = b"Id=" + unit.encode() + b"\n"
+    before = identity + (f"LoadState=loaded\nActiveState={state}\nMainPID=123\n"
+                         f"ControlGroup=/system.slice/{unit}\n").encode()
+    calls = cleanup_identity_commands(monkeypatch, service, unit, before, identity + _CLEANUP_ABSENT)
+    service._stop_unit(unit)
+    assert calls == ["show", "stop", "show"]
+
+
+@pytest.mark.parametrize("after", [
+    b"Id=unrelated.service\n" + _CLEANUP_ABSENT,
+    b"Id=" + _CLEANUP_UNIT.encode() + b"\n" + _CLEANUP_LOADED.replace(b"MainPID=0", b"MainPID=12"),
+    b"Id=" + _CLEANUP_UNIT.encode() + b"\n" + _CLEANUP_LOADED.replace(b"ControlGroup=", b"ControlGroup=/other"),
+])
+def test_cleanup_prequery_does_not_replace_post_stop_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after: bytes,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    before = b"Id=" + _CLEANUP_UNIT.encode() + b"\n" + _CLEANUP_LOADED
+    calls = cleanup_identity_commands(monkeypatch, service, _CLEANUP_UNIT, before, after)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(_CLEANUP_UNIT)
+    assert calls == ["show", "stop", "show"]
+
+
+@pytest.mark.parametrize("fault", ["alias", "missing-id", "query-failed", "contradictory-absent"])
+def test_cleanup_prequery_rejects_unowned_or_unknown_mount_before_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    mod = broker()
+    service = mod.PreviewBroker(prepared(tmp_path)[1])
+    session = mod._Session("a" * 32, "fixture", object(), tmp_path, 0,
+                           mounted=True, mount_unit="fixture.mount")
+    before = b"Id=fixture.mount\nLoadState=loaded\nActiveState=active\n"
+    if fault == "alias":
+        before = before.replace(b"Id=fixture.mount", b"Id=foreign.mount")
+    elif fault == "missing-id":
+        before = before.replace(b"Id=fixture.mount\n", b"")
+    elif fault == "contradictory-absent":
+        before = before.replace(b"loaded", b"not-found")
+    calls = cleanup_identity_commands(monkeypatch, service, "fixture.mount", before, before,
+                                      pre_rc=int(fault == "query-failed"))
+    with pytest.raises(RuntimeError):
+        service._stop_storage(session)
+    assert calls == ["show"] and session.mounted
+
+
+@pytest.mark.parametrize("entry", ["stop", "restart"])
+@pytest.mark.parametrize("target", ["work", "owned"])
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO])
+def test_cleanup_mount_lstat_error_retains_quota_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    entry: str, target: str, error_number: int,
+) -> None:
+    import posixpath
+    from dataclasses import replace
+    mod = broker()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    service = mod.PreviewBroker(replace(prepared(tmp_path)[1], runtime_root=runtime, max_sessions=1))
+    session = service._reserve("fixture", object(), 30)
+    session.mounted = True
+    session.mount_unit = "fixture.mount"
+    work = session.owned / "work"
+    work.mkdir()
+    before = b"Id=fixture.mount\nLoadState=loaded\nActiveState=active\n"
+    after = b"Id=fixture.mount\nLoadState=loaded\nActiveState=inactive\n"
+    calls: list[str] = []
+
+    def command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv[1])
+        if argv[1] == "show":
+            assert argv[-1] == "--property=Id,LoadState,ActiveState"
+            data = before if calls.count("show") == 1 else after
+            return subprocess.CompletedProcess(argv, 0, data)
+        return subprocess.CompletedProcess(argv, 0, b"")
+
+    monkeypatch.setattr(service, "_command", command)
+    monkeypatch.setattr(service, "_mount_unit_name", lambda owned: "fixture.mount")
+    monkeypatch.setattr(service, "_stop_unit", lambda unit: None)
+    monkeypatch.setattr(os.path, "ismount", posixpath.ismount)
+    actual_lstat = os.lstat
+    failures: list[int] = []
+    selected = work if target == "work" else session.owned
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path) == selected and not failures and (target == "work" or "show" in calls):
+            failures.append(error_number)
+            raise OSError(error_number, "fixture mount observation unavailable")
+        return actual_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    if entry == "restart":
+        service._sessions.clear()
+    with pytest.raises((OSError, RuntimeError)):
+        service.recover() if entry == "restart" else service._stop(session)
+    assert failures == [error_number]
+    retained = service._sessions[session.handle]
+    assert retained.mounted and not retained.stopped and retained.revoked
+    assert work.is_dir() and session.handle not in service._completed
+    with pytest.raises(RuntimeError, match="capacity"):
+        service._reserve("blocked", object(), 30)
+    service.reap()
+    assert not service._sessions and not session.owned.exists()
+    assert session.handle in service._completed
+    assert service._reserve("new", object(), 30).handle in service._sessions
+
+
+@pytest.mark.parametrize("state", ["pending", "never-created"])
+@pytest.mark.parametrize("work_exists", [False, True])
+def test_cleanup_restart_checks_mount_unit_even_without_visible_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, work_exists: bool,
+) -> None:
+    from dataclasses import replace
+    mod = broker()
+    runtime = tmp_path / "runtime"
+    owned = runtime / ("a" * 32)
+    owned.mkdir(parents=True)
+    if work_exists:
+        (owned / "work").mkdir()
+    service = mod.PreviewBroker(replace(prepared(tmp_path)[1], runtime_root=runtime))
+    linux_metadata(monkeypatch, {owned: (0, stat.S_IFDIR | 0o755)})
+    monkeypatch.setattr(service, "_stop_unit", lambda unit: None)
+    monkeypatch.setattr(service, "_mount_unit_name", lambda path: "fixture.mount")
+    before = b"Id=fixture.mount\nLoadState=loaded\nActiveState=activating\n"
+    after = b"Id=fixture.mount\nLoadState=not-found\nActiveState=inactive\n"
+    calls = cleanup_identity_commands(monkeypatch, service, "fixture.mount",
+                                      before if state == "pending" else after, after,
+                                      stop_rc=0 if state == "pending" else 5)
+    service.recover()
+    assert calls == ["show", "stop", "show"]
+    assert not owned.exists() and not service._sessions
+    assert owned.name in service._completed
+
+
+@pytest.mark.parametrize("output,query_rc", [
+    pytest.param(_CLEANUP_ABSENT, 1, id="failed-not-found-query"),
+    pytest.param(_CLEANUP_LOADED, 1, id="failed-loaded-query"),
+    pytest.param(b"", 0, id="empty"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"inactive", b"active"), 0, id="not-found-active"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"inactive", b"failed"), 0, id="not-found-failed"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"MainPID=0", b"MainPID=9"), 0, id="not-found-pid"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"ControlGroup=", b"ControlGroup=" + _CLEANUP_GROUP.encode()), 0, id="not-found-group"),
+    pytest.param(_CLEANUP_LOADED.replace(b"LoadState=loaded\n", b""), 0, id="missing-load"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"ActiveState=inactive\n", b""), 0, id="missing-active"),
+    pytest.param(_CLEANUP_ABSENT.replace(b"MainPID=0\n", b""), 0, id="missing-pid"),
+    pytest.param(_CLEANUP_LOADED.replace(b"ControlGroup=\n", b""), 0, id="missing-group"),
+    pytest.param(_CLEANUP_LOADED.replace(b"loaded", b"error"), 0, id="unknown-load"),
+    pytest.param(_CLEANUP_LOADED.replace(b"inactive", b"deactivating"), 0, id="still-stopping"),
+    pytest.param(_CLEANUP_LOADED.replace(b"MainPID=0", b"MainPID=00"), 0, id="malformed-pid"),
+    pytest.param(_CLEANUP_LOADED + b"garbage\n", 0, id="malformed-line"),
+    pytest.param(_CLEANUP_LOADED.replace(b"\n", b"\v"), 0, id="malformed-line-ending"),
+    pytest.param(_CLEANUP_LOADED + b"Unknown=value\n", 0, id="unexpected-field"),
+    pytest.param(_CLEANUP_LOADED + b"\xff\n", 0, id="invalid-encoding"),
+    *[pytest.param(_CLEANUP_LOADED + line + b"\n", 0, id="duplicate-" + line.split(b"=")[0].decode())
+      for line in _CLEANUP_LOADED.splitlines()],
+])
+def test_cleanup_rejects_unknown_service_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    output: bytes, query_rc: int,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, output, query_rc=query_rc)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(_CLEANUP_UNIT)
+
+
+@pytest.mark.parametrize("unit", [
+    "other.service", "agent-hub-preview-fixture-start.service",
+    _CLEANUP_UNIT.replace("-start", "-shell"), _CLEANUP_UNIT.replace("aaaa", "AAAA"),
+    "../" + _CLEANUP_UNIT, _CLEANUP_UNIT + "/child", _CLEANUP_UNIT + "\n",
+])
+def test_cleanup_rejects_nonowned_unit_before_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit: str,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    calls = cleanup_commands(monkeypatch, service, unit, _CLEANUP_ABSENT)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(unit)
+    assert calls == []
+
+
+@pytest.mark.parametrize("reported", [
+    "/unrelated.service", _CLEANUP_GROUP + "/child", _CLEANUP_GROUP + "/../other",
+    "/system.slice//" + _CLEANUP_UNIT, "/system.slice/./" + _CLEANUP_UNIT,
+    _CLEANUP_GROUP.replace("system.slice", "user.slice"),
+    _CLEANUP_GROUP.replace("aaaa", "bbbb"), _CLEANUP_GROUP.replace("-start", "-build"),
+    _CLEANUP_GROUP + "/", _CLEANUP_GROUP.removeprefix("/"),
+    _CLEANUP_GROUP.replace("-start", "\\x2dstart"),
+])
+def test_cleanup_rejects_cgroup_alias_without_reading_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path, reported: str,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    output = _CLEANUP_LOADED.replace(b"ControlGroup=", b"ControlGroup=" + reported.encode())
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, output)
+
+    def unexpected_read(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("mismatched systemd path must not cause filesystem reads")
+
+    monkeypatch.setattr(Path, "lstat", unexpected_read)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(_CLEANUP_UNIT)
+
+
+@pytest.mark.parametrize("output", [_CLEANUP_ABSENT, _CLEANUP_LOADED])
+@pytest.mark.parametrize("events", [
+    None, b"", b"frozen 0\n", b"populated 1\n", b"populated 2\n", b"populated 00\n",
+    b"populated 0\npopulated 0\n", b"populated 1\npopulated 0\n",
+    b"populated=0\n", b"populated 0 extra\n", b"populated 0\ngarbage\n", b"\xff\n",
+    pytest.param(b"populated 0\vfrozen 0\n", id="malformed-line-ending"),
+])
+def test_cleanup_rejects_surviving_canonical_cgroup_without_empty_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    output: bytes, events: bytes | None,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, output)
+    cleanup_cgroup.mkdir()
+    if events is not None:
+        (cleanup_cgroup / "cgroup.events").write_bytes(events)
+    with pytest.raises((OSError, RuntimeError)):
+        service._stop_unit(_CLEANUP_UNIT)
+
+
+@pytest.mark.parametrize("output,stop_rc", [
+    (_CLEANUP_ABSENT, 0), (_CLEANUP_ABSENT, 5), (_CLEANUP_LOADED, 0),
+    (_CLEANUP_LOADED.replace(b"inactive", b"failed"), 0),
+    (_CLEANUP_LOADED.replace(b"ControlGroup=", b"ControlGroup=" + _CLEANUP_GROUP.encode()), 0),
+])
+@pytest.mark.parametrize("exists", [False, True])
+def test_cleanup_accepts_confirmed_absent_or_empty_cgroup_idempotently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    output: bytes, stop_rc: int, exists: bool,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, output, stop_rc=stop_rc)
+    if exists:
+        cleanup_cgroup.mkdir()
+        (cleanup_cgroup / "cgroup.events").write_bytes(b"populated 0\nfrozen 0\n")
+    service._stop_unit(_CLEANUP_UNIT)
+    service._stop_unit(_CLEANUP_UNIT)
+
+
+def test_cleanup_loaded_unit_retains_failed_stop_even_with_empty_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    calls = cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, _CLEANUP_LOADED, stop_rc=1)
+    with pytest.raises(RuntimeError):
+        service._stop_unit(_CLEANUP_UNIT)
+    assert [call[1] for call in calls] == ["show", "stop", "kill", "show"]
+
+
+@pytest.mark.parametrize("target", ["parent", "group", "events"])
+@pytest.mark.parametrize("kind", ["permission", "io", "link", "reparse", "wrong-type"])
+def test_cleanup_rejects_unobservable_or_aliased_cgroup_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    target: str, kind: str,
+) -> None:
+    from types import SimpleNamespace
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, _CLEANUP_ABSENT)
+    cleanup_cgroup.mkdir()
+    events = cleanup_cgroup / "cgroup.events"
+    events.write_bytes(b"populated 0\n")
+    selected = {"parent": cleanup_cgroup.parent, "group": cleanup_cgroup, "events": events}[target]
+    original = Path.lstat
+
+    def lstat(path: Path) -> Any:
+        info = original(path)
+        if path != selected:
+            return info
+        if kind == "permission":
+            raise PermissionError("fixture")
+        if kind == "io":
+            raise OSError("fixture")
+        return SimpleNamespace(
+            st_mode=(stat.S_IFLNK if kind == "link" else stat.S_IFIFO if kind == "wrong-type"
+                     else info.st_mode) | 0o555,
+            st_uid=0, st_file_attributes=0x400 if kind == "reparse" else 0, st_nlink=1,
+        )
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises((OSError, RuntimeError)):
+        service._stop_unit(_CLEANUP_UNIT)
+
+
+@pytest.mark.parametrize("disappear", ["none", "group", "parent"])
+@pytest.mark.parametrize("error_type", [PermissionError, FileNotFoundError, OSError])
+def test_cleanup_event_read_failure_requires_explicit_group_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path,
+    disappear: str, error_type: type[OSError],
+) -> None:
+    service = broker().PreviewBroker(prepared(tmp_path)[1])
+    cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, _CLEANUP_ABSENT)
+    cleanup_cgroup.mkdir()
+    events = cleanup_cgroup / "cgroup.events"
+    events.write_bytes(b"populated 0\n")
+    original = os.open
+    attempted = False
+
+    def open_events(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal attempted
+        if Path(path) == events:
+            attempted = True
+            if disappear != "none":
+                events.unlink()
+                cleanup_cgroup.rmdir()
+                if disappear == "parent":
+                    cleanup_cgroup.parent.rmdir()
+            raise error_type("fixture")
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_events)
+    if disappear == "group":
+        service._stop_unit(_CLEANUP_UNIT)
+    else:
+        with pytest.raises((OSError, RuntimeError)):
+            service._stop_unit(_CLEANUP_UNIT)
+    assert attempted
+
+
+@pytest.mark.parametrize("output,query_rc,stop_rc,mounted", [
+    (b"LoadState=not-found\nActiveState=inactive\n", 1, 0, False),
+    (b"LoadState=not-found\nActiveState=active\n", 0, 0, False),
+    (b"LoadState=not-found\n", 0, 0, False),
+    (b"ActiveState=inactive\n", 0, 0, False),
+    (b"LoadState=error\nActiveState=inactive\n", 0, 0, False),
+    (b"LoadState=loaded\nActiveState=inactive\nLoadState=not-found\n", 0, 0, False),
+    (b"LoadState=loaded\nActiveState=active\nActiveState=inactive\n", 0, 0, False),
+    (b"LoadState=loaded\nActiveState=inactive\nmalformed\n", 0, 0, False),
+    pytest.param(b"LoadState=loaded\vActiveState=inactive\n", 0, 0, False,
+                 id="malformed-line-ending"),
+    (b"LoadState=loaded\nActiveState=inactive\n\xff\n", 0, 0, False),
+    (b"LoadState=loaded\nActiveState=inactive\n", 1, 0, False),
+    (b"LoadState=loaded\nActiveState=inactive\n", 0, 1, False),
+    (b"LoadState=loaded\nActiveState=active\n", 0, 0, False),
+    (b"LoadState=not-found\nActiveState=inactive\n", 0, 0, True),
+    (b"LoadState=loaded\nActiveState=inactive\n", 0, 0, True),
+])
+def test_cleanup_rejects_unknown_or_surviving_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    output: bytes, query_rc: int, stop_rc: int, mounted: bool,
+) -> None:
+    mod = broker()
+    service = mod.PreviewBroker(prepared(tmp_path)[1])
+    session = mod._Session("a" * 32, "fixture", object(), tmp_path, 0,
+                           mounted=True, mount_unit="fixture.mount")
+    cleanup_commands(monkeypatch, service, "fixture.mount", output,
+                     query_rc=query_rc, stop_rc=stop_rc)
+    work = tmp_path / "work"
+    work.mkdir()
+    actual_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = actual_lstat(path, *args, **kwargs)
+        if Path(path) == work and mounted:
+            values = list(info)
+            values[2] += 1
+            return os.stat_result(values, {"st_file_attributes": getattr(info, "st_file_attributes", 0)})
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(RuntimeError):
+        service._stop_storage(session)
+    assert session.mounted
+
+
+@pytest.mark.parametrize("load,stop_rc", [("loaded", 0), ("not-found", 0), ("not-found", 5)])
+def test_cleanup_accepts_confirmed_unmounted_storage_idempotently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load: str, stop_rc: int,
+) -> None:
+    mod = broker()
+    service = mod.PreviewBroker(prepared(tmp_path)[1])
+    session = mod._Session("a" * 32, "fixture", object(), tmp_path, 0,
+                           mounted=True, mount_unit="fixture.mount")
+    output = f"LoadState={load}\nActiveState=inactive\n".encode()
+    cleanup_commands(monkeypatch, service, "fixture.mount", output, stop_rc=stop_rc)
+    service._stop_storage(session)
+    assert not session.mounted
+    service._stop_storage(session)
+
+
+@pytest.mark.parametrize("failure", ["query", "cgroup", "mount", "remove"])
+def test_cleanup_failure_retains_resources_quota_and_reaper_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_cgroup: Path, failure: str,
+) -> None:
+    import shutil
+    from dataclasses import replace
+    from types import SimpleNamespace
+    mod = broker()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    service = mod.PreviewBroker(replace(prepared(tmp_path)[1], runtime_root=runtime, max_sessions=2))
+    with monkeypatch.context() as fixed_handle:
+        fixed_handle.setattr(mod.uuid, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
+        failed = service._reserve("failed", object(), 30)
+    other = service._reserve("other", object(), 30)
+    failed.revoked = other.revoked = True
+    failed.units.add(_CLEANUP_UNIT)
+    (failed.owned / "sentinel").write_text("retained")
+    cleanup_cgroup.mkdir()
+    events = cleanup_cgroup / "cgroup.events"
+    events.write_bytes(b"populated 1\n" if failure == "cgroup" else b"populated 0\n")
+    if failure == "mount":
+        failed.units.clear()
+        failed.mounted = True
+        failed.mount_unit = "fixture.mount"
+        cleanup_commands(monkeypatch, service, "fixture.mount",
+                         b"LoadState=not-found\nActiveState=active\n")
+    else:
+        cleanup_commands(monkeypatch, service, _CLEANUP_UNIT, _CLEANUP_ABSENT,
+                         query_rc=1 if failure == "query" else 0)
+    remove = shutil.rmtree
+
+    def remove_owned(path: Path) -> None:
+        if failure == "remove" and path == failed.owned:
+            raise PermissionError("fixture")
+        remove(path)
+
+    monkeypatch.setattr(shutil, "rmtree", remove_owned)
+    with pytest.raises(RuntimeError, match="retained for retry"):
+        service.reap()
+    assert failed.handle in service._sessions
+    assert failed.handle not in service._completed
+    assert not failed.stopped
+    assert (failed.owned / "sentinel").read_text() == "retained"
+    assert failed.units == ({_CLEANUP_UNIT} if failure in {"query", "cgroup"} else set())
+    assert failed.mounted == (failure == "mount")
+    assert other.stopped and not other.owned.exists()
+    service.policy = replace(service.policy, max_sessions=1)
+    with pytest.raises(RuntimeError, match="capacity"):
+        service._reserve("new", object(), 30)
+    events.write_bytes(b"populated 0\n")
+    unit = "fixture.mount" if failure == "mount" else _CLEANUP_UNIT
+    output = b"LoadState=not-found\nActiveState=inactive\n" if failure == "mount" else _CLEANUP_ABSENT
+    cleanup_commands(monkeypatch, service, unit, output, stop_rc=5)
+    monkeypatch.setattr(shutil, "rmtree", remove)
+    service.reap()
+    assert failed.stopped and not failed.owned.exists()
+    assert failed.handle in service._completed
+    assert not service._sessions
+    assert service._reserve("new", object(), 30).handle in service._sessions
 
 
 def test_ownership_rejected_and_expiry_cannot_relay(
@@ -277,6 +834,9 @@ def test_restart_reclaims_only_fixed_owned_units(
     service = mod.PreviewBroker(replace(policy, runtime_root=runtime_root))
     stopped: list[str] = []
     monkeypatch.setattr(service, "_stop_unit", stopped.append)
+    monkeypatch.setattr(service, "_mount_unit_name", lambda path: "fixture.mount")
+    cleanup_commands(monkeypatch, service, "fixture.mount",
+                     b"LoadState=not-found\nActiveState=inactive\n", stop_rc=5)
     linux_metadata(monkeypatch, {owned: (0, stat.S_IFDIR | 0o755)})
     service.recover()
     assert set(stopped) == {f"agent-hub-preview-{handle}-{stage}.service"
