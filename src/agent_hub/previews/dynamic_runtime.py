@@ -27,6 +27,7 @@ from agent_hub.previews.dynamic_runner import (
     validate_http_request,
     write_frame,
 )
+from agent_hub.previews.provenance import PreviewProvenanceV1
 
 BROKER_SOCKET_PATH = Path("/run/agent-hub/preview-broker.sock")
 __all__ = [
@@ -115,6 +116,25 @@ class DynamicPreviewRuntime:
     @property
     def identity(self) -> PreviewIdentityV1:
         return self._identity
+
+    def source_provenance(self) -> PreviewProvenanceV1:
+        with self._lock:
+            if self._revoked:
+                raise DynamicPreviewUnavailable("preview provenance unavailable after revocation")
+            try:
+                write_frame(self._stream, {"version": 2, "action": "source_provenance",
+                                          "handle": self._handle})
+                result = read_frame(self._stream)
+                if set(result) != {"ok", "provenance"} or result["ok"] is not True:
+                    raise ValueError("invalid provenance reply")
+                provenance = PreviewProvenanceV1.from_wire(result["provenance"])
+                if provenance.identity != self.identity:
+                    raise ValueError("provenance identity mismatch")
+                return provenance
+            except (EOFError, OSError, ValueError) as error:
+                # Revoke requests, retaining the original stop/recovery ownership.
+                self._revoked = True
+                raise DynamicPreviewUnavailable("preview source provenance unavailable") from error
 
     def request(self, method: str, target: str, headers: tuple[tuple[str, str], ...],
                 body: bytes) -> DynamicPreviewResponse:

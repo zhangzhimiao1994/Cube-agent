@@ -96,6 +96,113 @@ def test_preview_serves_immutable_snapshot_when_workspace_changes(tmp_path: Path
         assert response.body == b"window.version = 'original';"
 
 
+def test_provenance_is_exact_copied_bytes_owner_only_and_live(tmp_path: Path) -> None:
+    from hashlib import sha256
+
+    from agent_hub.previews.provenance import SnapshotManifestV1
+    user = uuid4()
+    session = _session_root(tmp_path)
+    _write(session, "dist/index.html", b"original")
+    _write(session, "server.js", b"not served")
+    with PreviewManager(tmp_path) as manager:
+        launch = _start(manager, user_id=user)
+        before = manager.provenance(launch.state.preview_id, TENANT_ID, user)
+        _write(session, "dist/index.html", b"changed")
+        assert before == manager.provenance(launch.state.preview_id, TENANT_ID, user)
+        assert before.identity == launch.state.identity
+        assert before.snapshot_manifest == SnapshotManifestV1.from_manifest(
+            {"index.html": (8, sha256(b"original").hexdigest())},
+            selection_policy="static-display-root-v1",
+        )
+        for tenant, owner in ((uuid4(), user), (TENANT_ID, uuid4())):
+            with pytest.raises(PreviewNotFound):
+                manager.provenance(launch.state.preview_id, tenant, owner)
+        manager.stop(launch.state.preview_id)
+        with pytest.raises(PreviewNotFound):
+            manager.provenance(launch.state.preview_id, TENANT_ID, user)
+
+
+
+def test_static_manifest_and_tree_bind_copied_snapshot_mutated_before_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hashlib import sha256
+
+    from agent_hub.previews.provenance import SnapshotManifestV1
+    user = uuid4()
+    session = _session_root(tmp_path)
+    _write(session, "dist/index.html", b"original source")
+    original_digest = preview_manager_module._static_digest
+    roots: list[Path] = []
+    changed = b"copied snapshot changed before authoritative digest"
+    asset = b"snapshot-only asset"
+
+    def mutate_before_digest(
+        root: Path, max_bytes: int, max_files: int, *,
+        file_manifest: dict[str, tuple[int, str]] | None = None,
+    ) -> str:
+        roots.append(root)
+        _write(root, "index.html", changed)
+        _write(root, "assets/ui.js", asset)
+        if file_manifest is None:
+            return original_digest(root, max_bytes, max_files)
+        return original_digest(root, max_bytes, max_files, file_manifest=file_manifest)
+
+    monkeypatch.setattr(preview_manager_module, "_static_digest", mutate_before_digest)
+    with PreviewManager(tmp_path) as manager:
+        launch = _start(manager, user_id=user)
+        metadata = manager.provenance(launch.state.preview_id, TENANT_ID, user)
+        assert manager.read(launch.state.preview_id, launch.token).body == changed
+        assert manager.read(launch.state.preview_id, launch.token, "assets/ui.js").body == asset
+        assert metadata.snapshot_manifest == SnapshotManifestV1.from_manifest(
+            {"index.html": (len(changed), sha256(changed).hexdigest()),
+             "assets/ui.js": (len(asset), sha256(asset).hexdigest())},
+            selection_policy="static-display-root-v1",
+        )
+        assert metadata.identity.source_sha256 == original_digest(roots[0], 128 * 1024 * 1024, 10_000)
+        assert (session / "dist/index.html").read_bytes() == b"original source"
+
+
+def test_static_digest_manifest_retains_tree_framing_and_rejects_read_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    from hashlib import sha256
+
+    from agent_hub.previews.cleanup import tree_entry
+    from agent_hub.previews.provenance import SnapshotManifestV1
+    root = tmp_path / "copied-site"
+    data = b"exact copied bytes\x00with framing"
+    _write(root, "assets/ui.js", data)
+    manifest: dict[str, tuple[int, str]] = {}
+    expected_tree = sha256(b"".join(
+        tree_entry(path.relative_to(root).as_posix(), directory=path.is_dir(),
+                   executable=bool(path.stat().st_mode & 0o111),
+                   data=b"" if path.is_dir() else data)
+        for path in sorted(root.rglob("*"))
+    )).hexdigest()
+    assert preview_manager_module._static_digest(root, 1024, 10, file_manifest=manifest) == expected_tree
+    assert SnapshotManifestV1.from_manifest(manifest, selection_policy="static-display-root-v1") == (
+        SnapshotManifestV1.from_manifest({"assets/ui.js": (len(data), sha256(data).hexdigest())},
+                                        selection_policy="static-display-root-v1")
+    )
+    original_fstat = os.fstat
+    calls = 0
+
+    def mutate_during_capture(fd: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (root / "assets/ui.js").write_bytes(b"changed while descriptor was open")
+        return original_fstat(fd)
+
+    monkeypatch.setattr(os, "fstat", mutate_during_capture)
+    failed_manifest: dict[str, tuple[int, str]] = {}
+    with pytest.raises(InvalidPreviewPath, match="snapshot changed during capture"):
+        preview_manager_module._static_digest(root, 1024, 10, file_manifest=failed_manifest)
+    assert failed_manifest == {}
+
+
 def test_static_cleanup_record_survives_restart_and_preserves_identity(tmp_path: Path) -> None:
     _write(_session_root(tmp_path), "dist/index.html", "original")
     with PreviewManager(tmp_path) as manager:

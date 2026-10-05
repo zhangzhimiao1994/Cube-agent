@@ -179,6 +179,60 @@ def _workspace(root: Path, principal: AuthenticatedPrincipal) -> Path:
     return session
 
 
+def test_provenance_direct_wire_owner_only_no_store_and_stopped_404(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService],
+) -> None:
+    client, principal, _ = preview_client
+    started = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    }).json()
+    path = f'/api/v1/web-previews/{started["id"]}/provenance'
+    result = client.get(path, headers=_bearer())
+    assert result.status_code == 200
+    assert result.headers["cache-control"] == "no-store"
+    assert "set-cookie" not in result.headers
+    wire = result.json()
+    assert set(wire) == {"schema_version", "identity", "snapshot_manifest", "captured_at"}
+    assert wire["identity"] == started["identity"]
+    assert wire["snapshot_manifest"]["file_count"] == 3
+    app = cast(FastAPI, client.app)
+    app.state.auth_service.principal = AuthenticatedPrincipal(principal.user_id, principal.tenant_id, Role.VIEWER)
+    assert client.get(path, headers=_bearer()).status_code == 200
+    app.state.auth_service.principal = principal
+    assert client.get(path).status_code == 401
+    for tenant in (principal.tenant_id, uuid4()):
+        app.state.auth_service.principal = AuthenticatedPrincipal(uuid4(), tenant, Role.OPERATOR)
+        denied = client.get(path, headers=_bearer())
+        assert denied.status_code == 404
+        assert denied.headers["cache-control"] == "no-store"
+    app.state.auth_service.principal = principal
+    client.delete(f'/api/v1/web-previews/{started["id"]}', headers=_bearer())
+    stopped = client.get(path, headers=_bearer())
+    assert stopped.status_code == 404 and stopped.headers["cache-control"] == "no-store"
+
+
+def test_unknown_provenance_is_explicit_and_owner_can_still_stop(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService],
+) -> None:
+    client, _, _ = preview_client
+    started = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    }).json()
+    app = cast(FastAPI, client.app)
+    app.state.preview_manager._manager._runtimes[started["id"]].provenance = None
+    unknown = client.get(f'/api/v1/web-previews/{started["id"]}/provenance', headers=_bearer())
+    assert unknown.status_code == 503
+    assert unknown.headers["cache-control"] == "no-store"
+    assert "set-cookie" not in unknown.headers
+    stopped = client.delete(f'/api/v1/web-previews/{started["id"]}', headers=_bearer())
+    assert stopped.status_code == 200
+    assert stopped.json()["cleanup_receipt"]["status"] == "confirmed"
+
+
+
+
 def _client(
     tmp_path: Path,
 ) -> tuple[TestClient, AuthenticatedPrincipal, StubConversationService]:

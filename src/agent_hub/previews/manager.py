@@ -9,7 +9,6 @@ import mimetypes
 import os
 import re
 import secrets
-import shutil
 import socket
 import stat
 import sys
@@ -45,6 +44,12 @@ from agent_hub.previews.dynamic_runtime import (
     DynamicPreviewCleanupError,
     DynamicPreviewResponse,
     DynamicPreviewUnavailable,
+)
+from agent_hub.previews.provenance import (
+    STATIC_SELECTION_POLICY,
+    PreviewProvenanceUnavailable,
+    PreviewProvenanceV1,
+    SnapshotManifestV1,
 )
 
 PreviewStatus = Literal["ready", "stopped", "expired"]
@@ -144,6 +149,7 @@ class _PreviewRuntime:
     proxy_condition: threading.Condition = field(default_factory=threading.Condition)
     stop_reason: str | None = None
     cleanup_identity: PreviewIdentityV1 | None = None
+    provenance: PreviewProvenanceV1 | None = None
 
     def __post_init__(self) -> None:
         path = Path(self.snapshot.name)
@@ -390,10 +396,18 @@ class PreviewManager:
             token = secrets.token_urlsafe(32)
             token_sha256 = sha256(token.encode("utf-8")).hexdigest()
             preview_id = str(uuid4())
-            identity = PreviewIdentityV1.create(preview_id, scope, kind="static",
-                                                digest=_static_digest(served_root, self._max_snapshot_bytes,
-                                                                      self._max_snapshot_files))
             try:
+                file_manifest: dict[str, tuple[int, str]] = {}
+                identity = PreviewIdentityV1.create(preview_id, scope, kind="static",
+                    digest=_static_digest(served_root, self._max_snapshot_bytes,
+                                          self._max_snapshot_files, file_manifest=file_manifest))
+                if entrypoint not in file_manifest:
+                    raise PreviewProvenanceUnavailable("static snapshot entrypoint missing")
+                provenance = PreviewProvenanceV1(1, identity,
+                    SnapshotManifestV1.from_manifest(file_manifest,
+                        selection_policy=STATIC_SELECTION_POLICY,
+                        max_files=self._max_snapshot_files, max_bytes=self._max_snapshot_bytes),
+                    _aware_utc(self._clock()))
                 handler = _handler_for(
                     served_root,
                     entrypoint,
@@ -433,6 +447,7 @@ class PreviewManager:
                 server=server,
                 thread=thread,
                 snapshot=snapshot,
+                provenance=provenance,
             )
             with self._lock:
                 if reservation_key in self._cancelled_starts:
@@ -598,6 +613,44 @@ class PreviewManager:
             except (OSError, ValueError, TypeError):
                 # A corrupt/missing file is missing evidence, never a cached success.
                 return None
+
+    def provenance(self, preview_id: str, tenant_id: UUID, user_id: UUID) -> PreviewProvenanceV1:
+        with self._lock:
+            runtime = self._provenance_runtime_locked(preview_id, tenant_id, user_id)
+            identity = runtime.state.identity
+            captured = runtime.provenance
+        if captured is None:
+            try:
+                provider = getattr(runtime.application, "source_provenance", None)
+                if not callable(provider):
+                    raise PreviewProvenanceUnavailable("backend has no source provenance")
+                value: object = provider()
+                if not isinstance(value, PreviewProvenanceV1):
+                    raise ValueError("invalid backend provenance metadata")  # noqa: TRY004
+                captured = PreviewProvenanceV1.from_wire(value.to_wire())
+            except Exception as error:
+                raise PreviewProvenanceUnavailable("preview source provenance unavailable") from error
+        if captured.identity != identity:
+            raise PreviewProvenanceUnavailable("preview source provenance identity mismatch")
+        with self._lock:
+            if self._provenance_runtime_locked(preview_id, tenant_id, user_id) is not runtime:
+                raise PreviewNotFound("preview does not exist")
+        return captured
+
+    def _provenance_runtime_locked(self, preview_id: str, tenant_id: UUID,
+                                   user_id: UUID) -> _PreviewRuntime:
+        runtime = self._runtimes.get(preview_id)
+        if (runtime is None or runtime.state.status != "ready" or user_id is None
+                or runtime.state.tenant_id != tenant_id or runtime.state.identity is None
+                or runtime.state.identity.user_id != str(user_id)
+                or runtime.state.identity.tenant_id != str(tenant_id)
+                or self._active_by_conversation.get((tenant_id, runtime.state.conversation_id)) != preview_id):
+            raise PreviewNotFound("preview does not exist")
+        now = _aware_utc(self._clock())
+        if runtime.state.lease_expires_at <= now or runtime.state.max_expires_at <= now:
+            self._stop_locked(preview_id, status="expired", now=now)
+            raise PreviewNotFound("preview does not exist")
+        return runtime
 
     def renew(
         self,
@@ -960,7 +1013,8 @@ def _remove_snapshot(runtime: _PreviewRuntime) -> Literal["absent", "present"]:
     return "present"
 
 
-def _static_digest(root: Path, max_bytes: int, max_files: int) -> str:
+def _static_digest(root: Path, max_bytes: int, max_files: int, *,
+                   file_manifest: dict[str, tuple[int, str]] | None = None) -> str:
     digest = sha256()
     total = count = 0
     for path in sorted(root.rglob("*")):
@@ -971,12 +1025,25 @@ def _static_digest(root: Path, max_bytes: int, max_files: int) -> str:
             raise InvalidPreviewPath("unsafe snapshot identity")
         data = b""
         if not directory:
-            with path.open("rb") as stream:
+            flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            with os.fdopen(os.open(path, flags), "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(opened.st_mode)
+                        or (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino)):
+                    raise InvalidPreviewPath("snapshot identity changed during capture")
                 data = stream.read(max_bytes - total + 1)
+                after = os.fstat(stream.fileno())
+            current = path.lstat()
+            if (_snapshot_file_signature(info) != _snapshot_file_signature(current)
+                    or _snapshot_file_signature(opened) != _snapshot_file_signature(after)):
+                raise InvalidPreviewPath("snapshot changed during capture")
             total += len(data)
             count += 1
             if total > max_bytes or count > max_files:
                 raise PreviewResponseTooLarge("snapshot identity exceeds limits")
+            if file_manifest is not None:
+                file_manifest[path.relative_to(root).as_posix()] = (len(data), sha256(data).hexdigest())
         digest.update(tree_entry(path.relative_to(root).as_posix(), directory=directory,
                                  executable=bool(info.st_mode & 0o111), data=data))
     return digest.hexdigest()
@@ -1045,6 +1112,10 @@ def _handler_for(
     return PreviewRequestHandler
 
 
+def _snapshot_file_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def _snapshot_preview_root(
     root: Path,
     *,
@@ -1103,23 +1174,26 @@ def _snapshot_preview_root(
                 total_bytes += size
                 if file_count > max_files or total_bytes > max_bytes:
                     raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
-                if staging is None:
-                    shutil.copyfile(source, destination)
-                else:
-                    before = source.stat()
-                    with source.open("rb") as stream:
-                        data = stream.read(max_bytes - (total_bytes - size) + 1)
-                    after = source.stat()
-                    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                        after.st_size,
-                        after.st_mtime_ns,
-                        after.st_ctime_ns,
-                    ):
-                        raise InvalidPreviewPath("preview source changed during preparation")
-                    total_bytes += len(data) - size
-                    if total_bytes > max_bytes:
-                        raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
-                    destination.write_bytes(data)
+                before = source.lstat()
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                with os.fdopen(os.open(source, flags), "rb") as stream:
+                    opened = os.fstat(stream.fileno())
+                    if (not stat.S_ISREG(opened.st_mode)
+                            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)):
+                        raise InvalidPreviewPath("preview source identity changed during preparation")
+                    data = stream.read(max_bytes - (total_bytes - size) + 1)
+                    after = os.fstat(stream.fileno())
+                current = source.lstat()
+                # Windows path and descriptor ctime semantics can differ; check
+                # stability within each API and inode identity across both.
+                if (_snapshot_file_signature(before) != _snapshot_file_signature(current)
+                        or _snapshot_file_signature(opened) != _snapshot_file_signature(after)):
+                    raise InvalidPreviewPath("preview source changed during preparation")
+                total_bytes += len(data) - size
+                if total_bytes > max_bytes:
+                    raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
+                destination.write_bytes(data)
+                if staging is not None:
                     destination.chmod(0o555 if before.st_mode & 0o111 else 0o444)
         return snapshot, destination_root
     except BaseException:

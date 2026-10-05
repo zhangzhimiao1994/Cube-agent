@@ -36,6 +36,7 @@ from agent_hub.previews.dynamic_runtime import (
     DynamicPreviewStartupFailed,
     DynamicPreviewUnavailable,
 )
+from agent_hub.previews.provenance import PreviewProvenanceUnavailable, PreviewProvenanceV1
 
 _MAX_REQUEST_BODY = 1024 * 1024
 _MAX_REQUEST_WIRE = 1536 * 1024
@@ -301,6 +302,10 @@ class WebPreviewService:
                 or record.identity.tenant_id != str(tenant_id)):
             raise PreviewNotFound("preview does not exist")
         return record
+
+    def provenance(self, tenant_id: UUID, preview_id: str, user_id: UUID) -> PreviewProvenanceV1:
+        self._owned_access(tenant_id, preview_id, user_id)
+        return self._manager.provenance(preview_id, tenant_id, user_id)
 
     def app_request(
         self,
@@ -691,6 +696,26 @@ async def renew_web_preview(
         )
     except (PreviewNotFound, PreviewTokenRejected, DynamicPreviewCleanupError, ValueError) as error:
         raise _preview_error(error) from error
+
+
+@router.get("/{preview_id}/provenance", response_model=None)
+async def get_web_preview_provenance(
+    preview_id: str,
+    response: Response,
+    service: Annotated[WebPreviewService, Depends(_preview_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> dict[str, object]:
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    response.headers.update(headers)
+    try:
+        provenance = await asyncio.to_thread(service.provenance, principal.tenant_id,
+                                            preview_id, principal.user_id)
+    except PreviewNotFound:
+        raise PublicAPIError(404, "preview_not_found", "preview was not found", headers=headers) from None
+    except (PreviewProvenanceUnavailable, DynamicPreviewCleanupError):
+        raise PublicAPIError(503, "preview_provenance_unavailable",
+                             "preview source provenance is unavailable", headers=headers) from None
+    return provenance.to_wire()
 
 
 @router.get("/{preview_id}/cleanup", response_model=WebPreviewCleanupResponse)

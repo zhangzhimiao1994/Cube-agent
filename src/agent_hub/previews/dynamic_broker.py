@@ -52,6 +52,11 @@ from agent_hub.previews.dynamic_runner import (
     write_frame,
 )
 from agent_hub.previews.dynamic_runtime import BROKER_SOCKET_PATH, decode_response
+from agent_hub.previews.provenance import (
+    DYNAMIC_SELECTION_POLICY,
+    PreviewProvenanceV1,
+    SnapshotManifestV1,
+)
 
 _STAGES = {"install", "build", "start", "probe"}
 _HANDLE = re.compile(r"[0-9a-f]{32}")
@@ -134,6 +139,7 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
     if payload["version"] == 2:
         fields["start"] |= {"scope"}
         fields["recover_stop"] |= {"identity", "identity_binding"}
+        fields["source_provenance"] = {"version", "action", "handle"}
     if not isinstance(action, str) or action not in fields or set(payload) != fields[action]:
         raise ValueError("invalid preview action fields")
     if action == "start":
@@ -149,7 +155,7 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
             if str(uuid.UUID(preview_id)) != preview_id:
                 raise ValueError("invalid preview UUID")
             PreviewOwnerScope.from_wire(payload["scope"])
-    elif action in {"request", "stop", "recover_stop"}:
+    elif action in {"request", "stop", "recover_stop", "source_provenance"}:
         handle = payload["handle"]
         if not isinstance(handle, str) or not _HANDLE.fullmatch(handle):
             raise ValueError("invalid owned handle")
@@ -215,7 +221,8 @@ def _manifest(data: bytes) -> None:
 
 
 def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None = None,
-              *, legacy: bool = False) -> str:
+              *, legacy: bool = False,
+              file_manifest: dict[str, tuple[int, str]] | None = None) -> str:
     _source_path(root, policy)
     digest = hashlib.sha256()
     total = 0
@@ -249,6 +256,8 @@ def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None 
             total += len(data)
             if total > policy.max_source_bytes:
                 raise ValueError("source size exceeded")
+            if file_manifest is not None:
+                file_manifest[relative.as_posix()] = (len(data), hashlib.sha256(data).hexdigest())
             executable = bool(info.st_mode & 0o111)
             if legacy:
                 digest.update(b"exec\0" if executable else b"file\0")
@@ -317,7 +326,14 @@ def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None 
             elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                 if info.st_size > policy.max_source_bytes - total:
                     raise ValueError("source size exceeded")
-                record(path.relative_to(root), info, path.read_bytes())
+                with path.open("rb") as stream:
+                    data = stream.read(policy.max_source_bytes - total + 1)
+                after = path.lstat()
+                if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+                ):
+                    raise ValueError("source changed during preparation")
+                record(path.relative_to(root), info, data)
             else:
                 raise ValueError("source links/special files forbidden")
     if manifest is None:
@@ -529,6 +545,7 @@ class _Session:
     identity: PreviewIdentityV1 | None = None
     observation: BrokerCleanupObservation | None = None
     owned_identity: tuple[int, int] | None = None
+    provenance: PreviewProvenanceV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1053,7 +1070,9 @@ class PreviewBroker:
                 with preview_startup_phase("storage_prepare"):
                     self._prepare_storage(session)
                 with preview_startup_phase("source_copy"):
-                    digest = _snapshot(source, self.policy, session.owned / "source", legacy=legacy)
+                    file_manifest: dict[str, tuple[int, str]] = {}
+                    digest = _snapshot(source, self.policy, session.owned / "source", legacy=legacy,
+                                       file_manifest=file_manifest if not legacy else None)
                 with preview_startup_phase("source_validate"):
                     if digest != initial_digest or _snapshot(source, self.policy, legacy=legacy) != digest:
                         raise ValueError("source changed during preparation")
@@ -1062,6 +1081,11 @@ class PreviewBroker:
                     session.identity = PreviewIdentityV1.create(session.preview_id,
                         PreviewOwnerScope.from_wire(payload["scope"]), kind="dynamic",
                         digest=digest, handle=session.handle)
+                    session.provenance = PreviewProvenanceV1(1, session.identity,
+                        SnapshotManifestV1.from_manifest(file_manifest,
+                            selection_policy=DYNAMIC_SELECTION_POLICY,
+                            max_files=self.policy.max_files, max_bytes=self.policy.max_source_bytes),
+                        utc_now())
                 with preview_startup_phase("install"):
                     self._launch(session, "install")
                 with preview_startup_phase("install_validate"):
@@ -1183,6 +1207,12 @@ class PreviewBroker:
             if session.revoked or time.monotonic() >= session.expires_at:
                 session.revoked = True
                 raise ValueError("preview lease revoked")
+            if action == "source_provenance":
+                if not session.ready or session.provenance is None:
+                    raise ValueError("preview source provenance unavailable")
+                if session.provenance.identity != session.identity:
+                    raise ValueError("preview provenance identity mismatch")
+                return {"ok": True, "provenance": session.provenance.to_wire()}
             process = session.process
             if process is None or process.poll() is not None:
                 session.revoked = True

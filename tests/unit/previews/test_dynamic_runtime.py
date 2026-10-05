@@ -129,6 +129,173 @@ def runtime() -> Any:
     return importlib.import_module("agent_hub.previews.dynamic_runtime")
 
 
+@pytest.mark.parametrize("change", [
+    None, ("preview_id", "90000000-0000-0000-0000-000000000001"),
+    ("tenant_id", "90000000-0000-0000-0000-000000000001"), ("user_id", None),
+    ("project_id", "foreign"), ("conversation_id", "foreign"),
+    ("workspace_session_id", "foreign"), ("runtime_handle", "c" * 32),
+    ("source_sha256", "c" * 64), ("display_root", "foreign"),
+    ("display_entrypoint", "other.html"),
+])
+def test_source_provenance_strict_identity_and_failure_keeps_owned_stop(
+    change: tuple[str, object] | None,
+) -> None:
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from agent_hub.previews.provenance import PreviewProvenanceV1, SnapshotManifestV1
+    mod = runtime()
+    bound = identity("dynamic")
+    metadata = PreviewProvenanceV1(1, replace(bound, **{change[0]: change[1]}) if change else bound,
+        SnapshotManifestV1.from_manifest({"package.json": (1, "a" * 64)},
+            selection_policy="dynamic-staged-session-v1"), datetime.now(UTC))
+    client, server = socket.socketpair()
+    seen: list[dict[str, object]] = []
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            seen.append(mod.read_frame(stream))
+            mod.write_frame(stream, {"ok": True, "provenance": metadata.to_wire()})
+            seen.append(mod.read_frame(stream))
+            mod.write_frame(stream, {"ok": True, "state": "stopped",
+                                     "observation": broker_observation(bound).to_wire()})
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), bound,
+                                    identity_binding="d" * 64)
+    try:
+        if change:
+            with pytest.raises(mod.DynamicPreviewUnavailable, match="provenance"):
+                app.source_provenance()
+            assert not app._closed
+        else:
+            assert app.source_provenance() == metadata
+        assert app.close().identity == bound
+        assert seen == [{"version": 2, "action": "source_provenance", "handle": bound.runtime_handle},
+                        {"version": 2, "action": "stop", "handle": bound.runtime_handle}]
+    finally:
+        client.close()
+        worker.join(timeout=2)
+
+
+def test_provenance_disconnect_keeps_exact_stop_only_recovery() -> None:
+    mod = runtime()
+    client, old_server = socket.socketpair()
+    fresh, server = socket.socketpair()
+    old_server.close()
+    seen: list[dict[str, object]] = []
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            seen.append(mod.read_frame(stream))
+            mod.write_frame(stream, {"ok": True, "state": "stopped",
+                                     "observation": broker_observation().to_wire()})
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"),
+        identity_binding="d" * 64, recovery_token="c" * 64,
+        reconnect=lambda: (fresh, fresh.makefile("rwb", buffering=0)))
+    try:
+        with pytest.raises(mod.DynamicPreviewUnavailable, match="provenance"):
+            app.source_provenance()
+        assert not app._closed and not seen
+        assert app.close().status == "confirmed"
+        assert seen == [{"version": 2, "action": "recover_stop", "handle": "a" * 32,
+                         "identity": identity("dynamic").to_wire(),
+                         "recovery_token": "c" * 64, "identity_binding": "d" * 64}]
+    finally:
+        client.close()
+        fresh.close()
+        worker.join(timeout=2)
+
+
+@pytest.mark.parametrize("reply", [
+    {"ok": 1, "provenance": {}}, {"ok": False, "error": "unavailable"},
+    {"ok": True, "provenance": {}}, {"ok": True, "provenance": {}, "files": []},
+])
+def test_provenance_rejects_malformed_reply_without_claiming_cleanup(reply: dict[str, object]) -> None:
+    mod = runtime()
+    client, server = socket.socketpair()
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            mod.read_frame(stream)
+            mod.write_frame(stream, reply)
+            mod.read_frame(stream)
+            mod.write_frame(stream, {"ok": True, "state": "stopped",
+                                     "observation": broker_observation().to_wire()})
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"),
+                                    identity_binding="d" * 64)
+    try:
+        with pytest.raises(mod.DynamicPreviewUnavailable, match="provenance"):
+            app.source_provenance()
+        assert not app._closed
+        assert app.close().status == "confirmed"
+    finally:
+        client.close()
+        worker.join(timeout=2)
+
+
+def test_provenance_serializes_with_application_requests() -> None:
+    from datetime import UTC, datetime
+
+    from agent_hub.previews.provenance import PreviewProvenanceV1, SnapshotManifestV1
+    mod = runtime()
+    metadata = PreviewProvenanceV1(1, identity("dynamic"), SnapshotManifestV1.from_manifest(
+        {"package.json": (0, "a" * 64)}, selection_policy="dynamic-staged-session-v1"),
+        datetime.now(UTC))
+    client, server = socket.socketpair()
+    entered, release, requesting = threading.Event(), threading.Event(), threading.Event()
+    seen: list[str] = []
+    results: list[object] = []
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            seen.append(mod.read_frame(stream)["action"])
+            entered.set()
+            assert release.wait(timeout=2)
+            mod.write_frame(stream, {"ok": True, "provenance": metadata.to_wire()})
+            seen.append(mod.read_frame(stream)["action"])
+            mod.write_frame(stream, {"ok": True, "response": {"status_code": 200, "headers": [], "body": ""}})
+            seen.append(mod.read_frame(stream)["action"])
+            mod.write_frame(stream, {"ok": True, "state": "stopped", "observation": broker_observation().to_wire()})
+
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"),
+                                    identity_binding="d" * 64)
+
+    def request() -> None:
+        requesting.set()
+        results.append(app.request("GET", "/tasks", (), b""))
+
+    worker = threading.Thread(target=serve, daemon=True)
+    reader = threading.Thread(target=lambda: results.append(app.source_provenance()), daemon=True)
+    caller = threading.Thread(target=request, daemon=True)
+    worker.start()
+    reader.start()
+    try:
+        assert entered.wait(timeout=2)
+        caller.start()
+        assert requesting.wait(timeout=2)
+        assert not results
+        release.set()
+        reader.join(timeout=2)
+        caller.join(timeout=2)
+        assert metadata in results and len(results) == 2
+        assert app.close().status == "confirmed"
+        assert seen == ["source_provenance", "request", "stop"]
+    finally:
+        release.set()
+        client.close()
+        worker.join(timeout=2)
+
+
+
+
 @pytest.mark.parametrize("method,target", [
     ("CONNECT", "/"), ("TRACE", "/"), ("get", "/"), ("GET", "https://example.invalid/"),
     ("GET", "//localhost/"), ("GET", "/%2e%2e/secret"), ("GET", "/a%2fb"),

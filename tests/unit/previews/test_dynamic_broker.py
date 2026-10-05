@@ -47,6 +47,62 @@ def prepared(tmp_path: Path) -> tuple[Path, Any]:
     return root, mod.PreviewBrokerPolicy(workspace_root=tmp_path, allowed_uid=uid)
 
 
+def test_copy_pass_manifest_and_v2_owned_stored_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from hashlib import sha256
+
+    from agent_hub.previews.provenance import PreviewProvenanceV1, SnapshotManifestV1
+    from tests.unit.previews.test_cleanup import identity
+    mod = broker()
+    source, policy = prepared(tmp_path)
+    monkeypatch.setattr(mod, "_PLATFORM", "linux")
+    original = {p.name: (len(p.read_bytes()), sha256(p.read_bytes()).hexdigest())
+                for p in source.iterdir()}
+    owned = tmp_path / "broker-owned"
+    owned.mkdir()
+    service = mod.PreviewBroker(replace(policy, runtime_root=owned))
+    monkeypatch.setattr(service, "_prepare_trusted", lambda session: None)
+    monkeypatch.setattr(service, "_prepare_storage", lambda session: None)
+    monkeypatch.setattr(service, "_validate_prepared_tree", lambda path: None)
+    monkeypatch.setattr(service, "_handoff_work", lambda path: None)
+    captured: list[object] = []
+
+    def launch(session: Any, stage: str) -> dict[str, object]:
+        if stage == "install":
+            captured.append(session.provenance)
+            (source / "server.js").write_text("mutated after copy")
+        return {"ok": True}
+
+    monkeypatch.setattr(service, "_launch", launch)
+    owner = object()
+    bound = identity("dynamic")
+    ready = service.handle({"version": 2, "action": "start", "preview_id": bound.preview_id,
+        "source_root": str(source), "lifetime_seconds": 30, "scope": bound.scope.to_wire()},
+        peer_uid=policy.allowed_uid, owner=owner)
+    assert set(ready) == {"ok", "state", "identity", "identity_binding", "recovery_token"}
+    handle = ready["identity"]["runtime_handle"]
+    request = {"version": 2, "action": "source_provenance", "handle": handle}
+    reply = service.handle(request, peer_uid=policy.allowed_uid, owner=owner)
+    metadata = PreviewProvenanceV1.from_wire(reply["provenance"])
+    assert metadata == captured[0]
+    assert metadata.identity.to_wire() == ready["identity"]
+    assert metadata.snapshot_manifest == SnapshotManifestV1.from_manifest(
+        original, selection_policy="dynamic-staged-session-v1")
+    with pytest.raises(ValueError, match="ownership"):
+        service.handle(request, peer_uid=policy.allowed_uid, owner=object())
+    for invalid in ({**request, "version": 1}, {**request, "source_root": str(source)},
+                    {**request, "recovery_token": ready["recovery_token"]}):
+        with pytest.raises(ValueError):
+            service.handle(invalid, peer_uid=policy.allowed_uid, owner=owner)
+    assert service.handle(request, peer_uid=policy.allowed_uid, owner=owner) == reply
+    # Fixture used no systemd process; remove read-only source files for Windows teardown.
+    for path in owned.rglob("*"):
+        path.chmod(0o777)
+
+
+
 def test_uid_and_snapshot_identity_are_fixed(tmp_path: Path) -> None:
     mod = broker()
     root, policy = prepared(tmp_path)

@@ -89,6 +89,66 @@ def start(manager: PreviewManager, conversation: str = "conversation-a") -> Prev
     )
 
 
+def test_legacy_backend_missing_metadata_keeps_launch_request_and_cleanup(tmp_path: Path) -> None:
+    from uuid import uuid4
+
+    from agent_hub.previews.provenance import PreviewProvenanceUnavailable
+    project(tmp_path)
+    backend = FakeBackend()
+    user = uuid4()
+    with PreviewManager(tmp_path, dynamic_backend=backend) as manager:
+        launch = manager.start(tenant_id=TENANT, user_id=user, conversation_id="conversation-a",
+            project_id="project-a", session_id="session-a", root="dist")
+        with pytest.raises(PreviewProvenanceUnavailable):
+            manager.provenance(launch.state.preview_id, TENANT, user)
+        assert manager.app_request(launch.state.preview_id, launch.token, "GET", "/tasks", (), b"").status_code == 201
+        manager.stop(launch.state.preview_id)
+        assert backend.runtime.closed
+
+
+@pytest.mark.parametrize("failure", ["foreign", "malformed", "error", "stopped"])
+def test_metadata_errors_and_revocation_cannot_substitute_preview_or_lose_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from uuid import uuid4
+
+    from agent_hub.previews import PreviewNotFound
+    from agent_hub.previews.provenance import (
+        PreviewProvenanceUnavailable,
+        PreviewProvenanceV1,
+        SnapshotManifestV1,
+    )
+    project(tmp_path)
+    user = uuid4()
+    backend = FakeBackend()
+    with PreviewManager(tmp_path, dynamic_backend=backend) as manager:
+        launch = manager.start(tenant_id=TENANT, user_id=user, conversation_id="conversation-a",
+            project_id="project-a", session_id="session-a", root="dist")
+
+        def metadata() -> object:
+            if failure == "error":
+                raise OSError("metadata unavailable")
+            if failure == "malformed":
+                return {"snapshot_manifest": {"manifest_sha256": "a" * 64}}
+            if failure == "stopped":
+                manager.stop(launch.state.preview_id)
+            bound = backend.runtime.identity
+            if failure == "foreign":
+                bound = replace(bound, workspace_session_id="other-session")
+            return PreviewProvenanceV1(1, bound, SnapshotManifestV1.from_manifest(
+                {"package.json": (0, "a" * 64)}, selection_policy="dynamic-staged-session-v1"),
+                datetime.now(UTC))
+
+        monkeypatch.setattr(backend.runtime, "source_provenance", metadata, raising=False)
+        expected = PreviewNotFound if failure == "stopped" else PreviewProvenanceUnavailable
+        with pytest.raises(expected):
+            manager.provenance(launch.state.preview_id, TENANT, user)
+        manager.stop(launch.state.preview_id)
+        assert backend.runtime.closed
+
+
+
+
 def test_dynamic_snapshot_includes_backend_separately_from_display_root(tmp_path: Path) -> None:
     session = project(tmp_path)
     backend = FakeBackend()
