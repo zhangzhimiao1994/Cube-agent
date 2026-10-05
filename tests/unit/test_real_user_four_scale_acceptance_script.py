@@ -6,11 +6,14 @@ import importlib.util
 import io
 import json
 import zipfile
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 from urllib.parse import quote, unquote
+from uuid import uuid4
 
 import pytest
 
@@ -21,6 +24,22 @@ from agent_hub.harness.project_scale_runner import (
     _idempotency_key,
     execute_project_scale_plan,
 )
+from tests.unit.harness.browser_evidence_fixture import build_device_bundle
+
+_BROWSER_EVIDENCE_ROOT: ContextVar[Path] = ContextVar("browser_evidence_root")
+
+
+@pytest.fixture(autouse=True)
+def browser_evidence_root(tmp_path: Path) -> Iterator[None]:
+    token = _BROWSER_EVIDENCE_ROOT.set(tmp_path)
+    try:
+        yield
+    finally:
+        _BROWSER_EVIDENCE_ROOT.reset(token)
+
+
+def _evidence_root() -> Path:
+    return _BROWSER_EVIDENCE_ROOT.get()
 
 
 def load_script() -> Any:
@@ -942,12 +961,12 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
         "execution_id": "matrix-123",
         "base_url": "http://example.test",
         "benchmark_kind": "capability",
-        "actor": {"principal": {"user_id": "user-test", "tenant_id": "tenant-test"}},
+        "actor": {"principal": {"user_id": "00000000-0000-4000-8000-000000000002", "tenant_id": "00000000-0000-4000-8000-000000000001"}},
         "execution_identity": {
             "execution_id": "matrix-123",
             "base_url": "http://example.test",
-            "user_id": "user-test",
-            "tenant_id": "tenant-test",
+            "user_id": "00000000-0000-4000-8000-000000000002",
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
         },
         "status": "pending_real_device",
         "core_acceptance_ok": True,
@@ -993,7 +1012,7 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
             persist=lambda: None,
         )
         journal.confirm(index, {
-            "id": case["run"]["run_id"], "tenant_id": "tenant-test", "status": "completed",
+            "id": case["run"]["run_id"], "tenant_id": "00000000-0000-4000-8000-000000000001", "status": "completed",
             "project_id": context["project_id"], "conversation_id": context["conversation_id"],
             "workspace_session_id": context["workspace_session_id"], "version": 1,
         }, lambda: None)
@@ -1136,7 +1155,7 @@ def test_mode_coverage_rejects_bad_identity_before_credit_or_resume(
         elif consumer == "resume":
             module._resume_cases(saved, saved["execution_identity"], [])
         else:
-            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert saved == before
 
 
@@ -1197,7 +1216,7 @@ def test_mode_coverage_finalizer_rejects_consistent_safe_upgrades(forged_summary
         )
     before = copy.deepcopy(saved)
     with pytest.raises(ValueError, match="mode coverage"):
-        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert saved == before
 
 
@@ -1217,14 +1236,14 @@ def test_mode_coverage_finalizer_rejects_inconsistent_supplied_summaries(
     saved = _pending_automated_report()
     saved[field] = value
     with pytest.raises(ValueError, match="coverage"):
-        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
 
 
 def test_mode_coverage_finalizer_recomputes_legacy_pending_report() -> None:
     module = load_script()
     saved = _pending_automated_report()
     before = copy.deepcopy(saved)
-    completed = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    completed = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert completed["core_passed_case_count"] == 20
     assert completed["auto_scale_case_count"] == 4
     assert completed["mode_capability_case_count"] == 16
@@ -1285,7 +1304,7 @@ def test_mode_coverage_cli_returns_pending_and_preserves_finalization_source(
     monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
     monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
     assert module.main([
-        "--base-url", "http://example.test", "--resume-report", str(output),
+        "--base-url", "http://example.test", "--evidence-root", str(_evidence_root()), "--resume-report", str(output),
         "--output", str(output),
     ]) == 2
     pending = json.loads(output.read_text(encoding="utf-8"))
@@ -1306,6 +1325,7 @@ def test_mode_coverage_finalized_cli_resume_fails_closed_without_writes_or_posts
     module, delegate, plans, _ = matrix_harness
     saved = module.finalize_real_device_acceptance(
         _pending_automated_report(), _real_device_evidence("matrix-123"),
+        evidence_root=_evidence_root(),
     )
     saved["attempt_history"] = [{"case_id": "small:auto", "attempt": 1, "status": "failed"}]
     if mutation == "safe_upgrades":
@@ -1325,7 +1345,7 @@ def test_mode_coverage_finalized_cli_resume_fails_closed_without_writes_or_posts
     monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
     monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
     assert module.main([
-        "--base-url", "http://example.test", "--resume-report", str(output),
+        "--base-url", "http://example.test", "--evidence-root", str(_evidence_root()), "--resume-report", str(output),
         "--output", str(output),
     ]) == 1
     assert output.read_bytes() == before
@@ -1334,8 +1354,99 @@ def test_mode_coverage_finalized_cli_resume_fails_closed_without_writes_or_posts
     assert plans == []
 
 
-def _real_device_evidence(execution_id: str, logical_model: str | None = None) -> dict[str, Any]:
-    scopes = {case["case_id"]: case for case in _pending_automated_report()["cases"]}
+@pytest.mark.parametrize("logical_model", [None, "deepseek-backup"])
+def test_browser_collection_scope_allows_partial_matrix_without_promotion(
+    logical_model: str | None,
+) -> None:
+    module = load_script()
+    report = _pending_automated_report(logical_model)
+    report["cases"] = report["cases"][:1]
+    report["submission_journal"]["records"] = report["submission_journal"]["records"][:1]
+    report.update(status="in_progress", core_acceptance_ok=False,
+                  automated_acceptance_complete=False, case_count=1)
+    before = copy.deepcopy(report)
+    collected = module.case_browser_collection_scope(report, "small:auto")
+    case = report["cases"][0]
+    assert collected == {
+        "scope": {
+            "execution_identity": report["execution_identity"],
+            "case_id": "small:auto",
+            "project_id": case["project"]["project_id"],
+            "conversation_id": case["conversation"]["conversation_id"],
+            "run_id": case["run"]["run_id"],
+            "workspace_session_id": case["conversation"]["workspace_path"],
+        },
+        "validated_manifest": {
+            path: list(item) for path, item in validated_workspace_manifest().items()
+        },
+    }
+    collected["scope"]["execution_identity"]["base_url"] = "https://foreign.invalid"
+    assert report == before
+
+
+@pytest.mark.parametrize("mutation", [
+    "case_missing", "duplicate", "identity", "profile", "journal", "unresolved",
+    "request_digest", "model", "public", "scale", "workspace", "nonterminal",
+])
+def test_browser_collection_scope_revalidates_existing_case_evidence(mutation: str) -> None:
+    module = load_script()
+    report = _pending_automated_report("deepseek-backup")
+    case = report["cases"][-1]
+    case_id = case["case_id"]
+    if mutation == "case_missing":
+        report["cases"].pop()
+    elif mutation == "duplicate":
+        report["cases"].append(copy.deepcopy(case))
+    elif mutation == "identity":
+        report["execution_identity"]["tenant_id"] = "foreign"
+    elif mutation == "profile":
+        case["model_profile"] = {"direct_model": "foreign", "allowed_models": ["foreign"]}
+    elif mutation == "journal":
+        report.pop("submission_journal")
+    elif mutation == "unresolved":
+        report["submission_journal"]["records"][-1]["state"] = "unresolved"
+        report["submission_journal"]["records"][-1]["response"] = None
+    elif mutation == "request_digest":
+        report["submission_journal"]["records"][-1]["request_sha256"] = "0" * 64
+    elif mutation == "model":
+        case["model_scope_evidence"]["runs"][0]["model_events"] = []
+    elif mutation == "public":
+        case["public_artifacts"]["workspace_manifest"] = {}
+    elif mutation == "scale":
+        case["run"]["scale_validation"] = None
+    elif mutation == "workspace":
+        case["conversation"]["workspace_path"] = "foreign"
+    else:
+        case["run"]["status"] = "running"
+    before = copy.deepcopy(report)
+    with pytest.raises((TypeError, ValueError)):
+        module.case_browser_collection_scope(report, case_id)
+    assert report == before
+
+
+def test_finalizer_rejects_legacy_flags_only_browser_evidence() -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    evidence["schema_version"] = 1
+    for case in evidence["cases"].values():
+        for device in ("desktop", "mobile"):
+            case[device].pop("bundle_file", None)
+            case[device].pop("schema_version", None)
+    before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
+    with pytest.raises(ValueError, match="schema_version"):
+        module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
+    assert report == before_report
+    assert evidence == before_evidence
+
+
+def _real_device_evidence(
+    execution_id: str, logical_model: str | None = None, *, evidence_root: Path | None = None,
+) -> dict[str, Any]:
+    root = _evidence_root() if evidence_root is None else evidence_root
+    report = _pending_automated_report(logical_model)
+    identity = copy.deepcopy(report["execution_identity"])
+    identity["execution_id"] = execution_id
     checks = {
         "login": True,
         "project_navigation": True,
@@ -1344,62 +1455,200 @@ def _real_device_evidence(execution_id: str, logical_model: str | None = None) -
         "preview_revoked": True,
     }
     evidence: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "execution_id": execution_id,
-        "execution_identity": {
-            "execution_id": execution_id,
-            "base_url": "http://example.test",
-            "user_id": "user-test",
-            "tenant_id": "tenant-test",
-        },
+        "execution_identity": identity,
         "desktop_browser_interaction": {
             "passed": True,
-            "observed_at": "2026-09-28T12:00:00+00:00",
-            "viewport": {"width": 1440, "height": 900},
+            "observed_at": "2026-10-05T12:00:00+00:00",
+            "viewport": {"width": 1440, "height": 960},
             "checks": checks,
         },
         "mobile_browser_interaction": {
             "passed": True,
-            "observed_at": "2026-09-28T12:05:00+00:00",
+            "observed_at": "2026-10-05T12:05:00+00:00",
             "viewport": {"width": 390, "height": 844},
             "checks": checks,
         },
-        "cases": {
-            case_id: {
-                "project_id": scopes[case_id]["project"]["project_id"],
-                "conversation_id": scopes[case_id]["conversation"]["conversation_id"],
-                "run_id": f"run-{case_id}",
-                "desktop": {
-                    "passed": True,
-                    "observed_at": "2026-09-28T12:01:00+00:00",
-                    "evidence_ref": f"desktop-trace-{case_id}",
-                    "checks": {
-                        "preview_rendered": True,
-                        "preview_interaction": True,
-                        "preview_revoked": True,
-                    },
-                },
-                "mobile": {
-                    "passed": True,
-                    "observed_at": "2026-09-28T12:06:00+00:00",
-                    "evidence_ref": f"mobile-trace-{case_id}",
-                    "checks": {
-                        "preview_rendered": True,
-                        "preview_interaction": True,
-                        "preview_revoked": True,
-                    },
-                },
-            }
-            for case_id in _FINALIZER_CASE_IDS
-        },
+        "cases": {},
     }
-    if logical_model is not None:
-        evidence["model_profile"] = {
-            "direct_model": logical_model,
-            "allowed_models": [logical_model],
+    batch = uuid4().hex
+    for case in report["cases"]:
+        case_id = case["case_id"]
+        scope = {
+            "execution_identity": identity,
+            "case_id": case_id,
+            "project_id": case["project"]["project_id"],
+            "conversation_id": case["conversation"]["conversation_id"],
+            "run_id": case["run"]["run_id"],
+            "workspace_session_id": case["conversation"]["workspace_path"],
         }
-        evidence["execution_identity"]["model_profile"] = copy.deepcopy(evidence["model_profile"])
+        evidence["cases"][case_id] = {
+            key: scope[key] for key in ("project_id", "conversation_id", "run_id")
+        }
+        for device in ("desktop", "mobile"):
+            evidence["cases"][case_id][device] = build_device_bundle(
+                root, scope=scope,
+                validated_manifest=validated_workspace_manifest(), device=device,
+                stem=f"{batch}-{case_id.replace(':', '-')}",
+            )
+    if logical_model is not None:
+        evidence["model_profile"] = copy.deepcopy(report["model_profile"])
     return evidence
+
+
+@pytest.mark.parametrize("root", [None, "untrusted"])
+def test_file_backed_finalizer_requires_caller_selected_trusted_root(root: object) -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    evidence["evidence_root"] = str(_evidence_root())
+    before = copy.deepcopy(report)
+    with pytest.raises((TypeError, ValueError), match="evidence_root"):
+        module.finalize_real_device_acceptance(report, evidence, evidence_root=root)
+    assert report == before
+
+
+@pytest.mark.parametrize("mutation", ["schema1", "missing_bundle", "foreign_case", "wrong_device"])
+def test_finalizer_rejects_flags_only_or_replayed_device_bundle(mutation: str) -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    case = evidence["cases"]["small:auto"]
+    if mutation == "schema1":
+        case["mobile"]["schema_version"] = 1
+    elif mutation == "missing_bundle":
+        case["mobile"].pop("bundle_file")
+    elif mutation == "foreign_case":
+        case["mobile"] = copy.deepcopy(evidence["cases"]["medium:auto"]["mobile"])
+    else:
+        case["mobile"] = copy.deepcopy(case["desktop"])
+    before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
+    with pytest.raises((TypeError, ValueError)):
+        module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
+    assert report == before_report
+    assert evidence == before_evidence
+
+
+def test_finalize_cli_explicit_root_overrides_only_evidence_file_parent(
+    tmp_path: Path,
+) -> None:
+    module = load_script()
+    automated = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    evidence["evidence_root"] = str(_evidence_root())
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    source, proof, output = (reports / name for name in ("source.json", "proof.json", "out.json"))
+    source.write_text(json.dumps(automated), encoding="utf-8")
+    proof.write_text(json.dumps(evidence), encoding="utf-8")
+    before = source.read_bytes()
+    args = ["--finalize-report", str(source), "--real-device-evidence", str(proof),
+            "--output", str(output)]
+    assert module.main(args) == 1
+    assert source.read_bytes() == before
+    assert json.loads(output.read_text(encoding="utf-8"))["acceptance_complete"] is False
+    assert module.main([*args, "--evidence-root", str(_evidence_root())]) == 0
+    completed = json.loads(output.read_text(encoding="utf-8"))
+    assert completed["acceptance_complete"] is True
+    assert completed["real_device_acceptance"]["schema_version"] == 2
+    assert source.read_bytes() == before
+    assert "evidence_root" not in completed
+    assert "evidence_root" not in completed["real_device_acceptance"]
+
+
+@pytest.mark.parametrize("device", ["desktop", "mobile"])
+@pytest.mark.parametrize("role", ["bundle", "viewport_png", "render", "business", "provenance", "cleanup"])
+@pytest.mark.parametrize("damage", ["deleted", "corrupt"])
+def test_finalized_resume_rereads_each_device_file_without_writes_or_tasks(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    device: str, role: str, damage: str, monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123"),
+        evidence_root=_evidence_root(),
+    )
+    descriptor = saved["real_device_acceptance"]["cases"]["small:auto"][device]
+    bundle_path = _evidence_root() / descriptor["bundle_file"]["path"]
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    target = bundle_path if role == "bundle" else _evidence_root() / bundle["files"][role]["path"]
+    if damage == "deleted":
+        target.unlink()
+    else:
+        target.write_bytes(b"corrupted operator observation")
+    output = tmp_path / "finalized.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    before = output.read_bytes()
+    evidence_files = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    def forbidden_write(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("finalized resume must not save or promote evidence")
+
+    monkeypatch.setattr(module, "_save_report", forbidden_write)
+    with pytest.raises((TypeError, ValueError)):
+        run_matrix(module, delegate, output_path=str(output), resume_report=saved)
+    assert output.read_bytes() == before
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == evidence_files
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+
+
+@pytest.mark.parametrize("damage", ["missing_root", "wrong_root", "deleted", "corrupt"])
+def test_finalized_cli_requires_explicit_root_and_revalidates_files(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    damage: str, monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123"),
+        evidence_root=_evidence_root(),
+    )
+    saved["evidence_root"] = str(_evidence_root())
+    if damage in {"deleted", "corrupt"}:
+        descriptor = saved["real_device_acceptance"]["cases"]["ultra:multi_agent"]["mobile"]
+        target = _evidence_root() / descriptor["bundle_file"]["path"]
+        if damage == "deleted":
+            target.unlink()
+        else:
+            target.write_bytes(b"corrupt bundle")
+    output = tmp_path / "finalized.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    before = output.read_bytes()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    args = ["--base-url", "http://example.test", "--resume-report", str(output)]
+    if damage != "missing_root":
+        root = tmp_path / "wrong" if damage == "wrong_root" else _evidence_root()
+        args += ["--evidence-root", str(root)]
+    assert module.main(args) == 1
+    assert output.read_bytes() == before
+    assert json.loads(before) == saved
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+
+
+def test_rejected_finalized_cli_resume_never_writes_alternate_output(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path, monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    report = _pending_automated_report()
+    report.update(status="passed", acceptance_complete=True)
+    source, output = tmp_path / "source.json", tmp_path / "alternate.json"
+    source.write_text(json.dumps(report), encoding="utf-8")
+    before = source.read_bytes()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    assert module.main([
+        "--base-url", "http://example.test", "--resume-report", str(source),
+        "--evidence-root", str(_evidence_root()), "--output", str(output),
+    ]) == 1
+    assert source.read_bytes() == before
+    assert not output.exists()
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
 
 
 def _corrupt_device_review_evidence(evidence: dict[str, Any], mutation: str) -> None:
@@ -1416,7 +1665,7 @@ def _corrupt_device_review_evidence(evidence: dict[str, Any], mutation: str) -> 
     elif mutation == "null_base_url":
         evidence["base_url"] = None
     elif mutation == "actor":
-        evidence["actor"] = {"principal": {"user_id": "foreign", "tenant_id": "tenant-test"}}
+        evidence["actor"] = {"principal": {"user_id": "foreign", "tenant_id": "00000000-0000-4000-8000-000000000001"}}
     elif mutation == "null_actor":
         evidence["actor"] = None
     elif mutation == "missing_principal":
@@ -1424,7 +1673,7 @@ def _corrupt_device_review_evidence(evidence: dict[str, Any], mutation: str) -> 
     elif mutation == "null_principal":
         evidence["actor"] = {"principal": None}
     elif mutation == "missing_tenant":
-        evidence["actor"] = {"principal": {"user_id": "user-test"}}
+        evidence["actor"] = {"principal": {"user_id": "00000000-0000-4000-8000-000000000002"}}
     elif mutation == "schema_missing":
         evidence.pop("schema_version", None)
     elif mutation.startswith("schema_"):
@@ -1453,7 +1702,7 @@ def test_device_review_fix_rejects_unbound_scope_and_unsupported_schema(
     report = _pending_automated_report()
     evidence = _real_device_evidence("matrix-123")
     if finalized:
-        report = module.finalize_real_device_acceptance(report, evidence)
+        report = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
         assert report["real_device_acceptance"].get("execution_identity") == (
             evidence["execution_identity"]
         )
@@ -1462,9 +1711,9 @@ def test_device_review_fix_rejects_unbound_scope_and_unsupported_schema(
     before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
     with pytest.raises((TypeError, ValueError)):
         if finalized:
-            module._validated_finalized_report(report)
+            module._validated_finalized_report(report, evidence_root=_evidence_root())
         else:
-            module.finalize_real_device_acceptance(report, evidence)
+            module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
     assert report == before_report
     assert evidence == before_evidence
 
@@ -1480,7 +1729,7 @@ def test_device_review_fix_binds_model_profile_inside_device_identity(
     report = _pending_automated_report("deepseek-backup")
     evidence = _real_device_evidence("matrix-123", "deepseek-backup")
     if finalized:
-        report = module.finalize_real_device_acceptance(report, evidence)
+        report = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
         assert report["real_device_acceptance"].get("execution_identity") == (
             evidence["execution_identity"]
         )
@@ -1491,9 +1740,9 @@ def test_device_review_fix_binds_model_profile_inside_device_identity(
         evidence["execution_identity"]["model_profile"] = profile
     with pytest.raises((TypeError, ValueError), match="identity"):
         if finalized:
-            module._validated_finalized_report(report)
+            module._validated_finalized_report(report, evidence_root=_evidence_root())
         else:
-            module.finalize_real_device_acceptance(report, evidence)
+            module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
 
 
 @pytest.mark.parametrize("stage", ["helper", "finalize", "resume"])
@@ -1510,7 +1759,7 @@ def test_device_review_fix_viewports_require_exact_positive_integers(
     report = _pending_automated_report()
     evidence = _real_device_evidence("matrix-123")
     if stage == "resume":
-        report = module.finalize_real_device_acceptance(report, evidence)
+        report = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
         evidence = report["real_device_acceptance"]
     key = f"{device}_browser_interaction"
     evidence[key]["viewport"][dimension] = value
@@ -1518,9 +1767,9 @@ def test_device_review_fix_viewports_require_exact_positive_integers(
         if stage == "helper":
             module._validated_device_result(evidence, key)
         elif stage == "resume":
-            module._validated_finalized_report(report)
+            module._validated_finalized_report(report, evidence_root=_evidence_root())
         else:
-            module.finalize_real_device_acceptance(report, evidence)
+            module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
 
 
 @pytest.mark.parametrize("logical_model", [None, "deepseek-backup"])
@@ -1534,23 +1783,23 @@ def test_device_review_fix_persists_proven_scope_version_and_final_counts(
     if redundant_scope:
         evidence["base_url"] = "http://example.test"
         evidence["actor"] = {
-            "principal": {"user_id": "user-test", "tenant_id": "tenant-test", "role": "operator"},
+            "principal": {"user_id": "00000000-0000-4000-8000-000000000002", "tenant_id": "00000000-0000-4000-8000-000000000001", "role": "operator"},
         }
     evidence["desktop_browser_interaction"]["viewport"] = {"width": 1024, "height": 1}
     evidence["mobile_browser_interaction"]["viewport"] = {"width": 600, "height": 1}
     before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
     assert report["pending_case_count"] == 20
-    completed = module.finalize_real_device_acceptance(report, evidence)
+    completed = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
     device = completed["real_device_acceptance"]
-    assert type(device.get("schema_version")) is int and device["schema_version"] == 1
+    assert type(device.get("schema_version")) is int and device["schema_version"] == 2
     assert device["execution_identity"] == evidence["execution_identity"]
     assert device["execution_identity"] is not evidence["execution_identity"]
     assert (completed["case_count"], completed["failed_case_count"], completed["pending_case_count"]) == (
         20, 0, 0,
     )
     assert completed["exact_mode_coverage_complete"] is True
-    assert module._validated_finalized_report(completed) == completed
-    assert module.finalize_real_device_acceptance(completed, evidence) == completed
+    assert module._validated_finalized_report(completed, evidence_root=_evidence_root()) == completed
+    assert module.finalize_real_device_acceptance(completed, evidence, evidence_root=_evidence_root()) == completed
     assert report == before_report
     assert evidence == before_evidence
 
@@ -1566,7 +1815,7 @@ def test_device_review_fix_rebuilds_stale_counts_but_rejects_immutable_finalized
     report = _pending_automated_report()
     report.update(counts)
     evidence = _real_device_evidence("matrix-123")
-    completed = module.finalize_real_device_acceptance(report, evidence)
+    completed = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
     assert (completed["case_count"], completed["failed_case_count"], completed["pending_case_count"]) == (
         20, 0, 0,
     )
@@ -1574,7 +1823,7 @@ def test_device_review_fix_rebuilds_stale_counts_but_rejects_immutable_finalized
     completed.update(counts)
     before = copy.deepcopy(completed)
     with pytest.raises(ValueError, match="contradicts"):
-        module._validated_finalized_report(completed)
+        module._validated_finalized_report(completed, evidence_root=_evidence_root())
     assert completed == before
 
 
@@ -1591,7 +1840,7 @@ def test_device_review_fix_cli_rejection_preserves_bytes_and_attempts_without_po
     report = _pending_automated_report()
     evidence = _real_device_evidence("matrix-123")
     if finalized:
-        report = module.finalize_real_device_acceptance(report, evidence)
+        report = module.finalize_real_device_acceptance(report, evidence, evidence_root=_evidence_root())
         assert report["real_device_acceptance"].get("execution_identity") == (
             evidence["execution_identity"]
         )
@@ -1607,7 +1856,7 @@ def test_device_review_fix_cli_rejection_preserves_bytes_and_attempts_without_po
     monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
     args = ["--output", str(output)]
     if finalized:
-        args += ["--base-url", "http://example.test", "--resume-report", str(output)]
+        args += ["--base-url", "http://example.test", "--evidence-root", str(_evidence_root()), "--resume-report", str(output)]
     else:
         args += ["--finalize-report", str(output), "--real-device-evidence", str(device)]
     assert module.main(args) == 1
@@ -1629,6 +1878,7 @@ def test_finalize_real_device_acceptance_requires_and_merges_both_viewports() ->
     completed = module.finalize_real_device_acceptance(
         pending,
         evidence,
+        evidence_root=_evidence_root(),
     )
 
     assert completed["status"] == "passed"
@@ -1657,6 +1907,7 @@ def test_finalize_real_device_acceptance_rejects_mismatched_execution() -> None:
         module.finalize_real_device_acceptance(
             pending,
             _real_device_evidence("matrix-other"),
+            evidence_root=_evidence_root(),
         )
     except ValueError as error:
         assert "execution_id" in str(error)
@@ -1674,6 +1925,7 @@ def test_finalize_real_device_acceptance_rejects_missing_case_evidence() -> None
         module.finalize_real_device_acceptance(
             pending,
             evidence,
+            evidence_root=_evidence_root(),
         )
 
 
@@ -1718,7 +1970,7 @@ def test_finalize_rejects_contradictory_core_evidence(
     (case if section is None else case[section])[field] = value
     before = copy.deepcopy(pending)
     with pytest.raises(ValueError, match="core"):
-        module.finalize_real_device_acceptance(pending, evidence)
+        module.finalize_real_device_acceptance(pending, evidence, evidence_root=_evidence_root())
     assert pending == before
 
 
@@ -1761,7 +2013,7 @@ def test_finalizer_rejects_unbound_or_incomplete_ultra_load(mutation: str) -> No
         case["scale_specific_evidence_ok"] = False
     before = copy.deepcopy(pending)
     with pytest.raises(ValueError, match="core"):
-        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert pending == before
 
 
@@ -1775,7 +2027,7 @@ def test_large_module_evidence_is_revalidated_at_finalize_and_finalized_resume(
     module, delegate, plans, _ = matrix_harness
     saved = _pending_automated_report()
     if finalized:
-        saved = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+        saved = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     case = next(row for row in saved["cases"] if row["case_id"] == "large:auto")
     bound = case["run"]["scale_validation"]
     if mutation == "missing":
@@ -1805,7 +2057,7 @@ def test_large_module_evidence_is_revalidated_at_finalize_and_finalized_resume(
         if finalized:
             run_matrix(module, delegate, output_path=str(output), resume_report=saved)
         else:
-            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert output.read_bytes() == original_bytes and saved == before
     assert not plans
     assert delegate.requests == ([("GET", "/api/v1/auth/me")] if finalized else [])
@@ -1854,7 +2106,7 @@ def test_finalize_rejects_wrong_version_or_execution_scope(change: str) -> None:
         case["run"]["final_effective_scale"] = "medium"
     before = copy.deepcopy(pending)
     with pytest.raises(ValueError):
-        module.finalize_real_device_acceptance(pending, evidence)
+        module.finalize_real_device_acceptance(pending, evidence, evidence_root=_evidence_root())
     assert pending == before
 
 
@@ -1865,7 +2117,7 @@ def test_finalize_rejects_top_level_errors(errors: object) -> None:
     pending["errors"] = errors
     before = copy.deepcopy(pending)
     with pytest.raises(ValueError, match="errors"):
-        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(pending, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert pending == before
 
 
@@ -1878,7 +2130,7 @@ def test_finalize_rejects_any_missing_canonical_case_despite_success_flags(case_
     del evidence["cases"][case_id]
 
     with pytest.raises(ValueError):
-        module.finalize_real_device_acceptance(pending, evidence)
+        module.finalize_real_device_acceptance(pending, evidence, evidence_root=_evidence_root())
 
 
 @pytest.mark.parametrize(
@@ -1958,7 +2210,7 @@ def test_finalize_rejects_invalid_automated_cases(change: str) -> None:
     evidence_before = copy.deepcopy(evidence)
 
     with pytest.raises((TypeError, ValueError)):
-        module.finalize_real_device_acceptance(pending, evidence)
+        module.finalize_real_device_acceptance(pending, evidence, evidence_root=_evidence_root())
     assert pending == pending_before
     assert evidence == evidence_before
 
@@ -1979,7 +2231,7 @@ def test_finalize_rejects_invalid_evidence_case_set(change: str) -> None:
         evidence["cases"]["small:auto"] = []
 
     with pytest.raises((TypeError, ValueError)):
-        module.finalize_real_device_acceptance(_pending_automated_report(), evidence)
+        module.finalize_real_device_acceptance(_pending_automated_report(), evidence, evidence_root=_evidence_root())
 
 
 @pytest.mark.parametrize("field", ["project_id", "conversation_id", "run_id"])
@@ -1990,7 +2242,7 @@ def test_finalize_rejects_case_evidence_scope_mismatch(field: str, value: object
     evidence["cases"]["ultra:multi_agent"][field] = value
 
     with pytest.raises(ValueError, match="does not match"):
-        module.finalize_real_device_acceptance(_pending_automated_report(), evidence)
+        module.finalize_real_device_acceptance(_pending_automated_report(), evidence, evidence_root=_evidence_root())
 
 
 @pytest.mark.parametrize(
@@ -2010,7 +2262,7 @@ def test_finalize_rejects_malformed_automated_scope(
     evidence["cases"]["ultra:multi_agent"][field] = value
 
     with pytest.raises((TypeError, ValueError)):
-        module.finalize_real_device_acceptance(pending, evidence)
+        module.finalize_real_device_acceptance(pending, evidence, evidence_root=_evidence_root())
 
 
 def test_finalize_cli_writes_complete_report_without_logging_in(
@@ -2154,7 +2406,7 @@ def matrix_harness(
         ) -> dict[str, object] | list[object]:
             self.requests.append((method, path))
             if method == "GET" and path == "/api/v1/auth/me":
-                return {"user_id": "user-test", "tenant_id": "tenant-test", "role": "operator"}
+                return {"user_id": "00000000-0000-4000-8000-000000000002", "tenant_id": "00000000-0000-4000-8000-000000000001", "role": "operator"}
             if method == "POST" and path == "/api/v1/admin/project-workspaces":
                 assert body is not None
                 project_id = str(body["project_id"])
@@ -2203,7 +2455,7 @@ def matrix_harness(
                     self.runs[idempotency_key] = {
                         **body,
                         "id": f"run-{len(self.runs) + 1}",
-                        "tenant_id": "tenant-test",
+                        "tenant_id": "00000000-0000-4000-8000-000000000001",
                         "version": 1,
                         "status": "completed",
                         "mode": "direct" if body["mode"] == "auto" else body["mode"],
@@ -2473,6 +2725,8 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
         "artifact_build_timeout_seconds": 1,
         **kwargs,
     }
+    if "evidence_root" not in options:
+        options["evidence_root"] = _evidence_root()
     def execute() -> dict[str, Any]:
         return cast(
             dict[str, Any],
@@ -2596,7 +2850,7 @@ def test_legacy_report_without_journal_cannot_resume_or_finalize(
     with pytest.raises(ValueError, match="journal is missing"):
         run_matrix(module, delegate, resume_report=saved, output_path=str(output))
     with pytest.raises(ValueError, match="journal is missing"):
-        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert delegate.requests == [("GET", "/api/v1/auth/me")]
     assert output.read_bytes() == original
 
@@ -2644,7 +2898,7 @@ def test_completed_report_still_rejects_original_request_digest_mismatch(
     with pytest.raises(ValueError, match="digest"):
         run_matrix(module, delegate, resume_report=saved, output_path=str(output))
     with pytest.raises(ValueError, match="digest"):
-        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"), evidence_root=_evidence_root())
     assert plans == []
     assert delegate.requests == [("GET", "/api/v1/auth/me")]
     assert output.read_bytes() == original
@@ -2739,7 +2993,8 @@ def test_model_profile_resume_mismatch_rejects_before_side_effects(
     saved = _pending_automated_report(saved_model)
     if finalized:
         saved = module.finalize_real_device_acceptance(
-            saved, _real_device_evidence("matrix-123", saved_model)
+            saved, _real_device_evidence("matrix-123", saved_model),
+            evidence_root=_evidence_root(),
         )
     before = copy.deepcopy(saved)
     output = tmp_path / "report.json"
@@ -2774,7 +3029,8 @@ def test_model_profile_cannot_relabel_existing_run_or_attempt_evidence(
         run_matrix(module, delegate, logical_model="deepseek-backup", resume_report=saved)
     with pytest.raises(ValueError, match="model profile"):
         module.finalize_real_device_acceptance(
-            saved, _real_device_evidence("matrix-123", "deepseek-backup")
+            saved, _real_device_evidence("matrix-123", "deepseek-backup"),
+            evidence_root=_evidence_root(),
         )
     assert saved == before
     assert delegate.requests == []
@@ -2798,7 +3054,7 @@ def test_finalizer_requires_exact_model_profile_in_device_evidence(profile: obje
     if profile is not None:
         evidence["model_profile"] = profile
     with pytest.raises((TypeError, ValueError), match="model profile"):
-        module.finalize_real_device_acceptance(saved, evidence)
+        module.finalize_real_device_acceptance(saved, evidence, evidence_root=_evidence_root())
 
 
 def test_scoped_finalizer_preserves_profile_and_does_not_invent_model_evidence() -> None:
@@ -2806,7 +3062,7 @@ def test_scoped_finalizer_preserves_profile_and_does_not_invent_model_evidence()
     saved = _pending_automated_report("deepseek-backup")
     evidence = _real_device_evidence("matrix-123", "deepseek-backup")
     before = copy.deepcopy(saved)
-    completed = module.finalize_real_device_acceptance(saved, evidence)
+    completed = module.finalize_real_device_acceptance(saved, evidence, evidence_root=_evidence_root())
     assert completed["model_profile"] == saved["model_profile"]
     assert completed["real_device_acceptance"]["model_profile"] == saved["model_profile"]
     assert saved == before
@@ -2911,7 +3167,7 @@ def test_model_profile_cli_mismatch_preserves_existing_report_before_client_crea
     before = report.read_bytes()
     args = ["--logical-model", "deepseek-backup", "--output", str(report)]
     if action == "resume":
-        args += ["--resume-report", str(report)]
+        args += ["--evidence-root", str(_evidence_root()), "--resume-report", str(report)]
     else:
         evidence = tmp_path / "evidence.json"
         evidence.write_text(json.dumps(_real_device_evidence("matrix-123")), encoding="utf-8")
@@ -3535,13 +3791,15 @@ async def test_crew_completion_proof_is_revalidated_on_resume_and_finalization(
     ) is (tamper is None)
     if tamper is None:
         finalized = module.finalize_real_device_acceptance(
-            report, _real_device_evidence("matrix-123", "deepseek")
+            report, _real_device_evidence("matrix-123", "deepseek"),
+            evidence_root=_evidence_root(),
         )
         assert finalized["acceptance_complete"] is True
     else:
         with pytest.raises(ValueError):
             module.finalize_real_device_acceptance(
-                report, _real_device_evidence("matrix-123", "deepseek")
+                report, _real_device_evidence("matrix-123", "deepseek"),
+                evidence_root=_evidence_root(),
             )
 
 
@@ -3709,13 +3967,15 @@ async def test_direct_completion_proof_is_revalidated_during_finalization(
     case["model_scope_evidence"] = evidence
     if tamper is None:
         finalized = module.finalize_real_device_acceptance(
-            report, _real_device_evidence("matrix-123", "deepseek")
+            report, _real_device_evidence("matrix-123", "deepseek"),
+            evidence_root=_evidence_root(),
         )
         assert finalized["acceptance_complete"] is True
     else:
         with pytest.raises(ValueError):
             module.finalize_real_device_acceptance(
-                report, _real_device_evidence("matrix-123", "deepseek")
+                report, _real_device_evidence("matrix-123", "deepseek"),
+                evidence_root=_evidence_root(),
             )
 
 
@@ -3839,7 +4099,8 @@ def test_scope_evidence_revalidated_on_resume_and_finalization(
         scope["ok"] = 1
     with pytest.raises(ValueError):
         module.finalize_real_device_acceptance(
-            saved, _real_device_evidence("matrix-123", "deepseek-backup")
+            saved, _real_device_evidence("matrix-123", "deepseek-backup"),
+            evidence_root=_evidence_root(),
         )
     monkeypatch.setattr(module, "_ACCEPTANCE_CASES", module._ACCEPTANCE_CASES[:1])
     saved["cases"] = [case]
@@ -4009,6 +4270,7 @@ def test_resume_finalized_report_returns_exact_evidence_without_tasks_or_writes(
     saved = module.finalize_real_device_acceptance(
         _pending_automated_report(logical_model),
         _real_device_evidence("matrix-123", logical_model),
+        evidence_root=_evidence_root(),
     )
     saved["cases"].reverse()
     saved["finished_at"] = "2026-10-02T13:00:00Z"
@@ -4065,7 +4327,8 @@ def test_resume_rejects_invalid_finalized_report_before_tasks_or_writes(
 ) -> None:
     module, delegate, plans, _ = matrix_harness
     saved = module.finalize_real_device_acceptance(
-        _pending_automated_report(), _real_device_evidence("matrix-123")
+        _pending_automated_report(), _real_device_evidence("matrix-123"),
+        evidence_root=_evidence_root(),
     )
     case = saved["cases"][0]
     device = saved["real_device_acceptance"]
@@ -4126,6 +4389,7 @@ def test_resume_finalized_cli_preserves_file_and_uses_only_authenticated_identit
     saved = module.finalize_real_device_acceptance(
         _pending_automated_report(logical_model),
         _real_device_evidence("matrix-123", logical_model),
+        evidence_root=_evidence_root(),
     )
     if invalid:
         saved["real_device_acceptance"]["mobile_browser_interaction"]["passed"] = False
@@ -4147,7 +4411,7 @@ def test_resume_finalized_cli_preserves_file_and_uses_only_authenticated_identit
         [
             "--base-url",
             "http://example.test",
-            "--resume-report",
+            "--evidence-root", str(_evidence_root()), "--resume-report",
             str(output),
         ]
         + (["--logical-model", logical_model] if logical_model is not None else [])
@@ -4331,7 +4595,7 @@ def test_resume_cli_uses_saved_execution_and_checkpoints_in_place(
         [
             "--base-url",
             "http://example.test/",
-            "--resume-report",
+            "--evidence-root", str(_evidence_root()), "--resume-report",
             str(output),
         ]
     )
@@ -4414,7 +4678,7 @@ def test_resume_cli_failure_preserves_report(
         [
             "--base-url",
             "http://different.test" if failure == "identity" else "http://example.test",
-            "--resume-report",
+            "--evidence-root", str(_evidence_root()), "--resume-report",
             str(output),
         ]
     )

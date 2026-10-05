@@ -280,6 +280,71 @@ def test_project_workspace_store_creates_bounded_zip_without_hidden_files(
         assert archive.read("src/app.py") == b"print('ok')\n"
 
 
+def test_workspace_zip_long_path(tmp_path: Path) -> None:
+    tenant_id, other_tenant_id = uuid4(), uuid4()
+    project_id, session_id = "correction-project", "correction-session"
+    public_filename = "correction-project-correction-session-workspace.zip"
+    scope = Path(str(tenant_id)) / "projects" / project_id / "sessions" / session_id
+    padding = max(0, 225 - len(str(tmp_path / "workspaces" / scope)))
+    store = ProjectWorkspaceStore(tmp_path / ("workspaces" + "x" * padding))
+    session_root = store.session_root(tenant_id, project_id, session_id)
+    legacy_bundle_path = session_root / ".bundles" / public_filename
+
+    # The files fit under MAX_PATH, but repeating the scope in the ZIP name does not.
+    assert len(str(legacy_bundle_path)) >= 260
+    assert len(str(session_root / ".bundles" / "workspace.zip")) < 260
+    assert len(str(session_root / "src/main.js")) < 260
+    source = b"console.log('tenant-one');\n"
+    other_source = b"console.log('tenant-two');\n"
+    store.write_bytes(
+        tenant_id, project_id, session_id, "src/main.js", source, "text/javascript"
+    )
+    store.write_bytes(
+        tenant_id, project_id, session_id, "README.md", b"# Long path\n", "text/markdown"
+    )
+    other_metadata = store.write_bytes(
+        other_tenant_id, project_id, session_id, "src/main.js", other_source, "text/javascript"
+    )
+    expected_files = store.list_files(tenant_id, project_id, session_id)
+
+    bundle = store.create_session_zip(tenant_id, project_id, session_id)
+    other_bundle = store.create_session_zip(other_tenant_id, project_id, session_id)
+
+    assert bundle.filename == other_bundle.filename == public_filename
+    assert bundle.mime_type == "application/zip"
+    assert len(str(bundle.path)) < 260
+    assert bundle.path.parent == session_root / ".bundles"
+    assert other_bundle.path.parent == (
+        store.session_root(other_tenant_id, project_id, session_id) / ".bundles"
+    )
+    assert bundle.path != other_bundle.path
+    assert bundle.files == expected_files
+    assert other_bundle.files == (other_metadata,)
+    assert store.list_files(tenant_id, project_id, session_id) == expected_files
+    with zipfile.ZipFile(bundle.path) as archive:
+        assert archive.namelist() == ["README.md", "src/main.js"]
+        assert archive.read("README.md") == b"# Long path\n"
+        assert archive.read("src/main.js") == source
+    with zipfile.ZipFile(other_bundle.path) as archive:
+        assert archive.namelist() == ["src/main.js"]
+        assert archive.read("src/main.js") == other_source
+
+    updated_source = b"console.log('updated');\n"
+    store.write_bytes(
+        tenant_id, project_id, session_id, "src/main.js", updated_source, "text/javascript"
+    )
+    updated_bundle = store.create_session_zip(tenant_id, project_id, session_id)
+
+    assert updated_bundle.filename == public_filename
+    assert updated_bundle.path == bundle.path
+    assert updated_bundle.files == store.list_files(tenant_id, project_id, session_id)
+    with zipfile.ZipFile(updated_bundle.path) as archive:
+        assert archive.namelist() == ["README.md", "src/main.js"]
+        assert archive.read("src/main.js") == updated_source
+    with zipfile.ZipFile(other_bundle.path) as archive:
+        assert archive.read("src/main.js") == other_source
+
+
 def test_project_workspace_store_rejects_empty_session_zip(tmp_path: Path) -> None:
     store = ProjectWorkspaceStore(tmp_path)
 

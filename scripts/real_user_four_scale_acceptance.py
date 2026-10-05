@@ -23,6 +23,7 @@ from typing import cast
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from uuid import UUID, uuid4
 
+from agent_hub.harness.browser_evidence import validate_case_browser_bundle
 from agent_hub.harness.project_scale import (
     PROJECT_SCALE_TIERS,
     ProjectScaleRunPlan,
@@ -1614,6 +1615,7 @@ def run_real_user_four_scale_acceptance(
     output_path: str | None = None,
     resume_report: Mapping[str, object] | None = None,
     logical_model: str | None = None,
+    evidence_root: Path | None = None,
 ) -> dict[str, object]:
     profile = _model_profile(logical_model)
     if resume_report is not None:
@@ -1634,15 +1636,8 @@ def run_real_user_four_scale_acceptance(
     )
     if resume_report is not None:
         cases = _resume_cases(resume_report, identity, attempt_history)
-        device = resume_report.get("real_device_acceptance")
-        if (
-            resume_report.get("status") == "passed"
-            or resume_report.get("acceptance_complete") is True
-            or resume_report.get("real_device_acceptance_complete") is True
-            or isinstance(device, Mapping)
-            and (device.get("status") == "passed" or device.get("counted_as_complete") is True)
-        ):
-            return _validated_finalized_report(resume_report)
+        if _is_finalized_report(resume_report):
+            return _validated_finalized_report(resume_report, evidence_root=evidence_root)
         _verify_retry_submissions(client, journal, resume_report, safe_execution_id)
         previous_start = resume_report.get("started_at")
         if isinstance(previous_start, str) and _timestamp(previous_start) is not None:
@@ -2139,8 +2134,8 @@ def _submission_journal_from_report(
         for case in entries:
             if not isinstance(case, Mapping):
                 raise ValueError("submission journal requires object case evidence")  # noqa: TRY004
-            case_id = case.get("case_id")
-            ids = confirmed.get((cast(str, case_id), _case_attempt(case)), set())
+            evidence_case_id = case.get("case_id")
+            ids = confirmed.get((cast(str, evidence_case_id), _case_attempt(case)), set())
             run = case.get("run")
             run_id = run.get("run_id") if isinstance(run, Mapping) else None
             scope_evidence = case.get("model_scope_evidence")
@@ -2551,11 +2546,65 @@ def _case_scope_value(
     return scoped
 
 
+def case_browser_collection_scope(
+    report: Mapping[str, object], case_id: str,
+) -> dict[str, object]:
+    """Return verified collection inputs for one completed case, including partial matrices."""
+    profile = _report_model_profile(report)
+    actor, execution_id, base_url = (
+        report.get("actor"), report.get("execution_id"), report.get("base_url")
+    )
+    principal = actor.get("principal") if isinstance(actor, Mapping) else None
+    if (
+        not isinstance(principal, Mapping)
+        or not isinstance(execution_id, str)
+        or not isinstance(base_url, str)
+    ):
+        raise TypeError("browser collection requires complete execution identity")
+    identity = _execution_identity(execution_id, base_url, principal, profile)
+    # Reuse authenticated resume validation without requests, writes or promotion.
+    _resume_cases(report, identity, [])
+    case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
+    by_id = _canonical_case_index(report.get("cases"))
+    if not isinstance(case_id, str) or case_id not in by_id:
+        raise ValueError("browser collection requires an existing canonical case")
+    case = by_id[case_id]
+    if not _has_complete_core_evidence(
+        case, safe_execution_id=_safe_identifier(execution_id), case_key=case_keys[case_id],
+    ):
+        raise ValueError(f"browser collection case evidence must pass core acceptance: {case_id}")
+    manifest = _validated_manifest(cast(Mapping[str, object], case["run"])[
+        "validated_workspace_manifest"
+    ])
+    if manifest is None:
+        raise ValueError("browser collection requires a validated workspace manifest")
+    return {
+        "scope": _browser_case_scope(case, identity),
+        "validated_manifest": {path: list(item) for path, item in manifest.items()},
+    }
+
+
+def _browser_case_scope(
+    case: Mapping[str, object], identity: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "execution_identity": copy.deepcopy(dict(identity)),
+        "case_id": case["case_id"],
+        "project_id": _case_scope_value(case, "project", "project_id"),
+        "conversation_id": _case_scope_value(case, "conversation", "conversation_id"),
+        "run_id": _case_scope_value(case, "run", "run_id"),
+        "workspace_session_id": _case_scope_value(case, "conversation", "workspace_path"),
+    }
+
+
 def _validated_case_device_result(
     result: object,
     *,
     case_id: str,
     device: str,
+    evidence_root: Path,
+    expected_scope: Mapping[str, object],
+    validated_manifest: Mapping[str, tuple[int, str]],
 ) -> dict[str, object]:
     label = f"case evidence {case_id}.{device}"
     if not isinstance(result, Mapping) or result.get("passed") is not True:
@@ -2571,12 +2620,18 @@ def _validated_case_device_result(
         checks.get(name) is not True for name in required_checks
     ):
         raise ValueError(f"{label}.checks must pass every required preview interaction")
-    return copy.deepcopy(dict(result))
+    return validate_case_browser_bundle(
+        result, evidence_root=evidence_root, expected_scope=expected_scope,
+        validated_manifest=validated_manifest, device=device,
+    )
 
 
 def _validated_case_evidence(
     automated_report: Mapping[str, object],
     evidence: Mapping[str, object],
+    *,
+    identity: Mapping[str, object],
+    evidence_root: Path | None,
 ) -> dict[str, dict[str, object]]:
     by_id = _canonical_case_index(automated_report.get("cases"))
     if not by_id:
@@ -2602,6 +2657,8 @@ def _validated_case_evidence(
         raise TypeError("real-device case evidence must be an object")
     if set(raw_evidence) != expected_ids:
         raise ValueError("real-device case evidence must match the canonical case set exactly")
+    if not isinstance(evidence_root, Path):
+        raise TypeError("real-device evidence_root must be an explicit trusted Path")
     validated: dict[str, dict[str, object]] = {}
     for case_id, case in by_id.items():
         item = raw_evidence.get(case_id)
@@ -2617,17 +2674,29 @@ def _validated_case_evidence(
         for key, expected in expected_scope.items():
             if item.get(key) != expected:
                 raise ValueError(f"case evidence {case_id}.{key} does not match the report")
+        browser_scope = _browser_case_scope(case, identity)
+        manifest = _validated_manifest(cast(Mapping[str, object], case["run"])[
+            "validated_workspace_manifest"
+        ])
+        if manifest is None:
+            raise ValueError(f"case evidence {case_id} requires a validated manifest")
         validated[case_id] = {
             **expected_scope,
             "desktop": _validated_case_device_result(
                 item.get("desktop"),
                 case_id=case_id,
                 device="desktop",
+                evidence_root=evidence_root,
+                expected_scope=browser_scope,
+                validated_manifest=manifest,
             ),
             "mobile": _validated_case_device_result(
                 item.get("mobile"),
                 case_id=case_id,
                 device="mobile",
+                evidence_root=evidence_root,
+                expected_scope=browser_scope,
+                validated_manifest=manifest,
             ),
         }
     return validated
@@ -2636,6 +2705,8 @@ def _validated_case_evidence(
 def finalize_real_device_acceptance(
     automated_report: Mapping[str, object],
     evidence: Mapping[str, object],
+    *,
+    evidence_root: Path | None = None,
 ) -> dict[str, object]:
     """Merge deployed desktop/mobile evidence into a completed acceptance report."""
 
@@ -2650,8 +2721,8 @@ def finalize_real_device_acceptance(
         or automated_report.get("benchmark_kind") != "capability"
     ):
         raise ValueError("automated report must be a supported capability acceptance report")
-    if type(evidence.get("schema_version")) is not int or evidence.get("schema_version") != 1:
-        raise ValueError("real-device evidence requires supported integer schema_version 1")
+    if type(evidence.get("schema_version")) is not int or evidence.get("schema_version") != 2:
+        raise ValueError("real-device evidence requires supported integer schema_version 2")
     if automated_report.get("errors", []) != []:
         raise ValueError("automated report errors must be empty before finalization")
     if (
@@ -2689,7 +2760,9 @@ def finalize_real_device_acceptance(
     _submission_journal_from_report(automated_report, identity)
     desktop = _validated_device_result(evidence, "desktop_browser_interaction")
     mobile = _validated_device_result(evidence, "mobile_browser_interaction")
-    case_evidence = _validated_case_evidence(automated_report, evidence)
+    case_evidence = _validated_case_evidence(
+        automated_report, evidence, identity=identity, evidence_root=evidence_root,
+    )
     coverage = _matrix_mode_coverage(automated_report.get("cases"), execution_id=execution_id)
     for key, value in coverage.items():
         if key in automated_report and (
@@ -2744,11 +2817,24 @@ def finalize_real_device_acceptance(
     return completed
 
 
-def _validated_finalized_report(report: Mapping[str, object]) -> dict[str, object]:
+def _is_finalized_report(report: Mapping[str, object]) -> bool:
+    device = report.get("real_device_acceptance")
+    return (
+        report.get("status") == "passed"
+        or report.get("acceptance_complete") is True
+        or report.get("real_device_acceptance_complete") is True
+        or isinstance(device, Mapping)
+        and (device.get("status") == "passed" or device.get("counted_as_complete") is True)
+    )
+
+
+def _validated_finalized_report(
+    report: Mapping[str, object], *, evidence_root: Path | None = None,
+) -> dict[str, object]:
     device = report.get("real_device_acceptance")
     if not isinstance(device, Mapping) or report.get("errors", []) != []:
         raise ValueError("finalized report requires complete real-device evidence")
-    rebuilt = finalize_real_device_acceptance(report, device)
+    rebuilt = finalize_real_device_acceptance(report, device, evidence_root=evidence_root)
     if json.dumps(rebuilt, sort_keys=True) != json.dumps(dict(report), sort_keys=True):
         raise ValueError("finalized report contradicts its complete acceptance evidence")
     return copy.deepcopy(dict(report))
@@ -2817,6 +2903,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--finalize-report")
     parser.add_argument("--real-device-evidence")
+    parser.add_argument("--evidence-root", type=Path, help="Trusted browser evidence directory.")
     parser.add_argument("--logical-model", help="Scope this test to one safe logical model ID.")
     parser.add_argument(
         "--resume-report",
@@ -2852,6 +2939,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = finalize_real_device_acceptance(
                 automated,
                 device_evidence,
+                evidence_root=(
+                    args.evidence_root.absolute() if args.evidence_root is not None
+                    else Path(args.real_device_evidence).absolute().parent
+                ),
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             if args.output and Path(args.output).resolve() == Path(args.finalize_report).resolve():
@@ -2916,6 +3007,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=args.output,
             resume_report=resume_report,
             logical_model=args.logical_model,
+            evidence_root=(
+                args.evidence_root.absolute() if args.evidence_root is not None else None
+            ),
             progress=lambda message: print(
                 f"real-user-four-scale progress: {message}",
                 file=sys.stderr,
@@ -2937,8 +3031,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "dynamic_web_preview": _dynamic_preview_pending(),
         }
         # Authentication, identity, and save errors must not overwrite durable case evidence.
-        if args.output and Path(args.output).exists():
-            print(f"preserved checkpoint: {args.output}", file=sys.stderr, flush=True)
+        finalized_resume = resume_report is not None and _is_finalized_report(resume_report)
+        if finalized_resume or args.output and Path(args.output).exists():
+            checkpoint = args.resume_report if finalized_resume else args.output
+            print(f"preserved checkpoint: {checkpoint}", file=sys.stderr, flush=True)
             _write_report(None, payload)
             return 1
     finalized_resume = resume_report is not None and payload.get("acceptance_complete") is True

@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import zipfile
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -198,7 +199,7 @@ def test_duplicate_public_listing_does_not_receive_positive_binding() -> None:
     ],
 )
 def test_resume_and_finalizer_recompute_identity_instead_of_trusting_success_flags(
-    change: str,
+    change: str, tmp_path: Path,
 ) -> None:
     module = load_script()
     report = _pending_automated_report()
@@ -243,6 +244,7 @@ def test_resume_and_finalizer_recompute_identity_instead_of_trusting_success_fla
         )
         is False
     )
+    device = _real_device_evidence("matrix-123", evidence_root=tmp_path)
     with pytest.raises(ValueError, match="core"):
-        module.finalize_real_device_acceptance(report, _real_device_evidence("matrix-123"))
+        module.finalize_real_device_acceptance(report, device, evidence_root=tmp_path)
     assert report == before

@@ -74,7 +74,7 @@ jobs:
         run: npx playwright install --with-deps chromium
         working-directory: web
       - name: Verify preview HTTP interaction and responsive layout
-        run: node --test e2e/preview-fetch-bridge.cjs e2e/website-preview-layout.cjs
+        run: node --test e2e/preview-fetch-bridge.cjs e2e/website-preview-layout.cjs e2e/collect-case-browser-evidence.test.cjs
         working-directory: web
       - name: Install shell test tools
         shell: bash

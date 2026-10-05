@@ -473,7 +473,7 @@ def test_unselected_build_cannot_skip_scope(scope: object) -> None:
 @pytest.mark.parametrize("selected", [None, "deepseek"])
 @pytest.mark.parametrize("tamper", [None, "missing", "bare", "flag_only", "other_run"])
 def test_resume_and_finalizer_require_retained_proof_not_regenerated_flags(
-    selected: str | None, tamper: str | None,
+    selected: str | None, tamper: str | None, tmp_path: Path,
 ) -> None:
     from tests.unit.test_real_user_four_scale_acceptance_script import _real_device_evidence
 
@@ -502,18 +502,20 @@ def test_resume_and_finalizer_require_retained_proof_not_regenerated_flags(
     )
     assert complete is (tamper is None)
     before = copy.deepcopy(report)
-    device = _real_device_evidence("matrix-123", selected)
+    device = _real_device_evidence("matrix-123", selected, evidence_root=tmp_path)
     if tamper is None:
-        assert module.finalize_real_device_acceptance(report, device)["acceptance_complete"] is True
+        assert module.finalize_real_device_acceptance(
+            report, device, evidence_root=tmp_path,
+        )["acceptance_complete"] is True
     else:
         with pytest.raises(ValueError, match="core"):
-            module.finalize_real_device_acceptance(report, device)
+            module.finalize_real_device_acceptance(report, device, evidence_root=tmp_path)
     assert report == before
 
 
 @pytest.mark.parametrize("delivery,passed", [("valid", True), ("bare", False), ("missing", False)])
 def test_matrix_collects_completion_scope_without_model_selection(
-    monkeypatch: pytest.MonkeyPatch, delivery: str, passed: bool,
+    monkeypatch: pytest.MonkeyPatch, delivery: str, passed: bool, tmp_path: Path,
 ) -> None:
     from tests.unit.test_real_user_four_scale_acceptance_script import matrix_harness, run_matrix
 
@@ -523,7 +525,7 @@ def test_matrix_collects_completion_scope_without_model_selection(
         direct_model_events("run-1") if delivery == "valid"
         else [_bare_completion("run-1")] if delivery == "bare" else []
     )
-    report = run_matrix(module, delegate)
+    report = run_matrix(module, delegate, evidence_root=tmp_path)
     case = report["cases"][0]
     assert "model_scope_evidence" in case
     assert case["model_scope_evidence"]["ok"] is passed
