@@ -1864,6 +1864,72 @@ def run_real_user_four_scale_acceptance(
     return payload
 
 
+def _canonical_case_index(cases: object) -> dict[str, dict[str, object]]:
+    if not isinstance(cases, list):
+        raise TypeError("canonical case evidence must be a list")
+    expected = {f"{scale}:{route}": (scale, route) for _, scale, route, _ in _ACCEPTANCE_CASES}
+    by_id: dict[str, dict[str, object]] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            raise TypeError("canonical case evidence must be an object")
+        case_id = case.get("case_id")
+        if not isinstance(case_id, str) or case_id not in expected:
+            raise ValueError("case evidence has an invalid canonical case_id")
+        if case_id in by_id:
+            raise ValueError(f"case evidence has duplicate case_id: {case_id}")
+        scale, route = expected[case_id]
+        if case.get("scale") != scale or case.get("route_intent") != route:
+            raise ValueError(f"case evidence identity does not match scale/route: {case_id}")
+        if "run" in case:
+            run = case["run"]
+            if not isinstance(run, Mapping):
+                raise TypeError(f"case evidence run must be an object: {case_id}")
+            if run.get("case_id") != case_id:
+                raise ValueError(f"case evidence run.case_id does not match: {case_id}")
+        by_id[case_id] = case
+    return by_id
+
+
+def _matrix_mode_coverage(cases: object, *, execution_id: str) -> dict[str, object]:
+    by_id = _canonical_case_index(cases)
+    safe_execution_id = _safe_identifier(execution_id)
+    auto_count = explicit_count = core_passed = auto_passed = exact_passed = safe_upgrades = 0
+    missing_auto: list[str] = []
+    missing_exact: list[str] = []
+    for kind, scale, route, case_key in _ACCEPTANCE_CASES:
+        case_id = f"{scale}:{route}"
+        case = by_id.get(case_id)
+        core_ok = case is not None and _has_complete_core_evidence(
+            case, safe_execution_id=safe_execution_id, case_key=case_key,
+        )
+        core_passed += int(core_ok)
+        # Core validation rebuilds and checks these credits against the underlying run.
+        exact_ok = core_ok and case is not None and case["exact_mode_coverage_ok"] is True
+        if core_ok and case is not None and case["coverage_credit"] == "safe_upgrade":
+            safe_upgrades += 1
+        if kind == "auto_scale":
+            auto_count += 1
+            auto_passed += int(exact_ok)
+            if not exact_ok:
+                missing_auto.append(case_id)
+        else:
+            explicit_count += 1
+            exact_passed += int(exact_ok)
+            if not exact_ok:
+                missing_exact.append(case_id)
+    return {
+        "auto_scale_case_count": auto_count,
+        "mode_capability_case_count": explicit_count,
+        "core_passed_case_count": core_passed,
+        "auto_scale_passed_case_count": auto_passed,
+        "exact_mode_passed_case_count": exact_passed,
+        "safe_upgrade_case_count": safe_upgrades,
+        "missing_auto_scale_case_ids": missing_auto,
+        "missing_exact_mode_case_ids": missing_exact,
+        "exact_mode_coverage_complete": not missing_auto and not missing_exact,
+    }
+
+
 def _matrix_report(
     *,
     client: RealUserAcceptanceClient,
@@ -1879,21 +1945,24 @@ def _matrix_report(
     finished: bool,
 ) -> dict[str, object]:
 
-    expected_case_count = len(_ACCEPTANCE_CASES)
+    coverage = _matrix_mode_coverage(cases, execution_id=execution_id)
     core_ok = (
         finished
         and client.submission_journal is not None
         and not client.submission_journal.has_unresolved
-        and len(cases) == expected_case_count
-        and all(case.get("core_acceptance_ok") is True for case in cases)
+        and coverage["core_passed_case_count"] == len(_ACCEPTANCE_CASES)
     )
-    status = "pending_real_device" if core_ok else "failed" if finished else "in_progress"
+    automated_ok = core_ok and coverage["exact_mode_coverage_complete"] is True
+    status = (
+        "pending_real_device" if automated_ok else "pending_mode_coverage" if core_ok
+        else "failed" if finished else "in_progress"
+    )
     report = {
         "schema_version": 1,
         "kind": "real_user_four_scale_acceptance",
         "status": status,
         "core_acceptance_ok": core_ok,
-        "automated_acceptance_complete": core_ok,
+        "automated_acceptance_complete": automated_ok,
         "real_device_acceptance_complete": False,
         "acceptance_complete": False,
         "started_at": started_at,
@@ -1907,8 +1976,7 @@ def _matrix_report(
         "mode_capabilities": list(_MODE_CAPABILITIES),
         "scales": list(PROJECT_SCALE_TIERS),
         "route_intents": list(_MODE_CAPABILITIES),
-        "auto_scale_case_count": len(PROJECT_SCALE_TIERS),
-        "mode_capability_case_count": len(PROJECT_SCALE_TIERS) * len(_MODE_CAPABILITIES),
+        **coverage,
         "actor": {
             "username_from_environment": username,
             "authentication_method": authentication_method,
@@ -1917,9 +1985,6 @@ def _matrix_report(
             "principal": principal,
         },
         "case_count": len(cases),
-        "core_passed_case_count": sum(
-            1 for case in cases if case.get("core_acceptance_ok") is True
-        ),
         "failed_case_count": sum(1 for case in cases if case.get("status") == "failed"),
         "pending_case_count": sum(
             1 for case in cases if case.get("status") == "pending_real_device"
@@ -1980,13 +2045,9 @@ def _verify_retry_submissions(
     report: Mapping[str, object], safe_execution_id: str,
 ) -> None:
     case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
-    entries = report.get("cases", [])
-    assert isinstance(entries, list)  # Validated with the journal before reaching this gate.
-    for case in entries:
-        assert isinstance(case, dict)
-        case_id = case.get("case_id") or f"{case.get('scale')}:{case.get('route_intent')}"
-        key = case_keys.get(str(case_id))
-        if key is None or _has_complete_core_evidence(
+    for case_id, case in _canonical_case_index(report.get("cases")).items():
+        key = case_keys[case_id]
+        if _has_complete_core_evidence(
             case, safe_execution_id=safe_execution_id, case_key=key,
         ):
             continue
@@ -2003,6 +2064,7 @@ def _verify_retry_submissions(
 def _submission_journal_from_report(
     report: Mapping[str, object], identity: Mapping[str, object],
 ) -> SubmissionJournal:
+    _canonical_case_index(report.get("cases"))
     raw = report.get("submission_journal")
     if not isinstance(raw, Mapping):
         raise ValueError("submission journal is missing; legacy submissions cannot be replayed")  # noqa: TRY004
@@ -2077,7 +2139,7 @@ def _submission_journal_from_report(
         for case in entries:
             if not isinstance(case, Mapping):
                 raise ValueError("submission journal requires object case evidence")  # noqa: TRY004
-            case_id = case.get("case_id") or f"{case.get('scale')}:{case.get('route_intent')}"
+            case_id = case.get("case_id")
             ids = confirmed.get((cast(str, case_id), _case_attempt(case)), set())
             run = case.get("run")
             run_id = run.get("run_id") if isinstance(run, Mapping) else None
@@ -2125,10 +2187,7 @@ def _resume_cases(
     ):
         raise ValueError("resume report execution identity does not match this execution")
     _submission_journal_from_report(report, identity)
-    raw_cases = report.get("cases")
-    if not isinstance(raw_cases, list):
-        raise TypeError("resume report cases must be a list")
-    by_id: dict[str, dict[str, object]] = {}
+    by_id = copy.deepcopy(_canonical_case_index(report.get("cases")))
     expected_ids = {f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES}
     raw_history = report.get("attempt_history", [])
     if not isinstance(raw_history, list):
@@ -2145,18 +2204,6 @@ def _resume_cases(
             raise ValueError("resume attempt_history contains a duplicate attempt")
         archived_attempts.add(key)
         attempt_history.append(copy.deepcopy(item))
-    for case in raw_cases:
-        if not isinstance(case, dict):
-            raise TypeError("resume report contains a non-object case")
-        case_id = case.get("case_id")
-        # Older exception reports have no case_id; derive only their canonical matrix key.
-        if case_id is None:
-            case_id = f"{case.get('scale')}:{case.get('route_intent')}"
-        if not isinstance(case_id, str) or case_id not in expected_ids:
-            raise ValueError("resume report contains an unknown case_id")
-        if case_id in by_id:
-            raise ValueError(f"resume report contains duplicate case_id: {case_id}")
-        by_id[case_id] = copy.deepcopy({**case, "case_id": case_id})
     cases = []
     for _, scale, route, case_key in _ACCEPTANCE_CASES:
         case = by_id.get(f"{scale}:{route}")
@@ -2469,7 +2516,7 @@ def _validated_device_result(
         raise TypeError(f"{key}.viewport is required")
     width = viewport.get("width")
     height = viewport.get("height")
-    if not isinstance(width, int) or not isinstance(height, int) or height <= 0:
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
         raise ValueError(f"{key}.viewport must contain positive integer dimensions")
     if key.startswith("desktop") and width < 1024:
         raise ValueError("desktop_browser_interaction viewport must be at least 1024px wide")
@@ -2531,29 +2578,20 @@ def _validated_case_evidence(
     automated_report: Mapping[str, object],
     evidence: Mapping[str, object],
 ) -> dict[str, dict[str, object]]:
-    raw_cases = automated_report.get("cases")
-    if not isinstance(raw_cases, list) or not raw_cases:
+    by_id = _canonical_case_index(automated_report.get("cases"))
+    if not by_id:
         raise ValueError("automated report must contain case evidence scopes")
     case_keys = {f"{scale}:{route}": key for _, scale, route, key in _ACCEPTANCE_CASES}
     expected_ids = set(case_keys)
     execution_id = automated_report.get("execution_id")
     if not isinstance(execution_id, str):
         raise TypeError("automated report core evidence requires execution_id")
-    case_ids: set[str] = set()
-    for case in raw_cases:
-        if not isinstance(case, Mapping):
-            raise TypeError("automated report case evidence must be an object")
-        case_id = case.get("case_id")
-        if not isinstance(case_id, str) or case_id not in expected_ids:
-            raise ValueError("automated report case evidence has an invalid canonical case_id")
-        if case_id in case_ids:
-            raise ValueError(f"automated report case evidence has duplicate case_id: {case_id}")
+    for case_id, case in by_id.items():
         if not _has_complete_core_evidence(
             case, safe_execution_id=_safe_identifier(execution_id), case_key=case_keys[case_id]
         ):
             raise ValueError(f"automated report case evidence must pass core acceptance: {case_id}")
-        case_ids.add(case_id)
-    if case_ids != expected_ids:
+    if set(by_id) != expected_ids:
         raise ValueError(
             "automated report case evidence must contain every canonical case exactly once"
         )
@@ -2565,8 +2603,7 @@ def _validated_case_evidence(
     if set(raw_evidence) != expected_ids:
         raise ValueError("real-device case evidence must match the canonical case set exactly")
     validated: dict[str, dict[str, object]] = {}
-    for case in raw_cases:
-        case_id = cast(str, case["case_id"])
+    for case_id, case in by_id.items():
         item = raw_evidence.get(case_id)
         if item is None:
             raise ValueError(f"case evidence is missing for {case_id}")
@@ -2613,6 +2650,8 @@ def finalize_real_device_acceptance(
         or automated_report.get("benchmark_kind") != "capability"
     ):
         raise ValueError("automated report must be a supported capability acceptance report")
+    if type(evidence.get("schema_version")) is not int or evidence.get("schema_version") != 1:
+        raise ValueError("real-device evidence requires supported integer schema_version 1")
     if automated_report.get("errors", []) != []:
         raise ValueError("automated report errors must be empty before finalization")
     if (
@@ -2633,16 +2672,42 @@ def finalize_real_device_acceptance(
         and automated_report["execution_identity"] != identity
     ):
         raise ValueError("automated report execution identity is inconsistent")
+    device_identity = evidence.get("execution_identity")
+    if not isinstance(device_identity, Mapping) or device_identity != identity:
+        raise ValueError("real-device evidence execution identity must match the automated identity")
+    if "base_url" in evidence and evidence["base_url"] != identity["base_url"]:
+        raise ValueError("real-device evidence base_url contradicts its execution identity")
+    if "actor" in evidence:
+        device_actor = evidence["actor"]
+        device_principal = (
+            device_actor.get("principal") if isinstance(device_actor, Mapping) else None
+        )
+        if not isinstance(device_principal, Mapping) or any(
+            device_principal.get(key) != identity[key] for key in ("user_id", "tenant_id")
+        ):
+            raise ValueError("real-device evidence actor.principal contradicts its execution identity")
     _submission_journal_from_report(automated_report, identity)
     desktop = _validated_device_result(evidence, "desktop_browser_interaction")
     mobile = _validated_device_result(evidence, "mobile_browser_interaction")
     case_evidence = _validated_case_evidence(automated_report, evidence)
+    coverage = _matrix_mode_coverage(automated_report.get("cases"), execution_id=execution_id)
+    for key, value in coverage.items():
+        if key in automated_report and (
+            type(automated_report[key]) is not type(value) or automated_report[key] != value
+        ):
+            raise ValueError(f"automated report mode coverage is inconsistent: {key}")
+    if coverage["exact_mode_coverage_complete"] is not True:
+        raise ValueError("automated report exact mode coverage must pass before finalization")
 
     completed = copy.deepcopy(dict(automated_report))
+    completed.update(coverage)
     completed["status"] = "passed"
     completed["real_device_acceptance_complete"] = True
     completed["acceptance_complete"] = True
     completed["real_device_acceptance"] = {
+        "schema_version": evidence["schema_version"],
+        "execution_id": evidence["execution_id"],
+        "execution_identity": copy.deepcopy(dict(device_identity)),
         "status": "passed",
         "counted_as_complete": True,
         "desktop_browser_interaction": desktop,
@@ -2671,6 +2736,11 @@ def finalize_real_device_acceptance(
             preview = case.get("dynamic_web_preview")
             if isinstance(preview, dict):
                 preview["browser_interaction"] = "verified_by_deployed_real_device_acceptance"
+        completed["case_count"] = len(cases)
+        completed["failed_case_count"] = sum(1 for case in cases if case["status"] == "failed")
+        completed["pending_case_count"] = sum(
+            1 for case in cases if case["status"] == "pending_real_device"
+        )
     return completed
 
 
@@ -2678,9 +2748,7 @@ def _validated_finalized_report(report: Mapping[str, object]) -> dict[str, objec
     device = report.get("real_device_acceptance")
     if not isinstance(device, Mapping) or report.get("errors", []) != []:
         raise ValueError("finalized report requires complete real-device evidence")
-    rebuilt = finalize_real_device_acceptance(
-        report, {**device, "execution_id": report.get("execution_id")}
-    )
+    rebuilt = finalize_real_device_acceptance(report, device)
     if json.dumps(rebuilt, sort_keys=True) != json.dumps(dict(report), sort_keys=True):
         raise ValueError("finalized report contradicts its complete acceptance evidence")
     return copy.deepcopy(dict(report))
@@ -2709,7 +2777,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run small/medium/large/ultra capability acceptance as one logged-in user. "
-            "Exit 0 means complete, 1 means failed, and 2 means core passed with pending preview."
+            "Exit 0 means complete, 1 means failed, and 2 means core passed with pending "
+            "exact mode coverage or real-device browser evidence."
         )
     )
     parser.add_argument(

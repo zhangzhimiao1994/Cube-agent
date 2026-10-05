@@ -1001,6 +1001,339 @@ def _pending_automated_report(logical_model: str | None = None) -> dict[str, Any
     return report
 
 
+def _safe_upgrade_cases(module: Any, report: dict[str, Any]) -> None:
+    for case in report["cases"]:
+        if case["case_id"] not in {"large:direct", "ultra:direct"}:
+            continue
+        run = case["run"]
+        result = ProjectScaleCaseResult(
+            case_id=case["case_id"], run_id=run["run_id"], status="completed",
+            evidence=copy.deepcopy(run["evidence"]), observed_mode="hybrid",
+            final_observed_mode="hybrid", requested_mode="direct",
+            route_reason="project_scale_mode_upgrade", mode_source="project_scale_assessment",
+            effective_scale=case["scale"], final_effective_scale=case["scale"],
+            artifact_origin=run["artifact_origin"],
+            workspace_bundle_source=run["workspace_bundle_source"],
+            validated_workspace_manifest=validated_workspace_manifest(),
+            scale_validation=copy.deepcopy(run["scale_validation"]),
+        )
+        rebuilt = module.build_case_report(
+            scale=case["scale"], project=case["project"], conversation=case["conversation"],
+            result=result, public_artifacts=case["public_artifacts"],
+            dynamic_web_preview=case["dynamic_web_preview"],
+            model_scope_evidence=case["model_scope_evidence"],
+        )
+        for key in ("status", "acceptance_complete", "real_device_acceptance_complete"):
+            rebuilt[key] = case[key]
+        case.update(rebuilt)
+
+
+def _mode_matrix_report(module: Any, saved: dict[str, Any]) -> dict[str, Any]:
+    client = module.RealUserAcceptanceClient(None)
+    client.configure_submission_journal(
+        module.SubmissionJournal(saved["execution_identity"], saved["submission_journal"]),
+        lambda: None,
+    )
+    return cast(dict[str, Any], module._matrix_report(
+        client=client, cases=saved["cases"], attempt_history=saved.get("attempt_history", []),
+        username="test", principal=saved["actor"]["principal"], base_url=saved["base_url"],
+        execution_id=saved["execution_id"], identity=saved["execution_identity"],
+        started_at="2026-10-05T00:00:00Z", authentication_method="bearer_token", finished=True,
+    ))
+
+
+@pytest.mark.parametrize("upgrades", [False, True])
+@pytest.mark.parametrize("reordered", [False, True])
+def test_mode_coverage_counts_only_current_canonical_core_cases(
+    upgrades: bool, reordered: bool,
+) -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    if upgrades:
+        _safe_upgrade_cases(module, saved)
+    if reordered:
+        saved["cases"].reverse()
+    before = copy.deepcopy(saved)
+    coverage = module._matrix_mode_coverage(saved["cases"], execution_id="matrix-123")
+    assert coverage == {
+        "auto_scale_case_count": 4,
+        "mode_capability_case_count": 16,
+        "core_passed_case_count": 20,
+        "auto_scale_passed_case_count": 4,
+        "exact_mode_passed_case_count": 14 if upgrades else 16,
+        "safe_upgrade_case_count": 2 if upgrades else 0,
+        "missing_auto_scale_case_ids": [],
+        "missing_exact_mode_case_ids": ["large:direct", "ultra:direct"] if upgrades else [],
+        "exact_mode_coverage_complete": not upgrades,
+    }
+    assert saved == before
+
+
+@pytest.mark.parametrize("count,auto,exact", [(0, 0, 0), (1, 1, 0), (4, 4, 0), (19, 4, 15)])
+def test_mode_coverage_partial_checkpoints_keep_full_denominators(
+    count: int, auto: int, exact: int,
+) -> None:
+    module = load_script()
+    canonical_ids = (
+        "small:auto", "medium:auto", "large:auto", "ultra:auto",
+        *(f"{scale}:{mode}" for scale in ("small", "medium", "large", "ultra")
+          for mode in ("direct", "dispatch", "hybrid", "multi_agent")),
+    )
+    by_id = {case["case_id"]: case for case in _pending_automated_report()["cases"]}
+    cases = [by_id[case_id] for case_id in canonical_ids[:count]]
+    coverage = module._matrix_mode_coverage(cases, execution_id="matrix-123")
+    assert coverage["core_passed_case_count"] == count
+    assert coverage["auto_scale_case_count"] == 4
+    assert coverage["mode_capability_case_count"] == 16
+    assert coverage["auto_scale_passed_case_count"] == auto
+    assert coverage["exact_mode_passed_case_count"] == exact
+    assert coverage["safe_upgrade_case_count"] == 0
+    assert coverage["missing_auto_scale_case_ids"] == list(canonical_ids[auto:4])
+    assert coverage["missing_exact_mode_case_ids"] == list(canonical_ids[4 + exact:])
+    assert coverage["exact_mode_coverage_complete"] is False
+
+
+@pytest.mark.parametrize("consumer", ["coverage", "matrix", "resume", "finalize"])
+@pytest.mark.parametrize("change", [
+    "duplicate", "unknown", "missing_id", "empty_id", "null_id", "integer_id", "list_id",
+    "whitespace_id", "scale", "route", "run_case", "run_missing_id", "null_run", "non_object",
+])
+def test_mode_coverage_rejects_bad_identity_before_credit_or_resume(
+    consumer: str, change: str,
+) -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    case = saved["cases"][0]
+    if change == "duplicate":
+        saved["cases"][-1] = copy.deepcopy(case)
+    elif change == "unknown":
+        case["case_id"] = "unknown:auto"
+    elif change == "missing_id":
+        del case["case_id"]
+    elif change in {"empty_id", "null_id", "integer_id", "list_id", "whitespace_id"}:
+        case["case_id"] = {
+            "empty_id": "", "null_id": None, "integer_id": 1, "list_id": ["small:auto"],
+            "whitespace_id": " small:auto ",
+        }[change]
+    elif change == "scale":
+        case["scale"] = "large"
+    elif change == "route":
+        case["route_intent"] = "direct"
+    elif change == "run_case":
+        case["run"]["case_id"] = "small:direct"
+    elif change == "run_missing_id":
+        del case["run"]["case_id"]
+    elif change == "null_run":
+        case["run"] = None
+    elif change == "non_object":
+        saved["cases"][0] = None
+    before = copy.deepcopy(saved)
+    with pytest.raises((ValueError, TypeError)):
+        if consumer == "coverage":
+            module._matrix_mode_coverage(saved["cases"], execution_id="matrix-123")
+        elif consumer == "matrix":
+            _mode_matrix_report(module, saved)
+        elif consumer == "resume":
+            module._resume_cases(saved, saved["execution_identity"], [])
+        else:
+            module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert saved == before
+
+
+@pytest.mark.parametrize("mutation", [
+    "failed_without_run", "missing_participation", "forged_credit", "forged_core",
+])
+def test_mode_coverage_revalidates_bottom_level_evidence_and_ignores_history(mutation: str) -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    _safe_upgrade_cases(module, saved)
+    case = next(case for case in saved["cases"] if case["case_id"] == "small:multi_agent")
+    saved["attempt_history"] = copy.deepcopy(_pending_automated_report()["cases"])
+    if mutation == "failed_without_run":
+        del case["run"]
+        case.update(status="failed", core_acceptance_ok=False, automated_acceptance_complete=False)
+    elif mutation == "missing_participation":
+        case["run"]["participant_agent_ids"] = []
+    elif mutation == "forged_credit":
+        case["coverage_credit"] = "safe_upgrade"
+    else:
+        case["run"]["evidence"]["generated_project_validation"] = False
+    payload = _mode_matrix_report(module, saved)
+    assert payload["core_passed_case_count"] == 19
+    assert payload["auto_scale_passed_case_count"] == 4
+    assert payload["exact_mode_passed_case_count"] == 13
+    assert payload["safe_upgrade_case_count"] == 2
+    assert payload["missing_exact_mode_case_ids"] == [
+        "small:multi_agent", "large:direct", "ultra:direct",
+    ]
+    assert payload["core_acceptance_ok"] is False
+    assert payload["automated_acceptance_complete"] is False
+    assert payload["status"] == "failed"
+
+
+def test_mode_coverage_missing_auto_blocks_completion_even_with_all_explicit_modes() -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    saved["cases"][0]["run"]["evidence"]["generated_project_validation"] = False
+    coverage = module._matrix_mode_coverage(saved["cases"], execution_id="matrix-123")
+    assert coverage["core_passed_case_count"] == 19
+    assert coverage["auto_scale_passed_case_count"] == 3
+    assert coverage["exact_mode_passed_case_count"] == 16
+    assert coverage["missing_auto_scale_case_ids"] == ["small:auto"]
+    assert coverage["missing_exact_mode_case_ids"] == []
+    assert coverage["exact_mode_coverage_complete"] is False
+
+
+@pytest.mark.parametrize("forged_summary", [False, True])
+def test_mode_coverage_finalizer_rejects_consistent_safe_upgrades(forged_summary: bool) -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    _safe_upgrade_cases(module, saved)
+    if forged_summary:
+        saved.update(
+            auto_scale_passed_case_count=4, exact_mode_passed_case_count=16,
+            safe_upgrade_case_count=0, missing_auto_scale_case_ids=[],
+            missing_exact_mode_case_ids=[], exact_mode_coverage_complete=True,
+        )
+    before = copy.deepcopy(saved)
+    with pytest.raises(ValueError, match="mode coverage"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert saved == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("core_passed_case_count", 19), ("auto_scale_case_count", 3),
+    ("mode_capability_case_count", 15), ("auto_scale_passed_case_count", 3),
+    ("exact_mode_passed_case_count", 14), ("safe_upgrade_case_count", 2),
+    ("missing_auto_scale_case_ids", ["small:auto"]),
+    ("missing_exact_mode_case_ids", ["large:direct"]),
+    ("exact_mode_coverage_complete", False), ("exact_mode_coverage_complete", 1),
+    ("safe_upgrade_case_count", False), ("exact_mode_passed_case_count", 16.0),
+])
+def test_mode_coverage_finalizer_rejects_inconsistent_supplied_summaries(
+    field: str, value: object,
+) -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    saved[field] = value
+    with pytest.raises(ValueError, match="coverage"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+
+
+def test_mode_coverage_finalizer_recomputes_legacy_pending_report() -> None:
+    module = load_script()
+    saved = _pending_automated_report()
+    before = copy.deepcopy(saved)
+    completed = module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert completed["core_passed_case_count"] == 20
+    assert completed["auto_scale_case_count"] == 4
+    assert completed["mode_capability_case_count"] == 16
+    assert completed["auto_scale_passed_case_count"] == 4
+    assert completed["exact_mode_passed_case_count"] == 16
+    assert completed["safe_upgrade_case_count"] == 0
+    assert completed["missing_auto_scale_case_ids"] == []
+    assert completed["missing_exact_mode_case_ids"] == []
+    assert completed["exact_mode_coverage_complete"] is True
+    assert completed["acceptance_complete"] is True
+    assert saved == before
+
+
+def test_mode_coverage_resume_keeps_completed_upgrades_without_new_plans_or_attempts(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    _safe_upgrade_cases(module, saved)
+    saved["attempt_history"] = []
+    before = copy.deepcopy(saved)
+    output = tmp_path / "pending.json"
+    resumed = run_matrix(module, delegate, resume_report=saved, output_path=str(output))
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+    assert {case["case_id"]: case for case in resumed["cases"]} == {
+        case["case_id"]: case for case in before["cases"]
+    }
+    assert resumed["attempt_history"] == []
+    assert resumed["submission_journal"] == before["submission_journal"]
+    assert resumed["core_acceptance_ok"] is True
+    assert resumed["automated_acceptance_complete"] is False
+    assert resumed["status"] == "pending_mode_coverage"
+    assert resumed["core_passed_case_count"] == 20
+    assert resumed["exact_mode_passed_case_count"] == 14
+    assert resumed["safe_upgrade_case_count"] == 2
+    assert resumed["exact_mode_coverage_complete"] is False
+    assert json.loads(output.read_text(encoding="utf-8")) == resumed
+    assert saved == before
+
+
+def test_mode_coverage_cli_returns_pending_and_preserves_finalization_source(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path, monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    _safe_upgrade_cases(module, saved)
+    output, device = tmp_path / "pending.json", tmp_path / "device.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    device.write_text(json.dumps(_real_device_evidence("matrix-123")), encoding="utf-8")
+    before = output.read_bytes()
+    assert module.main([
+        "--finalize-report", str(output), "--real-device-evidence", str(device),
+        "--output", str(output),
+    ]) == 1
+    assert output.read_bytes() == before
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    assert module.main([
+        "--base-url", "http://example.test", "--resume-report", str(output),
+        "--output", str(output),
+    ]) == 2
+    pending = json.loads(output.read_text(encoding="utf-8"))
+    assert pending["status"] == "pending_mode_coverage"
+    assert {case["case_id"]: case for case in pending["cases"]} == {
+        case["case_id"]: case for case in saved["cases"]
+    }
+    assert pending["attempt_history"] == []
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+
+
+@pytest.mark.parametrize("mutation", ["safe_upgrades", "missing_summary", "forged_summary"])
+def test_mode_coverage_finalized_cli_resume_fails_closed_without_writes_or_posts(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, mutation: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = module.finalize_real_device_acceptance(
+        _pending_automated_report(), _real_device_evidence("matrix-123"),
+    )
+    saved["attempt_history"] = [{"case_id": "small:auto", "attempt": 1, "status": "failed"}]
+    if mutation == "safe_upgrades":
+        _safe_upgrade_cases(module, saved)
+    elif mutation == "missing_summary":
+        for key in (
+            "auto_scale_passed_case_count", "exact_mode_passed_case_count", "safe_upgrade_case_count",
+            "missing_auto_scale_case_ids", "missing_exact_mode_case_ids", "exact_mode_coverage_complete",
+        ):
+            saved.pop(key, None)
+    else:
+        saved["exact_mode_passed_case_count"] = 14
+    output = tmp_path / "finalized.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    before = output.read_bytes()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    assert module.main([
+        "--base-url", "http://example.test", "--resume-report", str(output),
+        "--output", str(output),
+    ]) == 1
+    assert output.read_bytes() == before
+    assert json.loads(output.read_text(encoding="utf-8")) == saved
+    assert delegate.requests == [("GET", "/api/v1/auth/me")]
+    assert plans == []
+
+
 def _real_device_evidence(execution_id: str, logical_model: str | None = None) -> dict[str, Any]:
     scopes = {case["case_id"]: case for case in _pending_automated_report()["cases"]}
     checks = {
@@ -1010,9 +1343,15 @@ def _real_device_evidence(execution_id: str, logical_model: str | None = None) -
         "preview_interaction": True,
         "preview_revoked": True,
     }
-    evidence = {
+    evidence: dict[str, Any] = {
         "schema_version": 1,
         "execution_id": execution_id,
+        "execution_identity": {
+            "execution_id": execution_id,
+            "base_url": "http://example.test",
+            "user_id": "user-test",
+            "tenant_id": "tenant-test",
+        },
         "desktop_browser_interaction": {
             "passed": True,
             "observed_at": "2026-09-28T12:00:00+00:00",
@@ -1059,7 +1398,224 @@ def _real_device_evidence(execution_id: str, logical_model: str | None = None) -
             "direct_model": logical_model,
             "allowed_models": [logical_model],
         }
+        evidence["execution_identity"]["model_profile"] = copy.deepcopy(evidence["model_profile"])
     return evidence
+
+
+def _corrupt_device_review_evidence(evidence: dict[str, Any], mutation: str) -> None:
+    if mutation == "missing_identity":
+        evidence.pop("execution_identity", None)
+    elif mutation == "null_identity":
+        evidence["execution_identity"] = None
+    elif mutation == "missing_user":
+        evidence["execution_identity"].pop("user_id", None)
+    elif mutation.startswith("identity_"):
+        evidence["execution_identity"][mutation.removeprefix("identity_")] = "foreign"
+    elif mutation == "base_url":
+        evidence["base_url"] = "https://other.invalid"
+    elif mutation == "null_base_url":
+        evidence["base_url"] = None
+    elif mutation == "actor":
+        evidence["actor"] = {"principal": {"user_id": "foreign", "tenant_id": "tenant-test"}}
+    elif mutation == "null_actor":
+        evidence["actor"] = None
+    elif mutation == "missing_principal":
+        evidence["actor"] = {}
+    elif mutation == "null_principal":
+        evidence["actor"] = {"principal": None}
+    elif mutation == "missing_tenant":
+        evidence["actor"] = {"principal": {"user_id": "user-test"}}
+    elif mutation == "schema_missing":
+        evidence.pop("schema_version", None)
+    elif mutation.startswith("schema_"):
+        evidence["schema_version"] = {
+            "schema_bool": True, "schema_float": 1.0, "schema_unknown": 99,
+            "schema_null": None, "schema_string": "1",
+        }[mutation]
+    elif mutation == "viewport":
+        evidence["mobile_browser_interaction"]["viewport"] = {"width": True, "height": True}
+    else:
+        raise AssertionError(f"unknown device review mutation: {mutation}")
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("mutation", [
+    "missing_identity", "null_identity", "missing_user", "identity_execution_id",
+    "identity_base_url", "identity_user_id", "identity_tenant_id", "identity_extra",
+    "base_url", "null_base_url", "actor", "null_actor", "missing_principal",
+    "null_principal", "missing_tenant", "schema_missing", "schema_bool", "schema_float",
+    "schema_unknown", "schema_null", "schema_string",
+])
+def test_device_review_fix_rejects_unbound_scope_and_unsupported_schema(
+    finalized: bool, mutation: str,
+) -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    if finalized:
+        report = module.finalize_real_device_acceptance(report, evidence)
+        assert report["real_device_acceptance"].get("execution_identity") == (
+            evidence["execution_identity"]
+        )
+        evidence = report["real_device_acceptance"]
+    _corrupt_device_review_evidence(evidence, mutation)
+    before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
+    with pytest.raises((TypeError, ValueError)):
+        if finalized:
+            module._validated_finalized_report(report)
+        else:
+            module.finalize_real_device_acceptance(report, evidence)
+    assert report == before_report
+    assert evidence == before_evidence
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("profile", [None, {}, {
+    "direct_model": "foreign", "allowed_models": ["foreign"],
+}])
+def test_device_review_fix_binds_model_profile_inside_device_identity(
+    finalized: bool, profile: object,
+) -> None:
+    module = load_script()
+    report = _pending_automated_report("deepseek-backup")
+    evidence = _real_device_evidence("matrix-123", "deepseek-backup")
+    if finalized:
+        report = module.finalize_real_device_acceptance(report, evidence)
+        assert report["real_device_acceptance"].get("execution_identity") == (
+            evidence["execution_identity"]
+        )
+        evidence = report["real_device_acceptance"]
+    if profile is None:
+        evidence["execution_identity"].pop("model_profile")
+    else:
+        evidence["execution_identity"]["model_profile"] = profile
+    with pytest.raises((TypeError, ValueError), match="identity"):
+        if finalized:
+            module._validated_finalized_report(report)
+        else:
+            module.finalize_real_device_acceptance(report, evidence)
+
+
+@pytest.mark.parametrize("stage", ["helper", "finalize", "resume"])
+@pytest.mark.parametrize("device,dimension,value", [
+    ("mobile", "width", True), ("mobile", "height", True), ("desktop", "height", True),
+    ("desktop", "width", 1440.0), ("mobile", "width", 390.0),
+    ("desktop", "height", None), ("mobile", "height", None),
+    ("desktop", "height", 0), ("mobile", "width", 0), ("mobile", "width", False),
+])
+def test_device_review_fix_viewports_require_exact_positive_integers(
+    stage: str, device: str, dimension: str, value: object,
+) -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    if stage == "resume":
+        report = module.finalize_real_device_acceptance(report, evidence)
+        evidence = report["real_device_acceptance"]
+    key = f"{device}_browser_interaction"
+    evidence[key]["viewport"][dimension] = value
+    with pytest.raises((TypeError, ValueError), match="viewport"):
+        if stage == "helper":
+            module._validated_device_result(evidence, key)
+        elif stage == "resume":
+            module._validated_finalized_report(report)
+        else:
+            module.finalize_real_device_acceptance(report, evidence)
+
+
+@pytest.mark.parametrize("logical_model", [None, "deepseek-backup"])
+@pytest.mark.parametrize("redundant_scope", [False, True])
+def test_device_review_fix_persists_proven_scope_version_and_final_counts(
+    logical_model: str | None, redundant_scope: bool,
+) -> None:
+    module = load_script()
+    report = _mode_matrix_report(module, _pending_automated_report(logical_model))
+    evidence = _real_device_evidence("matrix-123", logical_model)
+    if redundant_scope:
+        evidence["base_url"] = "http://example.test"
+        evidence["actor"] = {
+            "principal": {"user_id": "user-test", "tenant_id": "tenant-test", "role": "operator"},
+        }
+    evidence["desktop_browser_interaction"]["viewport"] = {"width": 1024, "height": 1}
+    evidence["mobile_browser_interaction"]["viewport"] = {"width": 600, "height": 1}
+    before_report, before_evidence = copy.deepcopy(report), copy.deepcopy(evidence)
+    assert report["pending_case_count"] == 20
+    completed = module.finalize_real_device_acceptance(report, evidence)
+    device = completed["real_device_acceptance"]
+    assert type(device.get("schema_version")) is int and device["schema_version"] == 1
+    assert device["execution_identity"] == evidence["execution_identity"]
+    assert device["execution_identity"] is not evidence["execution_identity"]
+    assert (completed["case_count"], completed["failed_case_count"], completed["pending_case_count"]) == (
+        20, 0, 0,
+    )
+    assert completed["exact_mode_coverage_complete"] is True
+    assert module._validated_finalized_report(completed) == completed
+    assert module.finalize_real_device_acceptance(completed, evidence) == completed
+    assert report == before_report
+    assert evidence == before_evidence
+
+
+@pytest.mark.parametrize("counts", [
+    {"case_count": 1, "failed_case_count": 20, "pending_case_count": 20},
+    {"case_count": True, "failed_case_count": "20", "pending_case_count": None},
+])
+def test_device_review_fix_rebuilds_stale_counts_but_rejects_immutable_finalized_counts(
+    counts: dict[str, object],
+) -> None:
+    module = load_script()
+    report = _pending_automated_report()
+    report.update(counts)
+    evidence = _real_device_evidence("matrix-123")
+    completed = module.finalize_real_device_acceptance(report, evidence)
+    assert (completed["case_count"], completed["failed_case_count"], completed["pending_case_count"]) == (
+        20, 0, 0,
+    )
+    assert all(type(completed[key]) is int for key in counts)
+    completed.update(counts)
+    before = copy.deepcopy(completed)
+    with pytest.raises(ValueError, match="contradicts"):
+        module._validated_finalized_report(completed)
+    assert completed == before
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("mutation", [
+    "missing_identity", "identity_tenant_id", "base_url", "actor", "schema_missing",
+    "schema_bool", "schema_unknown", "viewport",
+])
+def test_device_review_fix_cli_rejection_preserves_bytes_and_attempts_without_posts(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, finalized: bool, mutation: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    report = _pending_automated_report()
+    evidence = _real_device_evidence("matrix-123")
+    if finalized:
+        report = module.finalize_real_device_acceptance(report, evidence)
+        assert report["real_device_acceptance"].get("execution_identity") == (
+            evidence["execution_identity"]
+        )
+        evidence = report["real_device_acceptance"]
+    report["attempt_history"] = [{"case_id": "small:auto", "attempt": 1, "status": "failed"}]
+    _corrupt_device_review_evidence(evidence, mutation)
+    output, device = tmp_path / "report.json", tmp_path / "device.json"
+    output.write_text(json.dumps(report), encoding="utf-8")
+    device.write_text(json.dumps(evidence), encoding="utf-8")
+    before_report, before_device = output.read_bytes(), device.read_bytes()
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "synthetic-token")
+    monkeypatch.delenv("AGENT_HUB_PROJECT_SCALE_EXECUTION_ID", raising=False)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    args = ["--output", str(output)]
+    if finalized:
+        args += ["--base-url", "http://example.test", "--resume-report", str(output)]
+    else:
+        args += ["--finalize-report", str(output), "--real-device-evidence", str(device)]
+    assert module.main(args) == 1
+    assert output.read_bytes() == before_report
+    assert device.read_bytes() == before_device
+    assert json.loads(output.read_text(encoding="utf-8")) == report
+    assert delegate.requests == ([("GET", "/api/v1/auth/me")] if finalized else [])
+    assert plans == []
 
 
 def test_finalize_real_device_acceptance_requires_and_merges_both_viewports() -> None:
