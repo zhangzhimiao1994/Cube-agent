@@ -412,6 +412,7 @@ def test_cleanup_mount_lstat_error_retains_quota_and_retries(
     runtime.mkdir()
     service = mod.PreviewBroker(replace(prepared(tmp_path)[1], runtime_root=runtime, max_sessions=1))
     session = service._reserve("fixture", object(), 30)
+    linux_metadata(monkeypatch, {session.owned: (0, stat.S_IFDIR | 0o755)})
     session.mounted = True
     session.mount_unit = "fixture.mount"
     work = session.owned / "work"
